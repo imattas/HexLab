@@ -7,9 +7,16 @@
 namespace hexlab::database {
 struct ConnectionState {
     sqlite3* db=nullptr;std::stop_token stop;bool rolling_back=false;
+    int rollback_failure_code=SQLITE_OK;
     ~ConnectionState(){if(db)sqlite3_close_v2(db);}
 };
 namespace {
+Result<bool> ensure_usable(const ConnectionState& state){
+    if(state.rollback_failure_code==SQLITE_OK)return true;
+    return Error{ErrorCode::integrity,
+        "SQLite transaction rollback failed (code "+std::to_string(state.rollback_failure_code)+
+        "); close and reopen the project before continuing"};
+}
 Error failure(sqlite3* db,int code){
     ErrorCode mapped=ErrorCode::io;
     switch(code&255){
@@ -30,8 +37,9 @@ int commit_checkpoint(void*)noexcept{
     catch(...){return 1;} // Never unwind C++ exceptions through SQLite's C frames.
 }
 #endif
-Result<bool> status(const ConnectionState& state,int code){if(code==SQLITE_OK)return true;return failure(state.db,code);}
+Result<bool> status(const ConnectionState& state,int code){auto usable=ensure_usable(state);if(!usable)return usable.error();if(code==SQLITE_OK)return true;return failure(state.db,code);}
 Result<bool> execute_native(ConnectionState& state,const char* sql){
+    auto usable=ensure_usable(state);if(!usable)return usable.error();
     if(state.stop.stop_requested())return Error{ErrorCode::canceled,"Database operation canceled"};
 #ifdef HEXLAB_DATABASE_TESTING
     if(std::string_view(sql)=="COMMIT")if(auto failure=testing::take_commit_failure())return Error{*failure,"Injected commit failure"};
@@ -48,6 +56,7 @@ Connection::Connection(std::shared_ptr<ConnectionState> state):state_(std::move(
 Connection::~Connection()=default;
 std::stop_token Connection::exchange_cancellation(std::stop_token stop)noexcept{return std::exchange(state_->stop,stop);}
 Result<bool> Connection::checkpoint(){
+    auto usable=ensure_usable(*state_);if(!usable)return usable.error();
     if(state_->stop.stop_requested())return Error{ErrorCode::canceled,"Checkpoint canceled"};
     int log=-1,done=-1;const auto code=sqlite3_wal_checkpoint_v2(state_->db,"main",SQLITE_CHECKPOINT_TRUNCATE,&log,&done);
     if(code!=SQLITE_OK)return failure(state_->db,code);
@@ -56,6 +65,8 @@ Result<bool> Connection::checkpoint(){
 }
 Result<bool> Connection::backup_to(Connection& destination,std::stop_token stop){
     if(this==&destination || state_==destination.state_)return Error{ErrorCode::invalid_argument,"Backup needs a separate destination connection"};
+    auto source_usable=ensure_usable(*state_);if(!source_usable)return source_usable.error();
+    auto destination_usable=ensure_usable(*destination.state_);if(!destination_usable)return destination_usable.error();
     if(stop.stop_requested())return Error{ErrorCode::canceled,"Backup canceled"};
     auto* backup=sqlite3_backup_init(destination.state_->db,"main",state_->db,"main");
     if(!backup)return failure(destination.state_->db,sqlite3_errcode(destination.state_->db));
@@ -116,6 +127,7 @@ struct Statement::Impl {
 Statement::Statement(std::unique_ptr<Impl> impl):impl_(std::move(impl)){}
 Statement::~Statement()=default;
 Result<std::shared_ptr<Statement>> Connection::prepare(std::string_view sql){
+    auto usable=ensure_usable(*state_);if(!usable)return usable.error();
     if(state_->stop.stop_requested())return Error{ErrorCode::canceled,"Database preparation canceled"};
     if(sql.empty() || sql.size()>1024*1024 || sql.find('\0')!=std::string_view::npos)return Error{ErrorCode::invalid_argument,"Invalid SQL statement extent"};
     try {
@@ -132,14 +144,16 @@ Result<bool> Connection::execute(std::string_view sql){
     auto prepared=prepare(sql);if(!prepared)return prepared.error();
     for(;;){auto row=prepared.value()->step();if(!row)return row.error();if(!row.value())return true;}
 }
-Result<bool> Statement::bind_integer(int index,std::int64_t value){return status(*impl_->state,sqlite3_bind_int64(impl_->statement,index,value));}
-Result<bool> Statement::bind_text(int index,std::string_view value){return status(*impl_->state,sqlite3_bind_text64(impl_->statement,index,value.empty()?"":value.data(),value.size(),SQLITE_TRANSIENT,SQLITE_UTF8));}
+Result<bool> Statement::bind_integer(int index,std::int64_t value){auto usable=ensure_usable(*impl_->state);if(!usable)return usable.error();return status(*impl_->state,sqlite3_bind_int64(impl_->statement,index,value));}
+Result<bool> Statement::bind_text(int index,std::string_view value){auto usable=ensure_usable(*impl_->state);if(!usable)return usable.error();return status(*impl_->state,sqlite3_bind_text64(impl_->statement,index,value.empty()?"":value.data(),value.size(),SQLITE_TRANSIENT,SQLITE_UTF8));}
 Result<bool> Statement::bind_blob(int index,std::span<const std::byte> value){
+    auto usable=ensure_usable(*impl_->state);if(!usable)return usable.error();
     static const std::byte empty{};return status(*impl_->state,sqlite3_bind_blob64(impl_->statement,index,value.empty()?&empty:value.data(),value.size(),SQLITE_TRANSIENT));
 }
-Result<bool> Statement::bind_null(int index){return status(*impl_->state,sqlite3_bind_null(impl_->statement,index));}
+Result<bool> Statement::bind_null(int index){auto usable=ensure_usable(*impl_->state);if(!usable)return usable.error();return status(*impl_->state,sqlite3_bind_null(impl_->statement,index));}
 Result<bool> Statement::step(){
     impl_->row=false;
+    auto usable=ensure_usable(*impl_->state);if(!usable)return usable.error();
     if(impl_->state->stop.stop_requested())return Error{ErrorCode::canceled,"Database step canceled"};
     if(impl_->done)return false;
     auto code=sqlite3_step(impl_->statement);
@@ -148,27 +162,32 @@ Result<bool> Statement::step(){
     return failure(impl_->state->db,code);
 }
 Result<bool> Statement::reset(){
+    auto usable=ensure_usable(*impl_->state);if(!usable)return usable.error();
     auto code=sqlite3_reset(impl_->statement);impl_->row=false;impl_->done=false;
     auto cleared=sqlite3_clear_bindings(impl_->statement);if(code!=SQLITE_OK)return failure(impl_->state->db,code);
     return status(*impl_->state,cleared);
 }
 Result<std::int64_t> Statement::integer(int index)const{
+    auto usable=ensure_usable(*impl_->state);if(!usable)return usable.error();
     if(!impl_->column(index) || sqlite3_column_type(impl_->statement,index)!=SQLITE_INTEGER)return Error{ErrorCode::integrity,"SQL column is not an integer"};
     return sqlite3_column_int64(impl_->statement,index);
 }
 Result<std::string> Statement::text(int index)const{
+    auto usable=ensure_usable(*impl_->state);if(!usable)return usable.error();
     if(!impl_->column(index) || sqlite3_column_type(impl_->statement,index)!=SQLITE_TEXT)return Error{ErrorCode::integrity,"SQL column is not text"};
     const auto* data=sqlite3_column_text(impl_->statement,index);const auto count=sqlite3_column_bytes(impl_->statement,index);
     if(!data)return failure(impl_->state->db,SQLITE_NOMEM);
     try{return std::string(reinterpret_cast<const char*>(data),count);}catch(const std::bad_alloc&){return Error{ErrorCode::resource_limit,"Cannot copy SQL text"};}
 }
 Result<std::vector<std::byte>> Statement::blob(int index)const{
+    auto usable=ensure_usable(*impl_->state);if(!usable)return usable.error();
     if(!impl_->column(index) || sqlite3_column_type(impl_->statement,index)!=SQLITE_BLOB)return Error{ErrorCode::integrity,"SQL column is not a blob"};
     const auto* data=static_cast<const std::byte*>(sqlite3_column_blob(impl_->statement,index));const auto count=sqlite3_column_bytes(impl_->statement,index);
     if(!count)return std::vector<std::byte>{};if(!data)return failure(impl_->state->db,SQLITE_NOMEM);
     try{return std::vector<std::byte>(data,data+count);}catch(const std::bad_alloc&){return Error{ErrorCode::resource_limit,"Cannot copy SQL blob"};}
 }
 Result<bool> Statement::is_null(int index)const{
+    auto usable=ensure_usable(*impl_->state);if(!usable)return usable.error();
     if(!impl_->column(index))return Error{ErrorCode::invalid_argument,"SQL column is unavailable"};
     return sqlite3_column_type(impl_->statement,index)==SQLITE_NULL;
 }
@@ -188,7 +207,12 @@ Result<std::shared_ptr<Transaction>> Transaction::begin_read(Connection& connect
     }catch(const std::bad_alloc&){return Error{ErrorCode::resource_limit,"Cannot allocate database read transaction"};}
 }
 Transaction::~Transaction(){
-    if(active_){state_->rolling_back=true;sqlite3_exec(state_->db,"ROLLBACK",nullptr,nullptr,nullptr);state_->rolling_back=false;}
+    if(active_){
+        state_->rolling_back=true;
+        const auto rolled_back=sqlite3_exec(state_->db,"ROLLBACK",nullptr,nullptr,nullptr);
+        state_->rolling_back=false;
+        if(rolled_back!=SQLITE_OK)state_->rollback_failure_code=rolled_back;
+    }
 }
 Result<bool> Transaction::commit(){
     if(!active_)return Error{ErrorCode::invalid_argument,"Transaction already completed"};

@@ -155,7 +155,10 @@ void read_protections(const ByteStorage &storage, const Image &image, MachOMetad
             row.raw_offset = static_cast<std::uint32_t>(reader.value(payload.bytes, at, 4));
             row.length = static_cast<std::uint16_t>(reader.value(payload.bytes, at + 4, 2));
             row.kind = static_cast<std::uint16_t>(reader.value(payload.bytes, at + 6, 2));
-            if (row.kind < 1 || row.kind > 5)
+            if (row.kind >= static_cast<std::uint16_t>(MachODataInCodeKind::data) &&
+                row.kind <= static_cast<std::uint16_t>(MachODataInCodeKind::absolute_jump_table32))
+                row.decoded_kind = static_cast<MachODataInCodeKind>(row.kind);
+            else
                 metadata.protections_complete = false;
             if (slice.header.file_type == 1) {
                 std::uint32_t matches = 0;

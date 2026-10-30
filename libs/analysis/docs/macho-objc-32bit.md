@@ -5,7 +5,10 @@ alongside the existing 64-bit path. This is the class-list runtime used by
 32-bit non-fragile Objective-C images, not the ObjC1 `__OBJC` runtime.
 `MachOObjCScan::pointer_bytes` records the selected four- or eight-byte width.
 A selected slice whose pointer width or byte order disagrees with the mapped
-image is rejected; arm64_32 is explicitly unsupported.
+image is rejected. The `arm64_32` CPU type uses four-byte metadata pointers
+inside its required 64-bit Mach-O header/address space; pointer targets and
+relative fields are still required to resolve within the 32-bit pointer
+domain. Other ABI64_32 CPU types are unsupported.
 
 The 32-bit class-list slots are four bytes. `class_t` is five 32-bit pointer
 fields (20 bytes); the superclass and data slots are at offsets 4 and 16.
@@ -54,8 +57,18 @@ default alignment follows the four-byte word size. Type encodings receive the
 selected pointer width, so `long`, object and block pointers use 32-bit sizes.
 Links and deduplication use the complete address-space ID plus offset.
 
+## Superclass graph integrity
+
+After class pointers resolve, the scanner links each in-image superclass to
+its scanned class record. The browser reports this graph link separately from
+the pointer/fixup status, distinguishing roots, resolved in-image links,
+unscanned external targets, and unresolved pointers. An iterative traversal
+detects cycles without recursion; cycle members are labeled `cycle` and make
+the overall metadata scan incomplete. Classes leading into a cycle retain
+their direct link status, and no class records are discarded.
+
 ObjC1 module/class/category/protocol records in `__OBJC`, big-endian images,
-arm64_32, tagged relative-list-list unions,
+tagged relative-list-list unions,
 runtime caches and realized/future runtime objects are intentionally unsupported.
 Optional category class-property tails, protocol extended method-type arrays,
 demangled-name/class-property tails, Swift initializer tails and private runtime

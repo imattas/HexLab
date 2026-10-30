@@ -271,6 +271,7 @@ void read_dyld(const ByteStorage &storage, const Image &image, MachOMetadata &me
     const auto header_anchor = take(macho_header_anchor(image, slice, stop));
     for (std::uint32_t i = 0; i < metadata.dyld_streams.size(); ++i)
         parse_stream(reader, image, metadata, i, libraries, header_anchor, budget, stop);
+    read_chain_starts_section(reader, image, metadata, budget, stop);
     // File-order scalar reads keep TrackingStorage dependencies bounded even
     // for descending streams, overlapping fixups and discontiguous VM fields.
     struct ByteRequest {

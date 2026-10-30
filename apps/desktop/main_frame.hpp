@@ -11,6 +11,7 @@
 
 namespace hexlab::plugins { class ModuleProvider; }
 namespace hexlab::desktop {
+class CompareView;
 inline constexpr int reset_layout_id = wxID_HIGHEST + 1;
 enum Command {
     open_raw_id = reset_layout_id + 1,
@@ -44,7 +45,10 @@ enum Command {
     incoming_references_id,
     outgoing_references_id,
     flirt_apply_id,
-    python_console_id
+    cross_document_jump_id,
+    python_console_id,
+    browse_image_entries_id,
+    export_navigation_history_id
 };
 class MainFrame final : public wxFrame {
   public:
@@ -67,7 +71,10 @@ class MainFrame final : public wxFrame {
     std::optional<std::pair<std::filesystem::path, std::uint64_t>> ActiveSavedProjectBinding();
 
   private:
+    friend class CompareView;
     struct Impl;
+    bool OpenComparisonSession(const std::filesystem::path &, bool show_error);
+    void TrackComparisonSession(CompareView *, const std::filesystem::path &);
     void AdaptLayout();
     void RestoreDesktopState();
     void SaveDesktopState();

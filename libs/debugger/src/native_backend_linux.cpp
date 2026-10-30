@@ -3,6 +3,7 @@
 #include "elf_process_architecture.hpp"
 #include "linux_x86_fp_registers.hpp"
 #include "linux_x86_registers.hpp"
+#include "linux_proc_task_state.hpp"
 
 #include <algorithm>
 #include <array>
@@ -20,6 +21,7 @@
 #include <iterator>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <set>
 #include <string>
 #include <thread>
@@ -235,13 +237,14 @@ class LinuxPtraceBackend final : public Backend {
         explicit WaitScope(LinuxPtraceBackend &value, std::optional<std::chrono::milliseconds> timeout = {})
             : backend(value), owner(!value.wait_deadline_) {
             if (owner) {
+                std::lock_guard gate(backend.wait_gate_mutex_);
                 backend.wait_stop_requested_.store(false);
                 const auto duration = timeout ? std::min(backend.wait_timeout_, std::max(*timeout, std::chrono::milliseconds(0))) : backend.wait_timeout_;
                 backend.wait_deadline_ = Clock::now() + duration;
                 backend.wait_active_.store(true);
             }
         }
-        ~WaitScope() { if (owner) { backend.wait_active_.store(false); backend.wait_deadline_.reset(); } }
+        ~WaitScope() { if (owner) { std::lock_guard gate(backend.wait_gate_mutex_); backend.wait_active_.store(false); backend.wait_deadline_.reset(); } }
     };
     struct CleanupScope {
         bool &flag; bool previous;
@@ -274,6 +277,8 @@ public:
     }
 
     Result<ProcessInfo> launch(const Target& target) override {
+        if (!target.remote_environment.empty())
+            return Error{ErrorCode::unsupported, "remote environment changes are not supported by native launch"};
         WaitScope scope(*this);
         if (startup_cleanup_) { auto cleanup = cleanup_startup(); if (!cleanup) return cleanup.error(); }
         if (pid_) return Error{ErrorCode::busy, "backend already owns a debug target"};
@@ -415,6 +420,17 @@ public:
             detach_preparing_ = true; resume_blocked_ = true;
             auto stopped = stop_all_threads(); if (!stopped) { resume_blocked_ = true; return stopped; }
             if (stopped_ != tracked_) return Error{ErrorCode::busy, "detach requires every owned thread stopped"};
+            std::set<std::uint64_t> enabled_addresses;
+            for (const auto& [id, address] : ids_)
+                if (enabled_ids_.contains(id)) enabled_addresses.insert(address);
+            // Validate the whole set before rewinding any PCs or restoring any
+            // bytes. An earlier detach attempt may already have restored a
+            // prefix; those addresses must still hold their saved originals.
+            for (const auto& [address, original] : breakpoints_) {
+                (void)original;
+                auto progress = wait_progress(); if (!progress) return progress;
+                auto owned = detach_breakpoint_byte(address, enabled_addresses.contains(address)); if (!owned) return owned.error();
+            }
             for (const auto tid : stopped_) {
                 if (detach_signals_.contains(tid)) continue;
                 auto progress = wait_progress(); if (!progress) return progress;
@@ -451,7 +467,12 @@ public:
             }
             for (const auto& [address, original] : breakpoints_) {
                 auto progress = wait_progress(); if (!progress) return progress;
-                if (!patch(address, original)) return sys_error("restore breakpoint before detach");
+                if (detach_restored_breakpoints_.contains(address)) continue;
+                auto owned = detach_breakpoint_byte(address, enabled_addresses.contains(address)); if (!owned) return owned.error();
+                // Allocate retry tracking before the target write.
+                detach_restored_breakpoints_.insert(address);
+                auto restored = replace_software_breakpoint_byte(address, owned.value(), original);
+                if (!restored) { detach_restored_breakpoints_.erase(address); return restored; }
             }
             if (!hardware_breakpoints_.empty() && !detach_hardware_cleared_) {
                 auto cleared = apply_hardware_breakpoints({}); if (!cleared) return cleared;
@@ -569,9 +590,41 @@ public:
     }
 
     Status request_interrupt() override {
+        std::lock_guard gate(wait_gate_mutex_);
+        if (pending_ || requested_thread_interrupt_)
+            return Error{ErrorCode::busy, "an event or thread-qualified interrupt is already pending"};
         if (wait_active_.load()) { wait_stop_requested_.store(true); return std::monostate{}; }
         return interrupt_running_threads(false);
     }
+    Status request_thread_interrupt(ThreadId thread) override {
+        std::lock_guard gate(wait_gate_mutex_);
+        if (pid_ <= 0 || exited_ || pending_ || startup_cleanup_ || detach_preparing_ || detaching_ || terminating_)
+            return Error{ErrorCode::invalid_argument, "thread interrupt requires a running target with no pending event"};
+        if (wait_active_.load())
+            return Error{ErrorCode::busy, "cannot target a thread while the ptrace event poller is active"};
+        if (thread == 0 || thread > static_cast<ThreadId>(std::numeric_limits<pid_t>::max()))
+            return Error{ErrorCode::invalid_argument, "thread interrupt requires a valid session thread ID"};
+        const auto tid = static_cast<pid_t>(thread);
+        if (!tracked_.contains(tid) || !seized_.contains(tid))
+            return Error{ErrorCode::invalid_argument, "thread is not a seized thread owned by this session"};
+        if (stopped_.contains(tid) || deferred_stops_.contains(tid) || initial_children_.contains(tid))
+            return Error{ErrorCode::invalid_argument, "thread interrupt requires a known-running thread"};
+        if (!interrupting_.empty() || requested_thread_interrupt_ || wait_stop_requested_.load() ||
+            !step_threads_.empty() || displaced_step_ || breakpoint_rollback_ || breakpoint_rearm_ ||
+            resume_blocked_ || !hardware_pending_children_.empty())
+            return Error{ErrorCode::busy, "another interrupt, step, rollback, or breakpoint configuration is in progress"};
+        interrupting_.insert(tid);
+        requested_thread_interrupt_ = tid;
+        if (ptrace(PTRACE_INTERRUPT, tid, nullptr, nullptr) != 0) {
+            interrupting_.erase(tid);
+            requested_thread_interrupt_.reset();
+            if (errno == ESRCH)
+                return Error{ErrorCode::invalid_argument, "thread exited before the interrupt was accepted"};
+            return sys_error("PTRACE_INTERRUPT selected thread");
+        }
+        return std::monostate{};
+    }
+    bool supports_thread_interrupt() const noexcept override { return true; }
 
     Result<DebugEvent> wait_event(std::chrono::milliseconds timeout) override {
         WaitScope scope(*this, timeout);
@@ -590,6 +643,7 @@ public:
         do {
             int status{};
             pid_t tid = 0;
+            bool requested_thread_interrupt = false;
             // Collect an active step's completion or exceptional stop before
             // exposing a deferred peer event. Otherwise stopping peers for
             // that event could consume this thread's trace/interrupt stop and
@@ -645,13 +699,14 @@ public:
                     const auto owner = std::find_if(ids_.begin(), ids_.end(), [&](const auto& item) {
                         return item.second == step.address && enabled_ids_.contains(item.first);
                     });
-                    if (owner != ids_.end() && !(tid == pid_ && (WIFEXITED(status) || WIFSIGNALED(status))) &&
-                        !patch(step.address, std::byte{0xcc})) {
+                    auto rearmed = owner != ids_.end() && !(tid == pid_ && (WIFEXITED(status) || WIFSIGNALED(status)))
+                        ? rearm_software_breakpoint(step.address) : Status{std::monostate{}};
+                    if (!rearmed) {
                         // Publish this stop normally and retain the missing
                         // trap as explicit recovery work before any resume.
                         breakpoint_rearm_ = step.address;
                         resume_blocked_ = true;
-                        resume_failure = sys_error("reinsert INT3 after displaced instruction").message;
+                        resume_failure = "reinsert INT3 after displaced instruction: " + rearmed.error().message;
                         failed_trace = trace_complete;
                     }
                     displaced_step_.reset();
@@ -668,6 +723,28 @@ public:
                             }
                             resume_failure = sys_error("PTRACE_CONT event thread after breakpoint rearm").message;
                             failed_trace = true;
+                        } else if (!step.deferred_resumes.empty()) {
+                            std::vector<pid_t> resumed;
+                            for (const auto& [resume_tid, signal] : step.deferred_resumes) {
+                                if (ptrace(PTRACE_CONT, resume_tid, nullptr,
+                                           reinterpret_cast<void*>(static_cast<std::intptr_t>(signal))) == 0) {
+                                    stopped_.erase(resume_tid);
+                                    deferred_signals_.erase(resume_tid);
+                                    resumed.push_back(resume_tid);
+                                    continue;
+                                }
+                                const auto error = sys_error("PTRACE_CONT deferred Linux breakpoint schedule");
+                                auto rollback = stop_threads(resumed, true);
+                                if (!rollback) {
+                                    resume_blocked_ = true;
+                                    resume_failure = error.message + "; deferred-schedule rollback failed: " + rollback.error().message;
+                                } else {
+                                    resume_failure = error.message;
+                                }
+                                failed_trace = true;
+                                break;
+                            }
+                            if (resume_failure.empty()) continue;
                         } else displaced_user_step = true;
                     } else displaced_user_step = trace_complete && resume_failure.empty() && internal_step_only;
                     if (!trace_complete && WIFSTOPPED(status)) {
@@ -681,6 +758,7 @@ public:
                     pending_debugger_trap_ = false;
                     deferred_signals_.erase(tid);
                     stopped_.erase(tid); tracked_.erase(tid); seized_.erase(tid); interrupting_.erase(tid); deferred_stops_.erase(tid);
+                    if (requested_thread_interrupt_ == tid) requested_thread_interrupt_.reset();
                     event.kind = tid == pid_ ? EventKind::process_exited : EventKind::thread_exited;
                     event.code = WIFEXITED(status) ? static_cast<std::uint32_t>(WEXITSTATUS(status)) : static_cast<std::uint32_t>(WTERMSIG(status));
                     event.message = tid == pid_ ? "process exited" : "thread exited";
@@ -688,6 +766,9 @@ public:
                 } else if (WIFSTOPPED(status)) {
                     const int signal = WSTOPSIG(status); event.code = static_cast<std::uint32_t>(signal);
                     const auto ptrace_event = static_cast<unsigned>(status) >> 16;
+                    const bool was_thread_interrupt = requested_thread_interrupt_ == tid;
+                    if (was_thread_interrupt) requested_thread_interrupt_.reset();
+                    requested_thread_interrupt = was_thread_interrupt && ptrace_event == PTRACE_EVENT_STOP && signal == SIGTRAP;
                     last_signal_ = ptrace_event == 0 ? static_cast<unsigned>(signal) : 0;
                     if (ptrace_event == PTRACE_EVENT_CLONE) {
                         defer_stop(tid, status);
@@ -699,9 +780,12 @@ public:
                         deferred_stops_.erase(tid);
                         event.kind = EventKind::thread_created; event.message = "thread created";
                     } else {
-                    event.kind = signal == (SIGTRAP | 0x80) ? EventKind::unknown : (signal == SIGTRAP ? EventKind::breakpoint : EventKind::exception);
-                    event.message = ptrace_event == PTRACE_EVENT_STOP ? "interrupt stop" : "ptrace stop";
-                    if (ptrace_event == PTRACE_EVENT_STOP) event.kind = EventKind::exception;
+                    const bool debugger_interrupt = ptrace_event == PTRACE_EVENT_STOP && signal == SIGTRAP;
+                    event.kind = debugger_interrupt ? EventKind::interrupted :
+                        signal == (SIGTRAP | 0x80) ? EventKind::unknown :
+                        (signal == SIGTRAP ? EventKind::breakpoint : EventKind::exception);
+                    event.message = debugger_interrupt ? "debugger interrupt" :
+                        ptrace_event == PTRACE_EVENT_STOP ? "group stop" : "ptrace stop";
                     if (signal == SIGTRAP && ptrace_event != PTRACE_EVENT_STOP) {
                         bool hardware_breakpoint = false;
                         if (hardware_slots_.size() != 0) {
@@ -763,14 +847,14 @@ public:
                         }
                     }
                 }
-                if (event.kind != EventKind::process_exited) {
+                if (event.kind != EventKind::process_exited && !requested_thread_interrupt) {
                     auto stopped = stop_all_threads();
                     if (!stopped) {
                         resume_blocked_ = true;
                         event.message += "; peer suspension incomplete: " + stopped.error().message;
                     }
                 }
-                pending_ = std::pair{event.sequence, tid}; return event;
+                pending_ = std::pair{event.sequence, tid}; pending_thread_interrupt_ = requested_thread_interrupt; return event;
             }
             auto progress = wait_progress(); if (!progress) return progress.error();
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -786,6 +870,15 @@ public:
         if (exited_ && tid == pid_) { clear(); return std::monostate{}; }
         auto recovered = recover_suspension();
         if (!recovered) return recovered;
+        if (pending_thread_interrupt_) {
+            if (ptrace(PTRACE_CONT, tid, nullptr, reinterpret_cast<void*>(static_cast<std::intptr_t>(signal))) != 0)
+                return sys_error("PTRACE_CONT interrupted Linux thread");
+            stopped_.erase(tid);
+            deferred_signals_.erase(tid);
+            pending_breakpoint_.reset(); pending_.reset(); pending_signal_ = 0;
+            pending_thread_interrupt_ = false;
+            return std::monostate{};
+        }
         if (disposition == ContinueStatus::handled) {
             auto displaced = needs_displaced_step(tid);
             if (!displaced) return displaced.error();
@@ -794,7 +887,7 @@ public:
         auto resumed = resume_stopped_threads(tid, signal);
         if (!resumed) return resumed;
         deferred_signals_.erase(tid);
-        pending_breakpoint_.reset(); pending_.reset(); pending_signal_ = 0;
+        pending_breakpoint_.reset(); pending_.reset(); pending_signal_ = 0; pending_thread_interrupt_ = false;
         return std::monostate{};
     }
     Status continue_thread_event(std::uint64_t sequence, ThreadId thread, ContinueStatus disposition) override {
@@ -818,7 +911,7 @@ public:
             return sys_error("PTRACE_CONT selected thread");
         stopped_.erase(tid);
         deferred_signals_.erase(tid);
-        pending_breakpoint_.reset(); pending_.reset(); pending_signal_ = 0;
+        pending_breakpoint_.reset(); pending_.reset(); pending_signal_ = 0; pending_thread_interrupt_ = false;
         return std::monostate{};
     }
     Status resume_threads_event(std::uint64_t sequence, std::span<const ThreadResumeAction> actions) override {
@@ -876,13 +969,17 @@ public:
             return Error{ErrorCode::invalid_argument, "resume schedule must include the thread that owns the pending event"};
         if (runnable.empty())
             return Error{ErrorCode::invalid_argument, "resume schedule must continue or step at least one thread"};
+        if (!step_threads_.empty() && std::any_of(runnable.begin(), runnable.end(), [](const auto* action) {
+                return action->kind == ThreadResumeKind::single_step;
+            }))
+            return Error{ErrorCode::busy, "cannot issue another Linux single-step while a step result is pending"};
 
         if (runnable.size() > 1) {
             const auto single_steps = std::count_if(runnable.begin(), runnable.end(), [](const auto *action) {
                 return action->kind == ThreadResumeKind::single_step;
             });
-            if (single_steps > 1 || (!step_threads_.empty() && single_steps != 0))
-                return Error{ErrorCode::unsupported, "Linux ptrace schedules support at most one outstanding single-step"};
+            if (single_steps > 1)
+                return Error{ErrorCode::unsupported, "Linux ptrace schedules support at most one single-step action"};
             const auto step_action = std::find_if(runnable.begin(), runnable.end(), [](const auto *action) {
                 return action->kind == ThreadResumeKind::single_step;
             });
@@ -898,8 +995,38 @@ public:
                     return Error{ErrorCode::unsupported,
                         "a mixed non-owner step requires the pending event owner to remain stopped"};
             }
-            if (pending_breakpoint_)
-                return Error{ErrorCode::unsupported, "cannot schedule multiple threads while stepping over a pending software breakpoint"};
+            bool pending_breakpoint_needs_step = false;
+            if (pending_breakpoint_) {
+                auto needs_step = needs_displaced_step(owner);
+                if (!needs_step) return needs_step.error();
+                pending_breakpoint_needs_step = needs_step.value();
+            }
+            if (pending_breakpoint_needs_step) {
+                const auto owner_action = std::find_if(actions.begin(), actions.end(), [&](const auto& action) {
+                    return static_cast<pid_t>(action.thread) == owner;
+                });
+                if (owner_action == actions.end() || owner_action->kind != ThreadResumeKind::continue_execution ||
+                    std::any_of(runnable.begin(), runnable.end(), [](const auto* action) {
+                        return action->kind != ThreadResumeKind::continue_execution;
+                    }))
+                    return Error{ErrorCode::unsupported,
+                        "a Linux software-breakpoint step-over schedule requires the event owner and selected peers to continue"};
+                std::vector<std::pair<pid_t, int>> deferred_resumes;
+                deferred_resumes.reserve(runnable.size());
+                for (const auto* action : runnable) {
+                    const auto tid = static_cast<pid_t>(action->thread);
+                    if (tid == owner && action->signal_disposition != ContinueStatus::handled && pending_signal_ != 0)
+                        return Error{ErrorCode::unsupported,
+                            "cannot combine software-breakpoint step-over with delivery of the owner's pending signal"};
+                    const int queued = signal_for(*action);
+                    const int delivered = action->signal_disposition == ContinueStatus::handled ? 0 : queued;
+                    deferred_resumes.emplace_back(tid, delivered);
+                }
+                auto stepped = begin_displaced_step(owner, false, false, std::move(deferred_resumes));
+                if (!stepped) return stepped;
+                apply_stopped_signal_dispositions();
+                return std::monostate{};
+            }
 
             // Release non-owner continuations first and the pending-event owner
             // last among continuations. A single step, whether it belongs to
@@ -959,7 +1086,7 @@ public:
                 resumed.push_back(tid);
             }
             apply_stopped_signal_dispositions();
-            pending_.reset(); pending_breakpoint_.reset(); pending_signal_ = 0; last_signal_ = 0;
+            pending_.reset(); pending_breakpoint_.reset(); pending_signal_ = 0; pending_thread_interrupt_ = false; last_signal_ = 0;
             return std::monostate{};
         }
 
@@ -985,7 +1112,7 @@ public:
             deferred_signals_.erase(tid);
             apply_stopped_signal_dispositions();
             pending_signal_ = 0;
-            pending_.reset(); pending_breakpoint_.reset(); last_signal_ = 0;
+            pending_.reset(); pending_breakpoint_.reset(); pending_thread_interrupt_ = false; last_signal_ = 0;
             return std::monostate{};
         }
 
@@ -1012,7 +1139,7 @@ public:
         deferred_signals_.erase(tid);
         apply_stopped_signal_dispositions();
         pending_signal_ = 0;
-        pending_.reset(); pending_breakpoint_.reset(); last_signal_ = 0;
+        pending_.reset(); pending_breakpoint_.reset(); pending_thread_interrupt_ = false; last_signal_ = 0;
         return std::monostate{};
     }
     Status single_step_event(std::uint64_t sequence, ContinueStatus disposition) override {
@@ -1029,7 +1156,7 @@ public:
         const int signal = disposition == ContinueStatus::handled ? 0 : pending_signal_;
         if (ptrace(PTRACE_SINGLESTEP, tid, nullptr, reinterpret_cast<void*>(static_cast<std::intptr_t>(signal))) != 0) return sys_error("PTRACE_SINGLESTEP");
         deferred_signals_.erase(tid);
-        pending_.reset(); pending_breakpoint_.reset(); pending_signal_ = 0;
+        pending_.reset(); pending_breakpoint_.reset(); pending_signal_ = 0; pending_thread_interrupt_ = false;
         stopped_.erase(tid); step_threads_.insert(tid); return std::monostate{};
     }
 
@@ -1044,7 +1171,22 @@ public:
         }
         return out;
     }
+    Result<std::vector<std::byte>> signal_info() override {
+        if (pid_ <= 0 || !pending_ || pending_->second <= 0 || !tracked_.contains(pending_->second))
+            return Error{ErrorCode::unsupported, "there is no pending Linux signal event with a readable siginfo record"};
+        siginfo_t info{};
+        if (ptrace(PTRACE_GETSIGINFO, pending_->second, nullptr, &info) != 0) {
+            if (errno == EINVAL || errno == EIO)
+                return Error{ErrorCode::unsupported, "the pending Linux ptrace event has no readable siginfo record"};
+            return sys_error("PTRACE_GETSIGINFO");
+        }
+        std::vector<std::byte> bytes(sizeof(info));
+        std::memcpy(bytes.data(), &info, sizeof(info));
+        return bytes;
+    }
     Status write_memory(std::uint64_t address, std::span<const std::byte> data) override {
+        if (detach_preparing_ || detaching_)
+            return Error{ErrorCode::busy, "complete detach cleanup before editing target memory"};
         if (pid_ <= 0) return Error{ErrorCode::invalid_argument, "no debug target is attached"};
         if (breakpoint_rollback_)
             return Error{ErrorCode::busy, "recover breakpoint-step rollback before editing target memory"};
@@ -1092,7 +1234,11 @@ public:
             pid_t tid{}; if (!parse_pid(it->path().filename().string(), tid)) continue;
             if (out.size() == max_inspection_threads)
                 return Error{ErrorCode::resource_limit, "target thread count exceeds the inspection limit"};
-            auto name = proc_name(tid); out.push_back({static_cast<ThreadId>(tid), std::move(name), stopped_.contains(tid) ? ThreadState::stopped : ThreadState::running});
+            auto name = proc_name(tid);
+            ThreadInfo thread{static_cast<ThreadId>(tid), std::move(name),
+                stopped_.contains(tid) ? ThreadState::stopped : ThreadState::running};
+            thread.native_state = detail::linux_proc_task_state(pid_, tid);
+            out.push_back(std::move(thread));
         }
         if (ec) return Error{ErrorCode::io, "failed to enumerate target threads: " + ec.message()};
         return out;
@@ -1171,6 +1317,13 @@ public:
             if (!fp_values) return fp_values.error();
             out.insert(out.end(), std::make_move_iterator(fp_values.value().begin()),
                        std::make_move_iterator(fp_values.value().end()));
+            if (const auto layout = host_ymm_xstate_layout()) {
+                auto ymm_values = detail::x86_i386_xstate_ymm_upper_register_values(xstate.value(), *layout);
+                if (ymm_values)
+                    out.insert(out.end(), std::make_move_iterator(ymm_values.value().begin()),
+                               std::make_move_iterator(ymm_values.value().end()));
+                else if (ymm_values.error().code != ErrorCode::unsupported) return ymm_values.error();
+            }
             return out;
         }
         user_regs_struct r{}; if (ptrace(PTRACE_GETREGS, static_cast<pid_t>(thread), nullptr, &r) != 0) return sys_error("PTRACE_GETREGS");
@@ -1209,6 +1362,8 @@ public:
         return out;
     }
     Status write_registers(ThreadId thread, std::span<const RegisterValue> registers) override {
+        if (detach_preparing_ || detaching_)
+            return Error{ErrorCode::busy, "complete detach cleanup before editing target registers"};
         if (breakpoint_rollback_)
             return Error{ErrorCode::busy, "recover breakpoint-step rollback before editing target registers"};
         if (architecture_ == Architecture::x86) {
@@ -1217,35 +1372,50 @@ public:
             if (!original_regs) return original_regs.error();
             auto regs = original_regs.value();
             std::vector<RegisterValue> fp_writes;
+            std::vector<RegisterValue> ymm_writes;
             for (const auto& reg : registers) {
                 if (detail::x86_i386_fxsave_field(reg.name)) {
                     fp_writes.push_back(reg);
+                } else if (detail::x86_i386_ymm_upper_index(reg.name)) {
+                    ymm_writes.push_back(reg);
                 } else if (!detail::set_i386_register(regs, reg)) {
                     return Error{ErrorCode::invalid_argument, "unknown i386 register or register width mismatch"};
                 }
             }
             std::optional<std::vector<std::byte>> original_xstate;
             std::optional<std::vector<std::byte>> updated_xstate;
-            if (!fp_writes.empty()) {
+            if (!fp_writes.empty() || !ymm_writes.empty()) {
                 auto xstate = read_i386_xstate_image(tid);
                 if (!xstate) return xstate.error();
                 original_xstate = std::move(xstate.value());
                 updated_xstate = *original_xstate;
-                auto fp_status = detail::write_x86_i386_fxsave_registers(
-                    std::span<std::byte>(updated_xstate->data(), detail::x86_fxsave_size), fp_writes);
-                if (!fp_status) return fp_status.error();
-                detail::x86_set_xstate_bv(*updated_xstate,
-                    detail::x86_xstate_bv(*updated_xstate) | 0x3u); // x87 and SSE state are now in use.
+                if (!fp_writes.empty()) {
+                    auto fp_status = detail::write_x86_i386_fxsave_registers(
+                        std::span<std::byte>(updated_xstate->data(), detail::x86_fxsave_size), fp_writes);
+                    if (!fp_status) return fp_status.error();
+                    detail::x86_set_xstate_bv(*updated_xstate,
+                        detail::x86_xstate_bv(*updated_xstate) | 0x3u); // x87 and SSE state are now in use.
+                }
+                if (!ymm_writes.empty()) {
+                    const auto layout = host_ymm_xstate_layout();
+                    if (!layout) return Error{ErrorCode::unsupported, "host does not expose AVX state for i386 YMM writes"};
+                    auto ymm_status = detail::write_x86_i386_xstate_ymm_upper_registers(
+                        *updated_xstate, *layout, ymm_writes);
+                    if (!ymm_status) return ymm_status.error();
+                }
             }
             const bool write_gpr = std::any_of(registers.begin(), registers.end(), [](const auto& reg) {
-                return !detail::x86_i386_fxsave_field(reg.name).has_value();
+                return !detail::x86_i386_fxsave_field(reg.name).has_value() &&
+                       !detail::x86_i386_ymm_upper_index(reg.name).has_value();
             });
-            return detail::transact_i386_register_sets(!fp_writes.empty(), write_gpr,
+            return detail::transact_i386_register_sets(!fp_writes.empty() || !ymm_writes.empty(), write_gpr,
                 [&] { return write_xstate_image(tid, *updated_xstate); },
                 [&] { return write_i386_registers(tid, regs); },
                 [&] { return write_xstate_image(tid, *original_xstate); });
         }
         const auto tid = static_cast<pid_t>(thread);
+        auto alias_status = detail::validate_x86_avx512_alias_writes(registers);
+        if (!alias_status) return alias_status.error();
         const bool write_fp = std::any_of(registers.begin(), registers.end(), [](const auto& reg) {
             return detail::x86_fxsave_field(reg.name).has_value() || reg.name.starts_with("ymm") ||
                    detail::x86_avx512_register_name(reg.name);
@@ -1333,14 +1503,17 @@ public:
         return std::monostate{};
     }
     Result<Breakpoint> add_breakpoint(std::uint64_t address, BreakpointKind kind) override {
+        if (detach_preparing_ || detaching_)
+            return Error{ErrorCode::busy, "complete detach cleanup before editing target breakpoints"};
         if (breakpoint_rollback_)
             return Error{ErrorCode::busy, "recover breakpoint-step rollback before editing target breakpoints"};
-        if (architecture_ == Architecture::x86 && kind != BreakpointKind::software)
-            return Error{ErrorCode::unsupported, "Linux i386 ptrace backend supports software breakpoints only"};
         if (kind == BreakpointKind::execute) return add_hardware_breakpoint(address, kind, 1);
         if (kind != BreakpointKind::software) return Error{ErrorCode::unsupported, "Linux ptrace backend supports software and x86 hardware breakpoints"};
         if (breakpoints_.contains(address)) return Error{ErrorCode::conflict, "breakpoint already exists at address"};
+        if (breakpoints_.size() >= 4096) return Error{ErrorCode::resource_limit, "Linux software breakpoint limit is 4096"};
         auto current = read_memory(address, 1); if (!current) return current.error();
+        if (current.value()[0] == std::byte{0xcc})
+            return Error{ErrorCode::conflict, "cannot claim an existing unowned INT3 instruction as a software breakpoint"};
         const std::byte trap{0xcc};
         auto written = write_memory(address, std::span<const std::byte>(&trap, 1));
         if (!written) return written.error();
@@ -1348,10 +1521,10 @@ public:
         ids_[id] = address; enabled_ids_.insert(id); return Breakpoint{id, address, kind, true, 1};
     }
     Result<Breakpoint> add_hardware_breakpoint(std::uint64_t address, BreakpointKind kind, std::uint8_t size) override {
-        if (architecture_ == Architecture::x86)
-            return Error{ErrorCode::unsupported, "Linux i386 hardware debug-register access is not implemented"};
+        if (detach_preparing_ || detaching_)
+            return Error{ErrorCode::busy, "complete detach cleanup before editing target breakpoints"};
         if (kind == BreakpointKind::read)
-            return Error{ErrorCode::unsupported, "x86-64 debug registers cannot distinguish read-only watchpoints; choose access (read/write) or write"};
+            return Error{ErrorCode::unsupported, "x86 debug registers cannot distinguish read-only watchpoints; choose access (read/write) or write"};
         if (!pending_ || !stopped_.contains(pending_->second))
             return Error{ErrorCode::busy, "hardware breakpoints can only be changed while a debug event has stopped the target"};
         auto next = hardware_breakpoints_;
@@ -1364,6 +1537,8 @@ public:
         return Breakpoint{id, address, kind, true, size};
     }
     Status remove_breakpoint(BreakpointId id) override {
+        if (detach_preparing_ || detaching_)
+            return Error{ErrorCode::busy, "complete detach cleanup before editing target breakpoints"};
         if (breakpoint_rollback_)
             return Error{ErrorCode::busy, "recover breakpoint-step rollback before editing target breakpoints"};
         const auto hardware = std::find_if(hardware_breakpoints_.begin(), hardware_breakpoints_.end(),
@@ -1381,10 +1556,16 @@ public:
         }
         const auto found = ids_.find(id); if (found == ids_.end()) return Error{ErrorCode::invalid_argument, "unknown breakpoint id"};
         const auto address = found->second; const auto original = breakpoints_.at(address);
-        if (enabled_ids_.contains(id) && !patch(address, original)) return sys_error("restore breakpoint");
+        if (!std::all_of(tracked_.begin(), tracked_.end(), [&](pid_t thread) { return stopped_.contains(thread); }))
+            return Error{ErrorCode::busy, "software breakpoints can only be removed while every traced thread is stopped"};
+        const auto expected = enabled_ids_.contains(id) ? std::byte{0xcc} : original;
+        auto restored = replace_software_breakpoint_byte(address, expected, original);
+        if (!restored) return restored;
         breakpoints_.erase(address); ids_.erase(found); enabled_ids_.erase(id); return std::monostate{};
     }
     Status set_breakpoint_enabled(BreakpointId id, bool enabled) override {
+        if (detach_preparing_ || detaching_)
+            return Error{ErrorCode::busy, "complete detach cleanup before editing target breakpoints"};
         if (breakpoint_rollback_)
             return Error{ErrorCode::busy, "recover breakpoint-step rollback before editing target breakpoints"};
         const auto hardware = std::find_if(hardware_breakpoints_.begin(), hardware_breakpoints_.end(),
@@ -1406,8 +1587,10 @@ public:
         if (was_enabled == enabled) return std::monostate{};
         if (!std::all_of(tracked_.begin(), tracked_.end(), [&](pid_t thread) { return stopped_.contains(thread); }))
             return Error{ErrorCode::busy, "software breakpoints can only be changed while every traced thread is stopped"};
-        const auto byte = enabled ? std::byte{0xcc} : breakpoints_.at(found->second);
-        if (!patch(found->second, byte)) return sys_error(enabled ? "enable software breakpoint" : "disable software breakpoint");
+        const auto original = breakpoints_.at(found->second);
+        auto patched = replace_software_breakpoint_byte(found->second,
+            enabled ? original : std::byte{0xcc}, enabled ? std::byte{0xcc} : original);
+        if (!patched) return patched;
         if (enabled) enabled_ids_.insert(id); else enabled_ids_.erase(id);
         return std::monostate{};
     }
@@ -1464,7 +1647,8 @@ private:
     }
     void forget_thread(pid_t tid) {
         tracked_.erase(tid); stopped_.erase(tid); seized_.erase(tid);
-        interrupting_.erase(tid); deferred_stops_.erase(tid); initial_children_.erase(tid);
+        interrupting_.erase(tid); if (requested_thread_interrupt_ == tid) requested_thread_interrupt_.reset();
+        deferred_stops_.erase(tid); initial_children_.erase(tid);
         deferred_signals_.erase(tid); hardware_pending_children_.erase(tid); step_threads_.erase(tid);
     }
     int signal_from_stop(pid_t tid, int status) const {
@@ -1582,7 +1766,13 @@ private:
             return Error{ErrorCode::resource_limit, "cloned-thread limit exceeded; ownership retained for cleanup"};
         return finish_cloned_thread(child);
     }
-    struct DisplacedStep { pid_t thread; std::uint64_t address; bool continue_process; bool continue_thread = false; };
+    struct DisplacedStep {
+        pid_t thread;
+        std::uint64_t address;
+        bool continue_process;
+        bool continue_thread = false;
+        std::vector<std::pair<pid_t, int>> deferred_resumes;
+    };
     struct BreakpointRollback { pid_t thread; std::uint64_t address, instruction_pointer; };
     struct HardwareRecord { BreakpointId id; std::uint64_t address; BreakpointKind kind; std::uint8_t size; bool enabled = true; };
 
@@ -1631,7 +1821,7 @@ private:
                     else forget_thread(tid);
                     const bool internal = WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP &&
                         (static_cast<unsigned>(status) >> 16) == PTRACE_EVENT_STOP;
-                    if (!internal) defer_stop(tid, status);
+                    if (!internal || requested_thread_interrupt_ == tid) defer_stop(tid, status);
                     if (WIFSTOPPED(status) && (static_cast<unsigned>(status) >> 16) == PTRACE_EVENT_CLONE) {
                         auto child = track_cloned_thread(tid); if (!child) return child;
                     }
@@ -1700,11 +1890,13 @@ private:
         if (!stopped) { resume_blocked_ = true; return stopped; }
         if (breakpoint_rollback_) {
             const auto& rollback = *breakpoint_rollback_;
-            const bool trap_restored = patch(rollback.address, std::byte{0xcc});
+            auto trap_restored = rearm_software_breakpoint(rollback.address);
             auto ip_restored = set_instruction_pointer(rollback.thread, rollback.instruction_pointer);
             if (!trap_restored || !ip_restored) {
                 resume_blocked_ = true;
-                return Error{ErrorCode::unsupported, "breakpoint-step rollback is incomplete; refusing to resume target"};
+                return Error{!trap_restored ? trap_restored.error().code : ip_restored.error().code,
+                    "breakpoint-step rollback is incomplete; refusing to resume target: " +
+                    (!trap_restored ? trap_restored.error().message : ip_restored.error().message)};
             }
             breakpoint_rollback_.reset();
         }
@@ -1712,9 +1904,10 @@ private:
             const auto owner = std::find_if(ids_.begin(), ids_.end(), [&](const auto& item) {
                 return item.second == *breakpoint_rearm_ && enabled_ids_.contains(item.first);
             });
-            if (owner != ids_.end() && !patch(*breakpoint_rearm_, std::byte{0xcc})) {
+            auto rearmed = owner != ids_.end() ? rearm_software_breakpoint(*breakpoint_rearm_) : Status{std::monostate{}};
+            if (!rearmed) {
                 resume_blocked_ = true;
-                return Error{ErrorCode::unsupported, "breakpoint trap is not rearmed; refusing to resume target"};
+                return Error{rearmed.error().code, "breakpoint trap is not rearmed; refusing to resume target: " + rearmed.error().message};
             }
             breakpoint_rearm_.reset();
         }
@@ -1734,30 +1927,35 @@ private:
         // A client may explicitly change PC before continuing this stop.
         return ip.value() == bp->first || (bp->first != UINT64_MAX && ip.value() == bp->first + 1);
     }
-    Status begin_displaced_step(pid_t tid, bool continue_process, bool continue_thread = false) {
+    Status begin_displaced_step(pid_t tid, bool continue_process, bool continue_thread = false,
+                                std::vector<std::pair<pid_t, int>> deferred_resumes = {}) {
         if (displaced_step_) return Error{ErrorCode::busy, "a displaced breakpoint instruction is already running"};
         auto stopped = stop_all_threads();
         if (!stopped) { resume_blocked_ = true; return stopped; }
         const auto address = *pending_breakpoint_;
+        auto owned = replace_software_breakpoint_byte(address, std::byte{0xcc}, std::byte{0xcc});
+        if (!owned) return owned;
         auto original_ip = instruction_pointer(tid);
         if (!original_ip) return original_ip.error();
         breakpoint_rollback_ = BreakpointRollback{tid, address, original_ip.value()};
         auto restore = [&](Error error) -> Status {
-            const bool trap_restored = patch(address, std::byte{0xcc});
+            auto trap_restored = rearm_software_breakpoint(address);
             auto ip_restored = set_instruction_pointer(tid, original_ip.value());
             if (!trap_restored || !ip_restored) {
                 resume_blocked_ = true;
-                return Error{error.code, error.message + "; breakpoint-step rollback incomplete"};
+                return Error{error.code, error.message + "; breakpoint-step rollback incomplete: " +
+                    (!trap_restored ? trap_restored.error().message : ip_restored.error().message)};
             }
             breakpoint_rollback_.reset();
             return error;
         };
         auto moved = set_instruction_pointer(tid, address);
         if (!moved) return restore(moved.error());
-        if (!patch(address, breakpoints_.at(address))) return restore(sys_error("restore displaced breakpoint instruction"));
+        auto displaced = replace_software_breakpoint_byte(address, std::byte{0xcc}, breakpoints_.at(address));
+        if (!displaced) return restore(displaced.error());
         if (ptrace(PTRACE_SINGLESTEP, tid, nullptr, nullptr) != 0)
             return restore(sys_error("PTRACE_SINGLESTEP over software breakpoint"));
-        displaced_step_ = DisplacedStep{tid, address, continue_process, continue_thread};
+        displaced_step_ = DisplacedStep{tid, address, continue_process, continue_thread, std::move(deferred_resumes)};
         breakpoint_rollback_.reset();
         stopped_.erase(tid);
         pending_breakpoint_.reset(); pending_.reset(); pending_signal_ = 0;
@@ -1861,6 +2059,10 @@ private:
         }
     }
     std::uint64_t regs_address(pid_t tid) const {
+        if (architecture_ == Architecture::x86) {
+            auto regs = read_i386_registers(tid);
+            return regs ? regs.value().eip : 0;
+        }
         user_regs_struct regs{};
         return ptrace(PTRACE_GETREGS, tid, nullptr, &regs) == 0 ? regs.rip : 0;
     }
@@ -1868,8 +2070,9 @@ private:
                                       bool allow_unconfigured_thread = false) {
         detail::DebugRegisters desired;
         const auto requests = hardware_requests(records);
-        if (!detail::encode_hardware_breakpoints(requests, 8, desired))
-            return Error{ErrorCode::invalid_argument, "invalid x86-64 hardware breakpoint configuration"};
+        const auto pointer_size = architecture_ == Architecture::x86 ? std::uint8_t{4} : std::uint8_t{8};
+        if (!detail::encode_hardware_breakpoints(requests, pointer_size, desired))
+            return Error{ErrorCode::invalid_argument, "invalid x86 hardware breakpoint configuration"};
         std::array<unsigned long, 4> prior{};
         for (unsigned slot = 0; slot < 4; ++slot) {
             auto value = peek_debug_register(tid, slot);
@@ -1880,7 +2083,7 @@ private:
         if (!old_dr7) return old_dr7.error();
         if (old_dr7.value() != 0 && !hardware_breakpoints_.empty()) {
             detail::DebugRegisters expected;
-            (void)detail::encode_hardware_breakpoints(hardware_requests(hardware_breakpoints_), 8, expected);
+            (void)detail::encode_hardware_breakpoints(hardware_requests(hardware_breakpoints_), pointer_size, expected);
             if (old_dr7.value() != expected.dr7 || !std::equal(prior.begin(), prior.end(), expected.address.begin()))
                 return Error{ErrorCode::conflict, "thread already uses hardware breakpoint registers outside this debugger"};
         } else if (old_dr7.value() != 0) {
@@ -1984,10 +2187,37 @@ private:
         }
         return std::monostate{};
     }
-    bool patch(std::uint64_t address, std::byte value) {
-        return static_cast<bool>(write_memory_raw(address, std::span<const std::byte>(&value, 1)));
+    Status replace_software_breakpoint_byte(std::uint64_t address, std::byte expected,
+                                            std::byte replacement) {
+        auto current = read_memory_raw(address, 1);
+        if (!current) return current.error();
+        if (current.value().size() != 1 || current.value()[0] != expected)
+            return Error{ErrorCode::conflict,
+                         "software breakpoint byte changed outside this debugger; refusing to overwrite it"};
+        if (expected == replacement) return std::monostate{};
+        return write_memory_raw(address, std::span<const std::byte>(&replacement, 1));
     }
-    void clear() { pending_debugger_trap_ = false; pending_signal_ = 0; detach_signals_.clear(); initial_children_.clear(); hardware_pending_children_.clear(); startup_cleanup_ = false; startup_kill_ = false; detaching_ = false; detach_hardware_cleared_ = false; detach_preparing_ = false; terminating_ = false; pid_ = 0; architecture_ = Architecture::unknown; launched_ = false; exited_ = false; pending_.reset(); initial_event_.reset(); pending_breakpoint_.reset(); stopped_.clear(); tracked_.clear(); seized_.clear(); step_threads_.clear(); displaced_step_.reset(); breakpoint_rollback_.reset(); breakpoint_rearm_.reset(); deferred_stops_.clear(); deferred_signals_.clear(); interrupting_.clear(); resume_blocked_ = false; breakpoints_.clear(); ids_.clear(); enabled_ids_.clear(); hardware_breakpoints_.clear(); hardware_slots_.clear(); hardware_slot_ids_.clear(); }
+    Status rearm_software_breakpoint(std::uint64_t address) {
+        const auto original = breakpoints_.find(address);
+        if (original == breakpoints_.end())return Error{ErrorCode::conflict, "software breakpoint ownership disappeared during rearm"};
+        auto current = read_memory_raw(address, 1); if (!current) return current.error();
+        // A retry may observe the already rearmed trap. Only the exact saved
+        // original or trap is owned; self-modified bytes are never overwritten.
+        if (current.value()[0] == std::byte{0xcc}) return std::monostate{};
+        return replace_software_breakpoint_byte(address, original->second, std::byte{0xcc});
+    }
+    Result<std::byte> detach_breakpoint_byte(std::uint64_t address, bool enabled) {
+        const auto original = breakpoints_.at(address);
+        const bool restored = detach_restored_breakpoints_.contains(address) || !enabled;
+        const bool displaced = (displaced_step_ && displaced_step_->address == address) ||
+            (breakpoint_rollback_ && breakpoint_rollback_->address == address) || breakpoint_rearm_ == address;
+        auto current = read_memory_raw(address, 1); if (!current) return current.error();
+        if (current.value()[0] != (restored ? original : std::byte{0xcc}) &&
+            !(!restored && displaced && current.value()[0] == original))
+            return Error{ErrorCode::conflict, "software breakpoint byte changed outside this debugger; detach retains stopped target ownership"};
+        return current.value()[0];
+    }
+    void clear() { pending_debugger_trap_ = false; pending_signal_ = 0; pending_thread_interrupt_ = false; requested_thread_interrupt_.reset(); detach_signals_.clear(); detach_restored_breakpoints_.clear(); initial_children_.clear(); hardware_pending_children_.clear(); startup_cleanup_ = false; startup_kill_ = false; detaching_ = false; detach_hardware_cleared_ = false; detach_preparing_ = false; terminating_ = false; pid_ = 0; architecture_ = Architecture::unknown; launched_ = false; exited_ = false; pending_.reset(); initial_event_.reset(); pending_breakpoint_.reset(); stopped_.clear(); tracked_.clear(); seized_.clear(); step_threads_.clear(); displaced_step_.reset(); breakpoint_rollback_.reset(); breakpoint_rearm_.reset(); deferred_stops_.clear(); deferred_signals_.clear(); interrupting_.clear(); resume_blocked_ = false; breakpoints_.clear(); ids_.clear(); enabled_ids_.clear(); hardware_breakpoints_.clear(); hardware_slots_.clear(); hardware_slot_ids_.clear(); }
     pid_t pid_ = 0; bool launched_ = false; bool exited_ = false; std::uint64_t seq_ = 0; BreakpointId next_bp_ = 1;
     Architecture architecture_ = Architecture::unknown;
     unsigned last_signal_ = 0;
@@ -2001,7 +2231,9 @@ private:
     std::vector<HardwareRecord> hardware_breakpoints_;
     std::vector<detail::HardwareRequest> hardware_slots_;
     std::vector<BreakpointId> hardware_slot_ids_;
-    std::set<pid_t> stopped_, tracked_, seized_, step_threads_;
+    std::mutex wait_gate_mutex_; std::set<pid_t> stopped_, tracked_, seized_, step_threads_;
+    std::optional<pid_t> requested_thread_interrupt_;
+    bool pending_thread_interrupt_ = false;
     std::optional<DisplacedStep> displaced_step_;
     std::optional<BreakpointRollback> breakpoint_rollback_;
     std::optional<std::uint64_t> breakpoint_rearm_;
@@ -2015,6 +2247,7 @@ private:
     bool startup_cleanup_ = false, startup_kill_ = false, detaching_ = false, detach_hardware_cleared_ = false, event_polling_ = false, terminating_ = false, cleanup_wait_ = false, detach_preparing_ = false;
     std::set<pid_t> initial_children_, hardware_pending_children_;
     std::map<pid_t, int> detach_signals_;
+    std::set<std::uint64_t> detach_restored_breakpoints_;
 };
 }
 

@@ -22,6 +22,28 @@ std::uint64_t saturating_multiply(std::uint64_t a, std::uint64_t b) noexcept {
     return a && b > UINT64_MAX / a ? UINT64_MAX : a * b;
 }
 
+std::uint64_t semantic_alignment_key(const InstructionSemanticFeature &feature) noexcept {
+    // Fold all frontend-provided semantic fields into the key used for LCS
+    // alignment. The resulting diff still checks the full fields before it
+    // reports an instruction as equal, so a hash collision can only reduce
+    // alignment quality; it cannot hide a semantic change.
+    std::uint64_t state = UINT64_C(0x6a09e667f3bcc909);
+    const auto fold = [&](std::uint64_t value) {
+        value ^= value >> 30;
+        value *= UINT64_C(0xbf58476d1ce4e5b9);
+        value ^= value >> 27;
+        value *= UINT64_C(0x94d049bb133111eb);
+        value ^= value >> 31;
+        state ^= value + UINT64_C(0x9e3779b97f4a7c15) + (state << 6) + (state >> 2);
+    };
+    fold(feature.fingerprint);
+    fold(feature.opcode);
+    fold(feature.flow);
+    fold(feature.operand_signature);
+    fold(feature.effect_signature);
+    return state;
+}
+
 Result<FunctionInstructionDiff> diff_with_unique_anchors(
     std::span<const std::uint64_t> old_fingerprints,
     std::span<const std::uint64_t> new_fingerprints,
@@ -372,29 +394,99 @@ Result<FunctionInstructionDiff> diff_function_instructions_detailed(
         return Error{ErrorCode::invalid_argument, "old instruction semantic fingerprint mismatch"};
     for (std::size_t i=0;i<new_features.size();++i) if (new_features[i].fingerprint != new_fingerprints[i])
         return Error{ErrorCode::invalid_argument, "new instruction semantic fingerprint mismatch"};
-    auto result = diff_function_instructions(old_fingerprints, new_fingerprints, options);
+    if (!options.max_semantic_alignment_items || old_fingerprints.size() > options.max_semantic_alignment_items ||
+        new_fingerprints.size() > options.max_semantic_alignment_items - old_fingerprints.size())
+        return Error{ErrorCode::resource_limit, "instruction semantic alignment item budget exceeded"};
+    std::vector<std::uint64_t> old_alignment, new_alignment;
+    old_alignment.reserve(old_features.size());
+    new_alignment.reserve(new_features.size());
+    for (const auto &feature : old_features) old_alignment.push_back(semantic_alignment_key(feature));
+    for (const auto &feature : new_features) new_alignment.push_back(semantic_alignment_key(feature));
+    auto result = diff_function_instructions(std::span<const std::uint64_t>(old_alignment),
+                                             std::span<const std::uint64_t>(new_alignment), options);
     if (!result) return result.error();
     auto &diff = result.value();
     diff.semantic.available = true;
-    for (auto &run : diff.runs) {
-        if (run.kind != InstructionDiffKind::changed) continue;
-        run.semantic.available = true;
-        const auto paired = std::min(run.old_count, run.new_count);
-        for (std::uint64_t n=0;n<paired;++n) {
-            const auto &a=old_features[static_cast<std::size_t>(run.old_start+n)];
-            const auto &b=new_features[static_cast<std::size_t>(run.new_start+n)];
-            if (a.opcode != b.opcode) ++run.semantic.opcode_changes;
-            if (a.flow != b.flow) ++run.semantic.flow_changes;
-            if (a.operand_signature != b.operand_signature) ++run.semantic.operand_changes;
-            if (a.effect_signature != b.effect_signature) ++run.semantic.effect_changes;
-            if (a.opcode == b.opcode && a.flow == b.flow && a.operand_signature == b.operand_signature &&
-                a.effect_signature == b.effect_signature) ++run.semantic.unclassified_changes;
+    std::vector<InstructionDiffRun> refined_runs;
+    refined_runs.reserve(diff.runs.size());
+    const auto append_equal = [&](std::uint64_t old_start, std::uint64_t new_start) {
+        if (!refined_runs.empty() && refined_runs.back().kind == InstructionDiffKind::equal &&
+            refined_runs.back().old_start + refined_runs.back().old_count == old_start &&
+            refined_runs.back().new_start + refined_runs.back().new_count == new_start) {
+            ++refined_runs.back().old_count;
+            ++refined_runs.back().new_count;
+        } else {
+            refined_runs.push_back({InstructionDiffKind::equal, old_start, new_start, 1, 1});
         }
-        auto &sum=diff.semantic;
-        sum.opcode_changes+=run.semantic.opcode_changes; sum.flow_changes+=run.semantic.flow_changes;
-        sum.operand_changes+=run.semantic.operand_changes; sum.effect_changes+=run.semantic.effect_changes;
-        sum.unclassified_changes+=run.semantic.unclassified_changes;
+    };
+    const auto append_changed = [&](InstructionDiffRun change) {
+        if (!refined_runs.empty() && refined_runs.back().kind == InstructionDiffKind::changed &&
+            refined_runs.back().old_start + refined_runs.back().old_count == change.old_start &&
+            refined_runs.back().new_start + refined_runs.back().new_count == change.new_start) {
+            auto &previous = refined_runs.back();
+            previous.old_count += change.old_count;
+            previous.new_count += change.new_count;
+            previous.semantic.opcode_changes += change.semantic.opcode_changes;
+            previous.semantic.flow_changes += change.semantic.flow_changes;
+            previous.semantic.operand_changes += change.semantic.operand_changes;
+            previous.semantic.effect_changes += change.semantic.effect_changes;
+            previous.semantic.unclassified_changes += change.semantic.unclassified_changes;
+        } else {
+            refined_runs.push_back(std::move(change));
+        }
+    };
+    const auto classify_pair = [&](InstructionDiffRun &run, std::uint64_t old_index,
+                                   std::uint64_t new_index) {
+        const auto &a = old_features[static_cast<std::size_t>(old_index)];
+        const auto &b = new_features[static_cast<std::size_t>(new_index)];
+        if (a.opcode != b.opcode) ++run.semantic.opcode_changes;
+        if (a.flow != b.flow) ++run.semantic.flow_changes;
+        if (a.operand_signature != b.operand_signature) ++run.semantic.operand_changes;
+        if (a.effect_signature != b.effect_signature) ++run.semantic.effect_changes;
+        if (a.opcode == b.opcode && a.flow == b.flow && a.operand_signature == b.operand_signature &&
+            a.effect_signature == b.effect_signature) ++run.semantic.unclassified_changes;
+    };
+    for (auto &run : diff.runs) {
+        if (run.kind == InstructionDiffKind::equal) {
+            for (std::uint64_t n = 0; n < run.old_count; ++n) {
+                const auto old_index = run.old_start + n, new_index = run.new_start + n;
+                const auto &a = old_features[static_cast<std::size_t>(old_index)];
+                const auto &b = new_features[static_cast<std::size_t>(new_index)];
+                const bool same_semantics = a.opcode == b.opcode && a.flow == b.flow &&
+                    a.operand_signature == b.operand_signature && a.effect_signature == b.effect_signature;
+                if (same_semantics) {
+                    append_equal(old_index, new_index);
+                    continue;
+                }
+                InstructionDiffRun semantic_change{InstructionDiffKind::changed, old_index, new_index, 1, 1};
+                semantic_change.semantic.available = true;
+                classify_pair(semantic_change, old_index, new_index);
+                --diff.equal_instructions;
+                ++diff.changed_instructions;
+                diff.semantic.opcode_changes += semantic_change.semantic.opcode_changes;
+                diff.semantic.flow_changes += semantic_change.semantic.flow_changes;
+                diff.semantic.operand_changes += semantic_change.semantic.operand_changes;
+                diff.semantic.effect_changes += semantic_change.semantic.effect_changes;
+                diff.semantic.unclassified_changes += semantic_change.semantic.unclassified_changes;
+                append_changed(std::move(semantic_change));
+            }
+            continue;
+        }
+        if (run.kind == InstructionDiffKind::changed) {
+            run.semantic.available = true;
+            const auto paired = std::min(run.old_count, run.new_count);
+            for (std::uint64_t n = 0; n < paired; ++n)
+                classify_pair(run, run.old_start + n, run.new_start + n);
+            diff.semantic.opcode_changes += run.semantic.opcode_changes;
+            diff.semantic.flow_changes += run.semantic.flow_changes;
+            diff.semantic.operand_changes += run.semantic.operand_changes;
+            diff.semantic.effect_changes += run.semantic.effect_changes;
+            diff.semantic.unclassified_changes += run.semantic.unclassified_changes;
+        }
+        if (run.kind == InstructionDiffKind::changed) append_changed(std::move(run));
+        else refined_runs.push_back(std::move(run));
     }
+    diff.runs = std::move(refined_runs);
     return result;
 }
 } // namespace hexlab::compare

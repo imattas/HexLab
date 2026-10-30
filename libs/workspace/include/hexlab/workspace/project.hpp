@@ -73,6 +73,8 @@ class ProjectSession {
     persist_breakpoint_hit_counts(std::span<const database::BreakpointHitCount>,std::stop_token);
     HEXLAB_WORKSPACE_EXPORT Result<std::shared_ptr<const ProjectSnapshot>>
     replace_type_import_diagnostics(std::span<const database::TypeImportDiagnostic>,std::stop_token);
+    HEXLAB_WORKSPACE_EXPORT Result<std::shared_ptr<const ProjectSnapshot>> upsert_decompiler_diagnostics(const AnalysisKey&,Address,std::span<const database::TypeImportDiagnostic>,std::stop_token);
+    HEXLAB_WORKSPACE_EXPORT Result<std::shared_ptr<const ProjectSnapshot>> replace_reviewed_analysis_issue_keys(std::span<const std::string>,std::stop_token);
     HEXLAB_WORKSPACE_EXPORT Result<std::shared_ptr<const ProjectSnapshot>> refresh_analysis(std::stop_token);
     HEXLAB_WORKSPACE_EXPORT Result<std::shared_ptr<const ProjectSnapshot>> adopt_analysis(const ProjectAnalysis &,
                                                                                           std::stop_token);

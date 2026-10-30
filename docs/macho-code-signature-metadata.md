@@ -14,10 +14,16 @@ uninterpreted rows and make protection metadata incomplete. Signature payloads
 larger than 16 MiB are retained as declarations only. Parsed bytes and rows
 count against the loader's 64 MiB metadata budget.
 
-This is structural metadata only. HexLab does not compute CodeDirectory
-hashes, verify CMS/signature blobs, validate entitlements or requirements, or
-establish signer identity or trust. Newer CodeDirectory extensions such as
-64-bit code limits are not interpreted; the displayed limit is the legacy
-32-bit field. Malformed SuperBlob/index/blob extents are rejected by the
-loader, while unsupported blob kinds are retained and mark the metadata
-incomplete.
+The read-only `verify_macho_code_directory_hashes` API and CLI verify code-page
+hashes for CodeDirectory SHA-256 (type 2) and truncated SHA-256 (type 3). The
+verifier checks the code-limit/page-size slot count, bounded hash-array extent,
+selected-slice extent, and each page hash. CLI work is capped at 256 MiB and
+eight CodeDirectory blobs per image, with at most 16 mismatch slots displayed
+per blob.
+
+This does not verify CMS/signature blobs, validate entitlements or
+requirements, or establish signer identity or trust. SHA-1/SHA-384 and newer
+CodeDirectory extensions such as 64-bit code limits are not interpreted; the
+displayed limit is the legacy 32-bit field. Malformed SuperBlob/index/blob
+extents are rejected by the loader, while unsupported blob kinds are retained
+and mark the metadata incomplete.

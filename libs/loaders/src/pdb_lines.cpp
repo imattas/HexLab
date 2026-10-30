@@ -1,6 +1,8 @@
 #include "hexlab/loaders/pdb_lines.hpp"
+#include "hexlab/core/sha256.hpp"
 #include "hexlab/image/file_storage.hpp"
 #include <algorithm>
+#include <cctype>
 #include <limits>
 #include <map>
 #include <set>
@@ -16,7 +18,7 @@ Result<std::size_t> attach_pdb_source_lines(LoadedImage &image,
     const PeCodeViewIdentity *match = nullptr;
     std::size_t matches = 0;
     for (const auto &identity : identities) {
-        if (identity.guid == pdb.info.guid && identity.age == pdb.info.age) {
+        if (identity.rsds && identity.guid == pdb.info.guid && identity.age == pdb.info.age) {
             match = &identity;
             ++matches;
         }
@@ -80,7 +82,7 @@ Result<std::size_t> attach_pdb_locals(LoadedImage &image, const types::PdbDataba
         return Error{ErrorCode::unsupported, "PDB locals require a loaded PE image"};
     std::size_t matches = 0;
     for (const auto &identity : image.metadata.pe->codeview)
-        if (identity.guid == pdb.info.guid && identity.age == pdb.info.age) ++matches;
+        if (identity.rsds && identity.guid == pdb.info.guid && identity.age == pdb.info.age) ++matches;
     if (matches != 1) return std::size_t{0};
     const auto base = image.load_base.value_or(image.metadata.preferred_base);
     const auto &sections = image.metadata.sections;
@@ -143,7 +145,7 @@ Result<std::size_t> attach_pdb_inline_sites(LoadedImage &image, const types::Pdb
         return Error{ErrorCode::unsupported, "PDB inline sites require a loaded PE image"};
     std::size_t matches = 0;
     for (const auto &identity : image.metadata.pe->codeview)
-        if (identity.guid == pdb.info.guid && identity.age == pdb.info.age) ++matches;
+        if (identity.rsds && identity.guid == pdb.info.guid && identity.age == pdb.info.age) ++matches;
     if (matches != 1) return std::size_t{0};
     using Key = std::pair<std::uint16_t, std::uint32_t>;
     std::map<Key, const types::PdbInlineeLine *> inlinees;
@@ -259,6 +261,7 @@ Result<bool> bind_local_pe_pdb(LoadedImage &image, const std::filesystem::path &
         return std::string(reinterpret_cast<const char *>(value.data()), value.size());
     }();
     pe.pdb_status = PePdbStatus::malformed;
+    pe.pdb_checksum_verified.reset();
     pe.pdb_symbols.clear(); pe.pdb_types.clear(); pe.pdb_locals.clear(); pe.source_lines.clear();
     pe.pdb_inline_sites.clear();
     auto file = FileStorage::open(path);
@@ -275,6 +278,36 @@ Result<bool> bind_local_pe_pdb(LoadedImage &image, const std::filesystem::path &
     if (stop.stop_requested()) return Error{ErrorCode::canceled, "PDB binding canceled"};
     auto view = file.value()->read_at({0}, static_cast<std::size_t>(file.value()->size()));
     if (!view) { pe.pdb_status = PePdbStatus::malformed; return false; }
+    Sha256 external_hasher;
+    auto external_hash = external_hasher.update(view.value().bytes);
+    if (!external_hash) { pe.pdb_status = PePdbStatus::malformed; return false; }
+    image.external_input_fingerprint = external_hasher.digest();
+    std::vector<const PePdbChecksum *> sha256_checksums;
+    for (const auto &checksum : pe.pdb_checksums) {
+        std::string algorithm = checksum.algorithm;
+        std::transform(algorithm.begin(), algorithm.end(), algorithm.begin(),
+                       [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+        if (algorithm != "sha256")
+            continue;
+        sha256_checksums.push_back(&checksum);
+    }
+    if (!sha256_checksums.empty()) {
+        Sha256 hasher;
+        auto hashed = hasher.update(view.value().bytes);
+        if (!hashed) { pe.pdb_status = PePdbStatus::malformed; return false; }
+        const auto pdb_digest = hasher.digest();
+        for (const auto *checksum : sha256_checksums) {
+            if (checksum->digest.size() != pdb_digest.size() ||
+                !std::equal(checksum->digest.begin(), checksum->digest.end(), pdb_digest.begin())) {
+                pe.pdb_checksum_verified = false;
+                pe.pdb_status = PePdbStatus::mismatch;
+                image.diagnostics.push_back({DiagnosticSeverity::warning,
+                    "Local PDB SHA256 does not match the PE PDB checksum record", {}});
+                return false;
+            }
+        }
+        pe.pdb_checksum_verified = true;
+    }
     auto database = types::parse_pdb(view.value().bytes, stop);
     if (!database) {
         if (database.error().code == ErrorCode::canceled) return database.error();
@@ -284,7 +317,7 @@ Result<bool> bind_local_pe_pdb(LoadedImage &image, const std::filesystem::path &
     }
     std::size_t matches = 0;
     for (const auto &identity : pe.codeview)
-        if (identity.guid == database.value().info.guid && identity.age == database.value().info.age) ++matches;
+        if (identity.rsds && identity.guid == database.value().info.guid && identity.age == database.value().info.age) ++matches;
     if (matches != 1) {
         pe.pdb_status = PePdbStatus::mismatch;
         image.diagnostics.push_back({DiagnosticSeverity::warning,
@@ -424,5 +457,187 @@ Result<bool> bind_local_pe_pdb(LoadedImage &image, const std::filesystem::path &
     }
     pe.pdb_status = PePdbStatus::matched;
     return true;
+}
+
+Result<std::size_t> bind_local_minidump_pdbs(
+    LoadedImage &image, std::span<const MinidumpPdbCandidate> candidates, std::stop_token stop) {
+    if (!image.metadata.minidump)
+        return Error{ErrorCode::unsupported, "Minidump PDB binding requires Minidump metadata"};
+    constexpr std::size_t max_candidate_rows = 256, max_unique_candidates = 128;
+    constexpr std::uint64_t max_total_pdb_bytes = 512ull * 1024 * 1024;
+    constexpr std::size_t max_retained_symbols = 100'000;
+    constexpr std::uint64_t max_retained_symbol_bytes = 48ull * 1024 * 1024;
+    if (candidates.size() > max_candidate_rows)
+        return Error{ErrorCode::resource_limit, "Minidump PDB candidate count exceeds 256"};
+
+    auto &dump = *image.metadata.minidump;
+    struct CandidatePath {
+        std::filesystem::path path;
+        std::string key, utf8;
+        std::vector<std::uint32_t> intended_modules;
+        bool global = false;
+    };
+    std::vector<CandidatePath> unique;
+    unique.reserve(std::min(candidates.size(), max_unique_candidates));
+    std::vector<bool> had_candidate(dump.modules.size(), false);
+    std::vector<bool> had_malformed(dump.modules.size(), false);
+    std::vector<bool> had_mismatch(dump.modules.size(), false);
+    for (auto &module : dump.modules) {
+        module.pdb_status = module.codeview_kind == "RSDS"
+            ? MinidumpPdbStatus::unavailable : module.codeview_kind.empty()
+                ? MinidumpPdbStatus::unavailable : MinidumpPdbStatus::unsupported_identity;
+        module.bound_pdb_path.clear(); module.pdb_diagnostic.clear();
+        module.pdb_symbol_count = 0; module.pdb_symbols_complete = false; module.pdb_symbols.clear();
+    }
+    for (const auto &candidate : candidates) {
+        if (stop.stop_requested()) return Error{ErrorCode::canceled, "Minidump PDB binding canceled"};
+        if (candidate.path.empty() || candidate.path.native().find(std::filesystem::path::value_type{}) != candidate.path.native().npos)
+            return Error{ErrorCode::invalid_argument, "Minidump PDB candidate path is invalid"};
+        if (candidate.module_index && *candidate.module_index >= dump.modules.size())
+            return Error{ErrorCode::invalid_argument, "Minidump PDB candidate names an absent module"};
+        const auto normalized = candidate.path.lexically_normal();
+        const auto encoded = normalized.u8string();
+        if (encoded.empty() || encoded.size() > 32768)
+            return Error{ErrorCode::resource_limit, "Minidump PDB candidate path exceeds 32 KiB"};
+        const std::string utf8_path(reinterpret_cast<const char *>(encoded.data()), encoded.size());
+        auto found = std::find_if(unique.begin(), unique.end(), [&](const auto &row) { return row.key == utf8_path; });
+        if (found == unique.end()) {
+            if (unique.size() >= max_unique_candidates)
+                return Error{ErrorCode::resource_limit, "Minidump PDB path count exceeds 128"};
+            unique.push_back({normalized, utf8_path, utf8_path, {}, !candidate.module_index});
+            found = std::prev(unique.end());
+        } else if (!candidate.module_index) found->global = true;
+        if (candidate.module_index) {
+            auto &module = dump.modules[*candidate.module_index];
+            if (module.codeview_kind == "RSDS") had_candidate[*candidate.module_index] = true;
+            if (std::find(found->intended_modules.begin(), found->intended_modules.end(), *candidate.module_index) ==
+                found->intended_modules.end()) found->intended_modules.push_back(*candidate.module_index);
+        } else {
+            for (std::size_t index = 0; index < dump.modules.size(); ++index)
+                if (dump.modules[index].codeview_kind == "RSDS") had_candidate[index] = true;
+        }
+    }
+    Sha256 fingerprint;
+    constexpr std::array<std::byte, 8> domain = {
+        std::byte{'H'}, std::byte{'L'}, std::byte{'M'}, std::byte{'D'},
+        std::byte{'P'}, std::byte{'D'}, std::byte{'B'}, std::byte{1}};
+    auto fingerprint_result = fingerprint.update(domain);
+    if (!fingerprint_result) return fingerprint_result.error();
+    std::uint64_t input_bytes = 0, retained_symbol_bytes = 0;
+    std::size_t retained_symbols = 0, bound_modules = 0;
+    for (const auto &candidate : unique) {
+        if (stop.stop_requested()) return Error{ErrorCode::canceled, "Minidump PDB binding canceled"};
+        auto mark_candidate_modules = [&](MinidumpPdbStatus status, const std::string &diagnostic) {
+            auto mark = [&](std::size_t index) {
+                if (index >= dump.modules.size() || dump.modules[index].codeview_kind != "RSDS" ||
+                    dump.modules[index].pdb_status == MinidumpPdbStatus::matched) return;
+                if (status == MinidumpPdbStatus::malformed) had_malformed[index] = true;
+                if (status == MinidumpPdbStatus::mismatch) had_mismatch[index] = true;
+                dump.modules[index].pdb_diagnostic = diagnostic;
+            };
+            if (candidate.global) {
+                for (std::size_t index = 0; index < dump.modules.size(); ++index) mark(index);
+            } else for (const auto index : candidate.intended_modules) mark(index);
+        };
+        auto storage = FileStorage::open(candidate.path);
+        if (!storage) {
+            mark_candidate_modules(MinidumpPdbStatus::missing, "PDB sidecar was not found or could not be opened");
+            continue;
+        }
+        const auto size = storage.value()->size();
+        if (!size || size > max_total_pdb_bytes || input_bytes > max_total_pdb_bytes - size) {
+            mark_candidate_modules(MinidumpPdbStatus::malformed, "PDB sidecar exceeds the 512 MiB cumulative input limit");
+            continue;
+        }
+        input_bytes += size;
+        auto view = storage.value()->read_at({0}, static_cast<std::size_t>(size));
+        if (!view) {
+            mark_candidate_modules(MinidumpPdbStatus::malformed, "PDB sidecar could not be read completely");
+            continue;
+        }
+        const std::array<std::byte, 1> path_tag{std::byte{1}};
+        auto hash_path = fingerprint.update(path_tag);
+        if (!hash_path) return hash_path.error();
+        const auto path_bytes = std::as_bytes(std::span(candidate.utf8.data(), candidate.utf8.size()));
+        hash_path = fingerprint.update(path_bytes);
+        if (!hash_path) return hash_path.error();
+        const std::array<std::byte, 1> file_tag{std::byte{2}};
+        hash_path = fingerprint.update(file_tag);
+        if (!hash_path) return hash_path.error();
+        hash_path = fingerprint.update(view.value().bytes);
+        if (!hash_path) return hash_path.error();
+        auto database = types::parse_pdb(view.value().bytes, stop);
+        if (!database) {
+            if (database.error().code == ErrorCode::canceled) return database.error();
+            mark_candidate_modules(MinidumpPdbStatus::malformed, "PDB sidecar could not be parsed: " + database.error().message);
+            continue;
+        }
+        std::vector<std::size_t> matches;
+        const auto matches_module = [&](std::size_t index) {
+            if (index >= dump.modules.size()) return false;
+            const auto &module = dump.modules[index];
+            return module.codeview_kind == "RSDS" && module.pdb_guid == database.value().info.guid &&
+                module.pdb_age == database.value().info.age;
+        };
+        if (candidate.global) {
+            for (std::size_t index = 0; index < dump.modules.size(); ++index)
+                if (matches_module(index)) matches.push_back(index);
+        } else {
+            for (const auto index : candidate.intended_modules)
+                if (matches_module(index)) matches.push_back(index);
+        }
+        if (matches.empty()) {
+            mark_candidate_modules(MinidumpPdbStatus::mismatch, "PDB GUID+age does not match any RSDS module identity");
+            continue;
+        }
+        auto symbols = types::parse_pdb_symbols(database.value(), stop);
+        if (!symbols && symbols.error().code == ErrorCode::canceled) return symbols.error();
+        if (!symbols) {
+            for (const auto index : matches) {
+                auto &module = dump.modules[index];
+                if (module.pdb_status == MinidumpPdbStatus::matched) continue;
+                module.pdb_status = MinidumpPdbStatus::matched;
+                module.bound_pdb_path = candidate.utf8;
+                module.pdb_diagnostic = "PDB identity matched, but DBI symbols are unavailable: " + symbols.error().message;
+                ++bound_modules;
+            }
+            continue;
+        }
+        for (const auto index : matches) {
+            auto &module = dump.modules[index];
+            if (module.pdb_status == MinidumpPdbStatus::matched) continue;
+            module.pdb_status = MinidumpPdbStatus::matched;
+            module.bound_pdb_path = candidate.utf8;
+            module.pdb_symbol_count = static_cast<std::uint32_t>(std::min<std::size_t>(symbols.value().symbols.size(), UINT32_MAX));
+            module.pdb_symbols_complete = true;
+            module.pdb_symbols.reserve(std::min(symbols.value().symbols.size(), max_retained_symbols));
+            for (const auto &symbol : symbols.value().symbols) {
+                const auto cost = sizeof(MinidumpPdbSymbol) + symbol.name.size() + symbol.module_name.size() + symbol.object_name.size();
+                if (retained_symbols >= max_retained_symbols || cost > max_retained_symbol_bytes - retained_symbol_bytes) {
+                    module.pdb_symbols_complete = false;
+                    continue;
+                }
+                retained_symbol_bytes += cost;
+                ++retained_symbols;
+                module.pdb_symbols.push_back({symbol.name, symbol.module_name, symbol.object_name,
+                    symbol.section, symbol.module_index, symbol.record_kind, symbol.section_offset,
+                    symbol.size, symbol.record_offset, symbol.kind == types::PdbSymbolKind::procedure,
+                    symbol.public_symbol});
+            }
+            ++bound_modules;
+        }
+    }
+    for (std::size_t index = 0; index < dump.modules.size(); ++index) {
+        auto &module = dump.modules[index];
+        if (module.pdb_status == MinidumpPdbStatus::matched || module.pdb_status == MinidumpPdbStatus::ambiguous ||
+            module.codeview_kind != "RSDS" || !had_candidate[index]) continue;
+        module.pdb_status = had_malformed[index] ? MinidumpPdbStatus::malformed :
+            had_mismatch[index] ? MinidumpPdbStatus::mismatch : MinidumpPdbStatus::missing;
+    }
+    if (input_bytes) {
+        image.external_input_fingerprint = fingerprint.digest();
+        image.metadata_reads_complete = false;
+    }
+    return bound_modules;
 }
 } // namespace hexlab

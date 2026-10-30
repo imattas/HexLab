@@ -133,6 +133,7 @@ Result<LoadedImage> macho_detail::load_macho_bound(std::shared_ptr<const ByteSto
             loaded.image = take(Image::create(storage, std::move(protected_layout)));
         read_symbols(*tracking, *loaded.image, metadata, budget, stop);
         read_commands(*tracking, *loaded.image, metadata, budget, stop);
+        read_indirect_symbol_bindings(metadata, budget, stop);
         read_relocations(*tracking, *loaded.image, metadata, budget, stop);
         read_dyld(*tracking, *loaded.image, metadata, budget, stop);
         if (!metadata.entries_conflict) {

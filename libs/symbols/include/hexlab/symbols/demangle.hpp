@@ -32,4 +32,14 @@ struct DemangleLimits {
 HEXLAB_SYMBOLS_EXPORT DemangleResult demangle_cpp_name(std::string_view raw,
                                                         DemangleLimits limits = {});
 
+// Conservative presentation support for Rust's v0 symbol format. This is a
+// separate entry point because v0 names are not C++ ABI spellings.
+HEXLAB_SYMBOLS_EXPORT DemangleResult demangle_rust_v0_name(std::string_view raw,
+                                                            DemangleLimits limits = {});
+
+// Dispatches supported Rust v0 names to the Rust parser and other names to the
+// existing C++ ABI parser.
+HEXLAB_SYMBOLS_EXPORT DemangleResult demangle_symbol_name(std::string_view raw,
+                                                           DemangleLimits limits = {});
+
 } // namespace hexlab::symbols

@@ -29,8 +29,8 @@ struct PdbDatabase {
     std::map<std::string, std::uint32_t> named_streams;
 };
 
-enum class CodeViewTypeKind : std::uint8_t { primitive, pointer, array, structure, class_type, union_type, enumeration, field_list, typedef_type, modifier, bitfield, type_server, unsupported, procedure, argument_list, method_list, member_function, vftable_shape, vftable, vector };
-struct CodeViewField { std::uint16_t leaf = 0; std::uint32_t type = 0; std::uint16_t attributes = 0; std::uint64_t offset = 0; std::string name; std::uint64_t value = 0; std::uint32_t auxiliary_type = 0; };
+enum class CodeViewTypeKind : std::uint8_t { primitive, pointer, array, strided_array, structure, class_type, union_type, enumeration, field_list, typedef_type, modifier, bitfield, type_server, unsupported, procedure, argument_list, method_list, member_function, vftable_shape, vftable, vector };
+struct CodeViewField { std::uint16_t leaf = 0; std::uint32_t type = 0; std::uint16_t attributes = 0; std::uint64_t offset = 0; std::string name; std::uint64_t value = 0; std::uint32_t auxiliary_type = 0; std::uint32_t record_offset = 0; };
 struct CodeViewTypeRecord {
     std::uint32_t index = 0;
     std::uint16_t leaf = 0;
@@ -43,6 +43,7 @@ struct CodeViewTypeRecord {
     std::uint32_t vtable_shape = 0;
     std::uint32_t underlying_type = 0;
     std::uint64_t size = 0; // Aggregate/array extent or LF_POINTER byte size.
+    std::uint64_t array_stride = 0; // LF_STRIDED_ARRAY byte distance between adjacent elements.
     std::uint32_t element_count = 0; // LF_VECTOR lane count.
     std::uint8_t pointer_kind = 0; // CodeView CV_ptrtype_e value.
     std::uint8_t pointer_mode = 0; // CodeView CV_ptrmode_e value.

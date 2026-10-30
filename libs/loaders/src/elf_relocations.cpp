@@ -202,9 +202,23 @@ Field field(const ElfHeader &header, std::uint32_t type) {
         default: break;
         }
     }
+    if (header.machine == 20 && !header.is_64) {
+        switch (type) {
+        case 1: return {K::absolute, 4}; // R_PPC_ADDR32
+        case 20: return {K::global_data, 4}; // R_PPC_GLOB_DAT
+        case 22: return {K::base_relative, 4}; // R_PPC_RELATIVE
+        default: break;
+        }
+    }
     if (header.machine == 22 && header.is_64) {
         switch (type) {
+        case 1: return {K::absolute, 1}; // R_390_8
+        case 3: return {K::absolute, 2}; // R_390_16
+        case 4: return {K::absolute, 4}; // R_390_32
         case 5: return {K::pc_relative, 4}; // R_390_PC32
+        case 16: return {K::pc_relative, 2}; // R_390_PC16
+        case 17: return {K::pc_relative, 2}; // R_390_PC16DBL
+        case 19: return {K::pc_relative, 4}; // R_390_PC32DBL
         case 10: return {K::global_data, 8}; // R_390_GLOB_DAT
         case 11: return {K::jump_slot, 8}; // R_390_JMP_SLOT
         case 12: return {K::base_relative, 8}; // R_390_RELATIVE
@@ -220,6 +234,7 @@ Field field(const ElfHeader &header, std::uint32_t type) {
             break;
         case 3: return {K::base_relative, word}; // R_RISCV_RELATIVE
         case 4: return {K::copy, {}}; // R_RISCV_COPY
+        case 57: return {K::pc_relative, 4}; // R_RISCV_32_PCREL
         case 5: return {K::jump_slot, word}; // R_RISCV_JUMP_SLOT
         case 6: case 8: case 10: return {K::tls, 4};
         case 7: case 9: case 11: return {K::tls, 8};
@@ -227,6 +242,11 @@ Field field(const ElfHeader &header, std::uint32_t type) {
         case 58: return {K::ifunc, word}; // R_RISCV_IRELATIVE
         default: break;
         }
+    }
+    if (header.machine == 8) {
+        // MIPS32 R_MIPS_REL32 uses S + A for symbol relocations. The dynamic
+        // loader's symbol-index-zero case is handled as B + A at application.
+        if (!header.is_64 && type == 3) return {K::absolute, 4};
     }
     return {K::unknown, {}};
 }
@@ -432,7 +452,8 @@ std::uint64_t read_relocation_table(const Reader &reader, const Image &image, El
         if (packed_rel)
             metadata.relocations_complete = false;
         map_place(row, target, image, reader, !input.rela && !retained && !packed_rel,
-                  metadata.header.machine == 40);
+                  metadata.header.machine == 40 ||
+                      (metadata.header.machine == 20 && !metadata.header.is_64));
         const RelocationRegistry::RowKey key{record_file, minimum, source_key(unused ? std::nullopt : row.symbol_table),
                                              metadata.header.object_type == 1 ? input.target : std::nullopt};
         if (const auto found = registry.rows.find(key); found != registry.rows.end()) {

@@ -2,6 +2,8 @@
 #include "hexlab/loaders/loaded_image.hpp"
 #include "hexlab/types/pdb.hpp"
 #include <filesystem>
+#include <optional>
+#include <span>
 
 namespace hexlab {
 // Import C13 rows from an explicitly supplied PDB into a PE image. Rows are
@@ -24,4 +26,14 @@ HEXLAB_LOADERS_EXPORT Result<std::size_t> attach_pdb_inline_sites(
 // state in PE metadata. Never performs network access.
 HEXLAB_LOADERS_EXPORT Result<bool> bind_local_pe_pdb(LoadedImage &, const std::filesystem::path &,
                                                     std::stop_token = {});
+struct MinidumpPdbCandidate {
+    // Null means a caller-supplied path intended for any matching module.
+    std::optional<std::uint32_t> module_index;
+    std::filesystem::path path;
+};
+// Binds bounded local PDB candidates to Minidump modules by an unambiguous
+// exact RSDS GUID+age match. Symbol addresses remain section-relative because
+// a Minidump module record does not carry the original PE section table.
+HEXLAB_LOADERS_EXPORT Result<std::size_t> bind_local_minidump_pdbs(
+    LoadedImage &, std::span<const MinidumpPdbCandidate>, std::stop_token = {});
 }

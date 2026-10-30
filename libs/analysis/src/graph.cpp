@@ -16,8 +16,16 @@ std::string safe_text(std::string_view value,std::size_t budget){
         if(valid){if(out.size()+n>budget)break;out.append(value.substr(i,n));i+=n;}else{if(out.size()+4>budget)break;constexpr char digits[]="0123456789abcdef";out+="\\x";out+=digits[c>>4];out+=digits[c&15];++i;}}
     return out;
 }
-std::string external_text(const ExternalIdentity& value){return safe_text(value.library)+"!"+(value.name?safe_text(*value.name):"#"+std::to_string(value.ordinal.value_or(0)));}
-std::string external_identity_key(const ExternalIdentity& value){Hash h;h.text(value.library);h.number(value.name.has_value());if(value.name)h.text(*value.name);h.number(value.ordinal.has_value());if(value.ordinal)h.number(*value.ordinal);auto d=h.hash.digest();return std::string(reinterpret_cast<const char*>(d.data()),d.size());}
+std::string external_text(const ExternalIdentity& value){
+    if (value.wasm_function_index) {
+        std::string text="wasm:"+safe_text(value.library)+"!"+(value.name?safe_text(*value.name):"<missing-name>");
+        text+=" [function index "+std::to_string(*value.wasm_function_index);
+        if(value.host_binding)text+=", host-binding "+safe_text(*value.host_binding);
+        return text+"]";
+    }
+    return safe_text(value.library)+"!"+(value.name?safe_text(*value.name):"#"+std::to_string(value.ordinal.value_or(0)));
+}
+std::string external_identity_key(const ExternalIdentity& value){Hash h;h.text(value.library);h.number(value.name.has_value());if(value.name)h.text(*value.name);h.number(value.ordinal.has_value());if(value.ordinal)h.number(*value.ordinal);h.number(value.wasm_function_index.has_value());if(value.wasm_function_index)h.number(*value.wasm_function_index);h.number(value.host_binding.has_value());if(value.host_binding)h.text(*value.host_binding);auto d=h.hash.digest();return std::string(reinterpret_cast<const char*>(d.data()),d.size());}
 void validate_options(const GraphOptions& o){require(o.node_budget<=1000000 && o.edge_budget<=4000000 && o.preview_lines<=1024 && o.call_depth>=1 && o.call_depth<=4,"Graph budget exceeds supported limits");for(double v:{o.node_width,o.line_height,o.rank_gap,o.node_gap,o.edge_gap})require(std::isfinite(v) && v>0 && v<=1000000,"Graph spacing must be positive and finite");}
 void validate_model(const GraphModel& model,std::stop_token stop){
     require(model.nodes.size()<=1000000 && model.edges.size()<=4000000,"Graph model exceeds supported limits");
@@ -27,7 +35,7 @@ void validate_model(const GraphModel& model,std::stop_token stop){
 }
 Sha256Digest fingerprint(const GraphModel& m,std::stop_token stop){
     Hash h;h.text("HexLab graph v1");h.number(static_cast<unsigned>(m.kind));h.number(m.function.has_value());if(m.function)h.number(m.function->value);h.number(m.complete);h.number(m.omitted_nodes);h.number(m.omitted_edges);h.number(m.presentation_revision);
-    h.number(m.source_key.has_value());if(m.source_key){auto& k=*m.source_key;h.number(k.input.size);h.bytes(k.input.sha256);h.number(k.byte_revision);h.number(k.decision_revision);h.bytes(k.recipe_fingerprint);h.bytes(k.engine_fingerprint);}
+    h.number(m.source_key.has_value());if(m.source_key){auto& k=*m.source_key;h.number(k.input.size);h.bytes(k.input.sha256);h.number(k.byte_revision);h.number(k.decision_revision);h.bytes(k.recipe_fingerprint);h.bytes(k.engine_fingerprint);h.number(k.external_input_fingerprint.has_value());if(k.external_input_fingerprint)h.bytes(*k.external_input_fingerprint);}
     std::vector<const GraphNode*> ns;for(auto& n:m.nodes)ns.push_back(&n);std::sort(ns.begin(),ns.end(),[](auto a,auto b){return a->id<b->id;});h.number(ns.size());for(auto n:ns){canceled(stop);h.number(n->id.value);h.number(static_cast<unsigned>(n->kind));h.text(n->label);h.text(n->comment);h.real(n->width);h.real(n->height);h.number(n->preview_lines);h.number(n->omitted_comment_bytes);h.number(n->selection.has_value());if(n->selection)h.location(*n->selection);h.number(n->external.has_value());if(n->external)h.text(external_identity_key(*n->external));h.number(n->block? n->block->id.value:0);h.number(n->function?n->function->id.value:0);if(n->block){h.number(n->block->instructions.size());for(auto& fact:n->block->instructions){canceled(stop);require(bool(fact) && fact->instruction.length==fact->instruction.encoded_bytes().size(),"Invalid instruction fact in graph");h.number(fact->id);h.location(fact->instruction.address);h.bytes(fact->instruction.encoded_bytes());}}}
     std::vector<const GraphEdge*> es;for(auto& e:m.edges)es.push_back(&e);std::sort(es.begin(),es.end(),[](auto a,auto b){return a->id<b->id;});h.number(es.size());for(auto e:es){canceled(stop);h.number(e->id.value);h.number(e->source.value);h.number(e->target.value);h.number(static_cast<unsigned>(e->kind));h.number(e->reference?e->reference->value:0);h.number(e->selection.has_value());if(e->selection)h.location(*e->selection);h.number(e->target_location.has_value());if(e->target_location)h.location(*e->target_location);h.number(e->boundary);}return h.hash.digest();
 }

@@ -1,9 +1,12 @@
 #pragma once
 #include "hexlab/automation/automation_export.hpp"
 #include "hexlab/automation/history.hpp"
+#include "hexlab/automation/workflow_state.hpp"
 #include "hexlab/workspace/project.hpp"
 #include "hexlab/workspace/export.hpp"
 #include "hexlab/workspace/search.hpp"
+#include "hexlab/analysis/graph.hpp"
+#include "hexlab/analysis/references.hpp"
 #include "hexlab/loaders/ar.hpp"
 #include <thread>
 
@@ -18,6 +21,17 @@ struct MappedSegment {
     FileOffset file_begin;
     std::uint64_t file_size = 0;
     bool readable = false, writable = false, executable = false;
+};
+// Detached ELF dynamic-table row. Rows from multiple PT_DYNAMIC/SHT_DYNAMIC
+// tables are concatenated in loader order; table identity is retained.
+struct ElfDynamicEntryInfo {
+    std::optional<std::uint32_t> section;
+    std::uint64_t table_file_offset = 0;
+    std::optional<Address> table_address;
+    std::uint32_t index = 0;
+    std::int64_t tag = 0;
+    std::uint64_t value = 0;
+    std::optional<std::string> string_value;
 };
 // Detached summary of the active loader mapping. Enum values are the public
 // hexlab Architecture/ExecutionMode numeric values; addresses retain domains.
@@ -71,6 +85,22 @@ struct StackSlotInfo {
     bool read = false;
     bool written = false;
     bool address_taken = false;
+    // ABI-qualified incoming stack arguments when their offset and access
+    // direction meet the modeled architecture convention.
+    bool incoming_argument = false;
+    // Count of retained outgoing stack-source/call provenance rows.
+    std::size_t outgoing_call_argument_count = 0;
+    std::optional<StackArgumentAbi> incoming_argument_abi;
+};
+// One bounded-page outgoing argument provenance row linking a stack source to
+// the direct or decoded call boundary that consumes it.
+struct StackSlotCallArgumentInfo {
+    // Compatibility alias for the source address. Prefer source_instruction
+    // and source_kind when interpreting non-x86 sources.
+    Address push_instruction;
+    Address call_instruction;
+    Address source_instruction;
+    StackCallArgumentSourceKind source_kind = StackCallArgumentSourceKind::x86_push;
 };
 struct StackSlotAccessInfo {
     Address instruction;
@@ -84,6 +114,8 @@ struct ArchiveSummary {
     bool has_symbol_index = false;
     bool symbol_index_complete = true;
     std::vector<std::string> diagnostics;
+    bool thin = false;
+    bool aix_big = false;
 };
 struct ArchiveMemberRecord {
     std::size_t index = 0;
@@ -190,6 +222,11 @@ public:
     HEXLAB_AUTOMATION_EXPORT Result<database::HistoryPage> history(
         std::uint64_t after_step=0, std::size_t count=256,
         std::optional<std::uint64_t> expected_revision={}, std::stop_token={}) const;
+    // Read-only structural audit page. Resume with next_after_step and the
+    // returned edit revision; the database validates payload pairs atomically.
+    HEXLAB_AUTOMATION_EXPORT Result<database::HistoryAuditPage> audit_history(
+        std::uint64_t after_step=0, database::HistoryAuditLimits={},
+        std::optional<std::uint64_t> expected_revision={}, std::stop_token={}) const;
     HEXLAB_AUTOMATION_EXPORT Result<std::shared_ptr<const HistoricalState>> preview_history(
         std::uint64_t target_step, database::HistoryPreviewLimits={},
         std::optional<std::uint64_t> expected_revision={}, std::stop_token={}) const;
@@ -198,9 +235,16 @@ public:
     HEXLAB_AUTOMATION_EXPORT Result<std::vector<FunctionRecord>> functions(std::size_t start=0, std::size_t count=256) const;
     HEXLAB_AUTOMATION_EXPORT Result<std::optional<FunctionRecord>> function_at(Address) const;
     HEXLAB_AUTOMATION_EXPORT Result<std::vector<FunctionOwnerCandidate>> function_owners(Address) const;
+    // Build a bounded, detached direct-call neighborhood for the unique
+    // recovered function containing address. GraphOptions carries depth and
+    // node/edge budgets; cancellation is checked throughout graph collection.
+    HEXLAB_AUTOMATION_EXPORT Result<std::shared_ptr<const GraphModel>> call_graph(
+        Address, GraphOptions = {}, std::stop_token = {}) const;
     HEXLAB_AUTOMATION_EXPORT Result<std::optional<StackFrameInfo>> stack_frame(Address) const;
     HEXLAB_AUTOMATION_EXPORT Result<std::vector<StackSlotInfo>> stack_slots(
         Address, std::size_t start=0, std::size_t count=256) const;
+    HEXLAB_AUTOMATION_EXPORT Result<std::vector<StackSlotCallArgumentInfo>> stack_slot_call_arguments(
+        Address, std::size_t slot_index, std::size_t start=0, std::size_t count=256) const;
     HEXLAB_AUTOMATION_EXPORT Result<std::vector<StackSlotAccessInfo>> stack_slot_accesses(
         Address, std::size_t slot_index, std::size_t start=0, std::size_t count=256) const;
     HEXLAB_AUTOMATION_EXPORT Result<Decompilation> decompile(Address) const;
@@ -210,11 +254,28 @@ public:
     HEXLAB_AUTOMATION_EXPORT Result<std::vector<BlockSuccessor>> block_successors(BlockId, std::size_t start=0, std::size_t count=256) const;
     HEXLAB_AUTOMATION_EXPORT Result<std::vector<Instruction>> instructions(std::size_t start=0, std::size_t count=256) const;
     HEXLAB_AUTOMATION_EXPORT Result<std::vector<MappedSegment>> segments(std::size_t start=0, std::size_t count=256) const;
+    // Return every initialized virtual alias for one source file byte.
+    HEXLAB_AUTOMATION_EXPORT Result<std::vector<Address>> addresses_for_file_offset(FileOffset) const;
+    // Detached PE import/export tables. Non-PE images return empty pages.
+    HEXLAB_AUTOMATION_EXPORT Result<std::vector<ImportSymbol>> pe_imports(std::size_t start=0, std::size_t count=256) const;
+    HEXLAB_AUTOMATION_EXPORT Result<std::vector<ExportSymbol>> pe_exports(std::size_t start=0, std::size_t count=256) const;
+    // ELF-only flattened dynamic entries; an image without ELF dynamic tables
+    // returns an empty page. Rows are descriptive and do not apply relocations.
+    HEXLAB_AUTOMATION_EXPORT Result<std::vector<ElfDynamicEntryInfo>> elf_dynamic_entries(
+        std::size_t start=0, std::size_t count=256) const;
     HEXLAB_AUTOMATION_EXPORT Result<std::vector<Reference>> references(Location, std::size_t start=0, std::size_t count=256) const;
     HEXLAB_AUTOMATION_EXPORT Result<ReferencePage> incoming_references(Location, std::size_t start=0, std::size_t count=256) const;
+    // Find references whose target or resolved association lies inside the
+    // half-open virtual-address range [begin, begin + size).
+    HEXLAB_AUTOMATION_EXPORT Result<ReferencePage> incoming_references_range(
+        Address begin, std::uint64_t size, std::size_t start=0, std::size_t count=256) const;
+    // Find references whose source lies inside the half-open virtual-address range.
+    HEXLAB_AUTOMATION_EXPORT Result<ReferencePage> outgoing_references_range(
+        Address begin, std::uint64_t size, std::size_t start=0, std::size_t count=256) const;
     HEXLAB_AUTOMATION_EXPORT Result<ReferencePage> all_references(std::size_t start=0, std::size_t count=256) const;
     HEXLAB_AUTOMATION_EXPORT Result<std::vector<StringRecord>> strings(std::size_t start=0, std::size_t count=256) const;
-    HEXLAB_AUTOMATION_EXPORT Result<SearchPage> search(const SearchQuery&, std::optional<SearchCursor> = {}, const SearchLimits& = {}, std::stop_token = {}) const;
+    HEXLAB_AUTOMATION_EXPORT Result<SearchPage> search(const SearchQuery&, std::optional<SearchCursor> = {},
+        const SearchLimits& = {}, std::stop_token = {}, std::optional<Location> start = {}) const;
     HEXLAB_AUTOMATION_EXPORT Result<std::shared_ptr<const ProjectSnapshot>> execute(const ProjectCommand&, std::uint64_t group=0, std::stop_token={});
     // Validate and commit a bounded group of compatible project edits as one
     // history step. An optional revision rejects stale plans; stop is checked
@@ -228,11 +289,33 @@ public:
     HEXLAB_AUTOMATION_EXPORT Result<std::shared_ptr<const ProjectSnapshot>> undo(std::stop_token={});
     HEXLAB_AUTOMATION_EXPORT Result<std::shared_ptr<const ProjectSnapshot>> redo(std::stop_token={});
     HEXLAB_AUTOMATION_EXPORT Result<std::shared_ptr<const ProjectSnapshot>> analyze(std::stop_token={});
+    HEXLAB_AUTOMATION_EXPORT Result<std::shared_ptr<const ProjectSnapshot>> analyze(
+        const AnalysisOptions &, std::stop_token={});
     HEXLAB_AUTOMATION_EXPORT Result<bool> save(std::stop_token={});
+    // Publish an immutable, independently versioned application checkpoint.
+    // Requires a live owner, but permits read-only projects. Existing paths are
+    // never replaced. The expected revision rejects a stale application plan.
+    HEXLAB_AUTOMATION_EXPORT Result<WorkflowState> save_workflow_state(
+        const std::filesystem::path&, std::string application, std::uint32_t schema_version,
+        std::span<const std::byte> payload, std::uint64_t expected_edit_revision,
+        std::stop_token={}) const;
+    // Verify checksum, envelope/application schemas, UUID, and current edit
+    // revision before returning any payload. Works after reopening a project.
+    HEXLAB_AUTOMATION_EXPORT Result<WorkflowState> load_workflow_state(
+        const std::filesystem::path&, std::string application, std::uint32_t schema_version,
+        std::stop_token={}) const;
     HEXLAB_AUTOMATION_EXPORT Result<database::SavedProject> save_as(const std::filesystem::path&, std::stop_token={});
     // Consistent restore-point backups preserve project UUID and history.
     HEXLAB_AUTOMATION_EXPORT Result<database::SavedProject> backup_to(
         const std::filesystem::path&, bool replace=false, std::stop_token={});
+    HEXLAB_AUTOMATION_EXPORT Result<database::SourceArchiveResult> archive_external_source(
+        const std::filesystem::path&, database::SourceArchiveOptions={}, std::stop_token={});
+    HEXLAB_AUTOMATION_EXPORT Result<database::SourceArchiveVerification> verify_source_archive(
+        const std::filesystem::path&, std::uint64_t max_bytes=database::source_archive_byte_limit,
+        std::stop_token={}) const;
+    HEXLAB_AUTOMATION_EXPORT Result<database::SourceArchiveRestore> restore_source_archive(
+        const std::filesystem::path& archive, const std::filesystem::path& output,
+        std::uint64_t max_bytes=database::source_archive_byte_limit, std::stop_token={}) const;
     HEXLAB_AUTOMATION_EXPORT Result<BackupRotationInfo> backup_to_rotating(
         const std::filesystem::path& base, std::size_t retain=5, std::stop_token={});
     HEXLAB_AUTOMATION_EXPORT Result<BackupListInfo> list_rotated_backups(
@@ -244,6 +327,14 @@ public:
     HEXLAB_AUTOMATION_EXPORT static Result<database::SavedProject> restore_backup_in_place(
         const std::filesystem::path& backup, const std::filesystem::path& target,
         std::uint32_t version=api_version, std::stop_token={});
+    // Read-only bounded discovery of complete HexLab staging recovery artifacts.
+    HEXLAB_AUTOMATION_EXPORT static Result<database::ProjectRecoveryScan> inspect_recovery_directory(
+        const std::filesystem::path& directory, std::uint32_t version=api_version, std::stop_token={});
+    // Re-discovers one validated recovery artifact and restores it as a new
+    // project with a fresh UUID. The artifact remains unchanged.
+    HEXLAB_AUTOMATION_EXPORT static Result<database::SavedProject> restore_recovery_artifact(
+        const std::filesystem::path& artifact, const std::filesystem::path& destination,
+        bool replace=false, std::uint32_t version=api_version, std::stop_token={});
     HEXLAB_AUTOMATION_EXPORT Result<ExportReceipt> export_binary(const std::filesystem::path&, std::stop_token={});
 private:
     Project(std::shared_ptr<database::ProjectStore> store, std::shared_ptr<ProjectSession> session)

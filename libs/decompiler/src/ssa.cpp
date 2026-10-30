@@ -13,14 +13,30 @@
 namespace hexlab::decompiler {
 namespace {
 using Key = std::tuple<unsigned, unsigned, unsigned, bool>;
-Key key(RegisterOperand reg) { return {static_cast<unsigned>(reg.bank), reg.index, reg.width, reg.high_byte}; }
+RegisterOperand canonical_register(RegisterOperand reg) {
+    if (reg.bank == RegisterBank::arm64_simd) reg.width = 128;
+    return reg;
+}
+Key key(RegisterOperand reg) {
+    reg = canonical_register(reg);
+    return {static_cast<unsigned>(reg.bank), reg.index, reg.width, reg.high_byte};
+}
 using AbsoluteMemoryRange = std::tuple<std::uint32_t, std::uint64_t, std::uint64_t>;
 using AbsoluteMemoryPartitions = std::map<AbsoluteMemoryRange, std::string>;
 using PointerRoot = std::pair<Key, std::uint32_t>;
-struct PointerOrigin { PointerRoot root; std::int64_t offset = 0; bool operator==(const PointerOrigin &) const = default; };
+// Same-root phis may select different checked offsets into one object. Keep
+// their enclosing interval; accesses use it only while the resulting range is bounded.
+struct PointerOrigin {
+    PointerRoot root;
+    std::int64_t min_offset = 0;
+    std::int64_t max_offset = 0;
+    bool operator==(const PointerOrigin &) const = default;
+};
 using PointerValueKey = std::pair<Key, std::uint32_t>;
 using PointerOrigins = std::map<PointerValueKey, PointerOrigin>;
 using IntegerConstants = std::map<PointerValueKey, std::uint64_t>;
+using IntegerRange = std::pair<std::uint64_t, std::uint64_t>;
+using IntegerRanges = std::map<PointerValueKey, IntegerRange>;
 using FlatAddressRootKey = std::pair<unsigned, unsigned>;
 using FlatAddressRoots = std::map<FlatAddressRootKey, PointerRoot>;
 using DynamicMemoryRange = std::tuple<PointerRoot, std::int64_t, std::int64_t>;
@@ -58,9 +74,11 @@ std::optional<PointerOrigin> pointer_origin(const ExpressionPtr &expression, con
         *offset_constant > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) return {};
     auto delta = static_cast<std::int64_t>(*offset_constant);
     if (binary->operation == "sub") delta = -delta;
-    const auto offset = add_signed(left->offset, delta);
-    if (!offset) return {};
-    left->offset = *offset;
+    const auto min_offset = add_signed(left->min_offset, delta);
+    const auto max_offset = add_signed(left->max_offset, delta);
+    if (!min_offset || !max_offset) return {};
+    left->min_offset = *min_offset;
+    left->max_offset = *max_offset;
     return left;
 }
 
@@ -85,14 +103,38 @@ std::optional<std::uint64_t> integer_constant(const ExpressionPtr &expression,
             if (found != constants.end() && found->second <= mask) return found->second;
             return {};
         }
+        if (const auto *unary = std::get_if<UnaryValue>(&node->value)) {
+            if ((unary->operation != "zext" && unary->operation != "sext") || !unary->operand ||
+                unary->operand->type.kind != TypeKind::integer || !unary->operand->type.bits ||
+                unary->operand->type.bits >= width || unary->operand->type.bits > 64) return {};
+            const auto source_width = unary->operand->type.bits;
+            const auto source_mask = source_width == 64 ? std::numeric_limits<std::uint64_t>::max()
+                                                        : (std::uint64_t{1} << source_width) - 1;
+            const auto operand = self(self, unary->operand, depth + 1);
+            if (!operand || *operand > source_mask) return {};
+            if (unary->operation == "zext") return *operand;
+            const auto sign = std::uint64_t{1} << (source_width - 1);
+            return (*operand & sign) ? (*operand | (mask ^ source_mask)) : *operand;
+        }
         const auto *binary = std::get_if<BinaryValue>(&node->value);
         if (!binary || !binary->left || !binary->right ||
             binary->left->type.kind != TypeKind::integer || binary->right->type.kind != TypeKind::integer ||
             binary->left->type.bits != width || binary->right->type.bits != width ||
-            (binary->operation != "add" && binary->operation != "sub" && binary->operation != "mul")) return {};
+            (binary->operation != "add" && binary->operation != "sub" && binary->operation != "mul" &&
+             binary->operation != "and" && binary->operation != "or" && binary->operation != "xor" &&
+             binary->operation != "shl" && binary->operation != "shr" && binary->operation != "sar")) return {};
         const auto left = self(self, binary->left, depth + 1);
         const auto right = self(self, binary->right, depth + 1);
         if (!left || !right) return {};
+        if (binary->operation == "shl" || binary->operation == "shr" || binary->operation == "sar") {
+            if (*right >= width) return {};
+            const auto shift = static_cast<unsigned>(*right);
+            if (binary->operation == "shl") return (*left << shift) & mask;
+            auto shifted = *left >> shift;
+            if (binary->operation == "sar" && shift && (*left & (std::uint64_t{1} << (width - 1))))
+                shifted |= mask ^ (mask >> shift);
+            return shifted & mask;
+        }
         if (binary->operation == "add") {
             if (*right > mask - *left) return {};
             return *left + *right;
@@ -101,10 +143,115 @@ std::optional<std::uint64_t> integer_constant(const ExpressionPtr &expression,
             if (*left < *right) return {};
             return *left - *right;
         }
+        if (binary->operation == "and") return *left & *right;
+        if (binary->operation == "or") return *left | *right;
+        if (binary->operation == "xor") return *left ^ *right;
         if (*right && *left > mask / *right) return {};
         return *left * *right;
     };
     return evaluate(evaluate, expression, 0);
+}
+
+std::optional<IntegerRange> integer_range(const ExpressionPtr &expression,
+                                          const IntegerConstants &constants,
+                                          const IntegerRanges &ranges) {
+    if (const auto value = integer_constant(expression, constants)) return IntegerRange{*value, *value};
+    if (!expression || expression->type.kind != TypeKind::integer || !expression->type.bits ||
+        expression->type.bits > 64) return {};
+    if (const auto *unary = std::get_if<UnaryValue>(&expression->value)) {
+        if ((unary->operation != "zext" && unary->operation != "sext") || !unary->operand ||
+            unary->operand->type.kind != TypeKind::integer || !unary->operand->type.bits ||
+            unary->operand->type.bits >= expression->type.bits || unary->operand->type.bits > 64) return {};
+        const auto source_width = unary->operand->type.bits;
+        const auto source_mask = source_width == 64 ? std::numeric_limits<std::uint64_t>::max()
+                                                    : (std::uint64_t{1} << source_width) - 1;
+        const auto source = integer_range(unary->operand, constants, ranges);
+        if (!source || source->first > source->second || source->second > source_mask) return {};
+        if (unary->operation == "zext") return source;
+        const auto target_mask = expression->type.bits == 64 ? std::numeric_limits<std::uint64_t>::max()
+            : (std::uint64_t{1} << expression->type.bits) - 1;
+        const auto sign = std::uint64_t{1} << (source_width - 1);
+        if (source->second < sign) return source;
+        if (source->first >= sign)
+            return IntegerRange{source->first | (target_mask ^ source_mask),
+                                source->second | (target_mask ^ source_mask)};
+        // Sign extension maps a range crossing the source sign bit to two
+        // unsigned intervals. Widen to the full target domain rather than
+        // treating either side as an exact single interval.
+        return IntegerRange{0, target_mask};
+    }
+    const auto *binary = std::get_if<BinaryValue>(&expression->value);
+    if (!binary || !binary->left || !binary->right ||
+        binary->left->type.kind != TypeKind::integer || binary->right->type.kind != TypeKind::integer ||
+        binary->left->type.bits != expression->type.bits || binary->right->type.bits != expression->type.bits)
+        return {};
+    if (binary->operation == "shl" || binary->operation == "shr" || binary->operation == "sar") {
+        const auto amount = integer_constant(binary->right, constants);
+        if (!amount || *amount >= expression->type.bits) return {};
+        const auto source = integer_range(binary->left, constants, ranges);
+        if (!source || source->first > source->second) return {};
+        const auto shift = static_cast<unsigned>(*amount);
+        if (!shift) return source;
+        const auto width = expression->type.bits;
+        const auto mask = width == 64 ? std::numeric_limits<std::uint64_t>::max()
+                                      : (std::uint64_t{1} << width) - 1;
+        if (binary->operation == "shl") {
+            if (source->second > (mask >> shift)) return {};
+            return IntegerRange{source->first << shift, source->second << shift};
+        }
+        if (binary->operation == "shr")
+            return IntegerRange{source->first >> shift, source->second >> shift};
+        const auto sign = std::uint64_t{1} << (width - 1);
+        if (source->second < sign)
+            return IntegerRange{source->first >> shift, source->second >> shift};
+        const auto arithmetic_shift = [&](std::uint64_t value) {
+            auto result = value >> shift;
+            if (shift && (value & sign)) result |= mask ^ (mask >> shift);
+            return result & mask;
+        };
+        if (source->first >= sign)
+            return IntegerRange{arithmetic_shift(source->first), arithmetic_shift(source->second)};
+        return IntegerRange{0, mask};
+    }
+    if (binary->operation == "add" || binary->operation == "sub" || binary->operation == "mul") {
+        const auto left = integer_range(binary->left, constants, ranges);
+        const auto right = integer_range(binary->right, constants, ranges);
+        if (!left || !right || left->first > left->second || right->first > right->second)
+            return {};
+        const auto width_mask = expression->type.bits == 64
+            ? std::numeric_limits<std::uint64_t>::max()
+            : (std::uint64_t{1} << expression->type.bits) - 1;
+        if (left->second > width_mask || right->second > width_mask) return {};
+        if (binary->operation == "mul") {
+            if (left->second && right->second > width_mask / left->second) return {};
+            return IntegerRange{left->first * right->first, left->second * right->second};
+        }
+        if (binary->operation == "add") {
+            if (right->second > width_mask - left->second) return {};
+            return IntegerRange{left->first + right->first, left->second + right->second};
+        }
+        // Subtraction stays in one unsigned interval only when every possible
+        // left value is at least every possible right value. Otherwise modular
+        // wrap would make the result non-contiguous.
+        if (left->first < right->second || left->second < right->first) return {};
+        return IntegerRange{left->first - right->second, left->second - right->first};
+    }
+    if (binary->operation != "and") return {};
+    const auto left_constant = integer_constant(binary->left, constants);
+    const auto right_constant = integer_constant(binary->right, constants);
+    const auto mask = left_constant ? left_constant : right_constant;
+    const auto &operand = left_constant ? binary->right : binary->left;
+    if (!mask || (left_constant && right_constant)) return {};
+    // A contiguous low-bit mask bounds an arbitrary same-width input to
+    // [0, mask]. Other masks can clear bits but do not define one interval.
+    if ((*mask & (*mask + 1)) != 0) return {};
+    if (const auto *reg = std::get_if<RegisterValue>(&operand->value)) {
+        if (!reg->version || reg->reg.width != expression->type.bits) return {};
+        const auto found = ranges.find({key(reg->reg), *reg->version});
+        if (found != ranges.end() && found->second.first <= found->second.second)
+            return IntegerRange{0, std::min(found->second.second, *mask)};
+    }
+    return IntegerRange{0, *mask};
 }
 
 std::optional<std::int64_t> flat_address_constant(PointerValueKey value,
@@ -127,32 +274,45 @@ std::optional<std::int64_t> flat_address_constant(PointerValueKey value,
 }
 
 std::optional<DynamicMemoryRange> dynamic_memory_range(const MemoryValue &memory, const PointerOrigins &origins,
-                                                       const IntegerConstants &constants) {
+                                                       const IntegerConstants &constants,
+                                                       const IntegerRanges &integer_ranges) {
     if (!memory.base || memory.absolute || !memory.type.bits || memory.type.bits % 8 ||
         !memory.base_version) return {};
     const auto found = origins.find({key(*memory.base), *memory.base_version});
     if (found == origins.end()) return {};
     if (std::get<2>(found->second.root.first) != memory.base->width) return {};
     auto displacement = memory.displacement;
+    auto index_min = std::int64_t{0};
+    auto index_max = std::int64_t{0};
     if (memory.index) {
         if (!memory.index_version ||
             (memory.index_shift != "" && memory.index_shift != "lsl")) return {};
-        const auto index = constants.find({key(*memory.index), *memory.index_version});
-        if (index == constants.end()) return {};
-        std::optional<std::int64_t> index_value;
+        auto range = integer_ranges.find({key(*memory.index), *memory.index_version});
+        IntegerRange raw{};
+        if (range != integer_ranges.end()) raw = range->second;
+        else {
+            const auto exact = constants.find({key(*memory.index), *memory.index_version});
+            if (exact == constants.end()) return {};
+            raw = {exact->second, exact->second};
+        }
+        if (raw.first > raw.second) return {};
         if (memory.index_extend.empty()) {
             if (memory.index->width != memory.base->width ||
-                index->second > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) return {};
-            index_value = static_cast<std::int64_t>(index->second);
+                raw.second > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) return {};
+            index_min = static_cast<std::int64_t>(raw.first); index_max = static_cast<std::int64_t>(raw.second);
         } else if (memory.index_extend == "uxtw") {
-            if (memory.index->width != 32 || index->second > std::numeric_limits<std::uint32_t>::max()) return {};
-            index_value = static_cast<std::int64_t>(index->second);
+            if (memory.index->width != 32 || raw.second > std::numeric_limits<std::uint32_t>::max()) return {};
+            index_min = static_cast<std::int64_t>(raw.first); index_max = static_cast<std::int64_t>(raw.second);
         } else if (memory.index_extend == "sxtw") {
-            if (memory.index->width != 32 || index->second > std::numeric_limits<std::uint32_t>::max()) return {};
-            index_value = std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(index->second));
+            if (memory.index->width != 32 || raw.second > std::numeric_limits<std::uint32_t>::max()) return {};
+            if (raw.second < (std::uint64_t{1} << 31)) { index_min = static_cast<std::int64_t>(raw.first); index_max = static_cast<std::int64_t>(raw.second); }
+            else if (raw.first == raw.second) index_min = index_max = std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(raw.first));
+            else { index_min = std::numeric_limits<std::int32_t>::min(); index_max = std::numeric_limits<std::int32_t>::max(); }
         } else if (memory.index_extend == "sxtx") {
             if (memory.index->width != 64 || memory.base->width != 64) return {};
-            index_value = std::bit_cast<std::int64_t>(index->second);
+            if (raw.second <= static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) { index_min = static_cast<std::int64_t>(raw.first); index_max = static_cast<std::int64_t>(raw.second); }
+            else if (raw.first == raw.second) index_min = index_max = std::bit_cast<std::int64_t>(raw.first);
+            else { index_min = std::numeric_limits<std::int64_t>::min(); index_max = std::numeric_limits<std::int64_t>::max(); }
         } else if (memory.index_extend == "uxtx") {
             // UXTX (also rendered by A64 assemblers as LSL when the shift is
             // present) preserves the full 64-bit unsigned index. Dynamic
@@ -160,8 +320,8 @@ std::optional<DynamicMemoryRange> dynamic_memory_range(const MemoryValue &memory
             // cannot be represented without wrapping and must stay on the
             // whole-memory chain.
             if (memory.index->width != 64 || memory.base->width != 64 ||
-                index->second > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) return {};
-            index_value = static_cast<std::int64_t>(index->second);
+                raw.second > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) return {};
+            index_min = static_cast<std::int64_t>(raw.first); index_max = static_cast<std::int64_t>(raw.second);
         } else {
             return {};
         }
@@ -170,26 +330,32 @@ std::optional<DynamicMemoryRange> dynamic_memory_range(const MemoryValue &memory
             static_cast<std::uint64_t>(memory.scale) >
                 (static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) >> shift)) return {};
         const auto factor = static_cast<std::int64_t>(static_cast<std::uint64_t>(memory.scale) << shift);
-        if (*index_value > std::numeric_limits<std::int64_t>::max() / factor ||
-            *index_value < std::numeric_limits<std::int64_t>::min() / factor) return {};
-        auto delta = *index_value * factor;
+        if (index_max > std::numeric_limits<std::int64_t>::max() / factor ||
+            index_min < std::numeric_limits<std::int64_t>::min() / factor) return {};
+        auto delta_min = index_min * factor;
+        auto delta_max = index_max * factor;
         if (!memory.index_add) {
-            if (delta == std::numeric_limits<std::int64_t>::min()) return {};
-            delta = -delta;
+            if (delta_min == std::numeric_limits<std::int64_t>::min()) return {};
+            const auto old_min = delta_min;
+            delta_min = -delta_max; delta_max = -old_min;
         }
-        const auto adjusted = add_signed(displacement, delta);
-        if (!adjusted) return {};
-        displacement = *adjusted;
+        const auto adjusted_min = add_signed(displacement, delta_min);
+        const auto adjusted_max = add_signed(displacement, delta_max);
+        if (!adjusted_min || !adjusted_max) return {};
+        index_min = *adjusted_min; index_max = *adjusted_max;
+    } else {
+        index_min = index_max = memory.displacement;
     }
-    const auto begin = add_signed(found->second.offset, displacement);
+    const auto begin = add_signed(found->second.min_offset, index_min);
+    const auto end_begin = add_signed(found->second.max_offset, index_max);
     const auto bytes = static_cast<std::int64_t>(memory.type.bits / 8);
-    if (!begin || bytes <= 0 || *begin > std::numeric_limits<std::int64_t>::max() - bytes) return {};
+    if (!begin || !end_begin || bytes <= 0 || *end_begin > std::numeric_limits<std::int64_t>::max() - bytes) return {};
     const auto address_width = std::get<2>(found->second.root.first);
     if (address_width < 2) return {};
     const auto offset_limit_bits = std::min(address_width - 2, 60u);
     const auto conservative_offset_limit = std::int64_t{1} << offset_limit_bits;
-    if (*begin < -conservative_offset_limit || *begin + bytes > conservative_offset_limit) return {};
-    return DynamicMemoryRange{found->second.root, *begin, *begin + bytes};
+    if (*begin < -conservative_offset_limit || *end_begin + bytes > conservative_offset_limit) return {};
+    return DynamicMemoryRange{found->second.root, *begin, *end_begin + bytes};
 }
 bool is_absolute_memory_partition(const std::string &partition) {
     return partition.starts_with("\x1fglobal:");
@@ -279,7 +445,8 @@ void rename_partition_memory(ExpressionPtr &expression,
                              const AbsoluteMemoryPartitions &absolute_partitions,
                              const DynamicMemoryPartitions &dynamic_partitions,
                              const PointerOrigins &pointer_origins,
-                             const IntegerConstants &integer_constants) {
+                             const IntegerConstants &integer_constants,
+                             const IntegerRanges &integer_ranges) {
     if (!expression) return;
     auto copy = std::make_shared<Expression>(*expression);
     std::visit([&](auto &value) {
@@ -291,7 +458,7 @@ void rename_partition_memory(ExpressionPtr &expression,
             } else if (const auto range = absolute_memory_range(value)) {
                 const auto found = absolute_partitions.find(*range);
                 if (found != absolute_partitions.end()) partition = found->second;
-            } else if (const auto range = dynamic_memory_range(value, pointer_origins, integer_constants)) {
+            } else if (const auto range = dynamic_memory_range(value, pointer_origins, integer_constants, integer_ranges)) {
                 const auto found = dynamic_partitions.find(*range);
                 if (found != dynamic_partitions.end()) partition = found->second;
             }
@@ -304,12 +471,12 @@ void rename_partition_memory(ExpressionPtr &expression,
             }
         } else if constexpr (std::is_same_v<T, UnaryValue>)
             rename_partition_memory(value.operand, versions, absolute_partitions, dynamic_partitions, pointer_origins,
-                                    integer_constants);
+                                    integer_constants, integer_ranges);
         else if constexpr (std::is_same_v<T, BinaryValue>) {
             rename_partition_memory(value.left, versions, absolute_partitions, dynamic_partitions, pointer_origins,
-                                    integer_constants);
+                                    integer_constants, integer_ranges);
             rename_partition_memory(value.right, versions, absolute_partitions, dynamic_partitions, pointer_origins,
-                                    integer_constants);
+                                    integer_constants, integer_ranges);
         }
     }, copy->value);
     expression = std::move(copy);
@@ -437,7 +604,7 @@ Result<LiftedFunction> to_ssa(const LiftedFunction &input,
     tracked_call_registers.reserve(call_argument_registers.size());
     for (const auto reg : call_argument_registers) {
         if (!reg.width) return Error{ErrorCode::invalid_argument, "SSA call snapshot contains a zero-width register"};
-        if (tracked_call_keys.insert(key(reg)).second) tracked_call_registers.push_back(reg);
+        if (tracked_call_keys.insert(key(reg)).second) tracked_call_registers.push_back(canonical_register(reg));
     }
     for (const auto &block : input.blocks) for (const auto &instruction : block.instructions)
         if (const auto *call = std::get_if<Call>(&instruction.statement)) {
@@ -648,28 +815,29 @@ Result<LiftedFunction> to_ssa(const LiftedFunction &input,
             if constexpr (std::is_same_v<T, Store> || std::is_same_v<T, Call>) return true;
             else if constexpr (std::is_same_v<T, Intrinsic>)
                 return statement.memory_effect == IntrinsicMemoryEffect::write ||
+                       statement.memory_effect == IntrinsicMemoryEffect::read_write ||
                        statement.memory_effect == IntrinsicMemoryEffect::unknown;
             else return false;
         }, instruction.statement);
         if (defines_memory) memory_definitions.insert(block);
         std::visit([&](const auto &statement) {
             using T = std::decay_t<decltype(statement)>;
-            if constexpr (std::is_same_v<T, Assign>) registers[key(statement.destination)] = statement.destination;
+            if constexpr (std::is_same_v<T, Assign>) registers[key(statement.destination)] = canonical_register(statement.destination);
             else if constexpr (std::is_same_v<T, Call>) {
-                if (statement.return_register) registers[key(*statement.return_register)] = *statement.return_register;
-                for (const auto reg : statement.register_writes) registers[key(reg)] = reg;
+                if (statement.return_register) registers[key(*statement.return_register)] = canonical_register(*statement.return_register);
+                for (const auto reg : statement.register_writes) registers[key(reg)] = canonical_register(reg);
             }
             else if constexpr (std::is_same_v<T, Intrinsic>)
-                for (const auto reg : statement.register_writes) registers[key(reg)] = reg;
+                for (const auto reg : statement.register_writes) registers[key(reg)] = canonical_register(reg);
         }, instruction.statement);
         std::function<void(const ExpressionPtr &)> save_regs = [&](const ExpressionPtr &expression) {
             if (!expression) return;
             std::visit([&](const auto &value) {
                 using T = std::decay_t<decltype(value)>;
-                if constexpr (std::is_same_v<T, RegisterValue>) registers[key(value.reg)] = value.reg;
+                if constexpr (std::is_same_v<T, RegisterValue>) registers[key(value.reg)] = canonical_register(value.reg);
                 else if constexpr (std::is_same_v<T, MemoryValue>) {
-                    if (value.base) registers[key(*value.base)] = *value.base;
-                    if (value.index) registers[key(*value.index)] = *value.index;
+                    if (value.base) registers[key(*value.base)] = canonical_register(*value.base);
+                    if (value.index) registers[key(*value.index)] = canonical_register(*value.index);
                 } else if constexpr (std::is_same_v<T, UnaryValue>) save_regs(value.operand);
                 else if constexpr (std::is_same_v<T, BinaryValue>) { save_regs(value.left); save_regs(value.right); }
             }, expression->value);
@@ -702,7 +870,7 @@ Result<LiftedFunction> to_ssa(const LiftedFunction &input,
             if (!expression) return;
             std::visit([&](const auto &value) {
                 using T = std::decay_t<decltype(value)>;
-                if constexpr (std::is_same_v<T, RegisterValue>) registers[key(value.reg)] = value.reg;
+                if constexpr (std::is_same_v<T, RegisterValue>) registers[key(value.reg)] = canonical_register(value.reg);
                 else if constexpr (std::is_same_v<T, UnaryValue>) save_switch_regs(value.operand);
                 else if constexpr (std::is_same_v<T, BinaryValue>) {
                     save_switch_regs(value.left); save_switch_regs(value.right);
@@ -904,6 +1072,7 @@ Result<LiftedFunction> to_ssa(const LiftedFunction &input,
                 if (statement.memory_effect != IntrinsicMemoryEffect::none)
                     statement.memory_input_version = memory_stack.back();
                 if (statement.memory_effect == IntrinsicMemoryEffect::write ||
+                    statement.memory_effect == IntrinsicMemoryEffect::read_write ||
                     statement.memory_effect == IntrinsicMemoryEffect::unknown) {
                     statement.memory_output_version = ++memory_counter;
                     memory_stack.push_back(*statement.memory_output_version);
@@ -1030,6 +1199,45 @@ Result<LiftedFunction> to_ssa(const LiftedFunction &input,
             }
         }
 
+        // Preserve bounded unsigned value sets for address indexes. Exact
+        // constants remain preferred; a low-bit mask also gives a sound
+        // interval that can conservatively widen one memory partition.
+        IntegerRanges integer_ranges;
+        for (const auto &[value, constant] : integer_constants)
+            integer_ranges.emplace(value, IntegerRange{constant, constant});
+        bool ranges_changed = true;
+        for (std::size_t iteration = 0; ranges_changed && iteration < 64; ++iteration) {
+            ranges_changed = false;
+            const auto propagate_range = [&](PointerValueKey value, IntegerRange candidate) {
+                auto [found, inserted] = integer_ranges.emplace(value, candidate);
+                if (inserted) { ranges_changed = true; return; }
+                const IntegerRange joined{std::min(found->second.first, candidate.first),
+                                          std::max(found->second.second, candidate.second)};
+                if (joined != found->second) { found->second = joined; ranges_changed = true; }
+            };
+            for (auto block_index : reachable) {
+                for (const auto &phi : partitioned.blocks[block_index].phis) {
+                    if (phi.inputs.empty()) continue;
+                    IntegerRange joined{std::numeric_limits<std::uint64_t>::max(), 0};
+                    bool complete = true;
+                    for (const auto &input : phi.inputs) {
+                        const auto found = integer_ranges.find({key(phi.destination), input.version});
+                        if (found == integer_ranges.end()) { complete = false; break; }
+                        joined.first = std::min(joined.first, found->second.first);
+                        joined.second = std::max(joined.second, found->second.second);
+                    }
+                    if (complete) propagate_range({key(phi.destination), phi.version}, joined);
+                }
+                for (const auto &instruction : partitioned.blocks[block_index].instructions)
+                    if (const auto *assign = std::get_if<Assign>(&instruction.statement);
+                        assign && assign->destination_version && assign->value &&
+                        assign->destination.width == assign->value->type.bits) {
+                        const auto candidate = integer_range(assign->value, integer_constants, integer_ranges);
+                        if (candidate) propagate_range({key(assign->destination), *assign->destination_version}, *candidate);
+                    }
+            }
+        }
+
         // Track pointer identity through SSA copies, constant add/sub (including
         // offsets in constant-proven SSA registers), and unanimous phis. Flat
         // architecture registers with proven numeric addresses share one root
@@ -1049,9 +1257,9 @@ Result<LiftedFunction> to_ssa(const LiftedFunction &input,
             if (constant) {
                 const auto root = flat_address_roots.find(
                     FlatAddressRootKey{std::get<0>(value.first), std::get<2>(value.first)});
-                if (root != flat_address_roots.end()) return PointerOrigin{root->second, *constant};
+                if (root != flat_address_roots.end()) return PointerOrigin{root->second, *constant, *constant};
             }
-            return PointerOrigin{PointerRoot{value.first, value.second}, 0};
+            return PointerOrigin{PointerRoot{value.first, value.second}, 0, 0};
         };
         for (const auto &variable : variables)
             pointer_origins.emplace(PointerValueKey{variable, 0}, initial_pointer_origin({variable, 0}));
@@ -1086,17 +1294,21 @@ Result<LiftedFunction> to_ssa(const LiftedFunction &input,
             for (auto block_index : reachable) {
                 for (const auto &phi : partitioned.blocks[block_index].phis) {
                     if (phi.inputs.empty()) continue;
-                    std::optional<PointerOrigin> unanimous;
+                    std::optional<PointerOrigin> joined;
                     bool complete = true;
                     for (const auto &input : phi.inputs) {
                         const auto found = pointer_origins.find({key(phi.destination), input.version});
                         if (found == pointer_origins.end()) { complete = false; break; }
-                        if (!unanimous) unanimous = found->second;
-                        else if (*unanimous != found->second) { complete = false; break; }
+                        if (!joined) joined = found->second;
+                        else if (joined->root != found->second.root) { complete = false; break; }
+                        else {
+                            joined->min_offset = std::min(joined->min_offset, found->second.min_offset);
+                            joined->max_offset = std::max(joined->max_offset, found->second.max_offset);
+                        }
                     }
-                    if (complete && unanimous) {
+                    if (complete && joined) {
                         auto &origin = pointer_origins[{key(phi.destination), phi.version}];
-                        if (origin != *unanimous) { origin = *unanimous; provenance_changed = true; }
+                        if (origin != *joined) { origin = *joined; provenance_changed = true; }
                     }
                 }
                 for (const auto &instruction : partitioned.blocks[block_index].instructions)
@@ -1122,7 +1334,7 @@ Result<LiftedFunction> to_ssa(const LiftedFunction &input,
                 std::visit([&](const auto &value) {
                     using T = std::decay_t<decltype(value)>;
                     if constexpr (std::is_same_v<T, MemoryValue>) {
-                        if (const auto range = dynamic_memory_range(value, pointer_origins, integer_constants))
+                        if (const auto range = dynamic_memory_range(value, pointer_origins, integer_constants, integer_ranges))
                             dynamic_ranges.insert(*range);
                     } else if constexpr (std::is_same_v<T, UnaryValue>) collect_dynamic(value.operand);
                     else if constexpr (std::is_same_v<T, BinaryValue>) { collect_dynamic(value.left); collect_dynamic(value.right); }
@@ -1156,7 +1368,7 @@ Result<LiftedFunction> to_ssa(const LiftedFunction &input,
                                 global_store_ranges.emplace(std::pair{block_index, instruction_index}, *range);
                                 ++local_writes;
                             } else if (const auto range = dynamic_memory_range(*address, pointer_origins,
-                                                                                integer_constants)) {
+                                                                                integer_constants, integer_ranges)) {
                                 dynamic_store_ranges.emplace(std::pair{block_index, instruction_index}, *range);
                                 ++local_writes;
                             } else ++global_writes;
@@ -1171,6 +1383,7 @@ Result<LiftedFunction> to_ssa(const LiftedFunction &input,
                         for (const auto &operand : statement.operands) inspect_expression(operand);
                         for (const auto &output : statement.register_output_values) inspect_expression(output);
                         if (statement.memory_effect == IntrinsicMemoryEffect::write ||
+                            statement.memory_effect == IntrinsicMemoryEffect::read_write ||
                             statement.memory_effect == IntrinsicMemoryEffect::unknown) ++global_writes;
                     }
                 }, instruction.statement);
@@ -1381,7 +1594,7 @@ Result<LiftedFunction> to_ssa(const LiftedFunction &input,
                             {block.id.value, instruction.origin.instruction_id}, capture_partitions());
                         const auto rename_reads = [&](ExpressionPtr &expression, const PartitionSnapshot &state) {
                             rename_partition_memory(expression, state, absolute_partitions, dynamic_partitions,
-                                                    pointer_origins, integer_constants);
+                                                    pointer_origins, integer_constants, integer_ranges);
                         };
                         std::visit([&](auto &statement) {
                             using T = std::decay_t<decltype(statement)>;
@@ -1442,6 +1655,7 @@ Result<LiftedFunction> to_ssa(const LiftedFunction &input,
                                 for (auto &output : statement.register_output_values)
                                     rename_reads(output, capture_partitions());
                                 if (statement.memory_effect == IntrinsicMemoryEffect::write ||
+                                    statement.memory_effect == IntrinsicMemoryEffect::read_write ||
                                     statement.memory_effect == IntrinsicMemoryEffect::unknown)
                                     invalidate_all(statement.memory_partition_effects);
                             }
@@ -1451,7 +1665,7 @@ Result<LiftedFunction> to_ssa(const LiftedFunction &input,
                     if (block.switch_dispatch)
                         rename_partition_memory(block.switch_dispatch->selector, capture_partitions(),
                                                 absolute_partitions, dynamic_partitions, pointer_origins,
-                                                integer_constants);
+                                                integer_constants, integer_ranges);
                     for (auto successor : successors[block_index]) if (reachable.contains(successor)) {
                         auto &target = partitioned.blocks[successor];
                         for (auto &phi : target.memory_partition_phis)

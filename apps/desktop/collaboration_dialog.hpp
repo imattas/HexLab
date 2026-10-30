@@ -9,6 +9,7 @@
 #include <wx/msgdlg.h>
 #include <wx/stattext.h>
 #include <wx/sizer.h>
+#include <wx/timer.h>
 #include <algorithm>
 #include <functional>
 
@@ -25,7 +26,7 @@ public:
         : wxDialog(parent, wxID_ANY, "Collaboration Proposals", wxDefaultPosition,
                    wxSize(780, 520), wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER),
           path_(std::move(project_path)), synchronize_(std::move(synchronize)),
-          committed_(std::move(committed)) {
+          committed_(std::move(committed)), peer_timer_(this) {
         auto* root = new wxBoxSizer(wxVERTICAL);
         root->Add(new wxStaticText(this, wxID_ANY,
             "Pending edits shared through this project file. Refresh before resolving to review the current project revision."),
@@ -53,6 +54,7 @@ public:
         refresh_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { refresh(); });
         accept_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { accept_selected(); });
         dismiss_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { dismiss_selected(); });
+        Bind(wxEVT_TIMER, [this](wxTimerEvent&) { poll_peer_state(); }, peer_timer_.GetId());
         load_facade();
     }
 
@@ -66,6 +68,8 @@ private:
     wxListBox* rows_ = nullptr;
     wxTextCtrl* detail_ = nullptr;
     wxButton *refresh_ = nullptr, *accept_ = nullptr, *dismiss_ = nullptr;
+    wxTimer peer_timer_;
+    std::optional<std::uint64_t> peer_version_;
 
     static wxString message(const std::string& value) { return wxString::FromUTF8(value.c_str()); }
     static wxString address_label(Address value) {
@@ -118,14 +122,21 @@ private:
         auto opened = database::ProjectCollaboration::open(path_, {});
         if (!opened) { show_error(opened.error()); return false; }
         collaboration_ = std::move(opened.value());
-        return refresh();
+        if (!refresh()) return false;
+        peer_timer_.Start(1000);
+        return true;
     }
-    bool refresh() {
+    bool refresh(bool report_errors = true) {
         if (!collaboration_) return false;
+        auto peer_version = collaboration_->external_change_version({});
+        if (!peer_version) { if (report_errors) show_error(peer_version.error()); return false; }
         auto state = collaboration_->refresh({});
-        if (!state) { show_error(state.error()); return false; }
+        if (!state) { if (report_errors) show_error(state.error()); return false; }
         auto pending = collaboration_->conflicts(false, {});
-        if (!pending) { show_error(pending.error()); return false; }
+        if (!pending) { if (report_errors) show_error(pending.error()); return false; }
+        // Remember the version sampled before reading project state and the
+        // inbox. A concurrent commit during refresh is detected next tick.
+        peer_version_ = peer_version.value();
         head_ = std::move(state.value());
         conflicts_ = std::move(pending.value());
         rows_->Clear();
@@ -138,10 +149,18 @@ private:
         show_selected();
         return true;
     }
+    void poll_peer_state() {
+        if (!collaboration_) return;
+        auto version = collaboration_->external_change_version({});
+        if (!version || (peer_version_ && version.value() == *peer_version_)) return;
+        // Periodic peer refreshes stay quiet on transient I/O failures; the
+        // unchanged token causes another attempt on the next timer tick.
+        refresh(false);
+    }
     void show_selected() {
         const int selected = rows_->GetSelection();
         if (selected == wxNOT_FOUND || static_cast<std::size_t>(selected) >= conflicts_.size()) {
-            detail_->SetValue("No pending proposals. Refresh to check for new shared edits.");
+            detail_->SetValue("No pending proposals. This window checks for shared edits automatically.");
             accept_->Disable(); dismiss_->Disable(); return;
         }
         const auto& conflict = conflicts_[static_cast<std::size_t>(selected)];

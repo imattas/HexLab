@@ -8,6 +8,27 @@ slots for every thread in the debuggee and applied to threads as their create
 thread events arrive. Updates require a pending debug event, which keeps the
 target stopped while contexts are changed.
 
+Windows software breakpoint disable, re-enable, and removal, and Linux x86
+software breakpoint disable, re-enable, and removal first compare the target
+bytes with the exact bytes expected for the current owned state. Linux removal
+also requires every traced thread to be stopped. If the
+instruction bytes have changed since the breakpoint was installed, the
+operation returns a conflict and leaves the patch and ownership record intact.
+This prevents removal or a toggle from silently overwriting code that the
+debuggee or another debugger modified. Adding a breakpoint still captures the
+bytes that were present at installation time. The check is performed while the
+target is stopped where the architecture requires it; it is not an atomic
+memory compare-and-swap against another process writer.
+
+The Linux x86-64/i386 path also verifies owned bytes before displaced-step
+restore/rearm and before detach cleanup. Missing traps and changed original
+instructions fail closed; rearm errors remain visible and block resume.
+Detach preflights all software records and retains per-address restoration
+progress for retry after a partial failure. Existing unowned `INT3` bytes
+cannot be claimed by installation, and software records are capped at 4,096.
+See [Linux breakpoint lifecycle](linux-ptrace-debugging.md) for retry behavior
+and the remaining external-writer atomicity limit.
+
 The desktop debugger exposes Software, Hardware execute, Hardware read,
 Hardware write, and Hardware access choices beside the breakpoint address.
 Selecting a data watchpoint enables the 1/2/4/8-byte length control; execute
@@ -20,6 +41,11 @@ address must be aligned to the selected length. DR7 encodes write-only with
 RW=01 and read/write with RW=11. x86/x64 provides no read-only data condition,
 so `BreakpointKind::read` is rejected instead of being silently encoded as
 access and also stopping on writes.
+This is a hardware encoding limitation, not a missing Windows access right or
+an unvalidated read-watchpoint path. Supporting only reads would require a
+separate instruction-access emulation/filtering design; a read/write hardware
+slot cannot truthfully implement the current read-only request. Windows native
+read requests continue to fail before target debug-register writes.
 For `EXCEPTION_SINGLE_STEP`, the backend reads DR6 and maps its B0-B3 status
 bits to the corresponding owned `BreakpointId` values in
 `DebugEvent::breakpoint_ids`. An event with at least one owned slot hit is

@@ -1,10 +1,14 @@
-﻿"""Import a bounded JSON batch of project names, comments, and bookmarks.
+﻿"""Import a bounded JSON or CSV batch of project names, comments, and bookmarks.
 
-Usage: hexlab_python import_annotations.py project.hxproj annotations.json [--merge replace|preserve]
-Manifest format: [{"location":{"va":{"space":0,"offset":"0x401000"}},"name":"entry","comment":"checked","bookmark":"review"}]
-A file-offset location is {"location":{"file_offset":"0x20"}}. Set bookmark to null to remove one.
+Usage: hexlab_python import_annotations.py project.hxproj annotations.json|annotations.csv [--format json|csv] [--merge replace|preserve]
+       hexlab_python import_annotations.py project.hxproj output.csv --export
+Accepts the versioned format written by Project.export_annotations_json(), or
+the legacy row array [{"location":{"va":{"space":0,"offset":"0x401000"}},"name":"entry","comment":"checked","bookmark":"review"}].
+A legacy file-offset location is {"location":{"file_offset":"0x20"}}. CSV uses location_kind,space,offset,name,comment,bookmark columns; blank annotation cells are omitted.
 """
 import argparse
+import csv
+import io
 import json
 from pathlib import Path
 import hexlab
@@ -15,7 +19,16 @@ MAX_MANIFEST_BYTES = 16 * 1024 * 1024
 def number(value, field):
     if isinstance(value, bool) or not isinstance(value, (int, str)):
         raise ValueError(field + " must be an integer or base-prefixed integer string")
-    return int(value, 0) if isinstance(value, str) else value
+    if not isinstance(value, str):
+        return value
+    value = value.strip()
+    try:
+        return int(value, 0)
+    except ValueError:
+        # Base-0 parsing rejects decimal spellings with leading zeroes.
+        if value.isdecimal():
+            return int(value, 10)
+        raise
 
 
 def location(value):
@@ -31,14 +44,86 @@ def location(value):
     raise ValueError("location must contain exactly one of va or file_offset")
 
 
+def read_csv_rows(text):
+    reader = csv.reader(io.StringIO(text, newline=""), strict=True)
+    try:
+        header = next(reader, None)
+        if not header:
+            raise ValueError("CSV manifest is empty")
+        if len(set(header)) != len(header):
+            raise ValueError("CSV manifest contains duplicate column names")
+        allowed = {"location_kind", "space", "offset", "name", "comment", "bookmark"}
+        if not set(header) <= allowed or not {"location_kind", "offset"} <= set(header):
+            raise ValueError("CSV header requires location_kind and offset and allows only space/name/comment/bookmark")
+        if not set(header) & {"name", "comment", "bookmark"}:
+            raise ValueError("CSV header must include at least one annotation column")
+        rows = []
+        for row_number, values in enumerate(reader, 2):
+            if not values:
+                continue
+            if len(values) != len(header):
+                raise ValueError("CSV row " + str(row_number) + " has the wrong number of columns")
+            fields = dict(zip(header, values))
+            kind = fields["location_kind"]
+            try:
+                offset = number(fields["offset"], "offset")
+            except ValueError as error:
+                raise ValueError("CSV row " + str(row_number) + ": " + str(error)) from error
+            if offset < 0 or offset > 0xffffffffffffffff:
+                raise ValueError("CSV row " + str(row_number) + " offset is outside the unsigned 64-bit range")
+            if kind == "va":
+                if "space" not in fields or not fields["space"].strip():
+                    raise ValueError("CSV row " + str(row_number) + " VA location requires space")
+                try:
+                    space = number(fields["space"], "space")
+                except ValueError as error:
+                    raise ValueError("CSV row " + str(row_number) + ": " + str(error)) from error
+                if space < 0 or space > 0xffffffffffffffff:
+                    raise ValueError("CSV row " + str(row_number) + " space is outside the unsigned 64-bit range")
+                where = {"va": {"space": space, "offset": offset}}
+            elif kind == "file":
+                if "space" in fields and fields["space"].strip():
+                    raise ValueError("CSV row " + str(row_number) + " file location must leave space blank")
+                where = {"file_offset": offset}
+            else:
+                raise ValueError("CSV row " + str(row_number) + " location_kind must be va or file")
+            item = {"location": where}
+            for field in ("name", "comment", "bookmark"):
+                value = fields.get(field, "")
+                if value:
+                    item[field] = value
+            if len(item) == 1:
+                raise ValueError("CSV row " + str(row_number) + " has no nonempty annotation fields")
+            rows.append(item)
+            if len(rows) > 4096:
+                raise ValueError("CSV manifest exceeds 4096 rows")
+        return rows
+    except csv.Error as error:
+        raise ValueError("malformed CSV manifest: " + str(error)) from error
+
+
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("project")
 parser.add_argument("manifest")
 parser.add_argument("--group", type=int, default=0, help="persistent undo group")
+parser.add_argument("--format", choices=("auto", "json", "csv"), default="auto",
+                    help="manifest format (infer CSV from .csv suffix; otherwise JSON)")
 parser.add_argument("--merge", choices=("replace", "preserve"), default="replace",
                     help="replace existing fields (default) or preserve them and fill blanks")
+parser.add_argument("--export", action="store_true",
+                    help="export the project annotations as CSV to the manifest path")
 args = parser.parse_args()
 manifest_path = Path(args.manifest)
+if args.export:
+    try:
+        with hexlab.Project.open(args.project, readonly=True) as project:
+            report = project.export_annotations_csv(manifest_path)
+        print("exported", report["row_count"], "rows;", report["bytes"], "bytes; edit revision",
+              report["source_edit_revision"], "to", report["path"])
+    except (OSError, ValueError, hexlab.Error, hexlab.ProjectChangedDuringExport,
+            hexlab.AnalysisCancelled) as error:
+        parser.error("annotation export failed: " + str(error))
+    raise SystemExit(0)
 size = manifest_path.stat().st_size
 if size > MAX_MANIFEST_BYTES:
     parser.error("manifest exceeds 16 MiB")
@@ -47,9 +132,46 @@ with manifest_path.open("rb") as source:
 if len(encoded) > MAX_MANIFEST_BYTES:
     parser.error("manifest grew beyond 16 MiB while reading")
 try:
-    document = json.loads(encoded.decode("utf-8"))
-except (UnicodeDecodeError, json.JSONDecodeError) as error:
-    parser.error("invalid UTF-8 JSON manifest: " + str(error))
+    manifest_format = args.format
+    if manifest_format == "auto":
+        manifest_format = "csv" if manifest_path.suffix.lower() == ".csv" else "json"
+    if manifest_format == "csv":
+        document = read_csv_rows(encoded.decode("utf-8-sig"))
+    else:
+        document = json.loads(encoded.decode("utf-8"))
+except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+    parser.error("invalid " + manifest_format.upper() + " manifest: " + str(error))
+if isinstance(document, dict):
+    if (set(document) != {"schema_version", "api_version", "source_edit_revision", "rows"} or
+            document["schema_version"] != 1 or document["api_version"] != hexlab.API_VERSION or
+            isinstance(document["schema_version"], bool) or isinstance(document["api_version"], bool)):
+        parser.error("unsupported versioned annotation manifest")
+    source_revision = document["source_edit_revision"]
+    if isinstance(source_revision, bool) or not isinstance(source_revision, int) or source_revision < 0:
+        parser.error("source_edit_revision must be a non-negative integer")
+    versioned_rows = document["rows"]
+    if not isinstance(versioned_rows, list):
+        parser.error("versioned manifest rows must be an array")
+    rows_in = []
+    for index, item in enumerate(versioned_rows):
+        if (not isinstance(item, dict) or "location" not in item or
+                not set(item) <= {"location", "name", "comment", "bookmark"}):
+            parser.error(f"row {index} must be an object with location")
+        where = item["location"]
+        if not isinstance(where, dict):
+            parser.error(f"row {index} location must be an object")
+        if where.get("kind") == "va" and set(where) == {"kind", "space", "offset"}:
+            translated_location = {"va": {"space": where["space"], "offset": where["offset"]}}
+        elif where.get("kind") == "file" and set(where) == {"kind", "offset"}:
+            translated_location = {"file_offset": where["offset"]}
+        else:
+            parser.error(f"row {index} has an unsupported location")
+        translated = {key: value for key, value in item.items() if key != "location"}
+        if len(translated) == 0:
+            parser.error(f"row {index} has no annotation fields")
+        translated["location"] = translated_location
+        rows_in.append(translated)
+    document = rows_in
 if not isinstance(document, list) or len(document) > 4096:
     parser.error("manifest must be an array with at most 4096 rows")
 rows = []

@@ -11,6 +11,17 @@
 
 namespace hexlab {
 enum class PeRuntimeArchitecture : std::uint8_t { arm64, x64_compatible };
+enum class PeWeakExternalSearch : std::uint32_t {
+    no_library = 1, library = 2, alias = 3, anti_dependency = 4
+};
+
+struct PeCoffSectionDefinition {
+    std::uint32_t length = 0, checksum = 0, associated_section = 0;
+    std::uint16_t relocation_count = 0, line_number_count = 0;
+    std::uint8_t selection = 0;
+    FileOffset source_file_offset{};
+    bool operator==(const PeCoffSectionDefinition &) const = default;
+};
 
 struct PeImageCoffSymbol {
     std::string name;
@@ -20,7 +31,35 @@ struct PeImageCoffSymbol {
     std::uint8_t storage_class = 0, auxiliary_count = 0;
     FileOffset source_file_offset{};
     std::optional<Address> address;
+    std::optional<std::uint32_t> function_size;
+    FileOffset function_aux_file_offset{};
+    std::optional<PeCoffSectionDefinition> section_definition;
+    std::optional<std::uint32_t> weak_external_tag_index;
+    std::optional<PeWeakExternalSearch> weak_external_search;
+    std::optional<std::string> weak_external_target_name;
     bool operator==(const PeImageCoffSymbol &) const = default;
+};
+enum class PeImageChecksumStatus : std::uint8_t { unset, matches, mismatch, not_checked_limit };
+struct PeImageChecksum {
+    std::uint32_t stored = 0;
+    std::optional<std::uint32_t> computed;
+    std::uint64_t file_size = 0;
+    FileOffset source_file_offset{};
+    PeImageChecksumStatus status = PeImageChecksumStatus::unset;
+    bool operator==(const PeImageChecksum &) const = default;
+};
+// Retains the loader-relevant COFF and standard optional-header fields that
+// are often useful when identifying a PE without decoding its sections.
+struct PeHeaderMetadata {
+    std::uint32_t timestamp = 0, win32_version_value = 0, loader_flags = 0;
+    std::uint16_t characteristics = 0, linker_major = 0, linker_minor = 0;
+    std::uint16_t os_major = 0, os_minor = 0, image_major = 0, image_minor = 0;
+    std::uint16_t subsystem_major = 0, subsystem_minor = 0, dll_characteristics = 0;
+    std::uint32_t number_of_rva_and_sizes = 0;
+    std::uint64_t stack_reserve = 0, stack_commit = 0, heap_reserve = 0, heap_commit = 0;
+    FileOffset coff_timestamp_source{}, coff_characteristics_source{};
+    FileOffset optional_header_source{};
+    bool operator==(const PeHeaderMetadata &) const = default;
 };
 
 struct PeCertificateRecord {
@@ -28,6 +67,10 @@ struct PeCertificateRecord {
     std::uint16_t revision = 0, type = 0;
     PeRecordSource source;
     std::vector<PeSourceSpan> payload;
+    // File-backed 8-byte alignment bytes after the declared payload. Their
+    // contents are reported as metadata and are not interpreted as a signature.
+    std::vector<PeSourceSpan> alignment_padding;
+    bool alignment_padding_nonzero = false;
     bool operator==(const PeCertificateRecord &) const = default;
 };
 struct PeCertificateTable {
@@ -35,6 +78,10 @@ struct PeCertificateTable {
     std::uint32_t size = 0;
     PeRecordSource source;
     std::vector<PeCertificateRecord> records;
+    // Structural inventory only. A partial table retains records parsed before
+    // the first malformed/truncated record; this does not imply signature trust.
+    bool complete = true;
+    std::string diagnostic;
     bool operator==(const PeCertificateTable &) const = default;
 };
 struct PeImportSource {
@@ -157,14 +204,29 @@ struct PeChpeCodeRange {
     PeRecordSource source;
     bool operator==(const PeChpeCodeRange &) const = default;
 };
+struct PeChpeRedirection {
+    std::uint32_t source_rva = 0, destination_rva = 0;
+    PeRecordSource source;
+    bool operator==(const PeChpeRedirection &) const = default;
+};
 // CHPE metadata keeps code-map ranges in RVAs. The loader publishes validated,
 // non-overlapping rows as an ImageExecutionProfile for range-aware decoding.
 struct PeChpeMetadata {
     std::uint32_t version = 0, metadata_rva = 0, code_map_rva = 0;
     std::uint32_t code_map_count = 0;
-    PeRecordSource source, code_map_source;
+    std::uint32_t redirection_metadata_rva = 0, redirection_metadata_count = 0;
+    PeRecordSource source, code_map_source, redirection_metadata_source;
     std::vector<PeChpeCodeRange> code_ranges;
+    std::vector<PeChpeRedirection> redirections;
     bool operator==(const PeChpeMetadata &) const = default;
+};
+// IMAGE_LOAD_CONFIG_CODE_INTEGRITY is retained as raw metadata. Catalog and
+// offset fields are not interpreted as a verified signature or trust result.
+struct PeLoadConfigCodeIntegrity {
+    std::uint16_t flags = 0, catalog = 0;
+    std::uint32_t catalog_offset = 0, reserved = 0;
+    PeRecordSource source;
+    bool operator==(const PeLoadConfigCodeIntegrity &) const = default;
 };
 // Supported load-config pointer fields are normalized to RVAs; fields with
 // per-record or table payloads retain their source spans and decoded rows.
@@ -173,6 +235,8 @@ struct PeLoadConfiguration {
     std::uint32_t declared_size = 0, timestamp = 0;
     std::uint16_t major_version = 0, minor_version = 0;
     std::uint32_t guard_flags = 0;
+    std::optional<PeRecordSource> declared_size_source, version_source, guard_flags_source;
+    std::optional<PeLoadConfigCodeIntegrity> code_integrity;
     std::optional<std::uint64_t> dynamic_value_relocation_table_rva;
     std::optional<PeRecordSource> dynamic_value_relocation_table_pointer_source;
     std::optional<PeDynamicRelocationTable> dynamic_value_relocations;
@@ -185,6 +249,9 @@ struct PeLoadConfiguration {
     std::vector<PeLoadConfigTarget> safe_seh_handlers;
     std::optional<std::uint64_t> guard_check_rva, guard_dispatch_rva;
     std::optional<std::uint64_t> guard_function_table_rva;
+    std::optional<std::uint64_t> guard_function_table_count;
+    std::optional<PeRecordSource> guard_function_table_pointer_source;
+    std::optional<PeRecordSource> guard_function_table_count_source;
     std::optional<PeRecordSource> directory_source;
     std::vector<PeGuardCfFunction> guard_functions;
     std::optional<std::uint64_t> guard_address_taken_iat_table_rva;
@@ -565,6 +632,34 @@ struct PeManifestInfo {
     bool complete = true;
     bool operator==(const PeManifestInfo &) const = default;
 };
+struct PeGroupIconEntry {
+    std::uint8_t width = 0, height = 0, color_count = 0;
+    std::uint16_t planes = 0, bit_count = 0, icon_id = 0;
+    std::uint32_t bytes_in_resource = 0;
+    PeRecordSource source;
+    std::optional<std::uint32_t> icon_resource_index;
+    bool operator==(const PeGroupIconEntry &) const = default;
+};
+struct PeGroupIcon {
+    PeRecordSource source;
+    std::vector<PeGroupIconEntry> entries;
+    bool complete = true;
+    bool operator==(const PeGroupIcon &) const = default;
+};
+struct PeGroupCursorEntry {
+    std::uint16_t width = 0, height = 0, planes = 0, bit_count = 0, cursor_id = 0;
+    std::uint32_t bytes_in_resource = 0;
+    PeRecordSource source;
+    std::optional<std::uint32_t> cursor_resource_index;
+    std::optional<bool> resource_size_matches;
+    bool operator==(const PeGroupCursorEntry &) const = default;
+};
+struct PeGroupCursor {
+    PeRecordSource source;
+    std::vector<PeGroupCursorEntry> entries;
+    bool complete = true;
+    bool operator==(const PeGroupCursor &) const = default;
+};
 struct PeResource {
     PeResourceIdentifier type, name, language;
     std::uint32_t data_rva = 0, size = 0, code_page = 0;
@@ -576,15 +671,29 @@ struct PeResource {
     std::optional<PeManifestInfo> manifest_info;
     // Decoded bounded UTF-16 entries from RT_STRING blocks.
     std::optional<PeStringTable> string_table;
+    // Decoded RT_GROUP_ICON directory entries and unique same-language links.
+    std::optional<PeGroupIcon> group_icon;
+    // Decoded RT_GROUP_CURSOR directory entries and same-language RT_CURSOR links.
+    std::optional<PeGroupCursor> group_cursor;
     bool operator==(const PeResource &) const = default;
 };
 struct PeCodeViewIdentity {
+    // RSDS identifies a PDB by GUID+age. NB10 is retained for discovery only.
+    bool rsds = true;
     std::array<std::byte, 16> guid{};
     std::uint32_t age = 0;
+    std::uint32_t nb10_signature = 0;
+    std::uint32_t nb10_timestamp = 0;
     std::string path;
     PeRecordSource directory_entry;
     std::vector<PeSourceSpan> record;
     bool operator==(const PeCodeViewIdentity &) const = default;
+};
+struct PePdbChecksum {
+    std::string algorithm;
+    std::vector<std::byte> digest;
+    PeRecordSource source;
+    bool operator==(const PePdbChecksum &) const = default;
 };
 // Common IMAGE_DEBUG_DIRECTORY fields are retained for every debug record;
 // payloads with no specialized decoder remain inspectable as raw file spans.
@@ -594,6 +703,14 @@ struct PeDebugDirectoryEntry {
     std::uint32_t type = 0, data_size = 0, data_rva = 0, raw_offset = 0;
     PeRecordSource entry;
     std::vector<PeSourceSpan> raw_data;
+    // IMAGE_DEBUG_TYPE_REPRO marks deterministic builds. Its optional hash is
+    // retained as opaque bytes because the debug record does not identify an algorithm.
+    bool reproducible_build = false;
+    std::vector<std::byte> reproducible_hash;
+    std::optional<PeRecordSource> reproducible_hash_source;
+    // IMAGE_DEBUG_TYPE_EX_DLLCHARACTERISTICS is a DWORD; unknown bits remain visible.
+    std::optional<std::uint32_t> extended_dll_characteristics;
+    std::optional<PeRecordSource> extended_dll_characteristics_source;
     bool operator==(const PeDebugDirectoryEntry &) const = default;
 };
 enum class PeFpoFrameKind : std::uint8_t { fpo, trap, task_state, non_fpo };
@@ -733,8 +850,10 @@ struct PePdbInlineSite {
     bool operator==(const PePdbInlineSite &) const = default;
 };
 struct PeMetadata {
+    std::optional<PeHeaderMetadata> headers;
     // IMAGE_DIRECTORY_ENTRY_GLOBALPTR is an RVA whose directory size is zero.
     std::optional<std::uint32_t> global_pointer_rva;
+    std::optional<PeImageChecksum> image_checksum;
     std::vector<PeImageCoffSymbol> coff_symbols;
     std::optional<PeMsvcRttiMetadata> msvc_rtti;
     std::optional<PeCertificateTable> certificate_table;
@@ -748,6 +867,10 @@ struct PeMetadata {
     std::optional<PeLoadConfiguration> load_configuration;
     std::vector<PeResource> resources;
     std::vector<PeCodeViewIdentity> codeview;
+    std::vector<PePdbChecksum> pdb_checksums;
+    // Set only when a supported checksum algorithm was available for a
+    // selected local PDB; false rejects that candidate before parsing/binding.
+    std::optional<bool> pdb_checksum_verified;
     std::vector<PeDebugDirectoryEntry> debug_directories;
     std::vector<PeFpoRecord> fpo_records;
     std::vector<PePogoData> pogo_data;

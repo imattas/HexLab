@@ -10,6 +10,7 @@ void populate_direct_call_neighborhoods(const FunctionSnapshot &snapshot,
     std::map<QualifiedAddress, std::size_t> feature_by_address;
     for (std::size_t i = 0; i < features.size(); ++i) {
         features[i].direct_calls.clear();
+        features[i].direct_calls_complete = snapshot.complete;
         feature_by_address.emplace(QualifiedAddress{features[i].address_space, features[i].entry}, i);
     }
 

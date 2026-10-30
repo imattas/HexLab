@@ -3,6 +3,7 @@
 #include "hexlab/loaders/recipe.hpp"
 #include "hexlab/image/file_storage.hpp"
 #include "hexlab/loaders/pdb_lines.hpp"
+#include "hexlab/loaders/minidump.hpp"
 #include <algorithm>
 #include <vector>
 namespace hexlab {
@@ -11,7 +12,7 @@ Result<LoadRecipe> resolve_open_recipe(const OpenRequest &request, std::stop_tok
         return Error{ErrorCode::canceled, "Opening canceled"};
     if (request.format != Format::automatic && request.format != Format::raw && request.format != Format::pe &&
         request.format != Format::elf && request.format != Format::macho &&
-        request.format != Format::intel_hex && request.format != Format::s_record && request.format != Format::wasm && request.format != Format::dex && request.format != Format::jvm)
+        request.format != Format::intel_hex && request.format != Format::s_record && request.format != Format::wasm && request.format != Format::dex && request.format != Format::jvm && request.format != Format::minidump)
         return Error{ErrorCode::invalid_argument, "Unknown requested input format"};
     if (request.macho && request.format != Format::macho && request.format != Format::automatic)
         return Error{ErrorCode::invalid_argument, "Slice options require Mach-O or automatic input format"};
@@ -23,12 +24,15 @@ Result<LoadRecipe> resolve_open_recipe(const OpenRequest &request, std::stop_tok
     if (request.dwarf_supplementary_package_path &&
         (request.pdb_path || !request.pdb_search_paths.empty()))
         return Error{ErrorCode::invalid_argument, "PE PDB and ELF DWARF supplementary options cannot be combined"};
+    if ((request.pdb_path || !request.pdb_search_paths.empty()) && request.format != Format::pe &&
+        request.format != Format::minidump && request.format != Format::automatic)
+        return Error{ErrorCode::invalid_argument, "Local PDB options require PE, Minidump, or automatic input format"};
     if (request.format != Format::raw) {
         if (request.raw || request.x86_profile_path || request.arm_profile_path)
             return Error{ErrorCode::invalid_argument, "Raw mapping options require explicit raw format"};
         if ((request.format == Format::intel_hex || request.format == Format::s_record) &&
             (request.pdb_path || !request.pdb_search_paths.empty()))
-            return Error{ErrorCode::invalid_argument, "Local PDB options require PE or automatic input format"};
+            return Error{ErrorCode::invalid_argument, "Local PDB options require PE, Minidump, or automatic input format"};
         auto recipe = LoadRecipe{request.format, {}, request.macho};
         recipe.pe_runtime_architecture = request.pe_runtime_architecture;
         if (request.dwarf_supplementary_package_path) {
@@ -124,10 +128,81 @@ Result<LoadRecipe> resolve_open_recipe(const OpenRequest &request, std::stop_tok
                 }
             }
         }
+        if (request.format == Format::minidump || request.format == Format::automatic) {
+            std::shared_ptr<const ByteStorage> storage = request.input_storage;
+            if (!storage && !request.path.empty()) {
+                auto opened = FileStorage::open(request.path);
+                if (opened) storage = opened.value();
+            }
+            if (storage) {
+                auto resolved = resolve_load_recipe(*storage, recipe, stop);
+                if (resolved && resolved.value().format == Format::minidump) {
+                    recipe = std::move(resolved.value());
+                    auto loaded = load_minidump(storage, stop);
+                    if (!loaded) return loaded.error();
+                    std::vector<MinidumpPdbCandidate> candidates;
+                    std::vector<std::filesystem::path> paths;
+                    bool search_truncated = false;
+                    const auto add_candidate = [&](const std::filesystem::path &path) -> Result<bool> {
+                        if (path.empty()) return true;
+                        std::error_code error;
+                        auto absolute = std::filesystem::absolute(path, error);
+                        if (error) return true;
+                        absolute = absolute.lexically_normal();
+                        if (std::find(paths.begin(), paths.end(), absolute) != paths.end()) return true;
+                        if (request.pdb_path && path == *request.pdb_path) {
+                            paths.insert(paths.begin(), absolute);
+                            return true;
+                        }
+                        if (request.pdb_path) return true;
+                        if (std::filesystem::is_regular_file(absolute, error) && !error) {
+                            if (paths.size() >= 128) search_truncated = true;
+                            else paths.push_back(std::move(absolute));
+                        }
+                        return true;
+                    };
+                    if (request.pdb_path) {
+                        auto result = add_candidate(*request.pdb_path);
+                        if (!result) return result.error();
+                    } else {
+                        std::vector<std::filesystem::path> directories;
+                        if (!request.path.empty()) directories.push_back(request.path.parent_path());
+                        directories.insert(directories.end(), request.pdb_search_paths.begin(), request.pdb_search_paths.end());
+                        std::vector<std::filesystem::path> names;
+                        names.reserve(129);
+                        for (const auto &module : loaded.value().metadata.minidump->modules) {
+                            if (module.codeview_kind != "RSDS" || module.pdb_path.empty()) continue;
+                            if (names.size() >= 128) { search_truncated = true; continue; }
+                            std::string path = module.pdb_path;
+                            std::replace(path.begin(), path.end(), '\\', '/');
+                            const auto leaf = std::filesystem::u8path(path).filename();
+                            if (!leaf.empty() && leaf != "." && leaf != "..") names.push_back(leaf);
+                        }
+                        if (names.size() < 128 && !request.path.empty()) names.push_back(request.path.stem().concat(".pdb"));
+                        else if (!request.path.empty()) search_truncated = true;
+                        for (const auto &directory : directories) {
+                            for (const auto &name : names) {
+                                auto result = add_candidate(directory / name);
+                                if (!result) return result.error();
+                            }
+                        }
+                    }
+                    candidates.reserve(paths.size());
+                    for (const auto &path : paths) candidates.push_back({std::nullopt, path});
+                    if (!candidates.empty()) {
+                        recipe.minidump_pdb_paths = std::move(paths);
+                    }
+                    recipe.minidump_pdb_search_truncated = search_truncated;
+                } else if (request.format == Format::minidump && resolved &&
+                           resolved.value().format != Format::minidump) {
+                    return Error{ErrorCode::invalid_argument, "Minidump PDB options require a Minidump input"};
+                }
+            }
+        }
         return recipe;
     }
     if (request.pdb_path || !request.pdb_search_paths.empty())
-        return Error{ErrorCode::invalid_argument, "Local PDB options require PE or automatic input format"};
+        return Error{ErrorCode::invalid_argument, "Local PDB options require PE, Minidump, or automatic input format"};
     if (unsigned(request.raw.has_value()) + unsigned(request.x86_profile_path.has_value()) +
             unsigned(request.arm_profile_path.has_value()) !=
         1)

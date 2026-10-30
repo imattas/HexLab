@@ -312,4 +312,21 @@ Result<Address> Image::to_address(FileOffset offset) const {
         return Error{ErrorCode::out_of_bounds, "File offset is not virtually mapped"};
     return Address{found->begin.space, found->begin.offset + (offset.value - found->file_begin.value)};
 }
+Result<std::vector<Address>> Image::to_addresses(FileOffset offset) const {
+    try {
+        std::vector<Address> result;
+        for (const auto &segment : layout_.segments) {
+            if (offset.value < segment.file_begin.value ||
+                offset.value - segment.file_begin.value >= segment.file_size)
+                continue;
+            result.push_back({segment.begin.space,
+                              segment.begin.offset + (offset.value - segment.file_begin.value)});
+        }
+        return result;
+    } catch (const std::bad_alloc &) {
+        return Error{ErrorCode::resource_limit, "Cannot allocate file-offset mapping results"};
+    } catch (const std::length_error &) {
+        return Error{ErrorCode::resource_limit, "File-offset mapping result exceeds container limits"};
+    }
+}
 } // namespace hexlab

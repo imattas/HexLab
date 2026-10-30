@@ -1,0 +1,5 @@
+# Firmware input-record navigation
+
+The Bytes pane uses the current document's immutable firmware metadata to associate a selected decoded byte with its Intel HEX or S-record data record. The **Go to input record** action reports the record index, original 1-based source line, and byte offset within the record. Activating it resolves that source line in the document's retained original input storage and moves the shared cursor to the line's first byte. The Bytes table's text column then displays the original record as the cursor advances through the input bytes.
+
+Navigation does not reparse the firmware file, reopen its path, or change project state. The source-line resolver reads at most 64 MiB from the retained input and accepts the requested source line up to 4 KiB; longer preceding lines are skipped while counting lines. If the requested line cannot be read, lies past the scan cap, or exceeds the line bound, the pane reports that the input record is unavailable and leaves the cursor unchanged. Firmware records without a unique mapped selected byte do not enable the action.

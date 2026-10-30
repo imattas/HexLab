@@ -172,6 +172,11 @@ Constants transfer(const Instruction &i, const Constants &input, bool relocated)
             else if (const auto prior = read(input, destination))
                 write(output, destination, (*prior & ~(UINT64_C(0xffff) << *shift)) | part);
         }
+    } else if ((i.opcode == Opcode::a64_adr || i.opcode == Opcode::a64_adrp) &&
+               destination && destination->width == 64 && i.operands.size() == 2) {
+        const auto *address = std::get_if<MemoryOperand>(&i.operands[1]);
+        if (address && address->resolved_address && address->resolved_address->space == i.address.space)
+            write(output, destination, address->resolved_address->offset);
     } else if ((i.opcode == Opcode::a64_csel || i.opcode == Opcode::a64_csinc ||
                 i.opcode == Opcode::a64_csinv || i.opcode == Opcode::a64_csneg) &&
                destination && i.operands.size() == 3) {
@@ -257,6 +262,20 @@ void Recovery::refine_a64_flow() {
             if (take(relocations.operand(i, n, stop)).relocated()) { relocated = true; break; }
         if (!relocated) {
             if (const auto evaluated = flag_transfer(i, input)) a64_flag_transfers[at] = *evaluated;
+            if (i.flow == FlowKind::call && i.opcode == Opcode::a64_blr &&
+                !node.call_target && i.operands.size() == 1) {
+                const auto *target_register = reg(i, 0);
+                const auto target_value = read(input, target_register);
+                if (target_register && target_register->width == 64 && target_value) {
+                    const Address target{i.address.space, *target_value};
+                    const auto context = image.context_at(target);
+                    if (context && context.value() == i.context && !permission(target)) {
+                        node.call_target = target;
+                        if (add_seed(all_seeds, {FunctionSeedKind::direct_call, target, at, {}}))
+                            a64_indirect_seeds_added = true;
+                    }
+                }
+            }
             if (i.opcode == Opcode::a64_cbz || i.opcode == Opcode::a64_cbnz ||
                 i.opcode == Opcode::a64_tbz || i.opcode == Opcode::a64_tbnz) {
                 const auto value = read(input, reg(i, 0));
@@ -299,5 +318,16 @@ void Recovery::refine_a64_flow() {
     // Back edges do not establish speculative entry constants. Local identities
     // and zero-register operands still prove flags inside an unresolved cycle.
     for (const auto at : eligible) if (!outputs.contains(at)) (void)evaluate(at, {});
+    if (a64_indirect_seeds_added) {
+        if (a64_indirect_passes >= 8) {
+            output->complete = false;
+            a64_indirect_seeds_added = false;
+            return;
+        }
+        a64_indirect_seeds_added = false;
+        ++a64_indirect_passes;
+        discover();
+        refine_a64_flow();
+    }
 }
 } // namespace hexlab::function_detail

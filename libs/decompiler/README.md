@@ -101,6 +101,9 @@ result width. Unsupported operations, unknown values, memory effects, and
 out-of-range shifts remain explicit. In call-containing functions, propagation
 stays within each block and clears at each unknown call; facts do not
 cross blocks until register clobbers are modeled.
+For JVM integer constants, `i2b` and `i2s` now fold with signed extension from
+8 and 16 bits, while `i2c` folds with zero extension from 16 bits. Each keeps
+the JVM-required 32-bit stack result.
 When a terminal branch has a constant boolean predicate and both CFG edges are
 validated, the pass selects the feasible edge, removes unreachable blocks, and
 removes phi inputs from the discarded paths. Other branch shapes remain
@@ -140,23 +143,43 @@ This exposes the surviving low-bit mask in common bit-clearing obfuscation
 sequences. It requires a pure operand and equal, valid shift counts; arithmetic
 right shifts and out-of-range counts are left unchanged.
 
+The identity pass also cancels opposite constant rotations of the same pure
+SSA bit-vector, such as `rotr(rotl(x, k), k)`, when both counts agree modulo
+the operand width. This follows the IR's fixed-width rotate semantics and is
+bounded to expressions of at most 256 nodes; nonconstant counts and expressions
+that may read memory remain unchanged.
+
+The pass also flattens a nested `select_if` when its outer and inner selectors
+are the same exact SSA expression. Branch values and the selector must be pure,
+total integer/boolean bitvectors within the 256-node cap; division, memory,
+unknown values, and unversioned registers are excluded. This handles true-arm
+and false-arm nesting without inferring predicate equivalence across CFG paths.
+See [`docs/decompiler-opaque-predicates.md`](../../docs/decompiler-opaque-predicates.md).
+
 `eliminate_dead_code` removes unused SSA assignments and phi nodes when their
-right-hand sides are pure register, constant, unary, or binary expressions.
-It iterates to a fixed point, so deleting a dead consumer can expose a dead
-definition chain. Assignments that read memory and all stores, calls, and
-intrinsics remain in the IR because their effects are observable or unknown.
-The pass leaves unversioned assignments alone and rejects duplicate SSA
-definitions.
+right-hand sides use registers/constants and a whitelist of total integer or
+Boolean bit-vector operations. Potentially trapping division/remainder,
+floating-point, memory, and unrecognized unary/binary operators remain. It
+iterates to a fixed point, so deleting a dead consumer can expose a dead
+definition chain. Stores, calls, and intrinsics remain because their effects
+are observable or unknown. The pass leaves unversioned assignments alone and
+rejects duplicate SSA definitions.
 
 Memory SSA keeps a coarse whole-memory chain as the fallback for all accesses.
-It also attaches partition versions to stack loads/stores only when
-`recover_stack_variables` proves a concrete, non-overlapping, nonescaping
-frame slot. Stores to one proven slot advance only that partition; other
-proven slots retain their versions. Calls, unclassified stores, and writing or
-unknown intrinsics advance every partition, and CFG joins carry partition
-phis. The coarse chain still advances for every write, so existing consumers
-remain conservative while partition-aware passes can use the additional alias
-facts. Intrinsics carry an `IntrinsicMemoryEffect` classification for no
+It also attaches partitions to proven stack slots, explicit absolute byte
+ranges, and bounded byte ranges reached through one proven pointer root.
+Pointer-relative ranges require checked constant pointer offsets (or a finite
+supported index range). A pointer phi may also use one range when all incoming
+values prove the same root; the pass joins their offsets into a bounded
+interval and treats every byte in that interval as potentially accessed.
+Phis joining different roots retain opaque provenance, and unrelated roots
+are never treated as disjoint. Unbounded or wrapping address arithmetic stays
+on whole-memory SSA. Stores advance the target partition and any other
+partition that may overlap; unclassified stores, calls, and writing or
+unknown intrinsics clobber the partitions that may be reached. CFG joins carry
+partition phis. The coarse chain still advances for every write, so existing
+consumers remain conservative while partition-aware passes can use the
+additional alias facts. Intrinsics carry an `IntrinsicMemoryEffect` classification for no
 memory, read-only, write, or unknown behavior. Unknown intrinsics default to a
 memory clobber, while known pure `nop` and read-only `cmp` facts preserve the
 incoming versions. The CLI `--decompile` path performs
@@ -176,6 +199,11 @@ region joins, finds blocks by address rather than storage order, and lowers SSA
 phi nodes into assignments on the corresponding incoming edges. Multiple
 explicit terminal returns use an analysis-only virtual exit, allowing shared
 SSA joins before a return choice and early returns around nested regions.
+Return-decision trees can reuse a terminal decision block across incoming
+paths when each path supplies a complete, predecessor-specific SSA phi input;
+the formatter emits that block in each guarded arm so the corresponding input
+copy stays on its original edge. Shared nonterminal blocks outside this bounded
+return shape still use the fallback.
 Shared instructions are emitted once, and straight-line setup can precede the
 first conditional. It also emits
 a simple one-arm `if` for a conditional early return, preserving the inverted
@@ -243,6 +271,33 @@ currently anchored to an instruction address; it does not rewrite lifted IR
 register expressions or infer a variable's type. Comments appear alongside
 their instruction origins in the pseudocode pane.
 
+## Structured SSA edits
+
+Library clients can use `replace_register_uses` to create an edited copy of a
+lifted function by substituting one versioned SSA register use with a typed
+expression. The operation visits nested unary and binary expressions,
+instruction expression operands, switch selectors, and trap conditions. It
+also visits the SSA base and index registers carried by memory-address
+expressions. Those address components can only be replaced with a register
+expression of the same register width; an arbitrary expression cannot be
+represented in the current memory-address IR and is rejected. For ordinary
+expression uses, the replacement's full `ValueType` must match. Call
+register-input snapshots are updated when the replacement is a versioned
+register expression of the same width; an arbitrary expression cannot be
+represented by the snapshot and is rejected. Phi inputs are updated when the
+replacement is a new version of the phi's same logical register; expressions
+and versions of other registers cannot be represented by the current phi-input
+IR and are rejected. The operation does not alter definitions, edges, or
+instruction origins. The edit is rejected
+without a versioned target, when the target is absent, or when a replacement
+is incompatible; callers receive either the complete edited function or an
+error, never a partially edited input.
+This is a caller-directed IR transformation and does not establish that the
+replacement is semantically equivalent. Format the returned function with
+`format_pseudocode` or `format_structured_pseudocode` to inspect the edited
+result. Project persistence and undo/redo for arbitrary IR edits are not
+provided by this library operation.
+
 ## Type recovery
 
 The opt-in `recover_types` pass propagates register widths, signedness, pointer
@@ -266,9 +321,11 @@ receiver's concrete aggregate type, the pointer-aligned vtable slot byte
 offset, and the complete function type. When it also supplies the proven
 vfptr offset, candidates must have an imported CodeView `LF_VFTABLE` entry at
 that exact vfptr and slot index. The legacy introduction-slot path remains
-available when no vfptr offset is supplied. Both paths require an identical
-encoded function signature. Multiple declarations are preserved as ambiguous
-candidates; no match remains untyped. Every candidate carries the
+available when no vfptr offset is supplied. Both paths require an exact
+function signature: return and parameter types, qualifiers, variadic state,
+and calling convention must match, while parameter display names are ignored.
+Multiple declarations are preserved as ambiguous candidates; no match remains
+untyped. Every candidate carries the
 caller-supplied provenance string (for example, the receiver assignment and
 PDB vftable symbol used to
 establish the facts).
@@ -291,3 +348,8 @@ only on CF/PF/ZF. These facts survive acyclic CFG edges only when every path
 agrees. Floating exception state, x87 TOP/stack rotation, arithmetic rounding,
 and SAHF predicates involving SF/OF remain opaque. See
 [`docs/decompiler-x87.md`](../../docs/decompiler-x87.md).
+
+The identity pass also removes `~~x` and folds `x & ~x`, `x | ~x`, and
+`x ^ ~x` for structurally equal, pure integer bitvectors of the same width.
+It detects these complements across same-operation associative groups without
+reordering effects or crossing SSA versions.

@@ -22,9 +22,14 @@ and no evaluated value. A valid block outside the selected PC is omitted before
 any register or memory evaluation. This filtering applies to the debugger locals
 table; function-wide pseudocode local-name and type inference remains separate.
 
-Currently evaluated locations are AMD64 and x86 register values,
-frame-pointer-relative memory (RBP/EBP), and register-relative memory using
-AMD64/x86 CodeView register identifiers. `S_DEFRANGE_REGISTER_REL_INDIR`
+Currently evaluated locations include AMD64/x86 register values and ARM64
+integer-register locations: CodeView W0-W30 are read as the low 32 bits of the
+corresponding debugger X register, X0-X28 map to their full-width registers,
+and FP/LR/SP map to x29/x30/SP. Values wider than the recorded CodeView
+register width remain unavailable; zero registers are not treated as writable
+storage. Frame-pointer-relative memory uses RBP/EBP or x29, and
+register-relative memory uses the architecture's supported CodeView register
+identifiers. `S_DEFRANGE_REGISTER_REL_INDIR`
 follows CodeView's `*(Register + BasePointerOffset) + OffsetInUDT` recipe. A
 whole local is read at the pointee only when both recorded member offsets are
 zero. For a nonzero offset, the evaluator requires the local's type to be a
@@ -52,7 +57,8 @@ parent as if it were a member.
 The record layouts were cross-checked against Ghidra's Java PDB reader for
 enregistered fields and LLVM's CodeView definition of the indirect recipe
 ([Ghidra `EnregisteredFieldOfSymbolDARMsSymbol`](https://github.com/NationalSecurityAgency/ghidra/blob/master/Ghidra/Features/PDB/src/main/java/ghidra/app/util/bin/format/pdb2/pdbreader/symbol/EnregisteredFieldOfSymbolDARMsSymbol.java),
-[LLVM `SymbolRecord.h`](https://github.com/llvm/llvm-project/blob/main/llvm/include/llvm/DebugInfo/CodeView/SymbolRecord.h)).
+[LLVM `SymbolRecord.h`](https://github.com/llvm/llvm-project/blob/main/llvm/include/llvm/DebugInfo/CodeView/SymbolRecord.h),
+and [LLVM `CodeViewRegisters.def`](https://github.com/llvm/llvm-project/blob/main/llvm/include/llvm/DebugInfo/CodeView/CodeViewRegisters.def)).
 HexLab performs the bounded type-layout proof and live memory read after
 decoding those records.
 

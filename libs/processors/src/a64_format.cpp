@@ -9,6 +9,16 @@ std::string hex(std::uint64_t value) {
 }
 } // namespace
 std::string mnemonic(Opcode opcode, std::uint8_t condition) {
+    if (opcode == Opcode::a64_adc) return "adc";
+    if (opcode == Opcode::a64_adcs) return "adcs";
+    if (opcode == Opcode::a64_sbc) return "sbc";
+    if (opcode == Opcode::a64_sbcs) return "sbcs";
+    if (opcode == Opcode::a64_rbit) return "rbit";
+    if (opcode == Opcode::a64_rev16) return "rev16";
+    if (opcode == Opcode::a64_rev32) return "rev32";
+    if (opcode == Opcode::a64_rev) return "rev";
+    if (opcode == Opcode::a64_clz) return "clz";
+    if (opcode == Opcode::a64_cls) return "cls";
     if (opcode == Opcode::a64_extr) return "extr";
     if (opcode == Opcode::a64_ldrsw) return "ldrsw";
     if (opcode == Opcode::a64_madd) return "madd";
@@ -26,6 +36,10 @@ std::string mnemonic(Opcode opcode, std::uint8_t condition) {
     if (opcode == Opcode::a64_vand) return "and";
     if (opcode == Opcode::a64_vorr) return "orr";
     if (opcode == Opcode::a64_veor) return "eor";
+    if (opcode == Opcode::a64_vsmax) return "smax";
+    if (opcode == Opcode::a64_vsmin) return "smin";
+    if (opcode == Opcode::a64_vumax) return "umax";
+    if (opcode == Opcode::a64_vumin) return "umin";
     if (opcode == Opcode::a64_fadd) return "fadd";
     if (opcode == Opcode::a64_fsub) return "fsub";
     if (opcode == Opcode::a64_fmul) return "fmul";
@@ -113,7 +127,21 @@ std::string format(const Instruction &i) {
         i.opcode == Opcode::a64_fmul || i.opcode == Opcode::a64_fdiv ||
         i.opcode == Opcode::a64_fmax || i.opcode == Opcode::a64_fmin;
     const bool vector_integer = i.opcode == Opcode::a64_vadd || i.opcode == Opcode::a64_vsub ||
-        i.opcode == Opcode::a64_vand || i.opcode == Opcode::a64_vorr || i.opcode == Opcode::a64_veor;
+        i.opcode == Opcode::a64_vand || i.opcode == Opcode::a64_vorr || i.opcode == Opcode::a64_veor ||
+        i.opcode == Opcode::a64_vsmax || i.opcode == Opcode::a64_vsmin ||
+        i.opcode == Opcode::a64_vumax || i.opcode == Opcode::a64_vumin;
+    if (vector_fp && (i.vector_bits == 32 || i.vector_bits == 64) &&
+        i.vector_bits == i.vector_element_bits && i.operands.size() == 3) {
+        std::string result = mnemonic(i.opcode, i.condition);
+        for (std::size_t n = 0; n < i.operands.size(); ++n) {
+            result += n ? ", " : " ";
+            const auto *reg = std::get_if<RegisterOperand>(&i.operands[n]);
+            if (!reg || reg->bank != RegisterBank::arm64_simd || reg->width != i.vector_bits)
+                return "?a64-scalar-fp";
+            result += register_name(*reg);
+        }
+        return result;
+    }
     if ((vector_integer || vector_fp) && (i.vector_bits == 64 || i.vector_bits == 128) && i.vector_element_bits) {
         const char suffix = i.vector_element_bits == 8 ? 'b' : i.vector_element_bits == 16 ? 'h' :
             i.vector_element_bits == 32 ? 's' : i.vector_element_bits == 64 ? 'd' : '?';
@@ -171,13 +199,36 @@ std::string format(const Instruction &i) {
         }
     }
     std::string result = mnemonic(i.opcode, i.condition);
+    std::uint32_t encoded_word = 0;
+    if (i.bytes.size() == 4)
+        for (unsigned byte = 0; byte < 4; ++byte)
+            encoded_word |= std::uint32_t(std::to_integer<unsigned>(i.bytes[byte])) << (byte * 8);
+    const bool extended_add_sub = i.bytes.size() == 4 &&
+        (encoded_word & 0x1f200000u) == 0x0b200000u;
     for (std::size_t n = 0; n < i.operands.size(); ++n) {
         result += n ? ", " : " ";
         const auto &value = i.operands[n];
-        if (auto r = std::get_if<RegisterOperand>(&value))
+        if (auto r = std::get_if<RegisterOperand>(&value)) {
             result += register_name(*r);
-        else if (auto immediate = std::get_if<ImmediateOperand>(&value)) {
-            if (n == 3 && (i.opcode == Opcode::a64_add || i.opcode == Opcode::a64_adds || i.opcode == Opcode::a64_sub || i.opcode == Opcode::a64_subs || i.opcode == Opcode::a64_and || i.opcode == Opcode::a64_orr || i.opcode == Opcode::a64_eor || i.opcode == Opcode::a64_ands)) {
+            if (n == 2 && (i.opcode == Opcode::a64_add || i.opcode == Opcode::a64_adds ||
+                           i.opcode == Opcode::a64_sub || i.opcode == Opcode::a64_subs) &&
+                extended_add_sub) {
+                if (((encoded_word >> 10) & 7u) == 0) {
+                    static constexpr const char *extensions[] = {
+                        "uxtb", "uxth", "uxtw", "uxtx", "sxtb", "sxth", "sxtw", "sxtx"};
+                    result += ", ";
+                    result += extensions[(encoded_word >> 13) & 7u];
+                }
+            }
+        } else if (auto immediate = std::get_if<ImmediateOperand>(&value)) {
+            if (n == 3 && (i.opcode == Opcode::a64_add || i.opcode == Opcode::a64_adds ||
+                           i.opcode == Opcode::a64_sub || i.opcode == Opcode::a64_subs) &&
+                           extended_add_sub) {
+                    static constexpr const char *extensions[] = {
+                        "uxtb", "uxth", "uxtw", "uxtx", "sxtb", "sxth", "sxtw", "sxtx"};
+                    result += std::string(extensions[(encoded_word >> 13) & 7u]) + " ";
+            }
+            if (n == 3 && !extended_add_sub && (i.opcode == Opcode::a64_add || i.opcode == Opcode::a64_adds || i.opcode == Opcode::a64_sub || i.opcode == Opcode::a64_subs || i.opcode == Opcode::a64_and || i.opcode == Opcode::a64_orr || i.opcode == Opcode::a64_eor || i.opcode == Opcode::a64_ands)) {
                 static constexpr const char *shifts[]{"lsl", "lsr", "asr", "ror"};
                 const auto shift = (std::to_integer<unsigned>(i.bytes[2]) >> 6) & 3;
                 result += std::string(shifts[shift]) + " ";

@@ -16,6 +16,8 @@ Analysis consumes the decoder's normal register read/write metadata.
 
 The lifting is descriptive, not an IEEE evaluator. It does not model FPCR
 rounding modes, exception flags/traps, NaN payload/quieting rules, or exact
-FMAX/FMIN NaN semantics. Scalar FP, half precision, fused operations,
-comparisons, conversions, pairwise/reduction operations, and FP/SIMD loads and
-stores remain unsupported by this feature slice.
+FMAX/FMIN NaN semantics. Half precision, fused operations, comparisons,
+conversions, pairwise/reduction operations, and FP/SIMD loads and stores remain
+unsupported by this feature slice.
+
+The decoder also recognizes scalar S/D three-register FADD, FSUB, FMUL, FDIV, FMAX, and FMIN. Formatting uses sN/dN operands, and register effects identify the full architectural V destination because FPCR merge behavior controls the untouched bits. Half precision, FPCR-dependent value evaluation, exceptions, and scalar decompiler lowering remain outside this decoder slice.

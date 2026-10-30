@@ -316,7 +316,7 @@ Result<database::StateDelta> validate_command(const ProjectSnapshot &snapshot, c
                     require(value.condition.size()<=256,"Project breakpoint condition exceeds 256 bytes");
                     require(value.log_message.size()<=1024,"Project breakpoint log message exceeds 1024 bytes");
                     std::optional<ProjectBreakpoint> after;
-                    if(!value.remove) after=ProjectBreakpoint{found==rows.end()?allocate():found->id,value.address,value.kind,value.enabled,value.size,value.condition,value.logpoint,value.log_message,value.ignore_count};
+                    if(!value.remove) after=ProjectBreakpoint{found==rows.end()?allocate():found->id,value.address,value.kind,value.enabled,value.size,value.condition,value.logpoint,value.log_message,value.ignore_count,value.one_shot};
                     change(rows,found,std::move(after));
                 } else if constexpr (std::is_same_v<T, PatchBytes>) {
                     require(!value.replacement.empty() && value.replacement.size() <= 16 * 1024 * 1024,
@@ -637,7 +637,8 @@ Result<database::StateDelta> validate_command(const ProjectSnapshot &snapshot, c
                                     (!incoming.cfa_offset || (!incoming.address && !incoming.location_expression.empty())),
                                 "Portable debug variable has conflicting location forms");
                         for (const auto &operation : incoming.location_operations)
-                            require(operation.kind <= 15 && !incoming.location_expression.empty() &&
+                            require(operation.kind <= 20 && (operation.kind != 16 || operation.second_unsigned_operand <= 9) &&
+                                        !incoming.location_expression.empty() &&
                                         operation.expression_offset < incoming.location_expression.size(),
                                     "Portable debug variable has an invalid location operation");
                         std::size_t range_expression_bytes = 0, range_operations = 0, range_payload = 4;
@@ -666,7 +667,8 @@ Result<database::StateDelta> validate_command(const ProjectSnapshot &snapshot, c
                                 check_location(snapshot, Location{last.value()});
                             }
                             for (const auto &operation : range.operations)
-                                require(operation.kind <= 15 && !range.expression.empty() &&
+                                require(operation.kind <= 20 && (operation.kind != 16 || operation.second_unsigned_operand <= 9) &&
+                                            !range.expression.empty() &&
                                             operation.expression_offset < range.expression.size(),
                                         "Portable debug variable has an invalid ranged operation");
                         }
@@ -826,10 +828,23 @@ Result<database::StateDelta> validate_command(const ProjectSnapshot &snapshot, c
                         if(!imported_variable_dies.insert(ScopeKey{variable.origin.source_id,variable.origin.section,variable.origin.unit_offset,variable.origin.record_offset}).second)continue;
                         DebugVariable row;row.id=allocate();row.function_entry=function->second;row.name=variable.name;row.is_parameter=variable.is_parameter;row.scope_offset=variable.scope_offset;row.address=variable.address;row.cfa_offset=variable.cfa_offset;row.location_expression=variable.location_expression;
                         row.origin={variable.origin.source_id,variable.origin.section,variable.origin.unit_offset,variable.origin.record_offset,variable.origin.record_size};
+                        const auto persist_operation = [](const symbols::LocationOperation &operation) {
+                            auto value = operation.unsigned_operand;
+                            auto second = operation.second_unsigned_operand;
+                            if (operation.kind == symbols::LocationOperationKind::implicit_value) {
+                                second = operation.block_operand.size() > 8 ? 9 : operation.block_operand.size();
+                                value = 0;
+                                if (operation.block_operand.size() <= 8)
+                                    for (std::size_t i = 0; i < operation.block_operand.size(); ++i)
+                                        value |= static_cast<std::uint64_t>(operation.block_operand[i]) << (i * 8);
+                            }
+                            return database::DebugLocationOperation{static_cast<std::uint8_t>(operation.kind), value,
+                                operation.signed_operand, operation.expression_offset, second};
+                        };
                         row.location_operations.reserve(variable.location_operations.size());
-                        for(const auto& operation:variable.location_operations)row.location_operations.push_back({static_cast<std::uint8_t>(operation.kind),operation.unsigned_operand,operation.signed_operand,operation.expression_offset,operation.second_unsigned_operand});
+                        for(const auto& operation:variable.location_operations)row.location_operations.push_back(persist_operation(operation));
                         row.location_ranges.reserve(variable.location_ranges.size());
-                        for(const auto& range:variable.location_ranges){database::DebugLocationRange imported_range;imported_range.begin=range.begin;imported_range.end=range.end;imported_range.expression=range.expression;for(const auto& operation:range.operations)imported_range.operations.push_back({static_cast<std::uint8_t>(operation.kind),operation.unsigned_operand,operation.signed_operand,operation.expression_offset,operation.second_unsigned_operand});row.location_ranges.push_back(std::move(imported_range));}
+                        for(const auto& range:variable.location_ranges){database::DebugLocationRange imported_range;imported_range.begin=range.begin;imported_range.end=range.end;imported_range.expression=range.expression;for(const auto& operation:range.operations)imported_range.operations.push_back(persist_operation(operation));row.location_ranges.push_back(std::move(imported_range));}
                         if(const auto named_type=project_type_ids.find(variable.type->id());named_type!=project_type_ids.end())row.type_id=named_type->second;
                         delta.changes.emplace_back(DebugVariableChange{{},row});user.debug_variables.push_back(std::move(row));++imported;
                     }

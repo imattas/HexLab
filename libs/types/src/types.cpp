@@ -1,5 +1,6 @@
 #include "hexlab/types/types.hpp"
 #include <algorithm>
+#include <functional>
 #include <limits>
 #include <sstream>
 #include <string_view>
@@ -7,38 +8,44 @@
 
 namespace hexlab::types {
 namespace {
+constexpr std::size_t max_type_record_size = 16 * 1024 * 1024;
+constexpr std::size_t max_type_text_size = 65536;
+constexpr std::size_t max_type_collection_items = 100000;
+constexpr unsigned max_type_nesting = 128;
 hexlab::Error invalid(std::string message) { return {hexlab::ErrorCode::invalid_argument, std::move(message)}; }
 struct TypeWriter {
     std::vector<std::byte> bytes;
-    void number(std::uint64_t value, std::size_t n) { if(n>16*1024*1024-bytes.size())throw std::length_error("type record exceeds limit");for (std::size_t i=0;i<n;++i) bytes.push_back(std::byte(value>>(8*(n-i-1)))); }
-    void text(std::string_view value) { constexpr auto limit=16*1024*1024;if(bytes.size()>limit-4||value.size()>limit-bytes.size()-4)throw std::length_error("type record exceeds limit");number(value.size(),4); auto data=std::as_bytes(std::span(value)); bytes.insert(bytes.end(),data.begin(),data.end()); }
+    void number(std::uint64_t value, std::size_t n) { if (bytes.size() > max_type_record_size || n > max_type_record_size - bytes.size()) throw std::length_error("type record exceeds limit"); for (std::size_t i=0;i<n;++i) bytes.push_back(std::byte(value>>(8*(n-i-1)))); }
+    void count(std::size_t value) { if (value > max_type_collection_items) throw std::length_error("type collection exceeds limit"); number(value, 4); }
+    void text(std::string_view value) { if (value.size() > max_type_text_size) throw std::length_error("type text exceeds limit"); if (bytes.size() > max_type_record_size - 4 || value.size() > max_type_record_size - bytes.size() - 4) throw std::length_error("type record exceeds limit"); number(value.size(),4); auto data=std::as_bytes(std::span(value)); bytes.insert(bytes.end(),data.begin(),data.end()); }
 };
 struct TypeReader {
     std::span<const std::byte> bytes; std::size_t cursor=0;
-    std::uint64_t number(std::size_t n) { if(n>bytes.size()-cursor) throw std::runtime_error("truncated type record"); std::uint64_t v=0; while(n--) v=(v<<8)|std::to_integer<unsigned>(bytes[cursor++]); return v; }
-    std::string text() { auto n=number(4); if(n>65536 || n>bytes.size()-cursor) throw std::runtime_error("invalid type text extent"); std::string v(reinterpret_cast<const char*>(bytes.data()+cursor),static_cast<std::size_t>(n)); cursor+=static_cast<std::size_t>(n); return v; }
+    std::uint64_t number(std::size_t n) { if (cursor > bytes.size() || n > bytes.size() - cursor) throw std::runtime_error("truncated type record"); std::uint64_t v=0; while(n--) v=(v<<8)|std::to_integer<unsigned>(bytes[cursor++]); return v; }
+    std::string text() { auto n=number(4); if(n>max_type_text_size || n>bytes.size()-cursor) throw std::runtime_error("invalid type text extent"); std::string v(reinterpret_cast<const char*>(bytes.data()+cursor),static_cast<std::size_t>(n)); cursor+=static_cast<std::size_t>(n); return v; }
 };
 void write_type(TypeWriter& out,const Type& t,unsigned depth,std::uint8_t version) {
-    if(depth>128) throw std::length_error("type nesting exceeds limit");
+    if(depth>max_type_nesting) throw std::length_error("type nesting exceeds limit");
     out.number(static_cast<unsigned>(t.kind()),1); out.text(t.name()); out.number(t.size().value_or(UINT64_MAX),8); out.number(t.alignment(),8); out.number(t.is_signed(),1); out.number(t.count(),8);
     switch(t.kind()) {
     case Kind::void_type: break;
     case Kind::boolean: case Kind::integer: case Kind::floating: break;
     case Kind::named_reference: break;
-    case Kind::pointer: case Kind::array: case Kind::vector: write_type(out,*t.element(),depth+1,version); break;
+    case Kind::pointer: case Kind::vector: write_type(out,*t.element(),depth+1,version); break;
+    case Kind::array: if(version>=19)out.number(t.array_stride(),8);write_type(out,*t.element(),depth+1,version); break;
     case Kind::enumeration:
         write_type(out,*t.element(),depth+1,version);
-        out.number(t.enumerators().size(),4);
+        out.count(t.enumerators().size());
         if (version == 1) { for (const auto& v : t.enumerators()) out.text(v); }
         else for (const auto& v : t.enumerator_values()) { out.text(v.name); out.number(v.value,8); }
         break;
-    case Kind::structure: case Kind::union_type: if(version>=10)out.number(t.size().has_value(),1);if(version>=6){out.number(t.packing_alignment().has_value(),1);if(t.packing_alignment())out.number(*t.packing_alignment(),8);}out.number(t.members().size(),4);for(auto& m:t.members()){out.text(m.name);out.number(m.offset,8);if(version>=3){out.number(m.bit_width.has_value(),1);if(m.bit_width){out.number(*m.bit_width,4);out.number(*m.bit_offset,4);}}if(version>=4){out.number(m.effective_alignment.has_value(),1);if(m.effective_alignment)out.number(*m.effective_alignment,8);}if(version>=9){out.number(m.virtual_base.has_value(),1);if(m.virtual_base){out.number(m.virtual_base->vbptr_offset,8);out.number(m.virtual_base->vbtable_index,8);out.number(m.virtual_base->indirect,1);write_type(out,*m.virtual_base->vbptr_type,depth+1,version);}}if(version>=15)out.number(static_cast<unsigned>(m.access),1);write_type(out,*m.type,depth+1,version);}if(version>=11){out.number(t.methods().size(),4);for(const auto& m:t.methods()){out.text(m.name);out.number(static_cast<unsigned>(m.access),1);out.number(static_cast<unsigned>(m.dispatch),1);out.number(m.source_attributes,2);out.number(m.is_static,1);out.number(m.introducing_vtable_offset.has_value(),1);if(m.introducing_vtable_offset)out.number(*m.introducing_vtable_offset,4);out.number(static_cast<std::uint32_t>(m.this_adjustment),4);out.number(m.function_options,1);out.number(m.declaration_ordinal,4);out.number(m.signature!=nullptr,1);if(m.signature)write_type(out,*m.signature,depth+1,version);out.number(m.this_type!=nullptr,1);if(m.this_type)write_type(out,*m.this_type,depth+1,version);if(version>=12){out.number(m.vtable_slots.size(),4);for(const auto& slot:m.vtable_slots){out.number(slot.vfptr_offset,4);out.number(slot.slot_index,4);out.text(slot.table_name);out.text(slot.method_name);out.number(slot.source_namespace,1);out.number(slot.source_type_index,4);out.number(slot.source_record_offset,4);}}}}if(version>=13){out.number(t.static_data_members().size(),4);for(const auto& member:t.static_data_members()){out.text(member.name);out.number(static_cast<unsigned>(member.access),1);out.number(member.source_attributes,2);out.number(member.declaration_ordinal,4);write_type(out,*member.type,depth+1,version);}}break;
-    case Kind::function: if(version>=7)out.number(static_cast<std::uint8_t>(t.function_convention()),1);write_type(out,*t.result_type(),depth+1,version);out.number(t.parameters().size(),4);for(auto& p:t.parameters()){out.text(p.name);write_type(out,*p.type,depth+1,version);}out.number(t.variadic(),1);break;
-    case Kind::qualified: if(version<8)throw std::runtime_error("qualified type requires type record version 8");out.number(t.qualifiers(),1);write_type(out,*t.element(),depth+1,version);break;
+    case Kind::structure: case Kind::union_type: if(version>=10)out.number(t.size().has_value(),1);if(version>=6){out.number(t.packing_alignment().has_value(),1);if(t.packing_alignment())out.number(*t.packing_alignment(),8);}out.count(t.members().size());for(auto& m:t.members()){out.text(m.name);out.number(m.offset,8);if(version>=3){out.number(m.bit_width.has_value(),1);if(m.bit_width){out.number(*m.bit_width,4);out.number(*m.bit_offset,4);}}if(version>=4){out.number(m.effective_alignment.has_value(),1);if(m.effective_alignment)out.number(*m.effective_alignment,8);}if(version>=9){out.number(m.virtual_base.has_value(),1);if(m.virtual_base){out.number(m.virtual_base->vbptr_offset,8);out.number(m.virtual_base->vbtable_index,8);out.number(m.virtual_base->indirect,1);write_type(out,*m.virtual_base->vbptr_type,depth+1,version);}}if(version>=15)out.number(static_cast<unsigned>(m.access),1);if(version>=18)out.number(m.anonymous,1);write_type(out,*m.type,depth+1,version);}if(version>=11){out.count(t.methods().size());for(const auto& m:t.methods()){out.text(m.name);out.number(static_cast<unsigned>(m.access),1);out.number(static_cast<unsigned>(m.dispatch),1);out.number(m.source_attributes,2);out.number(m.is_static,1);out.number(m.introducing_vtable_offset.has_value(),1);if(m.introducing_vtable_offset)out.number(*m.introducing_vtable_offset,4);out.number(static_cast<std::uint32_t>(m.this_adjustment),4);out.number(m.function_options,1);out.number(m.declaration_ordinal,4);out.number(m.signature!=nullptr,1);if(m.signature)write_type(out,*m.signature,depth+1,version);out.number(m.this_type!=nullptr,1);if(m.this_type)write_type(out,*m.this_type,depth+1,version);if(version>=12){out.count(m.vtable_slots.size());for(const auto& slot:m.vtable_slots){out.number(slot.vfptr_offset,4);out.number(slot.slot_index,4);out.text(slot.table_name);out.text(slot.method_name);out.number(slot.source_namespace,1);out.number(slot.source_type_index,4);out.number(slot.source_record_offset,4);}}}}if(version>=13){out.count(t.static_data_members().size());for(const auto& member:t.static_data_members()){out.text(member.name);out.number(static_cast<unsigned>(member.access),1);out.number(member.source_attributes,2);out.number(member.declaration_ordinal,4);write_type(out,*member.type,depth+1,version);}}break;
+    case Kind::function: if(version>=7)out.number(static_cast<std::uint8_t>(t.function_convention()),1);write_type(out,*t.result_type(),depth+1,version);out.count(t.parameters().size());for(auto& p:t.parameters()){out.text(p.name);write_type(out,*p.type,depth+1,version);}out.number(t.variadic(),1);break;
+    case Kind::qualified: if(version<8)throw std::runtime_error("qualified type requires type record version 8");if(version<17&&(t.qualifiers()&static_cast<std::uint8_t>(Qualifier::atomic_)))throw std::runtime_error("atomic qualification requires type record version 17");out.number(t.qualifiers(),1);write_type(out,*t.element(),depth+1,version);break;
     }
 }
 TypePtr read_type(TypeReader& in,unsigned depth,std::uint8_t version) {
-    if(depth>128) throw std::runtime_error("type nesting exceeds limit");
+    if(depth>max_type_nesting) throw std::runtime_error("type nesting exceeds limit");
     auto kind=static_cast<Kind>(in.number(1));auto name=in.text();auto size=in.number(8),align=in.number(8),sign=in.number(1),count=in.number(8);
     if(kind==Kind::void_type)return Type::void_type();
     if(kind==Kind::named_reference)return Type::named_reference(std::move(name)).value();
@@ -46,12 +53,27 @@ TypePtr read_type(TypeReader& in,unsigned depth,std::uint8_t version) {
     if(kind==Kind::integer)return Type::integer(std::move(name),size,align,sign!=0).value();
     if(kind==Kind::floating)return Type::floating(std::move(name),size,align).value();
     if(kind==Kind::pointer)return Type::pointer(read_type(in,depth+1,version),size,align).value();
-    if(kind==Kind::array)return Type::array(read_type(in,depth+1,version),count).value();
+    if(kind==Kind::array){
+        if(version>=19){
+            const auto stride=in.number(8);
+            auto element=read_type(in,depth+1,version);
+            // A zero count represents an incomplete array. It is valid only
+            // with the natural element stride; padded arrays need a count to
+            // define their occupied extent.
+            if(count==0){
+                if(!element->size() || stride!=*element->size())
+                    throw std::runtime_error("incomplete array has an invalid stride");
+                return Type::array(std::move(element),0).value();
+            }
+            return Type::strided_array(std::move(element),count,stride).value();
+        }
+        return Type::array(read_type(in,depth+1,version),count).value();
+    }
     if(kind==Kind::vector){if(version<5)throw std::runtime_error("vector type requires type record version 5");return Type::vector(read_type(in,depth+1,version),count,align).value();}
-    if(kind==Kind::enumeration){auto base=read_type(in,depth+1,version);auto n=in.number(4);if(n>100000)throw std::runtime_error("too many enumerators");if(version==1){std::vector<std::string> values;while(n--)values.push_back(in.text());return Type::enumeration(std::move(name),std::move(base),std::move(values)).value();}std::vector<Enumerator> values;while(n--)values.push_back({in.text(),in.number(8)});return Type::enumeration_with_values(std::move(name),std::move(base),std::move(values)).value();}
-    if(kind==Kind::structure||kind==Kind::union_type){const auto has_size=version>=10?in.number(1):1;if(has_size>1)throw std::runtime_error("invalid aggregate completeness flag");if(version>=10&&((has_size==0)!=(size==UINT64_MAX)))throw std::runtime_error("aggregate completeness flag disagrees with its size");std::optional<std::uint64_t> packing_alignment;if(version>=6){const auto has_pack=in.number(1);if(has_pack>1)throw std::runtime_error("invalid aggregate packing flag");if(has_pack)packing_alignment=in.number(8);}auto n=in.number(4);if(n>100000)throw std::runtime_error("too many members");std::vector<Member> members;while(n--){auto member=in.text();auto offset=in.number(8);std::optional<std::uint32_t> width,bit_offset;std::optional<std::uint64_t> effective_alignment;if(version>=3){const auto has_bits=in.number(1);if(has_bits>1)throw std::runtime_error("invalid bitfield flag");if(has_bits){width=static_cast<std::uint32_t>(in.number(4));bit_offset=static_cast<std::uint32_t>(in.number(4));}}if(version>=4){const auto has_alignment=in.number(1);if(has_alignment>1)throw std::runtime_error("invalid effective alignment flag");if(has_alignment)effective_alignment=in.number(8);}std::optional<Member::VirtualBaseLocation> virtual_base;if(version>=9){const auto has_virtual_base=in.number(1);if(has_virtual_base>1)throw std::runtime_error("invalid virtual-base flag");if(has_virtual_base){auto vbptr_offset=in.number(8),vbtable_index=in.number(8),indirect=in.number(1);if(indirect>1)throw std::runtime_error("invalid indirect virtual-base flag");virtual_base=Member::VirtualBaseLocation{read_type(in,depth+1,version),vbptr_offset,vbtable_index,indirect!=0};}}MemberAccess access=MemberAccess::unknown;if(version>=15){const auto encoded_access=in.number(1);if(encoded_access>static_cast<unsigned>(MemberAccess::public_))throw std::runtime_error("invalid member access");access=static_cast<MemberAccess>(encoded_access);}members.push_back({std::move(member),read_type(in,depth+1,version),offset,width,bit_offset,effective_alignment,std::move(virtual_base),access});}std::vector<Method> methods;if(version>=11){auto count=in.number(4);if(count>100000)throw std::runtime_error("too many methods");while(count--){Method m;m.name=in.text();auto access=in.number(1),dispatch=in.number(1);if(access>static_cast<unsigned>(MemberAccess::public_)||dispatch>static_cast<unsigned>(MemberDispatch::unknown))throw std::runtime_error("invalid method access or dispatch");m.access=static_cast<MemberAccess>(access);m.dispatch=static_cast<MemberDispatch>(dispatch);m.source_attributes=static_cast<std::uint16_t>(in.number(2));auto is_static=in.number(1),has_slot=in.number(1);if(is_static>1||has_slot>1)throw std::runtime_error("invalid method flag");m.is_static=is_static!=0;if(has_slot)m.introducing_vtable_offset=static_cast<std::uint32_t>(in.number(4));m.this_adjustment=static_cast<std::int32_t>(in.number(4));m.function_options=static_cast<std::uint8_t>(in.number(1));m.declaration_ordinal=static_cast<std::uint32_t>(in.number(4));auto has_signature=in.number(1);if(has_signature>1)throw std::runtime_error("invalid method signature flag");if(has_signature)m.signature=read_type(in,depth+1,version);auto has_this=in.number(1);if(has_this>1)throw std::runtime_error("invalid method this flag");if(has_this)m.this_type=read_type(in,depth+1,version);if(version>=12){auto slot_count=in.number(4);if(slot_count>100000)throw std::runtime_error("too many virtual-table slots");while(slot_count--){VTableSlot slot;slot.vfptr_offset=static_cast<std::uint32_t>(in.number(4));slot.slot_index=static_cast<std::uint32_t>(in.number(4));slot.table_name=in.text();slot.method_name=in.text();slot.source_namespace=static_cast<std::uint8_t>(in.number(1));slot.source_type_index=static_cast<std::uint32_t>(in.number(4));slot.source_record_offset=static_cast<std::uint32_t>(in.number(4));m.vtable_slots.push_back(std::move(slot));}}methods.push_back(std::move(m));}}std::vector<StaticDataMember> static_data_members;if(version>=13){auto count=in.number(4);if(count>100000)throw std::runtime_error("too many static data members");while(count--){StaticDataMember member;member.name=in.text();auto access=in.number(1);if(access>static_cast<unsigned>(MemberAccess::public_))throw std::runtime_error("invalid static data access");member.access=static_cast<MemberAccess>(access);member.source_attributes=static_cast<std::uint16_t>(in.number(2));member.declaration_ordinal=static_cast<std::uint32_t>(in.number(4));member.type=read_type(in,depth+1,version);static_data_members.push_back(std::move(member));}}TypePtr aggregate;if(!has_size){if(!members.empty()||packing_alignment)throw std::runtime_error("incomplete aggregate has layout metadata");aggregate=Type::incomplete_aggregate(kind,std::move(name)).value();}else aggregate=(kind==Kind::structure?Type::structure(std::move(name),std::move(members),size,align,packing_alignment):Type::union_type(std::move(name),std::move(members),size,align,packing_alignment)).value();if(!methods.empty())aggregate=Type::with_methods(std::move(aggregate),std::move(methods)).value();if(!static_data_members.empty())aggregate=Type::with_static_data_members(std::move(aggregate),std::move(static_data_members)).value();return aggregate;}
-    if(kind==Kind::function){auto convention=version>=7?in.number(1):0;if(convention>static_cast<std::uint8_t>(FunctionConvention::mips_n32)|| (convention==static_cast<std::uint8_t>(FunctionConvention::mips_n32)&&version<14))throw std::runtime_error("invalid function calling convention");auto result=read_type(in,depth+1,version);auto n=in.number(4);if(n>100000)throw std::runtime_error("too many parameters");std::vector<Parameter> params;while(n--)params.push_back({in.text(),read_type(in,depth+1,version)});auto variadic=in.number(1);if(variadic>1)throw std::runtime_error("invalid variadic flag");return Type::function(std::move(result),std::move(params),variadic!=0,static_cast<FunctionConvention>(convention)).value();}
-    if(kind==Kind::qualified){if(version<8)throw std::runtime_error("qualified type requires type record version 8");const auto qualifiers=in.number(1);return Type::qualified(read_type(in,depth+1,version),static_cast<std::uint8_t>(qualifiers)).value();}
+    if(kind==Kind::enumeration){auto base=read_type(in,depth+1,version);auto n=in.number(4);if(n>max_type_collection_items)throw std::runtime_error("too many enumerators");if(version==1){std::vector<std::string> values;while(n--)values.push_back(in.text());return Type::enumeration(std::move(name),std::move(base),std::move(values)).value();}std::vector<Enumerator> values;while(n--)values.push_back({in.text(),in.number(8)});return Type::enumeration_with_values(std::move(name),std::move(base),std::move(values)).value();}
+    if(kind==Kind::structure||kind==Kind::union_type){const auto has_size=version>=10?in.number(1):1;if(has_size>1)throw std::runtime_error("invalid aggregate completeness flag");if(version>=10&&((has_size==0)!=(size==UINT64_MAX)))throw std::runtime_error("aggregate completeness flag disagrees with its size");std::optional<std::uint64_t> packing_alignment;if(version>=6){const auto has_pack=in.number(1);if(has_pack>1)throw std::runtime_error("invalid aggregate packing flag");if(has_pack)packing_alignment=in.number(8);}auto n=in.number(4);if(n>max_type_collection_items)throw std::runtime_error("too many members");std::vector<Member> members;while(n--){auto member=in.text();auto offset=in.number(8);std::optional<std::uint32_t> width,bit_offset;std::optional<std::uint64_t> effective_alignment;if(version>=3){const auto has_bits=in.number(1);if(has_bits>1)throw std::runtime_error("invalid bitfield flag");if(has_bits){width=static_cast<std::uint32_t>(in.number(4));bit_offset=static_cast<std::uint32_t>(in.number(4));}}if(version>=4){const auto has_alignment=in.number(1);if(has_alignment>1)throw std::runtime_error("invalid effective alignment flag");if(has_alignment)effective_alignment=in.number(8);}std::optional<Member::VirtualBaseLocation> virtual_base;if(version>=9){const auto has_virtual_base=in.number(1);if(has_virtual_base>1)throw std::runtime_error("invalid virtual-base flag");if(has_virtual_base){auto vbptr_offset=in.number(8),vbtable_index=in.number(8),indirect=in.number(1);if(indirect>1)throw std::runtime_error("invalid indirect virtual-base flag");virtual_base=Member::VirtualBaseLocation{read_type(in,depth+1,version),vbptr_offset,vbtable_index,indirect!=0};}}MemberAccess access=MemberAccess::unknown;if(version>=15){const auto encoded_access=in.number(1);if(encoded_access>static_cast<unsigned>(MemberAccess::public_))throw std::runtime_error("invalid member access");access=static_cast<MemberAccess>(encoded_access);}bool anonymous=false;if(version>=18){const auto flag=in.number(1);if(flag>1)throw std::runtime_error("invalid anonymous member flag");anonymous=flag!=0;}members.push_back({std::move(member),read_type(in,depth+1,version),offset,width,bit_offset,effective_alignment,std::move(virtual_base),access,anonymous});}std::vector<Method> methods;if(version>=11){auto count=in.number(4);if(count>max_type_collection_items)throw std::runtime_error("too many methods");while(count--){Method m;m.name=in.text();auto access=in.number(1),dispatch=in.number(1);if(access>static_cast<unsigned>(MemberAccess::public_)||dispatch>static_cast<unsigned>(MemberDispatch::unknown))throw std::runtime_error("invalid method access or dispatch");m.access=static_cast<MemberAccess>(access);m.dispatch=static_cast<MemberDispatch>(dispatch);m.source_attributes=static_cast<std::uint16_t>(in.number(2));auto is_static=in.number(1),has_slot=in.number(1);if(is_static>1||has_slot>1)throw std::runtime_error("invalid method flag");m.is_static=is_static!=0;if(has_slot)m.introducing_vtable_offset=static_cast<std::uint32_t>(in.number(4));m.this_adjustment=static_cast<std::int32_t>(in.number(4));m.function_options=static_cast<std::uint8_t>(in.number(1));m.declaration_ordinal=static_cast<std::uint32_t>(in.number(4));auto has_signature=in.number(1);if(has_signature>1)throw std::runtime_error("invalid method signature flag");if(has_signature)m.signature=read_type(in,depth+1,version);auto has_this=in.number(1);if(has_this>1)throw std::runtime_error("invalid method this flag");if(has_this)m.this_type=read_type(in,depth+1,version);if(version>=12){auto slot_count=in.number(4);if(slot_count>max_type_collection_items)throw std::runtime_error("too many virtual-table slots");while(slot_count--){VTableSlot slot;slot.vfptr_offset=static_cast<std::uint32_t>(in.number(4));slot.slot_index=static_cast<std::uint32_t>(in.number(4));slot.table_name=in.text();slot.method_name=in.text();slot.source_namespace=static_cast<std::uint8_t>(in.number(1));slot.source_type_index=static_cast<std::uint32_t>(in.number(4));slot.source_record_offset=static_cast<std::uint32_t>(in.number(4));m.vtable_slots.push_back(std::move(slot));}}methods.push_back(std::move(m));}}std::vector<StaticDataMember> static_data_members;if(version>=13){auto count=in.number(4);if(count>max_type_collection_items)throw std::runtime_error("too many static data members");while(count--){StaticDataMember member;member.name=in.text();auto access=in.number(1);if(access>static_cast<unsigned>(MemberAccess::public_))throw std::runtime_error("invalid static data access");member.access=static_cast<MemberAccess>(access);member.source_attributes=static_cast<std::uint16_t>(in.number(2));member.declaration_ordinal=static_cast<std::uint32_t>(in.number(4));member.type=read_type(in,depth+1,version);static_data_members.push_back(std::move(member));}}TypePtr aggregate;if(!has_size){if(!members.empty()||packing_alignment)throw std::runtime_error("incomplete aggregate has layout metadata");aggregate=Type::incomplete_aggregate(kind,std::move(name)).value();}else aggregate=(kind==Kind::structure?Type::structure(std::move(name),std::move(members),size,align,packing_alignment):Type::union_type(std::move(name),std::move(members),size,align,packing_alignment)).value();if(!methods.empty())aggregate=Type::with_methods(std::move(aggregate),std::move(methods)).value();if(!static_data_members.empty())aggregate=Type::with_static_data_members(std::move(aggregate),std::move(static_data_members)).value();return aggregate;}
+    if(kind==Kind::function){auto convention=version>=7?in.number(1):0;if(convention>static_cast<std::uint8_t>(FunctionConvention::aapcs32_vfp)|| (convention==static_cast<std::uint8_t>(FunctionConvention::mips_n32)&&version<14)||(convention==static_cast<std::uint8_t>(FunctionConvention::aapcs32_vfp)&&version<16))throw std::runtime_error("invalid function calling convention");auto result=read_type(in,depth+1,version);auto n=in.number(4);if(n>max_type_collection_items)throw std::runtime_error("too many parameters");std::vector<Parameter> params;while(n--)params.push_back({in.text(),read_type(in,depth+1,version)});auto variadic=in.number(1);if(variadic>1)throw std::runtime_error("invalid variadic flag");return Type::function(std::move(result),std::move(params),variadic!=0,static_cast<FunctionConvention>(convention)).value();}
+    if(kind==Kind::qualified){if(version<8)throw std::runtime_error("qualified type requires type record version 8");const auto qualifiers=in.number(1);if(version<17&&(qualifiers&static_cast<std::uint8_t>(Qualifier::atomic_)))throw std::runtime_error("atomic qualification requires type record version 17");return Type::qualified(read_type(in,depth+1,version),static_cast<std::uint8_t>(qualifiers)).value();}
     throw std::runtime_error("unknown type kind");
 }
 std::uint64_t hash(std::string_view text) {
@@ -77,7 +99,7 @@ std::string canonical(const Type &type, std::unordered_set<const Type *> &active
     out << static_cast<int>(type.kind()) << ':';
     append_text(out, type.name());
     out << ':' << type.size().value_or(UINT64_MAX) << ':' << type.alignment() << ':' << type.packing_alignment().value_or(0) << ':' << type.is_signed() << ':'
-        << type.count() << ':';
+        << type.count() << ':' << type.array_stride() << ':';
     if (!type.size() && (type.kind() == Kind::structure || type.kind() == Kind::union_type))
         out << "incomplete:";
     if (type.qualifiers()) out << 'q' << static_cast<unsigned>(type.qualifiers()) << ':';
@@ -98,6 +120,7 @@ std::string canonical(const Type &type, std::unordered_set<const Type *> &active
         }
         if (member.effective_alignment) out << 'a' << *member.effective_alignment;
         if (member.bit_width) out << 'b' << *member.bit_width << '@' << *member.bit_offset;
+        if (member.anonymous) out << 'n';
         if (member.access != MemberAccess::unknown)
             out << 'a' << static_cast<unsigned>(member.access) << ':';
         out << canonical(*member.type, active) << '}';
@@ -156,6 +179,52 @@ void assign_id(Type &type) {
     type.id_ = hash(canonical(type, active));
 }
 
+std::vector<std::size_t> Type::members_covering_offset(std::uint64_t byte_offset) const {
+    std::vector<std::size_t> result;
+    if (kind_ != Kind::structure && kind_ != Kind::union_type) return result;
+    for (std::size_t i = 0; i < members_.size(); ++i) {
+        const auto &member = members_[i];
+        if (member.virtual_base || !member.type || (member.bit_width && *member.bit_width == 0) || !member.type->size())
+            continue;
+        const auto extent = *member.type->size();
+        // Aggregate validation guarantees member extents fit their owner;
+        // subtraction keeps the query safe even for malformed future sources.
+        if (byte_offset >= member.offset && byte_offset - member.offset < extent)
+            result.push_back(i);
+    }
+    return result;
+}
+
+std::vector<MemberPath> Type::member_paths(std::string_view name) const {
+    std::vector<MemberPath> result;
+    if ((kind_ != Kind::structure && kind_ != Kind::union_type) || name.empty()) return result;
+    std::vector<std::size_t> indexes;
+    std::unordered_set<const Type *> active;
+    std::function<void(const Type &, std::uint64_t, unsigned)> visit =
+        [&](const Type &aggregate, std::uint64_t base, unsigned depth) {
+            if (depth > 64 || (aggregate.kind() != Kind::structure && aggregate.kind() != Kind::union_type) ||
+                !active.insert(&aggregate).second)
+                return;
+            for (std::size_t i = 0; i < aggregate.members().size(); ++i) {
+                const auto &member = aggregate.members()[i];
+                if (member.offset > UINT64_MAX - base) continue;
+                const auto offset = base + member.offset;
+                indexes.push_back(i);
+                if (member.anonymous && member.type) {
+                    const auto *child = unqualified(member.type.get());
+                    if (child && (child->kind() == Kind::structure || child->kind() == Kind::union_type))
+                        visit(*child, offset, depth + 1);
+                } else if (!member.name.empty() && member.name == name) {
+                    result.push_back(MemberPath{indexes, offset});
+                }
+                indexes.pop_back();
+            }
+            active.erase(&aggregate);
+        };
+    visit(*this, 0, 0);
+    return result;
+}
+
 hexlab::Result<TypePtr> Type::aggregate(Kind kind, std::string name, std::vector<Member> members, std::uint64_t size,
                                         std::uint64_t alignment, std::optional<std::uint64_t> packing_alignment) {
     if (name.empty() || !valid_layout(size, alignment))
@@ -164,6 +233,19 @@ hexlab::Result<TypePtr> Type::aggregate(Kind kind, std::string name, std::vector
         (*packing_alignment & (*packing_alignment - 1)) != 0))
         return invalid("aggregate packing alignment must be a power of two from 1 through 16");
     std::unordered_set<std::string> names;
+    std::function<bool(const Type &, unsigned)> add_promoted_names = [&](const Type &aggregate, unsigned depth) {
+        if (depth > 64 || (aggregate.kind() != Kind::structure && aggregate.kind() != Kind::union_type))
+            return false;
+        for (const auto &nested : aggregate.members()) {
+            if (nested.anonymous) {
+                const auto *child = unqualified(nested.type.get());
+                if (!child || !add_promoted_names(*child, depth + 1)) return false;
+            } else if (!nested.name.empty() && !names.insert(nested.name).second) {
+                return false;
+            }
+        }
+        return true;
+    };
     for (std::size_t member_index = 0; member_index < members.size(); ++member_index) {
         const auto &member = members[member_index];
         const auto *member_base = unqualified(member.type.get());
@@ -190,8 +272,13 @@ hexlab::Result<TypePtr> Type::aggregate(Kind kind, std::string name, std::vector
         const bool deferred_named = member_base && member_base->kind() == Kind::named_reference;
         const bool zero_width_barrier = member.bit_width && *member.bit_width == 0 &&
                                         member.bit_offset && *member.bit_offset == 0;
-        if ((!member.bit_width && member.name.empty()) ||
-            (!member.name.empty() && !names.insert(member.name).second) || !member.type ||
+        const bool anonymous_type = member_base &&
+            (member_base->kind() == Kind::structure || member_base->kind() == Kind::union_type);
+        if ((!member.bit_width && member.name.empty() && !member.anonymous) ||
+            (member.anonymous && (!member.name.empty() || !anonymous_type || member.bit_width || member.bit_offset ||
+                                  member.virtual_base)) ||
+            (!member.name.empty() && !names.insert(member.name).second) ||
+            (member.anonymous && !add_promoted_names(*member_base, 0)) || !member.type ||
             static_cast<unsigned>(member.access) > static_cast<unsigned>(MemberAccess::public_) ||
             (!member.type->size() && !flexible && !deferred_named))
             return invalid("aggregate members require unique names and sized types or a named reference");
@@ -283,7 +370,8 @@ hexlab::Result<TypePtr> Type::named_reference(std::string name) {
 }
 hexlab::Result<TypePtr> Type::qualified(TypePtr base, std::uint8_t qualifiers) {
     constexpr std::uint8_t known = static_cast<std::uint8_t>(Qualifier::const_) |
-        static_cast<std::uint8_t>(Qualifier::volatile_) | static_cast<std::uint8_t>(Qualifier::restrict_);
+        static_cast<std::uint8_t>(Qualifier::volatile_) | static_cast<std::uint8_t>(Qualifier::restrict_) |
+        static_cast<std::uint8_t>(Qualifier::atomic_);
     if (!base || !qualifiers || (qualifiers & ~known)) return invalid("qualified type requires a base and known qualifiers");
     if (base->kind() == Kind::qualified && base->element() && base->element()->kind() != Kind::pointer) {
         qualifiers |= base->qualifiers();
@@ -325,11 +413,17 @@ hexlab::Result<TypePtr> Type::with_methods(TypePtr aggregate, std::vector<Method
             static_cast<unsigned>(method.dispatch) > static_cast<unsigned>(MemberDispatch::unknown) ||
             (method.is_static && method.this_type))
             return invalid("aggregate method metadata is invalid");
+        for (const auto &member : aggregate->members())
+            if (!member.name.empty() && member.name == method.name)
+                return invalid("aggregate method name conflicts with a data member");
+        for (const auto &member : aggregate->static_data_members())
+            if (member.name == method.name)
+                return invalid("aggregate method name conflicts with a static data member");
         if (method.introducing_vtable_offset &&
             method.dispatch != MemberDispatch::introducing_virtual &&
             method.dispatch != MemberDispatch::pure_introducing_virtual)
             return invalid("only an introducing virtual method may have a vtable offset");
-        if (method.vtable_slots.size() > 100000)
+        if (method.vtable_slots.size() > max_type_collection_items)
             return invalid("aggregate method has too many virtual-table slots");
         for (const auto &slot : method.vtable_slots)
             if (method.is_static || slot.table_name.empty() || slot.method_name.empty() ||
@@ -347,11 +441,18 @@ hexlab::Result<TypePtr> Type::with_static_data_members(TypePtr aggregate, std::v
     if (!aggregate || (aggregate->kind() != Kind::structure && aggregate->kind() != Kind::union_type))
         return invalid("static data declarations require an aggregate type");
     std::unordered_set<std::string> names;
-    for (const auto &member : members)
+    for (const auto &member : members) {
         if (member.name.empty() || member.name.size() > 4096 || !member.type ||
             static_cast<unsigned>(member.access) > static_cast<unsigned>(MemberAccess::public_) ||
             !names.insert(member.name).second)
             return invalid("aggregate static data metadata is invalid");
+        for (const auto &instance_member : aggregate->members())
+            if (!instance_member.name.empty() && instance_member.name == member.name)
+                return invalid("aggregate static data name conflicts with an instance data member");
+        for (const auto &method : aggregate->methods())
+            if (method.name == member.name)
+                return invalid("aggregate static data name conflicts with a method");
+    }
     auto type = std::shared_ptr<Type>(new Type(*aggregate));
     type->static_data_members_ = std::move(members);
     assign_id(*type);
@@ -424,10 +525,22 @@ hexlab::Result<TypePtr> Type::array(TypePtr element, std::uint64_t count) {
     type->name_ = "array";
     type->element_ = std::move(element);
     type->count_ = count;
+    type->array_stride_ = *type->element_->size();
     if (count) type->size_ = *type->element_->size() * count;
     type->alignment_ = type->element_->alignment();
     assign_id(*type);
     return TypePtr(type);
+}
+hexlab::Result<TypePtr> Type::strided_array(TypePtr element, std::uint64_t count, std::uint64_t stride) {
+    if (!element || !element->size() || !*element->size() || stride < *element->size())
+        return invalid("strided array requires a complete element and a stride at least as large as the element");
+    if (!count) return invalid("strided array count must be nonzero");
+    if (count - 1 > (UINT64_MAX - *element->size()) / stride)
+        return invalid("strided array size overflows");
+    auto type = std::shared_ptr<Type>(new Type(Kind::array));
+    type->name_ = "array"; type->element_ = std::move(element); type->count_ = count;
+    type->array_stride_ = stride; type->size_ = (count - 1) * stride + *type->element_->size();
+    type->alignment_ = type->element_->alignment(); assign_id(*type); return TypePtr(type);
 }
 hexlab::Result<TypePtr> Type::incomplete_aggregate(Kind kind, std::string name) {
     if ((kind != Kind::structure && kind != Kind::union_type) || name.empty())
@@ -481,7 +594,7 @@ hexlab::Result<TypePtr> Type::enumeration_with_values(std::string name, TypePtr 
 }
 hexlab::Result<TypePtr> Type::function(TypePtr result, std::vector<Parameter> parameters, bool variadic,
                                        FunctionConvention convention) {
-    if (static_cast<std::uint8_t>(convention) > static_cast<std::uint8_t>(FunctionConvention::mips_n32))
+    if (static_cast<std::uint8_t>(convention) > static_cast<std::uint8_t>(FunctionConvention::aapcs32_vfp))
         return invalid("invalid function calling convention");
     if (!result || unqualified(result.get())->kind() == Kind::array || unqualified(result.get())->kind() == Kind::function)
         return invalid("invalid function result type");
@@ -519,11 +632,21 @@ std::string format(const Type &type) {
         if (type.qualifiers() & static_cast<std::uint8_t>(Qualifier::const_)) prefix += "const ";
         if (type.qualifiers() & static_cast<std::uint8_t>(Qualifier::volatile_)) prefix += "volatile ";
         if (type.qualifiers() & static_cast<std::uint8_t>(Qualifier::restrict_)) prefix += "restrict ";
+        if (type.qualifiers() & static_cast<std::uint8_t>(Qualifier::atomic_)) {
+            auto underlying = format(*type.element());
+            if (type.element()->kind() == Kind::pointer && !prefix.empty())
+                underlying += " " + prefix.substr(0, prefix.size() - 1);
+            else
+                underlying = prefix + underlying;
+            return "_Atomic(" + underlying + ")";
+        }
         if (type.element()->kind() == Kind::pointer) return format(*type.element()) + " " + prefix.substr(0, prefix.size()-1);
         return prefix + format(*type.element());
     }
     case Kind::array:
-        return format(*type.element()) + "[" + (type.count() ? std::to_string(type.count()) : std::string{}) + "]";
+        return format(*type.element()) + "[" + (type.count() ? std::to_string(type.count()) : std::string{}) + "]" +
+            (type.element()->size() && type.array_stride() > *type.element()->size()
+                ? " (stride " + std::to_string(type.array_stride()) + ")" : "");
     case Kind::vector:
         return "vector<" + format(*type.element()) + ", " + std::to_string(type.count()) + ">";
     case Kind::structure:
@@ -577,7 +700,7 @@ std::string format(const Type &type) {
     case Kind::function:
         out << format(*type.result_type());
         if (type.function_convention() != FunctionConvention::platform_default) {
-            static constexpr const char *names[] = {"default", "cdecl", "stdcall", "fastcall", "thiscall", "vectorcall", "sysv_abi", "ms_abi", "aapcs64", "aapcs32", "mips_n64", "mips_n32"};
+            static constexpr const char *names[] = {"default", "cdecl", "stdcall", "fastcall", "thiscall", "vectorcall", "sysv_abi", "ms_abi", "aapcs64", "aapcs32", "mips_n64", "mips_n32", "aapcs32_vfp"};
             out << " [" << names[static_cast<unsigned>(type.function_convention())] << "]";
         }
         out << " (";
@@ -596,12 +719,12 @@ std::string format(const Type &type) {
     return {};
 }
 hexlab::Result<std::vector<std::byte>> encode(const Type& type) {
-    try { TypeWriter out;out.number(15,1);write_type(out,type,0,15);if(out.bytes.size()>16*1024*1024)return invalid("type record exceeds limit");return std::move(out.bytes); }
+    try { TypeWriter out;out.number(19,1);write_type(out,type,0,19);if(out.bytes.size()>max_type_record_size)return invalid("type record exceeds limit");return std::move(out.bytes); }
     catch(const std::bad_alloc&){return hexlab::Error{hexlab::ErrorCode::resource_limit,"Cannot encode type"};}
     catch(const std::exception& e){return invalid(e.what());}
 }
 hexlab::Result<TypePtr> decode(std::span<const std::byte> bytes) {
-    try {if(bytes.size()>16*1024*1024)return invalid("type record exceeds limit");TypeReader in{bytes};const auto version=in.number(1);if(version<1||version>15)return invalid("unknown type record version");auto value=read_type(in,0,static_cast<std::uint8_t>(version));if(in.cursor!=bytes.size())return invalid("trailing type record data");TypeWriter canonical;canonical.number(version,1);write_type(canonical,*value,0,static_cast<std::uint8_t>(version));if(canonical.bytes!=std::vector<std::byte>(bytes.begin(),bytes.end()))return invalid("noncanonical type record");return value;}
+    try {if(bytes.size()>max_type_record_size)return invalid("type record exceeds limit");TypeReader in{bytes};const auto version=in.number(1);if(version<1||version>19)return invalid("unknown type record version");auto value=read_type(in,0,static_cast<std::uint8_t>(version));if(in.cursor!=bytes.size())return invalid("trailing type record data");TypeWriter canonical;canonical.number(version,1);write_type(canonical,*value,0,static_cast<std::uint8_t>(version));if(canonical.bytes!=std::vector<std::byte>(bytes.begin(),bytes.end()))return invalid("noncanonical type record");return value;}
     catch(const std::bad_alloc&){return hexlab::Error{hexlab::ErrorCode::resource_limit,"Cannot decode type"};}
     catch(const std::exception& e){return invalid(e.what());}
 }

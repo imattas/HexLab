@@ -3,6 +3,7 @@
 #include "hexlab/database/project_state.hpp"
 #include <wx/timer.h>
 #include <filesystem>
+#include <chrono>
 #include <map>
 #include <future>
 #include <cstdint>
@@ -13,6 +14,12 @@
 #include "hexlab/workspace/listing.hpp"
 #include "hexlab/workspace/project_graph.hpp"
 namespace hexlab::desktop {
+struct AutomaticBackupOptions {
+    bool enabled = false;
+    int interval_minutes = 15;
+    std::size_t retain = 5;
+};
+enum class SourceArchiveAction : std::uint8_t { create, rotate, list, prune, verify };
 class SessionController final : public wxEvtHandler {
   public:
     explicit SessionController(std::function<void()> changed);
@@ -38,10 +45,24 @@ class SessionController final : public wxEvtHandler {
     Result<bool> rotate_backups(DocumentId, std::size_t retain = 5);
     Result<bool> list_backups(DocumentId);
     Result<bool> prune_backups(DocumentId, std::size_t retain);
+    Result<bool> manage_source_archive(DocumentId, SourceArchiveAction, std::filesystem::path = {},
+                                       std::size_t retain = 5);
+    bool source_archive_pending() const { return source_archive_job_.has_value(); }
+    void cancel_source_archive();
+    bool backup_pending(DocumentId) const;
+    AutomaticBackupOptions automatic_backup_options() const { return automatic_backup_options_; }
+    Result<bool> configure_automatic_backups(AutomaticBackupOptions);
+    wxString automatic_backup_status() const;
+    void cancel_automatic_backups();
+    void restart_automatic_backup_schedule();
     Result<bool> restore_backup(std::filesystem::path source, std::filesystem::path destination,
                                 bool replace = false, AnalysisOptions = {});
+    Result<bool> restore_recovery(std::filesystem::path source, std::filesystem::path destination,
+                                  bool replace = false, AnalysisOptions = {});
     Result<bool> restore_backup_in_place(std::filesystem::path source, std::filesystem::path target,
                                          AnalysisOptions = {});
+    Result<bool> restore_recovery_in_place(std::filesystem::path source, std::filesystem::path target,
+                                           AnalysisOptions = {});
     Result<ProjectOperationId> export_binary(DocumentId, std::filesystem::path, bool replace = false);
     Result<bool> find(DocumentId, SearchQuery, const SearchLimits & = {});
     Result<bool> find_all(SearchQuery, const SearchLimits & = {});
@@ -85,7 +106,7 @@ class SessionController final : public wxEvtHandler {
         database::ProjectMode mode;
         Error open_error;
         std::shared_ptr<std::stop_source> cancellation;
-        std::future<Result<std::vector<database::ProjectRecoveryCandidate>>> result;
+        std::future<Result<database::ProjectRecoveryScan>> result;
     };
     std::vector<RecoveryScan> recovery_scans_;
     struct BackupRestore {
@@ -99,11 +120,35 @@ class SessionController final : public wxEvtHandler {
                                                 database::BackupPruneResult>;
     struct BackupManagement {
         DocumentId document;
+        std::filesystem::path source_path;
         std::shared_ptr<std::stop_source> cancellation;
         std::future<Result<BackupManagementResult>> result;
+        bool automatic = false;
+        std::uint64_t schedule_generation = 0;
     };
     std::vector<BackupManagement> backup_management_;
-    Result<bool> start_backup_management(DocumentId, BackupManagementKind, std::size_t);
+    using SourceArchiveResult = std::variant<database::SourceArchiveResult, database::SourceArchiveRotationResult,
+        database::SourceArchiveListing, database::SourceArchivePruneResult, database::SourceArchiveVerification>;
+    struct SourceArchiveJob {
+        DocumentId document;
+        std::filesystem::path project_path;
+        std::shared_ptr<std::stop_source> cancellation;
+        std::future<Result<SourceArchiveResult>> result;
+    };
+    std::optional<SourceArchiveJob> source_archive_job_;
+    Result<bool> start_backup_management(DocumentId, BackupManagementKind, std::size_t, bool automatic = false);
+    struct AutomaticBackupState {
+        std::filesystem::path path;
+        std::chrono::steady_clock::time_point due;
+        wxString status;
+        bool paused = false;
+    };
+    AutomaticBackupOptions automatic_backup_options_;
+    std::map<std::uint64_t, AutomaticBackupState> automatic_backups_;
+    std::chrono::steady_clock::time_point next_backup_poll_{};
+    std::uint64_t backup_schedule_generation_ = 0;
+    void load_automatic_backup_options();
+    bool poll_automatic_backups();
     void scan_recovery_candidates(std::filesystem::path, database::ProjectMode, Error);
     Result<ProjectOperationId> observe(DocumentId, std::function<Result<ProjectSubmission>(ProjectActor &)>,
                                        bool watch_write = true);

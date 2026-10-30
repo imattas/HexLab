@@ -25,6 +25,80 @@
 namespace hexlab::desktop {
 namespace {
 constexpr std::size_t desktop_patch_byte_limit = 256;
+constexpr std::uint64_t firmware_source_scan_limit = 64ull * 1024 * 1024;
+constexpr std::size_t firmware_source_chunk_size = 4096;
+constexpr std::size_t firmware_source_line_limit = 4096;
+
+struct FirmwareSourceLine {
+    FileOffset offset;
+    std::string text;
+};
+
+std::optional<Address> address_for(const Image *image, Location location);
+
+std::optional<FirmwareSourceLine> resolve_firmware_source_line(const ByteStorage &storage, std::uint64_t wanted_line) {
+    if (!wanted_line)
+        return {};
+    const auto limit = std::min(storage.size(), firmware_source_scan_limit);
+    std::uint64_t offset = 0;
+    std::uint64_t line_number = 1;
+    std::uint64_t line_start = 0;
+    std::string line;
+    line.reserve(128);
+    bool line_overlong = false;
+    while (offset < limit) {
+        const auto count = static_cast<std::size_t>(std::min<std::uint64_t>(firmware_source_chunk_size, limit - offset));
+        auto chunk = storage.read_at(FileOffset{offset}, count);
+        if (!chunk || chunk.value().bytes.empty())
+            return {};
+        for (const auto byte : chunk.value().bytes) {
+            const auto value = std::to_integer<unsigned char>(byte);
+            ++offset;
+            if (value == '\n') {
+                if (line_number == wanted_line) {
+                    if (line_overlong)
+                        return {};
+                    if (!line.empty() && line.back() == '\r')
+                        line.pop_back();
+                    return FirmwareSourceLine{FileOffset{line_start}, std::move(line)};
+                }
+                ++line_number;
+                line_start = offset;
+                line.clear();
+                line_overlong = false;
+                continue;
+            }
+            if (line.size() == firmware_source_line_limit)
+                line_overlong = true;
+            else if (!line_overlong)
+                line.push_back(static_cast<char>(value));
+        }
+    }
+    if (offset == storage.size() && line_number == wanted_line && !line_overlong)
+        return FirmwareSourceLine{FileOffset{line_start}, std::move(line)};
+    return {};
+}
+
+struct FirmwareRecordMatch {
+    const FirmwareDataRecord *record = nullptr;
+    bool ambiguous = false;
+};
+
+FirmwareRecordMatch firmware_record_at(const DocumentSnapshot &document, Location location) {
+    const auto *firmware = document.metadata_view().firmware ? &*document.metadata_view().firmware : nullptr;
+    const auto address = address_for(document.image.get(), location);
+    if (!firmware || !address)
+        return {};
+    FirmwareRecordMatch match;
+    for (const auto &record : firmware->records)
+        if (record.size && record.address.space == address->space && address->offset >= record.address.offset &&
+            address->offset - record.address.offset < record.size) {
+            if (match.record)
+                return {nullptr, true};
+            match.record = &record;
+        }
+    return match;
+}
 
 std::optional<Address> address_for(const Image *image, Location location) {
     if (const auto *address = std::get_if<Address>(&location)) return *address;
@@ -246,9 +320,12 @@ void collect_typed_rows(const types::Type &type, std::string path, std::uint64_t
     auto location = advance(base, offset);
     if (!location)
         return;
+    const auto scalar_bytes = bytes.subspan(static_cast<std::size_t>(offset), static_cast<std::size_t>(*size));
+    std::optional<Address> pointer_target;
+    if (type.kind() == types::Kind::pointer && *size <= 8)
+        pointer_target = Address{base.space, decode_unsigned(scalar_bytes, order)};
     rows.push_back({Location{location.value()}, {wxString::Format("+0x%llX", static_cast<unsigned long long>(offset)),
-        text(path), text(types::format(type)), text(scalar_value(type, bytes.subspan(static_cast<std::size_t>(offset),
-                                             static_cast<std::size_t>(*size)), order))}});
+        text(path), text(types::format(type)), text(scalar_value(type, scalar_bytes, order))}, pointer_target});
 }
 }
 wxString text(std::string_view value) { return wxString::FromUTF8(value.data(), value.size()); }
@@ -525,6 +602,10 @@ BytesView::BytesView(wxWindow *parent) : wxPanel(parent) {
         "Assign a project type at the selected address to inspect its fields and array elements.");
     typed_status_->SetName("typed-data-status");
     typed_header->Add(typed_status_, 1, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(8));
+    export_page_ = new wxButton(typed_panel, wxID_ANY, "Export bytes page...");
+    export_page_->SetName("bytes-export-page");
+    export_page_->Disable();
+    typed_header->Add(export_page_, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(4));
     patch_bytes_ = new wxButton(typed_panel, wxID_ANY, "Patch bytes...");
     patch_bytes_->SetName("bytes-patch");
     patch_bytes_->Disable();
@@ -532,7 +613,19 @@ BytesView::BytesView(wxWindow *parent) : wxPanel(parent) {
     assign_type_ = new wxButton(typed_panel, wxID_ANY, "Assign type at cursor...");
     assign_type_->SetName("typed-data-assign");
     assign_type_->Disable();
-    typed_header->Add(assign_type_, 0, wxALIGN_CENTER_VERTICAL);
+    typed_header->Add(assign_type_, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(4));
+    follow_typed_pointer_ = new wxButton(typed_panel, wxID_ANY, "Follow mapped pointer");
+    follow_typed_pointer_->SetName("typed-data-follow-pointer");
+    follow_typed_pointer_->SetToolTip("Navigate to this pointer value only when it maps inside the current image.");
+    follow_typed_pointer_->Disable();
+    typed_header->Add(follow_typed_pointer_, 0, wxALIGN_CENTER_VERTICAL);
+    firmware_record_ = new wxButton(typed_panel, wxID_ANY, "Go to input record");
+    firmware_record_->SetName("firmware-record-origin");
+    firmware_record_->Disable();
+    typed_header->Add(firmware_record_, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, FromDIP(8));
+    firmware_record_status_ = new wxStaticText(typed_panel, wxID_ANY, "");
+    firmware_record_status_->SetName("firmware-record-origin-status");
+    typed_header->Add(firmware_record_status_, 1, wxALIGN_CENTER_VERTICAL | wxLEFT, FromDIP(6));
     typed_sizer->Add(typed_header, 0, wxEXPAND | wxALL, FromDIP(4));
     patch_help_ = new wxStaticText(typed_panel, wxID_ANY,
         "Patches are one undoable project step. Byte-dependent analysis refreshes for the new byte revision.");
@@ -583,8 +676,12 @@ BytesView::BytesView(wxWindow *parent) : wxPanel(parent) {
         if (row < typed_rows_.size() && navigate)
             navigate(typed_rows_[row].location);
     };
+    typed_table_->Bind(wxEVT_LIST_ITEM_SELECTED, [this](wxListEvent &) { update_typed_pointer_action(); });
+    follow_typed_pointer_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { follow_typed_pointer(); });
+    firmware_record_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { navigate_to_firmware_record(); });
     assign_type_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { apply_type(); });
     patch_bytes_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { patch_selected_bytes(); });
+    export_page_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { export_page(); });
 }
 void BytesView::set_document(std::shared_ptr<const DocumentSnapshot> doc) {
     document_ = std::move(doc);
@@ -593,6 +690,8 @@ void BytesView::set_document(std::shared_ptr<const DocumentSnapshot> doc) {
     selected_cell_.reset();
     table_->populate(0, {});
     update_patch_availability();
+    export_page_->Enable(document_ && !page_.cells.empty() && page_.cells.size() <= 256);
+    update_firmware_record_action();
     refresh_typed_data();
 }
 void BytesView::select(Location location) {
@@ -648,7 +747,95 @@ void BytesView::render() {
     if (selected_cell_ && *selected_cell_ < page_.cells.size())
         table_->select_row(*selected_cell_ / 8);
     update_patch_availability();
+    export_page_->Enable(document_ && !page_.cells.empty() && page_.cells.size() <= 256);
+    update_firmware_record_action();
     refresh_typed_data();
+}
+void BytesView::export_page() {
+    if (!document_ || page_.cells.empty() || page_.cells.size() > 256)
+        return;
+    const auto document = document_;
+    const auto cells = page_.cells;
+    std::vector<std::byte> output;
+    output.reserve(cells.size());
+    for (const auto &cell : cells)
+        output.push_back(cell.value);
+
+    auto protected_paths = document->project ? document->project->protected_paths
+                                              : std::vector<std::filesystem::path>{};
+    if (const auto file = std::dynamic_pointer_cast<const FileStorage>(document->input_storage))
+        protected_paths.push_back(file->backing_path());
+    wxFileDialog dialog(this, "Export bytes page", "", "bytes-page.bin",
+                        "Binary files (*.bin)|*.bin|All files (*.*)|*.*", wxFD_SAVE | wxFD_OVERWRITE_PROMPT);
+    if (dialog.ShowModal() != wxID_OK)
+        return;
+    auto publication = FilePublication::create(std::filesystem::path(dialog.GetPath().ToStdWstring()),
+                                               ExistingFilePolicy::replace, protected_paths, {});
+    if (!publication) {
+        wxMessageBox(text(publication.error().message), "Export bytes page", wxOK | wxICON_ERROR, this);
+        return;
+    }
+    const auto written = publication.value()->append(output);
+    if (!written) {
+        wxMessageBox(text(written.error().message), "Export bytes page", wxOK | wxICON_ERROR, this);
+        return;
+    }
+    const auto published = publication.value()->publish();
+    if (!published)
+        wxMessageBox(text(published.error().message), "Export bytes page", wxOK | wxICON_ERROR, this);
+}
+void BytesView::update_firmware_record_action() {
+    if (!firmware_record_ || !firmware_record_status_)
+        return;
+    const auto match = document_ && selected_cell_ && *selected_cell_ < page_.cells.size()
+        ? firmware_record_at(*document_, byte_location(page_.cells[*selected_cell_])) : FirmwareRecordMatch{};
+    const auto *record = match.record;
+    firmware_record_->Enable(record && record->source_line && navigate);
+    if (match.ambiguous) {
+        firmware_record_->Disable();
+        firmware_record_status_->SetLabel("Input record unavailable: multiple firmware records cover this address.");
+        return;
+    }
+    if (!record) {
+        firmware_record_status_->SetLabel("Select a byte originating in an Intel HEX or S-record data record.");
+        return;
+    }
+    const auto address = address_for(document_->image.get(), byte_location(page_.cells[*selected_cell_]));
+    if (!address) {
+        firmware_record_->Disable();
+        firmware_record_status_->SetLabel("The selected byte has no mapped firmware address.");
+        return;
+    }
+    firmware_record_status_->SetLabel(wxString::Format("Record %llu, input line %llu, byte +%llu",
+        static_cast<unsigned long long>(record->record_index),
+        static_cast<unsigned long long>(record->source_line),
+        static_cast<unsigned long long>(address->offset - record->address.offset)));
+}
+
+void BytesView::navigate_to_firmware_record() {
+    if (!document_ || !selected_cell_ || *selected_cell_ >= page_.cells.size() || !navigate)
+        return;
+    const auto match = firmware_record_at(*document_, byte_location(page_.cells[*selected_cell_]));
+    const auto *record = match.record;
+    if (match.ambiguous) {
+        firmware_record_status_->SetLabel("Input record unavailable: multiple firmware records cover this address.");
+        return;
+    }
+    if (!record || !record->source_line)
+        return;
+    const auto address = address_for(document_->image.get(), byte_location(page_.cells[*selected_cell_]));
+    if (!address)
+        return;
+    const auto line = resolve_firmware_source_line(document_->file_storage(), record->source_line);
+    if (!line) {
+        firmware_record_status_->SetLabel("Input record unavailable: its source line is outside the 64 MiB scan cap or could not be read.");
+        return;
+    }
+    firmware_record_status_->SetLabel(wxString::Format("Navigated to line %llu (record %llu, byte +%llu).",
+        static_cast<unsigned long long>(record->source_line),
+        static_cast<unsigned long long>(record->record_index),
+        static_cast<unsigned long long>(address->offset - record->address.offset)));
+    navigate(Location{line->offset});
 }
 void BytesView::update_patch_availability() {
     if (!patch_bytes_)
@@ -869,6 +1056,7 @@ void BytesView::refresh_typed_data() {
     if (!typed_table_ || !typed_status_ || !assign_type_)
         return;
     const auto refresh_rows = [this] {
+        follow_typed_pointer_->Disable();
         typed_table_->populate(typed_rows_.size(), [this](std::size_t row, int column) {
             return row < typed_rows_.size() && column >= 0 && column < 4
                 ? typed_rows_[row].cells[static_cast<std::size_t>(column)] : wxString{};
@@ -973,5 +1161,28 @@ void BytesView::refresh_typed_data() {
         type_name.c_str(), base_text.c_str(), static_cast<unsigned long long>(*size),
         static_cast<unsigned long long>(delta)));
     refresh_rows();
+}
+
+void BytesView::update_typed_pointer_action() {
+    std::optional<std::size_t> row;
+    if (typed_table_) row = typed_table_->selected_row();
+    if (!row || *row >= typed_rows_.size() || !typed_rows_[*row].pointer_target ||
+        !document_ || !document_->image || !document_->image->segment_at(*typed_rows_[*row].pointer_target)) {
+        follow_typed_pointer_->Disable();
+        return;
+    }
+    follow_typed_pointer_->Enable(navigate != nullptr);
+}
+
+void BytesView::follow_typed_pointer() {
+    std::optional<std::size_t> row;
+    if (typed_table_) row = typed_table_->selected_row();
+    if (!row || *row >= typed_rows_.size() || !typed_rows_[*row].pointer_target ||
+        !document_ || !document_->image || !document_->image->segment_at(*typed_rows_[*row].pointer_target)) {
+        follow_typed_pointer_->Disable();
+        typed_status_->SetLabel("The selected pointer does not map inside the current image.");
+        return;
+    }
+    if (navigate) navigate(Location{*typed_rows_[*row].pointer_target});
 }
 } // namespace hexlab::desktop

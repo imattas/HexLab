@@ -10,6 +10,8 @@ These helpers provide condition and arithmetic primitives for instruction liftin
 
 `evaluate_x86_multiply` computes unsigned or two's-complement signed full products at 8/16/32/64-bit operand widths and returns the low and high halves. For MUL and IMUL, CF and OF are defined and equal: they indicate whether the high half is a zero extension (unsigned MUL) or a sign extension (signed IMUL) of the low half. PF, ZF, and SF are marked undefined; AF is not modeled. `evaluate_x86_multiply_instruction` selects the operation and width from decoded MUL/IMUL records while taking the runtime operand values from its caller.
 
+The decompiler also lifts x86-64 one-operand `MUL` and `IMUL` with typed full-product, low/high accumulator-pair, and CF/OF output formulas; see [implicit multiply lifting](x86-implicit-multiply.md). Other arithmetic flags remain unspecified.
+
 `evaluate_x86_divide` accepts a width-sized high:low dividend and divisor for DIV/IDIV and returns width-sized quotient and remainder only on success. Divide-by-zero and quotient overflow (including signed minimum divided by minus one) return explicit statuses with both result-valid bits false. The decoded adapter derives operation and width from DIV/IDIV. Arithmetic status flags after DIV/IDIV are architecturally undefined and are not assigned guessed values by this API. Invalid operand widths and unrelated or malformed decoded instruction shapes return `nullopt`.
 
 The decompiler also lifts x86 `ADD`, `SUB`, `AND`, `OR`, `XOR`, and scalar shifts with a memory destination into a read-modify-write store. The stored expression reads from the same effective address that receives the result, preserving the decoded memory width. Register/immediate flag producers carry condition predicates across acyclic CFG edges. At a join, propagation continues only when every predecessor carries state from the same producer instruction; equal-looking operations produced separately on different paths stay opaque because this pass cannot prove their register values agree. Loop components, calls, opaque instructions, and overwritten source registers or flags invalidate propagation.
@@ -25,3 +27,17 @@ The native x86 decoder also recognizes the implicit-address `MOVS`, `CMPS`, `STO
 `evaluate_x86_shift_rotate` evaluates SHL, SHR, SAR, ROL, ROR, RCL, and RCR for 8/16/32/64-bit values. The caller supplies the already-read destination and incoming flags; the helper returns each modeled flag with a definedness bit and reports zero-count preservation explicitly. It applies the architectural 5-bit/6-bit count mask, then the rotate or carry-ring modulus. SHL/SHR/SAR compute the shifted value and PF/ZF/SF; CF is defined when the shifted-out bit is available; OF is defined only for count one; AF remains undefined. Counts beyond the operand width are conservatively reported as undefined. Rotates update CF and define OF only for count one, while preserving the other supplied status flags. The optional incoming AF value is separate because `X86Flags` intentionally contains only the five modeled condition flags.
 
 `evaluate_x86_shift_rotate_instruction` accepts decoded x86/x86-64 scalar forms, reads an immediate count from the instruction record, and requires a caller-supplied byte count for the CL register form. The caller supplies a memory destination's value; neither helper reads memory or mutates a machine state. This is an instruction-family evaluator, not a complete x64 execution engine.
+
+`evaluate_x86_setcc_instruction` evaluates a decoded `SETcc` to the byte value
+zero or one from its typed condition code and caller-supplied CF/PF/ZF/SF/OF.
+It validates the byte-register or byte-memory destination and decoded write
+effects. It returns the value only; memory writes and register updates remain
+caller-owned.
+
+`evaluate_x86_cmovcc_instruction` evaluates decoded CMOVcc from a destination
+value, source value, and incoming flags. A false condition preserves the full
+destination; a true 16-bit write merges only the low word, while a true 32-bit
+write in long mode zeroes the upper half. Memory-source forms require the
+decoded read effect because the source is read regardless of the condition.
+The helper returns the resulting destination bits but does not access memory or
+commit registers.

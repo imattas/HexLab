@@ -1,7 +1,9 @@
 ﻿#include "hexlab/decompiler/wasm_lifting.hpp"
 
+#include "hexlab/processors/wasm_simd_integer.hpp"
 #include <algorithm>
 #include <array>
+#include <deque>
 #include <limits>
 #include <map>
 #include <optional>
@@ -13,9 +15,15 @@
 namespace hexlab::decompiler {
 namespace {
 using Stack = std::vector<ExpressionPtr>;
+enum class ReferenceNullness : std::uint8_t { unknown, null_value, non_null };
 
 ValueType integer(unsigned bits, bool sign = false) { return {TypeKind::integer, static_cast<std::uint16_t>(bits), sign}; }
 ValueType floating(unsigned bits) { return {TypeKind::floating, static_cast<std::uint16_t>(bits), false}; }
+ValueType vector(unsigned bits, TypeKind element = TypeKind::unknown, unsigned element_bits = 0,
+                 unsigned lanes = 0, bool sign = false) {
+    return {TypeKind::vector, static_cast<std::uint16_t>(bits), sign, element,
+            static_cast<std::uint16_t>(element_bits), static_cast<std::uint8_t>(lanes)};
+}
 ValueType funcref() { return {TypeKind::pointer, 32, false}; }
 std::optional<ValueType> wasm_value_type(std::uint8_t code) {
     switch (code) {
@@ -24,6 +32,9 @@ std::optional<ValueType> wasm_value_type(std::uint8_t code) {
     case 0x7d: return floating(32);
     case 0x7c: return floating(64);
     case 0x70: return funcref();
+    // The common IR keeps both Wasm reference classes as opaque pointer-sized
+    // values; the module validator still checks their distinct Wasm types.
+    case 0x6f: return funcref();
     default: return {};
     }
 }
@@ -35,6 +46,27 @@ ExpressionPtr unary(std::string op, ExpressionPtr value, ValueType type) {
 }
 ExpressionPtr binary(std::string op, ExpressionPtr left, ExpressionPtr right, ValueType type) {
     return std::make_shared<Expression>(Expression{type, BinaryValue{std::move(op), std::move(left), std::move(right)}});
+}
+ReferenceNullness expression_nullness(const ExpressionPtr &expression, unsigned depth = 0) {
+    if (!expression || depth >= 64 || expression->type.kind != TypeKind::pointer)
+        return ReferenceNullness::unknown;
+    if (const auto *literal = std::get_if<ConstantValue>(&expression->value))
+        return literal->value == 0 ? ReferenceNullness::null_value : ReferenceNullness::non_null;
+    if (const auto *reference = std::get_if<UnaryValue>(&expression->value);
+        reference && reference->operation.rfind("wasm_ref_func_", 0) == 0)
+        return ReferenceNullness::non_null;
+    const auto *selection = std::get_if<BinaryValue>(&expression->value);
+    if (!selection || selection->operation != "select_if") return ReferenceNullness::unknown;
+    const auto *condition = selection->left
+        ? std::get_if<ConstantValue>(&selection->left->value) : nullptr;
+    const auto *alternatives = selection->right
+        ? std::get_if<BinaryValue>(&selection->right->value) : nullptr;
+    if (!alternatives || alternatives->operation != "pair") return ReferenceNullness::unknown;
+    if (condition && condition->type.kind == TypeKind::integer)
+        return expression_nullness(condition->value != 0 ? alternatives->left : alternatives->right, depth + 1);
+    const auto when_true = expression_nullness(alternatives->left, depth + 1);
+    const auto when_false = expression_nullness(alternatives->right, depth + 1);
+    return when_true == when_false ? when_true : ReferenceNullness::unknown;
 }
 std::optional<std::uint64_t> immediate(const Instruction &i, std::size_t n = 0) {
     if (n >= i.operands.size()) return {};
@@ -48,13 +80,31 @@ std::optional<std::uint8_t> bulk_memory_subopcode(const Instruction &i) {
         const auto byte = std::to_integer<std::uint8_t>(i.bytes[position]);
         subopcode |= std::uint32_t(byte & 0x7f) << ((position - 1) * 7);
         if (!(byte & 0x80))
-            return subopcode <= 11 ? std::optional<std::uint8_t>{static_cast<std::uint8_t>(subopcode)} : std::nullopt;
+            return subopcode <= 17 ? std::optional<std::uint8_t>{static_cast<std::uint8_t>(subopcode)} : std::nullopt;
     }
     return {};
 }
 bool valid_bulk_memory_indices(const Instruction &i, const WasmMetadata *metadata, std::uint8_t subopcode) {
     if (subopcode <= 7) return true;
     if (!metadata) return false;
+    if (subopcode >= 12) {
+        const auto table_count = static_cast<std::uint64_t>(metadata->imported_tables) + metadata->defined_tables;
+        if (subopcode == 13) {
+            const auto element = immediate(i, 0);
+            return element && *element < metadata->element_segments.size();
+        }
+        if (table_count != 1) return false;
+        if (subopcode == 12) {
+            const auto element = immediate(i, 0), table = immediate(i, 1);
+            return element && *element < metadata->element_segments.size() && table && *table == 0;
+        }
+        if (subopcode == 14) {
+            const auto destination = immediate(i, 0), source = immediate(i, 1);
+            return destination && *destination == 0 && source && *source == 0;
+        }
+        const auto table = immediate(i, 0);
+        return table && *table == 0;
+    }
     const auto memory_count = static_cast<std::uint64_t>(metadata->imported_memories) + metadata->defined_memories;
     if (subopcode == 9) {
         const auto data = immediate(i, 0);
@@ -200,6 +250,93 @@ struct MemoryOpInfo {
     ValueType access_type;
     unsigned maximum_alignment_exponent = 0;
 };
+struct SimdMemoryOpInfo {
+    bool store = false;
+    unsigned access_bits = 128;
+    ValueType stack_type = vector(128);
+    ValueType memory_type = vector(128);
+    std::string_view load_operation;
+    unsigned maximum_alignment_exponent = 4;
+    bool lane_indexed = false;
+};
+struct SimdLaneOpInfo {
+    bool replace = false;
+    unsigned lane_count = 0;
+    ValueType scalar_type;
+    std::string_view name;
+};
+std::optional<SimdLaneOpInfo> simd_lane_op(std::uint32_t subopcode) {
+    const auto i32 = integer(32), i64 = integer(64), f32 = floating(32), f64 = floating(64);
+    switch (subopcode) {
+    case 21: return SimdLaneOpInfo{false, 16, i32, "wasm_i8x16_extract_lane_s"};
+    case 22: return SimdLaneOpInfo{false, 16, i32, "wasm_i8x16_extract_lane_u"};
+    case 23: return SimdLaneOpInfo{true, 16, i32, "wasm_i8x16_replace_lane"};
+    case 24: return SimdLaneOpInfo{false, 8, i32, "wasm_i16x8_extract_lane_s"};
+    case 25: return SimdLaneOpInfo{false, 8, i32, "wasm_i16x8_extract_lane_u"};
+    case 26: return SimdLaneOpInfo{true, 8, i32, "wasm_i16x8_replace_lane"};
+    case 27: return SimdLaneOpInfo{false, 4, i32, "wasm_i32x4_extract_lane"};
+    case 28: return SimdLaneOpInfo{true, 4, i32, "wasm_i32x4_replace_lane"};
+    case 29: return SimdLaneOpInfo{false, 2, i64, "wasm_i64x2_extract_lane"};
+    case 30: return SimdLaneOpInfo{true, 2, i64, "wasm_i64x2_replace_lane"};
+    case 31: return SimdLaneOpInfo{false, 4, f32, "wasm_f32x4_extract_lane"};
+    case 32: return SimdLaneOpInfo{true, 4, f32, "wasm_f32x4_replace_lane"};
+    case 33: return SimdLaneOpInfo{false, 2, f64, "wasm_f64x2_extract_lane"};
+    case 34: return SimdLaneOpInfo{true, 2, f64, "wasm_f64x2_replace_lane"};
+    default: return {};
+    }
+}
+std::optional<std::uint32_t> simd_subopcode(const Instruction &instruction) {
+    if (instruction.length < 2 || std::to_integer<std::uint8_t>(instruction.bytes[0]) != 0xfd)
+        return {};
+    std::uint32_t value = 0;
+    for (std::size_t position = 1; position < instruction.length && position < instruction.bytes.size() && position < 6; ++position) {
+        const auto byte = std::to_integer<std::uint8_t>(instruction.bytes[position]);
+        value |= std::uint32_t(byte & 0x7f) << ((position - 1) * 7);
+        if (!(byte & 0x80)) return value;
+    }
+    return {};
+}
+std::optional<std::string_view> simd_integer_shift(std::uint32_t subopcode) {
+    static constexpr std::array<std::string_view, 12> names{
+        "wasm_i8x16_shl", "wasm_i8x16_shr_s", "wasm_i8x16_shr_u",
+        "wasm_i16x8_shl", "wasm_i16x8_shr_s", "wasm_i16x8_shr_u",
+        "wasm_i32x4_shl", "wasm_i32x4_shr_s", "wasm_i32x4_shr_u",
+        "wasm_i64x2_shl", "wasm_i64x2_shr_s", "wasm_i64x2_shr_u"};
+    for (std::size_t width = 0; width < 4; ++width) {
+        const auto first = std::array<std::uint32_t, 4>{0x6b, 0x8b, 0xab, 0xcb}[width];
+        if (subopcode >= first && subopcode < first + 3)
+            return names[width * 3 + subopcode - first];
+    }
+    return {};
+}
+std::optional<SimdMemoryOpInfo> simd_memory_op(std::uint32_t subopcode) {
+    const auto opaque = vector(128);
+    switch (subopcode) {
+    case 0: return SimdMemoryOpInfo{false, 128, opaque, opaque, {}, 4};
+    case 1: return SimdMemoryOpInfo{false, 64, vector(128, TypeKind::integer, 16, 8, true), vector(64), "wasm_v128_load8x8_s", 3};
+    case 2: return SimdMemoryOpInfo{false, 64, vector(128, TypeKind::integer, 16, 8), vector(64), "wasm_v128_load8x8_u", 3};
+    case 3: return SimdMemoryOpInfo{false, 64, vector(128, TypeKind::integer, 32, 4, true), vector(64), "wasm_v128_load16x4_s", 3};
+    case 4: return SimdMemoryOpInfo{false, 64, vector(128, TypeKind::integer, 32, 4), vector(64), "wasm_v128_load16x4_u", 3};
+    case 5: return SimdMemoryOpInfo{false, 64, vector(128, TypeKind::integer, 64, 2, true), vector(64), "wasm_v128_load32x2_s", 3};
+    case 6: return SimdMemoryOpInfo{false, 64, vector(128, TypeKind::integer, 64, 2), vector(64), "wasm_v128_load32x2_u", 3};
+    case 7: return SimdMemoryOpInfo{false, 8, vector(128, TypeKind::integer, 8, 16), integer(8), "wasm_v128_load8_splat", 0};
+    case 8: return SimdMemoryOpInfo{false, 16, vector(128, TypeKind::integer, 16, 8), integer(16), "wasm_v128_load16_splat", 1};
+    case 9: return SimdMemoryOpInfo{false, 32, vector(128, TypeKind::integer, 32, 4), integer(32), "wasm_v128_load32_splat", 2};
+    case 10: return SimdMemoryOpInfo{false, 64, vector(128, TypeKind::integer, 64, 2), integer(64), "wasm_v128_load64_splat", 3};
+    case 11: return SimdMemoryOpInfo{true, 128, opaque, opaque, {}, 4};
+    case 84: return SimdMemoryOpInfo{false, 8, opaque, integer(8), {}, 0, true};
+    case 85: return SimdMemoryOpInfo{false, 16, opaque, integer(16), {}, 1, true};
+    case 86: return SimdMemoryOpInfo{false, 32, opaque, integer(32), {}, 2, true};
+    case 87: return SimdMemoryOpInfo{false, 64, opaque, integer(64), {}, 3, true};
+    case 88: return SimdMemoryOpInfo{true, 8, opaque, integer(8), {}, 0, true};
+    case 89: return SimdMemoryOpInfo{true, 16, opaque, integer(16), {}, 1, true};
+    case 90: return SimdMemoryOpInfo{true, 32, opaque, integer(32), {}, 2, true};
+    case 91: return SimdMemoryOpInfo{true, 64, opaque, integer(64), {}, 3, true};
+    case 92: return SimdMemoryOpInfo{false, 32, opaque, integer(32), "wasm_v128_load32_zero", 2};
+    case 93: return SimdMemoryOpInfo{false, 64, opaque, integer(64), "wasm_v128_load64_zero", 3};
+    default: return {};
+    }
+}
 std::optional<MemoryOpInfo> memory_op(std::uint8_t op) {
     switch (op) {
     case 0x28: return MemoryOpInfo{false, integer(32), integer(32), 2};
@@ -278,6 +415,7 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
     constexpr std::size_t max_blocks = 16384;
     constexpr std::size_t max_nesting = 128;
     constexpr std::size_t max_stack = 128;
+    constexpr std::size_t max_switch_cases = 128;
     if (code.size() > max_instructions) return Error{ErrorCode::resource_limit, "WebAssembly function exceeds the instruction limit"};
 
     const auto function_index = static_cast<std::uint32_t>(function.entry.space.value);
@@ -425,14 +563,19 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
     }
     const auto function_label = labels.size();
     labels.push_back({0xff, 0, function_end, code.size(), {}, function_label_results});
-    struct Edge { std::size_t target; BlockEdgeKind kind; std::optional<std::size_t> label; };
+    struct Edge {
+        std::size_t target;
+        BlockEdgeKind kind;
+        std::optional<std::size_t> label;
+        std::optional<std::size_t> bridge;
+    };
     std::set<std::size_t> boundaries{0, code.size()};
     std::vector<std::vector<std::size_t>> active_labels(code.size());
     struct TableTarget { std::optional<std::uint64_t> value; std::size_t label; std::size_t target; };
     const auto table_targets = [&](std::size_t n) -> Result<std::vector<TableTarget>> {
         const auto &instruction = code[n]->instruction;
         const auto count = immediate(instruction, 0);
-        if (!count || *count > 12 || instruction.operands.size() != *count + 2)
+        if (!count || *count > max_switch_cases || instruction.operands.size() != *count + 2)
             return unsupported("br_table count or target vector is malformed or exceeds the decoded bound");
         std::vector<TableTarget> targets;
         targets.reserve(static_cast<std::size_t>(*count) + 1);
@@ -481,7 +624,7 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
     const auto block_for=[&](std::size_t instruction)->std::optional<std::size_t>{auto it=block_at.find(instruction);return it==block_at.end()?std::nullopt:std::optional<std::size_t>{it->second};};
     std::vector<std::vector<Edge>> successors(starts.size());
     const auto add_edge=[&](std::size_t from,std::size_t target,BlockEdgeKind kind,std::optional<std::size_t> label={}) -> bool {
-        auto to=block_for(target);if(!to)return false;successors[from].push_back({*to,kind,label});return true;
+        auto to=block_for(target);if(!to)return false;successors[from].push_back({*to,kind,label,{}});return true;
     };
     std::vector<std::optional<std::size_t>> opener_label(code.size()),end_label(code.size());
     for(const auto &[n,li]:label_for_opener)opener_label[n]=li;
@@ -513,6 +656,13 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
     // target slot so the ordinary common-IR phi machinery can express that
     // edge-specific stack projection.
     std::vector<std::map<std::size_t, std::vector<std::size_t>>> incoming_slot_sources(starts.size());
+    struct EdgeBridge {
+        std::size_t source = 0, target = 0;
+        BlockEdgeKind kind = BlockEdgeKind::jump;
+        Address source_address{{0}, 0};
+        std::vector<std::size_t> source_slots;
+    };
+    std::vector<EdgeBridge> edge_bridges;
     std::vector<std::size_t> work{0};std::vector<bool> queued(starts.size());queued[0]=true;entries[0]=Shape{};
     const auto shape_pop=[&](Shape &stack,ValueType expected)->Result<ValueType>{if(stack.empty())return unsupported("operand stack underflow");auto actual=stack.back();stack.pop_back();if(expected.kind!=TypeKind::unknown&&actual!=expected)return unsupported("operand stack type mismatch");return actual;};
     const auto signature_results = [&]() -> Result<std::vector<ValueType>> {
@@ -556,6 +706,7 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
             if(op==0x00)break;
             if(op==0x1a){auto v=shape_pop(stack,{});if(!v)return v.error();continue;}
             if(op==0x1b){auto c=shape_pop(stack,integer(32));if(!c)return c.error();auto a=shape_pop(stack,{});if(!a)return a.error();auto b=shape_pop(stack,a.value());if(!b)return b.error();stack.push_back(a.value());continue;}
+            if(op==0x1c){const auto type_code=immediate(code[n]->instruction);if(!type_code||*type_code>UINT8_MAX)return unsupported("typed select result type unavailable");const auto type=wasm_value_type(static_cast<std::uint8_t>(*type_code));if(!type)return unsupported("typed select result type is unsupported");auto c=shape_pop(stack,integer(32));if(!c)return c.error();auto a=shape_pop(stack,*type);if(!a)return a.error();auto b=shape_pop(stack,*type);if(!b)return b.error();stack.push_back(*type);continue;}
             if(op==0x0c||op==0x0d){if(op==0x0d){auto c=shape_pop(stack,integer(32));if(!c)return c.error();}continue;}
             if(op==0x0e){auto c=shape_pop(stack,integer(32));if(!c)return c.error();continue;}
             if (op >= 0x20 && op <= 0x22) {
@@ -647,6 +798,97 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
                 }
                 continue;
             }
+            if (op == 0xfd) {
+                const auto subopcode = simd_subopcode(code[n]->instruction);
+                const auto lane = subopcode ? simd_lane_op(*subopcode) : std::optional<SimdLaneOpInfo>{};
+                if (lane) {
+                    const auto lane_index = immediate(code[n]->instruction, 0);
+                    if (!lane_index || *lane_index >= lane->lane_count)
+                        return unsupported("SIMD lane immediate is missing or outside its lane count");
+                    if (lane->replace) {
+                        auto scalar = shape_pop(stack, lane->scalar_type);
+                        if (!scalar) return scalar.error();
+                        auto value = shape_pop(stack, vector(128));
+                        if (!value) return value.error();
+                        stack.push_back(vector(128));
+                    } else {
+                        auto value = shape_pop(stack, vector(128));
+                        if (!value) return value.error();
+                        stack.push_back(lane->scalar_type);
+                    }
+                    continue;
+                }
+                if (subopcode && (*subopcode == 77 || (*subopcode >= 78 && *subopcode <= 83))) {
+                    const auto vector_type = vector(128);
+                    const unsigned inputs = *subopcode == 82 ? 3 :
+                        (*subopcode == 77 || *subopcode == 83 ? 1 : 2);
+                    for (unsigned operand_index = 0; operand_index < inputs; ++operand_index) {
+                        auto value = shape_pop(stack, vector_type);
+                        if (!value) return value.error();
+                    }
+                    stack.push_back(*subopcode == 83 ? integer(32) : vector_type);
+                    continue;
+                }
+                if (subopcode && ((*subopcode >= 0x23 && *subopcode <= 0x4c) ||
+                                  (*subopcode >= 0xd6 && *subopcode <= 0xdb))) {
+                    auto right = shape_pop(stack, vector(128));
+                    auto left = shape_pop(stack, vector(128));
+                    if (!right) return right.error();
+                    if (!left) return left.error();
+                    stack.push_back(vector(128));
+                    continue;
+                }
+                if (subopcode && wasm_simd_integer_binary_op(*subopcode)) {
+                    auto right = shape_pop(stack, vector(128));
+                    auto left = shape_pop(stack, vector(128));
+                    if (!right) return right.error();
+                    if (!left) return left.error();
+                    stack.push_back(vector(128));
+                    continue;
+                }
+                if (subopcode && simd_integer_shift(*subopcode)) {
+                    auto shift = shape_pop(stack, integer(32));
+                    if (!shift) return shift.error();
+                    auto value = shape_pop(stack, vector(128));
+                    if (!value) return value.error();
+                    stack.push_back(vector(128));
+                    continue;
+                }
+                const auto info = subopcode ? simd_memory_op(*subopcode) : std::optional<SimdMemoryOpInfo>{};
+                if (!info) return unsupported("SIMD instruction is outside the supported memory subset");
+                if (!metadata || static_cast<std::uint64_t>(metadata->imported_memories) + metadata->defined_memories != 1)
+                    return unsupported("SIMD memory operation requires exactly one validated module memory");
+                const auto alignment = immediate(code[n]->instruction, 0);
+                const auto offset = immediate(code[n]->instruction, 1);
+                const auto expected_operands = info->lane_indexed ? 3u : 2u;
+                if (code[n]->instruction.operands.size() != expected_operands || !alignment || !offset)
+                    return unsupported("SIMD memory alignment or offset immediate unavailable");
+                if (*alignment > info->maximum_alignment_exponent || *offset > UINT32_MAX)
+                    return unsupported("SIMD memory alignment or Wasm32 offset exceeds its supported bound");
+                if (info->lane_indexed) {
+                    const auto lane = immediate(code[n]->instruction, 2);
+                    const auto lane_count = 128u / info->access_bits;
+                    if (code[n]->instruction.operands.size() != 3 || !lane || *lane >= lane_count)
+                        return unsupported("SIMD lane memory operation has a missing or out-of-range lane index");
+                    auto value = shape_pop(stack, vector(128));
+                    auto address = shape_pop(stack, integer(32));
+                    if (!value) return value.error();
+                    if (!address) return address.error();
+                    if (!info->store) stack.push_back(vector(128));
+                    continue;
+                }
+                if (info->store) {
+                    auto value = shape_pop(stack, info->stack_type);
+                    if (!value) return value.error();
+                    auto address = shape_pop(stack, integer(32));
+                    if (!address) return address.error();
+                } else {
+                    auto address = shape_pop(stack, integer(32));
+                    if (!address) return address.error();
+                    stack.push_back(info->stack_type);
+                }
+                continue;
+            }
             if (op == 0x3f || op == 0x40) {
                 const auto memory_index = immediate(code[n]->instruction);
                 if (!metadata ||
@@ -670,11 +912,21 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
                     auto value = shape_pop(stack, cv->input);
                     if (!value) return value.error();
                     stack.push_back(cv->output);
-                } else if (*subopcode == 8 || *subopcode == 10 || *subopcode == 11) {
+                } else if (*subopcode == 8 || *subopcode == 10 || *subopcode == 11 ||
+                           *subopcode == 12 || *subopcode == 14 || *subopcode == 17) {
                     for (unsigned operand = 0; operand < 3; ++operand) {
-                        auto value = shape_pop(stack, integer(32));
+                        const bool reference_value = *subopcode == 17 && operand == 1;
+                        auto value = shape_pop(stack, reference_value ? funcref() : integer(32));
                         if (!value) return value.error();
                     }
+                } else if (*subopcode == 15) {
+                    auto delta = shape_pop(stack, integer(32));
+                    if (!delta) return delta.error();
+                    auto reference = shape_pop(stack, funcref());
+                    if (!reference) return reference.error();
+                    stack.push_back(integer(32));
+                } else if (*subopcode == 16) {
+                    stack.push_back(integer(32));
                 }
                 continue;
             }
@@ -689,7 +941,7 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
             if(stack.size()>max_stack)return Error{ErrorCode::resource_limit,"WebAssembly operand stack exceeds 128 values"};
         }
         exits[bi]=stack;
-        for(const auto &edge:successors[bi]){
+        for(auto &edge:successors[bi]){
             Shape edge_shape=stack;
             std::vector<std::size_t> source_slots(stack.size());
             for (std::size_t slot = 0; slot < source_slots.size(); ++slot) source_slots[slot] = slot;
@@ -704,38 +956,288 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
             }
             if (source_slots.size() != edge_shape.size())
                 return Error{ErrorCode::malformed, "WebAssembly edge stack projection has an inconsistent height"};
-            auto &maps = incoming_slot_sources[edge.target];
-            const auto [map_it, inserted] = maps.emplace(bi, source_slots);
-            if (!inserted && map_it->second != source_slots)
-                return unsupported("multiple edges from one block require different stack projections at a join");
-            auto &inputs=predecessors[edge.target];if(std::find(inputs.begin(),inputs.end(),bi)==inputs.end())inputs.push_back(bi);
+            if (!edge.bridge) {
+                auto &maps = incoming_slot_sources[edge.target];
+                const auto map_it = maps.find(bi);
+                if (map_it == maps.end()) {
+                    maps.emplace(bi, source_slots);
+                    auto &inputs = predecessors[edge.target];
+                    if (std::find(inputs.begin(), inputs.end(), bi) == inputs.end()) inputs.push_back(bi);
+                } else if (map_it->second != source_slots) {
+                    if (starts.size() + edge_bridges.size() >= max_blocks)
+                        return Error{ErrorCode::resource_limit, "WebAssembly edge bridges exceed the block limit"};
+                    const auto bridge = starts.size() + edge_bridges.size();
+                    edge.bridge = bridge;
+                    edge_bridges.push_back({bi, edge.target, edge.kind,
+                        code[finish - 1]->instruction.address, source_slots});
+                    entries.resize(bridge + 1);
+                    exits.resize(bridge + 1);
+                    predecessors.resize(bridge + 1);
+                    incoming_slot_sources.resize(bridge + 1);
+                    queued.resize(bridge + 1);
+                    entries[bridge] = edge_shape;
+                    exits[bridge] = edge_shape;
+                    predecessors[bridge].push_back(bi);
+                    incoming_slot_sources[bridge].emplace(bi, source_slots);
+                    std::vector<std::size_t> identity(edge_shape.size());
+                    for (std::size_t slot = 0; slot < identity.size(); ++slot) identity[slot] = slot;
+                    incoming_slot_sources[edge.target].emplace(bridge, std::move(identity));
+                    auto &inputs = predecessors[edge.target];
+                    if (std::find(inputs.begin(), inputs.end(), bridge) == inputs.end()) inputs.push_back(bridge);
+                }
+            }
             if(!entries[edge.target]){entries[edge.target]=edge_shape;if(!queued[edge.target]){work.push_back(edge.target);queued[edge.target]=true;}}
             else if(*entries[edge.target]!=edge_shape)return unsupported("operand stack shapes disagree at a control-flow join");
         }
     }
 
+    // Track exact reference nullness through locals and globals. The operand-
+    // stack fact is intentionally limited to values produced by ref.null/
+    // ref.func, local/global.get, carried through local/global.set/tee, or
+    // immediately consumed by ref.is_null. Other stack effects reset it.
+    std::vector<ReferenceNullness> ref_is_null_input(code.size(), ReferenceNullness::unknown);
+    std::vector<std::optional<std::vector<ReferenceNullness>>> local_nullness_entries(starts.size());
+    std::vector<bool> nullness_queued(starts.size());
+    struct NullBranchPredicate {
+        std::size_t reference_slot;
+        bool true_edge_is_null;
+        bool operator==(const NullBranchPredicate &) const = default;
+    };
+    std::vector<std::optional<NullBranchPredicate>> branch_predicate_entries(starts.size());
+    std::vector<bool> branch_predicate_seen(starts.size());
+    const auto global_count = metadata ? metadata->globals.size() : 0;
+    if (!starts.empty() && (!local_types.empty() || global_count != 0) && entries[0]) {
+        const auto parameter_count = function_signature ? function_signature->parameter_types.size() : 0;
+        std::vector<ReferenceNullness> initial(local_types.size() + global_count, ReferenceNullness::unknown);
+        for (std::size_t index = parameter_count; index < local_types.size(); ++index)
+            if (local_types[index].kind == TypeKind::pointer)
+                initial[index] = ReferenceNullness::null_value;
+        // Immutable function-reference globals have a stable module value.
+        // Mutable globals start unknown because another invocation may have
+        // changed them before this function is analyzed or called.
+        if (metadata && metadata->globals.size() ==
+                static_cast<std::uint64_t>(metadata->imported_globals) + metadata->defined_globals) {
+            for (std::size_t index = 0; index < global_count; ++index) {
+                const auto &global = metadata->globals[index];
+                if ((global.value_type != 0x70 && global.value_type != 0x6f) ||
+                    global.mutable_value || !global.initializer) continue;
+                if (global.initializer->kind == WasmGlobalInitializerKind::ref_null)
+                    initial[local_types.size() + index] = ReferenceNullness::null_value;
+                else if (global.initializer->kind == WasmGlobalInitializerKind::ref_func)
+                    initial[local_types.size() + index] = ReferenceNullness::non_null;
+            }
+        }
+        local_nullness_entries[0] = std::move(initial);
+        branch_predicate_seen[0] = true;
+        std::deque<std::size_t> work{0};
+        nullness_queued[0] = true;
+        std::size_t visited_instructions = 0;
+        constexpr std::size_t max_nullness_work = 4'000'000;
+        bool exceeded_work = false;
+        while (!work.empty()) {
+            const auto bi = work.front();
+            work.pop_front();
+            nullness_queued[bi] = false;
+            if (!local_nullness_entries[bi] || !entries[bi]) continue;
+            auto locals = *local_nullness_entries[bi];
+            auto top = ReferenceNullness::unknown;
+            auto branch_predicate = branch_predicate_entries[bi];
+            // Track only a directly identifiable local/global reference. This
+            // lets a ref.is_null condition refine the two outgoing paths of
+            // br_if/if without pretending that arbitrary stack expressions
+            // have stable identity.
+            std::optional<std::size_t> top_reference_origin;
+            const auto begin = starts[bi];
+            const auto finish = bi + 1 < starts.size() ? starts[bi + 1] : code.size();
+            for (std::size_t n = begin; n < finish; ++n) {
+                if (++visited_instructions > max_nullness_work) {
+                    exceeded_work = true;
+                    break;
+                }
+                const auto &instruction = code[n]->instruction;
+                const auto op = std::to_integer<std::uint8_t>(instruction.bytes[0]);
+                if (op != 0x01 && op != 0x0d && op != 0x04 && op != 0x45)
+                    branch_predicate.reset();
+                if (op == 0xd0) {
+                    top = ReferenceNullness::null_value;
+                    top_reference_origin.reset();
+                } else if (op == 0xd2) {
+                    top = ReferenceNullness::non_null;
+                    top_reference_origin.reset();
+                } else if (op == 0x20 || op == 0x21 || op == 0x22) {
+                    const auto index = immediate(instruction);
+                    const auto type = index ? local_type(*index) : std::optional<ValueType>{};
+                    if (!index || !type || *index >= locals.size()) {
+                        top = ReferenceNullness::unknown;
+                        top_reference_origin.reset();
+                        continue;
+                    }
+                    if (op == 0x20) {
+                        top = type->kind == TypeKind::pointer
+                            ? locals[static_cast<std::size_t>(*index)] : ReferenceNullness::unknown;
+                        if (type->kind == TypeKind::pointer)
+                            top_reference_origin = static_cast<std::size_t>(*index);
+                        else
+                            top_reference_origin.reset();
+                    } else {
+                        if (type->kind == TypeKind::pointer)
+                            locals[static_cast<std::size_t>(*index)] = top;
+                        else
+                            locals[static_cast<std::size_t>(*index)] = ReferenceNullness::unknown;
+                        if (op == 0x21) {
+                            top = ReferenceNullness::unknown;
+                            top_reference_origin.reset();
+                        } else if (type->kind == TypeKind::pointer) {
+                            top_reference_origin = static_cast<std::size_t>(*index);
+                        }
+                    }
+                } else if (op == 0x23 || op == 0x24) {
+                    const auto index = immediate(instruction);
+                    if (!index || !metadata || *index >= metadata->globals.size()) {
+                        top = ReferenceNullness::unknown;
+                        top_reference_origin.reset();
+                        continue;
+                    }
+                    const auto global_index = static_cast<std::size_t>(*index);
+                    const auto &global = metadata->globals[global_index];
+                    if (global.value_type != 0x70 && global.value_type != 0x6f) {
+                        top = ReferenceNullness::unknown;
+                        top_reference_origin.reset();
+                    } else if (op == 0x23) {
+                        const auto slot = local_types.size() + global_index;
+                        top = locals[slot];
+                        top_reference_origin = slot;
+                    } else {
+                        if (global.mutable_value)
+                            locals[local_types.size() + global_index] = top;
+                        top = ReferenceNullness::unknown;
+                        top_reference_origin.reset();
+                    }
+                } else if (op == 0xd1) {
+                    ref_is_null_input[n] = top;
+                    if (top_reference_origin)
+                        branch_predicate = NullBranchPredicate{*top_reference_origin, true};
+                    else
+                        branch_predicate.reset();
+                    top = ReferenceNullness::unknown;
+                    top_reference_origin.reset();
+                } else if (op == 0x45) {
+                    // i32.eqz reverses a directly produced ref.is_null result:
+                    // the true edge now means the reference is non-null.
+                    if (branch_predicate)
+                        branch_predicate->true_edge_is_null = !branch_predicate->true_edge_is_null;
+                    top = ReferenceNullness::unknown;
+                    top_reference_origin.reset();
+                } else if (op == 0x0d || op == 0x04) {
+                    // The condition is consumed here. Keep only the narrow
+                    // ref.is_null provenance for the edge transfer below.
+                } else if (op != 0x01) {
+                    if (op == 0x10 || op == 0x11) {
+                        // Calls can mutate any mutable global through direct,
+                        // imported, or table-dispatched code.
+                        if (metadata)
+                            for (std::size_t index = 0; index < global_count; ++index)
+                                if (metadata->globals[index].mutable_value)
+                                    locals[local_types.size() + index] = ReferenceNullness::unknown;
+                    }
+                    top = ReferenceNullness::unknown;
+                    top_reference_origin.reset();
+                    branch_predicate.reset();
+                }
+            }
+            if (exceeded_work) break;
+            const auto terminator = finish > begin
+                ? std::to_integer<std::uint8_t>(code[finish - 1]->instruction.bytes[0]) : 0;
+            const bool ref_null_branch = branch_predicate &&
+                (terminator == 0x0d || terminator == 0x04);
+            const auto successor_predicate = (terminator == 0x0d || terminator == 0x04)
+                ? std::optional<NullBranchPredicate>{}
+                : branch_predicate;
+            for (const auto &edge : successors[bi]) {
+                const auto target = edge.target;
+                if (target >= starts.size() || !entries[target]) continue;
+                auto edge_locals = locals;
+                if (ref_null_branch &&
+                    (edge.kind == BlockEdgeKind::conditional_true ||
+                     edge.kind == BlockEdgeKind::conditional_false) &&
+                    branch_predicate->reference_slot < edge_locals.size()) {
+                    const bool true_edge = edge.kind == BlockEdgeKind::conditional_true;
+                    const bool is_null = true_edge == branch_predicate->true_edge_is_null;
+                    edge_locals[branch_predicate->reference_slot] = is_null
+                        ? ReferenceNullness::null_value : ReferenceNullness::non_null;
+                }
+                bool changed = false;
+                if (!branch_predicate_seen[target]) {
+                    branch_predicate_entries[target] = successor_predicate;
+                    branch_predicate_seen[target] = true;
+                    changed = successor_predicate.has_value();
+                } else if (branch_predicate_entries[target] &&
+                           branch_predicate_entries[target] != successor_predicate) {
+                    branch_predicate_entries[target].reset();
+                    changed = true;
+                }
+                if (!local_nullness_entries[target]) {
+                    local_nullness_entries[target] = std::move(edge_locals);
+                    changed = true;
+                } else {
+                    auto &incoming = *local_nullness_entries[target];
+                    for (std::size_t index = 0; index < incoming.size(); ++index) {
+                        if (incoming[index] != edge_locals[index] && incoming[index] != ReferenceNullness::unknown) {
+                            incoming[index] = ReferenceNullness::unknown;
+                            changed = true;
+                        }
+                    }
+                }
+                if (changed && !nullness_queued[target]) {
+                    work.push_back(target);
+                    nullness_queued[target] = true;
+                }
+            }
+        }
+        if (exceeded_work)
+            std::fill(ref_is_null_input.begin(), ref_is_null_input.end(), ReferenceNullness::unknown);
+    }
+
     auto function_result_types = signature_results();
     if (!function_result_types) return function_result_types.error();
     LiftedFunction out{function.id,function.entry,{},{}};
-    std::vector<std::vector<std::uint32_t>> output_versions(starts.size()),phi_versions(starts.size());
+    const auto total_blocks = starts.size() + edge_bridges.size();
+    std::vector<std::vector<std::uint32_t>> output_versions(total_blocks),phi_versions(total_blocks);
     std::array<std::uint32_t,256> versions{};
-    for(std::size_t bi=0;bi<starts.size();++bi)if(entries[bi]){
-        if(exits[bi]&&!successors[bi].empty()){output_versions[bi].resize(exits[bi]->size());for(std::size_t slot=0;slot<exits[bi]->size();++slot)output_versions[bi][slot]=++versions[slot];}
+    for(std::size_t bi=0;bi<total_blocks;++bi)if(entries[bi]){
+        if(exits[bi]&&(!successors[bi].empty()||bi>=starts.size())){output_versions[bi].resize(exits[bi]->size());for(std::size_t slot=0;slot<exits[bi]->size();++slot)output_versions[bi][slot]=++versions[slot];}
         if(predecessors[bi].size()>1){phi_versions[bi].resize(entries[bi]->size());for(std::size_t slot=0;slot<entries[bi]->size();++slot)phi_versions[bi][slot]=++versions[slot];}
     }
+    const auto bridge_id = [&](std::size_t index) {
+        return BlockId{0x8000000000000000ULL + index - starts.size() + 1};
+    };
+    const auto bridge_address = [&](std::size_t index) {
+        return Address{{UINT32_MAX}, static_cast<std::uint64_t>(index - starts.size()) + 1};
+    };
+    const auto route_address = [&](std::size_t source, std::size_t target,
+                                   std::optional<std::size_t> label, BlockEdgeKind kind) {
+        for (const auto &edge : successors[source])
+            if (edge.target == target && edge.label == label && edge.kind == kind)
+                return edge.bridge ? bridge_address(*edge.bridge)
+                                    : code[starts[target]]->instruction.address;
+        return code[starts[target]]->instruction.address;
+    };
     for(std::size_t bi=0;bi<starts.size();++bi)if(entries[bi]){
         const auto begin=starts[bi],finish=bi+1<starts.size()?starts[bi+1]:code.size(),last=finish-1;
         const BlockId id{static_cast<std::uint64_t>(bi+1)};
         LiftedBlock lifted{id,code[begin]->instruction.address,{},{}};
-        for(const auto &edge:successors[bi]){const auto target_addr=code[starts[edge.target]]->instruction.address;lifted.successors.push_back({code[last]->instruction.address,target_addr,BlockId{static_cast<std::uint64_t>(edge.target+1)},edge.kind});}
+        for(const auto &edge:successors[bi]){
+            const auto target_addr=edge.bridge?bridge_address(*edge.bridge):code[starts[edge.target]]->instruction.address;
+            const auto target_id=edge.bridge?bridge_id(*edge.bridge):BlockId{static_cast<std::uint64_t>(edge.target+1)};
+            lifted.successors.push_back({code[last]->instruction.address,target_addr,target_id,edge.kind});
+        }
         for(std::size_t n=begin;n<finish;++n){
             const auto op=std::to_integer<std::uint8_t>(code[n]->instruction.bytes[0]);
             if(op==0x00)
                 lifted.trap_edges.push_back({code[n]->instruction.address,TrapEdgeKind::unconditional,"unreachable"});
-            else if(op==0x11) lifted.trap_edges.push_back({code[n]->instruction.address,TrapEdgeKind::may_trap,"call_indirect table bounds or type mismatch"});
             if(op==0x00)break;
         }
-        for(std::size_t slot=0;slot<phi_versions[bi].size();++slot){const RegisterOperand reg{RegisterBank::wasm_stack,static_cast<std::uint8_t>(slot),entries[bi]->at(slot).bits,false};LiftedBlock::Phi phi{reg,phi_versions[bi][slot],{}};for(const auto pred:predecessors[bi]){const auto projection=incoming_slot_sources[bi].find(pred);if(projection==incoming_slot_sources[bi].end()||slot>=projection->second.size())return Error{ErrorCode::malformed,"WebAssembly predecessor stack projection is unavailable"};const auto source_slot=projection->second[slot];if(source_slot>=output_versions[pred].size())return Error{ErrorCode::malformed,"WebAssembly predecessor has no stack value for join"};phi.inputs.push_back({BlockId{static_cast<std::uint64_t>(pred+1)},output_versions[pred][source_slot]});}lifted.phis.push_back(std::move(phi));}
+        for(std::size_t slot=0;slot<phi_versions[bi].size();++slot){const RegisterOperand reg{RegisterBank::wasm_stack,static_cast<std::uint8_t>(slot),entries[bi]->at(slot).bits,false};LiftedBlock::Phi phi{reg,phi_versions[bi][slot],{}};for(const auto pred:predecessors[bi]){const auto projection=incoming_slot_sources[bi].find(pred);if(projection==incoming_slot_sources[bi].end()||slot>=projection->second.size())return Error{ErrorCode::malformed,"WebAssembly predecessor stack projection is unavailable"};const auto source_slot=projection->second[slot];if(source_slot>=output_versions[pred].size())return Error{ErrorCode::malformed,"WebAssembly predecessor has no stack value for join"};phi.inputs.push_back({pred>=starts.size()?bridge_id(pred):BlockId{static_cast<std::uint64_t>(pred+1)},output_versions[pred][source_slot]});}lifted.phis.push_back(std::move(phi));}
         Stack stack;
         if(!predecessors[bi].empty())for(std::size_t slot=0;slot<entries[bi]->size();++slot){const RegisterOperand reg{RegisterBank::wasm_stack,static_cast<std::uint8_t>(slot),entries[bi]->at(slot).bits,false};if(predecessors[bi].size()>1)stack.push_back(std::make_shared<Expression>(Expression{entries[bi]->at(slot),RegisterValue{reg,phi_versions[bi][slot]}}));else{const auto pred=predecessors[bi].front();const auto projection=incoming_slot_sources[bi].find(pred);if(projection==incoming_slot_sources[bi].end()||slot>=projection->second.size())return Error{ErrorCode::malformed,"WebAssembly predecessor stack projection is unavailable"};const auto source_slot=projection->second[slot];if(source_slot>=output_versions[pred].size())return Error{ErrorCode::malformed,"WebAssembly predecessor stack value is unavailable"};stack.push_back(std::make_shared<Expression>(Expression{entries[bi]->at(slot),RegisterValue{reg,output_versions[pred][source_slot]}}));}}
         auto pop=[&](ValueType expected)->Result<ExpressionPtr>{if(stack.empty())return unsupported("operand stack underflow");auto v=stack.back();stack.pop_back();if(expected.kind!=TypeKind::unknown&&v->type!=expected)return unsupported("operand stack type mismatch");return v;};
@@ -791,19 +1293,39 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
         for(std::size_t n=begin;n<finish;++n){const auto *fact=code[n];const auto &i=fact->instruction;const auto op=std::to_integer<std::uint8_t>(i.bytes[0]);
             if(op==0xd0){stack.push_back(constant(0,funcref()));continue;}
             if(op==0xd2){auto index=immediate(i);if(!index)return unsupported("ref.func index unavailable");stack.push_back(unary("wasm_ref_func_"+std::to_string(*index),constant(0,funcref()),funcref()));continue;}
-            if(op==0xd1){auto value=pop(funcref());if(!value)return value.error();stack.push_back(unary("wasm_ref_is_null",value.value(),integer(32)));continue;}
+            if(op==0xd1){
+                auto value=pop(funcref());if(!value)return value.error();
+                // Preserve the exact result when the reference's nullness is
+                // known locally. This also lets a following br_if use the
+                // actual Wasm predicate rather than an opaque helper call.
+                if (ref_is_null_input[n] == ReferenceNullness::null_value) {
+                    stack.push_back(constant(1, integer(32)));
+                } else if (ref_is_null_input[n] == ReferenceNullness::non_null) {
+                    stack.push_back(constant(0, integer(32)));
+                } else {
+                    const auto inferred = expression_nullness(value.value());
+                    if (inferred == ReferenceNullness::null_value)
+                        stack.push_back(constant(1, integer(32)));
+                    else if (inferred == ReferenceNullness::non_null)
+                        stack.push_back(constant(0, integer(32)));
+                    else
+                        stack.push_back(unary("wasm_ref_is_null",value.value(),integer(32)));
+                }
+                continue;
+            }
             if(op==0x41||op==0x42||op==0x43||op==0x44){auto v=immediate(i);if(!v)return unsupported("constant immediate unavailable");stack.push_back(constant(*v,op==0x41?integer(32):op==0x42?integer(64):op==0x43?floating(32):floating(64)));continue;}
             if(op==0x00){emit(n,Intrinsic{"wasm_unreachable",{},IntrinsicMemoryEffect::none});break;}
             if(op==0x01)continue;
             if(op==2||op==3){continue;}
-            if(op==4){auto cond=pop(integer(32));if(!cond)return cond.error();const auto li=*opener_label[n];const auto yes=code[n+1]->instruction.address;const auto target=labels[li].else_index<code.size()?labels[li].else_index+1:labels[li].end+1;emit(n,Branch{"wasm_if",yes,code[target]->instruction.address,cond.value()});continue;}
-            if(op==5){const auto li=active_labels[n].back();auto values=take_results(labels[li].result_types);if(!values)return values.error();if(!label_heights[li]||stack.size()<*label_heights[li])return unsupported("if then-arm stack height is unavailable");stack.resize(*label_heights[li]);stack.insert(stack.end(),values.value().begin(),values.value().end());const auto target=labels[li].end+1;emit(n,Branch{"true",code[target]->instruction.address,{}});continue;}
+            if(op==4){auto cond=pop(integer(32));if(!cond)return cond.error();const auto li=*opener_label[n];const auto yes_target=n+1;const auto no_target=labels[li].else_index<code.size()?labels[li].else_index+1:labels[li].end+1;const auto yes_block=block_for(yes_target),no_block=block_for(no_target);if(!yes_block||!no_block)return unsupported("if target is not a basic block");emit(n,Branch{"wasm_if",route_address(bi,*yes_block,{},BlockEdgeKind::conditional_true),route_address(bi,*no_block,{},BlockEdgeKind::conditional_false),cond.value()});continue;}
+            if(op==5){const auto li=active_labels[n].back();auto values=take_results(labels[li].result_types);if(!values)return values.error();if(!label_heights[li]||stack.size()<*label_heights[li])return unsupported("if then-arm stack height is unavailable");stack.resize(*label_heights[li]);stack.insert(stack.end(),values.value().begin(),values.value().end());const auto target=labels[li].end+1;const auto target_block=block_for(target);if(!target_block)return unsupported("else target is not a basic block");emit(n,Branch{"true",route_address(bi,*target_block,li,BlockEdgeKind::jump),{}});continue;}
             if(op==0x0b){if(end_label[n]){const auto li=*end_label[n];auto values=take_results(labels[li].result_types);if(!values)return values.error();if(!label_heights[li]||stack.size()<*label_heights[li])return unsupported("block stack height is unavailable");stack.resize(*label_heights[li]);stack.insert(stack.end(),values.value().begin(),values.value().end());}else if(n==function_end){auto result=emit_return(n,function_result_types.value());if(!result)return result.error();}continue;}
             if(op==0x0f){auto result=emit_return(n,function_result_types.value());if(!result)return result.error();continue;}
-            if(op==0x0c||op==0x0d){auto depth=immediate(i);if(!depth)return unsupported("branch depth unavailable");const auto li=active_labels[n][active_labels[n].size()-1-static_cast<std::size_t>(*depth)];const auto target=li==function_label?function_end:labels[li].kind==3?labels[li].opener+1:labels[li].end+1;if(op==0x0c)emit(n,Branch{"true",code[target]->instruction.address,{}});else{auto cond=pop(integer(32));if(!cond)return cond.error();emit(n,Branch{"br_if",code[target]->instruction.address,n+1<code.size()?std::optional<Address>{code[n+1]->instruction.address}:std::nullopt,cond.value()});}continue;}
-            if(op==0x0e){auto selector=pop(integer(32));if(!selector)return selector.error();auto targets=table_targets(n);if(!targets)return targets.error();LiftedBlock::SwitchDispatch dispatch;dispatch.selector=selector.value();for(const auto &target:targets.value()){const auto target_block=block_for(target.target);if(!target_block)return unsupported("br_table target is not a basic block");const auto address=code[starts[*target_block]]->instruction.address;if(target.value)dispatch.cases.push_back({*target.value,address});else dispatch.default_target=address;}lifted.switch_dispatch=std::move(dispatch);continue;}
+            if(op==0x0c||op==0x0d){auto depth=immediate(i);if(!depth)return unsupported("branch depth unavailable");const auto li=active_labels[n][active_labels[n].size()-1-static_cast<std::size_t>(*depth)];const auto target=li==function_label?function_end:labels[li].kind==3?labels[li].opener+1:labels[li].end+1;const auto target_block=block_for(target);if(!target_block)return unsupported("branch target is not a basic block");const auto branch_kind=op==0x0c?BlockEdgeKind::jump:BlockEdgeKind::conditional_true;const auto branch_target=route_address(bi,*target_block,li,branch_kind);if(op==0x0c)emit(n,Branch{"true",branch_target,{}});else{auto cond=pop(integer(32));if(!cond)return cond.error();const auto fallthrough=n+1<code.size()?block_for(n+1):std::nullopt;emit(n,Branch{"br_if",branch_target,fallthrough?std::optional<Address>{route_address(bi,*fallthrough,{},BlockEdgeKind::conditional_false)}:std::nullopt,cond.value()});}continue;}
+            if(op==0x0e){auto selector=pop(integer(32));if(!selector)return selector.error();auto targets=table_targets(n);if(!targets)return targets.error();LiftedBlock::SwitchDispatch dispatch;dispatch.selector=selector.value();for(const auto &target:targets.value()){const auto target_block=block_for(target.target);if(!target_block)return unsupported("br_table target is not a basic block");const auto address=route_address(bi,*target_block,target.label,BlockEdgeKind::jump);if(target.value)dispatch.cases.push_back({*target.value,address});else dispatch.default_target=address;}lifted.switch_dispatch=std::move(dispatch);continue;}
             if(op==0x1a){auto v=pop({});if(!v)return v.error();continue;}
             if(op==0x1b){auto cond=pop(integer(32));if(!cond)return cond.error();auto when_true=pop({});if(!when_true)return when_true.error();auto when_false=pop(when_true.value()->type);if(!when_false)return when_false.error();auto alternatives=binary("pair",when_true.value(),when_false.value(),when_true.value()->type);stack.push_back(binary("select_if",cond.value(),alternatives,when_true.value()->type));continue;}
+            if(op==0x1c){const auto type_code=immediate(i);if(!type_code||*type_code>UINT8_MAX)return unsupported("typed select result type unavailable");const auto type=wasm_value_type(static_cast<std::uint8_t>(*type_code));if(!type)return unsupported("typed select result type is unsupported");auto cond=pop(integer(32));if(!cond)return cond.error();auto when_true=pop(*type);if(!when_true)return when_true.error();auto when_false=pop(*type);if(!when_false)return when_false.error();auto alternatives=binary("pair",when_true.value(),when_false.value(),*type);stack.push_back(binary("select_if",cond.value(),alternatives,*type));continue;}
             if (op >= 0x20 && op <= 0x22) {
                 const auto index = immediate(code[n]->instruction);
                 const auto type = index ? local_type(*index) : std::optional<ValueType>{};
@@ -884,6 +1406,10 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
                     return unsupported("call_indirect table index is unavailable or not i32");
                 auto table_index_value = stack.back();
                 stack.pop_back();
+                lifted.trap_edges.push_back({i.address, TrapEdgeKind::may_trap,
+                    "call_indirect table bounds or type mismatch",
+                    unary("wasm_call_indirect_traps_type_" + std::to_string(*type_index),
+                          table_index_value, integer(32))});
                 const auto target_function = resolved_indirect_target(metadata,
                     static_cast<std::uint32_t>(*type_index), table_index_value);
                 std::vector<ExpressionPtr> arguments(callee->parameter_types.size());
@@ -961,6 +1487,191 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
                 }
                 continue;
             }
+            if (op == 0xfd) {
+                const auto subopcode = simd_subopcode(i);
+                const auto lane = subopcode ? simd_lane_op(*subopcode) : std::optional<SimdLaneOpInfo>{};
+                if (lane) {
+                    const auto lane_index = immediate(i, 0);
+                    if (!lane_index || *lane_index >= lane->lane_count)
+                        return unsupported("SIMD lane immediate is missing or outside its lane count");
+                    const auto vector_type = vector(128);
+                    const auto lane_name = std::string(lane->name) + "_" + std::to_string(*lane_index);
+                    if (lane->replace) {
+                        auto scalar = pop(lane->scalar_type);
+                        auto value = pop(vector_type);
+                        if (!scalar) return scalar.error();
+                        if (!value) return value.error();
+                        Intrinsic replace{lane_name, {value.value(), scalar.value()}, IntrinsicMemoryEffect::none};
+                        if (stack.size() >= max_stack)
+                            return Error{ErrorCode::resource_limit, "WebAssembly operand stack exceeds 128 values"};
+                        const auto slot = stack.size();
+                        const RegisterOperand result_register{RegisterBank::wasm_stack,
+                            static_cast<std::uint8_t>(slot), vector_type.bits, false};
+                        replace.register_writes.push_back(result_register);
+                        stack.push_back(std::make_shared<Expression>(Expression{
+                            vector_type, RegisterValue{result_register, 0}}));
+                        emit(n, std::move(replace));
+                    } else {
+                        auto value = pop(vector_type);
+                        if (!value) return value.error();
+                        stack.push_back(unary(lane_name, value.value(), lane->scalar_type));
+                    }
+                    continue;
+                }
+                if (subopcode && (*subopcode == 77 || (*subopcode >= 78 && *subopcode <= 83))) {
+                    const auto vector_type = vector(128);
+                    if (*subopcode == 77) {
+                        auto value = pop(vector_type);
+                        if (!value) return value.error();
+                        stack.push_back(unary("not", value.value(), vector_type));
+                    } else if (*subopcode >= 78 && *subopcode <= 81) {
+                        auto right = pop(vector_type);
+                        auto left = pop(vector_type);
+                        if (!right) return right.error();
+                        if (!left) return left.error();
+                        ExpressionPtr value;
+                        if (*subopcode == 78) value = binary("and", left.value(), right.value(), vector_type);
+                        else if (*subopcode == 79)
+                            value = binary("and", left.value(), unary("not", right.value(), vector_type), vector_type);
+                        else if (*subopcode == 80) value = binary("or", left.value(), right.value(), vector_type);
+                        else value = binary("xor", left.value(), right.value(), vector_type);
+                        stack.push_back(std::move(value));
+                    } else if (*subopcode == 82) {
+                        auto mask = pop(vector_type);
+                        auto second = pop(vector_type);
+                        auto first = pop(vector_type);
+                        if (!mask) return mask.error();
+                        if (!second) return second.error();
+                        if (!first) return first.error();
+                        auto selected_first = binary("and", first.value(), mask.value(), vector_type);
+                        auto selected_second = binary("and", second.value(),
+                            unary("not", mask.value(), vector_type), vector_type);
+                        stack.push_back(binary("or", std::move(selected_first),
+                            std::move(selected_second), vector_type));
+                    } else {
+                        auto value = pop(vector_type);
+                        if (!value) return value.error();
+                        stack.push_back(unary("wasm_v128_any_true", value.value(), integer(32)));
+                    }
+                    continue;
+                }
+                if (subopcode && ((*subopcode >= 0x23 && *subopcode <= 0x4c) ||
+                                  (*subopcode >= 0xd6 && *subopcode <= 0xdb))) {
+                    // SIMD comparison results are lane masks represented as
+                    // opaque v128 values. Keep the exact decoded mnemonic so
+                    // signedness and lane width survive lifting.
+                    if (i.mnemonic_override.empty())
+                        return unsupported("SIMD comparison mnemonic is unavailable");
+                    auto right = pop(vector(128));
+                    auto left = pop(vector(128));
+                    if (!right) return right.error();
+                    if (!left) return left.error();
+                    stack.push_back(binary(i.mnemonic_override, left.value(), right.value(), vector(128)));
+                    continue;
+                }
+                if (subopcode) {
+                    if (const auto operation = wasm_simd_integer_binary_op(*subopcode)) {
+                        auto right = pop(vector(128));
+                        auto left = pop(vector(128));
+                        if (!right) return right.error();
+                        if (!left) return left.error();
+                        // Generic 128-bit arithmetic would introduce cross-lane carries.
+                        stack.push_back(binary(std::string(operation->name), left.value(), right.value(), vector(128)));
+                        continue;
+                    }
+                    if (const auto operation = simd_integer_shift(*subopcode)) {
+                        auto shift = pop(integer(32));
+                        auto value = pop(vector(128));
+                        if (!shift) return shift.error();
+                        if (!value) return value.error();
+                        stack.push_back(binary(std::string(*operation), value.value(), shift.value(), vector(128)));
+                        continue;
+                    }
+                }
+                const auto info = subopcode ? simd_memory_op(*subopcode) : std::optional<SimdMemoryOpInfo>{};
+                if (!info) return unsupported("SIMD instruction is outside the supported memory subset");
+                if (!metadata || static_cast<std::uint64_t>(metadata->imported_memories) + metadata->defined_memories != 1)
+                    return unsupported("SIMD memory operation requires exactly one validated module memory");
+                const auto alignment = immediate(i, 0);
+                const auto offset = immediate(i, 1);
+                const auto expected_operands = info->lane_indexed ? 3u : 2u;
+                if (i.operands.size() != expected_operands || !alignment || !offset ||
+                    *alignment > info->maximum_alignment_exponent || *offset > UINT32_MAX)
+                    return unsupported("SIMD memory alignment or offset immediate is malformed or out of bounds");
+                if (info->lane_indexed) {
+                    const auto lane = immediate(i, 2);
+                    const auto lane_count = 128u / info->access_bits;
+                    if (i.operands.size() != 3 || !lane || *lane >= lane_count)
+                        return unsupported("SIMD lane memory operation has a missing or out-of-range lane index");
+                    auto value = pop(vector(128));
+                    auto address = pop(integer(32));
+                    if (!value) return value.error();
+                    if (!address) return address.error();
+                    const auto effective_address = *offset
+                        ? binary("add", address.value(), constant(*offset, integer(32)), integer(32))
+                        : address.value();
+                    const auto access_bytes = info->access_bits / 8;
+                    lifted.trap_edges.push_back({i.address, TrapEdgeKind::may_trap,
+                        "WebAssembly SIMD lane memory access out of bounds",
+                        unary("wasm_memory_access_out_of_bounds_length_" + std::to_string(access_bytes),
+                              effective_address, integer(32))});
+                    const RegisterOperand address_register{RegisterBank::wasm_stack, 255, 32, false};
+                    emit(n, Assign{address_register, effective_address});
+                    MemoryValue memory;
+                    memory.type = info->memory_type;
+                    memory.base = address_register;
+                    auto location = std::make_shared<Expression>(Expression{info->memory_type, std::move(memory)});
+                    const auto lane_name = std::to_string(info->access_bits) + "_" + std::to_string(*lane);
+                    if (info->store) {
+                        auto stored = unary("wasm_v128_extract_lane_" + lane_name,
+                                            value.value(), info->memory_type);
+                        emit(n, Store{std::move(location), std::move(stored)});
+                    } else {
+                        Intrinsic load{"wasm_v128_load_lane_" + lane_name,
+                            {value.value(), std::move(location)}, IntrinsicMemoryEffect::read};
+                        if (stack.size() >= max_stack)
+                            return Error{ErrorCode::resource_limit, "WebAssembly operand stack exceeds 128 values"};
+                        const auto slot = stack.size();
+                        const RegisterOperand result_register{RegisterBank::wasm_stack,
+                            static_cast<std::uint8_t>(slot), 128, false};
+                        load.register_writes.push_back(result_register);
+                        stack.push_back(std::make_shared<Expression>(Expression{
+                            vector(128), RegisterValue{result_register, 0}}));
+                        emit(n, std::move(load));
+                    }
+                    continue;
+                }
+                ExpressionPtr stored;
+                if (info->store) {
+                    auto value = pop(info->stack_type);
+                    if (!value) return value.error();
+                    stored = value.value();
+                }
+                auto address = pop(integer(32));
+                if (!address) return address.error();
+                const auto effective_address = *offset
+                    ? binary("add", address.value(), constant(*offset, integer(32)), integer(32))
+                    : address.value();
+                const auto access_bytes = info->access_bits / 8;
+                lifted.trap_edges.push_back({i.address, TrapEdgeKind::may_trap,
+                    "WebAssembly SIMD memory access out of bounds",
+                    unary("wasm_memory_access_out_of_bounds_length_" + std::to_string(access_bytes),
+                          effective_address, integer(32))});
+                const RegisterOperand address_register{RegisterBank::wasm_stack, 255, 32, false};
+                emit(n, Assign{address_register, effective_address});
+                MemoryValue memory;
+                memory.type = info->memory_type;
+                memory.base = address_register;
+                auto location = std::make_shared<Expression>(Expression{info->memory_type, std::move(memory)});
+                if (info->store) {
+                    emit(n, Store{std::move(location), std::move(stored)});
+                } else if (info->load_operation.empty()) {
+                    stack.push_back(std::move(location));
+                } else {
+                    stack.push_back(unary(std::string(info->load_operation), std::move(location), info->stack_type));
+                }
+                continue;
+            }
             if (op == 0x3f || op == 0x40) {
                 const auto memory_index = immediate(code[n]->instruction);
                 if (!metadata ||
@@ -1004,6 +1715,80 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
                 if (*subopcode == 9) {
                     effect.name = "wasm_data_drop_segment_" + std::to_string(*immediate(i, 0));
                     effect.memory_effect = IntrinsicMemoryEffect::none;
+                } else if (*subopcode == 13) {
+                    effect.name = "wasm_element_drop_segment_" + std::to_string(*immediate(i, 0));
+                    effect.memory_effect = IntrinsicMemoryEffect::unknown;
+                } else if (*subopcode >= 12) {
+                    const auto table_range_oob = [&](const ExpressionPtr &address,
+                                                     const ExpressionPtr &length) {
+                        return binary("wasm_table_range_out_of_bounds_table_0", address, length, integer(32));
+                    };
+                    if (*subopcode == 12) {
+                        const auto element_index = *immediate(i, 0);
+                        auto length = pop(integer(32));
+                        auto source = pop(integer(32));
+                        auto destination = pop(integer(32));
+                        if (!length) return length.error();
+                        if (!source) return source.error();
+                        if (!destination) return destination.error();
+                        effect.name = "wasm_table_init_element_" + std::to_string(element_index);
+                        effect.operands = {destination.value(), source.value(), length.value()};
+                        effect.memory_effect = IntrinsicMemoryEffect::unknown;
+                        const auto &segment = metadata->element_segments[static_cast<std::size_t>(element_index)];
+                        const auto source_oob = binary(
+                            "wasm_element_segment_" + std::to_string(element_index) +
+                                "_source_range_out_of_bounds_count_" +
+                                std::to_string(segment.function_indices.size()),
+                            source.value(), length.value(), integer(32));
+                        const auto dropped = unary("wasm_element_segment_" + std::to_string(element_index) +
+                                                       "_dropped_and_length_nonzero",
+                                                   length.value(), integer(32));
+                        const auto condition = binary("or", table_range_oob(destination.value(), length.value()),
+                            binary("or", source_oob, dropped, integer(32)), integer(32));
+                        lifted.trap_edges.push_back({i.address, TrapEdgeKind::may_trap,
+                            effect.name + " bounds or dropped-segment trap", condition});
+                    } else if (*subopcode == 14) {
+                        auto length = pop(integer(32));
+                        auto source = pop(integer(32));
+                        auto destination = pop(integer(32));
+                        if (!length) return length.error();
+                        if (!source) return source.error();
+                        if (!destination) return destination.error();
+                        effect.name = "wasm_table_copy";
+                        effect.operands = {destination.value(), source.value(), length.value()};
+                        effect.memory_effect = IntrinsicMemoryEffect::unknown;
+                        const auto condition = binary("or", table_range_oob(destination.value(), length.value()),
+                            table_range_oob(source.value(), length.value()), integer(32));
+                        lifted.trap_edges.push_back({i.address, TrapEdgeKind::may_trap,
+                            "wasm_table_copy bounds trap", condition});
+                    } else if (*subopcode == 15) {
+                        auto delta = pop(integer(32));
+                        auto value = pop(funcref());
+                        if (!delta) return delta.error();
+                        if (!value) return value.error();
+                        effect.name = "wasm_table_grow_elements";
+                        effect.operands = {value.value(), delta.value()};
+                        effect.memory_effect = IntrinsicMemoryEffect::unknown;
+                        auto results = append_call_results(effect, {0x7f});
+                        if (!results) return results.error();
+                    } else if (*subopcode == 16) {
+                        effect.name = "wasm_table_size_elements";
+                        effect.memory_effect = IntrinsicMemoryEffect::read;
+                        auto results = append_call_results(effect, {0x7f});
+                        if (!results) return results.error();
+                    } else {
+                        auto length = pop(integer(32));
+                        auto value = pop(funcref());
+                        auto destination = pop(integer(32));
+                        if (!length) return length.error();
+                        if (!value) return value.error();
+                        if (!destination) return destination.error();
+                        effect.name = "wasm_table_fill";
+                        effect.operands = {destination.value(), value.value(), length.value()};
+                        effect.memory_effect = IntrinsicMemoryEffect::unknown;
+                        lifted.trap_edges.push_back({i.address, TrapEdgeKind::may_trap,
+                            "wasm_table_fill bounds trap", table_range_oob(destination.value(), length.value())});
+                    }
                 } else {
                     const char *name = *subopcode == 8 ? "wasm_memory_init_data_" :
                                        *subopcode == 10 ? "wasm_memory_copy" : "wasm_memory_fill";
@@ -1093,6 +1878,28 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
             const auto *origin=code[last];
             for(std::size_t slot=0;slot<output_versions[bi].size();++slot){const RegisterOperand reg{RegisterBank::wasm_stack,static_cast<std::uint8_t>(slot),exits[bi]->at(slot).bits,false};copies.push_back({{origin->instruction.address,origin->id},Assign{reg,stack[slot],output_versions[bi][slot]}});}
             if(!lifted.instructions.empty()&&(std::holds_alternative<Branch>(lifted.instructions.back().statement)||std::holds_alternative<Return>(lifted.instructions.back().statement)))lifted.instructions.insert(lifted.instructions.end()-1,std::make_move_iterator(copies.begin()),std::make_move_iterator(copies.end()));else lifted.instructions.insert(lifted.instructions.end(),std::make_move_iterator(copies.begin()),std::make_move_iterator(copies.end()));
+        }
+        out.blocks.push_back(std::move(lifted));
+    }
+    for (const auto &bridge : edge_bridges) {
+        const auto index = starts.size() + static_cast<std::size_t>(&bridge - edge_bridges.data());
+        LiftedBlock lifted{bridge_id(index), bridge_address(index), {}, {}};
+        lifted.successors.push_back({bridge_address(index),
+            code[starts[bridge.target]]->instruction.address,
+            BlockId{static_cast<std::uint64_t>(bridge.target + 1)}, BlockEdgeKind::jump});
+        for (std::size_t slot = 0; slot < bridge.source_slots.size(); ++slot) {
+            const auto source_slot = bridge.source_slots[slot];
+            if (source_slot >= output_versions[bridge.source].size())
+                return Error{ErrorCode::malformed, "WebAssembly edge bridge source value is unavailable"};
+            const RegisterOperand reg{RegisterBank::wasm_stack, static_cast<std::uint8_t>(slot),
+                entries[index]->at(slot).bits, false};
+            auto value = std::make_shared<Expression>(Expression{
+                exits[bridge.source]->at(source_slot),
+                RegisterValue{RegisterOperand{RegisterBank::wasm_stack,
+                    static_cast<std::uint8_t>(source_slot), exits[bridge.source]->at(source_slot).bits, false},
+                    output_versions[bridge.source][source_slot]}});
+            lifted.instructions.push_back({{bridge.source_address, 0},
+                Assign{reg, std::move(value), output_versions[index][slot]}});
         }
         out.blocks.push_back(std::move(lifted));
     }

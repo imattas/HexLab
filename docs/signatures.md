@@ -32,6 +32,17 @@ unscoped and are evaluated against the image selected by the caller. This is an
 in-memory API composition only; it does not define a new catalog-set file
 format or change the CLI's single `--definitions` input.
 
+`SignatureLimits::minimum_constrained_bits` optionally excludes masked
+byte-pattern definitions whose positive pattern has fewer constrained bits
+than the requested floor. The default is zero, preserving existing matches;
+the maximum supported floor is 2048 bits, matching the 256-byte pattern cap.
+Filtered definitions do not contribute scan candidates or consume byte-scan
+work when no eligible definitions remain. Pattern validation still runs for
+all definitions. This setting affects byte-pattern scans and recovered
+function-entry recognition, including catalog sets, but not normalized
+instruction-fingerprint recognition. Constrained-bit count describes pattern
+specificity only; it is not a confidence score and does not resolve ambiguity.
+
 Each following non-comment line has four pipe-separated fields:
 
 ```text
@@ -47,6 +58,8 @@ Example.Runtime|internal catalog|48 8B ?? ?? 48 85 C0|48 8B 05 10 00 00 00
 Pattern tokens are two hexadecimal digits, `??` for a full-byte wildcard, or nibble masks such as `A?` and `?F`. A definition needs at least one exact byte. Exclusions are matched at the same start offset as the positive pattern; if any exclusion matches, that candidate is suppressed. Blank lines and lines beginning with `#` are ignored.
 
 The parser caps a definition file at 1 MiB, 4,096 definitions, 128-byte names, 256-byte provenance fields and patterns, and 16 exclusions per definition. For each executable segment, the scanner indexes definitions by the leading byte of each pattern's longest exact-byte run, then verifies only offsets where that run matches. This keeps output deterministic (definition order, then ascending file offset) while avoiding full-pattern checks at every byte. The candidate budget counts anchor hits that proceed to full-pattern verification; the comparison budget includes anchor checks, full patterns, and exclusions; the indexed-byte budget bounds the linear pass over executable bytes. Cancellation is checked throughout. Patterns never cross segment boundaries, and non-executable or non-file-backed segment tails are not scanned.
+
+API callers can set `SignatureLimits::file_range` to scan one bounded file-coordinate window rather than every executable segment. The range must be nonempty and fit inside the effective byte source; scanning is clipped to its intersection with executable, file-backed segments. Positive patterns and exclusions must fit completely inside both the intersection and their segment, so a match cannot borrow bytes outside the requested range. Work budgets count only bytes and candidates inside the selected window. This field is also honored by catalog-set and recovered-function-entry recognition overloads.
 
 ## Project CLI
 
@@ -82,6 +95,26 @@ the same encoded addresses. The resulting `SignatureDefinition` can be exported 
 `serialize_signature_definitions` and read back by the existing parser. The
 serializer validates canonical nibble masks and metadata, preventing invalid
 or line-injected catalogs.
+
+`create_function_signature_catalog` builds a target-scoped v2 catalog from an
+explicit ordered span of recovered `FunctionId` values. It generates stable
+`sub_<address-space>_<entry>` names and applies the same effective-byte,
+decode-context, instruction-boundary, and minimum-exact-byte checks as the
+single-function API. The selection is capped at 4,096 functions; duplicate,
+unknown, or stale IDs, duplicate entry addresses, and any function that cannot
+produce a valid signature fail the whole operation. The returned catalog can
+be written with `serialize_signature_catalog` and passed directly to the
+existing single-catalog or ordered catalog-set recognition APIs. The CLI
+exposes the all-recovered-functions selection through
+`project signature-catalog-create <project> --all-functions --provenance <source>`.
+It preserves recovered-function order, writes canonical v2 catalog text to
+stdout, and fails without output if recovery is incomplete, the selection is
+empty or exceeds 4,096 functions, or any function cannot be signed. `--max-bytes`
+defaults to 128 and accepts 1..256; `--min-exact-bytes` defaults to 8 and
+accepts 1..`--max-bytes`. Provenance must be 1..256 bytes without `|`, CR, or
+LF, and serialized output is capped at 1 MiB. The CLI currently offers only
+this all-functions batch selection; `signature-create` remains available for
+extracting one function by entry address.
 
 `recognize_function_signatures` groups matches at recovered function entries.
 Matches inside functions are excluded. Each entry retains every matching
@@ -146,9 +179,16 @@ automatic library naming remain future work.
 
 ## FLAIR text patterns
 
-The desktop **Analysis > Scan FLAIR Catalog and Browse Results...** workflow
-imports `.pat`, gzip-wrapped `.pat.gz`, and binary `.sig` catalogs (versions
-5-10), then scans the active writable project's recovered functions. Format dispatch uses IDASGN and gzip magic bytes; otherwise input is parsed as FLAIR text. Its
+The desktop **Analysis > Scan FLAIR Catalogs and Browse Results...** workflow
+accepts an ordered selection of up to 256 `.pat`, gzip-wrapped `.pat.gz`, and
+binary `.sig` catalogs (versions 5-10), then scans the active writable
+project's recovered functions in one bounded recognition pass. Aggregate
+catalog inputs and inflated bodies are each capped at 64 MiB; the set is
+capped at 65,536 patterns. Format dispatch uses IDASGN and gzip magic bytes;
+otherwise input is parsed as FLAIR text. Candidates retain their zero-based
+catalog index and per-file provenance, including across duplicate catalogs.
+Set order and raw catalog contents contribute to the persisted evidence
+identity. Its
 results dialog reports catalog provenance, parsed pattern count, target, scan
 completeness, and work counters, then lists up to 2,000 matching function
 entries with candidate names, provenance, and ambiguity status. Select a row
@@ -174,8 +214,10 @@ byte offsets and must be strictly less than the module length. The CRC window
 starts immediately after the 32-byte head; a tail starts immediately after
 that window. The tail and CRC window must fit within the declared module
 length. Blank lines, leading-whitespace comment lines beginning `#` or `;`,
-and a `---` terminator are supported; continuation lines and inline comments
-are rejected. Unsupported syntax is rejected rather than partially imported.
+and a `---` terminator are supported. Inline comments may begin at any
+whitespace-delimited token boundary with `#` or `;`; the remainder of that
+record line is ignored. Continuation lines remain unsupported. Other malformed
+or unsupported syntax is rejected rather than partially imported.
 
 Reference records (`^offset name`) are checked against a direct call at the
 recorded function-relative offset. A reference is accepted only when the call
@@ -184,7 +226,7 @@ Unresolved references and reference-only cycles are discarded. Multiple
 distinct names remain explicit ambiguity; recognition does not rename
 functions. Parsing is limited to 64 MiB, 65,536 pattern records, 128 symbols
 per pattern, and 256-byte names and tails. `parse_flirt_sig` also accepts
-uncompressed IDA binary signature catalogs, versions 5 through 10, including
+IDA binary signature catalogs, versions 5 through 10, including
 sparse tail bytes, public/local names, reference names, and CRC collision
 modules. Its catalog API version stays at 1 while `source_format_version`
 retains the original IDASGN version. For `.sig` inputs the catalog also retains
@@ -195,12 +237,15 @@ The CLI selects `.sig` by its `IDASGN` magic and otherwise uses `.pat`.
 Supported catalog targets are x86 16/32/64, 6502, MIPS32/64, ARM32/64,
 PowerPC32/64, and RISC-V32/64. Architecture IDs follow the public IDA SDK
 processor constants; application-width flags follow the `idasgn_header_t`
-definitions. Compressed `.sig` bodies for versions 6 through 10 are inflated
-as zlib streams in 64 KiB chunks. Input and output are independently capped at
+definitions. Compressed `.sig` bodies for versions 5 through 10 are inflated
+in cancellable 64 KiB chunks: versions 5 and 6 use raw DEFLATE, and versions 7
+through 10 use zlib-wrapped DEFLATE. Input and output are independently capped at
 64 MiB by default, with a configurable lower output cap through
 `FlirtCatalogLimits::max_inflated_bytes`. Cancellation is checked between
-chunks, stream checksums are validated, and trailing compressed bytes are
-rejected. Compressed version 5, unsupported
+chunks, zlib stream checksums are validated when present, and trailing
+compressed bytes are rejected. Raw DEFLATE v5/v6 bodies have no wrapper
+checksum; successful decoding and full body parsing validate the contents.
+Unsupported
 architectures/application combinations, versions outside 5–10, and malformed
 or over-budget tries are rejected. Gzip-wrapped `.pat.gz` input is supported
 through the same `.pat` parser. RFC 1952 optional extra/name/comment/header-
@@ -210,6 +255,15 @@ uncompressed-size trailer are checked, and trailing bytes or concatenated gzip
 members are rejected. The CLI detects `.pat.gz` and `.sig` by magic, so gzip
 catalogs use the same recognition, provenance, and persisted-evidence path.
 
+Recognition indexes each pattern by its most selective constrained head byte.
+It supports partial-bit masks in caller-built `FlirtPatternDefinition` records,
+as well as exact bytes and fully wildcarded heads. Imported `.pat` and `.sig`
+formats currently provide exact-byte or wildcard-byte head constraints.
+Patterns with no constrained head byte use a bounded fallback candidate list;
+they still pass through the normal head, CRC, and tail checks and consume the
+same candidate/comparison budgets. Candidate processing remains in catalog
+order, so masked-anchor support does not change ambiguity ordering.
+
 Recognition validates every symbol record again, including catalogs assembled
 directly through the public C++ API. Public, local, and reference offsets must
 be nonnegative and fall within the declared module length; unknown symbol kinds
@@ -217,13 +271,31 @@ and malformed names are rejected before matching. This prevents an invalid
 binary or caller-built catalog from silently dropping out-of-range references
 or contributing misleading partial evidence.
 
+Binary `.sig` trie wildcard masks are also required to fit within each node's
+declared byte length. Bits beyond the node are rejected instead of being
+silently ignored, while canonical masks for all supported versions remain
+accepted. This validation applies before trie traversal and prevents malformed
+mask encodings from being normalized into apparently valid patterns.
+
 The binary layout was implemented from Hex-Rays' FLIRT technology overview
 and checked against the public `fast-flirt` parser documentation/source
-(Apache-2.0, format reference only; no code copied):
+(Apache-2.0, format reference only; no code copied) and the open-source
+radare2 parser's compressed-stream selection:
 https://docs.hex-rays.com/8.4/user-guide/signatures/flirt/ida-f.l.i.r.t.-technology-in-depth
 https://cpp.docs.hex-rays.com/idp_8hpp_source.html
 https://cpp.docs.hex-rays.com/libfuncs_8hpp_source.html
-and https://docs.rs/fast-flirt/latest/src/fast_flirt/sig.rs.html.
+https://docs.rs/fast-flirt/latest/src/fast_flirt/sig.rs.html
+https://github.com/radareorg/radare2/blob/master/libr/anal/flirt.c.
+
+Format coverage is not a full FLIRT corpus compatibility claim: binary `.sig`
+versions 5 through 10 and text `.pat`/single-member gzip `.pat.gz` are the
+supported import paths, for the processor targets listed above. Compressed
+versions 5 and 6 use raw DEFLATE; versions 7 through 10 use zlib-wrapped
+DEFLATE. Older and newer binary versions, other compression wrappers, and
+concatenated gzip members are rejected. Recognition returns structural pattern matches and
+ambiguity; it does not calculate IDA's library similarity ranking or validate
+matches against a representative third-party library corpus. Specificity and
+ambiguity are evidence only, so false-positive rates remain unmeasured.
 
 The project CLI exposes this recognition path without applying names or
 comments:
@@ -236,10 +308,11 @@ The command supplies the loaded image architecture/mode, prints every grounded
 candidate and ambiguity, and reports its pattern/comparison budgets. It reads
 the project read-only. To persist source-bound candidates and ambiguity without
 renaming functions, use `project flirt-apply` with the same options. Inspect
-stored evidence using `project recognition-evidence --kind flirt`. The FLAIR
-evidence format preserves public/local symbol kind and matching-pattern count,
-and binds evidence to the analysis key and SHA-256 of the catalog text plus its
-supplied provenance label.
+stored evidence using `project recognition-evidence --kind flirt`. Recognition
+evidence format 3 preserves public/local symbol kind, matching-pattern count,
+and ordered catalog index, and binds evidence to the analysis key and SHA-256
+of the catalog text plus its supplied provenance label. Readers retain support
+for evidence formats 1 and 2.
 
 To apply names, add `--rename-unique` to `flirt-apply`. It applies only a single
 unambiguous public name when that name does not collide within its address
@@ -275,14 +348,30 @@ contexts, or incomplete function shapes are not guessed.
 The v1 catalog records the target architecture/mode, instruction count, SHA-256
 of the canonical typed token stream, name, and provenance. Extraction defaults
 to at most 512 instructions, 1024 blocks, and 1 MiB of tokens per function;
-recognition is bounded to 100,000 functions, 4 million instructions and 256
-MiB of aggregate tokens. Candidate multiplicity is reported as ambiguity. The
+recognition is bounded to 100,000 functions, 4 million instructions, 256 MiB of
+aggregate tokens, and 16,777,216 function-to-definition comparisons by default.
+Candidate multiplicity is reported as ambiguity. The
 `fingerprints` query never renames functions. It stores completed recognition
 evidence in the project analysis cache.
 
+The C++ API and `fingerprints --definitions-list` accept ordered catalogs for
+cross-version comparisons. The UTF-8 list has one catalog path per line, with
+relative paths resolved from the list file; blank lines and `#` comments are
+ignored. CLI inputs are bounded to 256 catalogs and 64 MiB aggregate source
+bytes. Recognition supports up to 256 catalogs and 65,536 total
+definitions; each catalog must independently target the scanned image. The
+function token stream is computed once per recovered function, then compared
+against every catalog under the same function, instruction, and token-byte
+budgets. `FunctionFingerprintCandidate::catalog_index` identifies its source
+catalog. The comparison budget defaults to 16,777,216 checks and has a hard
+maximum of 268,435,456. Duplicate candidates remain ambiguous. Persisted
+evidence format 3 retains catalog index for every candidate while readers
+continue to accept formats 1 and 2. The evidence catalog digest covers the
+ordered canonical catalog set, including duplicate entries and order.
+
 Recognition evidence is bound to the full project `AnalysisKey` (image digest,
 byte and decision revisions, recipe and engine fingerprints) and a digest of
-the canonical catalog text. Each function record stores its stable function ID,
+the canonical catalog text or ordered catalog set. Each function record stores its stable function ID,
 entry address, every matching candidate with provenance and specificity or
 fingerprint metadata, and the explicit ambiguity state. Byte signatures and
 fingerprints use separate cache kinds. Writes are rejected if the current
@@ -307,7 +396,8 @@ recomputed implicitly. A hit whose evidence is incomplete also returns 3.
 
 ```text
 hexlab_cli project fingerprint-create library.hxproj --at va:0x1000 --name Runtime.Helper --provenance "internal library v1" > library.hxfp
-hexlab_cli project fingerprints target.hxproj --definitions library.hxfp
+hexlab_cli project fingerprint-create library.hxproj --all-functions --provenance "internal library v1" > library.hxfp
+hexlab_cli project fingerprints target.hxproj --definitions-list runtime-versions.txt
 ```
 
 Use byte signatures when precise encoded prefixes are desired and normalized
@@ -333,3 +423,22 @@ ctest --test-dir .codex-signature-library-build -C Debug -R '^(signatures|projec
 
 Both CTests passed. The CLI fixture exercises actual call-continuation block
 splitting, catalog text output and re-import, and two competing library names.
+
+## Cross-version catalog sets
+
+`signatures` and `signature-apply` accept either one `--definitions` file or a `--definitions-list` file. The list is UTF-8 text with one catalog path per line; blank lines and lines beginning with `#` are ignored, and relative paths resolve from the list file's directory. Up to 256 catalogs and 4,096 definitions are composed in list order, with a 64 MiB aggregate catalog-byte limit. Every catalog retains its own processor target and definition provenance, and all candidates are evaluated under one scan budget. Output includes each match's catalog index when multiple catalogs are present. Duplicate names or patterns from different catalog versions remain separate candidates and therefore preserve ambiguity.
+
+Function-entry scans persist evidence against a digest of the ordered canonical catalog set, including duplicates, so changing catalog order or membership produces distinct evidence identity. `signature-apply` only renames entries with one candidate across the full set; ambiguous results and cross-version name collisions remain unapplied. This supports comparing catalogs collected from different library releases without treating a match as proof of identity or choosing a version automatically.
+
+### Batch fingerprint catalog extraction
+
+`create_function_fingerprint_catalog` builds a portable normalized-fingerprint catalog from an explicit span of recovered `FunctionId` values. It preserves caller selection order, uses deterministic `sub_<address-space>_<entry>` names, and applies the same effective-byte re-decode and completeness checks as single-function extraction. The selection is capped at 4,096 entries; duplicate or stale IDs and any un-fingerprintable selected function fail the operation instead of producing a silently partial catalog. Pass the returned value to `serialize_function_fingerprint_catalog` to write the existing v1 catalog format. The CLI exposes this batch API through `fingerprint-create --all-functions`, selecting the recovered function snapshot in stable order and refusing snapshots larger than 4,096 functions rather than silently truncating them. In this mode, names use the stable address labels; `--name` and `--at` are not accepted. The existing one-function `--at`/`--name` mode remains available.
+
+The Python automation API exposes the same batch operation as
+`Project.function_fingerprint_catalog(function_ids, provenance, ...)`. It
+returns serialized v1 catalog text, preserves the supplied ID order, and uses
+the same all-or-error handling for duplicate, stale, or un-fingerprintable
+selections. `expected_revision` can pin the initial project edit revision;
+changes to edit or byte revisions during extraction raise
+`ProjectChangedDuringQuery`. The Python API accepts a bounded `CancellationToken`
+and the same per-function instruction, block, and token-byte limits.

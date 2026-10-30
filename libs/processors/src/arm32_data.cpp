@@ -16,6 +16,72 @@ bool data(Instruction &i, std::uint32_t word) {
     // space. Decode them before the ordinary data-processing class.
     const auto mul_rn = (word >> 16) & 15, mul_rd = (word >> 12) & 15;
     const auto mul_rs = (word >> 8) & 15, mul_rm = word & 15;
+    // Saturating scalar add/subtract. Bits 22:21 select whether Rn is
+    // doubled and whether that doubled value is added or subtracted.
+    if ((word & 0x0f900ff0u) == 0x01000050u) {
+        const auto rd = (word >> 12) & 15;
+        const auto rn = (word >> 16) & 15;
+        const auto rm = word & 15;
+        if (rd == 15 || rn == 15 || rm == 15)
+            return false;
+        const auto operation = (word >> 21) & 3;
+        static constexpr Opcode opcodes[]{Opcode::arm_qadd, Opcode::arm_qsub,
+                                           Opcode::arm_qdadd, Opcode::arm_qdsub};
+        const auto destination = gpr(rd), first = gpr(rm), second = gpr(rn);
+        i.opcode = opcodes[operation];
+        i.operands = {destination, first, second};
+        i.access = {OperandAccess::write, OperandAccess::read, OperandAccess::read};
+        read(i, first); read(i, second);
+        i.register_writes.push_back(destination);
+        i.arm->q_flag_may_set = true;
+        return true;
+    }
+    const auto bitfield_key = word & 0x0fe00070u;
+    const auto bitfield_rd = (word >> 12) & 15;
+    const auto bitfield_rn = word & 15;
+    const auto bitfield_lsb = (word >> 7) & 31;
+    const auto bitfield_msb_or_width = (word >> 16) & 31;
+    const auto append_field = [&](unsigned value) {
+        i.operands.emplace_back(ImmediateOperand{value, 5, 32, false, {}});
+        i.access.push_back(OperandAccess::read);
+    };
+    if (bitfield_key == 0x07c00010u) { // BFI/BFC: msb is encoded, not width-1.
+        if (bitfield_rd == 15 || bitfield_msb_or_width < bitfield_lsb)
+            return false;
+        const auto width = bitfield_msb_or_width - bitfield_lsb + 1;
+        const auto destination = gpr(bitfield_rd);
+        if (bitfield_rn == 15) {
+            i.opcode = Opcode::arm_bfc;
+            i.operands = {destination};
+            i.access = {OperandAccess::read_write};
+            read(i, destination);
+        } else {
+            i.opcode = Opcode::arm_bfi;
+            i.operands = {destination, gpr(bitfield_rn)};
+            i.access = {OperandAccess::read_write, OperandAccess::read};
+            read(i, destination);
+            read(i, gpr(bitfield_rn));
+        }
+        append_field(bitfield_lsb);
+        append_field(width);
+        i.register_writes.push_back(destination);
+        return true;
+    }
+    if (bitfield_key == 0x07a00050u || bitfield_key == 0x07e00050u) { // SBFX/UBFX
+        const auto width = bitfield_msb_or_width + 1;
+        if (bitfield_rd == 15 || bitfield_rn == 15 || bitfield_lsb + width > 32)
+            return false;
+        const bool signed_extract = bitfield_key == 0x07a00050u;
+        const auto destination = gpr(bitfield_rd), source = gpr(bitfield_rn);
+        i.opcode = signed_extract ? Opcode::arm_sbfx : Opcode::arm_ubfx;
+        i.operands = {destination, source};
+        i.access = {OperandAccess::write, OperandAccess::read};
+        append_field(bitfield_lsb);
+        append_field(width);
+        read(i, source);
+        i.register_writes.push_back(destination);
+        return true;
+    }
     if ((word & 0x0ff000f0) == 0x00600090) { // MLS Rd, Rm, Rs, Rn
         if (mul_rd == 15 || mul_rn == 15 || mul_rm == 15 || mul_rs == 15)
             return false;
@@ -71,6 +137,64 @@ bool data(Instruction &i, std::uint32_t word) {
             i.arm->flags_written = 12; i.arm->flags_known = true;
             read(i, flags); i.register_writes.push_back(flags);
         }
+        return true;
+    }
+    // ARMv6 signed/unsigned byte and halfword extend operations. Rn=pc
+    // selects the non-accumulating form; all other Rn values are the base
+    // operand of the extend-add form. Rotate is restricted to multiples of 8.
+    const auto extend_encoding = word & 0x0ff003f0;
+    const bool sxtb16 = extend_encoding == 0x06800070;
+    const bool uxtb16 = extend_encoding == 0x06c00070;
+    if (sxtb16 || uxtb16) {
+        const auto rn = (word >> 16) & 15;
+        const auto rd = (word >> 12) & 15;
+        const auto rm = word & 15;
+        if (rd == 15 || rm == 15)
+            return false;
+        const bool add = rn != 15;
+        i.opcode = sxtb16 ? (add ? Opcode::a32_sxtab16 : Opcode::a32_sxtb16)
+                          : (add ? Opcode::a32_uxtab16 : Opcode::a32_uxtb16);
+        const auto rotated = ArmShiftedRegisterOperand{
+            gpr(rm), ArmShift::ror, static_cast<std::uint8_t>(((word >> 10) & 3) * 8), std::nullopt};
+        if (add) {
+            i.operands = {gpr(rd), gpr(rn), rotated};
+            i.access = {OperandAccess::write, OperandAccess::read, OperandAccess::read};
+            read(i, gpr(rn));
+        } else {
+            i.operands = {gpr(rd), rotated};
+            i.access = {OperandAccess::write, OperandAccess::read};
+        }
+        read(i, gpr(rm));
+        i.register_writes.push_back(gpr(rd));
+        return true;
+    }
+    const bool sxtb = extend_encoding == 0x06a00070;
+    const bool sxth = extend_encoding == 0x06b00070;
+    const bool uxtb = extend_encoding == 0x06e00070;
+    const bool uxth = extend_encoding == 0x06f00070;
+    if (sxtb || sxth || uxtb || uxth) {
+        const auto rn = (word >> 16) & 15;
+        const auto rd = (word >> 12) & 15;
+        const auto rm = word & 15;
+        if (rd == 15 || rm == 15)
+            return false;
+        const bool add = rn != 15;
+        i.opcode = sxtb ? (add ? Opcode::a32_sxtab : Opcode::a32_sxtb) :
+                   sxth ? (add ? Opcode::a32_sxtah : Opcode::a32_sxth) :
+                   uxtb ? (add ? Opcode::a32_uxtab : Opcode::a32_uxtb) :
+                          (add ? Opcode::a32_uxtah : Opcode::a32_uxth);
+        if (add) {
+            i.operands = {gpr(rd), gpr(rn), ArmShiftedRegisterOperand{
+                gpr(rm), ArmShift::ror, static_cast<std::uint8_t>(((word >> 10) & 3) * 8), std::nullopt}};
+            i.access = {OperandAccess::write, OperandAccess::read, OperandAccess::read};
+            read(i, gpr(rn));
+        } else {
+            i.operands = {gpr(rd), ArmShiftedRegisterOperand{
+                gpr(rm), ArmShift::ror, static_cast<std::uint8_t>(((word >> 10) & 3) * 8), std::nullopt}};
+            i.access = {OperandAccess::write, OperandAccess::read};
+        }
+        read(i, gpr(rm));
+        i.register_writes.push_back(gpr(rd));
         return true;
     }
     if ((word & 0x0c000000) != 0)

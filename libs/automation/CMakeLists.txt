@@ -56,7 +56,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 endif()
 
 option(HEXLAB_ENABLE_PYTHON_AUTOMATION "Build the trusted CPython automation script runner and console" OFF)
-hexlab_add_library(automation SOURCES src/api.cpp src/history.cpp src/debug_info.cpp
+hexlab_add_library(automation SOURCES src/api.cpp src/history.cpp src/debug_info.cpp src/workflow_state.cpp
   DEPENDS hexlab::workspace hexlab::database hexlab::analysis hexlab::loaders
           hexlab::processors hexlab::types hexlab::image hexlab::symbols hexlab::firmware hexlab::core hexlab::decompiler)
 
@@ -112,6 +112,12 @@ if(HEXLAB_ENABLE_PYTHON_AUTOMATION)
   install(TARGETS hexlab_python RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
 endif()
 
+option(HEXLAB_BUILD_AUTOMATION_EXAMPLES "Build native automation SDK examples" OFF)
+if(HEXLAB_BUILD_AUTOMATION_EXAMPLES)
+  add_executable(hexlab_resume_inventory examples/resume_inventory.cpp)
+  target_link_libraries(hexlab_resume_inventory PRIVATE hexlab::automation)
+endif()
+
 if(BUILD_TESTING)
   add_executable(hexlab_automation_tests tests/api_tests.cpp)
   target_link_libraries(hexlab_automation_tests PRIVATE hexlab::automation)
@@ -133,4 +139,7 @@ install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/../../docs/python-automation.md"
               "${CMAKE_CURRENT_SOURCE_DIR}/../../docs/python-stack-analysis.md"
               "${CMAKE_CURRENT_SOURCE_DIR}/../../docs/python-debug-information.md"
   DESTINATION "${CMAKE_INSTALL_DATADIR}/hexlab/docs")
-install(DIRECTORY examples/ DESTINATION "${CMAKE_INSTALL_DATADIR}/hexlab/examples/python")
+install(DIRECTORY examples/ DESTINATION "${CMAKE_INSTALL_DATADIR}/hexlab/examples/python"
+  PATTERN "*.cpp" EXCLUDE)
+install(FILES examples/resume_inventory.cpp DESTINATION "${CMAKE_INSTALL_DATADIR}/hexlab/examples/native")
+install(FILES README-workflow-state.md DESTINATION "${CMAKE_INSTALL_DATADIR}/hexlab/docs")

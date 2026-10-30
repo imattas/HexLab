@@ -1,8 +1,9 @@
 # ABI argument and return classification
 
-`hexlab/analysis/abi.hpp` exposes `classify_abi_signature()` for System V AMD64,
+`hexlab/analysis/abi.hpp` exposes `classify_abi_signature()` for MIPS O32/N32/N64,
+System V AMD64,
 Microsoft x64, 32-bit x86 `__cdecl`, `__stdcall`, `__fastcall`, and `__thiscall`,
-and the AArch64 AAPCS64 and 32-bit Arm AAPCS32 base procedure-call conventions. It
+and the AArch64 AAPCS64 and 32-bit Arm AAPCS32 base and VFP procedure-call conventions. It
 accepts the existing immutable `hexlab::types::Type` function model and returns
 one placement for each declared parameter and the result. Stack offsets are
 byte offsets from the callee's stack pointer at function entry.
@@ -23,6 +24,20 @@ endianness-dependent justification or integer sign/zero extension within the
 
 These placements follow the published [MIPSpro N32 ABI handbook, chapter 2](https://pixelbart.net/SGI/IRIX/i/65/30/doc/usr/share/Insight/library/SGI_bookshelves/SGI_Developer/books/Mpro_n32_ABI/sgi_html/ch02.html), which specifies the N32/64 subprogram interface. That handbook is an SGI platform reference; this classifier does not claim Linux-specific extension coverage.
 
+## MIPS O32 integer subset
+
+`CallingConvention::mips_o32` models non-variadic 32-bit integer, enum,
+boolean, and pointer parameters/results. Results use V0; the first four
+argument words use A0-A3, and later arguments use four-byte stack slots at
+entry-SP offsets beginning at +16, after the caller-provided four-word home
+area. `stack_argument_bytes` counts overflow words and excludes the home area.
+The selected profile uses 32-bit pointers and 8-byte stack alignment.
+Floating-point values, 64-bit scalars, aggregates, arrays, vectors, variadic
+functions, and target-specific soft/hard-float differences remain unsupported.
+Subword extension and endian-dependent register lanes are not modeled; the
+reported payload size is the source value width within a four-byte placement
+container.
+
 ## AAPCS32 base PCS
 
 `CallingConvention::aapcs32` and the retained `aapcs32` function qualifier
@@ -36,14 +51,22 @@ the stack under the base PCS C.5 rule, while later values use the stack.
 
 Scalar results up to four bytes use R0 and eight-byte scalar results use R0/R1.
 Composites up to four bytes use R0; larger composites use the hidden result
-pointer in R0. The classifier models only the base PCS: floating scalars use
-core registers or stack words, and VFP/Advanced SIMD register allocation and
-homogeneous floating-point aggregates are unsupported. `classify_abi_call`
-does not currently model AAPCS32 variadic call-site promotions. These rules
-follow the [Arm AAPCS32 specification, §§6.4-6.5](https://github.com/ARM-software/abi-aa/blob/main/aapcs32/aapcs32.rst).
-
+pointer in R0. The base selector models only the base PCS: floating scalars use
+core registers or stack words. `CallingConvention::aapcs32_vfp` selects the
+non-variadic VFP variant. It places half, single, and double scalars and
+homogeneous floating aggregates of one to four such members in the lowest
+available compatible S0-S15/D0-D7 register sequence, including aggregate
+returns. CPRCs that do not fit are placed on the stack and do not consume core
+argument registers; subsequent core-register aggregate splitting is disabled
+after a failed CPRC allocation. Variadic signatures use the base PCS, as
+required by AAPCS32. Advanced SIMD/vector CPRCs, VFP callee-save effects, and
+variadic call-site promotions are not modeled by the prototype-only API. The
+call-site API below applies default argument promotions and uses the base PCS
+for variadic AAPCS32 calls, including declarations qualified as VFP PCS. These rules follow the
+[Arm AAPCS32 specification](https://github.com/ARM-software/abi-aa/blob/main/aapcs32/aapcs32.rst).
 The overload `classify_abi_signature(function_type, platform_default)` honors
-retained `sysv_abi`, `ms_abi`, and `aapcs64` type qualifiers. Explicit `cdecl`
+retained `sysv_abi`, `ms_abi`, `aapcs64`, `aapcs32`, and `aapcs32_vfp` type qualifiers.
+The AAPCS32 qualifiers require an AArch32 platform default. Explicit `cdecl`
 selects the 32-bit cdecl model on 32-bit x86 and leaves the selected platform
 model on 64-bit targets. `stdcall`, `fastcall`, and `thiscall` are accepted only
 with the 32-bit x86 platform default. `vectorcall` maps to the x86 model when
@@ -61,6 +84,9 @@ ECX and places declared arguments on the stack. The model reports cleanup as
 pointer when present. Variadic x86 declarations use cdecl placement and caller
 cleanup, except variadic thiscall, which remains explicitly unsupported because
 its implicit `this` pointer moves to the stack and changes every argument offset.
+The call-site API accepts variadic `__fastcall` declarations, applies default
+argument promotions to unnamed arguments, and classifies all arguments on the
+cdecl stack path; fixed arguments do not use their usual fastcall registers.
 
 Scalar support includes 1/2/4/8-byte integers, booleans, enums, and pointers,
 plus 4/8-byte floating scalars. Nested structures/unions and arrays within an
@@ -170,7 +196,7 @@ layout-based C-compatible/trivial case only. Target-specific packed-layout
 metadata and non-default calling-convention attributes remain outside this
 classifier.
 
-## Variadic x64 call sites
+## Variadic call sites
 
 `classify_abi_call(convention, function_type, actual_argument_types)` accepts a
 variadic prototype and the argument types at one call site. Fixed arguments
@@ -181,6 +207,20 @@ signed `int`, `float` becomes `double`, and top-level arrays/functions decay
 to pointers. The returned `arguments` vector has one entry per actual argument
 at the call site.
 
+For AAPCS32, the call-site classifier selects the base PCS, even if the
+variadic function type retains the VFP variant qualifier. It uses four-byte
+pointer decay, applies the default promotions to anonymous arguments, and then
+places all arguments using the base core-register/stack rules. VFP registers
+and homogeneous floating aggregates are not used for a variadic call.
+
+For AAPCS64, fixed arguments retain their declared parameter types and
+anonymous arguments use the standard AAPCS64 register/stack allocation after
+the C default argument promotions. Two-byte floating arguments are promoted to
+double, as required for `__fp16` in the AAPCS64 C mapping. Supported short
+vectors and layout-known aggregates, including HFAs/HVAs, use the standard
+vector and composite allocation rules. Scalable vectors and unsupported lane
+shapes remain incomplete.
+
 For System V AMD64, `sysv_vector_register_count` reports the number of XMM
 argument registers used, capped by the ABI's eight-register argument bank; a
 caller places that value in `%al`. For Microsoft x64, floating values assigned
@@ -189,9 +229,9 @@ the corresponding GPR location. The GPR copy has `AbiLocation::duplicate`
 set; stack-passed values do not have an extra location. This follows the
 Microsoft [x64 calling convention](https://learn.microsoft.com/en-us/cpp/build/x64-calling-convention?view=msvc-170).
 
-This call-site API supports only variadic SysV AMD64 and Microsoft x64 calls.
-It does not classify unprototyped calls, `__vectorcall`, non-x64 variadic
-conventions, or variadic vector types absent from the type model. Missing
+This call-site API supports variadic SysV AMD64, Microsoft x64, AAPCS32,
+AAPCS64, and x86 fastcall calls. It does not classify unprototyped calls,
+`__vectorcall`, other variadic conventions, or vector types absent from the type model. Missing
 call-site types for anonymous arguments and argument counts below the fixed
 prototype are explicit incomplete results. The original
 `classify_abi_signature()` API is unchanged for callers that only have a
@@ -260,6 +300,15 @@ HFA occupies an aligned stack slot, rounded to an 8-byte size multiple. Other co
 consecutive `xN` registers when the whole value fits; larger composites are
 represented indirectly through `hidden_result_pointer` in `X8`.
 
+Homogeneous short-vector aggregates (HVAs) of one to four modeled vectors use
+the same independent SIMD argument and result bank. Homogeneity is based on
+the 8- or 16-byte vector width; lane type and lane count do not distinguish
+the ABI fundamental type. The current type model supports 32- or 64-bit
+integer/floating lanes for this path. Nested structures, arrays, and unions
+are flattened, and union alternatives at the same offset count once. When the
+HVA does not fit in the remaining `v0`–`v7` argument registers, the entire
+composite is placed on the stack and the SIMD bank is exhausted.
+
 The following table compares an aggregate argument with a same-typed return.
 The 8-byte value is `{u32, u32}`, the 16-byte value is `{u64, u64}`, and the
 24-byte value is `{u64, u64, u64}`. The x86 cdecl argument begins at offset 8
@@ -282,13 +331,15 @@ AAPCS64 HFA counting follows the specification's uniquely-addressable-member
 rule: overlapping alternatives in a union at the same address occupy one
 floating-point register.
 
-The AAPCS64 classifier rejects variadic signatures explicitly because their
-language promotions and anonymous-argument handling need a call-site-aware
-model. This type graph has no distinct vector/HVA node, so it does not infer
-vector classification from ordinary aggregates; unsupported scalar formats,
-vector-like values, unresolved types, and invalid aggregate forms remain
-explicitly unsupported. This slice follows the base AAPCS64 rules; scalable
-vector and platform-specific PCS extensions are outside its model. See the
+The prototype-only API classifies the named parameters and result of a
+variadic AAPCS64 function. The call-site API adds the actual anonymous
+arguments, applies the C default promotions, then uses the same AAPCS64
+allocation rules for the complete argument list. In particular, half- and
+single-precision variadic floating arguments are promoted to double before
+register allocation. Unsupported vector lane shapes, scalar formats,
+unresolved types, and invalid aggregate forms remain explicitly unsupported.
+This slice follows the base AAPCS64 rules; scalable vector and
+platform-specific PCS extensions are outside its model. See the
 [Arm AAPCS64 specification](https://github.com/ARM-software/abi-aa/blob/main/aapcs64/aapcs64.rst).
 The register and stack rules follow the [System V AMD64 psABI](https://refspecs.linuxfoundation.org/elf/x86_64-SysV-psABI.pdf) and [Microsoft x64 calling-convention documentation](https://learn.microsoft.com/en-us/cpp/build/x64-calling-convention?view=msvc-170). Microsoft documents that an indirect result pointer is passed first and the same pointer is returned in RAX. The 32-bit floating and aggregate return conventions follow the [Intel386 System V ABI](https://www.uclibc.org/docs/psABI-i386.pdf).
 

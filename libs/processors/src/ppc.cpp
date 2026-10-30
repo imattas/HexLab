@@ -9,6 +9,7 @@ using R = RegisterOperand;
 constexpr RegisterBank gpr_bank = RegisterBank::ppc_gpr;
 R gpr(unsigned index, unsigned width) { return {gpr_bank, static_cast<std::uint8_t>(index), static_cast<std::uint16_t>(width), false}; }
 R cr(unsigned field) { return {RegisterBank::ppc_cr, static_cast<std::uint8_t>(field), 4, false}; }
+R crbit(unsigned bit) { return {RegisterBank::ppc_crbit, static_cast<std::uint8_t>(bit), 1, false}; }
 R lr(unsigned width) { return {RegisterBank::ppc_lr, 0, static_cast<std::uint16_t>(width), false}; }
 R ctr(unsigned width) { return {RegisterBank::ppc_ctr, 0, static_cast<std::uint16_t>(width), false}; }
 R xer() { return {RegisterBank::ppc_xer, 0, 32, false}; }
@@ -151,6 +152,7 @@ DecodeResult decode_powerpc(DecodeContext context, std::span<const std::byte> by
         i.access.push_back(OperandAccess::read);
         // XER.CA is an architectural side effect even when the carry value is
         // not statically known. The dot form additionally writes CR0.
+        i.register_reads.push_back(xer());
         i.register_writes.push_back(xer());
         if (op == 13) i.register_writes.push_back(cr(0));
     } else if (op == 7 || op == 8) {
@@ -163,7 +165,7 @@ DecodeResult decode_powerpc(DecodeContext context, std::span<const std::byte> by
         i.operands.emplace_back(ImmediateOperand{static_cast<std::uint64_t>(immediate), 16,
                                                   static_cast<std::uint16_t>(width), true, EncodedField{2, 2}});
         i.access.push_back(OperandAccess::read);
-        if (op == 8) i.register_writes.push_back(xer());
+        if (op == 8) { i.register_reads.push_back(xer()); i.register_writes.push_back(xer()); }
     } else if (op == 10 || op == 11) {
         const bool wide = (w & (1u << 21)) != 0;
         const unsigned bf = (w >> 23) & 7;
@@ -179,6 +181,7 @@ DecodeResult decode_powerpc(DecodeContext context, std::span<const std::byte> by
                                                   EncodedField{2, 2}});
         i.access = {OperandAccess::write, OperandAccess::read, OperandAccess::read};
         i.register_reads.push_back(gpr(ra, compare_width));
+        i.register_reads.push_back(xer()); // CR[SO] reflects XER.SO.
         i.register_writes.push_back(cr(bf));
     } else if (op == 20 || op == 21 || op == 23) {
         const bool insert = op == 20, variable = op == 23, record = rc != 0;
@@ -252,13 +255,13 @@ DecodeResult decode_powerpc(DecodeContext context, std::span<const std::byte> by
     } else if ((op == 58 || op == 62) && ppc64) {
         const auto form = w & 3;
         const bool load = op == 58;
-        if (form == 2 && load)
-            return fail(DecodeStatus::unsupported, "Valid PowerPC LWA DS-form is outside the enabled subset");
-        if (form > 1)
+        const bool algebraic_word = load && form == 2;
+        if (form > 1 && !algebraic_word)
             return fail(DecodeStatus::invalid, "Reserved PowerPC DS-form selector");
         const bool update = form == 1;
-        const Opcode opcode = load ? (update ? Opcode::ppc_ldu : Opcode::ppc_ld)
-                                   : (update ? Opcode::ppc_stdu : Opcode::ppc_std);
+        const Opcode opcode = algebraic_word ? Opcode::ppc_lwa :
+            load ? (update ? Opcode::ppc_ldu : Opcode::ppc_ld)
+                 : (update ? Opcode::ppc_stdu : Opcode::ppc_std);
         const auto saved = w;
         (void)saved;
         if (update && (ra == 0 || (load && ra == rt)))
@@ -268,7 +271,8 @@ DecodeResult decode_powerpc(DecodeContext context, std::span<const std::byte> by
         auto data = gpr(rt, width);
         i.operands.emplace_back(data); i.access.push_back(load ? OperandAccess::write : OperandAccess::read);
         if (load) i.register_writes.push_back(data); else i.register_reads.push_back(data);
-        MemoryOperand memory{64, 64, {}, ra ? std::optional<R>(gpr(ra, 64)) : std::nullopt, {},
+        MemoryOperand memory{static_cast<std::uint16_t>(algebraic_word ? 32 : 64), 64, {},
+                             ra ? std::optional<R>(gpr(ra, 64)) : std::nullopt, {},
                              1, displacement, false, {}, EncodedField{2, 2}};
         i.operands.emplace_back(memory); i.access.push_back(OperandAccess::address);
         if (ra) i.register_reads.push_back(gpr(ra, 64));
@@ -317,6 +321,19 @@ DecodeResult decode_powerpc(DecodeContext context, std::span<const std::byte> by
             i.access = {OperandAccess::write, OperandAccess::read};
             i.register_writes.push_back(cr(bf));
             i.register_reads.push_back(cr(bfa));
+        } else if (xo == 257 || xo == 129 || xo == 289 || xo == 225 ||
+                   xo == 33 || xo == 449 || xo == 417 || xo == 193) {
+            if (rc)
+                return fail(DecodeStatus::invalid, "PowerPC condition-register logical operation has a reserved record bit");
+            i.opcode = xo == 257 ? Opcode::ppc_crand : xo == 129 ? Opcode::ppc_crandc :
+                       xo == 289 ? Opcode::ppc_creqv : xo == 225 ? Opcode::ppc_crnand :
+                       xo == 33 ? Opcode::ppc_crnor : xo == 449 ? Opcode::ppc_cror :
+                       xo == 417 ? Opcode::ppc_crorc : Opcode::ppc_crxor;
+            const auto destination = crbit(rt), left = crbit(ra), right = crbit(rb);
+            i.operands = {destination, left, right};
+            i.access = {OperandAccess::write, OperandAccess::read, OperandAccess::read};
+            i.register_writes = {destination};
+            i.register_reads = {left, right};
         } else if (xo != 16 && xo != 528)
             return fail(DecodeStatus::unsupported, "PowerPC opcode-19 instruction is outside the enabled branch subset");
         else {
@@ -403,14 +420,47 @@ DecodeResult decode_powerpc(DecodeContext context, std::span<const std::byte> by
             if (carry_out) i.register_writes.push_back(xer());
             if (rc) i.register_writes.push_back(cr(0));
         };
-        if ((xo == 266 || xo == 40 || xo == 444 || xo == 316 || xo == 28 ||
+        if (xo == 512) {
+            if ((rt & 3u) != 0 || ra != 0 || rb != 0 || rc != 0)
+                return fail(DecodeStatus::invalid, "PowerPC MCRXR has nonzero reserved fields");
+            const auto field = rt >> 2;
+            i.opcode = Opcode::ppc_mcrxr;
+            i.operands = {cr(field), xer()};
+            i.access = {OperandAccess::write, OperandAccess::read_write};
+            i.register_writes = {cr(field), xer()};
+            i.register_reads = {xer()};
+        } else if ((w & 0x3e) == 30) {
+            // ISEL has a five-bit XO; bits 6..10 select a CR bit.
+            if (rc != 0)
+                return fail(DecodeStatus::invalid, "PowerPC ISEL has its reserved record bit set");
+            const unsigned condition = (w >> 6) & 31;
+            i.opcode = Opcode::ppc_isel;
+            i.operands = {gpr(rt, width), gpr(ra, width), gpr(rb, width), crbit(condition)};
+            i.access = {OperandAccess::write, OperandAccess::read, OperandAccess::read, OperandAccess::read};
+            i.register_writes = {gpr(rt, width)};
+            i.register_reads = {gpr(ra, width), gpr(rb, width), crbit(condition)};
+        } else if ((xo & 0x1ff) == 266 || (xo & 0x1ff) == 40) {
+            const unsigned arithmetic_xo = xo & 0x1ff;
+            const bool overflow_enable = (w & 0x400) != 0;
+            const bool record = rc != 0;
+            if (overflow_enable)
+                i.register_reads.push_back(xer()); // SO is sticky across overflow events.
+            i.opcode = arithmetic_xo == 266 ? (overflow_enable ? (record ? Opcode::ppc_addo_dot : Opcode::ppc_addo)
+                                                                 : (record ? Opcode::ppc_add_dot : Opcode::ppc_add))
+                                 : (overflow_enable ? (record ? Opcode::ppc_subfo_dot : Opcode::ppc_subfo)
+                                                    : (record ? Opcode::ppc_subf_dot : Opcode::ppc_subf));
+            mark_destination(i, gpr(rt, width));
+            i.operands.emplace_back(gpr(ra, width)); i.operands.emplace_back(gpr(rb, width));
+            i.access.insert(i.access.end(), {OperandAccess::read, OperandAccess::read});
+            i.register_reads.insert(i.register_reads.end(), {gpr(ra, width), gpr(rb, width)});
+            if (overflow_enable) i.register_writes.push_back(xer());
+            if (record) i.register_writes.push_back(cr(0));
+        } else if ((xo == 444 || xo == 316 || xo == 28 ||
              xo == 60 || xo == 124 || xo == 284 || xo == 412 || xo == 476) && !(w & 0x400)) {
             const bool logical = xo == 444 || xo == 316 || xo == 28 || xo == 60 || xo == 124 ||
                                  xo == 284 || xo == 412 || xo == 476;
             const bool record = rc != 0;
-            i.opcode = xo == 266 ? (record ? Opcode::ppc_add_dot : Opcode::ppc_add) :
-                       xo == 40 ? (record ? Opcode::ppc_subf_dot : Opcode::ppc_subf) :
-                       xo == 444 ? (record ? Opcode::ppc_or_dot : Opcode::ppc_or) :
+            i.opcode = xo == 444 ? (record ? Opcode::ppc_or_dot : Opcode::ppc_or) :
                        xo == 316 ? (record ? Opcode::ppc_xor_dot : Opcode::ppc_xor) :
                        xo == 28 ? (record ? Opcode::ppc_and_dot : Opcode::ppc_and) :
                        xo == 60 ? (record ? Opcode::ppc_andc_dot : Opcode::ppc_andc) :
@@ -436,7 +486,20 @@ DecodeResult decode_powerpc(DecodeContext context, std::span<const std::byte> by
             i.operands = {cr(bf), gpr(ra, compare_width), gpr(rb, compare_width)};
             i.access = {OperandAccess::write, OperandAccess::read, OperandAccess::read};
             i.register_reads = {gpr(ra, compare_width), gpr(rb, compare_width)};
+            i.register_reads.push_back(xer()); // CR[SO] reflects XER.SO.
             i.register_writes.push_back(cr(bf));
+        } else if (xo == 122 || xo == 378 || xo == 506) {
+            if (rb != 0 || rc != 0)
+                return fail(DecodeStatus::invalid, "PowerPC population-count instruction has reserved fields set");
+            if (xo == 506 && !ppc64)
+                return fail(DecodeStatus::unsupported, "PowerPC doubleword population count requires PPC64 mode");
+            i.opcode = xo == 122 ? Opcode::ppc_popcntb :
+                       xo == 378 ? Opcode::ppc_popcntw : Opcode::ppc_popcntd;
+            const auto source_width = xo == 122 ? width : xo == 378 ? 32u : 64u;
+            i.operands = {gpr(ra, width), gpr(rt, source_width)};
+            i.access = {OperandAccess::write, OperandAccess::read};
+            i.register_writes = {gpr(ra, width)};
+            i.register_reads = {gpr(rt, source_width)};
         } else if (xo == 26 || xo == 58 || xo == 954 || xo == 922 || xo == 986) {
             if (rb != 0)
                 return fail(DecodeStatus::invalid, "PowerPC count/extend instruction has a reserved source field");
@@ -454,6 +517,24 @@ DecodeResult decode_powerpc(DecodeContext context, std::span<const std::byte> by
             i.access = {OperandAccess::write, OperandAccess::read};
             i.register_writes = {gpr(ra, width)};
             i.register_reads = {gpr(rt, source_width)};
+            if (record) {
+                i.register_reads.push_back(xer());
+                i.register_writes.push_back(cr(0));
+            }
+        } else if ((xo & 0x1ff) == 202 || (xo & 0x1ff) == 234) {
+            if (rb != 0)
+                return fail(DecodeStatus::invalid, "PowerPC ADDZE/ADDME has a reserved RB field");
+            if (w & 0x400)
+                return fail(DecodeStatus::unsupported, "PowerPC overflow-enabled ADDZE/ADDME is not modeled");
+            const bool add_minus_one = (xo & 0x1ff) == 234;
+            const bool record = rc != 0;
+            i.opcode = add_minus_one ? (record ? Opcode::ppc_addme_dot : Opcode::ppc_addme)
+                                     : (record ? Opcode::ppc_addze_dot : Opcode::ppc_addze);
+            mark_destination(i, gpr(rt, width));
+            i.operands.emplace_back(gpr(ra, width));
+            i.access.push_back(OperandAccess::read);
+            i.register_reads = {gpr(ra, width), xer()};
+            i.register_writes.push_back(xer());
             if (record) i.register_writes.push_back(cr(0));
         } else if (xo == 10 || xo == 138 || xo == 8 || xo == 136) {
             const bool carry_in = xo == 138 || xo == 136;
@@ -482,6 +563,14 @@ DecodeResult decode_powerpc(DecodeContext context, std::span<const std::byte> by
             i.operands.emplace_back(gpr(rb, width));
             i.access.insert(i.access.end(), {OperandAccess::read, OperandAccess::read});
             i.register_reads = {gpr(ra, width), gpr(rb, width)};
+            if (rc) i.register_writes.push_back(cr(0));
+        } else if (xo == 75 || xo == 11) {
+            i.opcode = xo == 75 ? Opcode::ppc_mulhw : Opcode::ppc_mulhwu;
+            mark_destination(i, gpr(rt, width));
+            i.operands.emplace_back(gpr(ra, width));
+            i.operands.emplace_back(gpr(rb, width));
+            i.access.insert(i.access.end(), {OperandAccess::read, OperandAccess::read});
+            i.register_reads = {gpr(ra, 32), gpr(rb, 32)};
             if (rc) i.register_writes.push_back(cr(0));
         } else if (xo == 24 || xo == 536 || xo == 792 || xo == 824 ||
                    xo == 27 || xo == 539 || xo == 794 || (xo & 0x1fe) == 412) {
@@ -518,15 +607,17 @@ DecodeResult decode_powerpc(DecodeContext context, std::span<const std::byte> by
         } else if (xo == 23 || xo == 55 || xo == 87 || xo == 119 || xo == 151 || xo == 183 ||
                    xo == 215 || xo == 247 || xo == 279 || xo == 311 || xo == 343 || xo == 375 ||
                    xo == 407 || xo == 439 || xo == 21 || xo == 53 || xo == 149 || xo == 181 ||
-                   xo == 534 || xo == 790 || xo == 662 || xo == 918 || xo == 532 || xo == 660) {
+                   xo == 534 || xo == 790 || xo == 662 || xo == 918 || xo == 532 || xo == 660 ||
+                   xo == 341 || xo == 373) {
             if (rc) return fail(DecodeStatus::invalid, "PowerPC indexed load/store has a reserved record bit");
             const bool update = xo == 55 || xo == 119 || xo == 183 || xo == 247 || xo == 311 || xo == 375 ||
-                                xo == 439 || xo == 53 || xo == 181;
+                                xo == 439 || xo == 53 || xo == 181 || xo == 373;
             const bool load = xo == 23 || xo == 55 || xo == 87 || xo == 119 || xo == 279 || xo == 311 ||
-                              xo == 343 || xo == 375 || xo == 21 || xo == 53 || xo == 534 || xo == 790 || xo == 532;
+                              xo == 343 || xo == 375 || xo == 21 || xo == 53 || xo == 534 || xo == 790 || xo == 532 ||
+                              xo == 341 || xo == 373;
             const bool doubleword = xo == 21 || xo == 53 || xo == 149 || xo == 181 || xo == 532 || xo == 660;
-            if (doubleword && !ppc64)
-                return fail(DecodeStatus::unsupported, "PowerPC indexed doubleword memory operation requires PPC64 mode");
+            if ((doubleword || xo == 341 || xo == 373) && !ppc64)
+                return fail(DecodeStatus::unsupported, "PowerPC indexed 64-bit or algebraic-word load requires PPC64 mode");
             const unsigned size = doubleword ? 64u :
                 (xo == 87 || xo == 119 || xo == 215 || xo == 247) ? 8u :
                 (xo == 279 || xo == 311 || xo == 343 || xo == 375 || xo == 407 || xo == 439 || xo == 790 || xo == 918) ? 16u : 32u;
@@ -535,6 +626,7 @@ DecodeResult decode_powerpc(DecodeContext context, std::span<const std::byte> by
             else if (xo == 87) opcode = Opcode::ppc_lbzx; else if (xo == 119) opcode = Opcode::ppc_lbzux;
             else if (xo == 279) opcode = Opcode::ppc_lhzx; else if (xo == 311) opcode = Opcode::ppc_lhzux;
             else if (xo == 343) opcode = Opcode::ppc_lhax; else if (xo == 375) opcode = Opcode::ppc_lhaux;
+            else if (xo == 341) opcode = Opcode::ppc_lwax; else if (xo == 373) opcode = Opcode::ppc_lwaux;
             else if (xo == 151) opcode = Opcode::ppc_stwx; else if (xo == 183) opcode = Opcode::ppc_stwux;
             else if (xo == 215) opcode = Opcode::ppc_stbx; else if (xo == 247) opcode = Opcode::ppc_stbux;
             else if (xo == 407) opcode = Opcode::ppc_sthx; else if (xo == 439) opcode = Opcode::ppc_sthux;
@@ -545,6 +637,21 @@ DecodeResult decode_powerpc(DecodeContext context, std::span<const std::byte> by
             else if (xo == 532) opcode = Opcode::ppc_ldbrx; else if (xo == 660) opcode = Opcode::ppc_stdbrx;
             if (!indexed_load_store(opcode, size, load, update))
                 return fail(DecodeStatus::invalid, "PowerPC indexed update-form load/store has an invalid base or destination");
+        } else if (xo == 4 || xo == 68) {
+            if (rc)
+                return fail(DecodeStatus::invalid, "PowerPC conditional trap has a reserved record bit");
+            const bool doubleword = xo == 68;
+            if (doubleword && !ppc64)
+                return fail(DecodeStatus::unsupported, "PowerPC doubleword conditional trap requires PPC64 mode");
+            const unsigned compare_width = doubleword ? 64u : 32u;
+            i.opcode = doubleword ? Opcode::ppc_td : Opcode::ppc_tw;
+            i.operands = {ImmediateOperand{rt, 5, 5, false, EncodedField{0, 3}},
+                          gpr(ra, compare_width), gpr(rb, compare_width)};
+            i.access = {OperandAccess::read, OperandAccess::read, OperandAccess::read};
+            i.register_reads = {gpr(ra, compare_width), gpr(rb, compare_width)};
+            // The trap is conditional. Keep the normal continuation edge;
+            // trap delivery is retained as a lifted predicate effect.
+            i.flow = FlowKind::fallthrough;
         } else if (xo == 19 && !rc) {
             if (ra != 0 || rb != 0)
                 return fail(DecodeStatus::invalid, "PowerPC MFCR has reserved source fields");

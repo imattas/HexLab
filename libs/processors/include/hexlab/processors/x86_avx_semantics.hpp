@@ -22,6 +22,20 @@ struct X86AvxPackedResult {
     bool operator==(const X86AvxPackedResult &) const = default;
 };
 
+// VEX floating comparison results are vector lanes, unlike EVEX's K result.
+// bytes includes the cleared high YMM half for a completed VEX.128 result.
+struct X86AvxFloatCompareResult {
+    std::array<std::byte, 32> bytes{};
+    std::uint16_t vector_bits = 0;
+    std::uint8_t lane_bits = 0;
+    bool zeroed_upper_128 = false;
+    bool invalid_operation = false;
+    bool denormal_operand = false;
+    bool completed = true;
+    std::uint32_t mxcsr_after = 0x1f80;
+    bool operator==(const X86AvxFloatCompareResult &) const = default;
+};
+
 struct X86EvexIntegerResult {
     std::array<std::byte, 64> bytes{};
     std::uint16_t vector_bits = 0;
@@ -43,6 +57,7 @@ struct X86EvexFloatCompareResult {
     bool denormal_operand = false;
     // An unmasked #I or #D suppresses retirement unless embedded SAE is set.
     bool completed = true;
+    std::uint32_t mxcsr_after = 0x1f80;
     bool operator==(const X86EvexFloatCompareResult &) const = default;
 };
 
@@ -57,7 +72,7 @@ struct IntegerDataflowShape {
 
 inline std::optional<IntegerDataflowShape> integer_dataflow_shape(Opcode opcode) noexcept {
     switch (opcode) {
-    case Opcode::vpandn: case Opcode::vpavgb: case Opcode::vpshufb:
+    case Opcode::vpandn: case Opcode::vpavgb: case Opcode::vpshufb: case Opcode::vpermb:
     case Opcode::vpunpcklbw: case Opcode::vpunpckhbw:
         return IntegerDataflowShape{8, 8, 8, false, false, false};
     case Opcode::vpavgw: case Opcode::vpunpcklwd: case Opcode::vpunpckhwd:
@@ -67,6 +82,9 @@ inline std::optional<IntegerDataflowShape> integer_dataflow_shape(Opcode opcode)
         return IntegerDataflowShape{32, 32, 32, false, false, false};
     case Opcode::vpunpcklqdq: case Opcode::vpunpckhqdq:
         return IntegerDataflowShape{64, 64, 64, false, false, false};
+    case Opcode::vpcmpgtq:
+        // Signed qword inputs produce a full-width unsigned lane mask.
+        return IntegerDataflowShape{64, 64, 64, true, true, false};
     case Opcode::vpminsb: case Opcode::vpmaxsb: case Opcode::vpsignb:
         return IntegerDataflowShape{8, 8, 8, true, true, true};
     // VEX packed variable shifts use SRC1 as the data vector and SRC2 as the
@@ -81,6 +99,12 @@ inline std::optional<IntegerDataflowShape> integer_dataflow_shape(Opcode opcode)
     case Opcode::vpminsd: case Opcode::vpmaxsd: case Opcode::vpsignd: case Opcode::vpmulld:
     case Opcode::vphaddd: case Opcode::vphsubd:
         return IntegerDataflowShape{32, 32, 32, true, true, true};
+    case Opcode::vpmullq:
+        return IntegerDataflowShape{64, 64, 64, false, false, false};
+    case Opcode::vpminsq: case Opcode::vpmaxsq:
+        return IntegerDataflowShape{64, 64, 64, true, true, true};
+    case Opcode::vpminuq: case Opcode::vpmaxuq:
+        return IntegerDataflowShape{64, 64, 64, false, false, false};
     case Opcode::vpsignw: case Opcode::vphaddw: case Opcode::vphaddsw:
     case Opcode::vphsubw: case Opcode::vphsubsw:
         return IntegerDataflowShape{16, 16, 16, true, true, true};
@@ -93,6 +117,7 @@ inline std::optional<IntegerDataflowShape> integer_dataflow_shape(Opcode opcode)
     case Opcode::vpackuswb: return IntegerDataflowShape{16, 16, 8, true, true, false};
     case Opcode::vpackusdw: return IntegerDataflowShape{32, 32, 16, true, true, false};
     case Opcode::vpsadbw: return IntegerDataflowShape{8, 8, 64, false, false, false};
+    case Opcode::vpermd: return IntegerDataflowShape{32, 32, 32, false, false, false};
     default: return std::nullopt;
     }
 }
@@ -136,15 +161,16 @@ inline std::optional<IntegerDataflowShape> evex_integer_shape(Opcode opcode) noe
         return IntegerDataflowShape{32,32,32,false,false,false};
     case Opcode::vpaddq: case Opcode::vpsubq:
         return IntegerDataflowShape{64,64,64,false,false,false};
-    case Opcode::vpandd: case Opcode::vpord: case Opcode::vpxord:
+    case Opcode::vpandd: case Opcode::vpandnd: case Opcode::vpord: case Opcode::vpxord:
         return IntegerDataflowShape{32,32,32,false,false,false};
-    case Opcode::vpandq: case Opcode::vporq: case Opcode::vpxorq:
+    case Opcode::vpandq: case Opcode::vpandnq: case Opcode::vporq: case Opcode::vpxorq:
         return IntegerDataflowShape{64,64,64,false,false,false};
-    case Opcode::vpavgb: case Opcode::vpavgw:
-    case Opcode::vpminsb: case Opcode::vpminsd: case Opcode::vpminuw: case Opcode::vpminud:
-    case Opcode::vpmaxsb: case Opcode::vpmaxsd: case Opcode::vpmaxuw: case Opcode::vpmaxud:
-    case Opcode::vpmulld: case Opcode::vpmuldq: case Opcode::vpmuludq:
+    case Opcode::vpavgb: case Opcode::vpavgw: case Opcode::vpsadbw: case Opcode::vpermb:
+    case Opcode::vpminsb: case Opcode::vpminsd: case Opcode::vpminsq: case Opcode::vpminuw: case Opcode::vpminud: case Opcode::vpminuq:
+    case Opcode::vpmaxsb: case Opcode::vpmaxsd: case Opcode::vpmaxsq: case Opcode::vpmaxuw: case Opcode::vpmaxud: case Opcode::vpmaxuq:
+    case Opcode::vpmulld: case Opcode::vpmullq: case Opcode::vpmuldq: case Opcode::vpmuludq:
     case Opcode::vpmaddwd: case Opcode::vpmaddubsw:
+    case Opcode::vpermd:
     // Packing narrows signed inputs, independently within 128-bit groups;
     // writemask elements follow the narrowed result rather than input lanes.
     case Opcode::vpacksswb: case Opcode::vpackssdw: case Opcode::vpackuswb: case Opcode::vpackusdw:
@@ -357,6 +383,25 @@ inline void evaluate_integer_dataflow(Opcode opcode, IntegerDataflowShape shape,
     const bool horizontal_add = opcode == Opcode::vphaddw || opcode == Opcode::vphaddd || opcode == Opcode::vphaddsw;
     const bool horizontal_sub = opcode == Opcode::vphsubw || opcode == Opcode::vphsubd || opcode == Opcode::vphsubsw;
     const bool horizontal_saturate = opcode == Opcode::vphaddsw || opcode == Opcode::vphsubsw;
+    if (opcode == Opcode::vpermd) {
+        const auto lane_bits = static_cast<unsigned>(shape.result_bits);
+        const auto permutation_lane_bytes = lane_bits / 8;
+        const auto lanes = bytes / permutation_lane_bytes;
+        for (unsigned lane = 0; lane < lanes; ++lane) {
+            const auto selector = load_lane(first, lane * permutation_lane_bytes, lane_bits);
+            const auto source_lane = static_cast<unsigned>(selector & (lanes - 1));
+            store_lane(output, lane * permutation_lane_bytes, lane_bits,
+                       load_lane(second, source_lane * permutation_lane_bytes, lane_bits));
+        }
+        return;
+    }
+    if (opcode == Opcode::vpermb) {
+        for (unsigned lane = 0; lane < bytes; ++lane) {
+            const auto selector = std::to_integer<unsigned>(second[lane]);
+            output[lane] = first[selector & (bytes - 1)];
+        }
+        return;
+    }
     // Lane-local forms repeat independently across each 128-bit group.
     for (unsigned base = 0; base < bytes; base += 16) {
         if (opcode == Opcode::vpshufb) {
@@ -444,15 +489,16 @@ inline void evaluate_integer_dataflow(Opcode opcode, IntegerDataflowShape shape,
                 }
                 case Opcode::vpcmpeqb: case Opcode::vpcmpeqw: case Opcode::vpcmpeqd:
                     value = left == right ? mask : 0; break;
-                case Opcode::vpcmpgtb: case Opcode::vpcmpgtw: case Opcode::vpcmpgtd:
+                case Opcode::vpcmpgtb: case Opcode::vpcmpgtw: case Opcode::vpcmpgtd: case Opcode::vpcmpgtq:
                     value = signed_lane(left, shape.first_bits) > signed_lane(right, shape.second_bits) ? mask : 0; break;
-                case Opcode::vpandn: value = ~left & right; break;
+                case Opcode::vpandn: case Opcode::vpandnd: case Opcode::vpandnq:
+                    value = ~left & right; break;
                 case Opcode::vpavgb: case Opcode::vpavgw: value = (left + right + 1) / 2; break;
-                case Opcode::vpminsb: case Opcode::vpminsd: value = static_cast<std::uint64_t>(std::min(lhs, rhs)); break;
-                case Opcode::vpmaxsb: case Opcode::vpmaxsd: value = static_cast<std::uint64_t>(std::max(lhs, rhs)); break;
-                case Opcode::vpminuw: case Opcode::vpminud: value = std::min(left, right); break;
-                case Opcode::vpmaxuw: case Opcode::vpmaxud: value = std::max(left, right); break;
-                case Opcode::vpmulld: case Opcode::vpmuludq: value = left * right; break;
+                case Opcode::vpminsb: case Opcode::vpminsd: case Opcode::vpminsq: value = static_cast<std::uint64_t>(std::min(lhs, rhs)); break;
+                case Opcode::vpmaxsb: case Opcode::vpmaxsd: case Opcode::vpmaxsq: value = static_cast<std::uint64_t>(std::max(lhs, rhs)); break;
+                case Opcode::vpminuw: case Opcode::vpminud: case Opcode::vpminuq: value = std::min(left, right); break;
+                case Opcode::vpmaxuw: case Opcode::vpmaxud: case Opcode::vpmaxuq: value = std::max(left, right); break;
+                case Opcode::vpmulld: case Opcode::vpmullq: case Opcode::vpmuludq: value = left * right; break;
                 case Opcode::vpmuldq: value = static_cast<std::uint64_t>(lhs * rhs); break;
                 case Opcode::vpsignb: case Opcode::vpsignw: case Opcode::vpsignd:
                     value = rhs == 0 ? 0 : rhs < 0 ? UINT64_C(0) - left : left; break;
@@ -538,11 +584,16 @@ inline std::optional<X86AvxPackedResult> evaluate_x86_avx_packed(
         return std::nullopt;
 
     const bool move = instruction.opcode == Opcode::vmovups;
+    const bool shuffle = instruction.opcode == Opcode::vshufps || instruction.opcode == Opcode::vshufpd;
+    const bool immediate_shuffle = instruction.opcode == Opcode::vpshufd;
     const auto immediate_shift = immediate_shift_shape(instruction.opcode);
     const auto absolute = absolute_lane_width(instruction.opcode);
-    if (!move && !immediate_shift && !absolute && !is_avx_integer_bitwise_or_compare(instruction.opcode))
+    if (!move && !shuffle && !immediate_shuffle && !immediate_shift && !absolute &&
+        !is_avx_integer_bitwise_or_compare(instruction.opcode))
         return std::nullopt;
-    if (!move && !absolute && instruction.operands.size() != 3) return std::nullopt;
+    if (shuffle && instruction.operands.size() != 4) return std::nullopt;
+    if ((!move && !shuffle && !immediate_shuffle && !absolute && instruction.operands.size() != 3) ||
+        (immediate_shuffle && instruction.operands.size() != 3)) return std::nullopt;
     if (move && instruction.operands.size() != 2) return std::nullopt;
 
     const bool store = move && std::holds_alternative<MemoryOperand>(instruction.operands[0]);
@@ -581,6 +632,26 @@ inline std::optional<X86AvxPackedResult> evaluate_x86_avx_packed(
             return std::nullopt;
         }
         register_destination = destination->index;
+    } else if (immediate_shuffle) {
+        const auto *destination = std::get_if<RegisterOperand>(&instruction.operands[0]);
+        if (!destination || (destination->bank != RegisterBank::xmm && destination->bank != RegisterBank::ymm))
+            return std::nullopt;
+        bits = destination->width;
+        if ((bits != 128 && bits != 256) || !is_xmm_or_ymm(instruction.operands[0], bits) ||
+            (instruction.vector_bits && instruction.vector_bits != bits) ||
+            (instruction.vector_element_bits && instruction.vector_element_bits != 32))
+            return std::nullopt;
+        register_destination = destination->index;
+        const auto &source = instruction.operands[1];
+        if (const auto *memory = std::get_if<MemoryOperand>(&source)) {
+            if (memory->data_width != bits) return std::nullopt;
+        } else if (!is_xmm_or_ymm(source, bits)) {
+            return std::nullopt;
+        }
+        const auto *selector = std::get_if<ImmediateOperand>(&instruction.operands[2]);
+        if (!selector || selector->encoded_width != 8 || selector->effective_width != 8 ||
+            selector->is_signed || selector->value > 0xff)
+            return std::nullopt;
     } else if (immediate_shift) {
         const auto *destination = std::get_if<RegisterOperand>(&instruction.operands[0]);
         if (!destination || (destination->bank != RegisterBank::xmm && destination->bank != RegisterBank::ymm))
@@ -618,6 +689,22 @@ inline std::optional<X86AvxPackedResult> evaluate_x86_avx_packed(
     }
 
     if (instruction.vector_bits && instruction.vector_bits != bits) return std::nullopt;
+    if (instruction.opcode == Opcode::vpcmpgtq && instruction.vector_element_bits &&
+        instruction.vector_element_bits != 64) return std::nullopt;
+    if (instruction.opcode == Opcode::vpermd && bits != 256) return std::nullopt;
+    if (shuffle) {
+        const auto *selector = std::get_if<ImmediateOperand>(&instruction.operands[3]);
+        const auto lane_bits = instruction.opcode == Opcode::vshufps ? 32u : 64u;
+        if (!selector || selector->encoded_width != 8 || selector->effective_width != 8 || selector->is_signed ||
+            (instruction.vector_element_bits && instruction.vector_element_bits != lane_bits) ||
+            !is_xmm_or_ymm(instruction.operands[1], bits))
+            return std::nullopt;
+        if (const auto *memory = std::get_if<MemoryOperand>(&instruction.operands[2])) {
+            if (memory->data_width != bits) return std::nullopt;
+        } else if (!is_xmm_or_ymm(instruction.operands[2], bits)) {
+            return std::nullopt;
+        }
+    }
 
     X86AvxPackedResult result{};
     result.vector_bits = bits;
@@ -632,6 +719,40 @@ inline std::optional<X86AvxPackedResult> evaluate_x86_avx_packed(
     const auto bytes = static_cast<unsigned>(bits / 8);
     if (move) {
         for (unsigned i = 0; i < bytes; ++i) result.bytes[i] = source1[i];
+        return result;
+    }
+
+    if (immediate_shuffle) {
+        const auto selector = static_cast<unsigned>(std::get<ImmediateOperand>(instruction.operands[2]).value);
+        for (unsigned lane_base = 0; lane_base < bytes; lane_base += 16) {
+            for (unsigned output_lane = 0; output_lane < 4; ++output_lane) {
+                const unsigned source_lane = (selector >> (output_lane * 2)) & 3u;
+                for (unsigned byte = 0; byte < 4; ++byte)
+                    result.bytes[lane_base + output_lane * 4 + byte] =
+                        source1[lane_base + source_lane * 4 + byte];
+            }
+        }
+        return result;
+    }
+
+    if (shuffle) {
+        const auto selector = static_cast<unsigned>(std::get<ImmediateOperand>(instruction.operands[3]).value);
+        const unsigned lane_bytes = instruction.opcode == Opcode::vshufps ? 4 : 8;
+        const unsigned lanes_per_128 = 16 / lane_bytes;
+        for (unsigned lane_base = 0; lane_base < bytes; lane_base += 16) {
+            for (unsigned output_lane = 0; output_lane < lanes_per_128; ++output_lane) {
+                const unsigned selector_bit = instruction.opcode == Opcode::vshufps
+                    ? output_lane * 2 : (lane_base / 16) * 2 + (output_lane == 0 ? 0 : 1);
+                const unsigned source_lane = (selector >> selector_bit) & (instruction.opcode == Opcode::vshufps ? 3u : 1u);
+                const bool from_second = instruction.opcode == Opcode::vshufps
+                    ? output_lane >= 2 : output_lane == 1;
+                const auto &input = from_second ? source2 : source1;
+                const unsigned copy_from = lane_base + source_lane * lane_bytes;
+                const unsigned copy_to = lane_base + output_lane * lane_bytes;
+                for (unsigned byte = 0; byte < lane_bytes; ++byte)
+                    result.bytes[copy_to + byte] = input[copy_from + byte];
+            }
+        }
         return result;
     }
 
@@ -691,6 +812,78 @@ inline std::optional<X86EvexIntegerResult> evaluate_x86_evex_integer(
         (instruction.vector_bits != 128 && instruction.vector_bits != 256 && instruction.vector_bits != 512) ||
         (instruction.x86_opmask_zeroing && !instruction.x86_opmask))
         return std::nullopt;
+    const auto immediate_shape = immediate_shift_shape(instruction.opcode);
+    if (immediate_shape && immediate_shape->second_bits == 8 &&
+        immediate_shape->result_bits != 128) {
+        const auto width = static_cast<unsigned>(instruction.vector_bits);
+        const auto *memory = std::get_if<MemoryOperand>(&instruction.operands[1]);
+        const auto *count_operand = std::get_if<ImmediateOperand>(&instruction.operands[2]);
+        if (!is_evex_vector(instruction.operands[0], width) ||
+            (!is_evex_vector(instruction.operands[1], width) && (!memory || memory->data_width != width)) ||
+            !count_operand || count_operand->encoded_width != 8 || count_operand->effective_width != 8 ||
+            count_operand->is_signed || count_operand->value > 0xff ||
+            (instruction.vector_element_bits && instruction.vector_element_bits != immediate_shape->result_bits) ||
+            instruction.x86_evex_broadcast || instruction.x86_evex_sae ||
+            (instruction.x86_opmask && (*instruction.x86_opmask == 0 || *instruction.x86_opmask > 7)) ||
+            (instruction.x86_opmask && !instruction.x86_opmask_zeroing && !old_destination))
+            return std::nullopt;
+        X86EvexIntegerResult result{};
+        result.vector_bits = static_cast<std::uint16_t>(width);
+        const auto lane_bits = static_cast<unsigned>(immediate_shape->result_bits);
+        const auto lane_bytes = lane_bits / 8;
+        const auto lane_mask = lane_bits == 64 ? UINT64_MAX : (UINT64_C(1) << lane_bits) - 1;
+        const bool left_shift = instruction.opcode == Opcode::vpsllw || instruction.opcode == Opcode::vpslld ||
+                                instruction.opcode == Opcode::vpsllq;
+        const bool arithmetic = instruction.opcode == Opcode::vpsraw || instruction.opcode == Opcode::vpsrad;
+        for (unsigned offset = 0; offset < width / 8; offset += lane_bytes) {
+            const auto lane = offset / lane_bytes;
+            const auto input = load_lane(source1, offset, lane_bits);
+            const auto sign = UINT64_C(1) << (lane_bits - 1);
+            std::uint64_t value = 0;
+            if (count_operand->value >= lane_bits) {
+                value = arithmetic && (input & sign) ? lane_mask : 0;
+            } else if (left_shift) {
+                value = (input << static_cast<unsigned>(count_operand->value)) & lane_mask;
+            } else {
+                value = input >> static_cast<unsigned>(count_operand->value);
+                if (arithmetic && count_operand->value != 0 && (input & sign))
+                    value |= lane_mask ^ (lane_mask >> static_cast<unsigned>(count_operand->value));
+            }
+            if (instruction.x86_opmask && !((opmask_value >> lane) & 1))
+                value = instruction.x86_opmask_zeroing ? 0 : load_lane(*old_destination, offset, lane_bits);
+            store_lane(result.bytes, offset, lane_bits, value & lane_mask);
+        }
+        return result;
+    }
+    if (instruction.opcode == Opcode::vpshufd) {
+        const auto width = static_cast<unsigned>(instruction.vector_bits);
+        const auto *memory = std::get_if<MemoryOperand>(&instruction.operands[1]);
+        const auto *selector = std::get_if<ImmediateOperand>(&instruction.operands[2]);
+        if (!is_evex_vector(instruction.operands[0], width) ||
+            (!is_evex_vector(instruction.operands[1], width) && (!memory || memory->data_width != width)) ||
+            !selector || selector->encoded_width != 8 || selector->effective_width != 8 || selector->is_signed ||
+            (instruction.vector_element_bits && instruction.vector_element_bits != 32) ||
+            (instruction.x86_opmask && (*instruction.x86_opmask == 0 || *instruction.x86_opmask > 7)) ||
+            (instruction.x86_opmask && !instruction.x86_opmask_zeroing && !old_destination))
+            return std::nullopt;
+        X86EvexIntegerResult result{};
+        result.vector_bits = static_cast<std::uint16_t>(width);
+        const auto active_bytes = width / 8;
+        for (unsigned base = 0; base < active_bytes; base += 16)
+            for (unsigned lane = 0; lane < 4; ++lane) {
+                const auto source_lane = (selector->value >> (2 * lane)) & 3;
+                const auto destination_lane = base / 4 + lane;
+                const auto source_offset = base + static_cast<unsigned>(source_lane) * 4;
+                const auto destination_offset = base + lane * 4;
+                const bool active = !instruction.x86_opmask || ((opmask_value >> destination_lane) & 1);
+                for (unsigned byte = 0; byte < 4; ++byte) {
+                    result.bytes[destination_offset + byte] = active
+                        ? source1[source_offset + byte]
+                        : instruction.x86_opmask_zeroing ? std::byte{} : (*old_destination)[destination_offset + byte];
+                }
+            }
+        return result;
+    }
     const auto shape=evex_integer_shape(instruction.opcode);
     if(!shape||(instruction.vector_element_bits&&instruction.vector_element_bits!=shape->result_bits))return std::nullopt;
     const auto *memory=std::get_if<MemoryOperand>(&instruction.operands[2]);
@@ -725,6 +918,169 @@ inline std::optional<X86EvexIntegerResult> evaluate_x86_evex_integer(
         const auto begin=lane*lane_bytes;
         for(unsigned byte=0;byte<lane_bytes;++byte)
             result.bytes[begin+byte]=instruction.x86_opmask_zeroing?std::byte{}:(*old_destination)[begin+byte];
+    }
+    return result;
+}
+
+// Exact EVEX VPTERNLOGD/Q evaluation. source_a is the pre-instruction
+// destination, source_b is EVEX.vvvv, and source_c is ModRM.r/m. It also
+// supplies the merge value for masked-off destination lanes.
+inline std::optional<X86EvexIntegerResult> evaluate_x86_evex_ternary_logic(
+    const Instruction &instruction, const std::array<std::byte, 64> &source_a,
+    const std::array<std::byte, 64> &source_b, const std::array<std::byte, 64> &source_c,
+    std::uint64_t opmask_value = UINT64_MAX) noexcept {
+    using namespace x86_avx_detail;
+    const bool qword = instruction.opcode == Opcode::vpternlogq;
+    if (instruction.context.architecture != Architecture::x86_64 ||
+        instruction.context.mode != ExecutionMode::x86_64 || !instruction.x86_evex ||
+        (instruction.opcode != Opcode::vpternlogd && !qword) || instruction.operands.size() != 4 ||
+        (instruction.vector_bits != 128 && instruction.vector_bits != 256 && instruction.vector_bits != 512) ||
+        instruction.x86_evex_broadcast || instruction.x86_evex_sae ||
+        (instruction.vector_element_bits && instruction.vector_element_bits != (qword ? 64 : 32)) ||
+        (instruction.x86_opmask_zeroing && !instruction.x86_opmask))
+        return std::nullopt;
+    const auto width = static_cast<unsigned>(instruction.vector_bits);
+    const auto *memory = std::get_if<MemoryOperand>(&instruction.operands[2]);
+    const auto *truth_table = std::get_if<ImmediateOperand>(&instruction.operands[3]);
+    if (!is_evex_vector(instruction.operands[0], width) || !is_evex_vector(instruction.operands[1], width) ||
+        (!is_evex_vector(instruction.operands[2], width) && (!memory || memory->data_width != width)) ||
+        !truth_table || truth_table->encoded_width != 8 || truth_table->effective_width != 8 || truth_table->is_signed ||
+        (instruction.x86_opmask && (*instruction.x86_opmask == 0 || *instruction.x86_opmask > 7)))
+        return std::nullopt;
+    X86EvexIntegerResult result{};
+    result.vector_bits = static_cast<std::uint16_t>(width);
+    const auto lane_bits = qword ? 64u : 32u;
+    const auto lane_bytes = lane_bits / 8;
+    for (unsigned offset = 0; offset < width / 8; offset += lane_bytes) {
+        const auto lane = offset / lane_bytes;
+        const auto lane_mask = lane_bits == 64 ? UINT64_MAX : (UINT64_C(1) << lane_bits) - 1;
+        const bool active = !instruction.x86_opmask || ((opmask_value >> lane) & 1);
+        auto value = active ? UINT64_C(0) : instruction.x86_opmask_zeroing ? UINT64_C(0)
+            : load_lane(source_a, offset, lane_bits);
+        if (active) {
+            const auto a = load_lane(source_a, offset, lane_bits);
+            const auto b = load_lane(source_b, offset, lane_bits);
+            const auto c = load_lane(source_c, offset, lane_bits);
+            value = 0;
+            for (unsigned bit = 0; bit < lane_bits; ++bit) {
+                const auto index = static_cast<unsigned>(((a >> bit) & 1) << 2 |
+                    ((b >> bit) & 1) << 1 | ((c >> bit) & 1));
+                if ((truth_table->value >> index) & 1)
+                    value |= UINT64_C(1) << bit;
+            }
+        }
+        store_lane(result.bytes, offset, lane_bits, value & lane_mask);
+    }
+    return result;
+}
+
+inline std::optional<X86EvexIntegerResult> evaluate_x86_evex_mask_to_vector(
+    const Instruction &instruction, std::uint64_t mask_value) noexcept {
+    using namespace x86_avx_detail;
+    unsigned element_bits = 0;
+    switch (instruction.opcode) {
+    case Opcode::vpmovm2b: element_bits = 8; break;
+    case Opcode::vpmovm2w: element_bits = 16; break;
+    case Opcode::vpmovm2d: element_bits = 32; break;
+    case Opcode::vpmovm2q: element_bits = 64; break;
+    default: return std::nullopt;
+    }
+    if (instruction.context.architecture != Architecture::x86_64 ||
+        instruction.context.mode != ExecutionMode::x86_64 || !instruction.x86_evex ||
+        instruction.operands.size() != 2 ||
+        (instruction.vector_bits != 128 && instruction.vector_bits != 256 && instruction.vector_bits != 512) ||
+        (instruction.vector_element_bits && instruction.vector_element_bits != element_bits) ||
+        instruction.x86_opmask || instruction.x86_opmask_zeroing)
+        return std::nullopt;
+    const auto width = static_cast<unsigned>(instruction.vector_bits);
+    const auto *source_mask = std::get_if<RegisterOperand>(&instruction.operands[1]);
+    if (!is_evex_vector(instruction.operands[0], width) || !source_mask ||
+        source_mask->bank != RegisterBank::opmask || source_mask->index >= 8 || source_mask->width != 64 ||
+        source_mask->high_byte)
+        return std::nullopt;
+    X86EvexIntegerResult result{};
+    result.vector_bits = static_cast<std::uint16_t>(width);
+    const auto lanes = width / element_bits;
+    const auto lane_mask = element_bits == 64 ? UINT64_MAX : (UINT64_C(1) << element_bits) - 1;
+    for (unsigned lane = 0; lane < lanes; ++lane)
+        store_lane(result.bytes, lane * (element_bits / 8), element_bits,
+            (mask_value & (UINT64_C(1) << lane)) ? lane_mask : 0);
+    return result;
+}
+
+inline std::optional<X86EvexMaskCompareResult> evaluate_x86_evex_vector_to_mask(
+    const Instruction &instruction, const std::array<std::byte, 64> &source) noexcept {
+    using namespace x86_avx_detail;
+    unsigned element_bits = 0;
+    switch (instruction.opcode) {
+    case Opcode::vpmovb2m: element_bits = 8; break;
+    case Opcode::vpmovw2m: element_bits = 16; break;
+    case Opcode::vpmovd2m: element_bits = 32; break;
+    case Opcode::vpmovq2m: element_bits = 64; break;
+    default: return std::nullopt;
+    }
+    if (instruction.context.architecture != Architecture::x86_64 ||
+        instruction.context.mode != ExecutionMode::x86_64 || !instruction.x86_evex ||
+        instruction.operands.size() != 2 ||
+        (instruction.vector_bits != 128 && instruction.vector_bits != 256 && instruction.vector_bits != 512) ||
+        (instruction.vector_element_bits && instruction.vector_element_bits != element_bits) ||
+        instruction.x86_opmask || instruction.x86_opmask_zeroing)
+        return std::nullopt;
+    const auto width = static_cast<unsigned>(instruction.vector_bits);
+    const auto *destination = std::get_if<RegisterOperand>(&instruction.operands[0]);
+    if (!destination || destination->bank != RegisterBank::opmask || destination->index >= 8 ||
+        destination->width != 64 || destination->high_byte || !is_evex_vector(instruction.operands[1], width))
+        return std::nullopt;
+    X86EvexMaskCompareResult result{};
+    result.vector_bits = static_cast<std::uint16_t>(width);
+    result.active_bits = static_cast<std::uint8_t>(width / element_bits);
+    const auto sign = UINT64_C(1) << (element_bits - 1);
+    for (unsigned lane = 0; lane < result.active_bits; ++lane)
+        if (load_lane(source, lane * (element_bits / 8), element_bits) & sign)
+            result.mask |= UINT64_C(1) << lane;
+    return result;
+}
+
+inline std::optional<X86EvexIntegerResult> evaluate_x86_evex_popcount(
+    const Instruction &instruction, const std::array<std::byte, 64> &source,
+    const std::array<std::byte, 64> *old_destination = nullptr,
+    std::uint64_t opmask_value = UINT64_MAX) noexcept {
+    using namespace x86_avx_detail;
+    unsigned element_bits = 0;
+    switch (instruction.opcode) {
+    case Opcode::vpopcntb: element_bits = 8; break;
+    case Opcode::vpopcntw: element_bits = 16; break;
+    case Opcode::vpopcntd: element_bits = 32; break;
+    case Opcode::vpopcntq: element_bits = 64; break;
+    default: return std::nullopt;
+    }
+    if (instruction.context.architecture != Architecture::x86_64 ||
+        instruction.context.mode != ExecutionMode::x86_64 || !instruction.x86_evex ||
+        instruction.operands.size() != 2 ||
+        (instruction.vector_bits != 128 && instruction.vector_bits != 256 && instruction.vector_bits != 512) ||
+        (instruction.vector_element_bits && instruction.vector_element_bits != element_bits) ||
+        instruction.x86_evex_broadcast || instruction.x86_evex_sae ||
+        (instruction.x86_opmask_zeroing && !instruction.x86_opmask))
+        return std::nullopt;
+    const auto width = static_cast<unsigned>(instruction.vector_bits);
+    const auto *memory = std::get_if<MemoryOperand>(&instruction.operands[1]);
+    if (!is_evex_vector(instruction.operands[0], width) ||
+        (!is_evex_vector(instruction.operands[1], width) && (!memory || memory->data_width != width)) ||
+        (instruction.x86_opmask && (*instruction.x86_opmask == 0 || *instruction.x86_opmask > 7)) ||
+        (instruction.x86_opmask && !instruction.x86_opmask_zeroing && !old_destination))
+        return std::nullopt;
+    X86EvexIntegerResult result{};
+    result.vector_bits = static_cast<std::uint16_t>(width);
+    const auto lanes = width / element_bits;
+    const auto lane_bytes = element_bits / 8;
+    for (unsigned lane = 0; lane < lanes; ++lane) {
+        const auto offset = lane * lane_bytes;
+        const bool active = !instruction.x86_opmask || ((opmask_value >> lane) & 1);
+        const auto count = active ? static_cast<std::uint64_t>(std::popcount(
+            load_lane(source, offset, element_bits))) : UINT64_C(0);
+        const auto value = !active && !instruction.x86_opmask_zeroing
+            ? load_lane(*old_destination, offset, element_bits) : count;
+        store_lane(result.bytes, offset, element_bits, value);
     }
     return result;
 }
@@ -781,41 +1137,15 @@ inline std::optional<X86EvexMaskCompareResult> evaluate_x86_evex_mask_compare(
     return result;
 }
 
-// Evaluate EVEX VCMPPS/VCMPPD predicates directly from IEEE bit patterns.
-// source2 supplies a full vector for register/non-broadcast operands and the
-// scalar value in its low bytes for an EVEX.b memory broadcast. MXCSR supplies
-// DAZ and exception-mask controls; sticky-flag updates remain the caller's
-// responsibility. If completed is false, the partial mask must not be
-// committed because an unmasked floating-point exception was raised.
-inline std::optional<X86EvexFloatCompareResult> evaluate_x86_evex_float_compare(
-    const Instruction &instruction, const std::array<std::byte, 64> &source1,
-    const std::array<std::byte, 64> &source2, std::uint64_t opmask_value = UINT64_MAX,
-    std::uint32_t mxcsr = 0x1f80) noexcept {
-    if (instruction.context.architecture != Architecture::x86_64 ||
-        instruction.context.mode != ExecutionMode::x86_64 || !instruction.x86_evex ||
-        (instruction.opcode != Opcode::vcmpps && instruction.opcode != Opcode::vcmppd) ||
-        (instruction.vector_bits != 128 && instruction.vector_bits != 256 && instruction.vector_bits != 512) ||
-        instruction.operands.size() != 4 || instruction.x86_opmask_zeroing ||
-        (instruction.x86_opmask && (*instruction.x86_opmask == 0 || *instruction.x86_opmask >= 8)))
-        return std::nullopt;
-    const auto width = static_cast<unsigned>(instruction.vector_bits);
-    const unsigned lane_bits = instruction.opcode == Opcode::vcmpps ? 32 : 64;
-    if (instruction.vector_element_bits && instruction.vector_element_bits != lane_bits) return std::nullopt;
-    const auto *destination = std::get_if<RegisterOperand>(&instruction.operands[0]);
-    const auto *memory = std::get_if<MemoryOperand>(&instruction.operands[2]);
-    const auto *predicate = std::get_if<ImmediateOperand>(&instruction.operands[3]);
-    const bool source2_vector = x86_avx_detail::is_evex_vector(instruction.operands[2], width);
-    const bool source2_memory = memory && memory->data_width ==
-        (instruction.x86_evex_broadcast ? lane_bits : width);
-    if (!destination || destination->bank != RegisterBank::opmask || destination->index >= 8 ||
-        destination->width != 64 || destination->high_byte ||
-        !x86_avx_detail::is_evex_vector(instruction.operands[1], width) ||
-        (!source2_vector && !source2_memory) ||
-        (instruction.x86_evex_broadcast && !memory) || !predicate ||
-        predicate->encoded_width != 8 || predicate->effective_width != 8 || predicate->is_signed ||
-        predicate->value >= 32)
-        return std::nullopt;
-
+namespace x86_avx_detail {
+// Shared IEEE bit-pattern engine. Public entry points validate operand shapes
+// and predicates before calling; inactive EVEX lanes never raise exceptions.
+template <std::size_t Size>
+inline X86EvexFloatCompareResult evaluate_float_compare_lanes(
+    unsigned width, unsigned lane_bits, std::uint8_t predicate,
+    const std::array<std::byte, Size> &source1,
+    const std::array<std::byte, Size> &source2, std::uint64_t opmask_value,
+    bool broadcast, bool sae, std::uint32_t mxcsr) noexcept {
     X86EvexFloatCompareResult result{};
     result.vector_bits = static_cast<std::uint16_t>(width);
     result.active_bits = static_cast<std::uint8_t>(width / lane_bits);
@@ -826,17 +1156,17 @@ inline std::optional<X86EvexFloatCompareResult> evaluate_x86_evex_float_compare(
     const auto encoding_mask = lane_bits == 32 ? UINT64_C(0xffffffff) : UINT64_MAX;
     const bool daz = (mxcsr & (UINT32_C(1) << 6)) != 0;
     bool signaling_predicate = false;
-    switch (predicate->value) {
+    switch (predicate) {
     case 1: case 2: case 5: case 6: case 9: case 10: case 13: case 14:
-    case 16: case 19: case 20: case 24: case 27: case 28: case 31:
+    case 16: case 19: case 20: case 23: case 24: case 27: case 28: case 31:
         signaling_predicate = true;
         break;
     default:
         break;
     }
     for (unsigned lane = 0; lane < result.active_bits; ++lane) {
-        if (instruction.x86_opmask && !(opmask_value & (UINT64_C(1) << lane))) continue;
-        const auto offset = instruction.x86_evex_broadcast ? 0 : lane * (lane_bits / 8);
+        if (!(opmask_value & (UINT64_C(1) << lane))) continue;
+        const auto offset = broadcast ? 0 : lane * (lane_bits / 8);
         auto left = x86_avx_detail::load_lane(source1, lane * (lane_bits / 8), lane_bits);
         auto right = x86_avx_detail::load_lane(source2, offset, lane_bits);
         const auto classify = [&](std::uint64_t bits) {
@@ -878,8 +1208,8 @@ inline std::optional<X86EvexFloatCompareResult> evaluate_x86_evex_float_compare(
         const bool unordered = nan;
         const bool greater = !unordered && !less && !equal;
         bool match = false;
-        switch (predicate->value) {
-        case 0: case 8: case 16: case 24: match = equal || (unordered && (predicate->value == 8 || predicate->value == 24)); break;
+        switch (predicate) {
+        case 0: case 8: case 16: case 24: match = equal || (unordered && (predicate == 8 || predicate == 24)); break;
         case 1: case 17: match = !unordered && less; break;
         case 2: case 18: match = !unordered && (less || equal); break;
         case 3: case 19: match = unordered; break;
@@ -894,13 +1224,160 @@ inline std::optional<X86EvexFloatCompareResult> evaluate_x86_evex_float_compare(
         case 13: case 29: match = !unordered && (greater || equal); break;
         case 14: case 30: match = !unordered && greater; break;
         case 15: case 31: match = true; break;
-        default: return std::nullopt;
+        default: break; // Callers validate the five-bit predicate.
         }
         if (match) result.mask |= UINT64_C(1) << lane;
     }
-    result.completed = instruction.x86_evex_sae ||
+    result.completed = sae ||
         (!(result.invalid_operation && !(mxcsr & (UINT32_C(1) << 7))) &&
          !(result.denormal_operand && !(mxcsr & (UINT32_C(1) << 8))));
+    result.mxcsr_after = mxcsr;
+    if (!sae) {
+        if (result.invalid_operation) result.mxcsr_after |= UINT32_C(1);
+        if (result.denormal_operand) result.mxcsr_after |= UINT32_C(1) << 1;
+    }
+    return result;
+}
+} // namespace x86_avx_detail
+
+// Evaluate the decoded VEX.128/.256 VCMPPS/VCMPPD forms. source1 is
+// VEX.vvvv and source2 is the register value or caller-loaded full memory
+// vector. The 32 predicates use exact IEEE encodings, with no host FP work.
+// MXCSR supplies DAZ and exception masks; mxcsr_after carries sticky IE/DE
+// status changes while memory faults remain caller-owned. If completed is false, neither bytes nor upper clearing
+// may be committed, including when an exception occurred in a later lane.
+inline std::optional<X86AvxFloatCompareResult> evaluate_x86_avx_float_compare(
+    const Instruction &instruction, const std::array<std::byte, 32> &source1,
+    const std::array<std::byte, 32> &source2, std::uint32_t mxcsr = 0x1f80) noexcept {
+    using namespace x86_avx_detail;
+    if (instruction.context.architecture != Architecture::x86_64 ||
+        instruction.context.mode != ExecutionMode::x86_64 || instruction.x86_evex ||
+        instruction.x86_opmask || instruction.x86_opmask_zeroing ||
+        instruction.x86_evex_broadcast || instruction.x86_evex_sae ||
+        (instruction.opcode != Opcode::vcmpps && instruction.opcode != Opcode::vcmppd) ||
+        (instruction.vector_bits != 128 && instruction.vector_bits != 256) ||
+        instruction.operands.size() != 4)
+        return std::nullopt;
+    const auto width = static_cast<unsigned>(instruction.vector_bits);
+    const unsigned lane_bits = instruction.opcode == Opcode::vcmpps ? 32 : 64;
+    const auto *memory = std::get_if<MemoryOperand>(&instruction.operands[2]);
+    const auto *predicate = std::get_if<ImmediateOperand>(&instruction.operands[3]);
+    if ((instruction.vector_element_bits && instruction.vector_element_bits != lane_bits) ||
+        !is_xmm_or_ymm(instruction.operands[0], width) ||
+        !is_xmm_or_ymm(instruction.operands[1], width) ||
+        (!is_xmm_or_ymm(instruction.operands[2], width) && (!memory || memory->data_width != width)) ||
+        !predicate || predicate->encoded_width != 8 || predicate->effective_width != 8 ||
+        predicate->is_signed || predicate->value >= 32)
+        return std::nullopt;
+    const auto comparison = evaluate_float_compare_lanes(width, lane_bits,
+        static_cast<std::uint8_t>(predicate->value), source1, source2, UINT64_MAX,
+        false, false, mxcsr);
+    X86AvxFloatCompareResult result{};
+    result.vector_bits = static_cast<std::uint16_t>(width);
+    result.lane_bits = static_cast<std::uint8_t>(lane_bits);
+    result.zeroed_upper_128 = width == 128;
+    result.invalid_operation = comparison.invalid_operation;
+    result.denormal_operand = comparison.denormal_operand;
+    result.completed = comparison.completed;
+    result.mxcsr_after = comparison.mxcsr_after;
+    for (unsigned lane = 0; lane < width / lane_bits; ++lane)
+        store_lane(result.bytes, lane * (lane_bits / 8), lane_bits,
+            comparison.mask & (UINT64_C(1) << lane) ? UINT64_MAX : 0);
+    return result;
+}
+
+// Evaluate EVEX VCMPPS/VCMPPD predicates directly from IEEE bit patterns.
+// source2 supplies a full vector for register/non-broadcast operands and the
+// scalar value in its low bytes for an EVEX.b memory broadcast. MXCSR supplies
+// DAZ and exception-mask controls; mxcsr_after contains sticky IE/DE changes,
+// except for embedded SAE. If completed is false, the partial mask must not be
+// committed because an unmasked floating-point exception was raised.
+inline std::optional<X86EvexFloatCompareResult> evaluate_x86_evex_float_compare(
+    const Instruction &instruction, const std::array<std::byte, 64> &source1,
+    const std::array<std::byte, 64> &source2, std::uint64_t opmask_value = UINT64_MAX,
+    std::uint32_t mxcsr = 0x1f80) noexcept {
+    if (instruction.context.architecture != Architecture::x86_64 ||
+        instruction.context.mode != ExecutionMode::x86_64 || !instruction.x86_evex ||
+        (instruction.opcode != Opcode::vcmpps && instruction.opcode != Opcode::vcmppd) ||
+        (instruction.vector_bits != 128 && instruction.vector_bits != 256 && instruction.vector_bits != 512) ||
+        instruction.operands.size() != 4 || instruction.x86_opmask_zeroing ||
+        (instruction.x86_opmask && (*instruction.x86_opmask == 0 || *instruction.x86_opmask >= 8)))
+        return std::nullopt;
+    const auto width = static_cast<unsigned>(instruction.vector_bits);
+    const unsigned lane_bits = instruction.opcode == Opcode::vcmpps ? 32 : 64;
+    if (instruction.vector_element_bits && instruction.vector_element_bits != lane_bits) return std::nullopt;
+    const auto *destination = std::get_if<RegisterOperand>(&instruction.operands[0]);
+    const auto *memory = std::get_if<MemoryOperand>(&instruction.operands[2]);
+    const auto *predicate = std::get_if<ImmediateOperand>(&instruction.operands[3]);
+    const bool source2_vector = x86_avx_detail::is_evex_vector(instruction.operands[2], width);
+    const bool source2_memory = memory && memory->data_width ==
+        (instruction.x86_evex_broadcast ? lane_bits : width);
+    if (!destination || destination->bank != RegisterBank::opmask || destination->index >= 8 ||
+        destination->width != 64 || destination->high_byte ||
+        !x86_avx_detail::is_evex_vector(instruction.operands[1], width) ||
+        (!source2_vector && !source2_memory) ||
+        (instruction.x86_evex_broadcast && !memory) || !predicate ||
+        predicate->encoded_width != 8 || predicate->effective_width != 8 || predicate->is_signed ||
+        predicate->value >= 32)
+        return std::nullopt;
+
+    return x86_avx_detail::evaluate_float_compare_lanes(width, lane_bits,
+        static_cast<std::uint8_t>(predicate->value), source1, source2,
+        instruction.x86_opmask ? opmask_value : UINT64_MAX,
+        instruction.x86_evex_broadcast, instruction.x86_evex_sae, mxcsr);
+}
+
+struct X86SimdMovemaskResult {
+    std::uint32_t mask = 0;
+    std::uint16_t vector_bits = 0;
+    std::uint8_t lane_bits = 0;
+    std::uint8_t destination_width = 32;
+    bool operator==(const X86SimdMovemaskResult &) const = default;
+};
+
+// Evaluate register-source PMOVMSKB/VPMOVMSKB and VMOVMSKPS/VMOVMSKPD.
+// `source` is in architectural byte order, with byte zero least significant.
+inline std::optional<X86SimdMovemaskResult> evaluate_x86_simd_movemask(
+    const Instruction &instruction, const std::array<std::byte, 32> &source) noexcept {
+    if (instruction.context.architecture != Architecture::x86_64 ||
+        instruction.context.mode != ExecutionMode::x86_64 || instruction.flow != FlowKind::fallthrough ||
+        instruction.x86_evex || instruction.x86_opmask || instruction.x86_opmask_zeroing ||
+        instruction.memory_read || instruction.memory_write || instruction.operands.size() != 2 ||
+        instruction.access.size() != 2 || instruction.access[0] != OperandAccess::write ||
+        instruction.access[1] != OperandAccess::read)
+        return std::nullopt;
+
+    unsigned lane_bits = 0;
+    switch (instruction.opcode) {
+    case Opcode::pmovmskb:
+    case Opcode::vpmovmskb: lane_bits = 8; break;
+    case Opcode::vmovmskps: lane_bits = 32; break;
+    case Opcode::vmovmskpd: lane_bits = 64; break;
+    default: return std::nullopt;
+    }
+    const auto vector_bits = instruction.vector_bits;
+    if ((vector_bits != 128 && vector_bits != 256) ||
+        instruction.vector_element_bits != lane_bits ||
+        (instruction.opcode == Opcode::pmovmskb && vector_bits != 128) ||
+        (instruction.opcode != Opcode::pmovmskb && vector_bits != 128 && vector_bits != 256))
+        return std::nullopt;
+
+    const auto *destination = std::get_if<RegisterOperand>(&instruction.operands[0]);
+    const auto *input = std::get_if<RegisterOperand>(&instruction.operands[1]);
+    const auto expected_vector_bank = vector_bits == 128 ? RegisterBank::xmm : RegisterBank::ymm;
+    if (!destination || destination->bank != RegisterBank::gpr || destination->width != 32 ||
+        destination->high_byte || !input || input->bank != expected_vector_bank ||
+        input->width != vector_bits || input->high_byte)
+        return std::nullopt;
+
+    const auto lane_bytes = lane_bits / 8;
+    const auto lane_count = vector_bits / lane_bits;
+    X86SimdMovemaskResult result{0, vector_bits, static_cast<std::uint8_t>(lane_bits), 32};
+    for (unsigned lane = 0; lane < lane_count; ++lane) {
+        const auto msb_byte = lane * lane_bytes + lane_bytes - 1;
+        const auto sign = (std::to_integer<std::uint8_t>(source[msb_byte]) >> 7) & 1u;
+        result.mask |= static_cast<std::uint32_t>(sign) << lane;
+    }
     return result;
 }
 

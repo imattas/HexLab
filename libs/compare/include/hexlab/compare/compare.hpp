@@ -53,7 +53,16 @@ struct Summary {
     std::uint64_t matched_regions = 0, added_regions = 0, removed_regions = 0;
     std::uint64_t ignored_bytes = 0;
 };
-struct Report { Summary summary; std::vector<ChangeRun> runs; };
+enum class RegionChangeKind : std::uint8_t { matched, added, removed };
+struct RegionSummary {
+    std::string region_key;
+    RegionChangeKind kind = RegionChangeKind::matched;
+    std::optional<std::uint64_t> old_address, new_address;
+    std::uint64_t old_size = 0, new_size = 0;
+    std::uint64_t compared_bytes = 0, equal_bytes = 0, changed_bytes = 0, ignored_bytes = 0;
+    std::uint64_t added_bytes = 0, removed_bytes = 0;
+};
+struct Report { Summary summary; std::vector<ChangeRun> runs; std::vector<RegionSummary> regions; bool region_summaries_available = false; std::uint64_t total_runs = 0; bool runs_truncated = false; };
 struct FunctionAddress {
     std::uint64_t entry = 0;
     std::uint32_t address_space = 0;
@@ -82,11 +91,17 @@ struct CfgBlockFeature {
     // Address-independent summary of the block's normalized instructions.
     std::uint64_t fingerprint = 0;
     std::vector<CfgEdgeFeature> successors;
-    // Optional complete instruction fingerprint sequence for block-local diff.
-    // Empty or unavailable sequences never get treated as evidence of equality.
+    // Known address-independent instruction fingerprints. Complete sequences
+    // support block-local diffs; partial sequences retain original positions
+    // and contribute weighted evidence without producing a diff.
     std::vector<std::uint64_t> instruction_fingerprints;
     bool instruction_fingerprints_available = false;
     std::vector<InstructionSemanticFeature> instruction_semantics;
+    // Partial instruction evidence may omit opaque instructions. Positions are
+    // parallel to fingerprints when supplied; an empty vector means dense order.
+    std::vector<std::uint64_t> instruction_fingerprint_positions;
+    std::uint64_t instruction_count = 0; // Zero infers the count from a legacy complete sequence.
+    bool instruction_fingerprints_complete = true;
 };
 // Architecture-neutral function shape used for relocation-tolerant matching.
 struct FunctionFeature {
@@ -113,14 +128,36 @@ struct FunctionFeature {
     // resulting address-independent color multisets. Appended to preserve
     // existing aggregate initialization.
     std::vector<CfgBlockFeature> cfg_blocks;
+    // True when direct_calls is the complete set of known in-image direct
+    // function targets. False keeps absent frontend data distinct from no calls.
+    bool direct_calls_complete = false;
+    // Parallel to instruction_fingerprints only when the entire sequence is
+    // available. These locations are for navigation, not matching evidence.
+    // Appended to preserve positional aggregate initialization.
+    std::vector<FunctionAddress> instruction_addresses;
 };
 enum class FunctionMatchKind { matched, added, removed, ambiguous };
+struct FunctionCallTargetSummary {
+    bool available = false;
+    std::uint64_t unchanged = 0, added = 0, removed = 0, ambiguous = 0;
+};
+// Component scores expose the bounded heuristic that produced a base match.
+// They are similarities, not probabilities or evidence of semantic equality.
+struct FunctionScoreBreakdown {
+    bool available = false;
+    bool shape_available = false, instruction_available = false;
+    bool histogram_available = false, cfg_available = false;
+    bool exact_name = false, name_floor_applied = false;
+    std::uint32_t shape_similarity = 0, instruction_similarity = 0;
+    std::uint32_t histogram_similarity = 0, cfg_similarity = 0;
+};
 struct FunctionMatchEvidence {
     std::uint32_t base_confidence = 0;
     // Distinct anchored caller/callee relations supporting this decision.
     // A neighbor appearing in both directions contributes two relations.
     std::uint64_t supporting_call_neighbors = 0;
     std::uint32_t call_graph_round = 0; // zero means accepted without graph refinement
+    FunctionScoreBreakdown score_breakdown;
 };
 struct FunctionMatch {
     FunctionMatchKind kind = FunctionMatchKind::ambiguous;
@@ -129,6 +166,7 @@ struct FunctionMatch {
     std::uint32_t old_space = 0, new_space = 0;
     std::string old_name, new_name;
     FunctionMatchEvidence evidence;
+    FunctionCallTargetSummary call_targets;
 };
 // Relative weights used only for the base function score. Fingerprint and
 // histogram weights are their percentage of the final score when that feature
@@ -185,6 +223,9 @@ struct InstructionDiffRun {
     std::uint64_t old_start = 0, new_start = 0;
     std::uint64_t old_count = 0, new_count = 0;
     InstructionChangeEvidence semantic;
+    // Optional frontend-provided locations for the first instruction on each
+    // side. The generic aligner leaves these empty.
+    std::optional<FunctionAddress> old_address, new_address;
 };
 struct FunctionInstructionDiff {
     std::vector<InstructionDiffRun> runs;
@@ -206,10 +247,14 @@ struct FunctionInstructionDiffOptions {
     // too large. This caps the total old+new fingerprints indexed by that path.
     // Kept last to preserve positional aggregate initialization.
     std::uint64_t max_anchor_index_items = 1'000'000;
+    // Detailed semantic alignment retains one 64-bit key per old/new feature.
+    // This bounds that temporary index even when the exact matrix fits.
+    std::uint64_t max_semantic_alignment_items = 1'000'000;
 };
 enum class BlockMatchKind { matched, added, removed, ambiguous };
 struct BlockInstructionEvidence {
-    bool available = false, adjacency_available = false;
+    bool available = false, adjacency_available = false, complete = false;
+    std::uint8_t old_coverage_percent = 0, new_coverage_percent = 0;
     std::uint32_t fingerprint_similarity = 0, adjacency_similarity = 0; // 0..100 Dice overlap
 };
 struct BlockCorrespondence {
@@ -221,8 +266,8 @@ struct BlockCorrespondence {
     bool instruction_diff_available = false;
     bool instruction_diff_budget_exhausted = false;
     FunctionInstructionDiff instruction_diff;
-    // Present only for a matched pair whose complete, nonempty normalized
-    // instruction sequences were compared. Does not assert semantic equality.
+    // Similarity may use partial known instructions. Coverage records the
+    // fraction available on each side; complete gates exact-anchor/diff use.
     BlockInstructionEvidence instruction_evidence;
 };
 struct FunctionBlockCorrespondence {
@@ -270,6 +315,9 @@ HEXLAB_COMPARE_EXPORT Result<FunctionInstructionDiff> diff_function_instructions
     std::span<const std::uint64_t> old_fingerprints,
     std::span<const std::uint64_t> new_fingerprints,
     const FunctionInstructionDiffOptions &options = {});
+// Detailed alignment uses the complete semantic feature tuple as well as the
+// fingerprint. This keeps repeated fingerprints with different retained
+// semantics from serving as exact anchors.
 HEXLAB_COMPARE_EXPORT Result<FunctionInstructionDiff> diff_function_instructions_detailed(
     std::span<const std::uint64_t> old_fingerprints, std::span<const std::uint64_t> new_fingerprints,
     std::span<const InstructionSemanticFeature> old_features,
@@ -287,6 +335,9 @@ struct CompareOptions {
     // Longer anchors reduce false resynchronization on repeated byte patterns.
     // Values from 1 through 64 are accepted; the default preserves prior behavior.
     std::uint64_t resync_anchor_bytes = 4;
+    // Maximum number of change runs retained in Report. All bytes are still
+    // compared and summarized after this cap; total_runs reports the full count.
+    std::uint64_t max_change_runs = 1'000'000;
 };
 // Regions align by unique key; bytes within a matched region align by offset,
 // with bounded anchor-based insertion/deletion resynchronization.

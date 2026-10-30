@@ -305,7 +305,8 @@ void validate_pointer_bits(const MachODyldChainedOrigin &v) {
     } else if (format == 14) {
         require(p.field_size == 8 && p.stride == 4 && !p.bind && !p.target_is_offset && !p.high8 &&
                     p.target == (raw & UINT32_MAX) && p.next == ((raw >> 51) & 0xfff) &&
-                    p.authenticated == bool(raw >> 63) && !p.complete,
+                    p.authenticated == bool(raw >> 63) &&
+                    (!p.complete || p.authenticated || !((raw >> 32) & 0x7ffff)),
                 "Owned ARM64e segmented pointer differs from original word");
         if (p.authenticated)
             require(p.diversity == ((raw >> 32) & 0xffff) &&
@@ -475,7 +476,8 @@ void validate_dyld_provenance(const MachODyldReferenceProvenance &v) {
     if (r.binding)
         text(r.binding->name);
     require((r.reason == R::resolved) == r.address.has_value(), "Owned dyld address/resolution mismatch");
-    require(!r.binding || r.reason == R::runtime_binding, "Nonbinding dyld result owns a binding");
+    require(!r.binding || r.reason == R::runtime_binding || r.reason == R::authenticated,
+            "Nonbinding dyld result owns a binding");
     require(!r.constant || r.reason == R::non_pointer, "Dyld pointer result claims scalar constant");
     for (std::size_t i = 0; i < v.origins.size(); ++i) {
         const auto &o = v.origins[i];
@@ -544,6 +546,8 @@ void validate_dyld_provenance(const MachODyldReferenceProvenance &v) {
                     require(in_slice(imp.name_file_offset->value, imp.name ? imp.name->size() + 1 : 1),
                             "Owned import name outside slice");
                 if (r.binding) {
+                    require(r.reason != R::authenticated || (p.bind && p.authenticated),
+                            "Authenticated dyld binding lacks an authenticated bind source");
                     require(imp.name && !((p.addend > 0 && imp.addend > INT64_MAX - p.addend) ||
                                           (p.addend < 0 && imp.addend < INT64_MIN - p.addend)),
                             "Owned binding addend overflow");

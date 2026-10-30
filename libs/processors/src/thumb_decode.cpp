@@ -49,7 +49,9 @@ DecodeResult decode_thumb(std::span<const std::byte> bytes, Address at, ThumbITS
     if (i.arm->predicate == ArmPredicate::condition)
         thumb_detail::read(i, thumb_detail::flags);
     const bool decoded = thumb_detail::flow(i, first, wide ? std::optional{half(2)} : std::nullopt) ||
-                         (!wide && (thumb_detail::memory(i, first) || thumb_detail::data(i, first)));
+                         (wide ? (thumb_detail::memory_wide(i, first, half(2)) ||
+                                  thumb_detail::data_wide(i, first, half(2)))
+                               : (thumb_detail::memory(i, first) || thumb_detail::data(i, first)));
     if (!decoded)
         return {DecodeStatus::unsupported, {}, "Thumb encoding or incoming IT context has no enabled decoder"};
     if (state.known && state.bits && i.arm->writes_pc && (state.bits & 15) != 8)

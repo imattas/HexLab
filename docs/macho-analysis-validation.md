@@ -8,12 +8,22 @@ and selected-slice image mappings. Thin32/64 and FAT32/FAT64, both byte orders,
 retain full CPU fields and absolute outer-container coordinates. Slice-crossing
 reads, overlapping descriptors, invalid command envelopes and conflicting linked
 backing fail. MH_OBJECT sections have independent one-based domains at offset0;
+64-bit Mach headers and FAT64 architecture descriptors must have zero reserved
+fields. Nonzero reserved words are rejected as malformed instead of being
+accepted as unexplained metadata.
 raw nonzero/equal section origins remain in metadata. Linked segments govern
 backing, with explicit partial diagnostics for disagreeing section declarations.
 SG_HIGHVM, no-access reservations and zero-fill section types are covered.
 Unsupported CPU/class/order combinations preserve metadata with unknown decode
 mode. Original nlist symbols, library/path commands, entry declarations, function
 starts and dynamic symbol group/indirect-table metadata are now implemented.
+`LC_UUID` commands are accepted only with the specified 24-byte command size;
+the 16 UUID bytes are retained with command index and absolute outer-file record
+offset plus the exact UUID payload offset, and printed in canonical hexadecimal
+grouping. This reports the embedded
+identifier only: it does not authenticate a file, establish equivalence between
+universal slices, or validate external symbol-server associations. CLI output is
+bounded to 16 UUID rows.
 Executable definitions seed recovery as heuristics rather than declared function
 types. LC_MAIN follows dyld: mapped Mach-header VA plus entryoff; unsupported or
 conflicting entry declarations stay explicit. Object relocations, dyld reference
@@ -31,6 +41,12 @@ segment/section, nlist, and relocation records use the selected slice's byte
 order and class widths. Architecture-specific big-endian relocation formulas,
 thread-state decoding, and unsupported command payloads stay explicitly
 incomplete and are not applied as guessed semantics.
+
+Section alignment is checked against both the declared VM address and, for
+nonempty file-backed sections, the raw file offset. Alignment exponents outside
+the address width or values that violate the declared power-of-two alignment
+are rejected before the section is mapped. Zero-fill sections have no file
+payload and therefore receive only the address-alignment check.
 
 Observed evidence under out/: macho-task1-red.log -> macho-task1-green.log;
 Task1 Debug4/4 and Release4/4 with572 header checks. Task2 missing image API RED

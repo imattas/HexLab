@@ -30,6 +30,10 @@ auto recognition = recognize_flirt_catalogs(
 
 The existing `recognize_flirt_catalog` overload remains available and behaves
 like a one-catalog set with index zero. There is no combined catalog file
-format; callers parse each `.pat`, `.pat.gz`, or `.sig` independently. The
-existing CLI still accepts one catalog per command. Neither API automatically
-renames functions; applying labels remains an explicit operation.
+format; callers parse each `.pat`, `.pat.gz`, or `.sig` independently. The CLI
+accepts one catalog with `--definitions` or an ordered catalog list with
+`--definitions-list`. The desktop **Scan FLAIR Catalogs and Browse Results...**
+command also accepts an ordered multi-file selection and stores one evidence
+result for the entire set. Candidate `catalog_index` values refer to selection
+order, starting at zero. Neither the API nor desktop scan automatically renames
+functions; applying labels remains an explicit operation.

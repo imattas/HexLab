@@ -1,6 +1,7 @@
 #include "hexlab/loaders/recipe.hpp"
 #include "hexlab/loaders/elf.hpp"
 #include "hexlab/image/file_storage.hpp"
+#include "hexlab/image/read_set.hpp"
 #include "hexlab/loaders/pdb_lines.hpp"
 #include "hexlab/loaders/firmware.hpp"
 #include "hexlab/loaders/wasm.hpp"
@@ -10,9 +11,27 @@
 #include "macho_internal.hpp"
 #include <stdexcept>
 #include <algorithm>
+#include <array>
 #include <mutex>
 namespace hexlab {
 namespace {
+Sha256Digest combine_external_fingerprints(const std::optional<Sha256Digest> &first,
+                                           const Sha256Digest &second) {
+    Sha256 combined;
+    constexpr std::array<std::byte, 8> domain = {
+        std::byte{'H'}, std::byte{'L'}, std::byte{'E'}, std::byte{'X'},
+        std::byte{'E'}, std::byte{'X'}, std::byte{'T'}, std::byte{1}};
+    (void)combined.update(domain);
+    if (first) {
+        constexpr std::array<std::byte, 1> first_tag{std::byte{1}};
+        (void)combined.update(first_tag);
+        (void)combined.update(*first);
+    }
+    constexpr std::array<std::byte, 1> second_tag{std::byte{2}};
+    (void)combined.update(second_tag);
+    (void)combined.update(second);
+    return combined.digest();
+}
 bool valid_plugin_identity(const PluginImageIdentity &identity) {
     const auto text = [](const std::string &s) {
         return !s.empty() && s.size() < 1024 && s.find('\0') == s.npos;
@@ -94,7 +113,23 @@ Result<LoadedImage> load_plugin(std::shared_ptr<const ByteStorage> storage,
     }
     if (!selected)
         return Error{ErrorCode::unsupported, "Exact plugin image provider is not loaded"};
-    try { return selected->load(std::move(storage), stop); }
+    try {
+        auto tracking = TrackingStorage::create(std::move(storage));
+        if (!tracking)
+            return tracking.error();
+        auto loaded = selected->load(tracking.value(), stop);
+        if (!loaded)
+            return loaded.error();
+        const bool image_uses_tracked_source = loaded.value().image &&
+            loaded.value().image->storage().get() == tracking.value().get();
+        // Replace plugin-reported ranges with the authoritative ByteStorage
+        // observations. Certification remains the provider's responsibility
+        // because it may depend on sidecars or other external state.
+        loaded.value().metadata_reads = tracking.value()->reads();
+        loaded.value().metadata_reads_complete = loaded.value().metadata_reads_complete &&
+            image_uses_tracked_source;
+        return loaded;
+    }
     catch (const std::bad_alloc &) {
         return Error{ErrorCode::resource_limit, "Cannot allocate plugin image"};
     } catch (...) { return Error{ErrorCode::io, "Plugin image provider raised an exception"}; }
@@ -121,6 +156,18 @@ bool valid(const LoadRecipe &recipe) {
         return false;
     if (recipe.pdb_path && recipe.format != Format::pe)
         return false;
+    if (recipe.minidump_pdb_paths.size() > 128 ||
+        (recipe.format != Format::minidump && (!recipe.minidump_pdb_paths.empty() || recipe.minidump_pdb_search_truncated)))
+        return false;
+    std::size_t minidump_pdb_path_bytes = 0;
+    for (const auto &path : recipe.minidump_pdb_paths) {
+        if (path.empty() || path.native().find(std::filesystem::path::value_type{}) != path.native().npos)
+            return false;
+        const auto size = path.u8string().size();
+        if (size > 32768 || minidump_pdb_path_bytes > 1024 * 1024 - size)
+            return false;
+        minidump_pdb_path_bytes += size;
+    }
     if (recipe.pdb_path && (recipe.pdb_path->empty() ||
         recipe.pdb_path->native().find(std::filesystem::path::value_type{}) != recipe.pdb_path->native().npos))
         return false;
@@ -148,6 +195,48 @@ bool valid(const LoadRecipe &recipe) {
 void integer(std::vector<std::byte> &out, uint64_t value, size_t width) {
     for (size_t i = width; i > 0; --i)
         out.push_back(std::byte(value >> ((i - 1) * 8)));
+}
+std::optional<std::filesystem::path> discover_local_supplementary_dwp(
+    const std::filesystem::path &primary_path, const symbols::DwarfSupplementaryIdentity &identity) noexcept {
+    try {
+        const std::filesystem::path hint = std::filesystem::u8path(identity.filename);
+        if (identity.filename.empty() || hint.is_absolute() || hint.has_root_path() ||
+            hint != hint.filename() || hint == "." || hint == "..")
+            return {};
+        std::error_code ec;
+        const auto source = std::filesystem::canonical(primary_path, ec);
+        if (ec) return {};
+        const auto candidate = std::filesystem::canonical(source.parent_path() / hint, ec);
+        if (ec || candidate.parent_path() != source.parent_path() || candidate == source ||
+            !std::filesystem::is_regular_file(candidate, ec) || ec)
+            return {};
+        const auto size = std::filesystem::file_size(candidate, ec);
+        if (ec || size > UINT64_C(64) * 1024 * 1024) return {};
+        return candidate;
+    } catch (...) {
+        // Malformed path encodings are treated as unavailable hints.
+        return {};
+    }
+}
+std::optional<std::filesystem::path> discover_local_split_dwp(
+    const std::filesystem::path &primary_path) noexcept {
+    try {
+        std::error_code ec;
+        const auto source = std::filesystem::canonical(primary_path, ec);
+        if (ec) return {};
+        auto candidate_name = source.filename().native();
+        candidate_name += std::filesystem::path(".dwp").native();
+        const auto unresolved = source.parent_path() / std::filesystem::path(candidate_name);
+        const auto link_status = std::filesystem::symlink_status(unresolved, ec);
+        if (ec || std::filesystem::is_symlink(link_status) || !std::filesystem::is_regular_file(link_status)) return {};
+        const auto candidate = std::filesystem::canonical(unresolved, ec);
+        if (ec || candidate.parent_path() != source.parent_path() || candidate == source) return {};
+        const auto size = std::filesystem::file_size(candidate, ec);
+        if (ec || size > UINT64_C(64) * 1024 * 1024) return {};
+        return candidate;
+    } catch (...) {
+        return {};
+    }
 }
 } // namespace
 Result<std::shared_ptr<void>> register_plugin_image_provider(const PluginImageIdentity &identity,
@@ -192,8 +281,19 @@ Result<std::vector<std::byte>> encode_recipe(const LoadRecipe &recipe) {
             return std::vector<std::byte>{std::byte{1}, std::byte{0}, std::byte{12}};
         if (recipe.format == Format::jvm)
             return std::vector<std::byte>{std::byte{1}, std::byte{0}, std::byte{13}};
-        if (recipe.format == Format::minidump)
-            return std::vector<std::byte>{std::byte{1}, std::byte{0}, std::byte{16}};
+        if (recipe.format == Format::minidump) {
+            if (recipe.minidump_pdb_paths.empty() && !recipe.minidump_pdb_search_truncated)
+                return std::vector<std::byte>{std::byte{1}, std::byte{0}, std::byte{16}};
+            std::vector<std::byte> out{std::byte{2}, std::byte{0}, std::byte{18}};
+            integer(out, recipe.minidump_pdb_paths.size(), 2);
+            out.push_back(std::byte(recipe.minidump_pdb_search_truncated ? 1 : 0));
+            for (const auto &path : recipe.minidump_pdb_paths) {
+                const auto encoded = path.u8string();
+                integer(out, encoded.size(), 4);
+                for (auto c : encoded) out.push_back(std::byte(static_cast<unsigned char>(c)));
+            }
+            return out;
+        }
         if (recipe.format == Format::pe && recipe.pe_runtime_architecture) {
             const auto target = static_cast<std::byte>(*recipe.pe_runtime_architecture);
             if (!recipe.pdb_path)
@@ -336,6 +436,41 @@ Result<LoadRecipe> decode_recipe(std::span<const std::byte> bytes) {
     if (bytes.size() == 3 && (bytes[0] == std::byte{1} || bytes[0] == std::byte{4}) &&
         bytes[1] == std::byte{0} && bytes[2] == std::byte{16})
         return LoadRecipe{Format::minidump, {}};
+    if (bytes.size() >= 6 && bytes[0] == std::byte{2} && bytes[1] == std::byte{0} &&
+        bytes[2] == std::byte{18}) {
+        const auto count = (std::to_integer<unsigned>(bytes[3]) << 8) |
+                           std::to_integer<unsigned>(bytes[4]);
+        if (count > 128)
+            return Error{ErrorCode::malformed, "Invalid Minidump PDB candidate count"};
+        LoadRecipe recipe{Format::minidump, {}};
+        const auto flags = std::to_integer<unsigned>(bytes[5]);
+        if (flags > 1 || (!count && !flags))
+            return Error{ErrorCode::malformed, "Invalid Minidump PDB recipe flags"};
+        recipe.minidump_pdb_search_truncated = (flags & 1) != 0;
+        std::size_t position = 6;
+        std::size_t total_path_bytes = 0;
+        for (unsigned index = 0; index < count; ++index) {
+            if (bytes.size() - position < 4)
+                return Error{ErrorCode::malformed, "Truncated Minidump PDB recipe path length"};
+            std::uint64_t size = 0;
+            for (std::size_t i = 0; i < 4; ++i) size = (size << 8) | std::to_integer<unsigned>(bytes[position++]);
+            if (!size || size > 32768 || size > bytes.size() - position ||
+                total_path_bytes > 1024 * 1024 - size)
+                return Error{ErrorCode::malformed, "Invalid Minidump PDB recipe path extent"};
+            total_path_bytes += static_cast<std::size_t>(size);
+            std::u8string path;
+            path.reserve(static_cast<std::size_t>(size));
+            for (std::size_t i = 0; i < size; ++i)
+                path.push_back(char8_t(std::to_integer<unsigned char>(bytes[position++])));
+            auto decoded = std::filesystem::path(path);
+            if (decoded.empty() || decoded.native().find(std::filesystem::path::value_type{}) != decoded.native().npos)
+                return Error{ErrorCode::malformed, "Invalid Minidump PDB recipe path"};
+            recipe.minidump_pdb_paths.push_back(std::move(decoded));
+        }
+        if (position != bytes.size())
+            return Error{ErrorCode::malformed, "Trailing bytes in Minidump PDB recipe"};
+        return recipe;
+    }
     if (bytes.size() == 4 && bytes[0] == std::byte{1} && bytes[1] == std::byte{0} &&
         bytes[2] == std::byte{14}) {
         const auto target = std::to_integer<unsigned>(bytes[3]);
@@ -545,10 +680,84 @@ Result<LoadedImage> load_image(std::shared_ptr<const ByteStorage> storage, const
         return Error{ErrorCode::canceled, "Image loading canceled"};
     if (!storage)
         return Error{ErrorCode::invalid_argument, "Image loading requires byte storage"};
-    auto resolved = resolve_load_recipe(*storage, requested, stop);
+    const auto file_storage = std::dynamic_pointer_cast<const FileStorage>(storage);
+    // Recipe detection and plugin probes can affect the selected image
+    // provider just as parser reads affect metadata. Track both phases on one
+    // source boundary so the durable LoadedImage retains the complete read set.
+    auto tracking = TrackingStorage::create(std::move(storage));
+    if (!tracking)
+        return tracking.error();
+    auto resolved = resolve_load_recipe(*tracking.value(), requested, stop);
     if (!resolved)
         return resolved.error();
-    return load_durable_image(std::move(storage), resolved.value(), stop);
+    auto loaded = load_durable_image(tracking.value(), resolved.value(), stop);
+    if (!loaded)
+        return loaded.error();
+    // DWARF .debug_sup filenames are untrusted hints. Automatic discovery is
+    // limited to a basename-only supplementary ELF beside a file-backed
+    // primary input; its role and checksum are validated before use.
+    bool supplementary_selected = resolved.value().dwarf_supplementary_package_path.has_value();
+    if (file_storage && !supplementary_selected &&
+        loaded.value().metadata.elf &&
+        loaded.value().metadata.elf->dwarf_supplementary_identity &&
+        !loaded.value().metadata.elf->dwarf_supplementary_identity->supplementary) {
+        const auto &identity = *loaded.value().metadata.elf->dwarf_supplementary_identity;
+        const auto candidate = discover_local_supplementary_dwp(file_storage->backing_path(), identity);
+        if (candidate) {
+            auto discovered = resolved.value();
+            discovered.dwarf_supplementary_package_path = *candidate;
+            auto supplemented = load_durable_image(tracking.value(), discovered, stop);
+            if (!supplemented) return supplemented.error();
+            loaded = std::move(supplemented);
+            supplementary_selected = true;
+        }
+    }
+    // Split-package discovery uses only the primary input's basename plus
+    // `.dwp`; DW_AT_dwo_name and DW_AT_comp_dir are never used as paths.
+    if (file_storage && resolved.value().format == Format::elf &&
+        !resolved.value().dwarf_supplementary_package_path && !supplementary_selected) {
+        const auto candidate = discover_local_split_dwp(file_storage->backing_path());
+        bool split_package_selected = false;
+        if (candidate) {
+            auto package = FileStorage::open(*candidate);
+            if (!package) return package.error();
+            if (package.value()->size() > UINT64_C(64) * 1024 * 1024)
+                return Error{ErrorCode::resource_limit, "Discovered ELF DWP exceeds 64 MiB"};
+            ElfLoadOptions options;
+            options.dwarf_split_debug_package = std::move(package.value());
+            auto split = load_elf(tracking.value(), options, stop);
+            if (!split) return split.error();
+            loaded = std::move(split);
+            split_package_selected = true;
+        }
+        // If there is no adjacent DWP, allow the bounded caller-scoped DWO
+        // resolver to try the basename named by each skeleton. The resolver
+        // rejects path components, symlinks, duplicate IDs, and oversized
+        // files; import_elf_dwo then verifies the exact DWO ID and address
+        // size before accepting any contribution. This remains offline.
+        if (!split_package_selected) {
+            std::error_code source_error;
+            const auto source = std::filesystem::canonical(file_storage->backing_path(), source_error);
+            if (source_error) return Error{ErrorCode::io, "Cannot canonicalize ELF input for DWO discovery: " + source_error.message()};
+            auto resolver = make_elf_dwo_directory_resolver(source.parent_path(), stop);
+            if (!resolver) return resolver.error();
+            Sha256 identity_hash;
+            constexpr std::string_view resolver_domain = "HexLab/automatic-ELF-DWO-directory/v1";
+            auto hashed = identity_hash.update(std::as_bytes(std::span(resolver_domain.data(), resolver_domain.size())));
+            if (!hashed) return hashed.error();
+            const auto root = source.parent_path().generic_string();
+            hashed = identity_hash.update(std::as_bytes(std::span(root.data(), root.size())));
+            if (!hashed) return hashed.error();
+            ElfLoadOptions options;
+            options.dwarf_split_resolver = std::move(resolver.value());
+            options.dwarf_split_resolver_identity = identity_hash.digest();
+            auto split = load_elf(tracking.value(), options, stop);
+            if (!split) return split.error();
+            loaded = std::move(split);
+        }
+    }
+    loaded.value().metadata_reads = tracking.value()->reads();
+    return loaded;
 }
 Result<LoadedImage> load_durable_image(std::shared_ptr<const ByteStorage> storage, const LoadRecipe &recipe,
                                        std::stop_token stop) {
@@ -591,6 +800,9 @@ Result<LoadedImage> load_durable_image(std::shared_ptr<const ByteStorage> storag
         if (recipe.pdb_path) {
             auto bound = bind_local_pe_pdb(loaded.value(), *recipe.pdb_path, stop);
             if (!bound) return bound.error();
+            // PDB binding reads a separate file whose byte dependencies are
+            // not represented by the PE source's ReadSet.
+            loaded.value().metadata_reads_complete = false;
         }
         return loaded;
     }
@@ -601,7 +813,13 @@ Result<LoadedImage> load_durable_image(std::shared_ptr<const ByteStorage> storag
         if (!package) return package.error();
         ElfLoadOptions options;
         options.dwarf_supplementary_package = std::move(package.value());
-        return load_elf(std::move(storage), options, stop);
+        auto loaded = load_elf(std::move(storage), options, stop);
+        if (!loaded) return loaded.error();
+        auto package_hash = hash_source(*options.dwarf_supplementary_package, stop);
+        if (!package_hash) return package_hash.error();
+        loaded.value().external_input_fingerprint =
+            combine_external_fingerprints(loaded.value().external_input_fingerprint, package_hash.value());
+        return loaded;
     }
     if (recipe.format == Format::macho)
         return macho_detail::load_macho_bound(std::move(storage), recipe.macho.value_or(MachOOptions{}),
@@ -612,8 +830,25 @@ Result<LoadedImage> load_durable_image(std::shared_ptr<const ByteStorage> storag
         return load_dex(std::move(storage), stop);
     if (recipe.format == Format::jvm)
         return load_jvm_class(std::move(storage), stop);
-    if (recipe.format == Format::minidump)
-        return load_minidump(std::move(storage), stop);
+    if (recipe.format == Format::minidump) {
+        auto loaded = load_minidump(std::move(storage), stop);
+        if (!loaded) return loaded.error();
+        if (!recipe.minidump_pdb_paths.empty()) {
+            std::vector<MinidumpPdbCandidate> candidates;
+            candidates.reserve(recipe.minidump_pdb_paths.size());
+            for (const auto &path : recipe.minidump_pdb_paths)
+                candidates.push_back({std::nullopt, path});
+            auto bound = bind_local_minidump_pdbs(loaded.value(), candidates, stop);
+            if (!bound) return bound.error();
+        }
+        if (recipe.minidump_pdb_search_truncated && loaded.value().metadata.minidump) {
+            for (auto &module : loaded.value().metadata.minidump->modules) {
+                if (module.codeview_kind == "RSDS" && module.pdb_status == MinidumpPdbStatus::unavailable)
+                    module.pdb_diagnostic = "PDB sidecar search was truncated at the 128 candidate path limit";
+            }
+        }
+        return loaded;
+    }
     if (recipe.format == Format::ar)
         return Error{ErrorCode::unsupported, "ar archives have no single image; use load_archive and select a member"};
     auto image = load_raw(storage, *recipe.raw, stop);

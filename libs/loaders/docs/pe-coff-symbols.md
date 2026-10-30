@@ -18,6 +18,19 @@ record count at one million, primary symbols at 262,144, the string table and
 aggregate decoded name bytes at 16 MiB, and a single name at 64 KiB. Cancellation
 is checked while traversing symbols. A missing table returns an empty result.
 
-This reader preserves auxiliary data as bytes; it does not decode each COFF
-auxiliary record variant or synthesize function boundaries. It also does not
-load external object files or PDBs.
+For external/static symbols with the COFF function-derived type, the first
+auxiliary record is decoded as a function definition only when its nonzero
+`TotalSize` lies wholly inside the symbol's executable, file-backed section.
+The resulting size and auxiliary-record file offset flow into PE metadata,
+the bounded CLI summary, and desktop COFF symbols table. Malformed or
+non-executable extents remain available as raw auxiliary bytes and are not
+presented as function ranges. `IMAGE_SYM_CLASS_WEAK_EXTERNAL` symbols require
+exactly one auxiliary record. The reader exposes its `TagIndex`, fallback
+symbol name, and search characteristic (`NOLIBRARY`, `LIBRARY`, `ALIAS`, or
+`ANTI_DEPENDENCY`) after validating that the index selects another primary
+symbol record rather than an auxiliary record or itself. Unknown search
+characteristics and invalid fallback indices reject the COFF symbol table.
+This reports the COFF relationship; it does not perform weak-symbol library
+search or object-file linking. Other auxiliary variants, including section
+definitions, remain opaque. This does not synthesize object-file function
+boundaries or load external object files or PDBs.

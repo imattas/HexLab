@@ -159,12 +159,24 @@ bool memory_form(State &s, std::uint8_t opcode, unsigned group, Operand &rm) {
                             (opcode == 0xdb && (group == 1 || group == 2 || group == 3 || group == 7)) ||
                             (opcode == 0xdd && (group == 1 || group == 2 || group == 3)) ||
                             (opcode == 0xdf && (group == 1 || group == 2 || group == 3 || group == 6 || group == 7));
+    const bool integer_store = (opcode == 0xdb && (group == 1 || group == 2 || group == 3)) ||
+                               (opcode == 0xdd && group == 1) ||
+                               (opcode == 0xdf && (group == 1 || group == 2 || group == 3 || group == 7));
     if (arithmetic || stores_st0)
         s.i.register_reads.push_back(st(0));
     if (arithmetic && (group == 2 || group == 3)) compare_status(s);
     if (arithmetic && group != 2 && group != 3) {
         arithmetic_environment(s);
         s.i.register_writes.push_back(st(0));
+    }
+    if (integer_store) {
+        // FIST/FISTP round according to FCW.RC; FISTTP truncates regardless
+        // of FCW. All three forms can update sticky conversion status.
+        status_read_write(s);
+        const bool truncating = (opcode == 0xdb && group == 1) ||
+                                (opcode == 0xdd && group == 1) ||
+                                (opcode == 0xdf && group == 1);
+        if (!truncating) add_register(s.i.register_reads, control());
     }
     if (opcode == 0xd9 && group == 5) s.i.register_writes.push_back(control());
     if (opcode == 0xd9 && group == 7) s.i.register_reads.push_back(control());
@@ -222,7 +234,8 @@ bool register_form(State &s, std::uint8_t opcode, unsigned group, unsigned index
         }
         if (group == 1) {
             mnemonic(s, "fxch"); s.operand(sti, OperandAccess::read_write);
-            s.i.register_reads.push_back(st0); s.i.register_writes.push_back(st0); return true;
+            s.i.register_reads.push_back(st0); s.i.register_writes.push_back(st0);
+            free_tag(s); status_read_write(s); return true;
         }
         if (group == 2 && index == 0) { mnemonic(s, "fnop"); return true; }
         if (group == 4) {
@@ -283,7 +296,7 @@ bool register_form(State &s, std::uint8_t opcode, unsigned group, unsigned index
     if (opcode == 0xda && (group == 0 || group == 1 || group == 2 || group == 3)) {
         static constexpr const char *names[]{"fcmovb", "fcmove", "fcmovbe", "fcmovu"};
         mnemonic(s, names[group]); s.operand(st0, OperandAccess::read_write); s.operand(sti, OperandAccess::read);
-        s.flags_read = true; return true;
+        s.flags_read = true; status_read_write(s); return true;
     }
     if (opcode == 0xda && group == 5 && index == 1) {
         mnemonic(s, "fucompp"); s.i.register_reads.push_back(st0); s.i.register_reads.push_back(st(1));
@@ -292,12 +305,12 @@ bool register_form(State &s, std::uint8_t opcode, unsigned group, unsigned index
     if (opcode == 0xdb && (group <= 3)) {
         static constexpr const char *names[]{"fcmovnb", "fcmovne", "fcmovnbe", "fcmovnu"};
         mnemonic(s, names[group]); s.operand(st0, OperandAccess::read_write); s.operand(sti, OperandAccess::read);
-        s.flags_read = true; return true;
+        s.flags_read = true; status_read_write(s); return true;
     }
     if (opcode == 0xdb && group == 4 && index <= 4) {
         static constexpr const char *names[]{"fneni", "fndisi", "fnclex", "fninit", "fsetpm"};
         mnemonic(s, names[index]);
-        if (index == 2) s.i.register_writes.push_back(status());
+        if (index == 2) status_read_write(s);
         if (index == 3) {
             s.i.register_writes.push_back(status());
             s.i.register_writes.push_back(control());
@@ -333,6 +346,7 @@ bool register_form(State &s, std::uint8_t opcode, unsigned group, unsigned index
         if (group == 2 || group == 3) {
             mnemonic(s, group == 2 ? "fst" : "fstp");
             s.operand(sti, OperandAccess::write); s.i.register_reads.push_back(st0);
+            if (group == 2) { free_tag(s); status_read_write(s); }
             if (group == 3) pop(s); return true;
         }
         if (group == 4 || group == 5) {
@@ -379,19 +393,40 @@ bool register_form(State &s, std::uint8_t opcode, unsigned group, unsigned index
 } // namespace
 
 bool x87(State &s, std::uint8_t opcode) {
+    const auto mark_waiting = [&] {
+        s.i.x87_waiting = !s.i.mnemonic_override.starts_with("fn");
+        if (s.i.x87_waiting) {
+            // Every waiting x87 operation checks the caller-owned pending
+            // exception state before executing, even when it has no other
+            // control/status dependency of its own.
+            add_register(s.i.register_reads, status());
+            add_register(s.i.register_reads, control());
+        }
+    };
+    if (opcode == 0x9b) {
+        // Standalone WAIT/FWAIT checks pending unmasked x87 exception state.
+        mnemonic(s, "fwait");
+        mark_waiting();
+        return true;
+    }
     if (opcode < 0xd8 || opcode > 0xdf)
         return false;
     // Decode the full ModRM once. Memory widths are assigned after classifying
     // the escape and extension, while the common decoder supplies all address
     // and displacement details.
     auto parsed = modrm(s, 32);
-    if (parsed.mod != 3)
-        return memory_form(s, opcode, parsed.group, parsed.rm);
+    if (parsed.mod != 3) {
+        const auto decoded = memory_form(s, opcode, parsed.group, parsed.rm);
+        if (decoded) mark_waiting();
+        return decoded;
+    }
     const auto register_index = std::get<RegisterOperand>(parsed.rm).index & 7;
     if (opcode == 0xde && parsed.group == 3 && register_index == 1) {
         mnemonic(s, "fcompp"); s.operand(st(0), OperandAccess::read); s.operand(st(1), OperandAccess::read);
-        compare_status(s); pop(s); pop(s); return true;
+        compare_status(s); pop(s); pop(s); mark_waiting(); return true;
     }
-    return register_form(s, opcode, parsed.group, register_index);
+    const auto decoded = register_form(s, opcode, parsed.group, register_index);
+    if (decoded) mark_waiting();
+    return decoded;
 }
 } // namespace hexlab::x64_detail

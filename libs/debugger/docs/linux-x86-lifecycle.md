@@ -24,6 +24,10 @@ ignore cancellation while retaining the original deadline. All other backend
 operations must remain serialized on the tracer thread; the atomic request
 does not make arbitrary backend calls concurrently safe.
 
+A debugger-generated `PTRACE_EVENT_STOP` carrying `SIGTRAP` is surfaced as an
+`interrupted` event, separate from a target exception. Job-control group stops
+remain exception events and retain their real stop signal for later delivery.
+
 Launch uses a close-on-exec socket gate, installs `PTRACE_SEIZE` options before
 releasing the child and waits for the exact exec stop. A failed launch receives
 SIGKILL and bounded reap attempts. Attach retains the existing 16-round,

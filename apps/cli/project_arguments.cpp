@@ -160,19 +160,50 @@ Arguments parse(std::span<const std::wstring_view> args) {
     require(args.size() >= 2, "Project command requires an action and project path");
     Arguments result;
     std::size_t option_start = 2;
-    if (args[0] == L"history") {
-        require(args.size() >= 3 && (args[1] == L"audit" || args[1] == L"preview" || args[1] == L"save"), "History requires audit, preview, or save and a project path");
-        result.action = args[1] == L"audit" ? L"history-audit" : args[1] == L"preview" ? L"history-preview" : L"history-save";
+    if (args[0] == L"schema") {
+        result.action = L"project-schema";
+        result.path = path_from_wide(args[1]);
+    } else if (args[0] == L"integrity") {
+        require(args.size() >= 2, "Integrity requires a project path");
+        result.action = L"project-integrity";
+        result.path = path_from_wide(args[1]);
+    } else if (args[0] == L"history") {
+        require(args.size() >= 3 && (args[1] == L"audit" || args[1] == L"verify" || args[1] == L"preview" || args[1] == L"save"), "History requires audit, verify, preview, or save and a project path");
+        result.action = args[1] == L"audit" ? L"history-audit" : args[1] == L"verify" ? L"history-verify" : args[1] == L"preview" ? L"history-preview" : L"history-save";
         result.path = path_from_wide(args[2]);
         option_start = 3;
     } else if (args[0] == L"recovery") {
-        require(args.size() >= 3 && (args[1] == L"list" || args[1] == L"restore"),
-                "Recovery requires list or restore and a directory/artifact path");
-        result.action = args[1] == L"list" ? L"recovery-list" : L"recovery-restore";
+        require(args.size() >= 3 && (args[1] == L"list" || args[1] == L"restore" ||
+                    args[1] == L"restore-in-place" || args[1] == L"inspect-wal"),
+                "Recovery requires list, restore, restore-in-place, or inspect-wal and an input path");
+        result.action = args[1] == L"list" ? L"recovery-list" :
+            args[1] == L"restore" ? L"recovery-restore" :
+            args[1] == L"restore-in-place" ? L"recovery-restore-in-place" : L"recovery-inspect-wal";
         result.path = path_from_wide(args[2]);
         option_start = 3;
     } else if (args[0] == L"backup") {
-        if (args.size() >= 3 && args[1] == L"restore") {
+        if (args.size() >= 3 && (args[1] == L"create-bundle" || args[1] == L"restore-bundle")) {
+            result.action = args[1] == L"create-bundle" ? L"backup-create-bundle" : L"backup-restore-bundle";
+            result.path = path_from_wide(args[2]);
+            option_start = 3;
+        } else if (args.size() >= 3 && args[1] == L"archive-source") {
+            result.action = L"backup-archive-source";
+            result.path = path_from_wide(args[2]);
+            option_start = 3;
+        } else if (args.size() >= 3 && args[1] == L"restore-source") {
+            result.action = L"backup-restore-source";
+            result.path = path_from_wide(args[2]);
+            option_start = 3;
+        } else if (args.size() >= 3 && args[1] == L"verify-source") {
+            result.action = L"backup-verify-source";
+            result.path = path_from_wide(args[2]);
+            option_start = 3;
+        } else if (args.size() >= 3 && (args[1] == L"rotate-source" || args[1] == L"list-source" || args[1] == L"prune-source")) {
+            result.action = args[1] == L"rotate-source" ? L"backup-source-rotate" :
+                args[1] == L"list-source" ? L"backup-source-list" : L"backup-source-prune";
+            result.path = path_from_wide(args[2]);
+            option_start = 3;
+        } else if (args.size() >= 3 && args[1] == L"restore") {
             result.action = L"backup-restore";
             result.path = path_from_wide(args[2]);
             option_start = 3;
@@ -182,6 +213,14 @@ Arguments parse(std::span<const std::wstring_view> args) {
             option_start = 3;
         } else if (args.size() >= 3 && args[1] == L"restore-in-place") {
             result.action = L"backup-restore-in-place";
+            result.path = path_from_wide(args[2]);
+            option_start = 3;
+        } else if (args.size() >= 3 && args[1] == L"verify") {
+            result.action = L"backup-verify";
+            result.path = path_from_wide(args[2]);
+            option_start = 3;
+        } else if (args.size() >= 3 && args[1] == L"verify-bundle") {
+            result.action = L"backup-verify-bundle";
             result.path = path_from_wide(args[2]);
             option_start = 3;
         } else {
@@ -196,8 +235,8 @@ Arguments parse(std::span<const std::wstring_view> args) {
         result.path = path_from_wide(args[2]);
         option_start = 3;
     } else if (args[0] == L"types") {
-        require(args.size() >= 3 && (args[1] == L"export" || args[1] == L"import" || args[1] == L"verify"), "Types requires export, import, or verify and a project/type-library path");
-        result.action = args[1] == L"export" ? L"types-export" : args[1] == L"import" ? L"types-import" : L"types-verify";
+        require(args.size() >= 3 && (args[1] == L"export" || args[1] == L"export-header" || args[1] == L"import" || args[1] == L"verify"), "Types requires export, export-header, import, or verify and a project/type-library path");
+        result.action = args[1] == L"export" ? L"types-export" : args[1] == L"export-header" ? L"types-export-header" : args[1] == L"import" ? L"types-import" : L"types-verify";
         result.path = path_from_wide(args[2]);
         option_start = 3;
     } else {
@@ -206,7 +245,7 @@ Arguments parse(std::span<const std::wstring_view> args) {
     }
     require(!result.path.empty(), "Empty project path");
     Options options;
-    const std::set<std::wstring_view> flags{L"--readonly", L"--replace", L"--remove", L"--signed", L"--unsigned", L"--function-entries", L"--json", L"--verify-replay", L"--dry-run", L"--skip-assignments-on-mismatch", L"--replace-assignments"};
+    const std::set<std::wstring_view> flags{L"--readonly", L"--replace", L"--remove", L"--signed", L"--unsigned", L"--function-entries", L"--all-functions", L"--json", L"--verify-replay", L"--verify-history", L"--verify-input", L"--dry-run", L"--skip-assignments-on-mismatch", L"--file-offset-assignments-on-mismatch", L"--replace-assignments", L"--self-contained"};
     for (std::size_t n = option_start; n < args.size(); ++n) {
         auto name = args[n];
         require(name.starts_with(L"--"), "Expected a named option");
@@ -224,6 +263,8 @@ Arguments parse(std::span<const std::wstring_view> args) {
     if (result.action == L"history-audit") {
         result.history_json = options.flag(L"--json");
         result.history_verify_replay = options.flag(L"--verify-replay");
+        result.history_verify_semantics = options.flag(L"--verify-history");
+        result.history_verify_input = options.flag(L"--verify-input");
         if (options.contains(L"--expected-edit"))
             result.history_expected_edit = number(options.pop(L"--expected-edit"));
         result.history_after_step = options.count(L"--after-step", 0);
@@ -245,6 +286,21 @@ Arguments parse(std::span<const std::wstring_view> args) {
         require(total_bytes > 0 && total_bytes <= 4ull * 1024 * 1024 * 1024,
                 "History audit total-byte budget must be 1..4294967296");
         result.history_total_delta_bytes = static_cast<std::size_t>(total_bytes);
+    } else if (result.action == L"history-verify") {
+        result.history_json = options.flag(L"--json");
+        result.history_verify_semantics = true;
+        if (options.contains(L"--expected-edit"))
+            result.history_expected_edit = number(options.pop(L"--expected-edit"));
+    } else if (result.action == L"project-schema") {
+        result.schema_json = options.flag(L"--json");
+    } else if (result.action == L"project-integrity") {
+        result.integrity_json = options.flag(L"--json");
+        result.integrity_verify_history = options.flag(L"--verify-history");
+        if (result.integrity_verify_history)
+            result.history_verify_semantics = true;
+        const auto issues = options.count(L"--max-issues", result.integrity_max_issues);
+        require(issues >= 1 && issues <= 256, "Integrity issue limit must be 1..256");
+        result.integrity_max_issues = static_cast<std::size_t>(issues);
     } else if (result.action == L"history-preview" || result.action == L"history-save") {
         result.history_target_step = number(options.needed(L"--step"));
         result.history_json = options.flag(L"--json");
@@ -262,10 +318,72 @@ Arguments parse(std::span<const std::wstring_view> args) {
         }
     } else if (result.action == L"recovery-list") {
         result.recovery_json = options.flag(L"--json");
+        result.recovery_inspect_wal = options.flag(L"--inspect-wal");
+        if (options.contains(L"--kind")) {
+            const auto kind = options.pop(L"--kind");
+            require(kind == L"interrupted-save" || kind == L"previous-version",
+                    "Recovery kind must be interrupted-save or previous-version");
+            result.recovery_kind_filter = kind == L"interrupted-save"
+                ? database::RecoveryArtifactKind::interrupted_save
+                : database::RecoveryArtifactKind::previous_version;
+        }
+    } else if (result.action == L"recovery-inspect-wal") {
+        result.recovery_json = options.flag(L"--json");
+        result.wal_inspection_limits.max_bytes = options.count(L"--max-bytes", result.wal_inspection_limits.max_bytes);
+        require(result.wal_inspection_limits.max_bytes >= 64 &&
+                    result.wal_inspection_limits.max_bytes <= database::wal_inspection_byte_limit,
+                "WAL inspection max bytes must be 64..67108864");
+        const auto frames = options.count(L"--max-frames", result.wal_inspection_limits.max_frames);
+        require(frames >= 1 && frames <= database::wal_inspection_frame_limit,
+                "WAL inspection max frames must be 1..65536");
+        result.wal_inspection_limits.max_frames = static_cast<std::size_t>(frames);
     } else if (result.action == L"recovery-restore") {
         result.output = path_from_wide(options.needed(L"--output"));
         result.replace = options.flag(L"--replace");
         result.recovery_json = options.flag(L"--json");
+    } else if (result.action == L"recovery-restore-in-place") {
+        result.output = path_from_wide(options.needed(L"--target"));
+        result.recovery_json = options.flag(L"--json");
+    } else if (result.action == L"backup-archive-source" || result.action == L"backup-create-bundle" ||
+               result.action == L"backup-restore-bundle") {
+        result.output = path_from_wide(options.needed(L"--output"));
+        result.backup_json = options.flag(L"--json");
+        result.source_archive_options.max_bytes = options.count(
+            L"--max-source-bytes", result.source_archive_options.max_bytes);
+        require(result.source_archive_options.max_bytes >= 1 &&
+                    result.source_archive_options.max_bytes <= database::source_archive_byte_limit,
+                "Source archive byte budget must be 1 byte through 1 GiB");
+    } else if (result.action == L"backup-verify-source") {
+        result.source_archive_path = path_from_wide(options.needed(L"--archive"));
+        result.backup_json = options.flag(L"--json");
+        result.source_archive_options.max_bytes = options.count(
+            L"--max-source-bytes", result.source_archive_options.max_bytes);
+        require(result.source_archive_options.max_bytes >= 1 &&
+                    result.source_archive_options.max_bytes <= database::source_archive_byte_limit,
+                "Source archive byte budget must be 1 byte through 1 GiB");
+    } else if (result.action == L"backup-restore-source") {
+        result.source_archive_path = path_from_wide(options.needed(L"--archive"));
+        result.output = path_from_wide(options.needed(L"--output"));
+        result.backup_json = options.flag(L"--json");
+        result.source_archive_options.max_bytes = options.count(
+            L"--max-source-bytes", result.source_archive_options.max_bytes);
+        require(result.source_archive_options.max_bytes >= 1 &&
+                    result.source_archive_options.max_bytes <= database::source_archive_byte_limit,
+                "Source archive byte budget must be 1 byte through 1 GiB");
+    } else if (result.action == L"backup-source-rotate" || result.action == L"backup-source-list" ||
+               result.action == L"backup-source-prune") {
+        result.source_archive_base = path_from_wide(options.needed(L"--base"));
+        result.backup_json = options.flag(L"--json");
+        result.source_archive_options.max_bytes = options.count(
+            L"--max-source-bytes", result.source_archive_options.max_bytes);
+        require(result.source_archive_options.max_bytes >= 1 &&
+                    result.source_archive_options.max_bytes <= database::source_archive_byte_limit,
+                "Source archive byte budget must be 1 byte through 1 GiB");
+        if (result.action != L"backup-source-list") {
+            const auto retention = options.count(L"--retain", result.source_archive_retention);
+            require(retention >= 1 && retention <= 32, "Source archive retention must be 1..32");
+            result.source_archive_retention = static_cast<std::size_t>(retention);
+        }
     } else if (result.action == L"backup") {
         result.output = path_from_wide(options.needed(L"--output"));
         result.replace = options.flag(L"--replace");
@@ -282,6 +400,28 @@ Arguments parse(std::span<const std::wstring_view> args) {
         result.backup_retention = static_cast<std::size_t>(retention);
     } else if (result.action == L"backup-restore-in-place") {
         result.output = path_from_wide(options.needed(L"--target"));
+    } else if (result.action == L"backup-verify") {
+        result.backup_json = options.flag(L"--json");
+        const auto steps = options.count(L"--max-history-steps", result.backup_verify_steps);
+        const auto bytes = options.count(L"--max-history-bytes", result.backup_verify_bytes);
+        require(steps >= 1 && steps <= 65536, "Backup history step budget must be 1..65536");
+        require(bytes >= 1 && bytes <= 512ull * 1024 * 1024, "Backup history byte budget must be 1..536870912");
+        result.backup_verify_steps = static_cast<std::size_t>(steps);
+        result.backup_verify_bytes = static_cast<std::size_t>(bytes);
+    } else if (result.action == L"backup-verify-bundle") {
+        result.source_archive_path = path_from_wide(options.needed(L"--archive"));
+        result.backup_json = options.flag(L"--json");
+        const auto steps = options.count(L"--max-history-steps", result.backup_verify_steps);
+        const auto bytes = options.count(L"--max-history-bytes", result.backup_verify_bytes);
+        require(steps >= 1 && steps <= 65536, "Backup history step budget must be 1..65536");
+        require(bytes >= 1 && bytes <= 512ull * 1024 * 1024, "Backup history byte budget must be 1..536870912");
+        result.backup_verify_steps = static_cast<std::size_t>(steps);
+        result.backup_verify_bytes = static_cast<std::size_t>(bytes);
+        result.source_archive_options.max_bytes = options.count(
+            L"--max-source-bytes", result.source_archive_options.max_bytes);
+        require(result.source_archive_options.max_bytes >= 1 &&
+                    result.source_archive_options.max_bytes <= database::source_archive_byte_limit,
+                "Source archive byte budget must be 1 byte through 1 GiB");
     } else if (result.action == L"exchange-export") {
         result.output = path_from_wide(options.needed(L"--output"));
         result.replace = options.flag(L"--replace");
@@ -298,13 +438,21 @@ Arguments parse(std::span<const std::wstring_view> args) {
     } else if (result.action == L"types-export") {
         result.output = path_from_wide(options.needed(L"--output"));
         result.replace = options.flag(L"--replace");
+    } else if (result.action == L"types-export-header") {
+        result.output = path_from_wide(options.needed(L"--output"));
+        result.replace = options.flag(L"--replace");
     } else if (result.action == L"types-import") {
         require(!result.readonly, "Cannot import types into a read-only project");
         result.type_library_input = path_from_wide(options.needed(L"--input"));
         result.type_skip_assignments_on_mismatch = options.flag(L"--skip-assignments-on-mismatch");
+        result.type_file_offset_on_mismatch = options.flag(L"--file-offset-assignments-on-mismatch");
+        require(!(result.type_skip_assignments_on_mismatch && result.type_file_offset_on_mismatch),
+                "Choose either --skip-assignments-on-mismatch or --file-offset-assignments-on-mismatch");
         result.type_replace_assignments = options.flag(L"--replace-assignments");
     } else if (result.action == L"types-verify") {
         result.type_library_input = result.path;
+        result.type_verify_json = options.flag(L"--json");
+        result.type_verify_self_contained = options.flag(L"--self-contained");
     } else if (result.action == L"create") {
         require(!result.readonly, "Cannot create a read-only project");
         result.replace = options.flag(L"--replace");
@@ -483,6 +631,11 @@ Arguments parse(std::span<const std::wstring_view> args) {
         result.at_expression = address(typed_location(options.needed(L"--at")));
     } else if (result.action == L"stack") {
         result.at_expression = address(typed_location(options.needed(L"--at")));
+    } else if (result.action == L"functions") {
+        result.functions_json = options.flag(L"--json");
+    } else if (result.action == L"decompile") {
+        result.at_expression = address(typed_location(options.needed(L"--at")));
+        result.decompile_json = options.flag(L"--json");
     } else if (result.action == L"references") {
         result.at_expression = typed_location(options.needed(L"--at"));
         auto direction = options.pop(L"--direction", L"outgoing");
@@ -529,13 +682,17 @@ Arguments parse(std::span<const std::wstring_view> args) {
         else if (kind == L"text") {
             auto encoding = options.needed(L"--encoding");
             require(encoding == L"ascii" || encoding == L"utf8" || encoding == L"utf16le" || encoding == L"utf16be" ||
-                        encoding == L"utf32le" || encoding == L"utf32be", "Unknown text encoding");
+                        encoding == L"utf32le" || encoding == L"utf32be" || encoding == L"windows1252" ||
+                        encoding == L"iso8859_1", "Unknown text encoding");
             const auto text_encoding = encoding == L"ascii"   ? TextEncoding::ascii
                                        : encoding == L"utf8"    ? TextEncoding::utf8
                                        : encoding == L"utf16le" ? TextEncoding::utf16le
                                        : encoding == L"utf16be" ? TextEncoding::utf16be
-                                       : encoding == L"utf32le" ? TextEncoding::utf32le : TextEncoding::utf32be;
-            result.query = TextQuery{utf8(options.needed(L"--text")), text_encoding};
+                                       : encoding == L"utf32le" ? TextEncoding::utf32le
+                                       : encoding == L"utf32be" ? TextEncoding::utf32be
+                                       : encoding == L"windows1252" ? TextEncoding::windows1252 : TextEncoding::iso8859_1;
+            result.query = TextQuery{utf8(options.needed(L"--text")), text_encoding,
+                                     !options.flag(L"--ignore-ascii-case")};
         } else if (kind == L"immediate") {
             auto width = number(options.needed(L"--width"));
             require(width <= 64, "Immediate width exceeds 64");
@@ -549,6 +706,8 @@ Arguments parse(std::span<const std::wstring_view> args) {
         auto fingerprint = take(search_query_fingerprint(*result.query));
         result.search_limits.max_results = std::size_t(options.count(L"--limit", 256));
         result.search_limits.max_candidates = options.count(L"--candidate-budget", 1048576);
+        if (options.contains(L"--start"))
+            result.search_start = typed_location(options.needed(L"--start"));
         result.search_json = options.flag(L"--json");
         if (options.contains(L"--cursor")) {
             result.cursor = parse_cursor(options.pop(L"--cursor"));
@@ -558,13 +717,25 @@ Arguments parse(std::span<const std::wstring_view> args) {
         result.signature_function_entries = options.flag(L"--function-entries");
         require(result.action != L"signature-apply" || !result.signature_function_entries,
                 "signature-apply always targets recovered function entries");
-        result.signature_definitions = path_from_wide(options.needed(L"--definitions"));
+        const bool has_definitions = options.contains(L"--definitions");
+        const bool has_list = options.contains(L"--definitions-list");
+        require(has_definitions != has_list, "Specify exactly one of --definitions or --definitions-list");
+        if (has_list)
+            result.signature_definitions_list = path_from_wide(options.needed(L"--definitions-list"));
+        else
+            result.signature_definitions = path_from_wide(options.needed(L"--definitions"));
         result.signature_limits.max_results = std::size_t(options.count(L"--limit", 4096));
         result.signature_limits.max_candidates = options.count(L"--candidate-budget", 16777216);
         result.signature_limits.max_comparisons = options.count(L"--comparison-budget", 67108864);
     } else if (result.action == L"signature-create") {
         result.at_expression = address(typed_location(options.needed(L"--at")));
         result.signature_name = utf8(options.needed(L"--name"));
+        result.signature_provenance = utf8(options.needed(L"--provenance"));
+        result.function_signature_options.max_bytes = std::size_t(options.count(L"--max-bytes", 128));
+        result.function_signature_options.min_exact_bytes = std::size_t(options.count(L"--min-exact-bytes", 8));
+    } else if (result.action == L"signature-catalog-create") {
+        result.signature_catalog_all_functions = options.flag(L"--all-functions");
+        require(result.signature_catalog_all_functions, "signature-catalog-create requires --all-functions");
         result.signature_provenance = utf8(options.needed(L"--provenance"));
         result.function_signature_options.max_bytes = std::size_t(options.count(L"--max-bytes", 128));
         result.function_signature_options.min_exact_bytes = std::size_t(options.count(L"--min-exact-bytes", 8));
@@ -613,18 +784,29 @@ Arguments parse(std::span<const std::wstring_view> args) {
         result.flirt_limits.max_reference_checks = reference_budget;
         result.flirt_limits.max_results = static_cast<std::size_t>(result_budget);
     } else if (result.action == L"fingerprints") {
-        result.fingerprint_definitions = path_from_wide(options.needed(L"--definitions"));
+        const bool has_definitions = options.contains(L"--definitions");
+        const bool has_list = options.contains(L"--definitions-list");
+        require(has_definitions != has_list, "Specify exactly one of --definitions or --definitions-list");
+        if (has_list) result.fingerprint_definitions_list = path_from_wide(options.needed(L"--definitions-list"));
+        else result.fingerprint_definitions = path_from_wide(options.needed(L"--definitions"));
         result.fingerprint_limits.max_functions = std::size_t(options.count(L"--function-budget", 100000));
         result.fingerprint_limits.max_instructions = options.count(L"--instruction-budget", 4000000);
         result.fingerprint_limits.max_token_bytes = options.count(L"--token-budget", 256ull * 1024 * 1024);
+        result.fingerprint_limits.max_definition_checks = options.count(L"--comparison-budget", 16777216);
         result.fingerprint_limits.per_function.max_instructions =
             std::size_t(options.count(L"--max-instructions", 512));
         result.fingerprint_limits.per_function.max_blocks = std::size_t(options.count(L"--max-blocks", 1024));
         result.fingerprint_limits.per_function.max_token_bytes =
             std::size_t(options.count(L"--per-function-token-budget", 1024 * 1024));
     } else if (result.action == L"fingerprint-create") {
-        result.at_expression = address(typed_location(options.needed(L"--at")));
-        result.signature_name = utf8(options.needed(L"--name"));
+        result.fingerprint_all_functions = options.flag(L"--all-functions");
+        if (result.fingerprint_all_functions) {
+            require(!options.contains(L"--at") && !options.contains(L"--name"),
+                    "--all-functions cannot be combined with --at or --name");
+        } else {
+            result.at_expression = address(typed_location(options.needed(L"--at")));
+            result.signature_name = utf8(options.needed(L"--name"));
+        }
         result.signature_provenance = utf8(options.needed(L"--provenance"));
         result.fingerprint_options.max_instructions = std::size_t(options.count(L"--max-instructions", 512));
         result.fingerprint_options.max_blocks = std::size_t(options.count(L"--max-blocks", 1024));
@@ -636,10 +818,29 @@ Arguments parse(std::span<const std::wstring_view> args) {
         result.recognition_kind = kind == L"signatures" ? FunctionRecognitionKind::byte_signatures
                                 : kind == L"fingerprints" ? FunctionRecognitionKind::normalized_fingerprints
                                                            : FunctionRecognitionKind::flirt_patterns;
+    } else if (result.action == L"managed-resources") {
+        if (options.contains(L"--inputs-list"))
+            result.managed_resource_inputs_list = path_from_wide(options.needed(L"--inputs-list"));
+        result.managed_resources_json = options.flag(L"--json");
     } else
-        require(result.action == L"history-audit" || result.action == L"history-preview" || result.action == L"recovery-list" || result.action == L"recovery-restore" || result.action == L"backup" || result.action == L"backup-restore" || result.action == L"backup-list" || result.action == L"backup-rotate" || result.action == L"backup-prune" || result.action == L"backup-restore-in-place" || result.action == L"exchange-export" || result.action == L"exchange-import" || result.action == L"inspect" || result.action == L"functions" || result.action == L"methods" || result.action == L"managed-types" || result.action == L"fields" || result.action == L"user-strings" || result.action == L"stack" || result.action == L"undo" ||
-                    result.action == L"redo" || result.action == L"save",
+        require(result.action == L"project-schema" || result.action == L"project-integrity" || result.action == L"history-audit" || result.action == L"history-preview" || result.action == L"recovery-list" || result.action == L"recovery-restore" || result.action == L"recovery-restore-in-place" || result.action == L"backup" || result.action == L"backup-archive-source" || result.action == L"backup-restore-source" || result.action == L"backup-verify-source" || result.action == L"backup-source-rotate" || result.action == L"backup-source-list" || result.action == L"backup-source-prune" || result.action == L"backup-restore" || result.action == L"backup-list" || result.action == L"backup-rotate" || result.action == L"backup-prune" || result.action == L"backup-restore-in-place" || result.action == L"backup-verify" || result.action == L"backup-verify-bundle" || result.action == L"exchange-export" || result.action == L"exchange-import" || result.action == L"inspect" || result.action == L"functions" || result.action == L"methods" || result.action == L"managed-types" || result.action == L"managed-resources" || result.action == L"fields" || result.action == L"properties" || result.action == L"events" || result.action == L"marshaling" || result.action == L"user-strings" || result.action == L"stack" || result.action == L"undo" ||
+                    result.action == L"redo" || result.action == L"save" || result.action == L"decompile",
                 "Unknown project action");
+    if (result.history_verify_semantics) {
+        auto &limits = result.history_semantic_limits;
+        const auto steps = options.count(L"--replay-steps", limits.max_steps);
+        require(steps <= 200000, "History semantic replay steps must be 0..200000");
+        limits.max_steps = static_cast<std::size_t>(steps);
+        const auto bytes = options.count(L"--replay-bytes", limits.max_delta_bytes);
+        require(bytes <= 512ull * 1024 * 1024, "History semantic replay bytes must be 0..536870912");
+        limits.max_delta_bytes = static_cast<std::size_t>(bytes);
+        limits.max_input_bytes = options.count(L"--replay-input-bytes", limits.max_input_bytes);
+        require(limits.max_input_bytes <= 1024ull * 1024 * 1024,
+                "History semantic replay input bytes must be 0..1073741824");
+        limits.max_validation_bytes = options.count(L"--replay-validation-bytes", limits.max_validation_bytes);
+        require(limits.max_validation_bytes <= 4ull * 1024 * 1024 * 1024,
+                "History semantic replay validation bytes must be 0..4294967296");
+    }
     require(options.values.empty(),
             options.values.empty() ? "" : "Unknown or inapplicable option " + utf8(options.values.begin()->first));
     return result;

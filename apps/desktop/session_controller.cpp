@@ -1,8 +1,10 @@
 #include "session_controller.hpp"
 #include "hexlab/core/sha256.hpp"
+#include <wx/config.h>
 #include <algorithm>
 #include <chrono>
 #include <new>
+#include <string>
 #include <system_error>
 #include <type_traits>
 namespace hexlab::desktop {
@@ -28,10 +30,20 @@ bool aliases_open_project(const DocumentManager &manager, const std::filesystem:
     }
     return false;
 }
+PoolLimits configured_pool_limits() {
+    PoolLimits limits;
+    long workers = static_cast<long>(limits.max_workers);
+    if (auto *config = wxConfigBase::Get())
+        config->Read("/Analysis/Workers", &workers, workers);
+    if (workers >= 1 && workers <= 16)
+        limits.max_workers = static_cast<std::size_t>(workers);
+    return limits;
+}
 } // namespace
 SessionController::SessionController(std::function<void()> changed)
-    : pool_(std::make_shared<AnalysisPool>()), manager_(take(DocumentManager::create(pool_))),
+    : pool_(std::make_shared<AnalysisPool>(configured_pool_limits())), manager_(take(DocumentManager::create(pool_))),
       changed_(std::move(changed)) {
+    load_automatic_backup_options();
     Bind(wxEVT_TIMER, [this](wxTimerEvent &) { poll(); });
     timer_.Start(25);
 }
@@ -44,6 +56,9 @@ SessionController::~SessionController() {
     backup_restore_.reset();
     for (auto &job : backup_management_)
         job.cancellation->request_stop();
+    if (source_archive_job_) source_archive_job_->cancellation->request_stop();
+    if (source_archive_job_ && source_archive_job_->result.valid()) source_archive_job_->result.wait();
+    source_archive_job_.reset();
     for (auto &job : backup_management_)
         if (job.result.valid())
             job.result.wait();
@@ -88,7 +103,7 @@ void SessionController::scan_recovery_candidates(std::filesystem::path failed_pa
         auto cancellation = std::make_shared<std::stop_source>();
         const auto token = cancellation->get_token();
         auto result = std::async(std::launch::async, [directory = std::move(directory), token] {
-            return database::ProjectStore::discover_recovery_candidates(directory, token);
+            return database::ProjectStore::inspect_recovery_directory(directory, token);
         });
         recovery_scans_.push_back({std::move(failed_path), mode, std::move(open_error),
                                    std::move(cancellation), std::move(result)});
@@ -100,6 +115,11 @@ void SessionController::scan_recovery_candidates(std::filesystem::path failed_pa
 }
 void SessionController::cancel() {
     if (auto id = manager_->active_document()) {
+        if (source_archive_job_ && source_archive_job_->document == *id)
+            source_archive_job_->cancellation->request_stop();
+        for (auto &job : backup_management_)
+            if (job.document == *id)
+                job.cancellation->request_stop();
         if (auto actor = manager_->actor(*id))
             actor->cancel_analysis();
         if (auto found = graphs_.find(id->value); found != graphs_.end()) {
@@ -158,6 +178,12 @@ void SessionController::close() {
     changed_();
 }
 void SessionController::close(DocumentId id) {
+    for (auto &job : backup_management_)
+        if (job.document == id)
+            job.cancellation->request_stop();
+    if (source_archive_job_ && source_archive_job_->document == id)
+        source_archive_job_->cancellation->request_stop();
+    automatic_backups_.erase(id.value);
     pending_project_opens_.erase(id.value);
     auto result = manager_->close(id);
     if (!result)
@@ -165,6 +191,10 @@ void SessionController::close(DocumentId id) {
     changed_();
 }
 void SessionController::close_all() {
+    for (auto &job : backup_management_)
+        job.cancellation->request_stop();
+    if (source_archive_job_) source_archive_job_->cancellation->request_stop();
+    automatic_backups_.clear();
     pending_project_opens_.clear();
     manager_->close_all();
     changed_();
@@ -249,7 +279,7 @@ Result<ProjectOperationId> SessionController::backup_to(DocumentId id, std::file
     }, false);
 }
 Result<bool> SessionController::start_backup_management(DocumentId id, BackupManagementKind kind,
-                                                        std::size_t retain) {
+                                                        std::size_t retain, bool automatic) {
     auto &jobs = backup_management_;
     if (std::any_of(jobs.begin(), jobs.end(), [id](const auto &job) { return job.document == id; }))
         return Error{ErrorCode::busy, "Wait for the current backup operation to finish"};
@@ -259,6 +289,10 @@ Result<bool> SessionController::start_backup_management(DocumentId id, BackupMan
             path = document.path;
     if (!path)
         return Error{ErrorCode::unsupported, "Save the project before managing rotated backups"};
+    const auto project = manager_->project(id);
+    if (!project || !project->state)
+        return Error{ErrorCode::busy, "Wait for the project to finish opening"};
+    const auto expected_uuid = project->state->uuid;
     if ((kind == BackupManagementKind::rotate || kind == BackupManagementKind::prune) &&
         (retain == 0 || retain > 32))
         return Error{ErrorCode::invalid_argument, "Backup retention must be from 1 through 32"};
@@ -270,11 +304,16 @@ Result<bool> SessionController::start_backup_management(DocumentId id, BackupMan
         auto cancellation = std::make_shared<std::stop_source>();
         const auto token = cancellation->get_token();
         auto result = std::async(std::launch::async,
-            [path = std::move(*path), base = std::move(backup_base), kind, retain, token]()
+            [path = *path, base = std::move(backup_base), kind, retain, token, expected_uuid]()
                 -> Result<BackupManagementResult> {
                 auto opened = database::ProjectStore::open(path, database::ProjectMode::read_only, token);
                 if (!opened)
                     return opened.error();
+                auto snapshot = opened.value()->snapshot();
+                if (!snapshot)
+                    return snapshot.error();
+                if (snapshot.value()->uuid != expected_uuid)
+                    return Error{ErrorCode::conflict, "Backup source was replaced by a different project"};
                 if (kind == BackupManagementKind::rotate) {
                     auto value = opened.value()->backup_to_rotating(base, retain, token);
                     if (!value)
@@ -292,7 +331,8 @@ Result<bool> SessionController::start_backup_management(DocumentId id, BackupMan
                     return value.error();
                 return BackupManagementResult{std::move(value.value())};
             });
-        jobs.push_back({id, std::move(cancellation), std::move(result)});
+        jobs.push_back({id, *path, std::move(cancellation), std::move(result), automatic,
+                       backup_schedule_generation_});
         return true;
     } catch (const std::system_error &error) {
         return Error{ErrorCode::resource_limit, error.what()};
@@ -308,6 +348,85 @@ Result<bool> SessionController::list_backups(DocumentId id) {
 }
 Result<bool> SessionController::prune_backups(DocumentId id, std::size_t retain) {
     return start_backup_management(id, BackupManagementKind::prune, retain);
+}
+void SessionController::cancel_source_archive() {
+    if (source_archive_job_) source_archive_job_->cancellation->request_stop();
+}
+Result<bool> SessionController::manage_source_archive(DocumentId id, SourceArchiveAction action,
+                                                       std::filesystem::path selected_path,
+                                                       std::size_t retain) {
+    if (source_archive_job_)
+        return Error{ErrorCode::busy, "Wait for the current source archive operation to finish"};
+    std::optional<std::filesystem::path> project_path;
+    for (const auto &document : manager_->documents())
+        if (document.id == id) project_path = document.path;
+    if (!project_path)
+        return Error{ErrorCode::unsupported, "Save the project before managing external source archives"};
+    const auto project = manager_->project(id);
+    if (!project || !project->state)
+        return Error{ErrorCode::busy, "Wait for the project to finish opening"};
+    if ((action == SourceArchiveAction::create || action == SourceArchiveAction::verify) && selected_path.empty())
+        return Error{ErrorCode::invalid_argument, "Choose a source archive path"};
+    if ((action == SourceArchiveAction::rotate || action == SourceArchiveAction::prune) &&
+        (retain == 0 || retain > 32))
+        return Error{ErrorCode::invalid_argument, "Source archive retention must be from 1 through 32"};
+    auto base_path = [&] {
+        auto name = project_path->stem().native();
+        name += std::filesystem::path("-source-archives").native();
+        name += project_path->extension().native();
+        return project_path->parent_path() / std::filesystem::path(std::move(name));
+    }();
+    try {
+        auto cancellation = std::make_shared<std::stop_source>();
+        const auto token = cancellation->get_token();
+        const auto expected_uuid = project->state->uuid;
+        auto result = std::async(std::launch::async,
+            [path = *project_path, base = std::move(base_path), selected = std::move(selected_path),
+             action, retain, token, expected_uuid]() -> Result<SourceArchiveResult> {
+                auto opened = database::ProjectStore::open(path, database::ProjectMode::read_only, token);
+                if (!opened) return opened.error();
+                auto snapshot = opened.value()->snapshot();
+                if (!snapshot) return snapshot.error();
+                if (snapshot.value()->uuid != expected_uuid)
+                    return Error{ErrorCode::conflict, "Project source was replaced by a different project"};
+                const auto options = database::SourceArchiveOptions{};
+                switch (action) {
+                case SourceArchiveAction::create: {
+                    auto value = opened.value()->archive_external_source(selected, options, token);
+                    if (!value) return value.error();
+                    return SourceArchiveResult{std::move(value.value())};
+                }
+                case SourceArchiveAction::rotate: {
+                    auto value = opened.value()->archive_external_source_rotating(base, retain, options, token);
+                    if (!value) return value.error();
+                    return SourceArchiveResult{std::move(value.value())};
+                }
+                case SourceArchiveAction::list: {
+                    auto value = opened.value()->list_rotated_source_archives(base, options.max_bytes, token);
+                    if (!value) return value.error();
+                    return SourceArchiveResult{std::move(value.value())};
+                }
+                case SourceArchiveAction::prune: {
+                    auto value = opened.value()->prune_rotated_source_archives(base, retain, options.max_bytes, token);
+                    if (!value) return value.error();
+                    return SourceArchiveResult{std::move(value.value())};
+                }
+                case SourceArchiveAction::verify: {
+                    auto value = opened.value()->verify_source_archive(selected, options.max_bytes, token);
+                    if (!value) return value.error();
+                    return SourceArchiveResult{std::move(value.value())};
+                }
+                }
+                return Error{ErrorCode::invalid_argument, "Unknown source archive operation"};
+            });
+        source_archive_job_.emplace(SourceArchiveJob{id, *project_path, std::move(cancellation), std::move(result)});
+        changed_();
+        return true;
+    } catch (const std::system_error &error) {
+        return Error{ErrorCode::resource_limit, error.what()};
+    } catch (const std::bad_alloc &) {
+        return Error{ErrorCode::resource_limit, "Cannot start source archive operation"};
+    }
 }
 Result<bool> SessionController::restore_backup(std::filesystem::path source, std::filesystem::path destination,
                                                bool replace, AnalysisOptions options) {
@@ -339,6 +458,45 @@ Result<bool> SessionController::restore_backup(std::filesystem::path source, std
         return Error{ErrorCode::resource_limit, "Cannot start backup restore"};
     }
 }
+Result<bool> SessionController::restore_recovery(std::filesystem::path source, std::filesystem::path destination,
+                                                 bool replace, AnalysisOptions options) {
+    if (backup_restore_)
+        return Error{ErrorCode::busy, "A project restore is already running"};
+    if (source.empty() || destination.empty())
+        return Error{ErrorCode::invalid_argument, "Choose both a recovery artifact and a destination project"};
+    if (aliases_open_project(*manager_, destination))
+        return Error{ErrorCode::conflict, "Restore destination is already open as a project"};
+    try {
+        auto cancellation = std::make_shared<std::stop_source>();
+        const auto token = cancellation->get_token();
+        auto result = std::async(std::launch::async,
+            [source = std::move(source), destination = std::move(destination), replace, token]()
+                -> Result<database::SavedProject> {
+                std::error_code error;
+                const auto absolute_source = std::filesystem::absolute(source, error).lexically_normal();
+                if (error) return Error{ErrorCode::io, "Cannot resolve recovery artifact path: " + error.message()};
+                auto candidates = database::ProjectStore::discover_recovery_candidates(absolute_source.parent_path(), token);
+                if (!candidates) return candidates.error();
+                const auto found = std::find_if(candidates.value().begin(), candidates.value().end(),
+                    [&](const database::ProjectRecoveryCandidate &candidate) {
+                        std::error_code candidate_error;
+                        const auto candidate_path = std::filesystem::absolute(candidate.path, candidate_error).lexically_normal();
+                        return !candidate_error && candidate_path == absolute_source;
+                    });
+                if (found == candidates.value().end())
+                    return Error{ErrorCode::invalid_argument, "Selected file is not a fully validated HexLab recovery artifact"};
+                return database::ProjectStore::recover_candidate(*found, destination,
+                    replace ? database::ReplacePolicy::replace_existing : database::ReplacePolicy::fail_if_exists, token);
+            });
+        backup_restore_.emplace(BackupRestore{std::move(options), std::move(cancellation), std::move(result)});
+        changed_();
+        return true;
+    } catch (const std::system_error &error) {
+        return Error{ErrorCode::resource_limit, error.what()};
+    } catch (const std::bad_alloc &) {
+        return Error{ErrorCode::resource_limit, "Cannot start recovery artifact restore"};
+    }
+}
 Result<bool> SessionController::restore_backup_in_place(std::filesystem::path source,
                                                         std::filesystem::path target,
                                                         AnalysisOptions options) {
@@ -365,6 +523,50 @@ Result<bool> SessionController::restore_backup_in_place(std::filesystem::path so
         return Error{ErrorCode::resource_limit, error.what()};
     } catch (const std::bad_alloc &) {
         return Error{ErrorCode::resource_limit, "Cannot start in-place backup restore"};
+    }
+}
+Result<bool> SessionController::restore_recovery_in_place(std::filesystem::path source,
+                                                          std::filesystem::path target,
+                                                          AnalysisOptions options) {
+    if (backup_restore_)
+        return Error{ErrorCode::busy, "A project restore is already running"};
+    if (source.empty() || target.empty())
+        return Error{ErrorCode::invalid_argument, "Choose both a recovery artifact and a target project"};
+    if (aliases_open_project(*manager_, target))
+        return Error{ErrorCode::conflict, "Close every open view of the target project before restoring it in place"};
+    if (aliases_open_project(*manager_, source))
+        return Error{ErrorCode::conflict, "Close the recovery artifact if it is open as a project"};
+    try {
+        auto cancellation = std::make_shared<std::stop_source>();
+        const auto token = cancellation->get_token();
+        auto result = std::async(std::launch::async,
+            [source = std::move(source), target = std::move(target), token]()
+                -> Result<database::SavedProject> {
+                std::error_code error;
+                const auto absolute_source = std::filesystem::absolute(source, error).lexically_normal();
+                if (error) return Error{ErrorCode::io, "Cannot resolve recovery artifact path: " + error.message()};
+                auto candidates = database::ProjectStore::discover_recovery_candidates(
+                    absolute_source.parent_path(), token);
+                if (!candidates) return candidates.error();
+                const auto found = std::find_if(candidates.value().begin(), candidates.value().end(),
+                    [&](const database::ProjectRecoveryCandidate &candidate) {
+                        if (candidate.kind != database::RecoveryArtifactKind::previous_version) return false;
+                        std::error_code candidate_error;
+                        const auto candidate_path = std::filesystem::absolute(candidate.path, candidate_error).lexically_normal();
+                        return !candidate_error && candidate_path == absolute_source;
+                    });
+                if (found == candidates.value().end())
+                    return Error{ErrorCode::invalid_argument,
+                                 "Selected file is not a fully validated retained previous-version artifact"};
+                return database::ProjectStore::recover_candidate_in_place(*found, target, token);
+            });
+        backup_restore_.emplace(BackupRestore{std::move(options), std::move(cancellation), std::move(result), true});
+        changed_();
+        return true;
+    } catch (const std::system_error &error) {
+        return Error{ErrorCode::resource_limit, error.what()};
+    } catch (const std::bad_alloc &) {
+        return Error{ErrorCode::resource_limit, "Cannot start recovery artifact restore"};
     }
 }
 Result<ProjectOperationId> SessionController::export_binary(DocumentId id, std::filesystem::path path, bool replace) {
@@ -406,14 +608,37 @@ void SessionController::poll() {
             ++it;
             continue;
         }
-        auto candidates = it->result.get();
+        auto scan = it->result.get();
         auto failed_path = std::move(it->failed_path);
         const auto mode = it->mode;
         auto failure_detail = std::move(it->open_error);
         it = recovery_scans_.erase(it);
         changed = true;
-        if (recovery_candidates_ready)
-            recovery_candidates_ready(std::move(failed_path), mode, std::move(failure_detail), std::move(candidates));
+        if (recovery_candidates_ready) {
+            if (!scan) {
+                recovery_candidates_ready(std::move(failed_path), mode, std::move(failure_detail), scan.error());
+                continue;
+            }
+            auto &report = scan.value();
+            failure_detail.message += "\n\nRecovery scan: " + std::to_string(report.visited_entries) +
+                " directory entries, " + std::to_string(report.matching_names) + " recovery-name candidates, " +
+                std::to_string(report.rejected_entries) + " rejected.";
+            if (!report.complete)
+                failure_detail.message += " The scan reached a safety limit; the candidate list may be incomplete.";
+            const auto shown = std::min<std::size_t>(report.issues.size(), 8);
+            if (shown) {
+                failure_detail.message += "\nRejected recovery artifacts:";
+                for (std::size_t index = 0; index < shown; ++index) {
+                    const auto &issue = report.issues[index];
+                    failure_detail.message += "\n  " + issue.name + ": " + issue.reason;
+                }
+            }
+            const auto omitted = report.omitted_issues + report.issues.size() - shown;
+            if (omitted)
+                failure_detail.message += "\n  ... " + std::to_string(omitted) + " more diagnostics omitted.";
+            recovery_candidates_ready(std::move(failed_path), mode, std::move(failure_detail),
+                                      std::move(report.candidates));
+        }
     }
     if (backup_restore_ && backup_restore_->result.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
         auto restored = [&]() -> Result<database::SavedProject> {
@@ -458,10 +683,42 @@ void SessionController::poll() {
             result = Error{ErrorCode::io, "Unknown backup management failure"};
         }
         const auto document = it->document;
+        const auto source_path = it->source_path;
+        const bool automatic = it->automatic;
+        const auto schedule_generation = it->schedule_generation;
         it = backup_management_.erase(it);
         changed = true;
+        // Closing or Save As may have changed the document while the worker ran.
+        // Consume its future without attaching an old result to the new document.
+        const auto live_documents = manager_->documents();
+        if (std::none_of(live_documents.begin(), live_documents.end(), [&](const auto &entry) {
+                return entry.id == document && entry.path && *entry.path == source_path;
+            }))
+            continue;
+        if (automatic && schedule_generation == backup_schedule_generation_) {
+            const auto found = automatic_backups_.find(document.value);
+            if (found != automatic_backups_.end() && found->second.path == source_path) {
+                auto &state = found->second;
+                state.due = std::chrono::steady_clock::now() +
+                            std::chrono::minutes(automatic_backup_options_.interval_minutes);
+                if (!result)
+                    state.status = result.error().code == ErrorCode::canceled ? wxString("Last backup canceled.")
+                        : "Last backup failed: " + wxString::FromUTF8(result.error().message);
+                else if (const auto *rotation = std::get_if<database::BackupRotationResult>(&result.value())) {
+                    // An unattended retry must not grow an unprunable directory forever.
+                    state.paused = !rotation->retention_satisfied;
+                    state.status = "Last backup: " + wxString(rotation->backup.path.filename().wstring()) +
+                        (rotation->retention_satisfied ? wxString(". Retention satisfied.")
+                            : wxString(". Retention incomplete; schedule paused. Review backup generations, then restart the schedule."));
+                }
+            }
+        }
         if (!result) {
-            manager_->report_error(document, result.error());
+            if (automatic) {
+                if (message)
+                    message(document, "Automatic project backup: " + wxString::FromUTF8(result.error().message));
+            } else
+                manager_->report_error(document, result.error());
             continue;
         }
         if (!message)
@@ -469,9 +726,12 @@ void SessionController::poll() {
         std::visit([&](const auto &value) {
             using T = std::decay_t<decltype(value)>;
             if constexpr (std::is_same_v<T, database::BackupRotationResult>) {
-                message(document, wxString("Created rotated backup: ") + wxString(value.backup.path.wstring()) +
+                message(document, wxString(automatic ? "Created automatic project backup: " : "Created rotated backup: ") +
+                    wxString(value.backup.path.wstring()) +
                     wxString::Format(" (%zu older generations removed%s).", value.removed_generations,
-                    value.retention_satisfied ? "" : "; retention limit was not fully met"));
+                    value.retention_satisfied ? "" : automatic && schedule_generation == backup_schedule_generation_
+                        ? "; retention incomplete; automatic schedule paused for review"
+                        : "; retention limit was not fully met"));
             } else if constexpr (std::is_same_v<T, database::BackupListing>) {
                 wxString summary = wxString::Format("Rotated backups (%zu listed%s):\n", value.backups.size(),
                     value.complete ? "" : ", scan incomplete");
@@ -485,6 +745,57 @@ void SessionController::poll() {
                     value.remaining, value.retention_satisfied ? "" : " (retention limit was not fully met)"));
             }
         }, result.value());
+    }
+    if (source_archive_job_ && source_archive_job_->result.wait_for(std::chrono::milliseconds(0)) ==
+                                   std::future_status::ready) {
+        Result<SourceArchiveResult> result = Error{ErrorCode::io, "Source archive operation failed"};
+        try { result = source_archive_job_->result.get(); }
+        catch (const std::bad_alloc &) { result = Error{ErrorCode::resource_limit, "Source archive operation ran out of memory"}; }
+        catch (const std::exception &error) { result = Error{ErrorCode::io, error.what()}; }
+        catch (...) { result = Error{ErrorCode::io, "Unknown source archive failure"}; }
+        const auto document = source_archive_job_->document;
+        const auto path = source_archive_job_->project_path;
+        source_archive_job_.reset();
+        changed = true;
+        const auto live_documents = manager_->documents();
+        if (std::none_of(live_documents.begin(), live_documents.end(), [&](const auto &entry) {
+                return entry.id == document && entry.path && *entry.path == path;
+            })) {
+            // The worker's result belongs to a closed or replaced project path.
+        } else if (!result) {
+            if (result.error().code == ErrorCode::canceled) {
+                if (message) message(document, "Source archive operation canceled; completed file changes, if any, were retained.");
+            } else manager_->report_error(document, result.error());
+        } else if (message) {
+            std::visit([&](const auto &value) {
+                using T = std::decay_t<decltype(value)>;
+                if constexpr (std::is_same_v<T, database::SourceArchiveResult>) {
+                    message(document, "Archived external source to " + wxString(value.path.wstring()) +
+                        wxString::Format(" (%llu bytes; project provenance unchanged).",
+                            static_cast<unsigned long long>(value.input.size)));
+                } else if constexpr (std::is_same_v<T, database::SourceArchiveRotationResult>) {
+                    message(document, "Created rotated source archive " + wxString(value.archive.path.wstring()) +
+                        wxString::Format(" (%llu bytes; %zu older generations removed%s).",
+                            static_cast<unsigned long long>(value.archive.input.size), value.removed_generations,
+                            value.retention_satisfied ? "" : "; retention incomplete, existing files preserved"));
+                } else if constexpr (std::is_same_v<T, database::SourceArchiveListing>) {
+                    wxString summary = wxString::Format("Validated source archives (%zu listed%s):\n",
+                        value.archives.size(), value.complete ? "" : "; scan incomplete");
+                    for (const auto &row : value.archives)
+                        summary += wxString(row.archive.path.filename().wstring()) +
+                            wxString::Format(" (%llu bytes)\n", static_cast<unsigned long long>(row.archive.bytes_verified));
+                    if (value.archives.empty()) summary += "No matching validated source archives found.";
+                    message(document, std::move(summary));
+                } else if constexpr (std::is_same_v<T, database::SourceArchivePruneResult>) {
+                    message(document, wxString::Format("Pruned %zu source archives; %zu remain%s.", value.removed,
+                        value.remaining, value.retention_satisfied ? "" : " (retention incomplete; files preserved)"));
+                } else {
+                    message(document, "Verified source archive " + wxString(value.path.wstring()) +
+                        wxString::Format(" (%llu bytes; SHA-256 matches embedded input).",
+                            static_cast<unsigned long long>(value.bytes_verified)));
+                }
+            }, result.value());
+        }
     }
     for (auto document = receipts_.begin(); document != receipts_.end();) {
         DocumentId id{document->first};
@@ -532,6 +843,7 @@ void SessionController::poll() {
     changed = poll_listing() || changed;
     changed = poll_search() || changed;
     changed = poll_graph() || changed;
+    changed = poll_automatic_backups() || changed;
     if (changed)
         changed_();
 }

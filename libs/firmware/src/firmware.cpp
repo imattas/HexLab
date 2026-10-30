@@ -80,13 +80,15 @@ struct Lines {
 }
 
 Result<FirmwareImage> parse_intel_hex(std::string_view text, ParseOptions options, std::stop_token stop) {
-    if (options.max_data_bytes == 0 || options.max_records == 0)
+    if (options.max_data_bytes == 0 || options.max_records == 0 || options.max_lines == 0)
         return Error{ErrorCode::invalid_argument, "firmware parser limits must be nonzero"};
     Builder builder; builder.options = options; builder.image.format = Format::intel_hex;
     Lines lines{text}; std::string_view line; std::uint64_t base = 0;
     std::size_t records = 0; bool eof = false;
     while (lines.next(line)) {
         if (canceled(stop)) return Error{ErrorCode::canceled, "firmware parsing canceled"};
+        if (lines.number > options.max_lines)
+            return fail(ErrorCode::resource_limit, lines.number, "configured input-line limit exceeded");
         if (line.empty()) continue;
         if (eof) return fail(ErrorCode::malformed, lines.number, "record appears after Intel HEX EOF");
         if (line.front() != ':') return fail(ErrorCode::malformed, lines.number, "Intel HEX record must begin with ':'");
@@ -128,13 +130,15 @@ Result<FirmwareImage> parse_intel_hex(std::string_view text, ParseOptions option
 }
 
 Result<FirmwareImage> parse_s_record(std::string_view text, ParseOptions options, std::stop_token stop) {
-    if (options.max_data_bytes == 0 || options.max_records == 0)
+    if (options.max_data_bytes == 0 || options.max_records == 0 || options.max_lines == 0)
         return Error{ErrorCode::invalid_argument, "firmware parser limits must be nonzero"};
     Builder builder; builder.options = options; builder.image.format = Format::motorola_s_record;
     Lines lines{text}; std::string_view line; std::size_t records = 0, data_records = 0;
     bool terminated = false; int last_data_type = 0; bool count_seen = false;
     while (lines.next(line)) {
         if (canceled(stop)) return Error{ErrorCode::canceled, "firmware parsing canceled"};
+        if (lines.number > options.max_lines)
+            return fail(ErrorCode::resource_limit, lines.number, "configured input-line limit exceeded");
         if (line.empty()) continue;
         if (terminated) return fail(ErrorCode::malformed, lines.number, "record appears after S-record termination");
         if (line.size() < 4 || line[0] != 'S' || line[1] < '0' || line[1] > '9')

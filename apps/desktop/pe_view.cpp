@@ -51,7 +51,7 @@ PeView::PeView(wxWindow *parent) : wxPanel(parent) {
     directories_ = new VirtualTable(tabs, "pe-directories", {"#", "Kind", "RVA / file", "Size"});
     auto *coff_symbol_page = new wxPanel(tabs);
     coff_symbol_status_ = new wxStaticText(coff_symbol_page, wxID_ANY, "COFF symbols: unavailable");
-    coff_symbols_ = new VirtualTable(coff_symbol_page, "pe-coff-symbols", {"Address / source", "Name", "Section", "Value", "Type / class", "Auxiliary"});
+    coff_symbols_ = new VirtualTable(coff_symbol_page, "pe-coff-symbols", {"Address / source", "Name", "Section", "Value", "Type / class", "Auxiliary", "Function size / aux"});
     auto *coff_symbol_layout = new wxBoxSizer(wxVERTICAL);
     coff_symbol_layout->Add(coff_symbol_status_, 0, wxEXPAND | wxALL, 4);
     coff_symbol_layout->Add(coff_symbols_, 1, wxEXPAND);
@@ -70,7 +70,7 @@ PeView::PeView(wxWindow *parent) : wxPanel(parent) {
     certificate_status_ = new wxStaticText(certificate_page, wxID_ANY,
         "Certificate table: unavailable; signatures are not verified");
     certificates_ = new VirtualTable(certificate_page, "pe-certificates",
-        {"File offset", "Length", "Revision", "Type", "Payload bytes", "Record"});
+        {"File offset", "Length", "Revision", "Type", "Payload bytes", "Padding", "Record"});
     auto *certificate_layout = new wxBoxSizer(wxVERTICAL);
     certificate_layout->Add(certificate_status_, 0, wxEXPAND | wxALL, 4);
     certificate_layout->Add(certificates_, 1, wxEXPAND);
@@ -200,7 +200,11 @@ void PeView::set_document(std::shared_ptr<const DocumentSnapshot> document) {
         case 2: return wxString::Format("%d", static_cast<int>(item.section_number));
         case 3: return wxString::Format("0x%08X", item.value);
         case 4: return wxString::Format("0x%04X / %u", item.type, static_cast<unsigned>(item.storage_class));
-        default: return wxString::Format("%u", static_cast<unsigned>(item.auxiliary_count));
+        case 5: return wxString::Format("%u", static_cast<unsigned>(item.auxiliary_count));
+        default: return item.function_size
+            ? wxString::Format("0x%X @ file:0x%llX", *item.function_size,
+                static_cast<unsigned long long>(item.function_aux_file_offset.value))
+            : wxString{};
         }
     });
     coff_symbols_->activate = [this, source_document, metadata, shown_coff_symbols](std::size_t row) {
@@ -334,12 +338,15 @@ void PeView::set_document(std::shared_ptr<const DocumentSnapshot> document) {
             const auto &record = records[row];
             const auto offset = record.source.spans.empty() ? 0 : record.source.spans.front().offset.value;
             const auto payload_size = record.payload.empty() ? 0 : record.payload.front().size;
+            const auto padding_size = record.alignment_padding.empty() ? 0 : record.alignment_padding.front().size;
             switch (column) {
             case 0: return wxString::Format("0x%llX", static_cast<unsigned long long>(offset));
             case 1: return wxString::Format("0x%X", record.length);
             case 2: return wxString::Format("0x%04X", record.revision);
             case 3: return wxString::Format("0x%04X (%s)", record.type, certificate_type_name(record.type));
             case 4: return wxString::Format("0x%llX", static_cast<unsigned long long>(payload_size));
+            case 5: return wxString::Format("%llu bytes%s", static_cast<unsigned long long>(padding_size),
+                                             record.alignment_padding_nonzero ? " (nonzero)" : "");
             default: return wxString::Format("%u", record.source.index);
             }
         });

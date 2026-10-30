@@ -23,17 +23,31 @@ The partitioner recognizes three bounded forms:
   opaque roots. The generic x86 GPR bank is excluded because a segment override
   can change the effective address without changing the GPR value. Integer
   offsets are propagated from literals, same-width copies, unanimous phis, and
-  checked same-width `add`, `sub`, or `mul` trees with no intermediate wrap and at most 32
+  checked same-width `add`, `sub`, or `mul` trees with no intermediate wrap,
+  plus exact same-width `and`, `or`, and `xor` trees, all bounded to 32
   expression levels before pointer origins are solved, so an address
   expression such as `base + offset_register` can produce an exact range when
   that register has one proven value.
   The memory access may have no index register, or use an index whose exact
-  constant is proven through a literal, same-width copy, unanimous phi, or a
-  checked same-width `add`, `sub`, or `mul` tree with no intermediate wrap and
-  at most 32 expression levels. Same-width unextended indices use nonnegative
-  values. AArch64 `uxtw`, `sxtw`, and `sxtx` indices use their architectural
-  zero- or sign-extension before checked scale/shift and displacement
-  arithmetic. The final byte range must fit the checked signed offset bounds.
+  constant is proven through a literal, same-width copy, unanimous phi, a
+  checked same-width `add`, `sub`, or `mul` tree with no intermediate wrap, or
+  exact same-width `and`, `or`, and `xor` trees, all bounded to 32 expression
+  levels. It can also use a bounded unsigned interval proven by `index & mask`
+  when the same-width mask is a contiguous run of low bits, or a complete phi
+  whose incoming values all have known intervals. Same-width `add`, `sub`, and
+  `mul` preserve intervals when endpoint checks prove every possible result
+  stays within the bit width without wrap; subtraction additionally requires
+  every possible left operand to be at least every possible right operand.
+  Multiplication bounds the maximum product before computing either endpoint.
+  An interval widens the partition to include every possible indexed byte; it
+  does not assert one runtime offset. Same-width unextended indices use
+  nonnegative values.
+  Explicit integer `zext`/`sext` assignments preserve index intervals across
+  width changes. Sign-extended ranges that cross the source sign bit widen to
+  the full target domain because they do not form one precise unsigned interval.
+  AArch64 `uxtw`, `sxtw`, and `sxtx` indices use their architectural zero- or
+  sign-extension before checked scale/shift and displacement arithmetic. The
+  final byte range must fit the checked signed offset bounds.
   The access also needs a bounded byte width. Ranges sharing the same root
   register version and overlapping offsets
   are grouped together. Call results and call-clobbered register
@@ -64,10 +78,16 @@ whole-memory SSA. If whole-function partition construction exceeds its budget,
 the function keeps only whole-memory SSA.
 
 This does not partition heap or global accesses whose address cannot be proven,
-aliases reached through unrelated roots, variable indices, unsupported index
-extensions, or pointer arithmetic whose offset is not a proven nonnegative
-constant in a supported same-width integer expression. Signed index offsets
-are accepted only for the listed AArch64 forms and only when checked arithmetic
+aliases reached through unrelated roots, variable indices without a supported
+bounded interval, unsupported index extensions, or pointer arithmetic whose
+offset is not a proven nonnegative constant in a supported same-width integer
+expression. Bitwise and shift constant expressions are evaluated at their
+declared width; shifts require a proven count below the width, while add/sub/mul
+still require no intermediate wrap. Bounded unsigned index intervals also
+propagate through constant-count shifts when the result remains ordered without
+wrap; arithmetic right shifts that cross the sign boundary widen conservatively.
+Signed index offsets are accepted only for the
+listed AArch64 forms and only when checked arithmetic
 does not overflow; wrapping address arithmetic remains unsupported. The IR
 keeps these partitions supplementary: passes that ignore `memory_partition`
 continue to use the coarser `memory_version` chain.

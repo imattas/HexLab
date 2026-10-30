@@ -4,8 +4,10 @@ The Linux x86 ptrace backend accepts a resume schedule with several
 `continue_execution` actions when a stop event is pending. Every listed thread
 must be owned by the session and stopped, thread IDs must be unique, and the
 schedule must include the thread that owns the event. Omitted threads and
-threads listed with `stop` remain stopped. Single-step actions can be combined
-with `stop` actions only when exactly one thread is runnable.
+threads listed with `stop` remain stopped. A schedule may contain several
+continues and at most one single-step. A non-owner single-step requires an
+explicit `stop` action for the event owner; an owner step may run alongside
+selected continues.
 
 For a multi-thread continue, the backend resumes selected peers first and the
 event owner last. If a `PTRACE_CONT` fails partway through, it interrupts the
@@ -15,12 +17,18 @@ as deferred events. If rollback cannot re-establish the stopped state, the
 session reports both errors and blocks subsequent resume operations until it
 recovers the suspension.
 
-Multi-thread schedules remain unsupported when the pending event owns a
-software breakpoint, because the backend must displace and single-step that
-instruction before safely resuming the owner. A multi-thread schedule also
-cannot contain a single-step action. These checks fail before any thread is
-resumed. This feature does not make multiple ptrace operations atomic; the
-backend uses stop-and-rollback to contain partial failure.
+When a multi-thread schedule continues the owner of a software-breakpoint
+stop, the backend first executes the displaced instruction with all peers
+stopped, rearms the breakpoint, then resumes the selected threads with their
+requested signals. The internal step is not surfaced as a user step event;
+the backend keeps waiting for the next real stop and returns that event after
+stopping the process threads. A schedule that requests a single-step at the
+breakpoint remains single-thread only, so its step event is preserved. If an
+earlier schedule already has a single-step in flight, another schedule may
+continue other stopped threads, but any new single-step action is rejected
+until the outstanding step produces its event. Resume failures stop already
+continued peers and preserve recovery state if rollback fails. This feature
+does not make multiple ptrace operations atomic.
 
 Each scheduled action can choose a signal disposition. If the thread owns a
 signal-delivery stop, omitting the choice preserves and redelivers that signal;

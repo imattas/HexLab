@@ -7,6 +7,7 @@
 #include <optional>
 #include <map>
 #include <memory>
+#include <set>
 #include <span>
 #include <stop_token>
 #include <string>
@@ -44,16 +45,31 @@ struct ManagedMethodAnalysis {
     std::map<std::uint32_t,ManagedMethodSignature> resolved_call_signatures;
     std::map<std::uint32_t,ManagedField> resolved_fields;
     std::map<std::uint32_t,std::string> resolved_exception_type_names;
+    // Tokens proven to denote managed reference types for token-typed CIL
+    // array operations. Unclassified TypeRefs and value types remain opaque.
+    std::set<std::uint32_t> resolved_array_reference_type_tokens;
+    // Catch tokens whose metadata row exists but whose exception ancestry
+    // cannot be proven from the loaded module and supplied type catalogs.
+    std::map<std::uint32_t,std::string> unresolved_exception_types;
     // Exact AssemblyRef identity for external TypeRefs used by catch clauses.
     // This preserves identity provenance without claiming external assignability.
     std::map<std::uint32_t,ManagedAssemblyIdentity> resolved_exception_type_assemblies;
     std::shared_ptr<const ManagedTypeCatalog> resolved_exception_types;
     std::shared_ptr<const ManagedUserStringCatalog> resolved_user_strings;
+    // CLR native integer width, not the host width. Zero denotes an AnyCPU
+    // or otherwise unresolved execution context; direct callers may provide
+    // an independently established 32/64-bit runtime context before lifting.
+    std::uint16_t native_integer_bits=0;
+    std::uint16_t native_image_machine=0;
+    std::optional<std::uint32_t> cli_runtime_flags;
 };
 // Rebuilds a bounded CLR method catalog from a loaded PE on every call; results
 // are derived data and need not be persisted in the project database.
 HEXLAB_LOADERS_EXPORT Result<std::vector<ManagedMethodAnalysis>> inspect_managed_methods(const LoadedImage&,std::stop_token={});
 HEXLAB_LOADERS_EXPORT Result<std::vector<ManagedTypeDefinition>> inspect_managed_types(const LoadedImage&);
 HEXLAB_LOADERS_EXPORT Result<std::vector<ManagedField>> inspect_managed_fields(const LoadedImage&);
+HEXLAB_LOADERS_EXPORT Result<std::vector<ManagedProperty>> inspect_managed_properties(const LoadedImage&);
+HEXLAB_LOADERS_EXPORT Result<std::vector<ManagedEvent>> inspect_managed_events(const LoadedImage&);
+HEXLAB_LOADERS_EXPORT Result<std::vector<ManagedMarshalDescriptor>> inspect_managed_marshal_descriptors(const LoadedImage&);
 HEXLAB_LOADERS_EXPORT Result<ManagedUserStringCatalog> inspect_managed_user_strings(const LoadedImage&);
 }

@@ -1,6 +1,7 @@
 #include "hexlab/analysis/stack.hpp"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <deque>
 #include <map>
@@ -24,6 +25,20 @@ struct FlowState {
     bool ambiguous = false;
     int frame_register = -1;
     bool arm64_frame_pointer = false;
+    // A bounded set of exact RISC-V temporary pointers derived from SP, s0,
+    // or another tracked temporary. Each value is entry-SP depth (not an
+    // absolute address), so direct memory operands can reuse the slot model.
+    std::array<FlowValue, 32> riscv_stack_alias_depths{};
+    // Equivalent fixed-width relation for AArch64 temporary base registers.
+    std::array<FlowValue, 31> arm64_stack_alias_depths{};
+    // Independently tracked NMOS 6502 copies of a TSX snapshot in A, X, or Y.
+    // Each delta is relative to frame_depth, the stack depth sampled by TSX.
+    std::array<FlowValue, 3> m6502_stack_alias_deltas{};
+    // For the NMOS 6502 TSX/$0100,X convention, track a small signed
+    // displacement from the sampled S value. Values outside +/-127 are
+    // intentionally discarded because 8-bit index wrap makes linear slot
+    // identities ambiguous over a complete page traversal.
+    FlowValue frame_register_delta;
 };
 
 bool add_checked(std::int64_t left, std::int64_t right, std::int64_t &result) {
@@ -38,6 +53,13 @@ bool subtract_checked(std::int64_t left, std::int64_t right, std::int64_t &resul
         return false;
     result = left - right;
     return true;
+}
+
+bool m6502_slot_offset_unambiguous(std::int64_t offset) noexcept {
+    // Keep any two modeled offsets inside one signed page window. Outside
+    // this range, the 8-bit stack/index arithmetic can wrap to a cell already
+    // represented by a different linear offset.
+    return offset >= -127 && offset <= 127;
 }
 
 bool add(FlowValue &value, std::int64_t delta) {
@@ -122,10 +144,56 @@ bool merge(FlowState &current, const FlowState &incoming) {
     current.ambiguous = current.ambiguous || incoming.ambiguous;
     const bool stack_changed = merge_value(current.stack_depth, incoming.stack_depth);
     const bool frame_changed = merge_value(current.frame_depth, incoming.frame_depth);
+    bool frame_register_delta_changed = false;
+    if (current.frame_register >= 0 && incoming.frame_register == current.frame_register) {
+        if (current.frame_register_delta.known && incoming.frame_register_delta.known) {
+            frame_register_delta_changed = merge_value(current.frame_register_delta, incoming.frame_register_delta);
+        } else if (current.frame_register_delta.known != incoming.frame_register_delta.known) {
+            current.frame_register_delta = {};
+            frame_register_delta_changed = true;
+        }
+    }
     if (current.frame_register != incoming.frame_register) {
         current.frame_register = -1;
         current.frame_depth = {};
+        current.frame_register_delta = {};
         current.ambiguous = true;
+    }
+    bool riscv_alias_changed = false;
+    for (std::size_t index = 1; index < current.riscv_stack_alias_depths.size(); ++index) {
+        auto &alias = current.riscv_stack_alias_depths[index];
+        const auto incoming_alias = incoming.riscv_stack_alias_depths[index];
+        if (!alias.known && incoming_alias.known) {
+            current.ambiguous = true;
+        } else if (alias.known && (!incoming_alias.known || alias.value != incoming_alias.value)) {
+            alias = {};
+            riscv_alias_changed = true;
+            current.ambiguous = true;
+        }
+    }
+    bool arm64_alias_changed = false;
+    for (std::size_t index = 0; index < current.arm64_stack_alias_depths.size(); ++index) {
+        auto &alias = current.arm64_stack_alias_depths[index];
+        const auto incoming_alias = incoming.arm64_stack_alias_depths[index];
+        if (!alias.known && incoming_alias.known) {
+            current.ambiguous = true;
+        } else if (alias.known && (!incoming_alias.known || alias.value != incoming_alias.value)) {
+            alias = {};
+            arm64_alias_changed = true;
+            current.ambiguous = true;
+        }
+    }
+    bool m6502_alias_changed = false;
+    for (std::size_t index = 0; index < current.m6502_stack_alias_deltas.size(); ++index) {
+        auto &alias = current.m6502_stack_alias_deltas[index];
+        const auto incoming_alias = incoming.m6502_stack_alias_deltas[index];
+        if (!alias.known && incoming_alias.known) {
+            current.ambiguous = true;
+        } else if (alias.known && (!incoming_alias.known || alias.value != incoming_alias.value)) {
+            alias = {};
+            m6502_alias_changed = true;
+            current.ambiguous = true;
+        }
     }
     if (current.arm64_frame_pointer != incoming.arm64_frame_pointer) {
         current.arm64_frame_pointer = false;
@@ -136,7 +204,8 @@ bool merge(FlowState &current, const FlowState &incoming) {
         current.ambiguous = true;
     return stack_changed || frame_changed || previously_supported != current.supported ||
            previously_ambiguous != current.ambiguous || previous_frame_register != current.frame_register ||
-           previous_arm64_frame_pointer != current.arm64_frame_pointer;
+           previous_arm64_frame_pointer != current.arm64_frame_pointer || frame_register_delta_changed ||
+           riscv_alias_changed || arm64_alias_changed || m6502_alias_changed;
 }
 
 bool arm32_register(const std::optional<RegisterOperand> &value, std::uint8_t index) {
@@ -147,8 +216,62 @@ bool mips_register(const std::optional<RegisterOperand> &value, std::uint8_t ind
     return value && value->bank == RegisterBank::mips_gpr && value->index == index;
 }
 
+bool mips_stack_adjust(const Instruction &instruction) {
+    if (instruction.context.architecture == Architecture::mips32)
+        return instruction.opcode == Opcode::mips_addiu || instruction.opcode == Opcode::mips_addi;
+    if (instruction.context.architecture == Architecture::mips64)
+        return instruction.opcode == Opcode::mips64_daddi || instruction.opcode == Opcode::mips64_daddiu;
+    return false;
+}
+
 bool riscv_register(const std::optional<RegisterOperand> &value, std::uint8_t index) {
     return value && value->bank == RegisterBank::riscv_gpr && value->index == index;
+}
+
+// RV32I/RV64I logical operations are XLEN-wide. Only these zero identities
+// preserve a pointer; a word-sized result or any other mask is not a copy.
+std::optional<RegisterOperand> riscv_bitwise_copy_source(const Instruction &instruction) {
+    const bool rv32 = instruction.context.architecture == Architecture::riscv32 &&
+                      instruction.context.mode == ExecutionMode::rv32;
+    const bool rv64 = instruction.context.architecture == Architecture::riscv64 &&
+                      (instruction.context.mode == ExecutionMode::rv64 ||
+                       instruction.context.mode == ExecutionMode::rv64c);
+    const bool register_form = instruction.opcode == Opcode::rv_or || instruction.opcode == Opcode::rv_xor;
+    const bool immediate_form = instruction.opcode == Opcode::rv_ori || instruction.opcode == Opcode::rv_xori;
+    if ((!rv32 && !rv64) || (!register_form && !immediate_form) || instruction.operands.size() != 3 ||
+        instruction.access != std::vector<OperandAccess>{OperandAccess::write, OperandAccess::read,
+                                                        OperandAccess::read} ||
+        instruction.flow != FlowKind::fallthrough || instruction.delay_slots ||
+        instruction.memory_read || instruction.memory_write || instruction.csr_read || instruction.csr_write ||
+        instruction.writes_fflags || instruction.reads_fflags || instruction.reads_frm)
+        return {};
+    const auto width = static_cast<std::uint16_t>(rv32 ? 32 : 64);
+    const auto full_gpr = [width](const std::optional<RegisterOperand> &reg) {
+        return reg && reg->bank == RegisterBank::riscv_gpr && reg->index < 32 &&
+               reg->width == width && !reg->high_byte;
+    };
+    const auto destination = register_at(instruction, 0);
+    auto source = register_at(instruction, 1);
+    if (!full_gpr(destination) || destination->index == 0 || !full_gpr(source))
+        return {};
+    if (register_form) {
+        const auto third = register_at(instruction, 2);
+        if (!full_gpr(third) || (source->index != 0 && third->index != 0))
+            return {};
+        if (source->index == 0)
+            source = third;
+    } else {
+        const auto *immediate = std::get_if<ImmediateOperand>(&instruction.operands[2]);
+        if (!immediate || immediate->value != 0 || immediate->encoded_width != 12 ||
+            immediate->effective_width != width || !immediate->is_signed)
+            return {};
+    }
+    const auto expected_reads = source->index == 0 ? std::vector<RegisterOperand>{}
+                                                  : std::vector<RegisterOperand>{*source};
+    if (instruction.register_reads != expected_reads ||
+        instruction.register_writes != std::vector<RegisterOperand>{*destination})
+        return {};
+    return source;
 }
 
 bool ppc_register(const std::optional<RegisterOperand> &value, std::uint8_t index) {
@@ -239,6 +362,155 @@ bool record_stack_slot(StackFrameAnalysis &result, std::int64_t offset, std::uin
     return record_slot_access(known, read, written, false, site, detail_count);
 }
 
+void mark_incoming_x86_32_argument(StackFrameAnalysis &result, std::int64_t offset, std::uint16_t width,
+                                   std::optional<std::uint16_t> callee_cleanup_bytes) {
+    if (offset < 4) return; // Entry-SP+0 is the near-call return address.
+    const auto slot = std::find_if(result.slots.begin(), result.slots.end(), [&](const auto &candidate) {
+        return candidate.offset_from_entry_sp == offset && candidate.width == width;
+    });
+    if (slot != result.slots.end()) {
+        slot->incoming_argument = true;
+        const auto slot_end = width % 8 == 0 && width != 0 &&
+            offset <= INT64_MAX - static_cast<std::int64_t>(width / 8)
+                ? offset + static_cast<std::int64_t>(width / 8) : INT64_MAX;
+        const auto cleanup_end = callee_cleanup_bytes
+            ? std::int64_t{4} + *callee_cleanup_bytes : std::int64_t{4};
+        slot->incoming_argument_abi = callee_cleanup_bytes && *callee_cleanup_bytes != 0 &&
+            slot_end <= cleanup_end ? StackArgumentAbi::x86_32_callee_cleanup
+                                    : StackArgumentAbi::x86_32_near_call;
+    }
+}
+
+std::optional<std::uint16_t> x86_32_callee_cleanup_bytes(
+    const FunctionRecord &function,
+    const std::map<std::uint64_t, std::shared_ptr<const BasicBlock>> &blocks) {
+    if (!function.complete) return {};
+    std::optional<std::uint16_t> cleanup;
+    bool saw_return = false;
+    for (const auto id : function.blocks) {
+        const auto block = blocks.find(id.value);
+        if (block == blocks.end() || !block->second) return {};
+        for (const auto &fact : block->second->instructions) {
+            if (!fact) return {};
+            const auto &instruction = fact->instruction;
+            if (instruction.context.architecture != Architecture::x86 ||
+                instruction.context.mode != ExecutionMode::x86_32 || instruction.flow != FlowKind::ret)
+                continue;
+            if (instruction.opcode != Opcode::ret || instruction.operands.size() > 1) return {};
+            std::uint16_t bytes = 0;
+            if (!instruction.operands.empty()) {
+                const auto *immediate = std::get_if<ImmediateOperand>(&instruction.operands.front());
+                if (!immediate || immediate->encoded_width != 16 || immediate->effective_width != 16 ||
+                    immediate->is_signed || immediate->value > UINT16_MAX)
+                    return {};
+                bytes = static_cast<std::uint16_t>(immediate->value);
+            }
+            if (cleanup && *cleanup != bytes) return {};
+            cleanup = bytes;
+            saw_return = true;
+        }
+    }
+    return saw_return && cleanup && *cleanup != 0 ? cleanup : std::nullopt;
+}
+
+void mark_incoming_aarch64_argument(StackFrameAnalysis &result, std::int64_t offset, std::uint16_t width,
+                                    bool read) {
+    if (offset < 0 || !read) return;
+    const auto slot = std::find_if(result.slots.begin(), result.slots.end(), [&](const auto &candidate) {
+        return candidate.offset_from_entry_sp == offset && candidate.width == width;
+    });
+    if (slot != result.slots.end()) {
+        slot->incoming_argument = true;
+        slot->incoming_argument_abi = StackArgumentAbi::aapcs64;
+    }
+}
+
+void mark_incoming_aapcs32_argument(StackFrameAnalysis &result, std::int64_t offset, std::uint16_t width,
+                                    bool read) {
+    // AAPCS32 places overflow arguments at the entry stack pointer after r0-r3.
+    if (offset < 0 || !read) return;
+    const auto slot = std::find_if(result.slots.begin(), result.slots.end(), [&](const auto &candidate) {
+        return candidate.offset_from_entry_sp == offset && candidate.width == width;
+    });
+    if (slot != result.slots.end()) {
+        slot->incoming_argument = true;
+        slot->incoming_argument_abi = StackArgumentAbi::aapcs32;
+    }
+}
+
+void mark_incoming_mips_o32_argument(StackFrameAnalysis &result, std::int64_t offset, std::uint16_t width,
+                                     bool read) {
+    // O32 reserves four 32-bit argument home words; overflow arguments begin at entry SP + 16.
+    if (offset < 16 || !read) return;
+    const auto slot = std::find_if(result.slots.begin(), result.slots.end(), [&](const auto &candidate) {
+        return candidate.offset_from_entry_sp == offset && candidate.width == width;
+    });
+    if (slot != result.slots.end()) {
+        slot->incoming_argument = true;
+        slot->incoming_argument_abi = StackArgumentAbi::mips_o32;
+    }
+}
+
+void mark_incoming_mips_n64_argument(StackFrameAnalysis &result, std::int64_t offset, std::uint16_t width,
+                                     bool read) {
+    // N64 overflow arguments are placed at the callee's entry SP after A0-A7.
+    // The classifier's first stack argument is at +0; writes alone do not
+    // establish that a slot contains an incoming value.
+    if (offset < 0 || !read) return;
+    const auto slot = std::find_if(result.slots.begin(), result.slots.end(), [&](const auto &candidate) {
+        return candidate.offset_from_entry_sp == offset && candidate.width == width;
+    });
+    if (slot != result.slots.end()) {
+        slot->incoming_argument = true;
+        slot->incoming_argument_abi = StackArgumentAbi::mips_n64;
+    }
+}
+
+void mark_incoming_ppc64_elfv2_argument(StackFrameAnalysis &result, std::int64_t offset, std::uint16_t width,
+                                       bool read) {
+    // ELFv2's parameter save area starts at entry SP+32 and reserves eight
+    // doublewords for r3-r10; overflow argument locations begin at +96.
+    if (offset < 96 || !read) return;
+    const auto slot = std::find_if(result.slots.begin(), result.slots.end(), [&](const auto &candidate) {
+        return candidate.offset_from_entry_sp == offset && candidate.width == width;
+    });
+    if (slot != result.slots.end()) {
+        slot->incoming_argument = true;
+        slot->incoming_argument_abi = StackArgumentAbi::ppc64le_elfv2;
+    }
+}
+
+void mark_incoming_riscv_argument(StackFrameAnalysis &result, std::int64_t offset, std::uint16_t width,
+                                  bool read, ExecutionMode mode) {
+    // The base integer psABI places overflow arguments at the callee's entry
+    // SP, after the a0-a7 register argument bank. A negative offset is local
+    // storage; a write-only access is not evidence of an incoming value.
+    if (offset < 0 || !read) return;
+    const auto slot = std::find_if(result.slots.begin(), result.slots.end(), [&](const auto &candidate) {
+        return candidate.offset_from_entry_sp == offset && candidate.width == width;
+    });
+    if (slot != result.slots.end()) {
+        slot->incoming_argument = true;
+        slot->incoming_argument_abi = mode == ExecutionMode::rv32
+            ? StackArgumentAbi::riscv32 : StackArgumentAbi::riscv64;
+    }
+}
+
+void mark_incoming_x86_64_argument(StackFrameAnalysis &result, std::int64_t offset, std::uint16_t width,
+                                   bool read, CallingConvention convention) {
+    if (!read) return;
+    const std::int64_t first_argument_offset = convention == CallingConvention::windows_x64 ? 40 : 8;
+    if (offset < first_argument_offset) return;
+    const auto slot = std::find_if(result.slots.begin(), result.slots.end(), [&](const auto &candidate) {
+        return candidate.offset_from_entry_sp == offset && candidate.width == width;
+    });
+    if (slot != result.slots.end()) {
+        slot->incoming_argument = true;
+        slot->incoming_argument_abi = convention == CallingConvention::windows_x64
+            ? StackArgumentAbi::windows_x64 : StackArgumentAbi::sysv_x86_64;
+    }
+}
+
 // Transfer only the x86 stack operations whose meaning is explicit in the
 // decoded operands. Any other write to SP/BP invalidates that register's
 // symbolic relation instead of guessing from mnemonic text.
@@ -246,28 +518,168 @@ bool transfer(const Instruction &instruction, FlowState &state) {
     const auto first = register_at(instruction, 0);
     const auto second = register_at(instruction, 1);
     if (instruction.context.architecture == Architecture::mos6502) {
+        const auto has_register = [](const std::vector<RegisterOperand> &registers, std::uint8_t index) {
+            return std::find(registers.begin(), registers.end(),
+                             RegisterOperand{RegisterBank::mos6502, index, 8, false}) != registers.end();
+        };
         switch (instruction.opcode) {
+        case Opcode::m6502_jsr:
+            // A callee may overwrite any general register. Keep the caller's
+            // entry-relative S depth (JSR/RTS is balanced), but do not let a
+            // stale TSX snapshot in X or a transferred A/Y alias justify a
+            // later TXS restore.
+            state.frame_depth = {};
+            state.frame_register = -1;
+            state.frame_register_delta = {};
+            state.m6502_stack_alias_deltas = {};
+            return true;
         case Opcode::m6502_rts:
         case Opcode::m6502_rti:
+            return true;
         case Opcode::m6502_tsx:
+            // TSX gives X a stable, byte-wide snapshot of the hardware stack
+            // pointer. Keep its entry-relative depth as a frame base until X
+            // is overwritten.
+            if (instruction.flow != FlowKind::fallthrough || !has_register(instruction.register_reads, 4) ||
+                !has_register(instruction.register_writes, 1)) {
+                state.frame_depth = {};
+                state.frame_register = -1;
+                state.frame_register_delta = {};
+                state.m6502_stack_alias_deltas = {};
+                state.supported = false;
+                return true;
+            }
+            state.frame_depth = state.stack_depth;
+            state.frame_register = -1;
+            state.frame_register_delta = {};
+            state.m6502_stack_alias_deltas = {};
+            state.m6502_stack_alias_deltas[1] = {true, 0};
+            if (!state.frame_depth.known || state.frame_depth.value < -127 || state.frame_depth.value > 127) {
+                state.frame_depth = {};
+                state.m6502_stack_alias_deltas = {};
+                state.supported = false;
+            }
             return true;
         case Opcode::m6502_txs:
+            // TXS copies the X snapshot back to S. If TSX established X as a
+            // stack snapshot and X has not been clobbered, this restores the
+            // exact previously observed stack depth (even after intervening
+            // pushes and pulls).
+            if (instruction.flow == FlowKind::fallthrough && has_register(instruction.register_reads, 1) &&
+                has_register(instruction.register_writes, 4) && state.frame_depth.known &&
+                state.m6502_stack_alias_deltas[1].known) {
+                std::int64_t restored_depth = 0;
+                if (subtract_checked(state.frame_depth.value, state.m6502_stack_alias_deltas[1].value, restored_depth) &&
+                    restored_depth >= -127 && restored_depth <= 127) {
+                    state.stack_depth = {true, restored_depth};
+                    return true;
+                }
+            }
             state.stack_depth = {};
             state.supported = false;
             return true;
+        case Opcode::m6502_inx:
+        case Opcode::m6502_dex:
+        case Opcode::m6502_iny:
+        case Opcode::m6502_dey:
+            {
+                const bool updates_x = instruction.opcode == Opcode::m6502_inx ||
+                                       instruction.opcode == Opcode::m6502_dex;
+                const auto index = static_cast<std::size_t>(updates_x ? 1 : 2);
+                auto &alias = state.m6502_stack_alias_deltas[index];
+                if (!alias.known) break;
+                if (instruction.flow != FlowKind::fallthrough || !has_register(instruction.register_reads, index) ||
+                    !has_register(instruction.register_writes, index)) {
+                    alias = {};
+                    state.supported = false;
+                    return true;
+                }
+                const auto delta = instruction.opcode == Opcode::m6502_inx ||
+                                           instruction.opcode == Opcode::m6502_iny ? 1 : -1;
+                if (add_checked(alias.value, delta, alias.value) &&
+                    alias.value >= -127 && alias.value <= 127)
+                    return true;
+                alias = {};
+                state.supported = false;
+                return true;
+            }
+        case Opcode::m6502_tax:
+        case Opcode::m6502_tay:
+        case Opcode::m6502_txa:
+        case Opcode::m6502_tya: {
+            const int source = instruction.opcode == Opcode::m6502_tax || instruction.opcode == Opcode::m6502_tay
+                                   ? 0
+                                   : instruction.opcode == Opcode::m6502_txa ? 1 : 2;
+            const int destination = instruction.opcode == Opcode::m6502_tax || instruction.opcode == Opcode::m6502_txa
+                                        ? 1
+                                        : instruction.opcode == Opcode::m6502_tay ? 2 : 0;
+            const auto source_index = static_cast<std::size_t>(source);
+            const auto destination_index = static_cast<std::size_t>(destination);
+            const RegisterOperand source_register{RegisterBank::mos6502, static_cast<std::uint8_t>(source), 8, false};
+            const RegisterOperand destination_register{RegisterBank::mos6502,
+                static_cast<std::uint8_t>(destination), 8, false};
+            if (instruction.flow != FlowKind::fallthrough ||
+                std::find(instruction.register_reads.begin(), instruction.register_reads.end(), source_register) ==
+                    instruction.register_reads.end() ||
+                std::find(instruction.register_writes.begin(), instruction.register_writes.end(), destination_register) ==
+                    instruction.register_writes.end()) {
+                state.m6502_stack_alias_deltas[destination_index] = {};
+                state.supported = false;
+                return true;
+            }
+            // These instructions copy rather than move; preserve the source
+            // alias and independently carry or clear the destination alias.
+            state.m6502_stack_alias_deltas[destination_index] =
+                state.m6502_stack_alias_deltas[source_index];
+            return true;
+        }
         case Opcode::m6502_pha:
         case Opcode::m6502_php:
             return add(state.stack_depth, 1);
         case Opcode::m6502_pla:
+            state.m6502_stack_alias_deltas[0] = {};
+            return add(state.stack_depth, -1);
         case Opcode::m6502_plp:
             return add(state.stack_depth, -1);
         default:
             break;
         }
     }
+    const bool riscv_instruction = instruction.context.architecture == Architecture::riscv32 ||
+                                   instruction.context.architecture == Architecture::riscv64;
+    if (riscv_instruction && instruction.opcode != Opcode::rv_addi) {
+        if (instruction.flow == FlowKind::call) {
+            for (auto &alias : state.riscv_stack_alias_depths) alias = {};
+        } else {
+            const auto copy_source = riscv_bitwise_copy_source(instruction);
+            const bool preserves_alias = copy_source && copy_source->index != 0 &&
+                (copy_source->index == 2 ||
+                 (copy_source->index == 8 && state.frame_register == 8) ||
+                 state.riscv_stack_alias_depths[copy_source->index].known);
+            const auto invalidate_alias = [&](const RegisterOperand &reg) {
+                if (!preserves_alias && reg.bank == RegisterBank::riscv_gpr && reg.index != 0 && reg.index < 32)
+                    state.riscv_stack_alias_depths[reg.index] = {};
+            };
+            for (const auto &reg : instruction.register_writes) invalidate_alias(reg);
+            for (std::size_t index = 0; index < instruction.operands.size(); ++index) {
+                if (index >= instruction.access.size() ||
+                    (instruction.access[index] != OperandAccess::write &&
+                     instruction.access[index] != OperandAccess::read_write))
+                    continue;
+                if (const auto reg = register_at(instruction, index)) invalidate_alias(*reg);
+            }
+        }
+    }
     if ((instruction.context.architecture == Architecture::x86 ||
          instruction.context.architecture == Architecture::x86_64) &&
         instruction.flow == FlowKind::ret)
+        return true;
+    // A recovered near call pushes a return address and a normally returning
+    // callee removes it. Keep the caller-visible depth unchanged at the call
+    // boundary; outgoing arguments remain present until caller cleanup.
+    if ((instruction.context.architecture == Architecture::x86 ||
+         instruction.context.architecture == Architecture::x86_64) &&
+        instruction.flow == FlowKind::call)
         return true;
     if ((instruction.context.architecture == Architecture::x86 ||
          instruction.context.architecture == Architecture::x86_64) &&
@@ -280,7 +692,9 @@ bool transfer(const Instruction &instruction, FlowState &state) {
         }
         return add(state.stack_depth, (instruction.opcode == Opcode::pusha ? 8 : -8) * bytes);
     }
-    if (instruction.opcode == Opcode::push || instruction.opcode == Opcode::pop) {
+    const bool x86_push = instruction.opcode == Opcode::push || instruction.opcode == Opcode::pushf;
+    const bool x86_pop = instruction.opcode == Opcode::pop || instruction.opcode == Opcode::popf;
+    if (x86_push || x86_pop) {
         std::int64_t bytes = instruction.stack_value_width / 8;
         if (!bytes && first)
             bytes = first->width / 8;
@@ -297,7 +711,7 @@ bool transfer(const Instruction &instruction, FlowState &state) {
             state.frame_depth = {};
             state.frame_register = -1;
         }
-        return add(state.stack_depth, instruction.opcode == Opcode::push ? bytes : -bytes);
+        return add(state.stack_depth, x86_push ? bytes : -bytes);
     }
     if ((instruction.context.architecture == Architecture::x86 ||
          instruction.context.architecture == Architecture::x86_64) &&
@@ -382,19 +796,22 @@ bool transfer(const Instruction &instruction, FlowState &state) {
         if (!add(state.stack_depth, remainder)) return false;
         return true;
     }
-    if (instruction.opcode == Opcode::mov && is_gpr(first, 5) && is_gpr(second, 4)) {
+    const auto stack_pointer_width = static_cast<std::uint8_t>(pointer_bytes(instruction) * 8);
+    const bool full_width_x86 =
+        (instruction.context.architecture == Architecture::x86 ||
+         instruction.context.architecture == Architecture::x86_64) &&
+        stack_pointer_width != 0 && first && second &&
+        first->width == stack_pointer_width && second->width == stack_pointer_width;
+    if (full_width_x86 && instruction.opcode == Opcode::mov && is_gpr(first, 5) && is_gpr(second, 4)) {
         state.frame_depth = state.stack_depth;
         state.frame_register = 5;
         return true;
     }
-    if (instruction.opcode == Opcode::mov && is_gpr(first, 4) && is_gpr(second, 5)) {
+    if (full_width_x86 && instruction.opcode == Opcode::mov && is_gpr(first, 4) && is_gpr(second, 5)) {
         state.stack_depth = state.frame_depth;
         return true;
     }
-    if ((instruction.context.architecture == Architecture::mips32 ||
-         instruction.context.architecture == Architecture::mips64) &&
-        (instruction.opcode == Opcode::mips_addiu || instruction.opcode == Opcode::mips_addi ||
-         instruction.opcode == Opcode::mips64_daddi || instruction.opcode == Opcode::mips64_daddiu) &&
+    if (mips_stack_adjust(instruction) &&
         instruction.operands.size() >= 3) {
         const auto immediate = immediate_value(instruction, 2);
         const bool dst_stack = mips_register(first, 29);
@@ -414,19 +831,49 @@ bool transfer(const Instruction &instruction, FlowState &state) {
          instruction.context.architecture == Architecture::riscv64) &&
         instruction.opcode == Opcode::rv_addi && instruction.operands.size() >= 3) {
         const auto immediate = immediate_value(instruction, 2);
-        const bool dst_stack = riscv_register(first, 2);
-        const bool dst_frame = riscv_register(first, 8);
-        const bool src_stack = riscv_register(second, 2);
-        const bool src_frame = riscv_register(second, 8);
-        if (immediate && ((dst_stack && (src_stack || src_frame)) ||
-                          (dst_frame && (src_stack || src_frame)))) {
-            FlowValue relation = src_stack ? state.stack_depth : state.frame_depth;
-            if (!subtract_checked(relation.value, *immediate, relation.value)) return false;
-            if (!relation.known) state.supported = false;
-            if (dst_stack) state.stack_depth = relation;
-            else { state.frame_depth = relation; state.frame_register = 8; }
-            return true;
+        const auto width = static_cast<std::uint8_t>(pointer_bytes(instruction) * 8);
+        const bool valid_form = first && second && first->bank == RegisterBank::riscv_gpr &&
+            second->bank == RegisterBank::riscv_gpr && first->index < 32 && second->index < 32 &&
+            first->width == width && second->width == width && instruction.flow == FlowKind::fallthrough &&
+            instruction.access == std::vector<OperandAccess>{OperandAccess::write, OperandAccess::read,
+                                                              OperandAccess::read};
+        if (valid_form && immediate) {
+            FlowValue base;
+            bool stack_derived = false;
+            if (riscv_register(second, 2)) {
+                base = state.stack_depth;
+                stack_derived = true;
+            } else if (riscv_register(second, 8) && state.frame_register == 8) {
+                base = state.frame_depth;
+                stack_derived = true;
+            } else if (second->index != 0 && state.riscv_stack_alias_depths[second->index].known) {
+                base = state.riscv_stack_alias_depths[second->index];
+                stack_derived = true;
+            }
+            FlowValue relation = base;
+            if (relation.known && !subtract_checked(relation.value, *immediate, relation.value)) {
+                state.riscv_stack_alias_depths[first->index] = {};
+                return false;
+            }
+            if (riscv_register(first, 2)) {
+                if (!relation.known) state.supported = false;
+                state.stack_depth = relation;
+                return true;
+            }
+            if (riscv_register(first, 8)) {
+                if (!relation.known) state.supported = false;
+                state.frame_depth = relation;
+                state.frame_register = 8;
+                return true;
+            }
+            if (first->index != 0) {
+                state.riscv_stack_alias_depths[first->index] = relation;
+                if (stack_derived && !relation.known) state.supported = false;
+                return true;
+            }
         }
+        if (first && first->bank == RegisterBank::riscv_gpr && first->index != 0 && first->index < 32)
+            state.riscv_stack_alias_depths[first->index] = {};
     }
     if (instruction.context.architecture == Architecture::powerpc &&
         instruction.opcode == Opcode::ppc_addi && instruction.operands.size() >= 3) {
@@ -523,6 +970,43 @@ bool transfer(const Instruction &instruction, FlowState &state) {
         if (riscv_register(first, 8) && riscv_register(source, 2)) {
             state.frame_depth = state.stack_depth;
             state.frame_register = 8;
+            return true;
+        }
+    }
+    if (const auto source = riscv_bitwise_copy_source(instruction)) {
+        if (first->index == source->index && (first->index == 2 || first->index == 8))
+            return true;
+        if (first->index == 2 && source->index == 8) {
+            state.stack_depth = state.frame_register == 8 ? state.frame_depth : FlowValue{};
+            state.supported = state.supported && state.stack_depth.known;
+            return true;
+        }
+        if (first->index == 8 && source->index == 2) {
+            state.frame_depth = state.stack_depth;
+            state.frame_register = 8;
+            state.supported = state.supported && state.frame_depth.known;
+            return true;
+        }
+        // Preserve an exact stack relation through the XLEN-wide logical
+        // copy identities accepted above. The source relation can come from
+        // SP, the established frame pointer, or an earlier ADDI-derived
+        // temporary. The helper has already validated the complete register
+        // effects, so do not infer this from operands alone.
+        if (first->index != 0 && first->index != 2 && first->index != 8) {
+            FlowValue relation;
+            bool stack_derived = false;
+            if (source->index == 2) {
+                relation = state.stack_depth;
+                stack_derived = true;
+            } else if (source->index == 8 && state.frame_register == 8) {
+                relation = state.frame_depth;
+                stack_derived = true;
+            } else if (source->index != 0) {
+                relation = state.riscv_stack_alias_depths[source->index];
+                stack_derived = relation.known;
+            }
+            if (stack_derived)
+                state.riscv_stack_alias_depths[first->index] = relation;
             return true;
         }
     }
@@ -678,33 +1162,59 @@ bool transfer(const Instruction &instruction, FlowState &state) {
     };
     if (instruction.context.architecture == Architecture::arm64 &&
         (instruction.opcode == Opcode::a64_add || instruction.opcode == Opcode::a64_sub) &&
-        instruction.operands.size() >= 3 &&
-        ((arm64_sp(first) && arm64_sp(second)) ||
-         (arm64_sp(first) && second && second->bank == RegisterBank::arm64_gpr && second->index == 29) ||
-         (first && first->bank == RegisterBank::arm64_gpr && first->index == 29 && arm64_sp(second)))) {
+        instruction.operands.size() >= 3) {
         const auto immediate = immediate_value(instruction, 2);
-        if (immediate) {
-            const bool destination_is_sp = arm64_sp(first);
-            const bool source_is_frame = second && second->bank == RegisterBank::arm64_gpr && second->index == 29;
-            if (destination_is_sp && source_is_frame && !state.arm64_frame_pointer) {
-                state.stack_depth = {};
-                state.supported = false;
+        const bool destination_is_sp = arm64_sp(first);
+        const bool destination_is_gpr = first && first->bank == RegisterBank::arm64_gpr && first->index < 31;
+        const bool valid_form = immediate && first && second &&
+            (destination_is_sp || destination_is_gpr) && first->width == 64 && second->width == 64 &&
+            instruction.flow == FlowKind::fallthrough &&
+            instruction.access == std::vector<OperandAccess>{OperandAccess::write, OperandAccess::read,
+                                                              OperandAccess::read};
+        if (valid_form) {
+            FlowValue base;
+            bool stack_derived = false;
+            if (arm64_sp(second)) {
+                base = state.stack_depth;
+                stack_derived = true;
+            } else if (second->bank == RegisterBank::arm64_gpr && second->index == 29 &&
+                       state.arm64_frame_pointer) {
+                base = state.frame_depth;
+                stack_derived = true;
+            } else if (second->bank == RegisterBank::arm64_gpr && second->index < 31 &&
+                       state.arm64_stack_alias_depths[second->index].known) {
+                base = state.arm64_stack_alias_depths[second->index];
+                stack_derived = true;
+            }
+            FlowValue relation = base;
+            if (relation.known) {
+                const auto delta = instruction.opcode == Opcode::a64_sub ? *immediate : -*immediate;
+                if (!add(relation, delta)) {
+                    if (destination_is_sp) state.stack_depth = {};
+                    else if (first->index == 29) {
+                        state.frame_depth = {};
+                        state.arm64_frame_pointer = false;
+                    } else state.arm64_stack_alias_depths[first->index] = {};
+                    return false;
+                }
+            }
+            if (destination_is_sp) {
+                if (!stack_derived || !relation.known) state.supported = false;
+                state.stack_depth = relation;
                 return true;
             }
-            FlowValue relation = destination_is_sp && source_is_frame ? state.frame_depth : state.stack_depth;
-            if (instruction.opcode != Opcode::a64_sub && *immediate == INT64_MIN)
-                return false;
-            const auto delta = instruction.opcode == Opcode::a64_sub ? *immediate : -*immediate;
-            if (!add(relation, delta))
-                return false;
-            if (destination_is_sp)
-                state.stack_depth = relation;
-            else {
+            if (first->index == 29) {
                 state.frame_depth = relation;
-                state.arm64_frame_pointer = true;
+                state.arm64_frame_pointer = stack_derived && relation.known;
+                if (stack_derived && !relation.known) state.supported = false;
+                return true;
             }
+            state.arm64_stack_alias_depths[first->index] = stack_derived ? relation : FlowValue{};
+            if (stack_derived && !relation.known) state.supported = false;
             return true;
         }
+        if (first && first->bank == RegisterBank::arm64_gpr && first->index < 31 && first->index != 29)
+            state.arm64_stack_alias_depths[first->index] = {};
     }
 
     // Pair and scalar load/store writeback through SP is a common AArch64
@@ -713,21 +1223,52 @@ bool transfer(const Instruction &instruction, FlowState &state) {
     // it in entry-SP coordinates instead of treating the SP write as unknown.
     if (instruction.context.architecture == Architecture::arm64) {
         const MemoryOperand *stack_writeback = nullptr;
+        bool alias_writeback = false;
         for (const auto &operand : instruction.operands) {
             const auto *memory = std::get_if<MemoryOperand>(&operand);
-            if (!memory || !memory->base || memory->base->bank != RegisterBank::arm64_sp || !memory->writeback)
+            if (!memory || !memory->base || !memory->writeback)
                 continue;
+            const bool stack_base = memory->base->bank == RegisterBank::arm64_sp;
+            const bool alias_base = memory->base->bank == RegisterBank::arm64_gpr &&
+                                    memory->base->index < state.arm64_stack_alias_depths.size() &&
+                                    state.arm64_stack_alias_depths[memory->base->index].known;
+            if (!stack_base && !alias_base) continue;
             if (stack_writeback || memory->address_width != 64 || memory->index || memory->scale != 1) {
                 state.stack_depth = {};
                 state.supported = false;
                 return true;
             }
             stack_writeback = memory;
+            alias_writeback = alias_base;
         }
         if (stack_writeback) {
+            FlowValue *depth = &state.stack_depth;
+            if (alias_writeback) {
+                depth = &state.arm64_stack_alias_depths[stack_writeback->base->index];
+                const auto base_index = stack_writeback->base->index;
+                bool destination_overlap = false;
+                for (std::size_t index = 0; index < instruction.operands.size() &&
+                     index < instruction.access.size(); ++index) {
+                    const auto *reg = std::get_if<RegisterOperand>(&instruction.operands[index]);
+                    if (reg && instruction.access[index] != OperandAccess::read &&
+                        reg->bank == RegisterBank::arm64_gpr && reg->index == base_index) {
+                        destination_overlap = true;
+                        break;
+                    }
+                }
+                if (destination_overlap) {
+                    *depth = {};
+                    state.supported = false;
+                    return true;
+                }
+            }
             if (stack_writeback->writeback_displacement == INT64_MIN ||
-                !add(state.stack_depth, -stack_writeback->writeback_displacement))
+                !add(*depth, -stack_writeback->writeback_displacement))
                 return false;
+            for (const auto &reg : instruction.register_writes)
+                if (reg.bank == RegisterBank::arm64_gpr && reg.index < state.arm64_stack_alias_depths.size() &&
+                    (!alias_writeback || reg.index != stack_writeback->base->index))
+                    state.arm64_stack_alias_depths[reg.index] = {};
             if (std::any_of(instruction.register_writes.begin(), instruction.register_writes.end(),
                     [](const RegisterOperand &reg) {
                         return reg.bank == RegisterBank::arm64_gpr && reg.index == 29;
@@ -736,6 +1277,23 @@ bool transfer(const Instruction &instruction, FlowState &state) {
                 state.arm64_frame_pointer = false;
             }
             return true;
+        }
+    }
+
+    if (instruction.context.architecture == Architecture::arm64) {
+        if (instruction.flow == FlowKind::call) {
+            for (auto &alias : state.arm64_stack_alias_depths) alias = {};
+        } else {
+            for (const auto &reg : instruction.register_writes)
+                if (reg.bank == RegisterBank::arm64_gpr && reg.index < state.arm64_stack_alias_depths.size())
+                    state.arm64_stack_alias_depths[reg.index] = {};
+            for (std::size_t index = 0; index < instruction.operands.size() &&
+                 index < instruction.access.size(); ++index) {
+                const auto *reg = std::get_if<RegisterOperand>(&instruction.operands[index]);
+                if (reg && instruction.access[index] != OperandAccess::read &&
+                    reg->bank == RegisterBank::arm64_gpr && reg->index < state.arm64_stack_alias_depths.size())
+                    state.arm64_stack_alias_depths[reg->index] = {};
+            }
         }
     }
 
@@ -769,6 +1327,9 @@ bool transfer(const Instruction &instruction, FlowState &state) {
             if (reg.index == 1) wrote_stack = true;
             if (state.frame_register == 31 && reg.index == 31) wrote_frame = true;
         }
+        if (instruction.context.architecture == Architecture::mos6502 &&
+            reg.bank == RegisterBank::mos6502 && reg.index < state.m6502_stack_alias_deltas.size())
+            state.m6502_stack_alias_deltas[reg.index] = {};
     }
     for (std::size_t i = 0; i < instruction.operands.size(); ++i) {
         if (i >= instruction.access.size() ||
@@ -799,6 +1360,9 @@ bool transfer(const Instruction &instruction, FlowState &state) {
             wrote_stack = wrote_stack || reg->index == 1;
             wrote_frame = wrote_frame || (state.frame_register == 31 && reg->index == 31);
         }
+        if (instruction.context.architecture == Architecture::mos6502 && reg &&
+            reg->bank == RegisterBank::mos6502 && reg->index < state.m6502_stack_alias_deltas.size())
+            state.m6502_stack_alias_deltas[reg->index] = {};
     }
     if (wrote_stack) {
         state.stack_depth = {};
@@ -807,6 +1371,7 @@ bool transfer(const Instruction &instruction, FlowState &state) {
     if (wrote_frame) {
         state.frame_depth = {};
         state.frame_register = -1;
+        state.frame_register_delta = {};
         state.arm64_frame_pointer = false;
     }
     return true;
@@ -814,8 +1379,34 @@ bool transfer(const Instruction &instruction, FlowState &state) {
 
 } // namespace
 
+std::optional<CallingConvention> default_stack_calling_convention(const ImageMetadata &metadata) {
+    if (metadata.pe) return CallingConvention::windows_x64;
+    if (metadata.elf) {
+        constexpr std::uint16_t em_ppc64 = 21;
+        constexpr std::uint32_t ppc64_abi_mask = 0x3;
+        const auto &header = metadata.elf->header;
+        constexpr std::uint16_t em_mips = 8;
+        constexpr std::uint32_t ef_mips_abi2 = 0x20;
+        constexpr std::uint32_t ef_mips_abi_mask = 0xf000;
+        // N64 is the ELF64 MIPS ABI with neither the N32 marker nor a
+        // conflicting explicit ABI selector. Accept only generic SysV/Linux
+        // OSABI metadata; other MIPS environments have independent rules.
+        if (header.machine == em_mips && header.is_64 &&
+            (header.flags & (ef_mips_abi2 | ef_mips_abi_mask)) == 0 &&
+            (header.os_abi == 0 || header.os_abi == 3))
+            return CallingConvention::mips_n64;
+        if (header.machine == em_ppc64 && header.is_64 && header.order == ByteOrder::little &&
+            (header.flags & ppc64_abi_mask) == 2)
+            return CallingConvention::ppc64le_elfv2;
+        return CallingConvention::sysv_x86_64;
+    }
+    if (metadata.macho) return CallingConvention::sysv_x86_64;
+    return {};
+}
+
 Result<StackFrameAnalysis> analyze_stack_frame(const FunctionRecord &function, const FunctionSnapshot &snapshot,
-                                               std::stop_token stop) {
+                                               std::stop_token stop,
+                                               std::optional<CallingConvention> image_default_convention) {
     if (stop.stop_requested())
         return Error{ErrorCode::canceled, "Stack analysis canceled"};
     if (function.blocks.empty())
@@ -840,6 +1431,7 @@ Result<StackFrameAnalysis> analyze_stack_frame(const FunctionRecord &function, c
     }
     if (entry == blocks.end())
         return Error{ErrorCode::invalid_argument, "Function entry block is missing"};
+    const auto x86_32_cleanup = x86_32_callee_cleanup_bytes(function, blocks);
 
     std::map<std::uint64_t, FlowState> inputs;
     inputs[entry->first] = {true, {true, 0}, {}, true, false};
@@ -875,10 +1467,15 @@ Result<StackFrameAnalysis> analyze_stack_frame(const FunctionRecord &function, c
     std::size_t access_detail_count = 0;
     bool stack_extent_known = function.complete;
     std::uint64_t maximum_stack_allocation = 0;
-    const auto observe_stack_depth = [&](FlowValue depth) {
+    std::size_t stack_call_argument_detail_count = 0;
+    const auto observe_stack_depth = [&](FlowValue depth, bool wrapping_page_stack = false) {
         if (!depth.known || depth.value < 0) {
             stack_extent_known = false;
             return;
+        }
+        if (wrapping_page_stack && depth.value > 256) {
+            result.complete = false;
+            depth.value = 256;
         }
         maximum_stack_allocation = std::max(maximum_stack_allocation,
                                              static_cast<std::uint64_t>(depth.value));
@@ -902,13 +1499,528 @@ Result<StackFrameAnalysis> analyze_stack_frame(const FunctionRecord &function, c
         if (block == blocks.end() || input == inputs.end() || !input->second.reachable)
             continue;
         auto state = input->second;
-        observe_stack_depth(state.stack_depth);
-        for (const auto &fact : block->second->instructions) {
+        const bool m6502_block = !block->second->instructions.empty() && block->second->instructions.front() &&
+            block->second->instructions.front()->instruction.context.architecture == Architecture::mos6502;
+        observe_stack_depth(state.stack_depth, m6502_block);
+        struct PendingX86Push {
+            std::int64_t offset = 0;
+            std::uint16_t width = 0;
+            Address instruction;
+        };
+        std::vector<PendingX86Push> pending_x86_pushes;
+        bool pending_x86_pushes_valid = true;
+        struct PendingArm64Store {
+            std::int64_t offset = 0;
+            std::uint16_t width = 0;
+            Address instruction;
+        };
+        std::vector<PendingArm64Store> pending_arm64_stores;
+        struct PendingRiscvStore {
+            std::int64_t offset = 0;
+            std::int64_t stack_depth = 0;
+            std::uint16_t width = 0;
+            Address instruction;
+        };
+        std::vector<PendingRiscvStore> pending_riscv_stores;
+        struct PendingPowerPCStore {
+            std::int64_t offset = 0;
+            std::int64_t stack_depth = 0;
+            std::uint16_t width = 0;
+            Address instruction;
+        };
+        std::vector<PendingPowerPCStore> pending_powerpc_stores;
+        struct PendingMipsStore {
+            std::int64_t offset = 0;
+            std::int64_t stack_depth = 0;
+            std::uint16_t width = 0;
+            Address instruction;
+        };
+        std::vector<PendingMipsStore> pending_mips_stores;
+        struct PendingArm32Store {
+            std::int64_t offset = 0;
+            std::int64_t stack_depth = 0;
+            std::uint16_t width = 0;
+            Address instruction;
+        };
+        std::vector<PendingArm32Store> pending_arm32_stores;
+        struct PendingWindowsShadowStore {
+            std::int64_t offset = 0;
+            std::int64_t stack_depth = 0;
+            std::uint16_t width = 0;
+            Address instruction;
+        };
+        std::vector<PendingWindowsShadowStore> pending_windows_shadow_stores;
+        for (std::size_t instruction_index = 0;
+             instruction_index < block->second->instructions.size(); ++instruction_index) {
             if (stop.stop_requested())
                 return Error{ErrorCode::canceled, "Stack analysis canceled"};
-            if (!fact)
+            const auto &fact = block->second->instructions[instruction_index];
+            if (!fact) {
+                pending_x86_pushes.clear();
+                pending_x86_pushes_valid = true;
+                pending_arm64_stores.clear();
+                pending_riscv_stores.clear();
+                pending_powerpc_stores.clear();
+                pending_mips_stores.clear();
+                pending_arm32_stores.clear();
+                pending_windows_shadow_stores.clear();
                 continue;
+            }
             const auto &instruction = fact->instruction;
+            const auto stack_depth_before_instruction = state.stack_depth;
+            const bool windows_x64_abi = instruction.context.architecture == Architecture::x86_64 &&
+                instruction.context.mode == ExecutionMode::x86_64 && image_default_convention &&
+                *image_default_convention == CallingConvention::windows_x64;
+            if (windows_x64_abi && instruction.flow == FlowKind::call) {
+                for (const auto &store : pending_windows_shadow_stores) {
+                    if (!state.stack_depth.known || store.stack_depth != state.stack_depth.value) continue;
+                    const auto slot = std::find_if(result.slots.begin(), result.slots.end(), [&](const auto &candidate) {
+                        return candidate.offset_from_entry_sp == store.offset && candidate.width == store.width;
+                    });
+                    if (slot == result.slots.end()) continue;
+                    const StackSlotCallArgument provenance{store.instruction, instruction.address,
+                        StackCallArgumentSourceKind::windows_x64_shadow_store};
+                    if (std::find(slot->outgoing_call_arguments.begin(), slot->outgoing_call_arguments.end(),
+                                  provenance) != slot->outgoing_call_arguments.end()) continue;
+                    if (stack_call_argument_detail_count >= 1'000'000) { result.complete = false; break; }
+                    slot->outgoing_call_arguments.push_back(provenance);
+                    ++stack_call_argument_detail_count;
+                }
+                pending_windows_shadow_stores.clear();
+            } else if (!windows_x64_abi || instruction.flow != FlowKind::fallthrough) {
+                pending_windows_shadow_stores.clear();
+            } else {
+                if (std::any_of(instruction.register_writes.begin(), instruction.register_writes.end(),
+                    [](const auto &reg) { return reg.bank == RegisterBank::gpr && reg.index == 4 && reg.width == 64; }))
+                    pending_windows_shadow_stores.clear();
+                bool captured_store = false;
+                if (instruction.memory_write && state.stack_depth.known && state.stack_depth.value >= 32) {
+                    for (std::size_t operand_index = 0; operand_index < instruction.operands.size(); ++operand_index) {
+                        const auto *memory = std::get_if<MemoryOperand>(&instruction.operands[operand_index]);
+                        if (!memory || operand_index >= instruction.access.size() ||
+                            instruction.access[operand_index] != OperandAccess::write || !memory->base ||
+                            memory->base->bank != RegisterBank::gpr || memory->base->index != 4 ||
+                            memory->base->width != 64 || memory->address_width != 64 || memory->index ||
+                            memory->ip_relative || memory->writeback || memory->post_index ||
+                            memory->displacement < 0 || memory->displacement >= 32 ||
+                            !memory->data_width || memory->data_width > 64 || memory->data_width % 8) continue;
+                        const auto width_bytes = static_cast<std::int64_t>(memory->data_width / 8);
+                        if (memory->displacement + width_bytes > 32) continue;
+                        std::int64_t offset = 0;
+                        if (!subtract_checked(memory->displacement, state.stack_depth.value, offset)) continue;
+                        if (pending_windows_shadow_stores.size() >= 1024) {
+                            pending_windows_shadow_stores.clear();
+                            break;
+                        }
+                        std::int64_t end = 0;
+                        if (!add_checked(offset, width_bytes, end)) continue;
+                        std::erase_if(pending_windows_shadow_stores, [&](const auto &previous) {
+                            std::int64_t previous_end = 0;
+                            if (!add_checked(previous.offset, previous.width / 8, previous_end)) return true;
+                            return offset < previous_end && previous.offset < end;
+                        });
+                        pending_windows_shadow_stores.push_back({offset, state.stack_depth.value,
+                            memory->data_width, instruction.address});
+                        captured_store = true;
+                    }
+                }
+                if (!captured_store && (instruction.memory_write || instruction.memory_read))
+                    pending_windows_shadow_stores.clear();
+            }
+            if (instruction.context.architecture == Architecture::arm64 &&
+                instruction.opcode == Opcode::a64_bl && instruction.flow == FlowKind::call) {
+                for (const auto &store : pending_arm64_stores) {
+                    const auto slot = std::find_if(result.slots.begin(), result.slots.end(), [&](const auto &candidate) {
+                        return candidate.offset_from_entry_sp == store.offset && candidate.width == store.width;
+                    });
+                    if (slot == result.slots.end()) continue;
+                    const StackSlotCallArgument provenance{store.instruction, instruction.address,
+                                                           StackCallArgumentSourceKind::aarch64_store};
+                    if (std::find(slot->outgoing_call_arguments.begin(), slot->outgoing_call_arguments.end(),
+                                  provenance) != slot->outgoing_call_arguments.end())
+                        continue;
+                    if (stack_call_argument_detail_count >= 1'000'000) {
+                        result.complete = false;
+                        break;
+                    }
+                    slot->outgoing_call_arguments.push_back(provenance);
+                    ++stack_call_argument_detail_count;
+                }
+                pending_arm64_stores.clear();
+            } else if (instruction.context.architecture == Architecture::arm64 &&
+                       instruction.flow != FlowKind::fallthrough) {
+                pending_arm64_stores.clear();
+            } else if (instruction.context.architecture == Architecture::arm64) {
+                const bool pair_store = instruction.opcode == Opcode::a64_stp;
+                const bool scalar_store = instruction.opcode == Opcode::a64_str ||
+                    instruction.opcode == Opcode::a64_strb || instruction.opcode == Opcode::a64_strh;
+                const std::size_t memory_index = pair_store ? 2 : 1;
+                const auto *memory = pair_store || scalar_store
+                    ? (memory_index < instruction.operands.size()
+                        ? std::get_if<MemoryOperand>(&instruction.operands[memory_index]) : nullptr)
+                    : nullptr;
+                const bool store_access = memory && memory_index < instruction.access.size() &&
+                    instruction.access[memory_index] == OperandAccess::write;
+                if (store_access && memory->base && memory->base->bank == RegisterBank::arm64_sp &&
+                    !memory->index && !memory->ip_relative && !memory->writeback && !memory->post_index &&
+                    memory->address_width == 64 && memory->data_width > 0 && memory->data_width % 8 == 0 &&
+                    memory->displacement >= 0 && state.stack_depth.known) {
+                    const auto width = memory->data_width;
+                    const auto element_bytes = static_cast<std::int64_t>(width / 8);
+                    const auto count = pair_store ? 2 : 1;
+                    for (int element = 0; element < count; ++element) {
+                        std::int64_t displacement = memory->displacement;
+                        std::int64_t offset = 0;
+                        if ((element && !add_checked(displacement, element_bytes, displacement)) ||
+                            !subtract_checked(displacement, state.stack_depth.value, offset)) {
+                            pending_arm64_stores.clear();
+                            break;
+                        }
+                        if (pending_arm64_stores.size() >= 1024) {
+                            pending_arm64_stores.clear();
+                            break;
+                        }
+                        std::int64_t new_end = 0;
+                        if (!add_checked(offset, element_bytes, new_end)) {
+                            pending_arm64_stores.clear();
+                            break;
+                        }
+                        std::erase_if(pending_arm64_stores, [&](const auto &previous) {
+                            std::int64_t previous_end = 0;
+                            if (!add_checked(previous.offset, previous.width / 8, previous_end))
+                                return true;
+                            return offset < previous_end && previous.offset < new_end;
+                        });
+                        pending_arm64_stores.push_back({offset, width, instruction.address});
+                    }
+                } else if (instruction.memory_write || instruction.memory_read) {
+                    // Do not carry candidate outgoing stores across other memory traffic.
+                    pending_arm64_stores.clear();
+                }
+            }
+            const bool riscv_stack_context =
+                (instruction.context.architecture == Architecture::riscv32 &&
+                 instruction.context.mode == ExecutionMode::rv32) ||
+                (instruction.context.architecture == Architecture::riscv64 &&
+                 (instruction.context.mode == ExecutionMode::rv64 ||
+                  instruction.context.mode == ExecutionMode::rv64c));
+            if (riscv_stack_context && instruction.flow == FlowKind::call) {
+                for (const auto &store : pending_riscv_stores) {
+                    if (!state.stack_depth.known || state.stack_depth.value != store.stack_depth) continue;
+                    const auto slot = std::find_if(result.slots.begin(), result.slots.end(), [&](const auto &candidate) {
+                        return candidate.offset_from_entry_sp == store.offset && candidate.width == store.width;
+                    });
+                    if (slot == result.slots.end()) continue;
+                    const StackSlotCallArgument provenance{store.instruction, instruction.address,
+                        StackCallArgumentSourceKind::riscv_store};
+                    if (std::find(slot->outgoing_call_arguments.begin(), slot->outgoing_call_arguments.end(),
+                                  provenance) != slot->outgoing_call_arguments.end()) continue;
+                    if (stack_call_argument_detail_count >= 1'000'000) { result.complete = false; break; }
+                    slot->outgoing_call_arguments.push_back(provenance);
+                    ++stack_call_argument_detail_count;
+                }
+                pending_riscv_stores.clear();
+            } else if (!riscv_stack_context || instruction.flow != FlowKind::fallthrough) {
+                pending_riscv_stores.clear();
+            } else {
+                const auto width = static_cast<std::uint16_t>(instruction.context.mode == ExecutionMode::rv32 ? 32 : 64);
+                if (std::any_of(instruction.register_writes.begin(), instruction.register_writes.end(),
+                    [&](const auto &reg) { return reg.bank == RegisterBank::riscv_gpr && reg.index == 2 &&
+                                                  reg.width == width; }))
+                    pending_riscv_stores.clear();
+                bool captured_store = false;
+                const auto expected_store = width == 32 ? Opcode::rv_sw : Opcode::rv_sd;
+                if (instruction.memory_write && instruction.opcode == expected_store && state.stack_depth.known) {
+                    for (std::size_t operand_index = 0; operand_index < instruction.operands.size(); ++operand_index) {
+                        const auto *memory = std::get_if<MemoryOperand>(&instruction.operands[operand_index]);
+                        if (!memory || operand_index >= instruction.access.size() ||
+                            instruction.access[operand_index] != OperandAccess::write || !memory->base ||
+                            memory->base->bank != RegisterBank::riscv_gpr || memory->base->index != 2 ||
+                            memory->base->width != width || memory->address_width != width || memory->index ||
+                            memory->ip_relative || memory->writeback || memory->post_index ||
+                            memory->displacement < 0 || memory->data_width != width) continue;
+                        std::int64_t offset = 0;
+                        if (!subtract_checked(memory->displacement, state.stack_depth.value, offset)) continue;
+                        if (pending_riscv_stores.size() >= 1024) {
+                            pending_riscv_stores.clear();
+                            break;
+                        }
+                        std::int64_t end = 0;
+                        if (!add_checked(offset, width / 8, end)) continue;
+                        std::erase_if(pending_riscv_stores, [&](const auto &previous) {
+                            std::int64_t previous_end = 0;
+                            if (!add_checked(previous.offset, previous.width / 8, previous_end)) return true;
+                            return offset < previous_end && previous.offset < end;
+                        });
+                        pending_riscv_stores.push_back({offset, state.stack_depth.value, width, instruction.address});
+                        captured_store = true;
+                    }
+                }
+                if (!captured_store && (instruction.memory_write || instruction.memory_read))
+                    pending_riscv_stores.clear();
+            }
+            const bool powerpc_stack_context = instruction.context.architecture == Architecture::powerpc &&
+                (instruction.context.mode == ExecutionMode::ppc32 || instruction.context.mode == ExecutionMode::ppc64);
+            if (powerpc_stack_context && instruction.flow == FlowKind::call) {
+                for (const auto &store : pending_powerpc_stores) {
+                    if (!state.stack_depth.known || state.stack_depth.value != store.stack_depth) continue;
+                    const auto slot = std::find_if(result.slots.begin(), result.slots.end(), [&](const auto &candidate) {
+                        return candidate.offset_from_entry_sp == store.offset && candidate.width == store.width;
+                    });
+                    if (slot == result.slots.end()) continue;
+                    const StackSlotCallArgument provenance{store.instruction, instruction.address,
+                        StackCallArgumentSourceKind::powerpc_store};
+                    if (std::find(slot->outgoing_call_arguments.begin(), slot->outgoing_call_arguments.end(),
+                                  provenance) != slot->outgoing_call_arguments.end()) continue;
+                    if (stack_call_argument_detail_count >= 1'000'000) { result.complete = false; break; }
+                    slot->outgoing_call_arguments.push_back(provenance);
+                    ++stack_call_argument_detail_count;
+                }
+                pending_powerpc_stores.clear();
+            } else if (!powerpc_stack_context || instruction.flow != FlowKind::fallthrough) {
+                pending_powerpc_stores.clear();
+            } else {
+                const auto width = static_cast<std::uint16_t>(instruction.context.mode == ExecutionMode::ppc32 ? 32 : 64);
+                if (std::any_of(instruction.register_writes.begin(), instruction.register_writes.end(),
+                    [&](const auto &reg) { return reg.bank == RegisterBank::ppc_gpr && reg.index == 1 &&
+                                                  reg.width == width; }))
+                    pending_powerpc_stores.clear();
+                bool captured_store = false;
+                if (instruction.memory_write && state.stack_depth.known &&
+                    (instruction.opcode == Opcode::ppc_stw || instruction.opcode == Opcode::ppc_std)) {
+                    for (std::size_t operand_index = 0; operand_index < instruction.operands.size(); ++operand_index) {
+                        const auto *memory = std::get_if<MemoryOperand>(&instruction.operands[operand_index]);
+                        if (!memory || operand_index >= instruction.access.size() ||
+                            instruction.access[operand_index] != OperandAccess::write || !memory->base ||
+                            memory->base->bank != RegisterBank::ppc_gpr || memory->base->index != 1 ||
+                            memory->base->width != width || memory->address_width != width || memory->index ||
+                            memory->ip_relative || memory->writeback || memory->post_index ||
+                            memory->displacement < 0 || !memory->data_width || memory->data_width % 8) continue;
+                        const auto expected_width = instruction.opcode == Opcode::ppc_std ? 64 : 32;
+                        if (memory->data_width != expected_width) continue;
+                        const auto byte_width = static_cast<std::int64_t>(memory->data_width / 8);
+                        std::int64_t offset = 0;
+                        if (!subtract_checked(memory->displacement, state.stack_depth.value, offset)) continue;
+                        if (pending_powerpc_stores.size() >= 1024) {
+                            pending_powerpc_stores.clear();
+                            break;
+                        }
+                        std::int64_t end = 0;
+                        if (!add_checked(offset, byte_width, end)) continue;
+                        std::erase_if(pending_powerpc_stores, [&](const auto &previous) {
+                            std::int64_t previous_end = 0;
+                            if (!add_checked(previous.offset, previous.width / 8, previous_end)) return true;
+                            return offset < previous_end && previous.offset < end;
+                        });
+                        pending_powerpc_stores.push_back({offset, state.stack_depth.value,
+                                                          memory->data_width, instruction.address});
+                        captured_store = true;
+                    }
+                }
+                if (!captured_store && (instruction.memory_write || instruction.memory_read))
+                    pending_powerpc_stores.clear();
+            }
+            const bool mips_stack_context =
+                (instruction.context.architecture == Architecture::mips32 && instruction.context.mode == ExecutionMode::mips32) ||
+                (instruction.context.architecture == Architecture::mips64 && instruction.context.mode == ExecutionMode::mips64);
+            if (mips_stack_context && instruction.flow == FlowKind::call) {
+                for (const auto &store : pending_mips_stores) {
+                    if (!state.stack_depth.known || state.stack_depth.value != store.stack_depth) continue;
+                    const auto slot = std::find_if(result.slots.begin(), result.slots.end(), [&](const auto &candidate) {
+                        return candidate.offset_from_entry_sp == store.offset && candidate.width == store.width;
+                    });
+                    if (slot == result.slots.end()) continue;
+                    const StackSlotCallArgument provenance{store.instruction, instruction.address,
+                        StackCallArgumentSourceKind::mips_store};
+                    if (std::find(slot->outgoing_call_arguments.begin(), slot->outgoing_call_arguments.end(),
+                                  provenance) != slot->outgoing_call_arguments.end()) continue;
+                    if (stack_call_argument_detail_count >= 1'000'000) { result.complete = false; break; }
+                    slot->outgoing_call_arguments.push_back(provenance);
+                    ++stack_call_argument_detail_count;
+                }
+                pending_mips_stores.clear();
+            } else if (!mips_stack_context || instruction.flow != FlowKind::fallthrough) {
+                pending_mips_stores.clear();
+            } else {
+                const auto width = static_cast<std::uint16_t>(instruction.context.mode == ExecutionMode::mips32 ? 32 : 64);
+                if (std::any_of(instruction.register_writes.begin(), instruction.register_writes.end(),
+                    [&](const auto &reg) { return reg.bank == RegisterBank::mips_gpr && reg.index == 29 &&
+                                                  reg.width == width; }))
+                    pending_mips_stores.clear();
+                bool captured_store = false;
+                const auto expected_store = width == 32 ? Opcode::mips_sw : Opcode::mips64_sd;
+                if (instruction.memory_write && instruction.opcode == expected_store && state.stack_depth.known) {
+                    for (std::size_t operand_index = 0; operand_index < instruction.operands.size(); ++operand_index) {
+                        const auto *memory = std::get_if<MemoryOperand>(&instruction.operands[operand_index]);
+                        if (!memory || operand_index >= instruction.access.size() ||
+                            instruction.access[operand_index] != OperandAccess::write || !memory->base ||
+                            memory->base->bank != RegisterBank::mips_gpr || memory->base->index != 29 ||
+                            memory->base->width != width || memory->address_width != width || memory->index ||
+                            memory->ip_relative || memory->writeback || memory->post_index ||
+                            memory->displacement < 0 || memory->data_width != width) continue;
+                        const auto byte_width = static_cast<std::int64_t>(width / 8);
+                        std::int64_t offset = 0;
+                        if (!subtract_checked(memory->displacement, state.stack_depth.value, offset)) continue;
+                        if (pending_mips_stores.size() >= 1024) {
+                            pending_mips_stores.clear();
+                            break;
+                        }
+                        std::int64_t end = 0;
+                        if (!add_checked(offset, byte_width, end)) continue;
+                        std::erase_if(pending_mips_stores, [&](const auto &previous) {
+                            std::int64_t previous_end = 0;
+                            if (!add_checked(previous.offset, previous.width / 8, previous_end)) return true;
+                            return offset < previous_end && previous.offset < end;
+                        });
+                        pending_mips_stores.push_back({offset, state.stack_depth.value, width, instruction.address});
+                        captured_store = true;
+                    }
+                }
+                if (!captured_store && (instruction.memory_write || instruction.memory_read))
+                    pending_mips_stores.clear();
+            }
+            const bool arm32_stack_context = instruction.context.architecture == Architecture::arm &&
+                (instruction.context.mode == ExecutionMode::a32 || instruction.context.mode == ExecutionMode::thumb);
+            if (arm32_stack_context && instruction.flow == FlowKind::call && instruction.condition == 14) {
+                for (const auto &store : pending_arm32_stores) {
+                    if (!state.stack_depth.known || state.stack_depth.value != store.stack_depth) continue;
+                    const auto slot = std::find_if(result.slots.begin(), result.slots.end(), [&](const auto &candidate) {
+                        return candidate.offset_from_entry_sp == store.offset && candidate.width == store.width;
+                    });
+                    if (slot == result.slots.end()) continue;
+                    const StackSlotCallArgument provenance{store.instruction, instruction.address,
+                        StackCallArgumentSourceKind::aapcs32_store};
+                    if (std::find(slot->outgoing_call_arguments.begin(), slot->outgoing_call_arguments.end(),
+                                  provenance) != slot->outgoing_call_arguments.end()) continue;
+                    if (stack_call_argument_detail_count >= 1'000'000) { result.complete = false; break; }
+                    slot->outgoing_call_arguments.push_back(provenance);
+                    ++stack_call_argument_detail_count;
+                }
+                pending_arm32_stores.clear();
+            } else if (!arm32_stack_context || instruction.flow != FlowKind::fallthrough) {
+                pending_arm32_stores.clear();
+            } else {
+                if (std::any_of(instruction.register_writes.begin(), instruction.register_writes.end(),
+                    [](const auto &reg) { return reg.bank == RegisterBank::arm32_gpr && reg.index == 13; }))
+                    pending_arm32_stores.clear();
+                bool captured_store = false;
+                if (instruction.memory_write && state.stack_depth.known && instruction.condition == 14 &&
+                    (instruction.opcode == Opcode::a32_str || instruction.opcode == Opcode::a32_strb ||
+                     instruction.opcode == Opcode::a32_strh)) {
+                    for (std::size_t operand_index = 0; operand_index < instruction.operands.size(); ++operand_index) {
+                        const auto *memory = std::get_if<ArmMemoryOperand>(&instruction.operands[operand_index]);
+                        if (!memory || operand_index >= instruction.access.size() ||
+                            instruction.access[operand_index] != OperandAccess::write ||
+                            memory->base.bank != RegisterBank::arm32_gpr || memory->base.index != 13 ||
+                            !memory->add || !memory->pre_index || memory->writeback) continue;
+                        const auto *displacement = std::get_if<std::uint32_t>(&memory->offset);
+                        if (!displacement) continue;
+                        const auto expected_width = instruction.opcode == Opcode::a32_str ? 32 :
+                            instruction.opcode == Opcode::a32_strh ? 16 : 8;
+                        if (memory->data_width != expected_width) continue;
+                        const auto byte_width = static_cast<std::int64_t>(memory->data_width / 8);
+                        std::int64_t offset = 0;
+                        if (!subtract_checked(static_cast<std::int64_t>(*displacement), state.stack_depth.value, offset))
+                            continue;
+                        if (pending_arm32_stores.size() >= 1024) {
+                            pending_arm32_stores.clear();
+                            break;
+                        }
+                        std::int64_t end = 0;
+                        if (!add_checked(offset, byte_width, end)) continue;
+                        std::erase_if(pending_arm32_stores, [&](const auto &previous) {
+                            std::int64_t previous_end = 0;
+                            if (!add_checked(previous.offset, previous.width / 8, previous_end)) return true;
+                            return offset < previous_end && previous.offset < end;
+                        });
+                        pending_arm32_stores.push_back({offset, state.stack_depth.value,
+                                                        memory->data_width, instruction.address});
+                        captured_store = true;
+                    }
+                }
+                if (!captured_store && (instruction.memory_write || instruction.memory_read))
+                    pending_arm32_stores.clear();
+            }
+            const bool x86_16_abi = instruction.context.architecture == Architecture::x86 &&
+                                    instruction.context.mode == ExecutionMode::x86_16;
+            const bool x86_32_abi = instruction.context.architecture == Architecture::x86 &&
+                                    instruction.context.mode == ExecutionMode::x86_32;
+            const bool x86_64_abi = instruction.context.architecture == Architecture::x86_64 &&
+                                    instruction.context.mode == ExecutionMode::x86_64 &&
+                                    image_default_convention &&
+                                    (*image_default_convention == CallingConvention::sysv_x86_64 ||
+                                     *image_default_convention == CallingConvention::windows_x64);
+            const bool x86_stack_abi = x86_16_abi || x86_32_abi || x86_64_abi;
+            if (x86_stack_abi && instruction.opcode == Opcode::push) {
+                auto width = instruction.stack_value_width;
+                if (!width) {
+                    const auto pushed = register_at(instruction, 0);
+                    if (pushed) width = pushed->width;
+                    if (!width) width = static_cast<std::uint16_t>(pointer_bytes(instruction) * 8);
+                }
+                const auto bytes = static_cast<std::int64_t>(width / 8);
+                std::int64_t depth = state.stack_depth.value;
+                std::int64_t offset = 0;
+                const bool exact_push = pending_x86_pushes_valid && state.stack_depth.known && bytes > 0 &&
+                    width % 8 == 0 && instruction.flow == FlowKind::fallthrough &&
+                    add_checked(depth, bytes, depth) && subtract_checked(0, depth, offset) &&
+                    pending_x86_pushes.size() < 1024;
+                if (exact_push) {
+                    pending_x86_pushes.push_back({offset, width, instruction.address});
+                } else {
+                    pending_x86_pushes.clear();
+                    pending_x86_pushes_valid = false;
+                }
+            } else if (x86_stack_abi && instruction.flow == FlowKind::call) {
+                std::int64_t pushed_bytes = 0;
+                bool exact_cleanup = false;
+                if (pending_x86_pushes_valid && !pending_x86_pushes.empty() &&
+                    instruction_index + 1 < block->second->instructions.size()) {
+                    for (const auto &push : pending_x86_pushes)
+                        if (!add_checked(pushed_bytes, push.width / 8, pushed_bytes)) {
+                            pushed_bytes = -1;
+                            break;
+                        }
+                    const auto &cleanup_fact = block->second->instructions[instruction_index + 1];
+                    if (pushed_bytes > 0 && cleanup_fact &&
+                        cleanup_fact->instruction.context.architecture == instruction.context.architecture &&
+                        cleanup_fact->instruction.context.mode == instruction.context.mode &&
+                        cleanup_fact->instruction.opcode == Opcode::add &&
+                        cleanup_fact->instruction.flow == FlowKind::fallthrough) {
+                        const auto cleanup_stack = register_at(cleanup_fact->instruction, 0);
+                        const auto cleanup_bytes = immediate_value(cleanup_fact->instruction, 1);
+                        const auto stack_width = static_cast<std::uint16_t>(x86_64_abi ? 64 : x86_32_abi ? 32 : 16);
+                        exact_cleanup = cleanup_stack && cleanup_stack->bank == RegisterBank::gpr &&
+                            cleanup_stack->index == 4 &&
+                            cleanup_stack->width == stack_width && cleanup_bytes &&
+                            *cleanup_bytes == pushed_bytes;
+                    }
+                }
+                if (pending_x86_pushes_valid && exact_cleanup) {
+                    for (const auto &push : pending_x86_pushes) {
+                        const auto slot = std::find_if(result.slots.begin(), result.slots.end(), [&](const auto &candidate) {
+                            return candidate.offset_from_entry_sp == push.offset && candidate.width == push.width;
+                        });
+                        if (slot == result.slots.end()) continue;
+                        const StackSlotCallArgument provenance{push.instruction, instruction.address,
+                                                               StackCallArgumentSourceKind::x86_push};
+                        if (std::find(slot->outgoing_call_arguments.begin(), slot->outgoing_call_arguments.end(),
+                                      provenance) != slot->outgoing_call_arguments.end())
+                            continue;
+                        if (stack_call_argument_detail_count >= 1'000'000) {
+                            result.complete = false;
+                            break;
+                        }
+                        slot->outgoing_call_arguments.push_back(provenance);
+                        ++stack_call_argument_detail_count;
+                    }
+                }
+                pending_x86_pushes.clear();
+                pending_x86_pushes_valid = true;
+            } else {
+                pending_x86_pushes.clear();
+                pending_x86_pushes_valid = true;
+            }
             const bool stack_architecture = instruction.context.architecture == Architecture::x86 ||
                 instruction.context.architecture == Architecture::x86_64 ||
                 instruction.context.architecture == Architecture::mos6502 ||
@@ -986,10 +2098,7 @@ Result<StackFrameAnalysis> analyze_stack_frame(const FunctionRecord &function, c
                         }
                     } else address_displacement = *immediate;
                 }
-            } else if ((instruction.context.architecture == Architecture::mips32 ||
-                        instruction.context.architecture == Architecture::mips64) &&
-                       (instruction.opcode == Opcode::mips_addiu || instruction.opcode == Opcode::mips_addi ||
-                        instruction.opcode == Opcode::mips64_daddi || instruction.opcode == Opcode::mips64_daddiu) &&
+            } else if (mips_stack_adjust(instruction) &&
                        instruction.operands.size() >= 3 && address_destination && address_source &&
                        address_destination->bank == RegisterBank::mips_gpr &&
                        address_destination->index != 29 && address_destination->index != 30) {
@@ -1053,6 +2162,12 @@ Result<StackFrameAnalysis> analyze_stack_frame(const FunctionRecord &function, c
                         forms_stack_address = false;
                     }
                 }
+            } else if (const auto source = riscv_bitwise_copy_source(instruction);
+                       source && address_destination->index != 2 && address_destination->index != 8) {
+                if (source->index == 2 || (source->index == 8 && state.frame_register == 8)) {
+                    forms_stack_address = true;
+                    address_base = source->index == 2 ? state.stack_depth : state.frame_depth;
+                }
             } else if (instruction.context.architecture == Architecture::powerpc &&
                        instruction.opcode == Opcode::ppc_addi && instruction.operands.size() >= 3 &&
                        address_destination && address_source && address_destination->bank == RegisterBank::ppc_gpr &&
@@ -1095,15 +2210,20 @@ Result<StackFrameAnalysis> analyze_stack_frame(const FunctionRecord &function, c
             const bool pair_fp = pair_memory && pair_memory->base &&
                                  pair_memory->base->bank == RegisterBank::arm64_gpr &&
                                  pair_memory->base->index == 29;
+            const bool pair_alias = pair_memory && pair_memory->base &&
+                                    pair_memory->base->bank == RegisterBank::arm64_gpr &&
+                                    pair_memory->base->index < state.arm64_stack_alias_depths.size() &&
+                                    state.arm64_stack_alias_depths[pair_memory->base->index].known;
             if (arm64_pair && (!pair_memory || !pair_memory->base)) {
                 result.complete = false;
-            } else if (pair_sp || pair_fp) {
+            } else if (pair_sp || pair_fp || pair_alias) {
                 if (pair_memory->data_width == 0 || pair_memory->data_width % 8 != 0 ||
                     pair_memory->index || pair_memory->ip_relative || pair_memory->address_width != 64 ||
                     instruction.access.size() <= 2) {
                     result.complete = false;
                 } else {
-                    const auto base = pair_sp ? state.stack_depth : state.frame_depth;
+                    const auto base = pair_alias ? state.arm64_stack_alias_depths[pair_memory->base->index]
+                        : pair_fp ? state.frame_depth : state.stack_depth;
                     const auto access = instruction.access[2];
                     const bool read = access == OperandAccess::read || access == OperandAccess::read_write;
                     const bool written = access == OperandAccess::write || access == OperandAccess::read_write;
@@ -1124,16 +2244,20 @@ Result<StackFrameAnalysis> analyze_stack_frame(const FunctionRecord &function, c
                                 if (!record_stack_slot(result, offset, pair_memory->data_width, read, written,
                                                        false, instruction.address, access_detail_count))
                                     return Error{ErrorCode::resource_limit, "Stack analysis slot budget exceeded"};
+                                mark_incoming_aarch64_argument(result, offset, pair_memory->data_width, read);
                             }
                         }
                     }
                 }
             }
-            // PUSH and POP access the stack implicitly. Preserve the cell's
-            // entry-SP offset before transfer() advances or restores SP.
+            // PUSH/POP and PUSHF/POPF access the stack implicitly. Preserve
+            // the cell's entry-SP offset before transfer() updates SP.
             if ((instruction.context.architecture == Architecture::x86 ||
                  instruction.context.architecture == Architecture::x86_64) &&
-                (instruction.opcode == Opcode::push || instruction.opcode == Opcode::pop)) {
+                (instruction.opcode == Opcode::push || instruction.opcode == Opcode::pop ||
+                 instruction.opcode == Opcode::pushf || instruction.opcode == Opcode::popf)) {
+                const bool push = instruction.opcode == Opcode::push || instruction.opcode == Opcode::pushf;
+                const bool pop = instruction.opcode == Opcode::pop || instruction.opcode == Opcode::popf;
                 auto width = instruction.stack_value_width;
                 if (!width) {
                     const auto value = register_at(instruction, 0);
@@ -1148,12 +2272,11 @@ Result<StackFrameAnalysis> analyze_stack_frame(const FunctionRecord &function, c
                 } else {
                     std::int64_t offset = 0;
                     auto depth = state.stack_depth.value;
-                    if ((instruction.opcode == Opcode::push && !add_checked(depth, bytes, depth)) ||
+                    if ((push && !add_checked(depth, bytes, depth)) ||
                         !subtract_checked(0, depth, offset)) {
                         result.complete = false;
                     } else if (!record_stack_slot(result, offset, width,
-                                                  instruction.opcode == Opcode::pop,
-                                                  instruction.opcode == Opcode::push, false,
+                                                  pop, push, false,
                                                   instruction.address, access_detail_count)) {
                         return Error{ErrorCode::resource_limit, "Stack analysis slot budget exceeded"};
                     }
@@ -1177,11 +2300,98 @@ Result<StackFrameAnalysis> analyze_stack_frame(const FunctionRecord &function, c
                         std::int64_t offset = 0;
                         if (!subtract_checked(0, cell_depth, offset)) {
                             result.complete = false;
+                        } else if (!m6502_slot_offset_unambiguous(offset)) {
+                            result.complete = false;
                         } else if (!record_stack_slot(result, offset, 8, !push, push, false,
                                                       instruction.address, access_detail_count)) {
                             return Error{ErrorCode::resource_limit, "Stack analysis slot budget exceeded"};
                         }
                     }
+                }
+            }
+            if (instruction.context.architecture == Architecture::mos6502 &&
+                (instruction.opcode == Opcode::m6502_jsr || instruction.opcode == Opcode::m6502_rts ||
+                 instruction.opcode == Opcode::m6502_rti)) {
+                // JSR writes the return address high byte at the current S,
+                // then the low byte at S-1. RTS consumes those two bytes
+                // above its entry S. RTI additionally consumes the status
+                // byte at entry S+1. These are implicit accesses; the
+                // interprocedural call itself remains stack-balanced in the
+                // flow state below.
+                if (instruction.opcode == Opcode::m6502_jsr) {
+                    if (!state.stack_depth.known) {
+                        result.complete = false;
+                    } else {
+                        for (std::int64_t byte = 0; byte < 2; ++byte) {
+                            std::int64_t cell_depth = 0;
+                            std::int64_t offset = 0;
+                            if (!add_checked(state.stack_depth.value, byte, cell_depth) ||
+                                !subtract_checked(0, cell_depth, offset)) {
+                                result.complete = false;
+                                break;
+                            }
+                            if (!m6502_slot_offset_unambiguous(offset)) {
+                                result.complete = false;
+                                continue;
+                            }
+                            if (!record_stack_slot(result, offset, 8, false, true, false,
+                                                   instruction.address, access_detail_count))
+                                return Error{ErrorCode::resource_limit, "Stack analysis slot budget exceeded"};
+                        }
+                        std::int64_t transient_depth = 0;
+                        if (!add_checked(state.stack_depth.value, 2, transient_depth) || transient_depth < 0) {
+                            result.complete = false;
+                        } else {
+                            if (transient_depth > 256) result.complete = false;
+                            maximum_stack_allocation = std::max(
+                                maximum_stack_allocation,
+                                static_cast<std::uint64_t>(std::min<std::int64_t>(transient_depth, 256)));
+                        }
+                    }
+                } else {
+                    const std::int64_t frame_bytes = instruction.opcode == Opcode::m6502_rti ? 3 : 2;
+                    for (std::int64_t byte = 1; byte <= frame_bytes; ++byte) {
+                        if (!record_stack_slot(result, byte, 8, true, false, false,
+                                               instruction.address, access_detail_count))
+                            return Error{ErrorCode::resource_limit, "Stack analysis slot budget exceeded"};
+                    }
+                }
+            }
+            // NMOS 6502 has no explicit stack-base addressing mode, but the
+            // common TSX / $0100,index idiom addresses the byte currently named
+            // by S. Since the index is an 8-bit snapshot and the base is exactly the
+            // stack-page origin, the effective byte cannot leave page one.
+            // Other page-one bases can cross into page two and remain opaque.
+            if (instruction.context.architecture == Architecture::mos6502) {
+                for (std::size_t i = 0; i < instruction.operands.size(); ++i) {
+                    const auto *memory = std::get_if<MemoryOperand>(&instruction.operands[i]);
+                    if (!memory || !memory->index || memory->index->bank != RegisterBank::mos6502 ||
+                        (memory->index->index != 1 && memory->index->index != 2) ||
+                        memory->index->width != 8 || memory->address_width != 16 || memory->ip_relative ||
+                        memory->base || memory->scale != 1 || memory->displacement < 0x0100 ||
+                        memory->displacement > 0x01ff)
+                        continue;
+                    const auto index = static_cast<std::size_t>(memory->index->index);
+                    const auto delta = state.m6502_stack_alias_deltas[index];
+                    if (i >= instruction.access.size() || memory->data_width != 8 ||
+                        memory->displacement != 0x0100 || !state.frame_depth.known || !delta.known) {
+                        result.complete = false;
+                        continue;
+                    }
+                    std::int64_t offset = 0;
+                    if (!subtract_checked(delta.value, state.frame_depth.value, offset)) {
+                        result.complete = false;
+                        continue;
+                    }
+                    const auto access = instruction.access[i];
+                    const bool address_taken = access == OperandAccess::address;
+                    const bool read = access == OperandAccess::read || access == OperandAccess::read_write;
+                    const bool written = access == OperandAccess::write || access == OperandAccess::read_write;
+                    if ((address_taken || read || written) &&
+                        !record_stack_slot(result, offset, address_taken ? 0 : memory->data_width,
+                                           read, written, address_taken, instruction.address,
+                                           access_detail_count))
+                        return Error{ErrorCode::resource_limit, "Stack analysis slot budget exceeded"};
                 }
             }
             for (std::size_t i = 0; i < instruction.operands.size(); ++i) {
@@ -1200,6 +2410,10 @@ Result<StackFrameAnalysis> analyze_stack_frame(const FunctionRecord &function, c
                 const bool arm64_frame = instruction.context.architecture == Architecture::arm64 &&
                                          memory->base->bank == RegisterBank::arm64_gpr &&
                                          memory->base->index == 29;
+                const bool arm64_alias = instruction.context.architecture == Architecture::arm64 &&
+                                         memory->base->bank == RegisterBank::arm64_gpr &&
+                                         memory->base->index < state.arm64_stack_alias_depths.size() &&
+                                         state.arm64_stack_alias_depths[memory->base->index].known;
                 const bool x86_stack = (instruction.context.architecture == Architecture::x86 ||
                                         instruction.context.architecture == Architecture::x86_64) &&
                                        memory->base->bank == RegisterBank::gpr &&
@@ -1216,12 +2430,18 @@ Result<StackFrameAnalysis> analyze_stack_frame(const FunctionRecord &function, c
                 const bool riscv_frame = (instruction.context.architecture == Architecture::riscv32 ||
                                           instruction.context.architecture == Architecture::riscv64) &&
                                          memory->base->bank == RegisterBank::riscv_gpr && memory->base->index == 8;
+                const bool riscv_alias = (instruction.context.architecture == Architecture::riscv32 ||
+                                          instruction.context.architecture == Architecture::riscv64) &&
+                                         memory->base->bank == RegisterBank::riscv_gpr &&
+                                         memory->base->index != 0 && memory->base->index != 2 &&
+                                         memory->base->index != 8 && memory->base->index < 32 &&
+                                         state.riscv_stack_alias_depths[memory->base->index].known;
                 const bool ppc_stack = instruction.context.architecture == Architecture::powerpc &&
                                        memory->base->bank == RegisterBank::ppc_gpr && memory->base->index == 1;
                 const bool ppc_frame = instruction.context.architecture == Architecture::powerpc &&
                                        memory->base->bank == RegisterBank::ppc_gpr && memory->base->index == 31;
-                if (!arm64_stack && !arm64_frame && !x86_stack && !mips_stack && !mips_frame &&
-                    !riscv_stack && !riscv_frame && !ppc_stack && !ppc_frame)
+                if (!arm64_stack && !arm64_frame && !arm64_alias && !x86_stack && !mips_stack && !mips_frame &&
+                    !riscv_stack && !riscv_frame && !riscv_alias && !ppc_stack && !ppc_frame)
                     continue;
                 const bool from_frame = arm64_frame || mips_frame || riscv_frame ||
                                         ppc_frame || (x86_stack && memory->base->index == 5);
@@ -1234,7 +2454,9 @@ Result<StackFrameAnalysis> analyze_stack_frame(const FunctionRecord &function, c
                     result.complete = false;
                     continue;
                 }
-                const auto base = from_frame ? state.frame_depth : state.stack_depth;
+                const auto base = arm64_alias ? state.arm64_stack_alias_depths[memory->base->index]
+                    : riscv_alias ? state.riscv_stack_alias_depths[memory->base->index]
+                    : from_frame ? state.frame_depth : state.stack_depth;
                 const bool access_address = instruction.access[i] == OperandAccess::address;
                 const bool ppc_memory = ppc_stack || ppc_frame;
                 const bool address_taken = access_address &&
@@ -1253,10 +2475,40 @@ Result<StackFrameAnalysis> analyze_stack_frame(const FunctionRecord &function, c
                                   (ppc_stack || ppc_frame) && access_address && instruction.memory_read;
                 const bool written = access == OperandAccess::write || access == OperandAccess::read_write ||
                                      (ppc_stack || ppc_frame) && access_address && instruction.memory_write;
-                if ((address_taken || read || written) &&
-                    !record_stack_slot(result, offset, address_taken ? 0 : memory->data_width,
-                                     read, written, address_taken, instruction.address, access_detail_count))
-                    return Error{ErrorCode::resource_limit, "Stack analysis slot budget exceeded"};
+                if (address_taken || read || written) {
+                    const auto width = address_taken ? 0 : memory->data_width;
+                    if (!record_stack_slot(result, offset, width, read, written, address_taken,
+                                           instruction.address, access_detail_count))
+                        return Error{ErrorCode::resource_limit, "Stack analysis slot budget exceeded"};
+                    if (instruction.context.architecture == Architecture::x86 &&
+                        instruction.context.mode == ExecutionMode::x86_32)
+                        mark_incoming_x86_32_argument(result, offset, width, x86_32_cleanup);
+                    if (instruction.context.architecture == Architecture::x86_64 &&
+                        instruction.context.mode == ExecutionMode::x86_64 && read && image_default_convention &&
+                        (*image_default_convention == CallingConvention::sysv_x86_64 ||
+                         *image_default_convention == CallingConvention::windows_x64))
+                        mark_incoming_x86_64_argument(result, offset, width, read, *image_default_convention);
+                    if (instruction.context.architecture == Architecture::arm64)
+                        mark_incoming_aarch64_argument(result, offset, width, read);
+                    if (instruction.context.architecture == Architecture::arm &&
+                        (instruction.context.mode == ExecutionMode::a32 ||
+                         instruction.context.mode == ExecutionMode::thumb))
+                        mark_incoming_aapcs32_argument(result, offset, width, read);
+                    if (instruction.context.architecture == Architecture::mips32 &&
+                        instruction.context.mode == ExecutionMode::mips32)
+                        mark_incoming_mips_o32_argument(result, offset, width, read);
+                    if (instruction.context.architecture == Architecture::mips64 &&
+                        instruction.context.mode == ExecutionMode::mips64 && image_default_convention &&
+                        *image_default_convention == CallingConvention::mips_n64)
+                        mark_incoming_mips_n64_argument(result, offset, width, read);
+                    if (instruction.context.architecture == Architecture::powerpc &&
+                        instruction.context.mode == ExecutionMode::ppc64 && image_default_convention &&
+                        *image_default_convention == CallingConvention::ppc64le_elfv2)
+                        mark_incoming_ppc64_elfv2_argument(result, offset, width, read);
+                    if (instruction.context.architecture == Architecture::riscv32 ||
+                        instruction.context.architecture == Architecture::riscv64)
+                        mark_incoming_riscv_argument(result, offset, width, read, instruction.context.mode);
+                }
             }
         // PUSHA/POPA have implicit memory operands. Their decoded width and
         // slot count let us recover the eight stack cells without inferring
@@ -1385,6 +2637,10 @@ Result<StackFrameAnalysis> analyze_stack_frame(const FunctionRecord &function, c
                     const bool read = access == OperandAccess::read || access == OperandAccess::read_write;
                     const bool written = access == OperandAccess::write || access == OperandAccess::read_write;
                     if (address_taken || read || written) {
+                        if (!m6502_slot_offset_unambiguous(offset)) {
+                            result.complete = false;
+                            continue;
+                        }
                         if (!record_stack_slot(result, offset, address_taken ? 0 : memory->data_width,
                                                read, written, address_taken, instruction.address,
                                                access_detail_count))
@@ -1394,13 +2650,49 @@ Result<StackFrameAnalysis> analyze_stack_frame(const FunctionRecord &function, c
             }
             if (instruction.context.architecture == Architecture::mos6502 &&
                 instruction.opcode == Opcode::m6502_brk) {
-                state.stack_depth = {};
-                state.supported = false;
+                // BRK writes the return PC and status byte to the NMOS 6502
+                // page-one stack before transferring control to the IRQ
+                // vector. These are known implicit accesses even though the
+                // interrupt handler is outside this function's CFG.
+                if (!state.stack_depth.known) {
+                    result.complete = false;
+                    state.stack_depth = {};
+                    state.supported = false;
+                } else {
+                    for (std::int64_t byte = 0; byte < 3; ++byte) {
+                        std::int64_t depth = 0;
+                        std::int64_t offset = 0;
+                        if (!add_checked(state.stack_depth.value, byte, depth) ||
+                            !subtract_checked(0, depth, offset)) {
+                            result.complete = false;
+                            state.stack_depth = {};
+                            state.supported = false;
+                            break;
+                        }
+                        if (!m6502_slot_offset_unambiguous(offset)) {
+                            result.complete = false;
+                            continue;
+                        }
+                        if (!record_stack_slot(result, offset, 8, false, true, false,
+                                               instruction.address, access_detail_count))
+                            return Error{ErrorCode::resource_limit, "Stack analysis slot budget exceeded"};
+                    }
+                    if (state.stack_depth.known && !add(state.stack_depth, 3)) {
+                        result.complete = false;
+                        state.stack_depth = {};
+                        state.supported = false;
+                    }
+                }
             } else if (!transfer(instruction, state)) {
                 state.stack_depth = {};
                 state.supported = false;
             }
-            observe_stack_depth(state.stack_depth);
+            if (!pending_arm64_stores.empty() &&
+                (!stack_depth_before_instruction.known || !state.stack_depth.known ||
+                 stack_depth_before_instruction.value != state.stack_depth.value))
+                pending_arm64_stores.clear();
+            observe_stack_depth(state.stack_depth,
+                                instruction.context.architecture == Architecture::mos6502);
             if (!state.supported)
                 result.complete = false;
         }

@@ -21,6 +21,23 @@ pointer signatures, arrays of function pointers, and functions returning
 pointers to arrays of function pointers where the immutable type graph can
 represent them. Calling-convention metadata remains attached to the function
 type layer represented by the parsed declarator.
+Function prototype parameters may specify default arguments. Their type and
+name are retained, while the default expression is discarded; balanced
+parentheses, brackets, and braces are supported, but template-ids containing
+commas in a default argument are outside the supported skip grammar.
+The non-layout standard attributes `[[maybe_unused]]`, `[[nodiscard]]`, and
+`[[deprecated]]` are accepted and discarded; `nodiscard` and `deprecated` may
+carry one string-literal reason/message. Attribute metadata is not retained.
+In instantiated class templates, method prototypes accept a direct type-pack
+parameter expansion (`Ts... values`) capped at 32 concrete parameters; empty
+packs contribute none. Compound pack patterns and non-type/template-name packs
+in parameter lists remain unsupported.
+Class-template bodies also accept the direct type-pack data-member form
+`Ts... members;`, expanded into complete object fields named
+`members__packN` (zero-based), with at most 32 fields. Empty packs add no
+fields. Compound patterns, value/template-name packs, member attributes,
+initializers, and bitfield expansions remain unsupported; member-pack lookup
+semantics are not retained.
 
 Class, struct, and union bodies accept ordinary method prototypes. They retain
 each method's function signature, declaration order, and current

@@ -181,7 +181,12 @@ const ReadOnlyContribution *read_only_contribution(const Object &object, std::ui
         [&](const auto &contribution) { return contribution.source_section == section; });
     return found == object.read_only.end() ? nullptr : &*found;
 }
-struct Definition { std::size_t object = 0; const MachOSymbol *symbol = nullptr; bool weak = false; };
+struct Definition {
+    std::size_t object = 0;
+    const MachOSymbol *symbol = nullptr;
+    bool weak = false, common = false;
+    std::uint64_t common_size = 0, common_alignment = 1, common_offset = 0;
+};
 struct OutputSymbol { std::string name; std::uint64_t value = 0; std::uint16_t descriptor = 0; std::uint8_t section = 0; };
 
 std::vector<std::byte> build(std::vector<Object> &objects, std::string_view entry,
@@ -234,6 +239,10 @@ std::vector<std::byte> build(std::vector<Object> &objects, std::string_view entr
                 require((section.flags & 0xff) == 0,
                         "Mach-O __DATA_CONST,__const must be an S_REGULAR section", ErrorCode::unsupported);
                 read_only_sections.push_back(&section);
+            } else if (section.segment_name == "__DATA" && section.name == "__const" && section.size) {
+                require((section.flags & 0xff) == 0,
+                        "Mach-O __DATA,__const must be an S_REGULAR section", ErrorCode::unsupported);
+                read_only_sections.push_back(&section);
             } else if (section.segment_name == "__TEXT" && section.name == "__cstring" && section.size) {
                 require((section.flags & 0xff) == 2,
                         "Mach-O __TEXT,__cstring must be an S_CSTRING_LITERALS section", ErrorCode::unsupported);
@@ -260,7 +269,7 @@ std::vector<std::byte> build(std::vector<Object> &objects, std::string_view entr
                        section.name != "__debug_info" && section.name != "__debug_abbrev" &&
                        section.name != "__debug_line" && section.name != "__debug_str") {
                 throw Failure{{ErrorCode::unsupported,
-                    "Mach-O static link subset only maps __TEXT,__text/read-only literals, __DATA_CONST,__const, and __DATA,__data/__bss sections"}};
+                    "Mach-O static link subset only maps __TEXT,__text/read-only literals, __DATA/__DATA_CONST,__const, and __DATA,__data/__bss sections"}};
             }
         }
         require(text && text->file_offset && text->size <= limits.max_output_bytes && text->size <= SIZE_MAX &&
@@ -355,21 +364,46 @@ std::vector<std::byte> build(std::vector<Object> &objects, std::string_view entr
         }
         for (const auto &symbol : metadata.symbols) {
             canceled(stop);
-            if (!(symbol.type & 1) || symbol.name.empty() || symbol.state != MachOSymbolState::defined ||
-                (symbol.section != text->ordinal && !read_only_contribution(mutable_object, symbol.section) &&
-                 (!data || symbol.section != data->ordinal) && (!bss || symbol.section != bss->ordinal)))
+            if (!(symbol.type & 1) || symbol.name.empty())
                 continue;
-            const auto section_size = symbol.section == text->ordinal ? text->size :
-                read_only_contribution(mutable_object, symbol.section) ?
-                    read_only_contribution(mutable_object, symbol.section)->bytes.size() :
-                data && symbol.section == data->ordinal ? data->size : bss->size;
-            require(symbol.value <= section_size, "Mach-O defined symbol exceeds its source section");
             const bool weak = (symbol.descriptor & 0x0080) != 0;
-            auto [at, inserted] = definitions.emplace(symbol.name, Definition{oi, &symbol, weak});
+            const bool common = symbol.state == MachOSymbolState::common;
+            if (!common) {
+                if (symbol.state != MachOSymbolState::defined ||
+                    (symbol.section != text->ordinal && !read_only_contribution(mutable_object, symbol.section) &&
+                     (!data || symbol.section != data->ordinal) && (!bss || symbol.section != bss->ordinal)))
+                    continue;
+                const auto section_size = symbol.section == text->ordinal ? text->size :
+                    read_only_contribution(mutable_object, symbol.section) ?
+                        read_only_contribution(mutable_object, symbol.section)->bytes.size() :
+                    data && symbol.section == data->ordinal ? data->size : bss->size;
+                require(symbol.value <= section_size, "Mach-O defined symbol exceeds its source section");
+            }
+            const auto alignment_exponent = static_cast<unsigned>(symbol.descriptor & 0x000f);
+            require(!common || alignment_exponent < 63,
+                    "Mach-O common-symbol alignment exceeds the supported range", ErrorCode::resource_limit);
+            const auto common_alignment = common ? (UINT64_C(1) << alignment_exponent) : UINT64_C(1);
+            Definition candidate{oi, &symbol, weak, common,
+                                 common ? symbol.value : UINT64_C(0), common_alignment, 0};
+            auto [at, inserted] = definitions.emplace(symbol.name, candidate);
             if (!inserted) {
-                require(at->second.weak && !weak, "Duplicate strong Mach-O symbol: " + symbol.name,
-                        ErrorCode::conflict);
-                if (at->second.weak && !weak) at->second = {oi, &symbol, false};
+                auto &current = at->second;
+                if (common && current.common) {
+                    if (candidate.common_size > current.common_size) {
+                        current.object = oi;
+                        current.symbol = &symbol;
+                    }
+                    current.common_size = std::max(current.common_size, candidate.common_size);
+                    current.common_alignment = std::max(current.common_alignment, candidate.common_alignment);
+                } else if (common) {
+                    if (current.weak) current = candidate;
+                } else if (current.common) {
+                    if (!weak) current = candidate;
+                } else {
+                    require(current.weak || weak, "Duplicate strong Mach-O symbol: " + symbol.name,
+                            ErrorCode::conflict);
+                    if (current.weak && !weak) current = candidate;
+                }
             }
         }
         for (const auto &row : metadata.relocations) {
@@ -443,6 +477,17 @@ std::vector<std::byte> build(std::vector<Object> &objects, std::string_view entr
             }
         }
     }
+    for (auto &[name, definition] : definitions) {
+        (void)name;
+        if (!definition.common) continue;
+        bss_size = align_to(bss_size, definition.common_alignment);
+        require(bss_size <= limits.max_output_bytes &&
+                    definition.common_size <= limits.max_output_bytes - bss_size,
+                "Mach-O common-symbol storage exceeds output limit", ErrorCode::resource_limit);
+        definition.common_offset = bss_size;
+        bss_size += definition.common_size;
+        bss_alignment = std::max(bss_alignment, definition.common_alignment);
+    }
     std::vector<GotEntry> got_entries;
     std::map<std::tuple<std::size_t, std::uint32_t, std::uint64_t, std::int64_t>, std::size_t> got_indices;
     const auto got_symbol_target = [&](std::size_t object_index, const MachORelocation &row) {
@@ -463,10 +508,13 @@ std::vector<std::byte> build(std::vector<Object> &objects, std::string_view entr
                  (target_object.bss_section && target_symbol.section == target_object.bss_section));
         };
         const auto definition = definitions.find(symbol->name);
-        require(definition != definitions.end() && supported(objects[definition->second.object], *definition->second.symbol),
+        require(definition != definitions.end() &&
+                    (definition->second.common || supported(objects[definition->second.object], *definition->second.symbol)),
                 "ARM64 GOT symbol is unresolved or outside supported output sections: " + symbol->name,
                 ErrorCode::unsupported);
-        return std::tuple{definition->second.object, definition->second.symbol->section,
+        if (definition->second.common)
+            return std::tuple{definition->second.object, UINT32_MAX, definition->second.common_offset};
+        return std::tuple{definition->second.object, static_cast<std::uint32_t>(definition->second.symbol->section),
                           definition->second.symbol->value};
     };
     for (auto &relocation : relocations) {
@@ -633,6 +681,10 @@ std::vector<std::byte> build(std::vector<Object> &objects, std::string_view entr
     auto linked_address = [&](std::size_t object_index, std::uint32_t section_ordinal, std::uint64_t value) {
         require(object_index < objects.size(), "Mach-O relocation references an invalid object", ErrorCode::malformed);
         const auto &object = objects[object_index];
+        if (section_ordinal == UINT32_MAX) {
+            require(value <= bss_size, "Mach-O common symbol exceeds merged __bss", ErrorCode::malformed);
+            return bss_address + value;
+        }
         if (section_ordinal == object.text_section) {
             require(value <= object.text.size(), "Mach-O text symbol exceeds its contribution", ErrorCode::malformed);
             return code_base + object.output_offset + value;
@@ -682,8 +734,9 @@ std::vector<std::byte> build(std::vector<Object> &objects, std::string_view entr
         const auto definition = definitions.find(symbol->name);
         require(definition != definitions.end(), "Mach-O relocation symbol is unresolved or unsupported: " + symbol->name,
                 ErrorCode::unsupported);
-        return linked_address(definition->second.object, definition->second.symbol->section,
-                              definition->second.symbol->value);
+        if (definition->second.common)
+            return linked_address(definition->second.object, UINT32_MAX, definition->second.common_offset);
+        return linked_address(definition->second.object, definition->second.symbol->section, definition->second.symbol->value);
     };
     for (const auto &reloc : relocations) {
         canceled(stop);
@@ -811,12 +864,17 @@ std::vector<std::byte> build(std::vector<Object> &objects, std::string_view entr
     for (const auto &[name, definition] : definitions) {
         if (definition.object >= objects.size()) continue;
         const auto &object = objects[definition.object];
-        const auto section_index = definition.symbol->section == object.text_section ? 1 :
+        const auto section_index = definition.common ? 4 : definition.symbol->section == object.text_section ? 1 :
             read_only_contribution(object, definition.symbol->section) ? 2 :
             definition.symbol->section == object.data_section ? 3 : 4;
-        output_symbols.push_back({name, linked_address(definition.object, definition.symbol->section,
-                                                       definition.symbol->value),
-                                  definition.symbol->descriptor, static_cast<std::uint8_t>(section_index)});
+        const auto symbol_address = definition.common
+            ? linked_address(definition.object, UINT32_MAX, definition.common_offset)
+            : linked_address(definition.object, definition.symbol->section, definition.symbol->value);
+        output_symbols.push_back({name, symbol_address,
+                                  static_cast<std::uint16_t>(definition.common
+                                      ? definition.symbol->descriptor & ~UINT16_C(0x000f)
+                                      : definition.symbol->descriptor),
+                                  static_cast<std::uint8_t>(section_index)});
     }
     std::sort(output_symbols.begin(), output_symbols.end(), [](const auto &a, const auto &b) { return a.name < b.name; });
     require(constants.size() <= SIZE_MAX - const_file_offset, "Mach-O output offsets overflow addressable memory",

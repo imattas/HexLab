@@ -1,6 +1,8 @@
 #include "graph_view.hpp"
 #include "data_views.hpp"
 #include <wx/button.h>
+#include <wx/clipbrd.h>
+#include <wx/dataobj.h>
 #include <wx/sizer.h>
 #include "hexlab/loaders/loaded_image.hpp"
 #include <algorithm>
@@ -70,6 +72,11 @@ GraphView::GraphView(wxWindow *parent) : wxPanel(parent) {
     graph_items->SetName("graph-items-show");
     graph_items->SetToolTip("Show the accessible node and edge list. F6 moves between this list and the canvas.");
     bar->Add(graph_items, 0, wxALL, pad);
+    copy_graph_json_ = new wxButton(this, wxID_ANY, "Copy graph JSON");
+    copy_graph_json_->SetName("graph-copy-json");
+    copy_graph_json_->SetToolTip("Copy the current graph model as bounded versioned JSON.");
+    copy_graph_json_->Disable();
+    bar->Add(copy_graph_json_, 0, wxALL, pad);
     canvas = new GraphCanvas(this);
     canvas->SetToolTip("Find searches graph node names, comments, and addresses. Click an instruction to select it. Up/Down: previous/next instruction; "
                        "Ctrl+Left/Right: select or follow predecessor/successor; Ctrl+Up/Down: cycle branch edges. "
@@ -123,6 +130,7 @@ GraphView::GraphView(wxWindow *parent) : wxPanel(parent) {
             canvas->SetFocus();
         }
     });
+    copy_graph_json_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { copy_graph_json(); });
     items_->Bind(wxEVT_LIST_ITEM_SELECTED, [this](wxListEvent &event) {
         const auto row = event.GetIndex();
         if (!updating_items_ && row >= 0 && static_cast<std::size_t>(row) < item_rows_.size()) {
@@ -291,6 +299,36 @@ void GraphView::refresh_status() {
     status_->SetLabel(label);
     refresh_items();
 }
+void GraphView::copy_graph_json() {
+    const auto graph = canvas->graph();
+    if (!graph || !graph->model) {
+        status_->SetLabel("No current graph to copy.");
+        return;
+    }
+    auto exported = graph->layout
+        ? export_graph_json(*graph->model, *graph->layout)
+        : export_graph_json(*graph->model);
+    if (!exported) {
+        status_->SetLabel("Graph JSON export failed: " + wxString::FromUTF8(exported.error().message));
+        return;
+    }
+    constexpr std::size_t clipboard_limit = 4 * 1024 * 1024;
+    if (exported.value().size() > clipboard_limit) {
+        status_->SetLabel("Graph JSON exceeds the 4 MiB clipboard limit; reduce graph scope and copy again.");
+        return;
+    }
+    if (!wxTheClipboard || !wxTheClipboard->Open()) {
+        status_->SetLabel("The system clipboard is unavailable.");
+        return;
+    }
+    const auto byte_count = exported.value().size();
+    const bool copied = wxTheClipboard->SetData(new wxTextDataObject(
+        wxString::FromUTF8(exported.value().data(), exported.value().size())));
+    wxTheClipboard->Close();
+    status_->SetLabel(copied
+        ? wxString::Format("Copied %llu bytes of graph JSON.", static_cast<unsigned long long>(byte_count))
+        : wxString("Could not copy graph JSON to the clipboard."));
+}
 void GraphView::update(const ProjectSnapshot *project, std::optional<Location> selection, GraphKind kind,
                        std::size_t call_depth,
                        std::shared_ptr<const ProjectGraph> graph, bool pending, const wxString &reason) {
@@ -307,6 +345,7 @@ void GraphView::update(const ProjectSnapshot *project, std::optional<Location> s
         search_status_->SetLabel("");
     }
     canvas->set_graph(graph);
+    copy_graph_json_->Enable(graph && graph->model);
     if (selection && std::holds_alternative<FileOffset>(*selection) && project && project->loaded && project->loaded->image) {
         const auto address = project->loaded->image->to_address(std::get<FileOffset>(*selection));
         if (address) selection = address.value();

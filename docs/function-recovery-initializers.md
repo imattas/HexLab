@@ -25,13 +25,29 @@ executable-permission, and relocation code-start checks before becoming a
 function root. Unrelocated ambiguity in PIE address interpretation does not
 seed either candidate.
 
+For static ELF `ET_EXEC` files, allocated `SHT_PROGBITS` sections named
+`.ctors` and `.dtors` are also recognized as legacy constructor/destructor
+lists. The section must be file-backed, readable, non-writable, aligned to
+the ELF pointer width, and contain at most 65,536 slots. Null and all-ones
+sentinels are skipped. Each remaining slot is checked against relocation
+metadata before its pointer bytes are read, and a root is accepted only when
+the target is initialized executable code. Seed provenance records the exact
+section, entry index, file offset, and relocation rows. PIE/shared-object
+`ET_DYN` lists are deliberately unsupported here because their load-bias and
+runtime relocation interpretation needs a distinct validated source path;
+relocatable objects are also excluded. The added seed source is serialized in
+derived-cache version 91, and the function-engine fingerprint includes the
+legacy-list discovery rule.
+
 For Mach-O images, `LC_ROUTINES` and `LC_ROUTINES_64` module initializer
 addresses are retained as separate metadata from process entry commands. A
 nonzero address is published as a root only when it maps to initialized
 executable bytes. Malformed or unmapped nonzero addresses leave metadata
 incomplete and do not become function roots. File-backed `__mod_init_func`
-sections (section type `S_MOD_INIT_FUNC_POINTERS`) are scanned in pointer-width
-slots, capped at 65,536 entries per section. Mach-O relocation and dyld fixup
+sections (section type `S_MOD_INIT_FUNC_POINTERS`) and `__mod_term_func`
+sections (`S_MOD_TERM_FUNC_POINTERS`) are scanned in pointer-width slots,
+capped at 65,536 entries per section. Initializer and terminator provenance is
+retained separately. Mach-O relocation and dyld fixup
 metadata is consulted for each slot. A resolved target becomes a root with
 the slot address as its source and retains file offset, section/index, and
 relocation/dyld-origin row IDs; unresolved fixups are left opaque. Existing PE

@@ -14,7 +14,12 @@ offset to the CIE record start; it is never interpreted as the `.eh_frame`
 backward pointer. Width-specific all-ones identifiers distinguish CIEs.
 References into record bodies, outside the section or to FDEs fail.
 
-CIE versions 1, 3 and 4 are accepted only with an empty augmentation string.
+CIE versions 1, 3 and 4 are accepted with an empty augmentation string or the
+bounded `zR` augmentation. `zR` must declare native absolute-pointer encoding
+(`DW_EH_PE_absptr`); its FDE augmentation length must be zero. This admits
+records that use the common augmentation envelope without assuming a relative
+base or reading an indirect pointer. Other augmentations and pointer encodings
+remain unsupported.
 Version 4 must declare the ELF class's four/eight-byte address size and a zero
 segment-selector size. Older versions use that address size implicitly.
 Record starts and total extents must be aligned to the target address size.

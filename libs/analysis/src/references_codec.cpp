@@ -44,7 +44,7 @@ struct Writer {
     }
     void reg(const RegisterOperand &value) {
         number(static_cast<unsigned>(value.bank), 1);
-        number(value.index, 1);
+        number(value.index, 2);
         number(value.width, 2);
         number(value.high_byte, 1);
     }
@@ -84,6 +84,12 @@ struct Writer {
             text(*value.name);
         else
             number(*value.ordinal, 2);
+        number(value.wasm_function_index ? 1 : 0, 1);
+        if (value.wasm_function_index) {
+            number(*value.wasm_function_index, 4);
+            number(value.host_binding ? 1 : 0, 1);
+            if (value.host_binding) text(*value.host_binding);
+        }
     }
     void elf_vtable(const ElfVTableReferenceProvenance &value) {
         address(value.table_begin);
@@ -206,6 +212,9 @@ struct Writer {
         number(value.decision_revision, 8);
         append(value.recipe_fingerprint);
         append(value.engine_fingerprint);
+        number(value.external_input_fingerprint.has_value() ? 1 : 0, 1);
+        if (value.external_input_fingerprint)
+            append(*value.external_input_fingerprint);
     }
 };
 struct Reader {
@@ -259,7 +268,7 @@ struct Reader {
     }
     RegisterOperand reg() {
         const auto bank = static_cast<RegisterBank>(number(1));
-        const auto index = static_cast<uint8_t>(number(1));
+        const auto index = static_cast<std::uint16_t>(number(payload_version >= 18 ? 2 : 1));
         const auto width = static_cast<uint16_t>(number(2));
         return {bank, index, width, flag()};
     }
@@ -303,6 +312,10 @@ struct Reader {
         else {
             require(kind == 1, "Unknown external symbol selector");
             value.ordinal = static_cast<uint16_t>(number(2));
+        }
+        if (payload_version >= 19 && flag()) {
+            value.wasm_function_index = static_cast<std::uint32_t>(number(4));
+            if (flag()) value.host_binding = text();
         }
         return value;
     }
@@ -454,6 +467,12 @@ struct Reader {
         std::copy(digest.begin(), digest.end(), value.recipe_fingerprint.begin());
         digest = read(32);
         std::copy(digest.begin(), digest.end(), value.engine_fingerprint.begin());
+        if (payload_version >= 17 && flag()) {
+            digest = read(32);
+            Sha256Digest external{};
+            std::copy(digest.begin(), digest.end(), external.begin());
+            value.external_input_fingerprint = external;
+        }
         return value;
     }
 };
@@ -556,8 +575,14 @@ bool valid_external(const ExternalIdentity &value) {
     const auto valid_text = [](const std::string &text) {
         return !text.empty() && text.size() <= 65536 && text.find('\0') == std::string::npos;
     };
+    if (value.wasm_function_index)
+        return !value.ordinal && value.name.has_value() && value.library.size() <= 65536 &&
+               value.library.find('\0') == std::string::npos && value.name->size() <= 65536 &&
+               value.name->find('\0') == std::string::npos &&
+               (!value.host_binding || (!value.host_binding->empty() && value.host_binding->size() <= 4096 &&
+                                        value.host_binding->find('\0') == std::string::npos));
     return valid_text(value.library) && value.name.has_value() != value.ordinal.has_value() &&
-           (!value.name || valid_text(*value.name));
+           (!value.name || valid_text(*value.name)) && !value.host_binding;
 }
 std::string external_key(const ExternalIdentity &value) {
     require(valid_external(value), "Invalid external identity");
@@ -857,7 +882,9 @@ void validate_reference(const Reference &value) {
     if (value.provenance.kind != ReferenceProvenanceKind::user)
         if (auto location = std::get_if<Location>(&value.target))
             require(std::holds_alternative<Address>(*location), "Decoded references require an address target domain");
-    require(imported == (value.provenance.kind == ReferenceProvenanceKind::import_slot),
+    const auto *external_target = std::get_if<ExternalIdentity>(&value.target);
+    const bool wasm_external = external_target && external_target->wasm_function_index.has_value();
+    require(imported == (value.provenance.kind == ReferenceProvenanceKind::import_slot || wasm_external),
             "Import provenance/kind mismatch");
     if (value.kind == ReferenceKind::memory_read)
         require(value.access == OperandAccess::read, "Memory read access mismatch");
@@ -868,10 +895,18 @@ void validate_reference(const Reference &value) {
     if (value.kind == ReferenceKind::memory_address || imported || value.kind == ReferenceKind::call ||
         value.kind == ReferenceKind::jump || value.kind == ReferenceKind::conditional_jump)
         require(value.access == OperandAccess::address, "Control/address access mismatch");
-    if (imported)
-        require(std::holds_alternative<ExternalIdentity>(value.target) && value.operand_index && value.association &&
-                    std::holds_alternative<Address>(*value.association),
-                "Import reference needs external identity and numeric slot association");
+    if (imported) {
+        require(external_target && value.operand_index, "Import reference needs external identity and source operand");
+        if (wasm_external)
+            require(value.kind == ReferenceKind::imported_call &&
+                        value.provenance.kind == ReferenceProvenanceKind::decoded && !value.association &&
+                        std::holds_alternative<Address>(value.source),
+                    "WebAssembly import reference must remain symbolic without a code address");
+        else
+            require(value.provenance.kind == ReferenceProvenanceKind::import_slot && value.association &&
+                        std::holds_alternative<Address>(*value.association),
+                    "Native import reference needs a numeric slot association");
+    }
     if (const auto *external = std::get_if<ExternalIdentity>(&value.target))
         require(imported && valid_external(*external), "Invalid external reference identity");
     if (const auto *unresolved = std::get_if<UnresolvedTarget>(&value.target)) {
@@ -1014,7 +1049,7 @@ Result<std::vector<std::byte>> encode_reference_index(const ReferenceIndex &inde
         using namespace reference_detail;
         canceled(stop);
         Writer out;
-        out.number(16, 1);
+        out.number(19, 1);
         out.number(0, 1);
         out.number(index.key() ? 1 : 0, 1);
         if (index.key())
@@ -1046,7 +1081,8 @@ Result<std::shared_ptr<const ReferenceIndex>> decode_reference_index(std::span<c
         require((in.payload_version == 7 || in.payload_version == 8 || in.payload_version == 9 ||
                  in.payload_version == 10 || in.payload_version == 11 || in.payload_version == 12 ||
                  in.payload_version == 13 || in.payload_version == 14 || in.payload_version == 15 ||
-                 in.payload_version == 16) && in.number(1) == 0,
+                 in.payload_version == 16 || in.payload_version == 17 || in.payload_version == 18 ||
+                 in.payload_version == 19) && in.number(1) == 0,
                 "Unknown reference payload version");
         std::optional<AnalysisKey> key;
         if (in.flag())
@@ -1062,10 +1098,10 @@ Result<std::shared_ptr<const ReferenceIndex>> decode_reference_index(std::span<c
             const auto id = in.number(8);
             require(id != 0, "Zero cached reference identity");
             auto reference = in.record();
-            // Older payloads predate target-mode provenance, which changes
-            // the canonical record bytes. Recompute their identities in
-            // memory while upgrading so v16 references use the new key shape.
-            reference.id = in.payload_version >= 16 ? ReferenceId{id} : ReferenceId{};
+            // Earlier payloads predate the extended external identity fields.
+            // Recompute their identities in memory while upgrading so older
+            // references use the current canonical key shape.
+            reference.id = in.payload_version >= 19 ? ReferenceId{id} : ReferenceId{};
             references.push_back(std::move(reference));
         }
         require(in.cursor == payload.size(), "Trailing reference payload bytes");

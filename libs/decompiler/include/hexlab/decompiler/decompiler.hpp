@@ -11,6 +11,7 @@
 #include "hexlab/types/types.hpp"
 
 #include <memory>
+#include <cstddef>
 #include <functional>
 #include <map>
 #include <optional>
@@ -100,6 +101,12 @@ struct MemoryPartitionEffect {
     std::uint32_t input_version = 0;
     std::uint32_t output_version = 0;
 };
+struct IntrinsicMemoryOutput {
+    // Operand containing the memory value whose location is updated, and
+    // operand containing the exact value written back to that location.
+    std::uint32_t location_operand = 0;
+    std::uint32_t value_operand = 0;
+};
 struct Store {
     ExpressionPtr address, value;
     std::optional<std::uint32_t> memory_input_version, memory_output_version;
@@ -166,13 +173,16 @@ struct Return {
     std::optional<std::uint64_t> delay_slot_snapshot_instruction;
     std::optional<X86StackControlEffect> x86_stack_effect;
 };
-enum class IntrinsicMemoryEffect { none, read, write, unknown };
+enum class IntrinsicMemoryEffect { none, read, write, unknown, read_write };
 struct Intrinsic {
     std::string name;
     std::vector<ExpressionPtr> operands;
     IntrinsicMemoryEffect memory_effect = IntrinsicMemoryEffect::unknown;
     std::optional<std::uint32_t> memory_input_version, memory_output_version;
     std::vector<MemoryPartitionEffect> memory_partition_effects;
+    // Present when an intrinsic's opaque memory effect also has one proven
+    // concrete write value. The whole-memory SSA versions still govern state.
+    std::optional<IntrinsicMemoryOutput> memory_output;
     std::vector<RegisterOperand> register_writes;
     std::vector<std::uint32_t> register_output_versions;
     std::optional<ValueType> result_type;
@@ -272,6 +282,17 @@ struct ManagedCilExceptionRegion {
     // where their clauses occur in the metadata section chain.
     std::vector<std::uint32_t> clause_indices;
 };
+struct ManagedCilNativeConversion {
+    std::uint32_t offset = 0;
+    std::string opcode;
+    ValueType source_type, result_type;
+    bool overflow_checked = false, unsigned_source = false;
+    // Formula for a successful integer path and its OverflowException guard.
+    // Unknown runtime width, floating and address inputs stay explicit opaque
+    // CLI operations; exact_integer_semantics is false for those cases.
+    bool exact_integer_semantics = false;
+    ExpressionPtr normal_value, overflow_condition;
+};
 struct ManagedCilDecompilation {
     LiftedFunction lifted;
     StructuredPseudocode pseudocode;
@@ -281,6 +302,8 @@ struct ManagedCilDecompilation {
     bool complete = true;
     std::vector<CilExceptionClause> exception_clauses;
     std::vector<ManagedCilExceptionRegion> exception_regions;
+    std::uint16_t native_integer_bits = 0;
+    std::vector<ManagedCilNativeConversion> native_integer_conversions;
 };
 // Lifts the supported evaluation-stack subset of one decoded managed method
 // into the common IR. Signatures resolved by inspect_managed_methods are used
@@ -333,6 +356,17 @@ HEXLAB_DECOMPILER_EXPORT void attach_switch_analysis(LiftedFunction &, const Swi
 HEXLAB_DECOMPILER_EXPORT Result<LiftedFunction> to_ssa(const LiftedFunction &);
 HEXLAB_DECOMPILER_EXPORT Result<LiftedFunction> to_ssa(
     const LiftedFunction &, std::span<const RegisterOperand> call_argument_registers);
+struct SsaRegisterValidation {
+    std::size_t reachable_blocks = 0;
+    std::size_t definitions = 0;
+    std::size_t uses = 0;
+    std::size_t phi_nodes = 0;
+};
+// Checks register SSA definition uniqueness, phi predecessor coverage, and
+// definition dominance for reachable register uses. Version zero is the
+// implicit incoming value; the JVM evaluation-stack bank is owned by its
+// stack-shape lifter and is excluded.
+HEXLAB_DECOMPILER_EXPORT Result<SsaRegisterValidation> validate_register_ssa(const LiftedFunction &);
 // Propagates proven SSA constants and folds supported fixed-width integer
 // expressions. Unsupported operations remain unchanged.
 HEXLAB_DECOMPILER_EXPORT Result<LiftedFunction> simplify_constants(const LiftedFunction &);
@@ -345,6 +379,14 @@ HEXLAB_DECOMPILER_EXPORT Result<LiftedFunction> simplify_identities(const Lifted
 // Removes unused SSA register definitions and dead phi nodes when their value
 // expressions are pure. Memory reads and all explicit side effects are kept.
 HEXLAB_DECOMPILER_EXPORT Result<LiftedFunction> eliminate_dead_code(const LiftedFunction &);
+// Replaces every expression use of one versioned SSA register with a typed
+// expression. The replacement is applied atomically across nested expressions
+// and instruction/block expression fields; definitions and CFG metadata are
+// unchanged. The target must occur and every replaced use must have the same
+// complete ValueType as the replacement. This is an explicit IR edit, not an
+// optimization or a claim that the replacement is semantically equivalent.
+HEXLAB_DECOMPILER_EXPORT Result<LiftedFunction> replace_register_uses(
+    const LiftedFunction &, RegisterValue target, ExpressionPtr replacement);
 // Names non-overlapping, constant-offset locals addressed through a recognized
 // frame pointer. Dynamic and ambiguous accesses retain ordinary memory form.
 HEXLAB_DECOMPILER_EXPORT Result<LiftedFunction> recover_stack_variables(const LiftedFunction &);

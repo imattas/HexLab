@@ -84,6 +84,15 @@ wxString listing_text(const DocumentSnapshot &document, const ListingRow &row, b
             if (!annotation->comment.empty())
                 result += " ; " + (full_comment ? text(annotation->comment) : preview_text(annotation->comment));
         }
+    // Type assignments are address scoped. Show them on the corresponding
+    // listing row so a user can see the applied interpretation while browsing
+    // instructions, without switching to the typed-data pane.
+    if (document.project && std::holds_alternative<Address>(row.location)) {
+        if (const auto *assignment = type_assignment(*document.project, std::get<Address>(row.location))) {
+            if (const auto *definition = type_definition(*document.project, assignment->type_id))
+                result += " [type: " + text(definition->name) + "]";
+        }
+    }
     return result;
 }
 } // namespace hexlab::desktop

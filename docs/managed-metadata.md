@@ -5,6 +5,21 @@ The loader exposes type and method definitions and now also exposes FieldDef
 rows through `parse_managed_fields`. Each returned `ManagedField` retains its
 metadata token, flags, name, signature-blob index, and owning type name.
 
+Property declarations, ownership, signatures, defaults and accessor roles are
+also exposed through `parse_managed_properties`, `inspect_managed_properties`
+and the project `properties` CLI action. See [managed property metadata](managed-properties.md)
+for exact supported tables, source offsets, limits and signature diagnostics.
+
+Event declarations, EventMap/EventPtr ownership, TypeDefOrRef event type tokens,
+and AddOn/RemoveOn/Fire/Other accessor associations are available through
+`parse_managed_events`, `inspect_managed_events`, and the project `events`
+action. See [managed event metadata](managed-events.md) for limits and
+validation behavior.
+
+ManifestResource names, visibility, implementation tokens, and bounded
+embedded payloads are exposed by `parse_managed_resources` and
+`inspect_managed_resources`; see [CLR resource metadata](managed-resources.md).
+
 Field ownership follows each TypeDef's `FieldList`. Optimized `#~` metadata
 uses FieldDef row order directly. Unoptimized `#-` metadata may include a
 FieldPtr table; its indexes are validated for bounds and uniqueness and its
@@ -29,6 +44,16 @@ parameters with resolved constraint identities, and `parse_managed_methods`
 attaches those records to methods. The standalone
 `parse_managed_generic_parameters` API returns raw constraint tokens.
 
+`parse_managed_methods` also attaches Param rows to each MethodDef. The
+result preserves each Param token, sequence number, flags, and optional name;
+sequence zero is the return parameter and positive sequences are one-based
+signature parameters. Both optimized `#~` ordering and `#-` ParamPtr ordering
+are honored. ParamList boundaries, pointer indexes, duplicate sequence
+numbers, reserved flag bits, row layouts, and heap names are validated. This
+exposes declaration metadata only. Param constants and FieldMarshal rows are
+validated and attached to their owning parameter; parameter types still come
+from the method signature.
+
 `parse_managed_types` attaches TypeDef-owned generic rows to each
 `ManagedTypeDefinition`. `parse_managed_methods` attaches MethodDef-owned rows
 to each method and copies its declaring type's generic rows alongside them.
@@ -52,6 +77,17 @@ full TypeDef, TypeRef, or TypeSpec tokens. Recursive TypeSpec graphs and invalid
 tags or row indexes are rejected; this metadata catalog does not create
 editable project types or resolve external assemblies. A null TypeRef scope is
 also retained as unresolved.
+
+The managed type and field catalogs retain ECMA-335 `ClassLayout` and
+`FieldLayout` rows. Type definitions expose explicit packing size, declared
+class size, and the metadata-root offset of the ClassLayout row; fields expose
+their explicit field offset and FieldLayout row provenance. The
+`project managed-types` and `project fields` summaries print these values when
+present. Parent/index bounds, duplicate layout rows, sorted FieldLayout order,
+row widths, and table extents are validated. This reports declarations only:
+it does not compute runtime object sizes, infer implicit field offsets, or
+validate architecture-specific layout behavior. A zero ClassLayout packing
+value is retained as the CLR default marker.
 
 `parse_managed_type_catalog` retains up to 250,000 ECMA-335 `ExportedType`
 rows, including flags, `TypeDefId`, full names, and the original Implementation
@@ -141,3 +177,34 @@ from a loaded managed PE and prints each value as comma-separated four-digit
 hexadecimal UTF-16 code units. This preserves embedded NULs and unpaired
 surrogates exactly, without normalization or terminal decoding. A missing `#US`
 stream is a valid empty catalog.
+
+`parse_managed_constants` exposes bounded ECMA-335 Constant rows for Field,
+Param and Property owners. Each result retains its Constant token, owner token,
+blob index and element type. Integer, character, Boolean and IEEE floating-point
+values retain their exact little-endian bits in `scalar_bits`; signed values
+retain two's-complement bits without host conversions. String values retain
+UTF-16 code units, including embedded NULs and unpaired surrogates, in
+`string_value`. An ELEMENT_TYPE_CLASS value denotes null and must contain four
+zero bytes. Both `#~` and `#-` tables and wide coded/blob indexes are supported.
+
+The parser validates owner tags and row bounds, the owner's HasDefault flag,
+unique ownership, zero padding, compressed blob extents, scalar widths, Boolean
+values and even string byte counts. It caps the catalog at 250,000 rows, each
+payload at 4 MiB and cumulative decoded payloads at 64 MiB, including repeated
+references to the same blob. `parse_managed_fields` attaches Field constants as
+`ManagedField::default_value`; `parse_managed_methods` attaches Param constants
+as `ManagedParameter::default_value`, preserving return-parameter sequence zero
+and ParamPtr ownership. Property constants are available through the standalone
+catalog; property declarations attach them through `parse_managed_properties`.
+Execution of default values is not inferred.
+Constant payload types are retained as metadata and are not asserted compatible
+with the owner's signature.
+
+Field and parameter `FieldMarshal` rows are retained by
+`parse_managed_marshal_descriptors` as raw `NativeType` bytes with parent token,
+table offset, blob index and blob payload offset. The owner-aware field and
+method catalogs also attach each row to its `ManagedField` or `ManagedParameter`
+record, and the `project fields` and `project methods` queries show a compact
+summary. The `project marshaling` query prints the full bounded catalog. Parser
+validation and the deliberate opaque descriptor boundary are documented in
+[CLR marshal metadata](managed-field-marshal.md).

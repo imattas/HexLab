@@ -5,6 +5,7 @@
 #include "hexlab/loaders/ar.hpp"
 #include <filesystem>
 #include <functional>
+#include <vector>
 namespace hexlab {
 struct PluginImageIdentity {
     std::string plugin_id, plugin_version, extension_id, format_id;
@@ -22,9 +23,13 @@ struct LoadRecipe {
     // Selects the effective byte/decode view for an ARM64X PE image. Persisted
     // with the project recipe so reopening uses the same process architecture.
     std::optional<PeRuntimeArchitecture> pe_runtime_architecture;
-    // Exact caller-selected DWARF v5 supplementary DWP package. Persisted so
-    // saved projects reopen with the same type-reference source.
+    // Exact caller-selected supplementary ELF object or DWARF v5 DWP. Persisted
+    // so saved projects reopen with the same type-reference source.
     std::optional<std::filesystem::path> dwarf_supplementary_package_path;
+    // Ordered exact-identity Minidump PDB candidates selected during open.
+    // Appended to preserve existing positional aggregate initializers.
+    std::vector<std::filesystem::path> minidump_pdb_paths;
+    bool minidump_pdb_search_truncated = false;
 };
 using PluginImageLoader = std::function<Result<LoadedImage>(
     std::shared_ptr<const ByteStorage>, std::stop_token)>;

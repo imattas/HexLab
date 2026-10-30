@@ -1,10 +1,13 @@
 #include "hexlab/decompiler/optimizer.hpp"
 #include "hexlab/processors/riscv_semantics.hpp"
+#include "hexlab/processors/x86_crc32_semantics.hpp"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <charconv>
 #include <iterator>
+#include <limits>
 #include <map>
 #include <new>
 #include <set>
@@ -40,6 +43,19 @@ std::optional<X87Binary80Value> fold_x87_unary(const UnaryValue &unary, ValueTyp
     X87UnaryArithmetic operation;
     if (unary.operation == "x87_fchs") operation = X87UnaryArithmetic::change_sign;
     else if (unary.operation == "x87_fabs") operation = X87UnaryArithmetic::absolute;
+    else if (unary.operation == "x87_frndint") {
+        // FRNDINT consults FCW.RC and may set PE. Fold only when all four
+        // rounding directions produce the same payload and masked completion.
+        std::optional<X87Binary80> common;
+        for (std::uint16_t rounding = 0; rounding < 4; ++rounding) {
+            const auto control = static_cast<std::uint16_t>(0x007fu | (rounding << 10));
+            const auto evaluated = evaluate_x87_round_to_integral({operand->value, control, 0});
+            if (!evaluated || !evaluated->completed || !evaluated->value) return {};
+            if (common && *common != *evaluated->value) return {};
+            common = *evaluated->value;
+        }
+        return common ? std::optional<X87Binary80Value>{X87Binary80Value{*common}} : std::nullopt;
+    }
     else if (unary.operation == "x87_sqrt") {
         const auto exponent = operand->value.sign_exponent & 0x7fffu;
         const bool negative = (operand->value.sign_exponent & 0x8000u) != 0;
@@ -69,11 +85,57 @@ std::optional<ConstantValue> fold_unary(const UnaryValue &unary, ValueType resul
     if (!operand || !operand->type.bits || operand->type.bits > 64 ||
         !result_type.bits || result_type.bits > 64)
         return {};
+    // FCLASS is a raw-encoding operation: classify the IEEE bit pattern rather
+    // than interpreting it as a host float (which could canonicalize NaNs).
+    if ((unary.operation == "fclass.s" || unary.operation == "fclass.d") &&
+        operand->type.kind == TypeKind::floating && result_type.kind == TypeKind::integer &&
+        result_type.bits >= 10 &&
+        operand->type.bits == (unary.operation == "fclass.s" ? 32 : 64)) {
+        const auto opcode = unary.operation == "fclass.s" ? RiscvOpcode::fclass_s
+                                                            : RiscvOpcode::fclass_d;
+        if (const auto value = evaluate_riscv_fclass(
+                opcode, operand->value & width_mask(operand->type.bits)))
+            return ConstantValue{*value, result_type};
+    }
     const auto source_mask = width_mask(operand->type.bits);
     const auto result_mask = width_mask(result_type.bits);
+    if (unary.operation == "-" && operand->type.kind == TypeKind::integer &&
+        result_type == operand->type)
+        return ConstantValue{(std::uint64_t{0} - operand->value) & result_mask, result_type};
+    if (unary.operation == "~" && operand->type.kind == TypeKind::integer &&
+        result_type == operand->type)
+        return ConstantValue{~operand->value & result_mask, result_type};
     if (unary.operation == "bitnot" && operand->type.kind == TypeKind::integer &&
         result_type == operand->type)
         return ConstantValue{~operand->value & result_mask, result_type};
+    if (operand->type.kind == TypeKind::integer && result_type == operand->type &&
+        (unary.operation == "clz" || unary.operation == "ctz" || unary.operation == "popcount")) {
+        const auto value = operand->value & source_mask;
+        if (unary.operation == "clz")
+            return ConstantValue{static_cast<std::uint64_t>(std::countl_zero(value) - (64 - operand->type.bits)), result_type};
+        if (unary.operation == "ctz")
+            return ConstantValue{static_cast<std::uint64_t>(std::min<unsigned>(std::countr_zero(value), operand->type.bits)), result_type};
+        return ConstantValue{static_cast<std::uint64_t>(std::popcount(value)), result_type};
+    }
+    if (operand->type.kind == TypeKind::integer && result_type == operand->type &&
+        unary.operation == "bswap" + std::to_string(operand->type.bits)) {
+        const auto value = operand->value & source_mask;
+        std::uint64_t reversed = 0;
+        for (unsigned byte = 0; byte < operand->type.bits / 8; ++byte)
+            reversed |= ((value >> (byte * 8)) & 0xffu) << (operand->type.bits - 8 - byte * 8);
+        return ConstantValue{reversed & result_mask, result_type};
+    }
+    // JVM i2b/i2c/i2s produce an int on the operand stack. The conversion is
+    // therefore a truncate followed by an opcode-specific extension.
+    if (operand->type.kind == TypeKind::integer && operand->type.bits == 32 &&
+        result_type.kind == TypeKind::integer && result_type.bits == 32 &&
+        (unary.operation == "i2b" || unary.operation == "i2c" || unary.operation == "i2s")) {
+        const unsigned narrow_bits = unary.operation == "i2b" ? 8u : 16u;
+        auto value = operand->value & width_mask(static_cast<std::uint16_t>(narrow_bits));
+        if (unary.operation != "i2c" && (value & (std::uint64_t{1} << (narrow_bits - 1))))
+            value |= UINT32_MAX ^ width_mask(static_cast<std::uint16_t>(narrow_bits));
+        return ConstantValue{value & UINT32_MAX, result_type};
+    }
     if (unary.operation == "not" && operand->type.kind == TypeKind::boolean && operand->type.bits == 1 &&
         result_type.kind == TypeKind::boolean && result_type.bits == 1 && operand->value <= 1)
         return ConstantValue{(operand->value & 1) == 0 ? 1u : 0u, result_type};
@@ -150,13 +212,147 @@ std::optional<RiscvOpcode> riscv_m_opcode(const std::string &name) {
     if (name == "rvm_remuw") return RiscvOpcode::remuw;
     return {};
 }
+// Only the explicit Zfa rounding formulas have these semantics. Keep the
+// enclosing intrinsic and its old-fflags OR: folding a value cannot erase the
+// parallel architectural status write.
+std::optional<ConstantValue> fold_riscv_fround(const BinaryValue &binary, ValueType result_type) {
+    std::string_view operation = binary.operation;
+    const bool exceptions = operation.ends_with(".exceptions");
+    if (exceptions) operation.remove_suffix(std::string_view(".exceptions").size());
+    RiscvOpcode opcode;
+    std::uint16_t width = 0;
+    if (operation == "fround.s") { opcode = RiscvOpcode::fround_s; width = 32; }
+    else if (operation == "froundnx.s") { opcode = RiscvOpcode::froundnx_s; width = 32; }
+    else if (operation == "fround.d") { opcode = RiscvOpcode::fround_d; width = 64; }
+    else if (operation == "froundnx.d") { opcode = RiscvOpcode::froundnx_d; width = 64; }
+    else return {};
+    const ValueType source_type{TypeKind::floating, width, false};
+    const ValueType mode_type{TypeKind::integer, 3, false};
+    const ValueType expected_result = exceptions ? ValueType{TypeKind::integer, 5, false} : source_type;
+    const auto *source = binary.left ? std::get_if<ConstantValue>(&binary.left->value) : nullptr;
+    const auto *mode = binary.right ? std::get_if<ConstantValue>(&binary.right->value) : nullptr;
+    if (!source || !mode || binary.left->type != source_type || source->type != source_type ||
+        binary.right->type != mode_type || mode->type != mode_type || result_type != expected_result ||
+        mode->value > 4 || (source->value & ~width_mask(width)))
+        return {};
+    const auto exponent_mask = width == 32 ? UINT64_C(0x7f800000) : UINT64_C(0x7ff0000000000000);
+    const auto fraction_mask = width == 32 ? UINT64_C(0x007fffff) : UINT64_C(0x000fffffffffffff);
+    // Do not bring the helper's payload-preserving NaN policy into architectural
+    // folding until canonical NaNs and physical FPR boxing are modeled.
+    if ((source->value & exponent_mask) == exponent_mask && (source->value & fraction_mask))
+        return {};
+    const auto evaluated = evaluate_riscv_fround_operation(opcode, source->value,
+        static_cast<std::uint8_t>(mode->value));
+    if (!evaluated) return {};
+    return ConstantValue{exceptions ? evaluated->fflags_set : evaluated->value, expected_result};
+}
+
 std::optional<ConstantValue> fold_binary(const BinaryValue &binary, ValueType result_type) {
+    if (auto rounded = fold_riscv_fround(binary, result_type)) return rounded;
     const auto *left = binary.left ? std::get_if<ConstantValue>(&binary.left->value) : nullptr;
     const auto *right = binary.right ? std::get_if<ConstantValue>(&binary.right->value) : nullptr;
     if (!left || !right || !left->type.bits || left->type.bits > 64 ||
         !right->type.bits || right->type.bits > 64 ||
         !result_type.bits || result_type.bits > 64)
         return {};
+    const ValueType jvm_int{TypeKind::integer, 32, true};
+    if (binary.operation == "jvm_lcmp" && left->type == ValueType{TypeKind::integer, 64, true} &&
+        right->type == left->type && result_type == jvm_int) {
+        const auto a = std::bit_cast<std::int64_t>(left->value);
+        const auto b = std::bit_cast<std::int64_t>(right->value);
+        return ConstantValue{static_cast<std::uint64_t>(a < b ? -1 : a > b ? 1 : 0), result_type};
+    }
+    const auto jvm_float_compare = [&](unsigned width, bool nan_is_greater) -> std::optional<ConstantValue> {
+        const ValueType floating_type{TypeKind::floating, static_cast<std::uint16_t>(width), false};
+        if (left->type != floating_type || right->type != floating_type || result_type != jvm_int)
+            return {};
+        int comparison = 0;
+        bool is_nan = false;
+        const auto compare_ieee_bits = [](std::uint64_t a, std::uint64_t b,
+                                          std::uint64_t sign_mask) {
+            if ((a & ~sign_mask) == 0 && (b & ~sign_mask) == 0) return 0;
+            const bool a_negative = (a & sign_mask) != 0;
+            const bool b_negative = (b & sign_mask) != 0;
+            if (a_negative != b_negative) return a_negative ? -1 : 1;
+            if (a == b) return 0;
+            const bool less = a_negative ? a > b : a < b;
+            return less ? -1 : 1;
+        };
+        if (width == 32) {
+            const auto a_bits = static_cast<std::uint32_t>(left->value);
+            const auto b_bits = static_cast<std::uint32_t>(right->value);
+            is_nan = ((a_bits & 0x7f800000u) == 0x7f800000u && (a_bits & 0x007fffffu) != 0) ||
+                     ((b_bits & 0x7f800000u) == 0x7f800000u && (b_bits & 0x007fffffu) != 0);
+            if (!is_nan) comparison = compare_ieee_bits(a_bits, b_bits, 0x80000000u);
+        } else {
+            const auto a_bits = left->value;
+            const auto b_bits = right->value;
+            is_nan = ((a_bits & 0x7ff0000000000000ULL) == 0x7ff0000000000000ULL &&
+                      (a_bits & 0x000fffffffffffffULL) != 0) ||
+                     ((b_bits & 0x7ff0000000000000ULL) == 0x7ff0000000000000ULL &&
+                      (b_bits & 0x000fffffffffffffULL) != 0);
+            if (!is_nan) comparison = compare_ieee_bits(a_bits, b_bits, 0x8000000000000000ULL);
+        }
+        if (is_nan) comparison = nan_is_greater ? 1 : -1;
+        return ConstantValue{static_cast<std::uint64_t>(comparison), result_type};
+    };
+    if (binary.operation == "jvm_fcmpl_nan_minus_one") return jvm_float_compare(32, false);
+    if (binary.operation == "jvm_fcmpg_nan_plus_one") return jvm_float_compare(32, true);
+    if (binary.operation == "jvm_dcmpl_nan_minus_one") return jvm_float_compare(64, false);
+    if (binary.operation == "jvm_dcmpg_nan_plus_one") return jvm_float_compare(64, true);
+    if ((binary.operation == "==" || binary.operation == ">" || binary.operation == "<" ||
+         binary.operation == "fcgt_un" || binary.operation == "fclt_un") &&
+        left->type.kind == TypeKind::floating && left->type == right->type &&
+        (left->type.bits == 32 || left->type.bits == 64) &&
+        result_type == ValueType{TypeKind::boolean, 1, false}) {
+        const auto compare_ieee_bits = [](std::uint64_t a, std::uint64_t b,
+                                          std::uint64_t sign_mask) {
+            if ((a & ~sign_mask) == 0 && (b & ~sign_mask) == 0) return 0;
+            const bool a_negative = (a & sign_mask) != 0;
+            const bool b_negative = (b & sign_mask) != 0;
+            if (a_negative != b_negative) return a_negative ? -1 : 1;
+            if (a == b) return 0;
+            const bool less = a_negative ? a > b : a < b;
+            return less ? -1 : 1;
+        };
+        std::uint64_t a_bits = left->value, b_bits = right->value;
+        std::uint64_t exponent_mask = 0, fraction_mask = 0, sign_mask = 0;
+        if (left->type.bits == 32) {
+            a_bits = static_cast<std::uint32_t>(a_bits);
+            b_bits = static_cast<std::uint32_t>(b_bits);
+            exponent_mask = 0x7f800000u;
+            fraction_mask = 0x007fffffu;
+            sign_mask = 0x80000000u;
+        } else {
+            exponent_mask = 0x7ff0000000000000ULL;
+            fraction_mask = 0x000fffffffffffffULL;
+            sign_mask = 0x8000000000000000ULL;
+        }
+        const auto is_nan = [&](std::uint64_t bits) {
+            return (bits & exponent_mask) == exponent_mask && (bits & fraction_mask) != 0;
+        };
+        const bool unordered = is_nan(a_bits) || is_nan(b_bits);
+        bool value = false;
+        if (binary.operation == "fcgt_un" || binary.operation == "fclt_un") {
+            value = unordered || (binary.operation == "fcgt_un"
+                ? compare_ieee_bits(a_bits, b_bits, sign_mask) > 0
+                : compare_ieee_bits(a_bits, b_bits, sign_mask) < 0);
+        } else if (!unordered) {
+            const auto comparison = compare_ieee_bits(a_bits, b_bits, sign_mask);
+            value = binary.operation == "==" ? comparison == 0 :
+                    binary.operation == ">" ? comparison > 0 : comparison < 0;
+        }
+        return ConstantValue{value ? 1u : 0u, result_type};
+    }
+    if (binary.operation == "x86_crc32c") {
+        const ValueType crc_type{TypeKind::integer, 32, false};
+        if (left->type != crc_type || result_type != crc_type || binary.left->type != left->type ||
+            binary.right->type != right->type || right->type.kind != TypeKind::integer || right->type.is_signed)
+            return {};
+        const auto result = evaluate_x86_crc32c(static_cast<std::uint32_t>(left->value), right->value,
+            right->type.bits);
+        return result ? std::optional<ConstantValue>{ConstantValue{*result, crc_type}} : std::nullopt;
+    }
     const auto bits = left->type.bits;
     const auto a = left->value & width_mask(bits), b = right->value & width_mask(bits);
     const bool comparison = binary.operation == "eq" || binary.operation == "ne" || binary.operation == "ult" ||
@@ -194,6 +390,26 @@ std::optional<ConstantValue> fold_binary(const BinaryValue &binary, ValueType re
             result_type.is_signed || left->type != right->type || left->type != result_type || b == 0)
             return {};
         return ConstantValue{binary.operation == "udiv" ? a / b : a % b, result_type};
+    }
+    if (binary.operation == "sdiv" || binary.operation == "srem") {
+        if (left->type.kind != TypeKind::integer || right->type.kind != TypeKind::integer ||
+            result_type.kind != TypeKind::integer || !left->type.is_signed || !right->type.is_signed ||
+            !result_type.is_signed || left->type != right->type || left->type != result_type || b == 0)
+            return {};
+        const auto signed_value = [bits](std::uint64_t value) -> std::int64_t {
+            value &= width_mask(bits);
+            if (bits == 64) return std::bit_cast<std::int64_t>(value);
+            const auto sign = std::uint64_t{1} << (bits - 1);
+            if ((value & sign) == 0) return static_cast<std::int64_t>(value);
+            const auto magnitude = ((~value) & width_mask(bits)) + 1;
+            return -static_cast<std::int64_t>(magnitude);
+        };
+        const auto signed_a = signed_value(a);
+        const auto signed_b = signed_value(b);
+        if (signed_a == std::numeric_limits<std::int64_t>::min() && signed_b == -1)
+            return {};
+        const auto folded = binary.operation == "sdiv" ? signed_a / signed_b : signed_a % signed_b;
+        return ConstantValue{static_cast<std::uint64_t>(folded) & width_mask(result_bits), result_type};
     }
     if (const auto m_opcode = riscv_m_opcode(binary.operation)) {
         const auto folded = evaluate_riscv_m_operation(*m_opcode, bits, left->value, right->value);
@@ -262,6 +478,38 @@ std::optional<KnownBits> evaluate_known_bits(const ExpressionPtr &expression,
         if (unary->operation == "bitnot" && operand->width == width &&
             expression->type.kind == TypeKind::integer && unary->operand->type.kind == TypeKind::integer)
             return KnownBits{width, operand->one & result_mask, operand->zero & result_mask};
+        if (unary->operation == "~" && operand->width == width &&
+            expression->type.kind == TypeKind::integer && unary->operand->type.kind == TypeKind::integer)
+            return KnownBits{width, operand->one & result_mask, operand->zero & result_mask};
+        if (unary->operation == "-" && operand->width == width &&
+            expression->type.kind == TypeKind::integer && unary->operand->type.kind == TypeKind::integer) {
+            // Two's-complement negation is ~x + 1. Track the carry as a set
+            // so facts remain valid when operand bits are unknown.
+            std::uint8_t carries = 2; // bit 1 means carry 1 is possible.
+            std::uint64_t known_zero = 0, known_one = 0;
+            for (std::uint16_t bit = 0; bit < width; ++bit) {
+                const auto bit_mask = std::uint64_t{1} << bit;
+                const bool can_zero = (operand->zero & bit_mask) ||
+                    !((operand->zero | operand->one) & bit_mask);
+                const bool can_one = (operand->one & bit_mask) ||
+                    !((operand->zero | operand->one) & bit_mask);
+                bool output_zero = false, output_one = false;
+                std::uint8_t next_carries = 0;
+                for (unsigned input = 0; input <= 1; ++input) {
+                    if (input ? !can_one : !can_zero) continue;
+                    for (unsigned carry = 0; carry <= 1; ++carry) {
+                        if ((carries & (std::uint8_t{1} << carry)) == 0) continue;
+                        const auto sum = (1u - input) + carry;
+                        (sum & 1u) ? output_one = true : output_zero = true;
+                        next_carries |= std::uint8_t{1} << (sum >> 1);
+                    }
+                }
+                if (output_zero && !output_one) known_zero |= bit_mask;
+                if (output_one && !output_zero) known_one |= bit_mask;
+                carries = next_carries;
+            }
+            return KnownBits{width, known_zero & result_mask, known_one & result_mask};
+        }
         if (unary->operation == "not" && operand->width == 1 && width == 1 &&
             expression->type.kind == TypeKind::boolean && unary->operand->type.kind == TypeKind::boolean)
             return KnownBits{1, operand->one & 1, operand->zero & 1};
@@ -336,6 +584,14 @@ std::optional<KnownBits> evaluate_known_bits(const ExpressionPtr &expression,
                 }
                 return KnownBits{width, zero & mask, one & mask};
             }
+            if (const auto amount = fixed_amount("ror_")) {
+                const auto shift = *amount % width;
+                const auto rotate = [&](std::uint64_t value) {
+                    value &= mask;
+                    return shift ? ((value >> shift) | (value << (width - shift))) & mask : value;
+                };
+                return KnownBits{width, rotate(operand->zero), rotate(operand->one)};
+            }
         }
         return {};
     }
@@ -346,6 +602,46 @@ std::optional<KnownBits> evaluate_known_bits(const ExpressionPtr &expression,
         const auto left_type = binary->left->type;
         const auto right_type = binary->right->type;
         const bool integers = left_type.kind == TypeKind::integer && right_type.kind == TypeKind::integer;
+        const bool variable_shift = binary->operation == "shl" || binary->operation == "shr" ||
+                                    binary->operation == "sar" || binary->operation == "rotl" ||
+                                    binary->operation == "rotr";
+        if (variable_shift && integers && left_type == expression->type &&
+            expression->type.kind == TypeKind::integer && left->width == width &&
+            right->width == right_type.bits && right_type.bits > 0 && right_type.bits <= 64) {
+            const auto count_mask = width_mask(right_type.bits);
+            if (((right->zero | right->one) & count_mask) != count_mask) return {};
+            const auto raw_count = right->one & count_mask;
+            if (binary->operation == "rotl" || binary->operation == "rotr") {
+                const auto shift = static_cast<unsigned>(raw_count % width);
+                KnownBits rotated{width, 0, 0};
+                for (unsigned source = 0; source < width; ++source) {
+                    const auto source_mask = std::uint64_t{1} << source;
+                    const auto destination = binary->operation == "rotl"
+                        ? (source + shift) % width : (source + width - shift) % width;
+                    const auto destination_mask = std::uint64_t{1} << destination;
+                    if (left->zero & source_mask) rotated.zero |= destination_mask;
+                    if (left->one & source_mask) rotated.one |= destination_mask;
+                }
+                return rotated;
+            }
+            if (raw_count >= width) return {};
+            const auto shift = static_cast<unsigned>(raw_count);
+            if (binary->operation == "shl") {
+                const auto inserted = shift ? (std::uint64_t{1} << shift) - 1 : 0;
+                return KnownBits{width, ((left->zero << shift) | inserted) & mask,
+                                 (left->one << shift) & mask};
+            }
+            const auto inserted = mask ^ (mask >> shift);
+            auto zero = left->zero >> shift;
+            auto one = left->one >> shift;
+            if (binary->operation == "shr") zero |= inserted;
+            else {
+                const auto sign = std::uint64_t{1} << (width - 1);
+                if (left->zero & sign) zero |= inserted;
+                if (left->one & sign) one |= inserted;
+            }
+            return KnownBits{width, zero & mask, one & mask};
+        }
         if (integers && left_type == right_type && expression->type == left_type &&
             left->width == width && right->width == width) {
             if (binary->operation == "and")
@@ -466,6 +762,67 @@ std::optional<KnownBits> evaluate_known_bits(const ExpressionPtr &expression,
                 carries = next_carries;
             }
             return KnownBits{width, known_zero & mask, known_one & mask};
+        }
+        if (binary->operation == "mul" && binary->left->type == expression->type &&
+            binary->right->type == expression->type) {
+            // Multiply by accumulating possible partial-product sums one
+            // result bit at a time. Operand bits are treated independently;
+            // that may lose facts, but cannot invent them. The carry set is
+            // bounded by the number of partial products (at most 64).
+            std::array<bool, 129> carries{};
+            carries[0] = true;
+            std::uint64_t known_zero = 0, known_one = 0;
+            for (std::uint16_t bit = 0; bit < width; ++bit) {
+                std::array<bool, 65> partial_sums{};
+                partial_sums[0] = true;
+                for (std::uint16_t lhs_bit = 0; lhs_bit <= bit; ++lhs_bit) {
+                    const auto rhs_bit = static_cast<std::uint16_t>(bit - lhs_bit);
+                    const auto lhs_mask = std::uint64_t{1} << lhs_bit;
+                    const auto rhs_mask = std::uint64_t{1} << rhs_bit;
+                    const bool lhs_can_zero = (left->zero & lhs_mask) || !((left->zero | left->one) & lhs_mask);
+                    const bool lhs_can_one = (left->one & lhs_mask) || !((left->zero | left->one) & lhs_mask);
+                    const bool rhs_can_zero = (right->zero & rhs_mask) || !((right->zero | right->one) & rhs_mask);
+                    const bool rhs_can_one = (right->one & rhs_mask) || !((right->zero | right->one) & rhs_mask);
+                    const bool product_zero = (lhs_can_zero && (rhs_can_zero || rhs_can_one)) ||
+                                              (rhs_can_zero && (lhs_can_zero || lhs_can_one));
+                    const bool product_one = lhs_can_one && rhs_can_one;
+                    std::array<bool, 65> next{};
+                    for (unsigned sum = 0; sum < partial_sums.size(); ++sum) {
+                        if (!partial_sums[sum]) continue;
+                        if (product_zero) next[sum] = true;
+                        if (product_one) next[sum + 1] = true;
+                    }
+                    partial_sums = next;
+                }
+                bool output_zero = false, output_one = false;
+                std::array<bool, 129> next_carries{};
+                for (std::size_t carry = 0; carry < carries.size(); ++carry) {
+                    if (!carries[carry]) continue;
+                    for (std::size_t partial = 0; partial < partial_sums.size(); ++partial) {
+                        if (!partial_sums[partial]) continue;
+                        const auto sum = carry + partial;
+                        (sum & 1u) ? output_one = true : output_zero = true;
+                        next_carries[sum / 2] = true;
+                    }
+                }
+                const auto bit_mask = std::uint64_t{1} << bit;
+                if (output_zero && !output_one) known_zero |= bit_mask;
+                if (output_one && !output_zero) known_one |= bit_mask;
+                carries = next_carries;
+            }
+            return KnownBits{width, known_zero & mask, known_one & mask};
+        }
+        if ((binary->operation == "rotl" || binary->operation == "rotr") &&
+            binary->left->type == expression->type && binary->right->type == expression->type &&
+            (((right->zero | right->one) & mask) == mask)) {
+            auto amount = static_cast<unsigned>(right->one % width);
+            if (binary->operation == "rotl" && amount)
+                amount = static_cast<unsigned>(width) - amount;
+            const auto rotate = [&](std::uint64_t value) {
+                value &= mask;
+                return amount ? ((value >> amount) | (value << (width - amount))) & mask : value;
+            };
+            return KnownBits{width, rotate(left->zero), rotate(left->one)};
         }
         const bool shift = binary->operation == "shl" || binary->operation == "shr" || binary->operation == "sar";
         const auto shift_mask = width_mask(right->width);
@@ -945,6 +1302,30 @@ std::optional<SccpBranchEdges> sccp_branch_edges(const LiftedBlock &block, const
     return SccpBranchEdges{*on_true, *on_false};
 }
 
+struct SccpSwitchSelection {
+    Address target;
+    bool matched_case = false;
+};
+
+std::optional<SccpSwitchSelection> sccp_switch_selection(
+    const LiftedBlock::SwitchDispatch &dispatch, const ConstantValue &selector, SccpBudget &budget) {
+    if (!dispatch.complete || !selector.type.bits || selector.type.bits > 64 ||
+        (selector.type.kind != TypeKind::integer && selector.type.kind != TypeKind::boolean) ||
+        (selector.value & ~width_mask(selector.type.bits)) != 0 ||
+        (selector.type.kind == TypeKind::boolean &&
+         (selector.type.bits != 1 || selector.value > 1))) return {};
+    std::optional<Address> selected;
+    budget.tick(dispatch.cases.size());
+    for (const auto &item : dispatch.cases) {
+        if (item.value != selector.value) continue;
+        if (selected && *selected != item.target) return {};
+        selected = item.target;
+    }
+    if (selected) return SccpSwitchSelection{*selected, true};
+    if (!dispatch.default_target) return {};
+    return SccpSwitchSelection{*dispatch.default_target, false};
+}
+
 Result<LiftedFunction> sparse_conditional_constants(const LiftedFunction &input) {
     try {
         std::map<BlockId, std::size_t> block_index;
@@ -1009,6 +1390,7 @@ Result<LiftedFunction> sparse_conditional_constants(const LiftedFunction &input)
         std::set<SccpEdge> feasible_edges;
         std::map<BlockId, std::set<BlockId>> feasible_predecessors;
         std::set<BlockId> forced_unknown_branches;
+        std::set<BlockId> forced_unknown_switches;
         auto mark_edge = [&](const LiftedBlock &block, std::size_t edge_index, bool &changed) {
             if (!feasible_edges.insert({block.id, edge_index}).second) return;
             changed = true;
@@ -1071,9 +1453,31 @@ Result<LiftedFunction> sparse_conditional_constants(const LiftedFunction &input)
                         branch_edges = sccp_branch_edges(block, *branch);
                         predicate = sccp_evaluate(branch->predicate, values, definitions, budget);
                     }
+                    std::optional<SccpSwitchSelection> switch_selection;
+                    bool switch_selector_unknown = false;
+                    if (block.switch_dispatch && block.switch_dispatch->complete &&
+                        !forced_unknown_switches.contains(block.id)) {
+                        const auto selector = sccp_evaluate(block.switch_dispatch->selector, values,
+                                                            definitions, budget);
+                        if (selector.kind == SccpValue::Kind::constant)
+                            switch_selection = sccp_switch_selection(*block.switch_dispatch,
+                                                                     selector.constant, budget);
+                        else if (selector.kind == SccpValue::Kind::unknown)
+                            switch_selector_unknown = true;
+                        if (switch_selection && std::none_of(block.successors.begin(), block.successors.end(),
+                            [&](const auto &edge) {
+                                return edge.target && *edge.target == switch_selection->target;
+                            }))
+                            switch_selection.reset();
+                    }
                     for (std::size_t edge_index = 0; edge_index < block.successors.size(); ++edge_index) {
                         bool feasible = true;
-                        if (branch && branch_edges && !forced_unknown_branches.contains(block.id)) {
+                        if (switch_selection) {
+                            const auto &target = block.successors[edge_index].target;
+                            feasible = target && *target == switch_selection->target;
+                        } else if (switch_selector_unknown) {
+                            feasible = false;
+                        } else if (branch && branch_edges && !forced_unknown_branches.contains(block.id)) {
                             if (predicate.kind == SccpValue::Kind::constant &&
                                 predicate.constant.type.kind == TypeKind::boolean && predicate.constant.type.bits == 1 &&
                                 predicate.constant.value <= 1) {
@@ -1093,15 +1497,30 @@ Result<LiftedFunction> sparse_conditional_constants(const LiftedFunction &input)
         // A bottom predicate at convergence is not a proof of a dead edge.
         // Open both edges and propagate the newly reachable values instead.
         bool opened_unknown = false;
-        for (const auto &block : input.blocks) {
-            if (!reachable.contains(block.id) || block.instructions.empty()) continue;
-            const auto *branch = std::get_if<Branch>(&block.instructions.back().statement);
-            if (!branch || branch->condition == "true" || !sccp_branch_edges(block, *branch)) continue;
-            const auto predicate = sccp_evaluate(branch->predicate, values, definitions, budget);
-            if (predicate.kind == SccpValue::Kind::unknown && forced_unknown_branches.insert(block.id).second)
-                opened_unknown = true;
-        }
-        if (opened_unknown) run_to_fixed_point();
+        do {
+            opened_unknown = false;
+            for (const auto &block : input.blocks) {
+                if (!reachable.contains(block.id)) continue;
+                if (!block.instructions.empty()) {
+                    const auto *branch = std::get_if<Branch>(&block.instructions.back().statement);
+                    if (branch && branch->condition != "true" && sccp_branch_edges(block, *branch)) {
+                        const auto predicate = sccp_evaluate(branch->predicate, values, definitions, budget);
+                        if (predicate.kind == SccpValue::Kind::unknown &&
+                            forced_unknown_branches.insert(block.id).second)
+                            opened_unknown = true;
+                    }
+                }
+                if (block.switch_dispatch && block.switch_dispatch->complete &&
+                    !forced_unknown_switches.contains(block.id)) {
+                    const auto selector = sccp_evaluate(block.switch_dispatch->selector, values,
+                                                        definitions, budget);
+                    if (selector.kind == SccpValue::Kind::unknown &&
+                        forced_unknown_switches.insert(block.id).second)
+                        opened_unknown = true;
+                }
+            }
+            if (opened_unknown) run_to_fixed_point();
+        } while (opened_unknown);
 
         LiftedFunction result = input;
         std::map<Key, ConstantValue> constants;
@@ -1133,6 +1552,28 @@ Result<LiftedFunction> sparse_conditional_constants(const LiftedFunction &input)
                             branch->true_target = edge.target;
                             branch->false_target.reset();
                             branch->predicate.reset();
+                        }
+                    }
+                }
+            }
+            if (block.switch_dispatch) {
+                const auto selector = sccp_evaluate(block.switch_dispatch->selector, values,
+                                                    definitions, budget);
+                if (selector.kind == SccpValue::Kind::constant) {
+                    const auto selection = sccp_switch_selection(*block.switch_dispatch,
+                                                                  selector.constant, budget);
+                    if (selection && std::any_of(block.successors.begin(), block.successors.end(),
+                        [&](const auto &edge) {
+                            return edge.target && *edge.target == selection->target;
+                        })) {
+                        block.switch_dispatch->selector = constant_expression(selector.constant);
+                        if (selection->matched_case) {
+                            std::erase_if(block.switch_dispatch->cases, [&](const auto &item) {
+                                return item.value != selector.constant.value;
+                            });
+                            block.switch_dispatch->default_target.reset();
+                        } else {
+                            block.switch_dispatch->cases.clear();
                         }
                     }
                 }
@@ -1712,6 +2153,7 @@ struct SummaryWorker {
         summary.register_effects_known = input.boundary_register_effects_known;
         summary.may_read_memory = input.boundary_memory_effect != IntrinsicMemoryEffect::none;
         summary.may_write_memory = input.boundary_memory_effect == IntrinsicMemoryEffect::write ||
+                                   input.boundary_memory_effect == IntrinsicMemoryEffect::read_write ||
                                    input.boundary_memory_effect == IntrinsicMemoryEffect::unknown;
         for (const auto reg : input.boundary_register_writes) add_write(summary.register_writes, reg, budget);
         bool unanimous_return = true;
@@ -1887,6 +2329,7 @@ void validate_summary_input(const CallSummaryInput &input, SummaryBudget &budget
     if (input.boundary_memory_effect != IntrinsicMemoryEffect::none &&
         input.boundary_memory_effect != IntrinsicMemoryEffect::read &&
         input.boundary_memory_effect != IntrinsicMemoryEffect::write &&
+        input.boundary_memory_effect != IntrinsicMemoryEffect::read_write &&
         input.boundary_memory_effect != IntrinsicMemoryEffect::unknown)
         throw Error{ErrorCode::invalid_argument, "Call-summary boundary has an invalid memory effect"};
     budget.tick(input.boundary_register_writes.size());

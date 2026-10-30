@@ -22,8 +22,12 @@ namespace hexlab::decompiler {
 namespace {
 using Key = std::tuple<unsigned, unsigned, unsigned, bool, std::uint32_t, bool>;
 Key key(RegisterOperand r, std::optional<std::uint32_t> v = {}) {
+    if (r.bank == RegisterBank::arm64_simd) r.width = 128;
     return {static_cast<unsigned>(r.bank), r.index, r.width, r.high_byte, v.value_or(0), v.has_value()};
 }
+enum class A64SimdDefinition : std::uint8_t {
+    unknown, scalar_s, scalar_d, full_q, conflicting
+};
 struct Fact {
     RegisterOperand reg;
     std::optional<std::uint32_t> version;
@@ -40,8 +44,19 @@ struct Fact {
     bool exact_type_ambiguous = false;
     bool floating=false;
     bool floating_ambiguous=false;
+    // AArch64 S and D names are scalar views of the same 128-bit SIMD
+    // register identity used by SSA. Keep the observed scalar width apart
+    // from the physical register width so a Q-register assignment does not
+    // turn a scalar float into a fictitious 128-bit floating type.
+    std::uint16_t a64_scalar_float_bits = 0;
+    // The type of the definition, when the lifted output type proves it.
+    // Scalar writes clear upper bits architecturally; full vector writes define
+    // the complete Q value (including known zero-upper vector operations).
+    A64SimdDefinition a64_simd_definition = A64SimdDefinition::unknown;
     // Byte widths observed through constant-offset accesses on this pointer.
     std::map<std::uint64_t, std::uint16_t> object_fields;
+    // Signed members require unanimous same-width integer-load evidence.
+    std::set<std::uint64_t> signed_object_fields;
     // A field is classified as a pointer only when a pointer-valued load/store
     // at that exact offset supplies independent evidence.
     std::set<std::uint64_t> pointer_fields;
@@ -60,6 +75,7 @@ struct Fact {
 };
 struct AggregateLayout {
     std::map<std::uint64_t, std::uint16_t> fields;
+    std::set<std::uint64_t> signed_fields;
     std::set<std::uint64_t> pointer_fields;
     std::map<std::uint64_t, std::shared_ptr<const AggregateLayout>> nested_fields;
     std::set<std::uint64_t> nested_fields_ambiguous;
@@ -82,13 +98,19 @@ bool equal_layout(const AggregateLayout &left, const AggregateLayout &right,
         return true;
     };
     if (!spend()) return false;
-    if (left.fields.size() != right.fields.size() || left.pointer_fields.size() != right.pointer_fields.size() ||
+    if (left.fields.size() != right.fields.size() || left.signed_fields.size() != right.signed_fields.size() ||
+        left.pointer_fields.size() != right.pointer_fields.size() ||
         left.nested_fields_ambiguous.size() != right.nested_fields_ambiguous.size() ||
         left.nested_fields.size() != right.nested_fields.size()) return false;
     auto left_field = left.fields.begin(), right_field = right.fields.begin();
     while (left_field != left.fields.end()) {
         if (!spend()) return false;
         if (*left_field++ != *right_field++) return false;
+    }
+    auto left_signed = left.signed_fields.begin(), right_signed = right.signed_fields.begin();
+    while (left_signed != left.signed_fields.end()) {
+        if (!spend()) return false;
+        if (*left_signed++ != *right_signed++) return false;
     }
     auto left_pointer = left.pointer_fields.begin(), right_pointer = right.pointer_fields.begin();
     while (left_pointer != left.pointer_fields.end()) {
@@ -223,7 +245,7 @@ std::shared_ptr<const AggregateLayout> observed_structure_layout(
     const types::TypePtr &structure, std::uint16_t pointer_bits,
     std::size_t &work, unsigned depth) {
     if (!structure || structure->kind() != types::Kind::structure || !structure->size() ||
-        *structure->size() == 0 || *structure->size() > (1u << 20) || depth > 4)
+        *structure->size() == 0 || *structure->size() > (1u << 20) || depth > 8)
         return {};
     if (work >= aggregate_layout_work_limit) return {};
     ++work;
@@ -260,7 +282,7 @@ std::shared_ptr<const AggregateLayout> observed_structure_layout(
         if (!pointer_bits || bits != pointer_bits) return false;
         layout->pointer_fields.insert(offset);
         const auto pointee = unqualified_type(type->element());
-        if (!pointee || pointee->kind() != types::Kind::structure || nested_depth >= 4) return true;
+        if (!pointee || pointee->kind() != types::Kind::structure || nested_depth >= 8) return true;
         const auto nested = observed_structure_layout(pointee, pointer_bits, work, nested_depth + 1);
         if (!nested || nested->fields.empty()) return true;
         auto found = layout->nested_fields.find(offset);
@@ -348,6 +370,8 @@ struct PointerMemoryObservation {
     Key base;
     std::int64_t displacement = 0;
     std::uint16_t bits = 0;
+    bool integer_type = false;
+    bool signed_integer = false;
 };
 std::optional<std::pair<Key, std::int64_t>> canonical_stack_address(
     const Key &start, const std::vector<PointerAlias> &aliases);
@@ -407,11 +431,12 @@ std::optional<std::uint64_t> shifted_field(std::uint64_t offset, std::int64_t di
 
 types::TypePtr recovered_object_type(
     const std::map<std::uint64_t, std::uint16_t> &fields,
+    const std::set<std::uint64_t> &signed_fields,
     const std::set<std::uint64_t> &pointer_fields,
     const std::map<std::uint64_t, std::shared_ptr<const AggregateLayout>> &nested_fields,
     const std::set<std::uint64_t> &nested_fields_ambiguous,
     std::uint16_t pointer_bits, std::size_t &work, unsigned depth = 0) {
-    constexpr unsigned maximum_nested_depth = 4;
+    constexpr unsigned maximum_nested_depth = 8;
     if (depth > maximum_nested_depth || work >= aggregate_layout_work_limit) return {};
     if (fields.empty()) return {};
     std::vector<types::Member> members;
@@ -432,20 +457,21 @@ types::TypePtr recovered_object_type(
             const auto nested = nested_fields.find(offset);
             if (nested != nested_fields.end() && nested->second) {
                 const auto &child = *nested->second;
-                auto inferred = recovered_object_type(child.fields, child.pointer_fields,
+                auto inferred = recovered_object_type(child.fields, child.signed_fields, child.pointer_fields,
                     child.nested_fields, child.nested_fields_ambiguous, pointer_bits, work, depth + 1);
                 if (inferred) pointee = std::move(inferred);
             }
         }
         auto member_type = pointer_field
             ? types::Type::pointer(std::move(pointee), bytes, member_alignment)
-            : types::Type::integer("field", bytes, member_alignment, false);
+            : types::Type::integer("field", bytes, member_alignment, signed_fields.contains(offset));
         if (!member_type) return {};
         auto end = std::next(field);
         std::uint64_t count = 1;
         auto expected_offset = offset + bytes;
         while (!pointer_fields.contains(offset) && end != fields.end() &&
-               end->second == bits && end->first == expected_offset && !pointer_fields.contains(end->first)) {
+               end->second == bits && end->first == expected_offset && !pointer_fields.contains(end->first) &&
+               signed_fields.contains(end->first) == signed_fields.contains(offset)) {
             if (work >= aggregate_layout_work_limit) return {};
             ++work;
             ++count;
@@ -481,12 +507,14 @@ types::TypePtr make_type(const Fact &f, std::uint16_t pointer_bits, std::size_t 
     if (f.exact_type) return f.exact_type;
     if (f.vector_evidence) return f.vector_ambiguous ? types::TypePtr{} : f.vector_type;
     if (f.floating_ambiguous) return {};
-    const auto bits = f.pointer ? (pointer_bits ? pointer_bits : f.bits) : f.bits;
+    const auto bits = f.floating && f.reg.bank == RegisterBank::arm64_simd && f.a64_scalar_float_bits
+        ? f.a64_scalar_float_bits
+        : f.pointer ? (pointer_bits ? pointer_bits : f.bits) : f.bits;
     const std::uint64_t bytes = std::max<std::uint64_t>(1, (bits + 7u) / 8u);
     if (f.floating) { auto t=types::Type::floating("floating",bytes,bytes); return t ? t.value() : types::TypePtr{}; }
     if (f.pointer) {
         auto base = f.object_layout_ambiguous ? types::TypePtr{} : recovered_object_type(
-            f.object_fields, f.pointer_fields, f.nested_fields,
+            f.object_fields, f.signed_object_fields, f.pointer_fields, f.nested_fields,
             f.nested_fields_ambiguous, pointer_bits, aggregate_work);
         if (!base && !f.object_layout_ambiguous && !f.indexed_element_ambiguous &&
             f.indexed_element_bits && *f.indexed_element_bits &&
@@ -507,6 +535,55 @@ types::TypePtr make_type(const Fact &f, std::uint16_t pointer_bits, std::size_t 
     if (f.sign_ambiguous) return {};
     auto value = types::Type::integer(f.sign ? "signed" : "unsigned", bytes, bytes, f.sign);
     return value ? value.value() : types::TypePtr{};
+}
+
+bool observe_a64_scalar_float_width(Fact &fact, const RegisterOperand &reg, std::uint16_t bits) {
+    if (reg.bank != RegisterBank::arm64_simd || (bits != 32 && bits != 64)) return false;
+    if (fact.a64_simd_definition == A64SimdDefinition::full_q) return false;
+    if (fact.vector_evidence) {
+        if (fact.a64_simd_definition == A64SimdDefinition::scalar_s ||
+            fact.a64_simd_definition == A64SimdDefinition::scalar_d)
+            return false;
+        fact.vector_type.reset();
+        fact.vector_ambiguous = true;
+        fact.floating = false;
+        fact.floating_ambiguous = true;
+        return true;
+    }
+    if (!fact.a64_scalar_float_bits) {
+        fact.a64_scalar_float_bits = bits;
+        fact.floating = true;
+        return true;
+    }
+    if (fact.a64_scalar_float_bits == bits) return false;
+    fact.a64_scalar_float_bits = 0;
+    fact.floating = false;
+    fact.floating_ambiguous = true;
+    return true;
+}
+
+bool merge_a64_scalar_float_width(Fact &destination, const Fact &source) {
+    if (!source.a64_scalar_float_bits || destination.floating_ambiguous) return false;
+    if (destination.a64_simd_definition == A64SimdDefinition::full_q) return false;
+    if (destination.vector_evidence &&
+        destination.a64_simd_definition != A64SimdDefinition::scalar_s &&
+        destination.a64_simd_definition != A64SimdDefinition::scalar_d) {
+        destination.vector_type.reset();
+        destination.vector_ambiguous = true;
+        destination.floating = false;
+        destination.floating_ambiguous = true;
+        return true;
+    }
+    if (!destination.a64_scalar_float_bits) {
+        destination.a64_scalar_float_bits = source.a64_scalar_float_bits;
+        destination.floating = true;
+        return true;
+    }
+    if (destination.a64_scalar_float_bits == source.a64_scalar_float_bits) return false;
+    destination.a64_scalar_float_bits = 0;
+    destination.floating = false;
+    destination.floating_ambiguous = true;
+    return true;
 }
 
 bool is_pointer_type(const types::TypePtr &t) { return t && t->kind()==types::Kind::pointer; }
@@ -545,6 +622,14 @@ types::TypePtr vector_type_from_value(const ValueType &value) {
 }
 bool merge_vector_fact(Fact &destination, const Fact &source) {
     if (!source.vector_evidence) return false;
+    if (destination.reg.bank == RegisterBank::arm64_simd &&
+        (destination.a64_simd_definition == A64SimdDefinition::scalar_s ||
+         destination.a64_simd_definition == A64SimdDefinition::scalar_d))
+        return false;
+    if (source.reg.bank == RegisterBank::arm64_simd &&
+        (source.a64_simd_definition == A64SimdDefinition::scalar_s ||
+         source.a64_simd_definition == A64SimdDefinition::scalar_d))
+        return false;
     if (!destination.vector_evidence) {
         destination.vector_evidence = true;
         destination.vector_type = source.vector_type;
@@ -566,6 +651,24 @@ bool merge_vector_fact(Fact &destination, const Fact &source) {
         return true;
     }
     return false;
+}
+
+bool reject_a64_scalar_vector_alias(Fact &fact) {
+    if (fact.reg.bank != RegisterBank::arm64_simd || !fact.a64_scalar_float_bits ||
+        !fact.vector_evidence)
+        return false;
+    if (fact.a64_simd_definition == A64SimdDefinition::scalar_s ||
+        fact.a64_simd_definition == A64SimdDefinition::scalar_d ||
+        fact.a64_simd_definition == A64SimdDefinition::full_q)
+        return false;
+    const bool changed = !fact.floating_ambiguous || !fact.vector_ambiguous || fact.floating ||
+        fact.vector_type || fact.a64_scalar_float_bits;
+    fact.a64_scalar_float_bits = 0;
+    fact.floating = false;
+    fact.floating_ambiguous = true;
+    fact.vector_type.reset();
+    fact.vector_ambiguous = true;
+    return changed;
 }
 bool merge_exact_type(Fact &destination, const types::TypePtr &type) {
     if (!type || destination.exact_type_ambiguous) return false;
@@ -606,6 +709,12 @@ std::optional<RegisterOperand> classified_register(std::string_view name) {
             return RegisterOperand{RegisterBank::x87, static_cast<std::uint8_t>(*index), 80, false};
         return {};
     }
+    if (name.size() > 1 && (name[0] == 'S' || name[0] == 'D')) {
+        const auto index = parse_index(1);
+        if (index && *index < (name[0] == 'S' ? 32u : 16u))
+            return RegisterOperand{RegisterBank::arm32_vfp, static_cast<std::uint8_t>(*index),
+                                   static_cast<std::uint16_t>(name[0] == 'S' ? 32 : 64), false};
+    }
     if (name.starts_with("XMM")) {
         const auto index = parse_index(3);
         if (index && *index < 16) return RegisterOperand{RegisterBank::xmm, static_cast<std::uint8_t>(*index), 128, false};
@@ -614,6 +723,11 @@ std::optional<RegisterOperand> classified_register(std::string_view name) {
     if (name.size() > 1 && (name[0] == 'X' || name[0] == 'W')) {
         const auto index = parse_index(1);
         if (index && *index < 31) return RegisterOperand{RegisterBank::arm64_gpr, static_cast<std::uint8_t>(*index), 64, false};
+    }
+    if (name.size() > 1 && name[0] == 'R') {
+        const auto index = parse_index(1);
+        if (index && *index < 16)
+            return RegisterOperand{RegisterBank::arm32_gpr, static_cast<std::uint8_t>(*index), 32, false};
     }
     if (name.size() > 1 && (name[0] == 'H' || name[0] == 'S' || name[0] == 'D' || name[0] == 'Q')) {
         const auto index = parse_index(1);
@@ -674,9 +788,14 @@ std::optional<CallingConvention> classifier_convention(const AbiDescription &abi
     if (abi.name == "x86-64 System V") return CallingConvention::sysv_x86_64;
     if (abi.name == "x86-64 Windows") return CallingConvention::windows_x64;
     if (abi.name == "AArch64 AAPCS64") return CallingConvention::aapcs64;
+    if (abi.name == "ARM32 AAPCS base PCS") return CallingConvention::aapcs32;
+    if (abi.name == "ARM32 AAPCS VFP PCS") return CallingConvention::aapcs32_vfp;
     if (abi.name == "PowerPC64 ELFv2") return CallingConvention::ppc64le_elfv2;
     if (abi.name == "MIPS N32 hard-float scalar profile") return CallingConvention::mips_n32;
     if (abi.name == "x86-32 cdecl") return CallingConvention::x86_32_cdecl;
+    if (abi.name == "x86-32 stdcall") return CallingConvention::x86_32_stdcall;
+    if (abi.name == "x86-32 fastcall") return CallingConvention::x86_32_fastcall;
+    if (abi.name == "x86-32 thiscall") return CallingConvention::x86_32_thiscall;
     return {};
 }
 
@@ -688,6 +807,7 @@ struct HiddenResultPointerInfo {
 std::optional<HiddenResultPointerInfo> hidden_result_pointer_info(
     const AbiDescription &abi, const types::TypePtr &result_type) {
     if (!result_type || (abi.name != "x86-64 System V" && abi.name != "AArch64 AAPCS64" &&
+                         abi.name != "ARM32 AAPCS base PCS" && abi.name != "ARM32 AAPCS VFP PCS" &&
                          abi.name != "PowerPC64 ELFv2"))
         return {};
     const auto result = unqualified_type(result_type);
@@ -797,6 +917,64 @@ std::vector<AbiArgumentSlot> aapcs64_prototype_slots(const types::TypePtr &proto
         }
         slots.push_back({classified->value_class, {}, stack_offset, parameter_number, {}});
         stack_offset += static_cast<std::int64_t>(allocation);
+    }
+    return slots;
+}
+
+std::vector<AbiArgumentSlot> aapcs32_vfp_prototype_slots(const types::TypePtr &prototype) {
+    std::vector<AbiArgumentSlot> slots;
+    if (!prototype || prototype->kind() != types::Kind::function ||
+        prototype->parameters().size() > 256) return slots;
+    // The shared classifier deliberately switches variadic AAPCS32 signatures
+    // to the base PCS, including when the declaration carries the VFP variant.
+    // Its parameter list contains only named parameters, so this slot map must
+    // not invent locations for unnamed call-site arguments.
+    const auto classified = classify_abi_signature(CallingConvention::aapcs32_vfp, *prototype);
+    if (classified.arguments.size() != prototype->parameters().size()) return slots;
+    for (std::size_t index = 0; index < classified.arguments.size(); ++index) {
+        const auto &arg = classified.arguments[index];
+        const auto &type = prototype->parameters()[index].type;
+        if (!arg.supported || !type) continue;
+        const auto elements = hfa_float_elements(type);
+        const bool aggregate_hfa = static_cast<bool>(elements);
+        if (aggregate_hfa && !arg.locations.empty() &&
+            arg.locations.front().kind == AbiLocationKind::stack) {
+            for (std::size_t n = 0; n < elements->size(); ++n) {
+                const auto element_size = (*elements)[n]->size().value_or(0);
+                const auto value_offset = static_cast<std::uint64_t>(n) * element_size;
+                const auto first = std::find_if(arg.locations.begin(), arg.locations.end(), [&](const auto &loc) {
+                    return loc.kind == AbiLocationKind::stack && loc.value_offset == value_offset;
+                });
+                if (first == arg.locations.end() || first->stack_offset > INT64_MAX) continue;
+                slots.push_back({AbiValueClass::floating, {}, static_cast<std::int64_t>(first->stack_offset),
+                                 static_cast<std::uint16_t>(index), static_cast<std::uint8_t>(n)});
+            }
+            continue;
+        }
+        for (const auto &location : arg.locations) {
+            std::optional<std::uint8_t> component;
+            if (aggregate_hfa) {
+                for (std::size_t n = 0; n < elements->size(); ++n) {
+                    // Member offsets, rather than ordinal byte offsets, cover
+                    // nested/overlaid source layouts accepted by the classifier.
+                    if ((*elements)[n] && (*elements)[n]->size() &&
+                        location.size == *(*elements)[n]->size() && location.value_offset == n * location.size) {
+                        component = static_cast<std::uint8_t>(n);
+                        break;
+                    }
+                }
+            }
+            if (location.kind == AbiLocationKind::register_) {
+                const auto reg = classified_register(location.register_name);
+                if (!reg || (aggregate_hfa && !component)) continue;
+                slots.push_back({AbiValueClass::floating, *reg, {}, static_cast<std::uint16_t>(index), component});
+            } else if (location.kind == AbiLocationKind::stack &&
+                       location.value_offset == 0 && type->kind() == types::Kind::floating &&
+                       type->size() && location.stack_offset <= INT64_MAX) {
+                slots.push_back({AbiValueClass::floating, {}, static_cast<std::int64_t>(location.stack_offset),
+                                 static_cast<std::uint16_t>(index)});
+            }
+        }
     }
     return slots;
 }
@@ -1217,6 +1395,27 @@ AbiDescription x86_32_cdecl_abi() {
     }
     return a;
 }
+AbiDescription x86_32_stdcall_abi() {
+    auto a = x86_32_cdecl_abi();
+    a.name = "x86-32 stdcall";
+    return a;
+}
+AbiDescription x86_32_fastcall_abi() {
+    auto a = x86_32_cdecl_abi();
+    a.name = "x86-32 fastcall";
+    a.integer_argument_registers = {gpr(1, 32), gpr(2, 32)};
+    a.arguments.insert(a.arguments.begin(), {
+        {AbiValueClass::integer, gpr(1, 32), {}},
+        {AbiValueClass::integer, gpr(2, 32), {}}
+    });
+    return a;
+}
+AbiDescription x86_32_thiscall_abi() {
+    auto a = x86_32_cdecl_abi();
+    a.name = "x86-32 thiscall";
+    a.arguments.clear();
+    return a;
+}
 AbiDescription aarch64_abi() {
     AbiDescription a; a.name = "AArch64 AAPCS64"; a.pointer_bits = 64;
     for(unsigned i=0;i<8;++i) a.integer_argument_registers.push_back({RegisterBank::arm64_gpr,static_cast<std::uint8_t>(i),64,false});
@@ -1263,6 +1462,22 @@ AbiDescription arm32_aapcs_abi() {
         a.stack_argument_offsets.push_back(offset);
         a.arguments.push_back({AbiValueClass::integer, {}, offset});
     }
+    return a;
+}
+
+AbiDescription arm32_aapcs_vfp_abi() {
+    auto a = arm32_aapcs_abi();
+    a.name = "ARM32 AAPCS VFP PCS";
+    for (unsigned index = 0; index < 16; ++index) {
+        a.floating_argument_registers.push_back({RegisterBank::arm32_vfp,
+            static_cast<std::uint8_t>(index), 64, false});
+        a.caller_saved_registers.push_back({RegisterBank::arm32_vfp,
+            static_cast<std::uint8_t>(index), 64, false});
+    }
+    for (unsigned index = 0; index < 32; ++index)
+        a.caller_saved_registers.push_back({RegisterBank::arm32_vfp,
+            static_cast<std::uint8_t>(index), 32, false});
+    a.floating_return_register = RegisterOperand{RegisterBank::arm32_vfp, 0, 64, false};
     return a;
 }
 
@@ -1416,13 +1631,13 @@ static Result<TypeRecoveryResult> recover_types_impl(
     if (prototype && prototype->kind()!=types::Kind::function)
         return Error{ErrorCode::invalid_argument, "type recovery prototype must be a function type"};
     std::map<Key, Fact> facts;
-    std::map<Key, std::optional<bool>> division_signedness;
-    const auto record_division_operand = [&](const ExpressionPtr &operand, bool is_signed) {
+    std::map<Key, std::optional<bool>> operation_signedness;
+    const auto record_signedness_operand = [&](const ExpressionPtr &operand, bool is_signed) {
         if (!operand) return;
         const auto *value = std::get_if<RegisterValue>(&operand->value);
         if (!value) return;
         const auto operand_key = key(value->reg, value->version);
-        auto [found, inserted] = division_signedness.emplace(operand_key, is_signed);
+        auto [found, inserted] = operation_signedness.emplace(operand_key, is_signed);
         if (!inserted && found->second && *found->second != is_signed) found->second.reset();
     };
     // ABI snapshots describe liveness, not evidence that a callee consumes
@@ -1432,6 +1647,7 @@ static Result<TypeRecoveryResult> recover_types_impl(
     std::vector<PointerAlias> pointer_aliases;
     std::vector<PointerMemoryObservation> pointer_memory_observations;
     auto ensure=[&](RegisterOperand r,std::optional<std::uint32_t> v={}) -> Fact& {
+        if (r.bank == RegisterBank::arm64_simd) r.width = 128;
         Fact initial;
         initial.reg = r;
         initial.version = v;
@@ -1439,6 +1655,137 @@ static Result<TypeRecoveryResult> recover_types_impl(
         auto [it,inserted]=facts.try_emplace(key(r,v),std::move(initial));
         (void)inserted; return it->second;
     };
+    const auto record_floating_operand = [&](const ExpressionPtr &operand, std::uint16_t bits) {
+        if (!operand || !bits ||
+            (operand->type.kind != TypeKind::unknown && operand->type.kind != TypeKind::floating)) return;
+        const auto *value = std::get_if<RegisterValue>(&operand->value);
+        if (!value) return;
+        auto &fact = ensure(value->reg, value->version);
+        if (fact.exact_type || fact.exact_type_ambiguous || fact.floating_ambiguous) return;
+        if (value->reg.bank == RegisterBank::arm64_simd) {
+            (void)observe_a64_scalar_float_width(fact, value->reg, bits);
+            return;
+        }
+        // Other scalar register banks expose the scalar width directly. Do
+        // not infer through a width-changing view or a vector-class fact.
+        if (fact.vector_evidence || value->reg.width != bits) return;
+        fact.floating = true;
+        fact.bits = bits;
+    };
+    const auto a64_definition_for_value = [](RegisterOperand reg, const ValueType &type) {
+        if (reg.bank != RegisterBank::arm64_simd) return A64SimdDefinition::unknown;
+        if (type.kind == TypeKind::floating && type.bits == 32) return A64SimdDefinition::scalar_s;
+        if (type.kind == TypeKind::floating && type.bits == 64) return A64SimdDefinition::scalar_d;
+        if (type.kind == TypeKind::vector && type.bits == 128) return A64SimdDefinition::full_q;
+        return A64SimdDefinition::unknown;
+    };
+    const auto a64_definition_for_write_width = [](RegisterOperand reg) {
+        if (reg.bank != RegisterBank::arm64_simd) return A64SimdDefinition::unknown;
+        if (reg.width == 32) return A64SimdDefinition::scalar_s;
+        if (reg.width == 64) return A64SimdDefinition::scalar_d;
+        return A64SimdDefinition::unknown;
+    };
+    const auto record_a64_definition = [&](RegisterOperand reg, std::optional<std::uint32_t> version,
+                                           A64SimdDefinition definition) {
+        if (definition == A64SimdDefinition::unknown) return;
+        auto &fact = ensure(reg, version);
+        if (fact.a64_simd_definition == A64SimdDefinition::unknown)
+            fact.a64_simd_definition = definition;
+        else if (fact.a64_simd_definition != definition)
+            fact.a64_simd_definition = A64SimdDefinition::conflicting;
+    };
+    const auto a64_definition_for_type = [&](RegisterOperand reg, const types::TypePtr &input) {
+        auto type = input;
+        while (type && type->kind() == types::Kind::qualified) type = type->element();
+        if (!type) return A64SimdDefinition::unknown;
+        if (type->kind() == types::Kind::floating && type_bits(type) == 32)
+            return a64_definition_for_value(reg, ValueType{TypeKind::floating, 32, false});
+        if (type->kind() == types::Kind::floating && type_bits(type) == 64)
+            return a64_definition_for_value(reg, ValueType{TypeKind::floating, 64, false});
+        if (type->kind() == types::Kind::vector && type_bits(type) == 128)
+            return a64_definition_for_value(reg, ValueType{TypeKind::vector, 128, false});
+        return A64SimdDefinition::unknown;
+    };
+    // Resolve output definitions before examining their uses. A scalar S/D
+    // assignment and a full-Q vector result share the same physical register
+    // key, but their write semantics make opposite views non-conflicting.
+    for (const auto &block : fn.blocks) {
+        for (const auto &phi : block.phis) {
+            ensure(phi.destination, phi.version);
+            for (const auto &input : phi.inputs) ensure(phi.destination, input.version);
+        }
+        for (const auto &block_instruction : block.instructions) {
+            std::visit([&](const auto &statement) {
+                using T = std::decay_t<decltype(statement)>;
+                if constexpr (std::is_same_v<T, Assign>) {
+                    const auto typed_definition = statement.value
+                        ? a64_definition_for_value(statement.destination, statement.value->type)
+                        : A64SimdDefinition::unknown;
+                    record_a64_definition(statement.destination, statement.destination_version,
+                        typed_definition != A64SimdDefinition::unknown
+                            ? typed_definition : a64_definition_for_write_width(statement.destination));
+                } else if constexpr (std::is_same_v<T, Call>) {
+                    if (statement.return_register && statement.return_version) {
+                        const auto typed_definition = a64_definition_for_type(*statement.return_register,
+                            statement.result_type);
+                        record_a64_definition(*statement.return_register, statement.return_version,
+                            typed_definition != A64SimdDefinition::unknown
+                                ? typed_definition : a64_definition_for_write_width(*statement.return_register));
+                    }
+                } else if constexpr (std::is_same_v<T, Intrinsic>) {
+                    if (statement.register_output_values.size() == statement.register_writes.size()) {
+                        for (std::size_t index = 0; index < statement.register_writes.size(); ++index) {
+                            if (statement.register_output_values[index])
+                                record_a64_definition(statement.register_writes[index],
+                                    index < statement.register_output_versions.size()
+                                        ? std::optional<std::uint32_t>{statement.register_output_versions[index]}
+                                        : std::nullopt,
+                                    a64_definition_for_value(statement.register_writes[index],
+                                        statement.register_output_values[index]->type));
+                        }
+                    } else if (statement.register_writes.size() == 1 && statement.result_type) {
+                        record_a64_definition(statement.register_writes.front(),
+                            statement.register_output_versions.empty()
+                                ? std::nullopt
+                                : std::optional<std::uint32_t>{statement.register_output_versions.front()},
+                            a64_definition_for_value(statement.register_writes.front(), *statement.result_type));
+                    }
+                }
+            }, block_instruction.statement);
+        }
+    }
+    for (std::size_t pass = 0; pass < facts.size(); ++pass) {
+        bool changed = false;
+        for (const auto &block : fn.blocks) for (const auto &phi : block.phis) {
+            if (phi.destination.bank != RegisterBank::arm64_simd || phi.inputs.empty()) continue;
+            auto &destination = ensure(phi.destination, phi.version);
+            if (destination.a64_simd_definition != A64SimdDefinition::unknown) continue;
+            A64SimdDefinition common = A64SimdDefinition::unknown;
+            bool incomplete = false, conflict = false;
+            for (const auto &input : phi.inputs) {
+                const auto found = facts.find(key(phi.destination, input.version));
+                if (found == facts.end() || found->second.a64_simd_definition == A64SimdDefinition::unknown) {
+                    incomplete = true;
+                    continue;
+                }
+                const auto incoming = found->second.a64_simd_definition;
+                if (incoming == A64SimdDefinition::conflicting ||
+                    (common != A64SimdDefinition::unknown && common != incoming)) {
+                    conflict = true;
+                    break;
+                }
+                common = incoming;
+            }
+            if (conflict) {
+                destination.a64_simd_definition = A64SimdDefinition::conflicting;
+                changed = true;
+            } else if (!incomplete && common != A64SimdDefinition::unknown) {
+                destination.a64_simd_definition = common;
+                changed = true;
+            }
+        }
+        if (!changed) break;
+    }
     auto register_expr=[&](const ExpressionPtr &e, auto &&self)->void {
         if (!e) return;
         std::visit([&](const auto &x) {
@@ -1452,15 +1799,18 @@ static Result<TypeRecoveryResult> recover_types_impl(
                 // use it simply to mean "not classified".
                 if (e->type.kind == TypeKind::integer && e->type.is_signed &&
                     !fact.sign_ambiguous) fact.sign = true;
-                if (e->type.kind == TypeKind::floating && !fact.floating_ambiguous) {
+                if (e->type.kind == TypeKind::floating && !fact.floating_ambiguous &&
+                    fact.a64_simd_definition != A64SimdDefinition::full_q) {
                     fact.floating = true;
                     if (e->type.bits) fact.bits = e->type.bits;
+                    observe_a64_scalar_float_width(fact, x.reg, e->type.bits);
                 }
                 if (e->type.kind == TypeKind::vector) {
                     Fact vector_fact;
                     vector_fact.vector_evidence = true;
                     vector_fact.vector_type = vector_type_from_value(e->type);
                     merge_vector_fact(fact, vector_fact);
+                    reject_a64_scalar_vector_alias(fact);
                 }
             }
             else if constexpr(std::is_same_v<T,MemoryValue>) {
@@ -1487,18 +1837,36 @@ static Result<TypeRecoveryResult> recover_types_impl(
                         } else if (!base.indexed_element_ambiguous) base.indexed_element_bits = x.type.bits;
                     }
                     if (!x.index && !x.absolute && x.type.bits && x.type.bits % 8 == 0) {
-                        pointer_memory_observations.push_back({key(*x.base, x.base_version), x.displacement, x.type.bits});
+                        pointer_memory_observations.push_back({key(*x.base, x.base_version), x.displacement,
+                            x.type.bits, x.type.kind == TypeKind::integer, x.type.is_signed});
                     }
                 }
                 if(x.index) { parameter_evidence.insert(key(*x.index, x.index_version)); ensure(*x.index,x.index_version); }
             } else if constexpr(std::is_same_v<T,UnaryValue>) self(x.operand,self);
             else if constexpr(std::is_same_v<T,BinaryValue>) {
                 if (x.operation == "sdiv" || x.operation == "srem" || x.operation == "a64_sdiv") {
-                    record_division_operand(x.left, true);
-                    record_division_operand(x.right, true);
+                    record_signedness_operand(x.left, true);
+                    record_signedness_operand(x.right, true);
                 } else if (x.operation == "udiv" || x.operation == "urem" || x.operation == "a64_udiv") {
-                    record_division_operand(x.left, false);
-                    record_division_operand(x.right, false);
+                    record_signedness_operand(x.left, false);
+                    record_signedness_operand(x.right, false);
+                } else if (x.operation == "sar") {
+                    record_signedness_operand(x.left, true);
+                } else if (x.operation == "lshr") {
+                    record_signedness_operand(x.left, false);
+                } else if (x.operation == "smul64" || x.operation == "umul64") {
+                    const bool signed_operation = x.operation == "smul64";
+                    record_signedness_operand(x.left, signed_operation);
+                    record_signedness_operand(x.right, signed_operation);
+                }
+                const bool floating_arithmetic =
+                    x.operation == "fadd" || x.operation == "fsub" || x.operation == "fsubr" ||
+                    x.operation == "fmul" || x.operation == "fdiv" || x.operation == "fdivr" ||
+                    x.operation.starts_with("fadd.") || x.operation.starts_with("fsub.") ||
+                    x.operation.starts_with("fmul.") || x.operation.starts_with("fdiv.");
+                if (floating_arithmetic && e->type.kind == TypeKind::floating) {
+                    record_floating_operand(x.left, e->type.bits);
+                    record_floating_operand(x.right, e->type.bits);
                 }
                 self(x.left,self); self(x.right,self);
             }
@@ -1511,6 +1879,8 @@ static Result<TypeRecoveryResult> recover_types_impl(
             if constexpr(std::is_same_v<T,Assign>) {
                 auto &f=ensure(s.destination,s.destination_version);
                 f.bits=s.destination.width;
+                if (s.value && s.value->type.kind == TypeKind::floating)
+                    observe_a64_scalar_float_width(f, s.destination, s.value->type.bits);
                 register_expr(s.value,register_expr);
                 if (auto alias=pointer_alias(s)) pointer_aliases.push_back(*alias);
             }
@@ -1527,6 +1897,8 @@ static Result<TypeRecoveryResult> recover_types_impl(
                     returned.sign = is_signed_type(s.result_type);
                     returned.pointer = is_pointer_type(s.result_type);
                     returned.floating = s.result_type->kind() == types::Kind::floating;
+                    if (returned.floating)
+                        observe_a64_scalar_float_width(returned, *s.return_register, type_bits(s.result_type));
                     returned.constrained = true;
                     merge_exact_type(returned, s.result_type);
                 }
@@ -1545,6 +1917,8 @@ static Result<TypeRecoveryResult> recover_types_impl(
                             returned.sign = is_signed_type(piece.type);
                             returned.pointer = is_pointer_type(piece.type);
                             returned.floating = piece.type->kind() == types::Kind::floating;
+                            if (returned.floating)
+                                observe_a64_scalar_float_width(returned, piece.reg, type_bits(piece.type));
                             returned.constrained = true;
                             merge_exact_type(returned, piece.type);
                             break;
@@ -1570,11 +1944,13 @@ static Result<TypeRecoveryResult> recover_types_impl(
                 // so their signedness is not visible to the BinaryValue path.
                 // Retain the operation's interpretation on direct SSA inputs;
                 // the common copy propagation below handles renamed operands.
-                const bool signed_mips_arithmetic = s.name == "mips.mult.s32" || s.name == "mips.div.s32";
-                const bool unsigned_mips_arithmetic = s.name == "mips.mult.u32" || s.name == "mips.div.u32";
+                const bool signed_mips_arithmetic = s.name == "mips.mult.s32" || s.name == "mips.div.s32" ||
+                    s.name == "mips64.dmult.s64" || s.name == "mips64.ddiv.s64";
+                const bool unsigned_mips_arithmetic = s.name == "mips.mult.u32" || s.name == "mips.div.u32" ||
+                    s.name == "mips64.dmult.u64" || s.name == "mips64.ddiv.u64";
                 if (signed_mips_arithmetic || unsigned_mips_arithmetic)
                     for (const auto &operand : s.operands)
-                        record_division_operand(operand, signed_mips_arithmetic);
+                        record_signedness_operand(operand, signed_mips_arithmetic);
                 for(const auto &e:s.operands) register_expr(e,register_expr);
                 // Scalar RISC-V conversion outputs are typed individually:
                 // integer/FPR results and accrued FCSR flags must never share
@@ -1602,13 +1978,15 @@ static Result<TypeRecoveryResult> recover_types_impl(
                     for (std::size_t n = 0; n < s.register_writes.size(); ++n) {
                         const auto bank = s.register_writes[n].bank;
                         if (bank != RegisterBank::x87 && bank != RegisterBank::mips_fpr &&
-                            bank != RegisterBank::riscv_fpr)
+                            bank != RegisterBank::riscv_fpr && bank != RegisterBank::arm64_simd)
                             continue;
                         const auto version = n < s.register_output_versions.size()
                             ? std::optional<std::uint32_t>{s.register_output_versions[n]} : std::nullopt;
                         auto &destination = ensure(s.register_writes[n], version);
                         destination.bits = s.result_type->bits ? s.result_type->bits : destination.bits;
                         destination.floating = true;
+                        if (bank == RegisterBank::arm64_simd)
+                            observe_a64_scalar_float_width(destination, s.register_writes[n], s.result_type->bits);
                     }
                 }
                 if (s.result_type && s.result_type->kind == TypeKind::vector) {
@@ -1682,6 +2060,8 @@ static Result<TypeRecoveryResult> recover_types_impl(
             fact.sign = is_signed_type(unqualified);
             fact.pointer = is_pointer_type(unqualified);
             fact.floating = value_class == AbiValueClass::floating;
+            if (fact.floating)
+                observe_a64_scalar_float_width(fact, reg, type_bits(unqualified));
             fact.constrained = true;
             merge_exact_type(fact, param);
             if (value_class == AbiValueClass::vector) {
@@ -1806,6 +2186,20 @@ static Result<TypeRecoveryResult> recover_types_impl(
             }
             // Unsupported trailing parameters remain unconstrained here; the
             // ABI slot map reports the same boundary to interprocedural recovery.
+        } else if (abi.name == "ARM32 AAPCS VFP PCS") {
+            for (const auto &slot : aapcs32_vfp_prototype_slots(prototype)) {
+                if (!slot.parameter_index || *slot.parameter_index >= parameters.size()) continue;
+                const auto &parameter_type = parameters[*slot.parameter_index].type;
+                if (!parameter_type) continue;
+                auto component_type = parameter_type;
+                if (slot.component_index) {
+                    const auto components = hfa_float_elements(parameter_type);
+                    if (!components || *slot.component_index >= components->size()) continue;
+                    component_type = (*components)[*slot.component_index];
+                }
+                if (slot.reg) constrain_register(*slot.reg, component_type);
+                else if (slot.stack_offset) constrain_stack_slot(*slot.stack_offset, component_type);
+            }
         } else if (abi.name == "PowerPC64 ELFv2") {
             for (const auto &slot : ppc64_elfv2_prototype_slots(prototype)) {
                 if (!slot.parameter_index || *slot.parameter_index >= parameters.size()) continue;
@@ -1860,6 +2254,8 @@ static Result<TypeRecoveryResult> recover_types_impl(
                 fact.sign = is_signed_type(param);
                 fact.pointer = is_pointer_type(param);
                 fact.floating = param->kind() == types::Kind::floating;
+                if (fact.floating)
+                    observe_a64_scalar_float_width(fact, fact.reg, type_bits(param));
                 fact.constrained = true;
                 merge_exact_type(fact, param);
                 if (param->kind() == types::Kind::vector) {
@@ -1926,6 +2322,8 @@ static Result<TypeRecoveryResult> recover_types_impl(
                 fact.bits = type_bits(argument_type) ? type_bits(argument_type) : fact.bits;
                 fact.sign = is_signed_type(argument_type);
                 fact.floating = argument_type->kind() == types::Kind::floating;
+                if (fact.floating)
+                    observe_a64_scalar_float_width(fact, known.value.reg, type_bits(argument_type));
                 if (argument_type->kind() == types::Kind::vector) {
                     fact.vector_evidence = true;
                     fact.vector_type = argument_type;
@@ -1958,16 +2356,16 @@ static Result<TypeRecoveryResult> recover_types_impl(
     } else {
         call_layout_budget_exhausted = true;
     }
-    // Signed comparisons and signed/unsigned division constrain the
-    // interpretation of direct register operands. Conflicting evidence leaves
-    // the integer type unknown rather than choosing whichever use came last.
+    // Signed comparisons and explicitly signed/unsigned operations constrain
+    // direct register operands. Conflicting evidence leaves the integer type
+    // unknown rather than choosing whichever use came last.
     std::map<Key, std::uint8_t> comparison_signedness;
     const auto collect_comparison_operand = [&](const ExpressionPtr &expression, std::uint8_t evidence) {
         if (!expression) return;
         if (const auto *value = std::get_if<RegisterValue>(&expression->value))
             comparison_signedness[key(value->reg, value->version)] |= evidence;
     };
-    for (const auto &[operand, interpretation] : division_signedness)
+    for (const auto &[operand, interpretation] : operation_signedness)
         comparison_signedness[operand] |= !interpretation ? 3 : *interpretation ? 1 : 2;
     const auto collect_comparisons = [&](const ExpressionPtr &expression, auto &&self) -> void {
         if (!expression) return;
@@ -2047,11 +2445,20 @@ static Result<TypeRecoveryResult> recover_types_impl(
     struct PointerAddressEdge { Key target; std::int64_t displacement; bool subtract; };
     std::map<Key, std::vector<PointerAddressEdge>> pointer_address_graph;
     std::map<Key, std::map<std::uint64_t, std::uint16_t>> normalized_fields;
+    // 1 means signed-only, 2 means unsigned-only, and 3 means conflicting
+    // evidence. Missing entries carry no signedness.
+    std::map<Key, std::map<std::uint64_t, std::uint8_t>> normalized_signs;
     std::set<Key> normalized_ambiguous;
     const auto stage_observation = [&](const Key &view, std::uint64_t offset, std::uint16_t bits) {
         auto &width = normalized_fields[view][offset];
         if (width && width != bits) normalized_ambiguous.insert(view);
         else width = bits;
+    };
+    const auto stage_sign = [&](const Key &view, std::uint64_t offset, bool is_signed) {
+        auto &state = normalized_signs[view][offset];
+        const auto incoming = static_cast<std::uint8_t>(is_signed ? 1 : 2);
+        if (state && state != incoming) state = 3;
+        else if (!state) state = incoming;
     };
     std::size_t pointer_observation_work = 0;
     bool pointer_observation_work_exceeded = false;
@@ -2072,8 +2479,11 @@ static Result<TypeRecoveryResult> recover_types_impl(
         }
         ++pointer_observation_work;
         if (observation.displacement >= 0 && observation.displacement <= (1 << 20) &&
-            facts.contains(observation.base) && facts.at(observation.base).pointer)
+            facts.contains(observation.base) && facts.at(observation.base).pointer) {
             stage_observation(observation.base, static_cast<std::uint64_t>(observation.displacement), observation.bits);
+            if (observation.integer_type)
+                stage_sign(observation.base, static_cast<std::uint64_t>(observation.displacement), observation.signed_integer);
+        }
         struct AddressNode { Key value; std::int64_t displacement; };
         std::vector<AddressNode> pending{{observation.base, 0}};
         std::map<Key, std::int64_t> visited;
@@ -2123,6 +2533,8 @@ static Result<TypeRecoveryResult> recover_types_impl(
             const auto fact = facts.find(view);
             if (fact == facts.end() || !fact->second.pointer) continue;
             stage_observation(view, static_cast<std::uint64_t>(field_offset), observation.bits);
+            if (observation.integer_type)
+                stage_sign(view, static_cast<std::uint64_t>(field_offset), observation.signed_integer);
         }
     }
     if (!pointer_observation_work_exceeded) {
@@ -2140,6 +2552,13 @@ static Result<TypeRecoveryResult> recover_types_impl(
                 }
                 width = bits;
             }
+            if (!destination.object_layout_ambiguous) {
+                const auto signs = normalized_signs.find(view);
+                if (signs != normalized_signs.end())
+                    for (const auto &[offset, state] : signs->second)
+                        if (state == 1 && destination.object_fields.contains(offset))
+                            destination.signed_object_fields.insert(offset);
+            }
         }
     }
 
@@ -2155,7 +2574,7 @@ static Result<TypeRecoveryResult> recover_types_impl(
         }
         std::visit([&](const auto &x) {
             using T=std::decay_t<decltype(x)>;
-            if constexpr(std::is_same_v<T,RegisterValue>) { auto it=facts.find(key(x.reg,x.version)); if(it!=facts.end()) { out.bits=it->second.bits; out.sign=it->second.sign; out.sign_ambiguous=it->second.sign_ambiguous; out.pointer=it->second.pointer; out.floating = out.floating || it->second.floating; out.floating_ambiguous = it->second.floating_ambiguous; out.object_fields=it->second.object_fields; out.object_layout_ambiguous=it->second.object_layout_ambiguous; out.pointer_fields=it->second.pointer_fields; out.indexed_element_bits=it->second.indexed_element_bits; out.indexed_element_ambiguous=it->second.indexed_element_ambiguous; if (it->second.exact_type) merge_exact_type(out, it->second.exact_type); if (it->second.exact_type_ambiguous) out.exact_type_ambiguous = true; if (it->second.vector_evidence) merge_vector_fact(out, it->second); } }
+            if constexpr(std::is_same_v<T,RegisterValue>) { auto it=facts.find(key(x.reg,x.version)); if(it!=facts.end()) { out.bits=it->second.bits; out.sign=it->second.sign; out.sign_ambiguous=it->second.sign_ambiguous; out.pointer=it->second.pointer; out.floating = out.floating || it->second.floating; out.floating_ambiguous = it->second.floating_ambiguous; out.a64_scalar_float_bits=it->second.a64_scalar_float_bits; out.object_fields=it->second.object_fields; out.object_layout_ambiguous=it->second.object_layout_ambiguous; out.pointer_fields=it->second.pointer_fields; out.indexed_element_bits=it->second.indexed_element_bits; out.indexed_element_ambiguous=it->second.indexed_element_ambiguous; if (it->second.exact_type) merge_exact_type(out, it->second.exact_type); if (it->second.exact_type_ambiguous) out.exact_type_ambiguous = true; if (it->second.vector_evidence) merge_vector_fact(out, it->second); } }
             else if constexpr(std::is_same_v<T,MemoryValue>) {
                 out.bits=x.type.bits;
                 out.floating=x.type.kind==TypeKind::floating;
@@ -2165,7 +2584,57 @@ static Result<TypeRecoveryResult> recover_types_impl(
             }
             else if constexpr(std::is_same_v<T,UnaryValue>) { out=self(x.operand,self); if(x.operation=="sext") { out.sign=true; out.sign_ambiguous=false; } if(x.operation=="zext") { out.sign=false; out.sign_ambiguous=false; } }
             else if constexpr(std::is_same_v<T,BinaryValue>) {
-                if (e->type.kind == TypeKind::boolean) {
+                const auto *alternatives = x.operation == "select_if" && x.right
+                    ? std::get_if<BinaryValue>(&x.right->value) : nullptr;
+                if (alternatives && alternatives->operation == "pair" && alternatives->left &&
+                    alternatives->right && alternatives->left->type == e->type &&
+                    alternatives->right->type == e->type) {
+                    const auto yes = self(alternatives->left, self);
+                    const auto no = self(alternatives->right, self);
+                    out.bits = e->type.bits ? e->type.bits :
+                        (yes.bits == no.bits ? yes.bits : std::uint16_t{0});
+                    out.pointer = e->type.kind == TypeKind::pointer || (yes.pointer && no.pointer);
+                    out.sign_ambiguous = yes.sign_ambiguous || no.sign_ambiguous;
+                    out.sign = !out.sign_ambiguous && ((e->type.kind == TypeKind::integer && e->type.is_signed) ||
+                                                       (yes.sign && no.sign));
+                    out.floating_ambiguous = yes.floating_ambiguous || no.floating_ambiguous ||
+                        (yes.floating != no.floating);
+                    out.floating = !out.floating_ambiguous &&
+                        (e->type.kind == TypeKind::floating || (yes.floating && no.floating));
+                    if (yes.exact_type && no.exact_type) {
+                        if (yes.exact_type->id() == no.exact_type->id())
+                            merge_exact_type(out, yes.exact_type);
+                        else out.exact_type_ambiguous = true;
+                    }
+                    out.exact_type_ambiguous = out.exact_type_ambiguous ||
+                        yes.exact_type_ambiguous || no.exact_type_ambiguous;
+                    out.object_layout_ambiguous = yes.object_layout_ambiguous || no.object_layout_ambiguous;
+                    if (!out.object_layout_ambiguous) {
+                        for (const auto &[offset, bits] : yes.object_fields) {
+                            const auto found = no.object_fields.find(offset);
+                            if (found != no.object_fields.end() && found->second == bits)
+                                out.object_fields.emplace(offset, bits);
+                        }
+                        for (const auto offset : yes.signed_object_fields)
+                            if (no.signed_object_fields.contains(offset)) out.signed_object_fields.insert(offset);
+                        for (const auto offset : yes.pointer_fields)
+                            if (no.pointer_fields.contains(offset)) out.pointer_fields.insert(offset);
+                    }
+                    if (yes.indexed_element_ambiguous || no.indexed_element_ambiguous ||
+                        yes.indexed_element_bits != no.indexed_element_bits) {
+                        out.indexed_element_ambiguous = true;
+                    } else {
+                        out.indexed_element_bits = yes.indexed_element_bits;
+                    }
+                    if (yes.vector_evidence && no.vector_evidence) {
+                        merge_vector_fact(out, yes);
+                        merge_vector_fact(out, no);
+                    } else if (yes.vector_evidence != no.vector_evidence ||
+                               yes.vector_ambiguous || no.vector_ambiguous) {
+                        out.vector_ambiguous = true;
+                        out.vector_type.reset();
+                    }
+                } else if (e->type.kind == TypeKind::boolean) {
                     out.sign = false;
                     out.sign_ambiguous = false;
                 } else {
@@ -2173,11 +2642,26 @@ static Result<TypeRecoveryResult> recover_types_impl(
                     out.sign_ambiguous = l.sign_ambiguous || r.sign_ambiguous;
                     out.pointer=(x.operation=="lea") || ((x.operation=="add"||x.operation=="sub") && (l.pointer||r.pointer));
                     if(x.operation=="sar") { out.sign=true; out.sign_ambiguous=false; }
-                    if(x.operation=="shr") { out.sign=false; out.sign_ambiguous=false; }
+                    if(x.operation=="shr" || x.operation=="lshr") { out.sign=false; out.sign_ambiguous=false; }
                 }
             }
         },e->value);
-        if (e->type.kind == TypeKind::floating && !out.floating_ambiguous) out.floating = true;
+        // Boolean is a semantic type in the lifted IR, not merely a one-bit
+        // unsigned integer. Preserve that annotation after visiting the
+        // expression so it also survives unary and binary expression paths.
+        if (e->type.kind == TypeKind::boolean) {
+            auto boolean_type = types::Type::boolean(1, 1);
+            if (boolean_type) merge_exact_type(out, boolean_type.value());
+        }
+        bool full_q_definition = false;
+        if (const auto *reg = std::get_if<RegisterValue>(&e->value);
+            reg && reg->reg.bank == RegisterBank::arm64_simd) {
+            const auto found = facts.find(key(reg->reg, reg->version));
+            full_q_definition = found != facts.end() &&
+                found->second.a64_simd_definition == A64SimdDefinition::full_q;
+        }
+        if (e->type.kind == TypeKind::floating && !out.floating_ambiguous && !full_q_definition)
+            out.floating = true;
         return out;
     };
     bool changed=true; for(unsigned pass=0;changed && pass<facts.size()+1;++pass) {
@@ -2192,11 +2676,13 @@ static Result<TypeRecoveryResult> recover_types_impl(
                 if(src.pointer&&!dst.pointer) {dst.pointer=true;changed=true;}
                 if (src.floating && !dst.floating && !dst.floating_ambiguous) { dst.floating=true; changed=true; }
                 if (src.floating_ambiguous && !dst.floating_ambiguous) { dst.floating=false; dst.floating_ambiguous=true; changed=true; }
+                if (merge_a64_scalar_float_width(dst, src)) changed = true;
                 if (merge_exact_type(dst, src.exact_type)) changed = true;
                 if (src.exact_type_ambiguous && !dst.exact_type_ambiguous) {
                     dst.exact_type.reset(); dst.exact_type_ambiguous = true; changed = true;
                 }
                 if (merge_vector_fact(dst, src)) changed = true;
+                if (reject_a64_scalar_vector_alias(dst)) changed = true;
                 if (src.object_layout_ambiguous && !dst.object_layout_ambiguous) {
                     dst.object_layout_ambiguous = true;
                     changed = true;
@@ -2229,6 +2715,8 @@ static Result<TypeRecoveryResult> recover_types_impl(
             bool conflicting_vector_inputs = false;
             bool any_floating_input = false;
             bool all_floating_inputs = !p.inputs.empty();
+            bool conflicting_a64_float_widths = false;
+            std::uint16_t common_a64_float_width = 0;
             types::TypePtr common_vector_type;
             types::TypePtr common_exact_type;
             bool all_exact_inputs = !p.inputs.empty();
@@ -2243,6 +2731,13 @@ static Result<TypeRecoveryResult> recover_types_impl(
                 all_pointer_inputs = all_pointer_inputs && it->second.pointer;
                 any_floating_input = any_floating_input || it->second.floating;
                 all_floating_inputs = all_floating_inputs && it->second.floating && !it->second.floating_ambiguous;
+                if (it->second.a64_scalar_float_bits) {
+                    if (common_a64_float_width && common_a64_float_width != it->second.a64_scalar_float_bits)
+                        conflicting_a64_float_widths = true;
+                    else common_a64_float_width = it->second.a64_scalar_float_bits;
+                } else if (it->second.floating && p.destination.bank == RegisterBank::arm64_simd) {
+                    conflicting_a64_float_widths = true;
+                }
                 any_vector_input = any_vector_input || it->second.vector_evidence;
                 all_vector_inputs = all_vector_inputs && it->second.vector_evidence;
                 all_exact_inputs = all_exact_inputs && static_cast<bool>(it->second.exact_type) &&
@@ -2300,12 +2795,28 @@ static Result<TypeRecoveryResult> recover_types_impl(
                     }
                 } else if (!dst.floating && !dst.floating_ambiguous) { dst.floating=true; changed=true; }
             }
+            if (p.destination.bank == RegisterBank::arm64_simd && any_floating_input) {
+                if (conflicting_a64_float_widths || !common_a64_float_width) {
+                    dst.a64_scalar_float_bits = 0;
+                    if (!dst.floating_ambiguous || dst.floating) {
+                        dst.floating = false;
+                        dst.floating_ambiguous = true;
+                        changed = true;
+                    }
+                } else {
+                    Fact incoming_width;
+                    incoming_width.reg = p.destination;
+                    incoming_width.a64_scalar_float_bits = common_a64_float_width;
+                    if (merge_a64_scalar_float_width(dst, incoming_width)) changed = true;
+                }
+            }
             if (any_vector_input) {
                 Fact vector_fact;
                 vector_fact.vector_evidence = true;
                 vector_fact.vector_type = all_vector_inputs && !conflicting_vector_inputs ? common_vector_type : nullptr;
                 vector_fact.vector_ambiguous = !all_vector_inputs || conflicting_vector_inputs;
                 if (merge_vector_fact(dst, vector_fact)) changed = true;
+                if (reject_a64_scalar_vector_alias(dst)) changed = true;
             }
         }
         for (const auto &alias : pointer_aliases) {
@@ -2446,7 +2957,7 @@ static Result<TypeRecoveryResult> recover_types_impl(
         }
     }
     if (!pointer_layout_nonconvergent) {
-        constexpr unsigned max_nested_levels = 5; // root fact plus four nested pointee layouts
+        constexpr unsigned max_nested_levels = 9; // root fact plus eight nested pointee layouts
         using LayoutKey = std::pair<Key, unsigned>;
         std::map<LayoutKey, std::shared_ptr<const AggregateLayout>> cache;
         std::set<Key> active;
@@ -2480,6 +2991,7 @@ static Result<TypeRecoveryResult> recover_types_impl(
             }
             nested_layout_work += fact->second.object_fields.size() + fact->second.pointer_fields.size();
             layout->fields = fact->second.object_fields;
+            layout->signed_fields = fact->second.signed_object_fields;
             layout->pointer_fields = fact->second.pointer_fields;
             for (const auto &[offset, children] : fact->second.nested_children) {
                 if (nested_layout_work >= nested_layout_work_limit) {
@@ -2946,7 +3458,9 @@ static Result<TypeRecoveryResult> recover_types_impl(
             result.diagnostics.push_back("vector return register has no supported lane shape; return type left unknown");
     }
     if(!prototype && !return_ambiguous && !result.return_type && abi.floating_return_register) {
-        for(const auto &[fk,fact]:facts) { (void)fk; if(fact.reg==*abi.floating_return_register && fact.bits) {
+        for(const auto &[fk,fact]:facts) { (void)fk; if((fact.reg==*abi.floating_return_register ||
+            (abi.name == "ARM32 AAPCS VFP PCS" && fact.reg.bank == RegisterBank::arm32_vfp &&
+             fact.reg.index == abi.floating_return_register->index)) && fact.bits) {
             Fact f=fact; f.floating=true; result.return_type=make_type(f,abi.pointer_bits,nested_layout_work); break;
         }}
         if(!result.return_type) result.diagnostics.push_back("floating return register has no width evidence; return type left unknown");
@@ -3234,9 +3748,16 @@ static Result<TypeRecoveryResult> recover_types_impl(
             }
         }
         if (!unresolved_argument_order) {
+            const auto inferred_convention = abi.name == "x86-32 stdcall"
+                ? types::FunctionConvention::stdcall
+                : abi.name == "x86-32 fastcall"
+                    ? types::FunctionConvention::fastcall
+                    : abi.name == "x86-32 thiscall"
+                        ? types::FunctionConvention::thiscall
+                        : types::FunctionConvention::platform_default;
             auto inferred = types::Type::function(
                 result.return_type ? result.return_type : types::Type::void_type(),
-                std::move(inferred_parameters), false);
+                std::move(inferred_parameters), false, inferred_convention);
             if (inferred) result.inferred_prototype = inferred.value();
             else result.diagnostics.push_back("could not construct inferred function prototype: " + inferred.error().message);
         }
@@ -3625,7 +4146,24 @@ Result<std::string> format_pseudocode_with_types(const LiftedFunction &input,
         case types::Kind::array:
             if (!type->element()) return {};
             return self(type->element(), name + "[" + std::to_string(type->count()) + "]", self);
-        case types::Kind::function:
+        case types::Kind::function: {
+            if (!type->result_type() ||
+                type->function_convention() != types::FunctionConvention::platform_default ||
+                (type->variadic() && type->parameters().empty())) return {};
+            std::string arguments;
+            if (type->parameters().empty()) arguments = "void";
+            for (std::size_t index = 0; index < type->parameters().size(); ++index) {
+                const auto &parameter = type->parameters()[index];
+                const auto parameter_name = parameter.name.empty()
+                    ? "arg" + std::to_string(index) : parameter.name;
+                const auto text = self(parameter.type, parameter_name, self);
+                if (!text) return {};
+                if (!arguments.empty()) arguments += ", ";
+                arguments += *text;
+            }
+            if (type->variadic()) arguments += ", ...";
+            return self(type->result_type(), name + "(" + arguments + ")", self);
+        }
         case types::Kind::void_type:
             return {};
         case types::Kind::qualified:
@@ -3780,6 +4318,8 @@ Result<std::vector<TypeRecoveryResult>> recover_interprocedural_types(
     };
     const auto slots_for = [](const AbiDescription &abi, const types::TypePtr &prototype = {})
         -> std::vector<AbiArgumentSlot> {
+        if (abi.name == "ARM32 AAPCS VFP PCS" && prototype && prototype->kind() == types::Kind::function)
+            return aapcs32_vfp_prototype_slots(prototype);
         if (abi.name == "AArch64 AAPCS64" && prototype && prototype->kind() == types::Kind::function) {
             return aapcs64_prototype_slots(prototype);
         }
@@ -3873,7 +4413,17 @@ Result<std::vector<TypeRecoveryResult>> recover_interprocedural_types(
         case types::Kind::integer:
         case types::Kind::enumeration:
         case types::Kind::pointer: return abi.integer_return_register;
-        case types::Kind::floating: return abi.floating_return_register;
+        case types::Kind::floating:
+            if (abi.name == "ARM32 AAPCS VFP PCS") {
+                auto signature = types::Type::function(type, {}, false);
+                if (signature) {
+                    const auto classified = classify_abi_signature(CallingConvention::aapcs32_vfp, *signature.value());
+                    if (classified.result.supported && classified.result.locations.size() == 1)
+                        return classified_register(classified.result.locations.front().register_name);
+                }
+                return {};
+            }
+            return abi.floating_return_register;
         case types::Kind::vector: return abi.vector_return_register;
         default: break;
         }
@@ -3901,6 +4451,13 @@ Result<std::vector<TypeRecoveryResult>> recover_interprocedural_types(
             return abi.name == "PowerPC64 ELFv2"
                 ? ppc64_classified_register(classified.result.locations.front().register_name)
                 : classified_register(classified.result.locations.front().register_name);
+        }
+        if (abi.name == "ARM32 AAPCS VFP PCS") {
+            auto signature = types::Type::function(type, {}, false);
+            if (!signature) return {};
+            const auto classified = classify_abi_signature(CallingConvention::aapcs32_vfp, *signature.value());
+            if (!classified.result.supported || classified.result.locations.size() != 1) return {};
+            return classified_register(classified.result.locations.front().register_name);
         }
         if (abi.name != "x86-64 Windows" && abi.name != "AArch64 AAPCS64") return {};
         if (abi.name == "AArch64 AAPCS64") {
@@ -4495,6 +5052,7 @@ Result<std::vector<TypeRecoveryResult>> recover_interprocedural_types(
                 if (std::holds_alternative<Call>(statement)) { active.erase(block_index); return {}; }
                 if (const auto *intrinsic = std::get_if<Intrinsic>(&statement)) {
                     if (intrinsic->memory_effect == IntrinsicMemoryEffect::write ||
+                        intrinsic->memory_effect == IntrinsicMemoryEffect::read_write ||
                         intrinsic->memory_effect == IntrinsicMemoryEffect::unknown) {
                         active.erase(block_index);
                         return {};
@@ -4650,6 +5208,15 @@ Result<std::vector<TypeRecoveryResult>> recover_interprocedural_types(
                     call->result_type = type;
                 else if (target_abi->name == "AArch64 AAPCS64" && aapcs64_hfa_return_pieces(type))
                     call->result_type = type;
+                else if (target_abi->name == "ARM32 AAPCS VFP PCS" && type &&
+                         hfa_float_elements(type) && hfa_float_elements(type)->size() > 1) {
+                    auto signature = types::Type::function(type, {}, false);
+                    if (signature) {
+                        const auto classified = classify_abi_signature(CallingConvention::aapcs32_vfp, *signature.value());
+                        if (classified.result.supported && classified.result.locations.size() <= 4)
+                            call->result_type = type;
+                    }
+                }
                 else if (target_abi->name == "PowerPC64 ELFv2" && ppc64_aggregate_return_pieces(type))
                     call->result_type = type;
                 else if (hidden_result_pointer_info(*target_abi, type))

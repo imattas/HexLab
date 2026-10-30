@@ -1,12 +1,19 @@
 #include "project_commands.hpp"
 #include "project_arguments.hpp"
+#include "signature_catalog_command.hpp"
+#include "signature_catalog_inputs.hpp"
 #include "project_exchange_cli.hpp"
+#include "project_history_cli.hpp"
 #include "hexlab/workspace/project_exchange.hpp"
 #include "hexlab/database/project_state.hpp"
+#include "hexlab/core/sha256.hpp"
+#include "hexlab/image/file_storage.hpp"
 #include <algorithm>
 #include <fstream>
 #include <functional>
 #include <iomanip>
+#include <iterator>
+#include <optional>
 #include <ostream>
 #include <set>
 #include <sstream>
@@ -62,6 +69,7 @@ std::string exchange_kind_name(ExchangeRecordKind kind) {
     case ExchangeRecordKind::type_assignment: return "type_assignment";
     case ExchangeRecordKind::debug_variable: return "debug_variable";
     case ExchangeRecordKind::project_breakpoint: return "project_breakpoint";
+    case ExchangeRecordKind::patch: return "patch";
     }
     return "unknown";
 }
@@ -87,7 +95,7 @@ void print_exchange_import_report(std::ostream &out, const ExchangeImport &plan,
             << ",\"regions\":" << plan.regions << ",\"functions\":" << plan.functions
             << ",\"types\":" << plan.type_definitions << ",\"type_assignments\":" << plan.type_assignments
             << ",\"debug_variables\":" << plan.debug_variables
-            << ",\"project_breakpoints\":" << plan.project_breakpoints << ",\"skipped\":" << plan.skipped
+            << ",\"project_breakpoints\":" << plan.project_breakpoints << ",\"patches\":" << plan.patches << ",\"skipped\":" << plan.skipped
             << ",\"conflicts\":" << plan.conflicts.size() << "},\"reported_conflicts\":" << reported
             << ",\"omitted_conflicts\":" << (plan.conflicts.size() - reported) << ",\"conflict_rows\":[";
         for (std::size_t i = 0; i < reported; ++i) {
@@ -111,6 +119,7 @@ void print_exchange_import_report(std::ostream &out, const ExchangeImport &plan,
         << " references=" << plan.references << " regions=" << plan.regions << " functions=" << plan.functions
         << " types=" << plan.type_definitions << " type-assignments=" << plan.type_assignments
         << " debug-variables=" << plan.debug_variables << " project-breakpoints=" << plan.project_breakpoints
+        << " patches=" << plan.patches
         << " skipped=" << plan.skipped
         << " conflicts=" << plan.conflicts.size();
     if (would_fail) out << " (selected fail policy would reject this import)";
@@ -127,6 +136,197 @@ void print_exchange_import_report(std::ostream &out, const ExchangeImport &plan,
         out << "  ... " << (plan.conflicts.size() - reported) << " additional conflicts omitted\n";
 }
 
+int run_wal_inspection(const project_detail::Arguments &args, std::ostream &out) {
+    using namespace project_detail;
+    const auto report = take(database::inspect_wal(args.path, args.wal_inspection_limits));
+    if (args.recovery_json) {
+        out << "{\"schema\":1,\"operation\":\"inspect-wal\",\"diagnostic_only\":true,\"path\":" << json_string(path_utf8(args.path))
+            << ",\"file_bytes\":" << report.file_bytes << ",\"inspected_bytes\":" << report.inspected_bytes
+            << ",\"header_valid\":" << (report.header_valid ? "true" : "false")
+            << ",\"format_version\":" << report.format_version << ",\"page_size\":" << report.page_size
+            << ",\"checksum_byte_order\":" << (report.header_valid ? json_string(report.checksum_big_endian ? "big" : "little") : "null")
+            << ",\"checkpoint_sequence\":" << report.checkpoint_sequence
+            << ",\"salt1\":" << report.salt1 << ",\"salt2\":" << report.salt2
+            << ",\"complete_frames\":" << report.complete_frames << ",\"valid_frames\":" << report.valid_frames
+            << ",\"commit_markers\":" << report.commit_markers << ",\"last_commit_frame\":" << report.last_commit_frame
+            << ",\"last_commit_pages\":" << report.last_commit_pages
+            << ",\"uncommitted_valid_frames\":" << report.valid_frames - report.last_commit_frame
+            << ",\"trailing_bytes\":" << report.trailing_bytes
+            << ",\"scan_complete\":" << (report.scan_complete ? "true" : "false")
+            << ",\"stop_reason\":" << json_string(report.stop_reason)
+            << ",\"diagnostic\":" << json_string(report.diagnostic) << "}\n";
+    } else {
+        out << "Read-only WAL diagnosis: " << escape(path_utf8(args.path)) << '\n'
+            << "  header_valid=" << (report.header_valid ? "yes" : "no") << " page_size=" << report.page_size
+            << " inspected_bytes=" << report.inspected_bytes << " file_bytes=" << report.file_bytes << '\n'
+            << "  checksum_valid_frames=" << report.valid_frames << '/' << report.complete_frames
+            << " commit_markers=" << report.commit_markers << " last_commit_frame=" << report.last_commit_frame
+            << " last_commit_pages=" << report.last_commit_pages << " trailing_bytes=" << report.trailing_bytes << '\n'
+            << "  " << report.stop_reason << ": " << report.diagnostic << '\n'
+            << "  Diagnostic only: opened for reads only; no database association or recovery established.\n";
+    }
+    return report.scan_complete ? 0 : 3;
+}
+
+struct RecoveryWalRow {
+    std::string name;
+    std::optional<database::WalInspection> report;
+    std::string error;
+};
+struct RecoveryWalDiagnostics {
+    std::vector<RecoveryWalRow> rows;
+    std::size_t visited_entries = 0, matching_names = 0, omitted_files = 0;
+    bool complete = true;
+};
+RecoveryWalDiagnostics inspect_recovery_wals(const std::filesystem::path &directory) {
+    constexpr std::size_t entry_limit = 8192, file_limit = 8;
+    constexpr std::uint64_t bytes_per_file = 8ull * 1024 * 1024;
+    constexpr std::size_t frames_per_file = 1024;
+    RecoveryWalDiagnostics result;
+    std::error_code error;
+    std::filesystem::directory_iterator current(directory, error), end;
+    if (error) {
+        result.complete = false;
+        result.rows.push_back({{}, {}, "Cannot enumerate WAL diagnostics: " + error.message()});
+        return result;
+    }
+    while (current != end) {
+        if (result.visited_entries >= entry_limit) {
+            result.complete = false;
+            break;
+        }
+        ++result.visited_entries;
+        const auto entry = *current;
+        current.increment(error);
+        if (error) {
+            result.complete = false;
+            result.rows.push_back({{}, {}, "Cannot enumerate WAL diagnostics: " + error.message()});
+            break;
+        }
+        const auto filename = entry.path().filename().u8string();
+        const bool project_wal = filename.ends_with(u8".hxproj-wal");
+        const bool staging_wal = (filename.starts_with(u8".hexlab-save-") ||
+                                  filename.starts_with(u8".hexlab-previous-")) &&
+                                 filename.ends_with(u8".tmp-wal");
+        if (!project_wal && !staging_wal) continue;
+        ++result.matching_names;
+        if (result.rows.size() >= file_limit) {
+            ++result.omitted_files;
+            result.complete = false;
+            continue;
+        }
+        std::string name(reinterpret_cast<const char *>(filename.data()), filename.size());
+        if (name.size() > 256) {
+            auto cut = std::size_t{256};
+            while (cut && cut < name.size() && (static_cast<unsigned char>(name[cut]) & 0xc0u) == 0x80u) --cut;
+            name.resize(cut);
+            name += "...";
+        }
+        std::error_code status_error;
+        const auto status = entry.symlink_status(status_error);
+        if (status_error || std::filesystem::is_symlink(status) || !std::filesystem::is_regular_file(status)) {
+            std::string reason = status_error ? "Cannot inspect WAL file: " + status_error.message()
+                : "WAL diagnostic candidate is not a regular file";
+            if (reason.size() > 256) reason.resize(256);
+            result.rows.push_back({std::move(name), {}, std::move(reason)});
+            result.complete = false;
+            continue;
+        }
+        auto report = database::inspect_wal(entry.path(), {bytes_per_file, frames_per_file}, {});
+        if (!report) {
+            std::string reason = report.error().message;
+            if (reason.size() > 256) reason.resize(256);
+            result.rows.push_back({std::move(name), {}, std::move(reason)});
+            result.complete = false;
+            continue;
+        }
+        if (!report.value().scan_complete) result.complete = false;
+        result.rows.push_back({std::move(name), std::move(report.value()), {}});
+    }
+    return result;
+}
+
+int run_project_integrity(const project_detail::Arguments &args, std::ostream &out) {
+    using namespace project_detail;
+    auto project = take(database::ProjectStore::open(args.path, database::ProjectMode::read_only, {}));
+    const auto snapshot = take(project->snapshot());
+    const auto report = take(project->check_integrity(snapshot->revisions.edit,
+                                                       args.integrity_max_issues, {}));
+    std::optional<database::HistoryReplayReport> history;
+    if (args.integrity_verify_history) {
+        history = take(project->verify_history_replay(snapshot->revisions.edit,
+                                                       args.history_semantic_limits, {}));
+        if (history->uuid != report.uuid || history->source_revisions != report.revisions)
+            throw Failure{{ErrorCode::conflict, "Project changed between database and history integrity checks"}};
+    }
+    const bool consistent = report.consistent && (!args.integrity_verify_history || history.has_value());
+    const bool complete = report.complete && (!args.integrity_verify_history || history.has_value());
+    if (args.integrity_json) {
+        out << "{\"schema_version\":" << (args.integrity_verify_history ? 2 : 1)
+            << ",\"operation\":\"project-integrity\",\"path\":"
+            << json_string(path_utf8(args.path)) << ",\"uuid\":" << json_string(uuid_text(report.uuid))
+            << ",\"revisions\":{\"edit\":" << report.revisions.edit
+            << ",\"bytes\":" << report.revisions.bytes
+            << ",\"decisions\":" << report.revisions.decisions << "},\"consistent\":"
+            << (consistent ? "true" : "false") << ",\"complete\":"
+            << (complete ? "true" : "false") << ",\"max_issues\":" << args.integrity_max_issues;
+        if (args.integrity_verify_history) {
+            out << ",\"history_verification\":{\"verified\":true,\"cursor\":"
+                << history->history_cursor << ",\"count\":" << history->history_count
+                << ",\"rewound_steps\":" << history->rewound_steps
+                << ",\"forward_steps\":" << history->forward_steps
+                << ",\"delta_bytes\":" << history->delta_bytes
+                << ",\"input_bytes_verified\":" << history->input_bytes_verified
+                << ",\"validation_bytes\":" << history->validation_bytes
+                << ",\"patch_bytes_verified\":" << history->patch_bytes_verified << '}';
+        }
+        out << ",\"issues\":[";
+        for (std::size_t index = 0; index < report.issues.size(); ++index) {
+            if (index) out << ',';
+            out << json_string(report.issues[index]);
+        }
+        out << "]}\n";
+    } else {
+        out << "Project integrity " << (consistent && complete ? "consistent" : "issues found")
+            << " (uuid=" << uuid_text(report.uuid) << ", revisions=" << report.revisions.edit << ':'
+            << report.revisions.bytes << ':' << report.revisions.decisions << ", "
+            << (report.complete ? "complete" : "issue limit reached") << ")\n";
+        if (args.integrity_verify_history)
+            out << "  Undo/redo history and embedded input verified (" << history->rewound_steps
+                << " rewound, " << history->forward_steps << " replayed; "
+                << history->input_bytes_verified << " input bytes checked)\n";
+        for (const auto &issue : report.issues) out << "  " << escape(issue) << '\n';
+    }
+    return consistent && complete ? 0 : 3;
+}
+
+int run_project_schema(const project_detail::Arguments &args, std::ostream &out) {
+    using namespace project_detail;
+    const auto report = take(database::ProjectStore::inspect_schema_compatibility(args.path, {}));
+    const char *state = report.state == database::ProjectSchemaState::supported ? "supported" :
+                        report.state == database::ProjectSchemaState::newer_than_supported ? "newer-than-supported" :
+                                                                                              "invalid-or-unreadable";
+    if (args.schema_json) {
+        out << "{\"schema_version\":1,\"operation\":\"project-schema\",\"path\":"
+            << json_string(path_utf8(args.path)) << ",\"state\":" << json_string(state)
+            << ",\"stored_version\":";
+        if (report.stored_version) out << *report.stored_version;
+        else out << "null";
+        out << ",\"current_version\":" << report.current_version
+            << ",\"read_only_supported\":" << (report.read_only_supported ? "true" : "false")
+            << ",\"writable_migration_available\":" << (report.writable_migration_available ? "true" : "false")
+            << ",\"diagnostic\":" << json_string(report.diagnostic) << "}\n";
+    } else {
+        out << "Project schema " << state << " (stored=";
+        if (report.stored_version) out << *report.stored_version;
+        else out << "unknown";
+        out << ", current=" << report.current_version << ")\n";
+        if (!report.diagnostic.empty()) out << "  " << escape(report.diagnostic) << '\n';
+    }
+    return report.state == database::ProjectSchemaState::supported ? 0 :
+           report.state == database::ProjectSchemaState::newer_than_supported ? 3 : 1;
+}
+
 int run_recovery_list(const project_detail::Arguments &args, std::ostream &out) {
     using namespace project_detail;
     std::error_code path_error;
@@ -139,34 +339,134 @@ int run_recovery_list(const project_detail::Arguments &args, std::ostream &out) 
     }
     const auto directory = supplied_directory ? args.path
         : (args.path.has_parent_path() ? args.path.parent_path() : std::filesystem::path("."));
-    const auto candidates = take(database::ProjectStore::discover_recovery_candidates(directory, {}));
+    const auto scan = take(database::ProjectStore::inspect_recovery_directory(directory, {}));
+    std::optional<RecoveryWalDiagnostics> wal_diagnostics;
+    if (args.recovery_inspect_wal)
+        wal_diagnostics = inspect_recovery_wals(directory);
+    const auto &scanned = scan.candidates;
+    std::vector<database::ProjectRecoveryCandidate> candidates;
+    candidates.reserve(scanned.size());
+    std::copy_if(scanned.begin(), scanned.end(), std::back_inserter(candidates), [&](const auto &candidate) {
+        return !args.recovery_kind_filter || candidate.kind == *args.recovery_kind_filter;
+    });
     if (args.recovery_json) {
         out << "{\"schema_version\":1,\"directory\":" << json_string(path_utf8(directory));
         if (!supplied_directory)
             out << ",\"project_path\":" << json_string(path_utf8(args.path));
+        out << ",\"visited_entries\":" << scan.visited_entries
+            << ",\"matching_names\":" << scan.matching_names
+            << ",\"scanned_candidates\":" << scanned.size()
+            << ",\"scan_complete\":" << (scan.complete ? "true" : "false")
+            << ",\"omitted_candidates\":" << scan.omitted_candidates
+            << ",\"rejected_candidates\":" << scan.rejected_entries
+            << ",\"omitted_diagnostics\":" << scan.omitted_issues
+            << ",\"kind_filter\":";
+        if (args.recovery_kind_filter)
+            out << json_string(recovery_kind(*args.recovery_kind_filter));
+        else
+            out << "null";
         out << ",\"candidates\":[";
         for (std::size_t i = 0; i < candidates.size(); ++i) {
             if (i) out << ',';
             out << "{\"path\":" << json_string(path_utf8(candidates[i].path))
                 << ",\"uuid\":" << json_string(uuid_text(candidates[i].uuid))
                 << ",\"kind\":" << json_string(recovery_kind(candidates[i].kind))
+                << ",\"artifact_size\":" << candidates[i].artifact_size
+                << ",\"artifact_sha256\":" << json_string(digest_hex(candidates[i].artifact_sha256))
                 << ",\"revisions\":{\"edit\":" << candidates[i].revisions.edit
                 << ",\"bytes\":" << candidates[i].revisions.bytes
                 << ",\"decisions\":" << candidates[i].revisions.decisions << "}}";
         }
-        out << "]}\n";
+        out << "],\"rejections\":[";
+        for (std::size_t i = 0; i < scan.issues.size(); ++i) {
+            if (i) out << ',';
+            out << "{\"name\":" << json_string(scan.issues[i].name)
+                << ",\"reason\":" << json_string(scan.issues[i].reason) << '}';
+        }
+        out << ']';
+        if (wal_diagnostics) {
+            const auto inspected_files = static_cast<std::size_t>(std::count_if(
+                wal_diagnostics->rows.begin(), wal_diagnostics->rows.end(),
+                [](const auto &row) { return row.report.has_value(); }));
+            out << ",\"wal_diagnostics\":{\"diagnostic_only\":true,\"associated_with_project\":false"
+                << ",\"complete\":" << (wal_diagnostics->complete ? "true" : "false")
+                << ",\"visited_entries\":" << wal_diagnostics->visited_entries
+                << ",\"matching_names\":" << wal_diagnostics->matching_names
+                << ",\"inspected_files\":" << inspected_files
+                << ",\"omitted_files\":" << wal_diagnostics->omitted_files
+                << ",\"max_bytes_per_file\":8388608,\"max_frames_per_file\":1024,\"items\":[";
+            for (std::size_t i = 0; i < wal_diagnostics->rows.size(); ++i) {
+                if (i) out << ',';
+                const auto &row = wal_diagnostics->rows[i];
+                out << "{\"name\":" << json_string(row.name);
+                if (!row.error.empty()) {
+                    out << ",\"error\":" << json_string(row.error) << '}';
+                    continue;
+                }
+                const auto &report = *row.report;
+                out << ",\"file_bytes\":" << report.file_bytes
+                    << ",\"inspected_bytes\":" << report.inspected_bytes
+                    << ",\"header_valid\":" << (report.header_valid ? "true" : "false")
+                    << ",\"complete_frames\":" << report.complete_frames
+                    << ",\"valid_frames\":" << report.valid_frames
+                    << ",\"commit_markers\":" << report.commit_markers
+                    << ",\"last_commit_frame\":" << report.last_commit_frame
+                    << ",\"last_commit_pages\":" << report.last_commit_pages
+                    << ",\"trailing_bytes\":" << report.trailing_bytes
+                    << ",\"scan_complete\":" << (report.scan_complete ? "true" : "false")
+                    << ",\"stop_reason\":" << json_string(report.stop_reason)
+                    << ",\"diagnostic\":" << json_string(report.diagnostic) << '}';
+            }
+            out << "]}";
+        }
+        out << "}\n";
     } else {
         out << "Validated project recovery artifacts in " << escape(path_utf8(directory));
         if (!supplied_directory)
             out << " (requested project " << escape(path_utf8(args.path)) << ')';
-        out << ": " << candidates.size() << '\n';
+        out << ": " << candidates.size();
+        if (args.recovery_kind_filter)
+            out << " of " << scanned.size() << " matching --kind " << recovery_kind(*args.recovery_kind_filter);
+        out << '\n';
         for (const auto &candidate : candidates)
             out << "  " << recovery_kind(candidate.kind) << " uuid=" << uuid_text(candidate.uuid)
                 << " revisions=" << candidate.revisions.edit << ':' << candidate.revisions.bytes
                 << ':' << candidate.revisions.decisions
+                << " artifact_size=" << candidate.artifact_size
+                << " artifact_sha256=" << digest_hex(candidate.artifact_sha256)
                 << " path=" << escape(path_utf8(candidate.path)) << '\n';
+        out << "Scan: visited=" << scan.visited_entries << " matching_names=" << scan.matching_names
+            << " rejected=" << scan.rejected_entries << " omitted_candidates=" << scan.omitted_candidates
+            << " omitted_diagnostics=" << scan.omitted_issues
+            << " complete=" << (scan.complete ? "yes" : "no; scan limit reached") << '\n';
+        for (const auto &issue : scan.issues)
+            out << "  rejected " << escape(issue.name) << ": " << escape(issue.reason) << '\n';
+        if (wal_diagnostics) {
+            const auto inspected_files = static_cast<std::size_t>(std::count_if(
+                wal_diagnostics->rows.begin(), wal_diagnostics->rows.end(),
+                [](const auto &row) { return row.report.has_value(); }));
+            out << "WAL diagnostics (diagnostic only; no database association or replay): inspected="
+                << inspected_files << " matching=" << wal_diagnostics->matching_names
+                << " omitted=" << wal_diagnostics->omitted_files
+                << " complete=" << (wal_diagnostics->complete ? "yes" : "no; limits or validation stopped a scan")
+                << '\n';
+            for (const auto &row : wal_diagnostics->rows) {
+                out << "  " << escape(row.name) << ": ";
+                if (!row.error.empty()) {
+                    out << "unavailable: " << escape(row.error) << '\n';
+                    continue;
+                }
+                const auto &report = *row.report;
+                out << "header_valid=" << (report.header_valid ? "yes" : "no")
+                    << " valid_frames=" << report.valid_frames << '/' << report.complete_frames
+                    << " commit_markers=" << report.commit_markers
+                    << " last_commit_frame=" << report.last_commit_frame
+                    << " scan_complete=" << (report.scan_complete ? "yes" : "no")
+                    << " stop_reason=" << report.stop_reason << '\n';
+            }
+        }
     }
-    return 0;
+    return scan.complete && (!wal_diagnostics || wal_diagnostics->complete) ? 0 : 3;
 }
 
 int run_recovery_restore(const project_detail::Arguments &args, std::ostream &out) {
@@ -197,6 +497,36 @@ int run_recovery_restore(const project_detail::Arguments &args, std::ostream &ou
     return 0;
 }
 
+int run_recovery_restore_in_place(const project_detail::Arguments &args, std::ostream &out) {
+    using namespace project_detail;
+    require(!args.readonly, "Cannot restore a recovery artifact with --readonly");
+    const auto directory = args.path.has_parent_path() ? args.path.parent_path() : std::filesystem::path(".");
+    const auto candidates = take(database::ProjectStore::discover_recovery_candidates(directory, {}));
+    std::error_code error;
+    const auto requested = std::filesystem::absolute(args.path, error).lexically_normal();
+    if (error) throw Failure{{ErrorCode::io, "Cannot resolve recovery artifact path: " + error.message()}};
+    const auto found = std::find_if(candidates.begin(), candidates.end(), [&](const auto &candidate) {
+        std::error_code candidate_error;
+        const auto discovered = std::filesystem::absolute(candidate.path, candidate_error).lexically_normal();
+        return !candidate_error && discovered == requested;
+    });
+    require(found != candidates.end(), "Path is not a fully validated HexLab recovery artifact");
+    require(found->kind == database::RecoveryArtifactKind::previous_version,
+            "In-place recovery requires a retained previous-version artifact");
+    const auto restored = take(database::ProjectStore::recover_candidate_in_place(*found, args.output, {}));
+    if (args.recovery_json) {
+        out << "{\"schema_version\":1,\"restored\":true,\"path\":"
+            << json_string(path_utf8(restored.path)) << ",\"uuid\":"
+            << json_string(uuid_text(restored.uuid)) << ",\"source_artifact\":"
+            << json_string(path_utf8(found->path)) << ",\"source_retained\":true,\"target_uuid_preserved\":true}\n";
+    } else {
+        out << "Recovered project in place: " << escape(path_utf8(restored.path))
+            << " uuid=" << uuid_text(restored.uuid)
+            << " (source artifact retained; close connections before restore and reopen target afterward)\n";
+    }
+    return 0;
+}
+
 int run_project_backup(const project_detail::Arguments &args, std::ostream &out) {
     using namespace project_detail;
     auto store = take(database::ProjectStore::open(args.path, database::ProjectMode::read_only, {}));
@@ -204,6 +534,175 @@ int run_project_backup(const project_detail::Arguments &args, std::ostream &out)
                                      : database::ReplacePolicy::fail_if_exists;
     const auto saved = take(store->backup_to(args.output, policy, {}));
     out << "Backed up project: " << escape(path_utf8(saved.path)) << " uuid=" << uuid_text(saved.uuid) << '\n';
+    return 0;
+}
+
+int run_project_source_archive(const project_detail::Arguments &args, std::ostream &out) {
+    using namespace project_detail;
+    auto store = take(database::ProjectStore::open(args.path, database::ProjectMode::read_only, {}));
+    const auto archive = take(store->archive_external_source(args.output, args.source_archive_options, {}));
+    if (args.backup_json) {
+        out << "{\"schema_version\":1,\"archived\":true,\"path\":" << json_string(path_utf8(archive.path))
+            << ",\"source\":" << json_string(path_utf8(archive.source))
+            << ",\"project_uuid\":" << json_string(uuid_text(archive.uuid))
+            << ",\"bytes\":" << archive.input.size << ",\"sha256\":" << json_string(digest_hex(archive.input.sha256))
+            << ",\"project_unchanged\":true}\n";
+    } else {
+        out << "Archived matching external source: " << escape(path_utf8(archive.path))
+            << " bytes=" << archive.input.size << " sha256=" << digest_hex(archive.input.sha256)
+            << " project-uuid=" << uuid_text(archive.uuid) << " (project and provenance unchanged)\n";
+    }
+    return 0;
+}
+
+int run_project_source_archive_verify(const project_detail::Arguments &args, std::ostream &out) {
+    using namespace project_detail;
+    auto store = take(database::ProjectStore::open(args.path, database::ProjectMode::read_only, {}));
+    const auto verified = take(store->verify_source_archive(
+        args.source_archive_path, args.source_archive_options.max_bytes, {}));
+    if (args.backup_json) {
+        out << "{\"schema_version\":1,\"verified\":true,\"project_path\":"
+            << json_string(path_utf8(args.path)) << ",\"archive_path\":"
+            << json_string(path_utf8(verified.path)) << ",\"project_uuid\":"
+            << json_string(uuid_text(verified.project_uuid)) << ",\"bytes\":"
+            << verified.bytes_verified << ",\"sha256\":"
+            << json_string(digest_hex(verified.input.sha256)) << "}\n";
+    } else {
+        out << "Verified source archive: " << escape(path_utf8(verified.path))
+            << " bytes=" << verified.bytes_verified
+            << " sha256=" << digest_hex(verified.input.sha256)
+            << " project-uuid=" << uuid_text(verified.project_uuid) << '\n';
+    }
+    return 0;
+}
+
+int run_project_source_archive_restore(const project_detail::Arguments &args, std::ostream &out) {
+    using namespace project_detail;
+    auto store = take(database::ProjectStore::open(args.path, database::ProjectMode::read_only, {}));
+    const auto restored = take(store->restore_source_archive(args.source_archive_path, args.output,
+        args.source_archive_options.max_bytes, {}));
+    if (args.backup_json) {
+        out << "{\"schema_version\":1,\"restored\":true,\"archive_path\":"
+            << json_string(path_utf8(restored.archive_path)) << ",\"path\":"
+            << json_string(path_utf8(restored.restored_path)) << ",\"project_uuid\":"
+            << json_string(uuid_text(restored.project_uuid)) << ",\"bytes\":" << restored.input.size
+            << ",\"sha256\":" << json_string(digest_hex(restored.input.sha256))
+            << ",\"project_unchanged\":true}\n";
+    } else {
+        out << "Restored matching source archive: " << escape(path_utf8(restored.archive_path))
+            << " -> " << escape(path_utf8(restored.restored_path)) << " bytes=" << restored.input.size
+            << " sha256=" << digest_hex(restored.input.sha256)
+            << " project-uuid=" << uuid_text(restored.project_uuid) << " (project unchanged)\n";
+    }
+    return 0;
+}
+
+int run_project_source_archive_rotate(const project_detail::Arguments &args, std::ostream &out) {
+    using namespace project_detail;
+    auto store = take(database::ProjectStore::open(args.path, database::ProjectMode::read_only, {}));
+    const auto result = take(store->archive_external_source_rotating(
+        args.source_archive_base, args.source_archive_retention, args.source_archive_options, {}));
+    if (args.backup_json) {
+        out << "{\"schema_version\":1,\"archived\":true,\"path\":"
+            << json_string(path_utf8(result.archive.path)) << ",\"source\":"
+            << json_string(path_utf8(result.archive.source)) << ",\"project_uuid\":"
+            << json_string(uuid_text(result.archive.uuid)) << ",\"bytes\":"
+            << result.archive.input.size << ",\"sha256\":"
+            << json_string(digest_hex(result.archive.input.sha256)) << ",\"removed_generations\":"
+            << result.removed_generations << ",\"retention_satisfied\":"
+            << (result.retention_satisfied ? "true" : "false") << "}\n";
+    } else {
+        out << "Created rotated source archive: " << escape(path_utf8(result.archive.path))
+            << " bytes=" << result.archive.input.size << " sha256=" << digest_hex(result.archive.input.sha256)
+            << " project-uuid=" << uuid_text(result.archive.uuid)
+            << "; removed=" << result.removed_generations
+            << "; retention=" << (result.retention_satisfied ? "satisfied" : "incomplete") << '\n';
+    }
+    return result.retention_satisfied ? 0 : 3;
+}
+
+int run_project_source_archive_list(const project_detail::Arguments &args, std::ostream &out) {
+    using namespace project_detail;
+    auto store = take(database::ProjectStore::open(args.path, database::ProjectMode::read_only, {}));
+    const auto listing = take(store->list_rotated_source_archives(
+        args.source_archive_base, args.source_archive_options.max_bytes, {}));
+    if (args.backup_json) {
+        out << "{\"schema_version\":1,\"complete\":" << (listing.complete ? "true" : "false") << ",\"archives\":[";
+        for (std::size_t i=0;i<listing.archives.size();++i) {
+            if (i) out << ',';
+            const auto &row=listing.archives[i];
+            out << "{\"path\":" << json_string(path_utf8(row.archive.path))
+                << ",\"project_uuid\":" << json_string(uuid_text(row.archive.project_uuid))
+                << ",\"created_unix_ms\":" << row.created_unix_ms
+                << ",\"bytes\":" << row.archive.bytes_verified
+                << ",\"sha256\":" << json_string(digest_hex(row.archive.input.sha256)) << '}';
+        }
+        out << "]}\n";
+    } else {
+        out << "Validated rotated source archives for " << escape(path_utf8(args.source_archive_base))
+            << ": " << listing.archives.size()
+            << (listing.complete ? " (complete scan)\n" : " (scan incomplete; pruning is disabled)\n");
+        for (const auto &row : listing.archives)
+            out << escape(path_utf8(row.archive.path)) << " bytes=" << row.archive.bytes_verified
+                << " sha256=" << digest_hex(row.archive.input.sha256)
+                << " project-uuid=" << uuid_text(row.archive.project_uuid)
+                << " created-unix-ms=" << row.created_unix_ms << '\n';
+    }
+    return listing.complete ? 0 : 3;
+}
+
+int run_project_source_archive_prune(const project_detail::Arguments &args, std::ostream &out) {
+    using namespace project_detail;
+    auto store = take(database::ProjectStore::open(args.path, database::ProjectMode::read_only, {}));
+    const auto result = take(store->prune_rotated_source_archives(args.source_archive_base,
+        args.source_archive_retention, args.source_archive_options.max_bytes, {}));
+    if (args.backup_json) {
+        out << "{\"schema_version\":1,\"retention_satisfied\":"
+            << (result.retention_satisfied ? "true" : "false")
+            << ",\"removed\":" << result.removed << ",\"remaining\":" << result.remaining << "}\n";
+    } else {
+        out << "Pruned rotated source archives: removed=" << result.removed
+            << " remaining=" << result.remaining
+            << "; retention=" << (result.retention_satisfied ? "satisfied" : "incomplete") << '\n';
+    }
+    return result.retention_satisfied ? 0 : 3;
+}
+
+int run_project_backup_bundle(const project_detail::Arguments &args, std::ostream &out) {
+    using namespace project_detail;
+    const bool restoring = args.action == L"backup-restore-bundle";
+    std::filesystem::path directory, source_path;
+    database::SavedProject project;
+    InputIdentity input;
+    if (restoring) {
+        const auto result = take(database::ProjectStore::restore_bundle_to(
+            args.path, args.output, args.source_archive_options.max_bytes, {}));
+        directory = result.path;
+        project = result.project;
+        source_path = result.source.restored_path;
+        input = result.source.input;
+    } else {
+        auto store = take(database::ProjectStore::open(args.path, database::ProjectMode::read_only, {}));
+        const auto result = take(store->backup_bundle_to(args.output, args.source_archive_options, {}));
+        directory = result.path;
+        project = result.project;
+        source_path = result.source.path;
+        input = result.source.input;
+    }
+    if (args.backup_json) {
+        out << "{\"schema_version\":1,\"operation\":"
+            << json_string(restoring ? "restore-bundle" : "create-bundle")
+            << ",\"path\":" << json_string(path_utf8(directory))
+            << ",\"project_path\":" << json_string(path_utf8(project.path))
+            << ",\"project_uuid\":" << json_string(uuid_text(project.uuid))
+            << ",\"source_archive_path\":" << json_string(path_utf8(source_path))
+            << ",\"source_archive_bytes\":" << input.size
+            << ",\"source_archive_sha256\":" << json_string(digest_hex(input.sha256)) << "}\n";
+    } else {
+        out << (restoring ? "Restored project/source bundle: " : "Created project/source bundle: ")
+            << escape(path_utf8(directory)) << " project-uuid=" << uuid_text(project.uuid)
+            << " source-bytes=" << input.size << " sha256=" << digest_hex(input.sha256) << '\n';
+    }
     return 0;
 }
 
@@ -245,6 +744,58 @@ int run_project_backup_list(const project_detail::Arguments &args, std::ostream 
     return listing.complete ? 0 : 3;
 }
 
+int run_project_backup_verify(const project_detail::Arguments &args, std::ostream &out) {
+    using namespace project_detail;
+    const auto result = take(database::ProjectStore::verify_backup(
+        args.path, args.backup_verify_steps, args.backup_verify_bytes, {}));
+    if (args.backup_json) {
+        out << "{\"schema_version\":1,\"path\":" << json_string(path_utf8(result.backup.path))
+            << ",\"uuid\":" << json_string(uuid_text(result.backup.uuid))
+            << ",\"history_count\":" << result.history_count
+            << ",\"history_steps_verified\":" << result.history_steps_verified
+            << ",\"history_bytes_verified\":" << result.history_bytes_verified
+            << ",\"history_complete\":" << (result.history_complete ? "true" : "false") << "}\n";
+    } else {
+        out << "Verified project backup: " << escape(path_utf8(result.backup.path))
+            << " uuid=" << uuid_text(result.backup.uuid)
+            << "; history=" << result.history_steps_verified << '/' << result.history_count
+            << " steps, " << result.history_bytes_verified << " bytes"
+            << (result.history_complete ? " (complete)\n" : " (budget-limited; increase verification budgets)\n");
+    }
+    return result.history_complete ? 0 : 3;
+}
+
+int run_project_backup_verify_bundle(const project_detail::Arguments &args, std::ostream &out) {
+    using namespace project_detail;
+    const auto backup = take(database::ProjectStore::verify_backup(
+        args.path, args.backup_verify_steps, args.backup_verify_bytes, {}));
+    auto store = take(database::ProjectStore::open(args.path, database::ProjectMode::read_only, {}));
+    const auto source = take(store->verify_source_archive(
+        args.source_archive_path, args.source_archive_options.max_bytes, {}));
+    require(source.project_uuid == backup.backup.uuid && source.input == backup.input,
+            "Project backup identity or embedded input changed between history audit and source verification");
+    if (args.backup_json) {
+        out << "{\"schema_version\":1,\"verified\":" << (backup.history_complete ? "true" : "false")
+            << ",\"project_uuid\":" << json_string(uuid_text(backup.backup.uuid))
+            << ",\"history_count\":" << backup.history_count
+            << ",\"history_steps_verified\":" << backup.history_steps_verified
+            << ",\"history_bytes_verified\":" << backup.history_bytes_verified
+            << ",\"history_complete\":" << (backup.history_complete ? "true" : "false")
+            << ",\"backup_path\":" << json_string(path_utf8(backup.backup.path))
+            << ",\"source_archive_path\":" << json_string(path_utf8(source.path))
+            << ",\"source_archive_bytes\":" << source.bytes_verified
+            << ",\"source_archive_sha256\":" << json_string(digest_hex(source.input.sha256)) << "}\n";
+    } else {
+        out << "Verified project/source backup pair: project-uuid=" << uuid_text(backup.backup.uuid)
+            << "; history=" << backup.history_steps_verified << '/' << backup.history_count
+            << " steps, " << backup.history_bytes_verified << " bytes"
+            << (backup.history_complete ? " (complete)" : " (budget-limited)")
+            << "; source=" << escape(path_utf8(source.path)) << " bytes=" << source.bytes_verified
+            << " sha256=" << digest_hex(source.input.sha256) << "\n";
+    }
+    return backup.history_complete ? 0 : 3;
+}
+
 int run_project_backup_rotate(const project_detail::Arguments &args, std::ostream &out) {
     using namespace project_detail;
     auto store = take(database::ProjectStore::open(args.path, database::ProjectMode::read_only, {}));
@@ -278,6 +829,28 @@ int run_history_audit(const project_detail::Arguments &args, std::ostream &out, 
     const auto expected_edit = args.history_expected_edit.value_or(snapshot->revisions.edit);
     if (expected_edit != snapshot->revisions.edit)
         throw Failure{{ErrorCode::conflict, "Project edit revision changed; refresh before retrying"}};
+
+    std::filesystem::path verified_input_path;
+    if (args.history_verify_input) {
+        if (!snapshot->provenance)
+            throw Failure{{ErrorCode::invalid_argument, "Project has no recorded input provenance to verify"}};
+        const auto &provenance = *snapshot->provenance;
+        if (!provenance.relative_path.empty()) {
+            const auto relative = std::filesystem::path(std::u8string(
+                reinterpret_cast<const char8_t *>(provenance.relative_path.data()), provenance.relative_path.size()));
+            verified_input_path = (args.path.parent_path() / relative).lexically_normal();
+        } else if (provenance.native_path.is_absolute()) {
+            verified_input_path = provenance.native_path;
+        }
+        if (verified_input_path.empty())
+            throw Failure{{ErrorCode::invalid_argument, "Project provenance does not contain a resolvable external input path"}};
+        auto input = take(FileStorage::open(verified_input_path));
+        if (input->size() != snapshot->input.size)
+            throw Failure{{ErrorCode::integrity, "External input size differs from the project’s recorded input identity"}};
+        const auto digest = take(hash_source(*input, {}));
+        if (digest != snapshot->input.sha256)
+            throw Failure{{ErrorCode::integrity, "External input SHA-256 differs from the project’s recorded input identity"}};
+    }
 
     std::uint64_t cursor = args.history_after_step;
     std::size_t pages = 0, entries = 0, delta_bytes = 0;
@@ -328,8 +901,16 @@ int run_history_audit(const project_detail::Arguments &args, std::ostream &out, 
             throw Failure{{ErrorCode::integrity, "History replay does not return to the empty initial user state"}};
         replay_verified = true;
     }
+    HistoryVerificationOutcome semantics;
+    if (args.history_verify_semantics && complete)
+        semantics = verify_history_semantics(*store, expected_edit, args.history_semantic_limits);
+    if (semantics.report && (semantics.report->uuid != snapshot->uuid ||
+            semantics.report->source_revisions != snapshot->revisions ||
+            semantics.report->history_cursor != history_cursor || semantics.report->history_count != history_count))
+        throw Failure{{ErrorCode::conflict, "Project history changed between structural audit and semantic verification"}};
+    const bool verification_complete = complete && (!args.history_verify_semantics || semantics.report.has_value());
     if (args.history_json) {
-        out << "{\"schema_version\":" << (args.history_verify_replay ? 2 : 1) << ",\"status\":\"" << (complete ? "complete" : "partial")
+        out << "{\"schema_version\":" << (args.history_verify_semantics ? 3 : (args.history_verify_replay || args.history_verify_input) ? 2 : 1) << ",\"status\":\"" << (verification_complete ? "complete" : "partial")
             << "\",\"project_uuid\":\"" << uuid_text(snapshot->uuid)
             << "\",\"expected_edit\":" << expected_edit
             << ",\"source_edit\":" << snapshot->revisions.edit
@@ -344,9 +925,17 @@ int run_history_audit(const project_detail::Arguments &args, std::ostream &out, 
             << ",\"byte_budget_limited\":" << (byte_budget_limited ? "true" : "false");
         if (args.history_verify_replay)
             out << ",\"replay_verified\":" << (replay_verified ? "true" : "false");
+        if (args.history_verify_semantics) {
+            out << ",\"structural_complete\":" << (complete ? "true" : "false")
+                << ",\"semantic_verification\":";
+            print_history_verification_json(out, semantics, args.history_semantic_limits);
+        }
+        if (args.history_verify_input)
+            out << ",\"input_verification\":{\"status\":\"verified\",\"path\":" << json_string(path_utf8(verified_input_path))
+                << ",\"size\":" << snapshot->input.size << ",\"sha256\":" << json_string(digest_hex(snapshot->input.sha256)) << '}';
         out << "}\n";
     } else {
-        out << "History audit " << (complete ? "complete" : "partial")
+        out << "History audit " << (verification_complete ? "complete" : "partial")
             << ": project=" << uuid_text(snapshot->uuid)
             << " edit=" << expected_edit << " cursor=" << history_cursor << '/' << history_count
             << " pages=" << pages << " entries=" << entries << " delta-bytes=" << delta_bytes;
@@ -354,11 +943,18 @@ int run_history_audit(const project_detail::Arguments &args, std::ostream &out, 
         else if (has_more) out << " (page limit reached)";
         if (args.history_verify_replay && complete) out << " replay-to-empty=verified";
         else if (args.history_verify_replay) out << " replay-to-empty=not-run (history audit is partial)";
+        if (args.history_verify_semantics)
+            print_history_verification_text(out, semantics);
+        if (args.history_verify_input)
+            out << " external-input=verified(" << escape(path_utf8(verified_input_path)) << ')';
         out << '\n';
         if (has_more)
             out << "Resume with --expected-edit " << expected_edit << " --after-step " << cursor << '\n';
+        else if (args.history_verify_semantics && !semantics.report)
+            out << "Structural audit completed; retry project history verify with --expected-edit "
+                << expected_edit << " and larger replay budgets\n";
     }
-    return complete ? 0 : 3;
+    return verification_complete ? 0 : 3;
 }
 
 struct HistoryStateCounts {
@@ -453,32 +1049,66 @@ int run_history_preview(const project_detail::Arguments &args, std::ostream &out
 
 void project_usage(std::ostream &out) {
     out << "Usage: hexlab_cli project <action> <project.hxproj> [options]\n"
+           "       hexlab_cli project schema <project.hxproj> [--json]\n"
+           "       hexlab_cli project integrity <project.hxproj> [--max-issues N] [--verify-history]\n"
+           "           [--replay-steps N] [--replay-bytes N] [--replay-input-bytes N] [--replay-validation-bytes N] [--json]\n"
+           "       hexlab_cli project decompile <project.hxproj> --at <va:entry> [--json]\n"
            "       hexlab_cli project history audit <project.hxproj> [--page-steps N] [--page-bytes N]\n"
-           "           [--max-pages N] [--total-bytes N] [--expected-edit N --after-step N] [--verify-replay] [--json]\n"
+           "           [--max-pages N] [--total-bytes N] [--expected-edit N --after-step N] [--verify-replay] [--verify-input] [--json]\n"
+           "           [--verify-history] [--replay-steps N] [--replay-bytes N] [--replay-input-bytes N] [--replay-validation-bytes N]\n"
+           "       hexlab_cli project history verify <project.hxproj> [--expected-edit N] [--json]\n"
+           "           [--replay-steps N] [--replay-bytes N] [--replay-input-bytes N] [--replay-validation-bytes N]\n"
            "       hexlab_cli project history preview <project.hxproj> --step N [--max-steps N] [--max-bytes N] [--json]\n"
            "       hexlab_cli project history save <project.hxproj> --step N --output <copy.hxproj>\n"
            "           [--expected-edit N] [--max-steps N] [--max-bytes N] [--replace] [--json]\n"
-           "       hexlab_cli project recovery list <directory> [--json]\n"
-           "       hexlab_cli project recovery list <project.hxproj> [--json]\n"
+           "       hexlab_cli project recovery list <directory> [--kind interrupted-save|previous-version] [--inspect-wal] [--json]\n"
+           "       hexlab_cli project recovery list <project.hxproj> [--kind interrupted-save|previous-version] [--inspect-wal] [--json]\n"
            "       hexlab_cli project recovery restore <artifact.tmp> --output <project.hxproj> [--replace] [--json]\n"
+           "       hexlab_cli project recovery restore-in-place <previous-version.tmp> --target <existing-project.hxproj> [--json]\n"
+           "       hexlab_cli project recovery inspect-wal <file-wal> [--max-bytes <n>] [--max-frames <n>] [--json]\n"
            "       hexlab_cli project backup <project.hxproj> --output <backup.hxproj> [--replace]\n"
+           "       hexlab_cli project backup create-bundle <project.hxproj> --output <new-directory> [--max-source-bytes N] [--json]\n"
+           "       hexlab_cli project backup restore-bundle <bundle-directory> --output <new-directory> [--max-source-bytes N] [--json]\n"
+           "       hexlab_cli project backup archive-source <project.hxproj> --output <source-copy> [--max-source-bytes N] [--json]\n"
+           "       hexlab_cli project backup verify-source <project.hxproj> --archive <source-copy> [--max-source-bytes N] [--json]\n"
+           "       hexlab_cli project backup restore-source <project.hxproj> --archive <source-copy> --output <restored-binary> [--max-source-bytes N] [--json]\n"
+           "       hexlab_cli project backup rotate-source <project.hxproj> --base <archive-name.bin> [--retain N] [--max-source-bytes N] [--json]\n"
+           "       hexlab_cli project backup list-source <project.hxproj> --base <archive-name.bin> [--max-source-bytes N] [--json]\n"
+           "       hexlab_cli project backup prune-source <project.hxproj> --base <archive-name.bin> [--retain N] [--max-source-bytes N] [--json]\n"
            "       hexlab_cli project backup restore <backup.hxproj> --output <new-project.hxproj> [--replace]\n"
            "       hexlab_cli project backup list <project.hxproj> --base <backup-name.hxproj> [--json]\n"
+           "       hexlab_cli project backup verify <backup.hxproj> [--max-history-steps N] [--max-history-bytes N] [--json]\n"
+           "       hexlab_cli project backup verify-bundle <backup.hxproj> --archive <source-copy> [--max-history-steps N] [--max-history-bytes N] [--max-source-bytes N] [--json]\n"
            "       hexlab_cli project backup rotate <project.hxproj> --base <backup-name.hxproj> [--retain N]\n"
            "       hexlab_cli project backup prune <project.hxproj> --base <backup-name.hxproj> [--retain N]\n"
            "       hexlab_cli project backup restore-in-place <backup.hxproj> --target <existing-project.hxproj>\n"
            "       hexlab_cli project exchange import <project> --input <file> [--conflict fail|skip|replace] [--dry-run] [--json]\n"
-           "Actions: create inspect rename comment bookmark define undefine reference patch undo redo\n"
-           "         save save-as export functions references switches stack graph search signatures signature-apply signature-create flirt flirt-apply fingerprints fingerprint-create recognition-evidence methods managed-types fields user-strings\n"
+           "Actions: create inspect decompile rename comment bookmark define undefine reference patch undo redo\n"
+           "         save save-as export functions references switches stack graph search signatures signature-apply signature-create signature-catalog-create flirt flirt-apply fingerprints fingerprint-create recognition-evidence methods managed-types managed-resources fields properties events marshaling user-strings\n"
+           "         managed-resources <project> [--inputs-list <utf8-path-list>] [--json]\n"
            "         exchange export|import <project> --output/--input <file> [--conflict fail|skip|replace]\n"
-           "         types export|import <project> --output/--input <file> [--replace] [--replace-assignments] [--skip-assignments-on-mismatch]\n"
-           "         types verify <type-library-file>\n"
-           "history audit: read-only paginated integrity check; --verify-replay also reverses the applied branch to empty state (max 4096 steps/64 MiB); JSON emits one summary; exit 3 means resume available\n"
+           "         types export|export-header|import <project> --output/--input <file> [--replace] [--replace-assignments]\n"
+           "             [--skip-assignments-on-mismatch]\n"
+           "         types verify <type-library-file> [--self-contained] [--json]\n"
+           "history audit: read-only paginated integrity check; --verify-replay reverses applied history; --verify-input hashes the recorded external input; exit 3 means resume available\n"
+           "history verify: read-only full undo/redo semantic replay, cursor agreement and original patch checks; exit 3 means replay budgets are insufficient\n"
+           "history audit --verify-history: run full semantic verification after structural pages complete; exit 3 also means semantic replay was budget-limited\n"
            "history preview: read-only bounded replay to an exact step; reports current and preview record counts without changing the project; exit 3 means target differs from current cursor\n"
            "history save: publishes an independent project at an exact step with full undo/redo history; source stays unchanged\n"
-           "recovery list: read-only scan for fully validated interrupted saves and retained previous versions; a project path scans its directory\n"
+           "recovery list: read-only scan for validated artifacts; rejected matching names include bounded reasons; a project path scans its directory\n"
+           "  --inspect-wal adds bounded read-only diagnostics for matching project/staging WAL sidecars; never associates or replays them\n"
            "recovery restore: revalidates an artifact and publishes an independent project copy; --json emits the published path and UUID; source artifact stays intact\n"
+           "recovery restore-in-place: restores a validated previous-version artifact over its same-UUID target; close connections first, target must be reopened, source is retained\n"
+           "recovery inspect-wal: reads WAL bytes without SQLite; checks header, salts, checksums, commit markers; diagnostic only; exit 3 means invalid, truncated, empty or budget-limited\n"
+           "integrity: read-only SQLite integrity and foreign-key check against a revision-pinned snapshot; exit 3 means inconsistent or issue output capped\n"
+           "schema: read-only schema compatibility probe; never migrates; exit 3 means newer than this build\n"
            "backup project: writes a consistent read-only SQLite snapshot while preserving project UUID and history\n"
+           "backup create-bundle/restore-bundle: publish project.hxproj and verified source.bin together in a new directory; UUID preserved; 8 GiB project, default 256 MiB source, maximum 1 GiB source\n"
+           "backup verify: validates project/schema/input/patch state and bounded forward/inverse history; exit 3 means more history remains beyond the supplied budget\n"
+           "backup verify-bundle: validates backup history and source archive bytes against its embedded input, rechecking project identity\n"
+           "backup archive-source: copies matching original external input atomically; never replaces output; default 256 MiB budget, maximum 1 GiB\n"
+           "backup verify-source: checks an archived source copy against embedded input size and SHA-256 without changing the project\n"
+           "backup rotate-source/list-source/prune-source: verify timestamped source archives against embedded size/SHA-256; at most 8192 entries, 64 candidates, 1 GiB cumulative hash; incomplete scans do not prune\n"
            "backup restore: validates the backup and creates an independent project with a new UUID; the backup is retained\n"
            "backup rotate/prune: only same-UUID, validated generated siblings are pruned; incomplete bounded scans preserve files and return exit 3\n"
            "backup restore-in-place: requires a same-UUID backup and closed target connections; target retains its UUID and must be reopened\n"
@@ -507,17 +1137,20 @@ void project_usage(std::ostream &out) {
            "       [--format json|dot] [--node-budget N] [--edge-budget N]; output goes to stdout\n"
            "       call is image-wide; function-calls emits the selected function's bounded caller/callee neighborhood\n"
            "search: --kind bytes --pattern <two-character hex octets; ? masks a nibble, e.g. 48 8B ?? A? ?F>\n"
-           "        --kind text --text <literal> --encoding ascii|utf8|utf16le|utf16be|utf32le|utf32be\n"
+           "        --kind text --text <literal> --encoding ascii|utf8|utf16le|utf16be|utf32le|utf32be|windows1252|iso8859_1 [--ignore-ascii-case]\n"
            "        --kind immediate --value <integer> --width 8|16|32|64 [--signed|--unsigned]\n"
-           "        [--limit N] [--candidate-budget N] [--cursor <continuation>] [--json]\n"
-           "signatures: --definitions <file> [--function-entries] [--limit N] [--candidate-budget N] [--comparison-budget N]\n"
-           "signature-apply: --definitions <file> [--limit N] [--candidate-budget N] [--comparison-budget N]\n"
+           "        [--start file:<offset>|va:<address>] [--limit N] [--candidate-budget N] [--cursor <continuation>] [--json]\n"
+           "functions: [--json] emits stable IDs, entries, completeness, and noncontiguous chunks\n"
+           "signatures: (--definitions <file> | --definitions-list <utf8-path-list>) [--function-entries] [--limit N] [--candidate-budget N] [--comparison-budget N]\n"
+           "signature-apply: (--definitions <file> | --definitions-list <utf8-path-list>) [--limit N] [--candidate-budget N] [--comparison-budget N]\n"
            "signature-create: --at va:<entry> --name <name> --provenance <source> [--max-bytes N] [--min-exact-bytes N]\n"
+           "signature-catalog-create: --all-functions --provenance <source> [--max-bytes N] [--min-exact-bytes N]\n"
            "flirt: --definitions <file.pat|file.pat.gz|file.sig> OR --definitions-list <utf8-path-list>; --provenance <source> [--catalog-byte-budget N] [--pattern-budget N]\n"
            "       [--function-budget N] [--candidate-budget N] [--comparison-budget N] [--reference-budget N] [--result-budget N]\n"
            "flirt-apply: same options; persist source-bound candidate evidence; [--rename-unique] applies only unique public names\n"
-           "fingerprints: --definitions <file> [--function-budget N] [--instruction-budget N] [--token-budget N]\n"
-           "fingerprint-create: --at va:<entry> --name <name> --provenance <source> [--max-instructions N] [--max-blocks N]\n"
+           "fingerprints: (--definitions <file> | --definitions-list <file>) [--function-budget N] [--instruction-budget N] [--token-budget N] [--comparison-budget N]\n"
+           "fingerprint-create: (--at va:<entry> --name <name> | --all-functions) --provenance <source> [--max-instructions N] [--max-blocks N]\n"
+           "                 --all-functions is capped at 4096 recovered functions; catalog names use stable sub_<space>_<entry> labels\n"
            "recognition-evidence: --kind signatures|fingerprints|flirt; reads source-current persisted candidates and ambiguity\n"
            "        file lines: name|provenance|byte pattern|excluded pattern[;excluded pattern...]\n"
            "Locations: va:<address>, va:<space>:<address>, file:<offset>; decimal or 0x hex.\n"
@@ -536,29 +1169,70 @@ int run_project_cli(std::span<const std::wstring_view> arguments, std::ostream &
     }
     try {
         auto args = parse(arguments);
+        if (args.action == L"project-schema")
+            return run_project_schema(args, out);
+        if (args.action == L"project-integrity")
+            return run_project_integrity(args, out);
         if (args.action == L"types-verify") {
             const auto bundle = take(read_type_library_file(args.type_library_input));
-            out << "Verified type library: " << bundle.entries.size() << " definitions, "
-                << bundle.assignments.size() << " assignments";
-            if (bundle.source_identity) out << ", source identity present";
-            out << "\n";
+            if (args.type_verify_self_contained) {
+                const std::set<std::string, std::less<>> no_external_definitions;
+                take(types::validate_library_references(bundle, no_external_definitions));
+            }
+            if (args.type_verify_json) {
+                out << "{\"schema_version\":1,\"verified\":true,\"definitions\":" << bundle.entries.size()
+                    << ",\"assignments\":" << bundle.assignments.size()
+                    << ",\"source_identity_present\":" << (bundle.source_identity ? "true" : "false")
+                    << ",\"self_contained\":";
+                if (args.type_verify_self_contained) out << "true";
+                else out << "null";
+                out << ",\"path\":" << json_string(path_utf8(args.type_library_input)) << "}\n";
+            } else {
+                out << "Verified type library: " << bundle.entries.size() << " definitions, "
+                    << bundle.assignments.size() << " assignments";
+                if (bundle.source_identity) out << ", source identity present";
+                if (args.type_verify_self_contained) out << ", all symbolic references are self-contained";
+                out << "\n";
+            }
             return 0;
         }
         if (args.action == L"history-audit")
             return run_history_audit(args, out, err);
+        if (args.action == L"history-verify")
+            return run_history_verify(args, out);
         if (args.action == L"history-preview")
             return run_history_preview(args, out);
         if (args.action == L"history-save")
             return run_history_save(args, out);
         if (args.action == L"recovery-list")
             return run_recovery_list(args, out);
+        if (args.action == L"recovery-inspect-wal")
+            return run_wal_inspection(args, out);
         if (args.action == L"recovery-restore")
             return run_recovery_restore(args, out);
+        if (args.action == L"recovery-restore-in-place")
+            return run_recovery_restore_in_place(args, out);
         if (args.action == L"backup")
             return run_project_backup(args, out);
+        if (args.action == L"backup-create-bundle" || args.action == L"backup-restore-bundle")
+            return run_project_backup_bundle(args, out);
+        if (args.action == L"backup-archive-source")
+            return run_project_source_archive(args, out);
+        if (args.action == L"backup-verify-source")
+            return run_project_source_archive_verify(args, out);
+        if (args.action == L"backup-restore-source")
+            return run_project_source_archive_restore(args, out);
+        if (args.action == L"backup-source-rotate")
+            return run_project_source_archive_rotate(args, out);
+        if (args.action == L"backup-source-list")
+            return run_project_source_archive_list(args, out);
+        if (args.action == L"backup-source-prune")
+            return run_project_source_archive_prune(args, out);
         if (args.action == L"backup-restore")
             return run_project_backup_restore(args, out);
         if (args.action == L"backup-list") return run_project_backup_list(args, out);
+        if (args.action == L"backup-verify") return run_project_backup_verify(args, out);
+        if (args.action == L"backup-verify-bundle") return run_project_backup_verify_bundle(args, out);
         if (args.action == L"backup-rotate") return run_project_backup_rotate(args, out);
         if (args.action == L"backup-prune") return run_project_backup_prune(args, out);
         if (args.action == L"backup-restore-in-place") return run_project_backup_restore_in_place(args, out);
@@ -590,12 +1264,13 @@ int run_project_cli(std::span<const std::wstring_view> arguments, std::ostream &
             }
             return 0;
         }
-        bool query = args.action == L"exchange-export" || args.action == L"types-export" ||
+        bool query = args.action == L"exchange-export" || args.action == L"types-export" || args.action == L"types-export-header" ||
+                     args.action == L"decompile" ||
                      (args.action == L"exchange-import" && args.exchange_dry_run) ||
-                     args.action == L"inspect" || args.action == L"functions" || args.action == L"methods" || args.action == L"managed-types" || args.action == L"fields" || args.action == L"user-strings" || args.action == L"references" || args.action == L"stack" ||
+                     args.action == L"inspect" || args.action == L"functions" || args.action == L"methods" || args.action == L"managed-types" || args.action == L"managed-resources" || args.action == L"fields" || args.action == L"properties" || args.action == L"events" || args.action == L"marshaling" || args.action == L"user-strings" || args.action == L"references" || args.action == L"stack" ||
                      args.action == L"switches" ||
                      args.action == L"graph" || args.action == L"search" || args.action == L"recognition-evidence" || (args.action == L"signatures" && !args.signature_function_entries) ||
-                     args.action == L"signature-create" || args.action == L"flirt" ||
+                     args.action == L"signature-create" || args.action == L"signature-catalog-create" || args.action == L"flirt" ||
                      args.action == L"fingerprints" || args.action == L"fingerprint-create";
         auto opened = reply(actor->open_project(
             args.path, query || args.readonly ? database::ProjectMode::read_only : database::ProjectMode::read_write,
@@ -606,9 +1281,13 @@ int run_project_cli(std::span<const std::wstring_view> arguments, std::ostream &
             out << "Exported exchange: " << current.snapshot->state->user->annotations.size() << " annotations, "
                 << current.snapshot->state->user->bookmarks.size() << " bookmarks, "
                 << current.snapshot->state->user->decisions.references.size() << " references, "
+                << current.snapshot->state->user->decisions.regions.size() << " regions, "
+                << current.snapshot->state->user->decisions.functions.size() << " functions, "
                 << current.snapshot->state->user->types.size() << " types, "
                 << current.snapshot->state->user->type_assignments.size() << " type assignments, "
-                << current.snapshot->state->user->debug_variables.size() << " debug variables\n";
+                << current.snapshot->state->user->debug_variables.size() << " debug variables, "
+                << current.snapshot->state->user->breakpoints.size() << " project breakpoints, "
+                << current.snapshot->state->user->patches.size() << " byte patches\n";
             return written ? 0 : 1;
         }
         if (args.action == L"types-export") {
@@ -617,10 +1296,17 @@ int run_project_cli(std::span<const std::wstring_view> arguments, std::ostream &
             out << "Exported type library: " << current.snapshot->state->user->types.size() << " definitions\n";
             return written ? 0 : 1;
         }
+        if (args.action == L"types-export-header") {
+            auto current = reply(actor->ready());
+            auto written = take(write_type_library_header(*current.snapshot, args.output, args.replace));
+            out << "Exported C11 type header: " << current.snapshot->state->user->types.size() << " definitions\n";
+            return written ? 0 : 1;
+        }
         if (args.action == L"types-import") {
             auto bundle = take(read_type_library_file(args.type_library_input));
             auto current = reply(actor->ready());
             bool compatible = false;
+            bool binary_identity_matches = false;
             if (bundle.source_identity) {
                 auto recipe = take(encode_recipe(current.snapshot->state->recipe));
                 Sha256 hash; take(hash.update(recipe));
@@ -629,12 +1315,21 @@ int run_project_cli(std::span<const std::wstring_view> arguments, std::ostream &
                     source.input_sha256 == current.snapshot->state->input.sha256 &&
                     source.recipe_sha256 == hash.digest();
             }
-            require(bundle.assignments.empty() || compatible || args.type_skip_assignments_on_mismatch,
-                    "Type library source identity does not match this project; use --skip-assignments-on-mismatch to import definitions only");
+            if (bundle.file_offset_identity)
+                binary_identity_matches = bundle.file_offset_identity->input_size == current.snapshot->state->input.size &&
+                    bundle.file_offset_identity->input_sha256 == current.snapshot->state->input.sha256;
+            require(bundle.assignments.empty() || compatible || binary_identity_matches || args.type_skip_assignments_on_mismatch ||
+                        args.type_file_offset_on_mismatch,
+                    "Type library source identity does not match this project; assignments will be skipped");
             std::set<std::string, std::less<>> available;
             for (const auto &row : current.snapshot->state->user->types) available.insert(row.name);
             for (const auto &entry : bundle.entries) available.insert(entry.name);
-            take(types::validate_library_references(bundle, available));
+            auto validation_bundle = bundle;
+            std::erase_if(validation_bundle.assignments, [&](const auto &assignment) {
+                const bool is_file = std::holds_alternative<FileOffset>(assignment.location);
+                return is_file ? !binary_identity_matches : !compatible;
+            });
+            take(types::validate_library_references(validation_bundle, available));
             ImportPortableTypes command;
             for (auto &entry : bundle.entries) {
                 auto found = std::find_if(current.snapshot->state->user->types.begin(), current.snapshot->state->user->types.end(),
@@ -647,8 +1342,14 @@ int run_project_cli(std::span<const std::wstring_view> arguments, std::ostream &
                     entry.origin->unit_offset, entry.origin->record_offset, entry.origin->record_size};
                 command.definitions.push_back({std::move(entry.name), std::move(entry.type), existing, std::move(origin), declaration_kind});
             }
-            if (compatible) {
+            std::size_t skipped_assignments = 0;
+            if (compatible || binary_identity_matches) {
                 for (const auto &assignment : bundle.assignments) {
+                    const auto *file = std::get_if<FileOffset>(&assignment.location);
+                    if ((!file && !compatible) || (file && !binary_identity_matches)) {
+                        ++skipped_assignments;
+                        continue;
+                    }
                     const auto target = std::find_if(current.snapshot->state->user->types.begin(), current.snapshot->state->user->types.end(),
                         [&](const auto &row) { return row.name == assignment.type_name; });
                     require(target != current.snapshot->state->user->types.end() || available.contains(assignment.type_name),
@@ -664,11 +1365,15 @@ int run_project_cli(std::span<const std::wstring_view> arguments, std::ostream &
                     }
                     command.assignments.push_back({assignment.location, assignment.type_name});
                 }
+            } else if (!bundle.assignments.empty()) {
+                skipped_assignments = bundle.assignments.size();
             }
             const auto definition_count = command.definitions.size(), assignment_count = command.assignments.size();
             if (definition_count || assignment_count)
                 reply(actor->execute(ImportPortableTypes{std::move(command.definitions), std::move(command.assignments)}, 0));
-            out << "Imported type library: " << definition_count << " definitions, " << assignment_count << " assignments\n";
+            out << "Imported type library: " << definition_count << " definitions, " << assignment_count << " assignments";
+            if (skipped_assignments) out << ", " << skipped_assignments << " assignments skipped because binary/source identity was absent or mismatched";
+            out << '\n';
             return 0;
         }
         if (args.action == L"exchange-import") {
@@ -720,6 +1425,14 @@ int run_project_cli(std::span<const std::wstring_view> arguments, std::ostream &
             return 0;
         }
         auto current = reply(actor->ready());
+        if (args.action == L"signature-catalog-create") {
+            require(bool(current.snapshot->loaded) && bool(current.snapshot->functions),
+                    "Function signature catalog extraction requires a loaded image and recovered function facts");
+            out << take(create_all_function_signature_catalog(*current.snapshot->loaded->image,
+                *current.snapshot->effective, *current.snapshot->functions,
+                args.signature_provenance, args.function_signature_options)) << '\n';
+            return 0;
+        }
         if (args.at_expression)
             args.at = take(resolve_location(*current.snapshot, *args.at_expression));
         if (args.action == L"recognition-evidence") {
@@ -752,6 +1465,8 @@ int run_project_cli(std::span<const std::wstring_view> arguments, std::ostream &
                         << " constrained-bits=" << candidate.constrained_bits
                         << " pattern-bytes=" << candidate.pattern_bytes
                         << " instructions=" << candidate.instruction_count;
+                    if (evidence.format_version >= 3)
+                        out << " catalog-index=" << candidate.catalog_index;
                     if (args.recognition_kind == FunctionRecognitionKind::flirt_patterns)
                         out << " symbol-kind="
                             << (candidate.symbol_kind == static_cast<std::uint8_t>(FlirtSymbolKind::local_name) ? "local" : "public")
@@ -769,19 +1484,14 @@ int run_project_cli(std::span<const std::wstring_view> arguments, std::ostream &
             const auto &snapshot = *current.snapshot;
             require(bool(snapshot.loaded) && bool(snapshot.functions),
                     "Signature application requires a loaded image and recovered function facts");
-            std::error_code ec;
-            const auto size = std::filesystem::file_size(args.signature_definitions, ec);
-            require(!ec && size <= 1024 * 1024, "Cannot read signature definitions or file exceeds 1 MiB");
-            std::ifstream input(args.signature_definitions, std::ios::binary);
-            require(bool(input), "Cannot open signature definitions");
-            std::string text(static_cast<std::size_t>(size), '\0');
-            require(!size || bool(input.read(text.data(), static_cast<std::streamsize>(size))), "Cannot read signature definitions");
-            const auto catalog = take(parse_signature_catalog(text));
+            const auto loaded_catalogs = load_signature_inputs(args);
+            const auto &catalogs = loaded_catalogs.catalogs;
             const auto recognized = take(recognize_function_signatures(*snapshot.loaded->image, *snapshot.effective,
-                *snapshot.functions, catalog, args.signature_limits));
+                *snapshot.functions, catalogs, args.signature_limits));
             require(recognized.complete, "Signature recognition is incomplete; no changes were applied");
-            const auto canonical=take(serialize_signature_catalog(catalog));Sha256 catalog_hash;
-            take(catalog_hash.update(std::span(reinterpret_cast<const std::byte*>(canonical.data()),canonical.size())));
+            Sha256 catalog_hash;
+            take(catalog_hash.update(std::span(reinterpret_cast<const std::byte*>(loaded_catalogs.identity.data()),
+                                                loaded_catalogs.identity.size())));
             auto evidence=take(make_function_recognition_evidence(*snapshot.functions,catalog_hash.digest(),recognized));
             auto evidence_write=take(actor->persist_function_recognition(std::move(evidence)));take(evidence_write.result.get());
 

@@ -7,12 +7,13 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace hexlab::types {
 enum class Kind { void_type, boolean, integer, floating, pointer, array, structure, union_type, enumeration, function, named_reference, vector, qualified };
-enum class Qualifier : std::uint8_t { const_ = 1, volatile_ = 2, restrict_ = 4 };
-enum class FunctionConvention : std::uint8_t { platform_default, c_decl, stdcall, fastcall, thiscall, vectorcall, sysv_abi, ms_abi, aapcs64, aapcs32, mips_n64, mips_n32 };
+enum class Qualifier : std::uint8_t { const_ = 1, volatile_ = 2, restrict_ = 4, atomic_ = 8 };
+enum class FunctionConvention : std::uint8_t { platform_default, c_decl, stdcall, fastcall, thiscall, vectorcall, sysv_abi, ms_abi, aapcs64, aapcs32, mips_n64, mips_n32, aapcs32_vfp };
 using TypePtr = std::shared_ptr<const class Type>;
 class Type;
 enum class MemberAccess : std::uint8_t { unknown, private_, protected_, public_ };
@@ -23,10 +24,11 @@ struct Member {
     std::string name;
     TypePtr type;
     std::uint64_t offset = 0;
-      // Present together only for CodeView/C-style bitfields. A zero width is
+      // Present together for source-described bitfields. A zero width is
       // reserved for an unnamed allocation-unit barrier; bit_offset is zero.
       // Otherwise offset is the byte offset of the storage unit and bit_offset
-      // is LSB-relative within it.
+      // is LSB-relative within it. Allocation-unit choice is producer metadata;
+      // when absent, portable layout cannot infer target compiler rules.
     std::optional<std::uint32_t> bit_width;
     std::optional<std::uint32_t> bit_offset;
     // Compiler-derived effective alignment for this member (for example from
@@ -46,7 +48,19 @@ struct Member {
     std::optional<VirtualBaseLocation> virtual_base;
     // Source access control is declaration metadata and does not affect layout.
     MemberAccess access = MemberAccess::unknown;
+    // C11 anonymous struct/union member: it has no spelling at this level,
+    // keeps its nested physical layout, and promotes its member names into
+    // the containing aggregate's lookup scope.
+    bool anonymous = false;
     bool has_fixed_offset() const noexcept { return !virtual_base.has_value(); }
+};
+struct MemberPath {
+    // Indices into each aggregate's physical member vector, beginning at the
+    // aggregate on which member_paths() was called. Anonymous members remain
+    // in this path so clients can both resolve the promoted name and preserve
+    // its nested storage provenance.
+    std::vector<std::size_t> indexes;
+    std::uint64_t byte_offset = 0;
 };
 struct Parameter {
     std::string name;
@@ -105,8 +119,16 @@ class HEXLAB_TYPES_EXPORT Type final {
     std::uint64_t alignment() const noexcept { return alignment_; }
     bool is_signed() const noexcept { return signed_; }
     std::uint64_t count() const noexcept { return count_; }
+    std::uint64_t array_stride() const noexcept { return array_stride_; }
     const TypePtr &element() const noexcept { return element_; }
     const std::vector<Member> &members() const noexcept { return members_; }
+    // Return every physical data member whose storage covers a byte offset.
+    // Results are member-vector indices; overlaps (for example unions and
+    // bitfields sharing an allocation unit) are intentionally preserved.
+    std::vector<std::size_t> members_covering_offset(std::uint64_t byte_offset) const;
+    // Finds direct and C-promoted member names. Multiple results mean the
+    // stored source graph is ambiguous; importers should reject that graph.
+    std::vector<MemberPath> member_paths(std::string_view name) const;
     std::optional<std::uint64_t> packing_alignment() const noexcept { return packing_alignment_; }
     const std::vector<std::string> &enumerators() const noexcept { return enumerators_; }
     const std::vector<Enumerator> &enumerator_values() const noexcept { return enumerator_values_; }
@@ -122,7 +144,7 @@ class HEXLAB_TYPES_EXPORT Type final {
     // A non-owning symbolic edge to a separately stored named definition.
     // This breaks recursive graphs without introducing shared_ptr cycles.
     static hexlab::Result<TypePtr> named_reference(std::string name);
-    // C/C++ cv/restrict qualification; nested qualification is flattened.
+    // C/C++ cv/restrict/atomic qualification; nested qualification is flattened.
     static hexlab::Result<TypePtr> qualified(TypePtr base, std::uint8_t qualifiers);
     // Returns a shallow copy with stronger ABI alignment, preserving size and
     // all nested type/member metadata. Alignment may only be increased.
@@ -141,6 +163,9 @@ class HEXLAB_TYPES_EXPORT Type final {
     // count == 0 represents an incomplete array; aggregates allow it only as
     // the final member of a structure (after at least one preceding member).
     static hexlab::Result<TypePtr> array(TypePtr element, std::uint64_t count);
+    // Fixed-stride array for binary formats whose element storage includes
+    // inter-element padding (for example CodeView LF_STRIDED_ARRAY).
+    static hexlab::Result<TypePtr> strided_array(TypePtr element, std::uint64_t count, std::uint64_t stride);
     // An incomplete tagged aggregate declaration. It has no object size and
     // cannot be laid out until a complete definition is available.
     static hexlab::Result<TypePtr> incomplete_aggregate(Kind kind, std::string name);
@@ -171,6 +196,7 @@ class HEXLAB_TYPES_EXPORT Type final {
     std::uint8_t qualifiers_ = 0;
     FunctionConvention function_convention_ = FunctionConvention::platform_default;
     std::uint64_t count_ = 0;
+    std::uint64_t array_stride_ = 0;
     TypePtr element_, result_;
     std::vector<Member> members_;
     std::optional<std::uint64_t> packing_alignment_;

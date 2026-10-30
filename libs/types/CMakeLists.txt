@@ -31,7 +31,7 @@ set(types_dependencies)
 if(TARGET hexlab::core)
   list(APPEND types_dependencies hexlab::core)
 endif()
-hexlab_add_library(types SOURCES src/types.cpp src/type_library.cpp src/enum_authoring.cpp src/layout.cpp src/pdb.cpp src/pdb_import.cpp src/header_preprocessor.cpp src/header_import.cpp DEPENDS ${types_dependencies})
+hexlab_add_library(types SOURCES src/types.cpp src/type_library.cpp src/type_library_header.cpp src/enum_authoring.cpp src/layout.cpp src/pdb.cpp src/pdb_import.cpp src/header_preprocessor.cpp src/header_import.cpp DEPENDS ${types_dependencies})
 
 if(BUILD_TESTING)
   add_executable(hexlab_types_tests "${CMAKE_CURRENT_SOURCE_DIR}/../../tests/types/types_tests.cpp")

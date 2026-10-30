@@ -3,6 +3,28 @@
 
 /* Public C-only entry point for native HexLab plugin modules. */
 #include "hexlab/plugins/plugin_abi.h"
+#include <string.h>
+
+/* Check an optional append-only ABI field without evaluating table more than
+   once. The field's offset/size come from the caller's compile-time header;
+   struct_size is copied from the runtime table and compared with overflow-safe
+   arithmetic. All HexLab versioned tables expose struct_size at a fixed offset. */
+static inline int hexlab_plugin_field_available(const void* table,
+                                                size_t struct_size_offset,
+                                                size_t field_offset,
+                                                size_t field_size) {
+    if (!table || struct_size_offset > (size_t)-1 - sizeof(uint32_t)) return 0;
+    uint32_t available_size = 0;
+    memcpy(&available_size, (const unsigned char*)table + struct_size_offset,
+           sizeof(available_size));
+    if ((size_t)available_size < field_offset) return 0;
+    return field_size <= (size_t)available_size - field_offset;
+}
+
+#define HEXLAB_PLUGIN_HAS_FIELD(table_, table_type_, field_) \
+    hexlab_plugin_field_available((table_), offsetof(table_type_, struct_size), \
+                                  offsetof(table_type_, field_), \
+                                  sizeof(((table_type_*)0)->field_))
 
 #if defined(_WIN32)
 #  define HEXLAB_PLUGIN_EXPORT __declspec(dllexport)

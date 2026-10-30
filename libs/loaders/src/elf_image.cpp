@@ -1,4 +1,5 @@
 #include "elf_internal.hpp"
+#include "hexlab/image/byte_storage.hpp"
 #include <algorithm>
 #include <array>
 #include <map>
@@ -283,6 +284,28 @@ Result<LoadedImage> load_elf(std::shared_ptr<const ByteStorage> storage, const E
     try {
         canceled(stop);
         require(bool(storage), "ELF loading requires storage", ErrorCode::invalid_argument);
+        std::vector<ExternalAnalysisInput> resolver_inputs;
+        const auto collect_inputs = [&](const auto &manifest, bool has_resolver, bool has_identity,
+                                        std::string_view family) {
+            if (!manifest) return;
+            require(has_resolver && has_identity,
+                "An ELF resolver input manifest requires its callback and stable identity", ErrorCode::invalid_argument);
+            require(manifest->size() <= options.dwarf_resolver_input_limits.inputs - resolver_inputs.size(),
+                "ELF resolver manifests exceed the combined input limit", ErrorCode::resource_limit);
+            for (const auto &input : *manifest) {
+                canceled(stop);
+                require(!input.identity.empty() && input.identity.size() <= 4096,
+                    "ELF resolver input requires a bounded nonempty identity", ErrorCode::invalid_argument);
+                resolver_inputs.push_back({std::string(family) + input.identity, input.storage});
+            }
+        };
+        collect_inputs(options.dwarf_split_resolver_inputs, bool(options.dwarf_split_resolver),
+            options.dwarf_split_resolver_identity.has_value(), "split/");
+        collect_inputs(options.dwarf_supplementary_resolver_inputs, bool(options.dwarf_supplementary_resolver),
+            options.dwarf_supplementary_resolver_identity.has_value(), "supplementary/");
+        std::optional<ExternalInputManifest> resolver_manifest;
+        if (options.dwarf_split_resolver_inputs || options.dwarf_supplementary_resolver_inputs)
+            resolver_manifest = take(fingerprint_external_inputs(resolver_inputs, options.dwarf_resolver_input_limits, stop));
         auto tracking = take(TrackingStorage::create(storage));
         ElfMetadata elf;
         elf.header = take(read_elf_header(*tracking, stop));
@@ -405,6 +428,9 @@ Result<LoadedImage> load_elf(std::shared_ptr<const ByteStorage> storage, const E
             auto line_result = read_source_lines(*tracking, elf, budget, stop);
             if (!line_result)
                 partial("DWARF line information unavailable: " + line_result.error().message);
+            auto macro_result = read_dwarf_macros(*tracking, elf, budget, stop);
+            if (!macro_result)
+                partial("DWARF macro information unavailable: " + macro_result.error().message);
             auto dwarf_result = read_dwarf_info(*tracking, elf, budget, stop, options.dwarf_split_resolver,
                                                  options.dwarf_supplementary_resolver,
                                                  options.dwarf_supplementary_max_bytes,
@@ -461,7 +487,72 @@ Result<LoadedImage> load_elf(std::shared_ptr<const ByteStorage> storage, const E
                      {}});
         }
         loaded.metadata_reads = tracking->reads();
-        loaded.metadata_reads_complete = true;
+        // This read set certifies primary-input dependencies. Selected package
+        // storages are content-fingerprinted below; callback dependencies are
+        // certified only when the caller supplied a complete byte manifest.
+        // Their external fingerprint changes the analysis key independently
+        // of primary-file range invalidation.
+        loaded.metadata_reads_complete =
+            (!options.dwarf_split_resolver || options.dwarf_split_resolver_inputs.has_value()) &&
+            (!options.dwarf_supplementary_resolver || options.dwarf_supplementary_resolver_inputs.has_value());
+        loaded.external_inputs_certified =
+            (!options.dwarf_split_resolver || options.dwarf_split_resolver_identity.has_value()) &&
+            (!options.dwarf_supplementary_resolver || options.dwarf_supplementary_resolver_identity.has_value());
+        // A selected split-DWARF package is an external metadata dependency.
+        // Keep its full content identity with the loaded image so incremental
+        // analysis keys change when the package changes in place.
+        if (options.dwarf_split_debug_package) {
+            auto fingerprint = hash_source(*options.dwarf_split_debug_package, stop);
+            if (!fingerprint)
+                return fingerprint.error();
+            loaded.external_input_fingerprint = fingerprint.value();
+        }
+        // Direct ElfLoadOptions callers need the selected supplementary
+        // package identity too; durable recipe loading may add its own domain.
+        if (options.dwarf_supplementary_package) {
+            require(options.dwarf_supplementary_package->size() <= options.dwarf_supplementary_max_bytes,
+                "ELF supplementary package exceeds its byte limit", ErrorCode::resource_limit);
+            const auto fingerprint = take(hash_source(*options.dwarf_supplementary_package, stop));
+            Sha256 combined;
+            constexpr std::string_view package_domain = "HexLab/ELF-selected-supplementary-input/v1";
+            take(combined.update(std::as_bytes(std::span(package_domain.data(), package_domain.size()))));
+            if (loaded.external_input_fingerprint) take(combined.update(*loaded.external_input_fingerprint));
+            take(combined.update(fingerprint));
+            loaded.external_input_fingerprint = combined.digest();
+        }
+        if (resolver_manifest) {
+            const auto after = take(fingerprint_external_inputs(resolver_inputs, options.dwarf_resolver_input_limits, stop));
+            require(after.fingerprint == resolver_manifest->fingerprint,
+                "ELF resolver byte inputs changed during metadata parsing", ErrorCode::conflict);
+            loaded.external_input_dependencies = resolver_manifest->dependencies;
+        }
+        if (options.dwarf_split_resolver_identity || options.dwarf_supplementary_resolver_identity) {
+            Sha256 resolver_hash;
+            constexpr std::string_view resolver_domain = "HexLab/ELF-DWARF-resolvers/v1";
+            take(resolver_hash.update(std::as_bytes(std::span(resolver_domain.data(), resolver_domain.size()))));
+            const std::byte split_tag{1}, supplementary_tag{2};
+            if (options.dwarf_split_resolver_identity) {
+                take(resolver_hash.update(std::span(&split_tag, 1)));
+                take(resolver_hash.update(*options.dwarf_split_resolver_identity));
+            }
+            if (options.dwarf_supplementary_resolver_identity) {
+                take(resolver_hash.update(std::span(&supplementary_tag, 1)));
+                take(resolver_hash.update(*options.dwarf_supplementary_resolver_identity));
+            }
+            if (resolver_manifest) {
+                const std::array<std::byte, 3> manifest_tag{std::byte{3},
+                    std::byte{static_cast<unsigned char>(options.dwarf_split_resolver_inputs.has_value())},
+                    std::byte{static_cast<unsigned char>(options.dwarf_supplementary_resolver_inputs.has_value())}};
+                take(resolver_hash.update(manifest_tag));
+                take(resolver_hash.update(resolver_manifest->fingerprint));
+            }
+            Sha256 combined;
+            constexpr std::string_view combined_domain = "HexLab/ELF-external-inputs/v1";
+            take(combined.update(std::as_bytes(std::span(combined_domain.data(), combined_domain.size()))));
+            if (loaded.external_input_fingerprint) take(combined.update(*loaded.external_input_fingerprint));
+            take(combined.update(resolver_hash.digest()));
+            loaded.external_input_fingerprint = combined.digest();
+        }
         canceled(stop);
         return loaded;
     } catch (const Failure &failure) {

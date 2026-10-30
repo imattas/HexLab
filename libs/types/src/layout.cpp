@@ -35,6 +35,7 @@ bool align_up(std::uint64_t value, std::uint64_t alignment, std::uint64_t &resul
 struct Calculator {
     Abi abi;
     std::uint64_t alignment_limit;
+    BitfieldLayoutPolicy bitfield_policy;
     const NamedTypeResolver &resolve_named_type;
     std::unordered_set<const Type *> active;
     std::unordered_set<std::string> active_names;
@@ -97,9 +98,11 @@ struct Calculator {
             auto element = calculate(*type.element());
             if (!element)
                 return element.error();
-            if (element.value().size > std::numeric_limits<std::uint64_t>::max() / type.count())
+            const auto stride = type.array_stride() ? type.array_stride() : element.value().size;
+            if (stride < element.value().size || type.count() - 1 >
+                (std::numeric_limits<std::uint64_t>::max() - element.value().size) / stride)
                 return overflow("array size overflows 64-bit layout");
-            result.size = element.value().size * type.count();
+            result.size = (type.count() - 1) * stride + element.value().size;
             result.alignment = element.value().alignment;
             return result;
         }
@@ -122,6 +125,13 @@ struct Calculator {
             std::optional<std::uint64_t> bitfield_source_offset;
             std::uint64_t bitfield_storage_size = 0;
             std::uint64_t bitfield_layout_offset = 0;
+            struct MicrosoftBitfieldUnit {
+                std::uint64_t size = 0;
+                std::uint64_t alignment = 1;
+                std::uint64_t offset = 0;
+                std::uint64_t used = 0;
+            };
+            std::optional<MicrosoftBitfieldUnit> microsoft_bitfield_unit;
             result.members.reserve(type.members().size());
             for (const auto &member : type.members()) {
                 if (member.virtual_base)
@@ -156,12 +166,16 @@ struct Calculator {
                 std::uint64_t offset = 0;
                 if (member.bit_width && *member.bit_width == 0) {
                     // A zero-width unnamed bitfield has no occupied bits, but
-                    // ends the current allocation unit and places the next
-                    // member at this declared type boundary. Its source byte
-                    // offset remains available in the immutable type record;
-                    // layout recomputes the boundary from the selected pack.
-                    if (!align_up(cursor, member_alignment, offset))
+                    // ends the current allocation unit. In recorded mode its
+                    // byte offset is explicit source metadata; inferring a new
+                    // allocation-unit boundary would require target rules.
+                    if (bitfield_policy == BitfieldLayoutPolicy::recorded) {
+                        offset = member.offset;
+                        if (offset < cursor)
+                            return unsupported("recorded zero-width bitfield boundary precedes occupied structure data");
+                    } else if (!align_up(cursor, member_alignment, offset)) {
                         return overflow("zero-width bitfield barrier offset overflows 64-bit layout");
+                    }
                     if (offset > cursor)
                         result.padding.push_back({cursor, offset - cursor});
                     result.members.push_back({member.name, offset, 0, member_alignment,
@@ -169,9 +183,74 @@ struct Calculator {
                     cursor = offset;
                     bitfield_source_offset.reset();
                     bitfield_storage_size = 0;
+                    microsoft_bitfield_unit.reset();
                     aggregate_alignment = std::max(aggregate_alignment, member_alignment);
                     continue;
                 }
+                if (member.bit_width && (bitfield_policy == BitfieldLayoutPolicy::microsoft ||
+                                         bitfield_policy == BitfieldLayoutPolicy::itanium)) {
+                    if (child.value().size != 1 && child.value().size != 2 && child.value().size != 4 &&
+                        (bitfield_policy == BitfieldLayoutPolicy::microsoft || child.value().size != 8))
+                        return unsupported(bitfield_policy == BitfieldLayoutPolicy::microsoft
+                            ? "Microsoft bitfield layout supports only 1-, 2-, and 4-byte allocation units"
+                            : "Itanium bitfield layout supports only 1-, 2-, 4-, and 8-byte allocation units");
+                    const auto storage_bits = child.value().size * 8;
+                    const auto width = static_cast<std::uint64_t>(*member.bit_width);
+                    if (!width || width > storage_bits)
+                        return unsupported("bitfield width does not fit its allocation unit");
+                    const bool can_share = microsoft_bitfield_unit &&
+                        microsoft_bitfield_unit->size == child.value().size &&
+                        microsoft_bitfield_unit->alignment == member_alignment &&
+                        width <= storage_bits - microsoft_bitfield_unit->used;
+                    std::uint32_t bit_offset = 0;
+                    if (can_share) {
+                        offset = microsoft_bitfield_unit->offset;
+                        bit_offset = static_cast<std::uint32_t>(microsoft_bitfield_unit->used);
+                        microsoft_bitfield_unit->used += width;
+                    } else {
+                        if (!align_up(cursor, member_alignment, offset))
+                            return overflow("Microsoft bitfield allocation offset overflows 64-bit layout");
+                        if (offset > cursor)
+                            result.padding.push_back({cursor, offset - cursor});
+                        if (child.value().size > std::numeric_limits<std::uint64_t>::max() - offset)
+                            return overflow("Microsoft bitfield allocation extent overflows 64-bit layout");
+                        cursor = offset + child.value().size;
+                        microsoft_bitfield_unit = MicrosoftBitfieldUnit{
+                            child.value().size, member_alignment, offset, width};
+                    }
+                    result.members.push_back({member.name, offset, child.value().size, member_alignment,
+                                              member.bit_width, bit_offset, false});
+                    aggregate_alignment = std::max(aggregate_alignment, member_alignment);
+                    continue;
+                }
+                if (member.bit_width && bitfield_policy == BitfieldLayoutPolicy::recorded) {
+                    // The immutable record carries both the allocation-unit
+                    // byte offset and the LSB-relative bit range. Honor those
+                    // coordinates directly; do not infer compiler allocation
+                    // units from the selected architecture.
+                    offset = member.offset;
+                    const bool shares_recorded_unit = bitfield_source_offset &&
+                        *bitfield_source_offset == member.offset &&
+                        bitfield_storage_size == child.value().size;
+                    if (!shares_recorded_unit) {
+                        if (offset < cursor)
+                            return unsupported("recorded bitfield allocation unit overlaps preceding structure data");
+                        if (offset > cursor)
+                            result.padding.push_back({cursor, offset - cursor});
+                        if (child.value().size > std::numeric_limits<std::uint64_t>::max() - offset)
+                            return overflow("recorded bitfield allocation extent overflows 64-bit layout");
+                        cursor = offset + child.value().size;
+                        bitfield_layout_offset = offset;
+                    }
+                    result.members.push_back({member.name, offset, child.value().size, member_alignment,
+                                              member.bit_width, member.bit_offset, false});
+                    bitfield_source_offset = member.offset;
+                    bitfield_storage_size = child.value().size;
+                    aggregate_alignment = std::max(aggregate_alignment, member_alignment);
+                    continue;
+                }
+                if (!member.bit_width)
+                    microsoft_bitfield_unit.reset();
                 const bool shares_bitfield_unit = member.bit_width && bitfield_source_offset &&
                     *bitfield_source_offset == member.offset && bitfield_storage_size == child.value().size;
                 if (shares_bitfield_unit) {
@@ -233,8 +312,20 @@ struct Calculator {
                 const auto member_size = member.bit_width && *member.bit_width == 0 ? 0 : child.value().size;
                 maximum_size = std::max(maximum_size, member_size);
                 aggregate_alignment = std::max(aggregate_alignment, member_alignment);
+                if (member.bit_width && (bitfield_policy == BitfieldLayoutPolicy::microsoft ||
+                                         bitfield_policy == BitfieldLayoutPolicy::itanium) &&
+                    *member.bit_width > 0 && child.value().size != 1 && child.value().size != 2 &&
+                    child.value().size != 4 &&
+                    (bitfield_policy == BitfieldLayoutPolicy::microsoft || child.value().size != 8))
+                    return unsupported(bitfield_policy == BitfieldLayoutPolicy::microsoft
+                        ? "Microsoft bitfield layout supports only 1-, 2-, and 4-byte allocation units"
+                        : "Itanium bitfield layout supports only 1-, 2-, 4-, and 8-byte allocation units");
                 result.members.push_back({member.name, 0, member_size, member_alignment,
-                                          member.bit_width, member.bit_offset, false});
+                                          member.bit_width,
+                                          member.bit_width && (bitfield_policy == BitfieldLayoutPolicy::microsoft ||
+                                                               bitfield_policy == BitfieldLayoutPolicy::itanium)
+                                              ? std::optional<std::uint32_t>{0} : member.bit_offset,
+                                          false});
             }
             aggregate_alignment = std::max(aggregate_alignment, type.alignment());
             if (!align_up(maximum_size, aggregate_alignment, result.size))
@@ -287,7 +378,11 @@ hexlab::Result<TypeLayout> layout(const Type &type, Abi abi, LayoutOptions optio
         return Error{ErrorCode::invalid_argument, "maximum member alignment must be a power of two no greater than 16"};
     const auto abi_cap = maximum_alignment(abi);
     const auto alignment_limit = pack ? std::min(pack, abi_cap) : abi_cap;
-    return Calculator{abi, alignment_limit, options.resolve_named_type}.calculate(type);
+    if (options.bitfield_policy != BitfieldLayoutPolicy::recorded &&
+        options.bitfield_policy != BitfieldLayoutPolicy::microsoft &&
+        options.bitfield_policy != BitfieldLayoutPolicy::itanium)
+        return Error{ErrorCode::invalid_argument, "unknown bitfield layout policy"};
+    return Calculator{abi, alignment_limit, options.bitfield_policy, options.resolve_named_type}.calculate(type);
 }
 
 } // namespace hexlab::types

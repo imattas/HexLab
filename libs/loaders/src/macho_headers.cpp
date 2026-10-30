@@ -87,6 +87,8 @@ MachOHeader header(const ByteStorage &storage, const MachOSlice &slice, Budget &
     out.command_bytes = value(20);
     out.flags = value(24);
     out.reserved = kind.wide ? value(28) : 0;
+    require(!kind.wide || out.reserved == 0,
+            "Mach-O 64-bit header reserved field is nonzero");
     require(out.command_count <= 65536 && out.command_count <= 1048576 - budget.commands,
             "Mach-O command count exceeds budget", ErrorCode::resource_limit);
     require(out.command_bytes <= slice.size - size, "Mach-O command extent crosses slice boundary");
@@ -156,6 +158,8 @@ Result<MachOContainer> read_macho_container(const ByteStorage &storage, std::sto
             slice.size = value(kind.wide ? 16 : 12, kind.wide ? 8 : 4);
             slice.alignment = static_cast<std::uint32_t>(value(kind.wide ? 24 : 16, 4));
             slice.reserved = kind.wide ? static_cast<std::uint32_t>(value(28, 4)) : 0;
+            require(!kind.wide || slice.reserved == 0,
+                    "Mach-O FAT64 descriptor reserved field is nonzero");
             require(slice.alignment < 64, "Mach-O slice alignment exponent overflows");
             require(slice.offset % (UINT64_C(1) << slice.alignment) == 0, "Misaligned Mach-O universal slice");
             require(slice.offset >= table_end && slice.offset <= storage.size() && slice.size >= 28 &&

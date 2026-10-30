@@ -20,6 +20,11 @@ the normal debug event stream. A target or stub must support the applicable
 platform operation; an interrupt request is not proof that the target has
 stopped until an event is received.
 
+`wait_event` accepts zero as a nonblocking poll and rejects negative timeout
+durations before calling a backend. This keeps timeout behavior consistent
+across native and remote backends and leaves pending interrupt/session state
+untouched when the caller supplies an invalid duration.
+
 `debugger` tests verify session state and duplicate/pending-event guards.
 `debugger_remote` verifies the raw Ctrl-C wire byte and exercises a complete
 remote-session resume, interrupt, asynchronous stop, and event transition.

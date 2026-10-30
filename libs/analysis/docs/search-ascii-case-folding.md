@@ -2,12 +2,14 @@
 
 `TextQuery::case_sensitive` controls ASCII-only case matching. When false,
 ASCII letters in the query match either uppercase or lowercase in the selected
-encoding. This applies to ASCII bytes embedded in UTF-8, UTF-16LE/BE, and
-UTF-32LE/BE encodings.
+encoding. This applies to ASCII bytes embedded in UTF-8, UTF-16LE/BE,
+UTF-32LE/BE, and Windows-1252 encodings.
 
 Non-ASCII Unicode scalars remain exact byte encodings; the search does not
 perform Unicode case folding, normalization, locale rules, or multi-scalar
-case expansions. The query still uses the ordinary bounded streaming byte
+case expansions. Windows-1252 queries must be representable in that code page;
+undefined byte positions and unmappable characters are rejected. The query
+still uses the ordinary bounded streaming byte
 search, so continuation cursors, page limits, effective patched bytes, and
 address mapping have the same behavior as case-sensitive text search.
 

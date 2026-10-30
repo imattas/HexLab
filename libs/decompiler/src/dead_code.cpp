@@ -1,8 +1,10 @@
 #include "hexlab/decompiler/decompiler.hpp"
 
 #include <algorithm>
+#include <array>
 #include <map>
 #include <set>
+#include <string_view>
 #include <tuple>
 #include <type_traits>
 
@@ -14,14 +16,35 @@ Key key(RegisterOperand reg, std::uint32_t version) {
     return {static_cast<unsigned>(reg.bank), reg.index, reg.width, reg.high_byte, version};
 }
 
+bool bitvector_type(ValueType type) {
+    return (type.kind == TypeKind::integer || type.kind == TypeKind::boolean) &&
+           type.bits > 0 && type.bits <= 64;
+}
+
 bool pure(const ExpressionPtr &expression) {
-    if (!expression) return true;
-    return std::visit([](const auto &value) {
+    if (!expression) return false;
+    return std::visit([&](const auto &value) {
         using T = std::decay_t<decltype(value)>;
         if constexpr (std::is_same_v<T, RegisterValue> || std::is_same_v<T, ConstantValue> ||
                       std::is_same_v<T, X87Binary80Value>) return true;
-        else if constexpr (std::is_same_v<T, UnaryValue>) return pure(value.operand);
-        else if constexpr (std::is_same_v<T, BinaryValue>) return pure(value.left) && pure(value.right);
+        else if constexpr (std::is_same_v<T, UnaryValue>) {
+            static constexpr std::array<std::string_view, 6> total_unary{
+                "neg", "bitnot", "not", "sext", "zext", "trunc32"};
+            return bitvector_type(expression->type) && value.operand &&
+                   bitvector_type(value.operand->type) &&
+                   std::find(total_unary.begin(), total_unary.end(), value.operation) != total_unary.end() &&
+                   pure(value.operand);
+        } else if constexpr (std::is_same_v<T, BinaryValue>) {
+            static constexpr std::array<std::string_view, 22> total_binary{
+                "add", "sub", "mul", "and", "or", "xor", "shl", "shr", "sar", "lshr",
+                "rotl", "rotr", "eq", "ne", "ult", "ule", "ugt", "uge", "slt", "sle",
+                "sgt", "sge"};
+            if (!bitvector_type(expression->type) || !value.left || !value.right ||
+                !bitvector_type(value.left->type) || !bitvector_type(value.right->type)) return false;
+            return
+                   std::find(total_binary.begin(), total_binary.end(), value.operation) != total_binary.end() &&
+                   pure(value.left) && pure(value.right);
+        }
         else return false;
     }, expression->value);
 }

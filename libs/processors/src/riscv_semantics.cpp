@@ -1,6 +1,7 @@
 #include "hexlab/processors/riscv_semantics.hpp"
 #include <algorithm>
 #include <bit>
+#include <limits>
 
 namespace hexlab {
 namespace {
@@ -16,6 +17,75 @@ std::uint64_t multiply_high_unsigned(std::uint64_t a, std::uint64_t b) noexcept 
     const std::uint64_t p10 = std::uint64_t{a1} * b0;
     const std::uint64_t middle = (p00 >> 32) + static_cast<std::uint32_t>(p01) + static_cast<std::uint32_t>(p10);
     return std::uint64_t{a1} * b1 + (p01 >> 32) + (p10 >> 32) + (middle >> 32);
+}
+
+std::optional<RiscvCsrResult> evaluate_riscv_csr_instruction_impl(
+    const RiscvInstruction &instruction, unsigned xlen, std::uint64_t old_csr,
+    std::uint64_t source_value) noexcept {
+    if ((xlen != 32 && xlen != 64) || instruction.length != 4 ||
+        instruction.flow != RiscvFlow::fallthrough || instruction.memory_read || instruction.memory_write ||
+        instruction.operands.size() != 3 || instruction.access.size() != 3 ||
+        instruction.access[0] != RiscvOperandAccess::write ||
+        instruction.access[2] != RiscvOperandAccess::read)
+        return std::nullopt;
+    bool immediate = false;
+    switch (instruction.opcode) {
+    case RiscvOpcode::csrrw: case RiscvOpcode::csrrs: case RiscvOpcode::csrrc: break;
+    case RiscvOpcode::csrrwi: case RiscvOpcode::csrrsi: case RiscvOpcode::csrrci: immediate = true; break;
+    default: return std::nullopt;
+    }
+    const auto *rd = std::get_if<RiscvRegister>(&instruction.operands[0]);
+    const auto *csr = std::get_if<RiscvImmediate>(&instruction.operands[1]);
+    if (!rd || rd->index > 31 || rd->floating_point || rd->vector || !csr || csr->encoded_width != 12 ||
+        csr->is_signed || csr->value < 0 || csr->value > 0xfff)
+        return std::nullopt;
+    bool source_zero = false;
+    if (immediate) {
+        const auto *zimm = std::get_if<RiscvImmediate>(&instruction.operands[2]);
+        if (!zimm || zimm->encoded_width != 5 || zimm->is_signed || zimm->value < 0 || zimm->value > 31)
+            return std::nullopt;
+        source_value = static_cast<std::uint64_t>(zimm->value);
+        source_zero = source_value == 0;
+    } else {
+        const auto *rs1 = std::get_if<RiscvRegister>(&instruction.operands[2]);
+        if (!rs1 || rs1->index > 31 || rs1->floating_point || rs1->vector)
+            return std::nullopt;
+        source_zero = rs1->index == 0;
+        if (!source_zero && std::find(instruction.register_reads.begin(), instruction.register_reads.end(), *rs1) ==
+                                instruction.register_reads.end())
+            return std::nullopt;
+        if (source_zero) source_value = 0;
+    }
+    const bool csrrw = instruction.opcode == RiscvOpcode::csrrw || instruction.opcode == RiscvOpcode::csrrwi;
+    const bool expected_read = csrrw ? rd->index != 0 : true;
+    const bool expected_write = csrrw || !source_zero;
+    const auto expected_csr_access = expected_read ? expected_write ? RiscvOperandAccess::read_write
+                                                                  : RiscvOperandAccess::read
+                                                    : RiscvOperandAccess::write;
+    if (instruction.access[1] != expected_csr_access || instruction.csr_read != expected_read ||
+        instruction.csr_write != expected_write)
+        return std::nullopt;
+    if (rd->index != 0 && std::find(instruction.register_writes.begin(), instruction.register_writes.end(), *rd) ==
+                              instruction.register_writes.end())
+        return std::nullopt;
+    const auto mask = width_mask(xlen);
+    old_csr &= mask;
+    source_value &= mask;
+    RiscvCsrResult result{};
+    result.writes_rd = rd->index != 0 && expected_read;
+    result.rd_value = result.writes_rd ? old_csr : 0;
+    result.writes_csr = expected_write;
+    result.csr_value = old_csr;
+    if (expected_write) {
+        switch (instruction.opcode) {
+        case RiscvOpcode::csrrw: case RiscvOpcode::csrrwi: result.csr_value = source_value; break;
+        case RiscvOpcode::csrrs: case RiscvOpcode::csrrsi: result.csr_value = old_csr | source_value; break;
+        case RiscvOpcode::csrrc: case RiscvOpcode::csrrci: result.csr_value = old_csr & ~source_value; break;
+        default: return std::nullopt;
+        }
+        result.csr_value &= mask;
+    }
+    return result;
 }
 
 bool negative(std::uint64_t value, unsigned bits) noexcept {
@@ -77,6 +147,31 @@ std::uint64_t multiply_high(std::uint64_t a, std::uint64_t b, unsigned bits, boo
 }
 } // namespace
 
+std::optional<RiscvCsrResult> evaluate_riscv_csr_instruction(
+    const RiscvInstruction &instruction, unsigned xlen, std::uint64_t old_csr,
+    std::uint64_t source_value) noexcept {
+    return evaluate_riscv_csr_instruction_impl(instruction, xlen, old_csr, source_value);
+}
+
+std::optional<RiscvCsrPrivilegeCheck> check_riscv_csr_privilege(
+    const RiscvInstruction &instruction, unsigned xlen,
+    RiscvPrivilegeMode current_privilege) noexcept {
+    if (static_cast<unsigned>(current_privilege) >
+        static_cast<unsigned>(RiscvPrivilegeMode::machine))
+        return {};
+    // Reuse the semantic adapter's structural validation without changing
+    // state; caller-provided values are irrelevant to access privilege.
+    if (!evaluate_riscv_csr_instruction(instruction, xlen, 0, 0))
+        return {};
+    const auto *csr = std::get_if<RiscvImmediate>(&instruction.operands[1]);
+    if (!csr || (instruction.csr_write && ((static_cast<unsigned>(csr->value) >> 10) & 3u) == 3u))
+        return {};
+    const auto required = static_cast<RiscvPrivilegeMode>(
+        (static_cast<unsigned>(csr->value) >> 8) & 3u);
+    return RiscvCsrPrivilegeCheck{required,
+        static_cast<unsigned>(current_privilege) >= static_cast<unsigned>(required)};
+}
+
 std::optional<std::uint64_t> evaluate_riscv_m_operation(RiscvOpcode opcode, unsigned xlen, std::uint64_t lhs,
                                                         std::uint64_t rhs) noexcept {
     if (xlen != 32 && xlen != 64)
@@ -115,6 +210,466 @@ std::optional<std::uint64_t> evaluate_riscv_m_operation(RiscvOpcode opcode, unsi
     }
 }
 
+std::optional<RiscvAmoResult> evaluate_riscv_amo_instruction(
+    const RiscvInstruction &instruction, unsigned xlen, std::uint64_t old_memory,
+    std::uint64_t source_value) noexcept {
+    enum class Operation { swap, add, bit_xor, bit_and, bit_or, min_signed, max_signed, min_unsigned, max_unsigned };
+    Operation operation{};
+    bool word = false;
+    switch (instruction.opcode) {
+    case RiscvOpcode::amoswap_w: operation = Operation::swap; word = true; break;
+    case RiscvOpcode::amoadd_w: operation = Operation::add; word = true; break;
+    case RiscvOpcode::amoxor_w: operation = Operation::bit_xor; word = true; break;
+    case RiscvOpcode::amoand_w: operation = Operation::bit_and; word = true; break;
+    case RiscvOpcode::amoor_w: operation = Operation::bit_or; word = true; break;
+    case RiscvOpcode::amomin_w: operation = Operation::min_signed; word = true; break;
+    case RiscvOpcode::amomax_w: operation = Operation::max_signed; word = true; break;
+    case RiscvOpcode::amominu_w: operation = Operation::min_unsigned; word = true; break;
+    case RiscvOpcode::amomaxu_w: operation = Operation::max_unsigned; word = true; break;
+    case RiscvOpcode::amoswap_d: operation = Operation::swap; break;
+    case RiscvOpcode::amoadd_d: operation = Operation::add; break;
+    case RiscvOpcode::amoxor_d: operation = Operation::bit_xor; break;
+    case RiscvOpcode::amoand_d: operation = Operation::bit_and; break;
+    case RiscvOpcode::amoor_d: operation = Operation::bit_or; break;
+    case RiscvOpcode::amomin_d: operation = Operation::min_signed; break;
+    case RiscvOpcode::amomax_d: operation = Operation::max_signed; break;
+    case RiscvOpcode::amominu_d: operation = Operation::min_unsigned; break;
+    case RiscvOpcode::amomaxu_d: operation = Operation::max_unsigned; break;
+    default: return {};
+    }
+    if ((xlen != 32 && xlen != 64) || (!word && xlen != 64) || instruction.length != 4 ||
+        (std::to_integer<std::uint8_t>(instruction.bytes[0]) & 0x7fu) != 0x2fu ||
+        instruction.flow != RiscvFlow::fallthrough || !instruction.memory_read || !instruction.memory_write ||
+        instruction.operands.size() != 3 || instruction.access.size() != 3 ||
+        instruction.access[0] != RiscvOperandAccess::write ||
+        instruction.access[1] != RiscvOperandAccess::read ||
+        instruction.access[2] != RiscvOperandAccess::read_write)
+        return {};
+    const auto *rd = std::get_if<RiscvRegister>(&instruction.operands[0]);
+    const auto *rs2 = std::get_if<RiscvRegister>(&instruction.operands[1]);
+    const auto *memory = std::get_if<RiscvMemory>(&instruction.operands[2]);
+    if (!rd || !rs2 || !memory || rd->index > 31 || rs2->index > 31 ||
+        rd->floating_point || rd->vector || rd->vector_configuration ||
+        rs2->floating_point || rs2->vector || rs2->vector_configuration ||
+        memory->base.index > 31 || memory->base.floating_point || memory->base.vector ||
+        memory->base.vector_configuration || memory->displacement != 0 ||
+        memory->width != (word ? 32 : 64) || memory->sign_extend != word)
+        return {};
+    const auto has_register = [](const std::vector<RiscvRegister> &registers, RiscvRegister value) {
+        return std::find(registers.begin(), registers.end(), value) != registers.end();
+    };
+    if ((rd->index != 0 && !has_register(instruction.register_writes, *rd)) ||
+        (rs2->index != 0 && !has_register(instruction.register_reads, *rs2)) ||
+        (memory->base.index != 0 && !has_register(instruction.register_reads, memory->base)))
+        return {};
+
+    const unsigned width = word ? 32u : 64u;
+    const auto mask = width_mask(width);
+    const auto old_value = old_memory & mask;
+    const auto source = source_value & mask;
+    std::uint64_t next = 0;
+    switch (operation) {
+    case Operation::swap: next = source; break;
+    case Operation::add: next = (old_value + source) & mask; break;
+    case Operation::bit_xor: next = old_value ^ source; break;
+    case Operation::bit_and: next = old_value & source; break;
+    case Operation::bit_or: next = old_value | source; break;
+    case Operation::min_unsigned: next = std::min(old_value, source); break;
+    case Operation::max_unsigned: next = std::max(old_value, source); break;
+    case Operation::min_signed:
+    case Operation::max_signed: {
+        const auto sign = UINT64_C(1) << (width - 1);
+        const bool old_less = (old_value ^ sign) < (source ^ sign);
+        next = (operation == Operation::min_signed ? old_less : !old_less) ? old_value : source;
+        break;
+    }
+    }
+    const auto rd_value = word && xlen == 64 ? sign_extend_32(static_cast<std::uint32_t>(old_value)) : old_value;
+    return RiscvAmoResult{rd_value, next & mask, static_cast<std::uint8_t>(width), rd->index != 0};
+}
+
+std::optional<bool> evaluate_riscv_branch_predicate(RiscvOpcode opcode, unsigned xlen,
+                                                     std::uint64_t lhs, std::uint64_t rhs) noexcept {
+    if (xlen != 32 && xlen != 64) return {};
+    const auto mask = width_mask(xlen);
+    lhs &= mask;
+    rhs &= mask;
+    switch (opcode) {
+    case RiscvOpcode::beq: return lhs == rhs;
+    case RiscvOpcode::bne: return lhs != rhs;
+    case RiscvOpcode::bltu: return lhs < rhs;
+    case RiscvOpcode::bgeu: return lhs >= rhs;
+    case RiscvOpcode::blt:
+    case RiscvOpcode::bge: {
+        const auto sign = UINT64_C(1) << (xlen - 1);
+        const bool less = (lhs ^ sign) < (rhs ^ sign);
+        return opcode == RiscvOpcode::blt ? less : !less;
+    }
+    default: return {};
+    }
+}
+
+std::optional<bool> evaluate_riscv_branch_predicate_instruction(const RiscvInstruction &instruction,
+                                                                unsigned xlen, std::uint64_t lhs,
+                                                                std::uint64_t rhs) noexcept {
+    if ((instruction.length != 2 && instruction.length != 4) ||
+        instruction.flow != RiscvFlow::conditional_branch || instruction.memory_read || instruction.memory_write ||
+        instruction.operands.size() != 3 || instruction.access.size() != 3 ||
+        instruction.access[0] != RiscvOperandAccess::read || instruction.access[1] != RiscvOperandAccess::read ||
+        instruction.access[2] != RiscvOperandAccess::read)
+        return {};
+    const auto *left = std::get_if<RiscvRegister>(&instruction.operands[0]);
+    const auto *right = std::get_if<RiscvRegister>(&instruction.operands[1]);
+    if (!left || !right || !std::holds_alternative<RiscvRelative>(instruction.operands[2]) ||
+        left->floating_point || left->vector || left->vector_configuration ||
+        right->floating_point || right->vector || right->vector_configuration)
+        return {};
+    const auto is_gpr_read = [&](const RiscvRegister &reg) {
+        return reg.index == 0 || std::find(instruction.register_reads.begin(), instruction.register_reads.end(), reg) !=
+                                     instruction.register_reads.end();
+    };
+    if (!is_gpr_read(*left) || !is_gpr_read(*right)) return {};
+    if (left->index == 0) lhs = 0;
+    if (right->index == 0) rhs = 0;
+    return evaluate_riscv_branch_predicate(instruction.opcode, xlen, lhs, rhs);
+}
+
+std::optional<RiscvIndirectJumpResult>
+evaluate_riscv_jalr_instruction(const RiscvInstruction &instruction, unsigned xlen,
+                                std::uint64_t base_value) noexcept {
+    if ((xlen != 32 && xlen != 64) || instruction.opcode != RiscvOpcode::jalr ||
+        (instruction.length != 2 && instruction.length != 4) ||
+        (instruction.flow != RiscvFlow::call && instruction.flow != RiscvFlow::jump &&
+         instruction.flow != RiscvFlow::ret) || instruction.operands.size() != 2 ||
+        instruction.access.size() != 2 || instruction.access[0] != RiscvOperandAccess::write ||
+        instruction.access[1] != RiscvOperandAccess::address || instruction.memory_read || instruction.memory_write)
+        return {};
+    const auto *destination = std::get_if<RiscvRegister>(&instruction.operands[0]);
+    const auto *address = std::get_if<RiscvMemory>(&instruction.operands[1]);
+    if (!destination || !address || destination->floating_point || destination->vector ||
+        destination->vector_configuration || destination->index >= 32 || address->base.floating_point ||
+        address->base.vector || address->base.vector_configuration || address->base.index >= 32 ||
+        address->width != xlen || (instruction.length == 2 && address->displacement != 0) ||
+        (instruction.length == 4 && (address->displacement < -2048 || address->displacement > 2047)))
+        return {};
+    const auto has = [](const auto &registers, RiscvRegister reg) {
+        return std::find(registers.begin(), registers.end(), reg) != registers.end();
+    };
+    if ((address->base.index != 0 && !has(instruction.register_reads, address->base)) ||
+        (destination->index != 0 && !has(instruction.register_writes, *destination)))
+        return {};
+    const auto mask = width_mask(xlen);
+    if (address->base.index == 0) base_value = 0;
+    const auto target = ((base_value + static_cast<std::uint64_t>(address->displacement)) & mask) & ~UINT64_C(1);
+    const auto link = (instruction.address.offset + instruction.length) & mask;
+    return RiscvIndirectJumpResult{target, link, destination->index != 0};
+}
+
+std::optional<RiscvUpperImmediateResult>
+evaluate_riscv_upper_immediate_instruction(const RiscvInstruction &instruction,
+                                           unsigned xlen) noexcept {
+    if (xlen != 32 && xlen != 64) return {};
+    const bool upper = instruction.opcode == RiscvOpcode::lui;
+    const bool pc_relative = instruction.opcode == RiscvOpcode::auipc;
+    if ((!upper && !pc_relative) || instruction.flow != RiscvFlow::fallthrough ||
+        (instruction.length != 2 && instruction.length != 4) || (pc_relative && instruction.length != 4) ||
+        instruction.memory_read || instruction.memory_write || instruction.operands.size() != 2 ||
+        instruction.access.size() != 2 || instruction.access[0] != RiscvOperandAccess::write ||
+        instruction.access[1] != RiscvOperandAccess::read)
+        return {};
+    const auto *destination = std::get_if<RiscvRegister>(&instruction.operands[0]);
+    const auto *immediate = std::get_if<RiscvImmediate>(&instruction.operands[1]);
+    const auto expected_immediate_width = static_cast<std::uint8_t>(instruction.length == 2 ? 6 : 20);
+    if (!destination || !immediate || destination->floating_point || destination->vector ||
+        destination->vector_configuration || destination->index >= 32 ||
+        immediate->encoded_width != expected_immediate_width || !immediate->is_signed ||
+        (static_cast<std::uint64_t>(immediate->value) & 0xfffu) != 0)
+        return {};
+    const auto has = [](const auto &registers, RiscvRegister reg) {
+        return std::find(registers.begin(), registers.end(), reg) != registers.end();
+    };
+    if (destination->index != 0 && !has(instruction.register_writes, *destination)) return {};
+    const auto mask = width_mask(xlen);
+    const auto immediate_bits = static_cast<std::uint64_t>(immediate->value) & mask;
+    const auto value = (pc_relative ? instruction.address.offset + immediate_bits : immediate_bits) & mask;
+    return RiscvUpperImmediateResult{value, static_cast<std::uint8_t>(xlen), destination->index != 0};
+}
+
+std::optional<std::uint16_t> evaluate_riscv_fclass(RiscvOpcode opcode, std::uint64_t value) noexcept {
+    const bool binary32 = opcode == RiscvOpcode::fclass_s;
+    if (!binary32 && opcode != RiscvOpcode::fclass_d) return {};
+    const unsigned fraction_bits = binary32 ? 23u : 52u;
+    const unsigned exponent_bits = binary32 ? 8u : 11u;
+    if (binary32 && (value >> 32)) return {};
+    const std::uint64_t fraction_mask = (UINT64_C(1) << fraction_bits) - 1;
+    const std::uint64_t exponent_mask = (UINT64_C(1) << exponent_bits) - 1;
+    const bool sign = ((value >> (fraction_bits + exponent_bits)) & 1u) != 0;
+    const auto exponent = (value >> fraction_bits) & exponent_mask;
+    const auto fraction = value & fraction_mask;
+    const auto category = [&](unsigned bit) { return std::optional<std::uint16_t>{static_cast<std::uint16_t>(1u << bit)}; };
+    if (exponent == exponent_mask) {
+        if (!fraction) return category(sign ? 0u : 7u);
+        const bool quiet = (fraction & (UINT64_C(1) << (fraction_bits - 1))) != 0;
+        return category(quiet ? 9u : 8u);
+    }
+    if (!exponent) {
+        if (!fraction) return category(sign ? 3u : 4u);
+        return category(sign ? 2u : 5u);
+    }
+    return category(sign ? 1u : 6u);
+}
+
+std::optional<std::uint16_t>
+evaluate_riscv_fclass_instruction(const RiscvInstruction &instruction, std::uint64_t value) noexcept {
+    if ((instruction.opcode != RiscvOpcode::fclass_s && instruction.opcode != RiscvOpcode::fclass_d) ||
+        instruction.operands.size() != 2 || instruction.access.size() != 2 ||
+        instruction.access[0] != RiscvOperandAccess::write || instruction.access[1] != RiscvOperandAccess::read ||
+        instruction.writes_fflags || instruction.reads_fflags || instruction.reads_frm)
+        return {};
+    const auto *destination = std::get_if<RiscvRegister>(&instruction.operands[0]);
+    const auto *source = std::get_if<RiscvRegister>(&instruction.operands[1]);
+    if (!destination || destination->floating_point || destination->vector || destination->vector_configuration ||
+        !source || !source->floating_point || source->vector || source->vector_configuration ||
+        std::find(instruction.register_reads.begin(), instruction.register_reads.end(), *source) ==
+            instruction.register_reads.end())
+        return {};
+    const bool writes_destination = std::find(instruction.register_writes.begin(),
+        instruction.register_writes.end(), *destination) != instruction.register_writes.end();
+    if (writes_destination != (destination->index != 0)) return {};
+    return evaluate_riscv_fclass(instruction.opcode, value);
+}
+
+std::optional<std::uint64_t> evaluate_riscv_fsgnj_operation(RiscvOpcode opcode, std::uint64_t lhs,
+                                                             std::uint64_t rhs) noexcept {
+    const bool binary32 = opcode == RiscvOpcode::fsgnj_s || opcode == RiscvOpcode::fsgnjn_s ||
+                          opcode == RiscvOpcode::fsgnjx_s;
+    const bool binary64 = opcode == RiscvOpcode::fsgnj_d || opcode == RiscvOpcode::fsgnjn_d ||
+                          opcode == RiscvOpcode::fsgnjx_d;
+    if (!binary32 && !binary64) return {};
+    if (binary32 && ((lhs | rhs) >> 32)) return {};
+    const unsigned sign_bit = binary32 ? 31u : 63u;
+    const std::uint64_t sign_mask = UINT64_C(1) << sign_bit;
+    std::uint64_t sign = rhs & sign_mask;
+    if (opcode == RiscvOpcode::fsgnjn_s || opcode == RiscvOpcode::fsgnjn_d)
+        sign ^= sign_mask;
+    else if (opcode == RiscvOpcode::fsgnjx_s || opcode == RiscvOpcode::fsgnjx_d)
+        sign = (lhs ^ rhs) & sign_mask;
+    return (lhs & ~sign_mask) | sign;
+}
+
+std::optional<std::uint64_t> evaluate_riscv_fsgnj_instruction(const RiscvInstruction &instruction,
+                                                              std::uint64_t lhs,
+                                                              std::uint64_t rhs) noexcept {
+    if ((instruction.opcode != RiscvOpcode::fsgnj_s && instruction.opcode != RiscvOpcode::fsgnjn_s &&
+         instruction.opcode != RiscvOpcode::fsgnjx_s && instruction.opcode != RiscvOpcode::fsgnj_d &&
+         instruction.opcode != RiscvOpcode::fsgnjn_d && instruction.opcode != RiscvOpcode::fsgnjx_d) ||
+        instruction.operands.size() != 3 || instruction.access.size() != 3 ||
+        instruction.access[0] != RiscvOperandAccess::write ||
+        instruction.access[1] != RiscvOperandAccess::read ||
+        instruction.access[2] != RiscvOperandAccess::read || instruction.memory_read ||
+        instruction.memory_write || instruction.writes_fflags || instruction.reads_fflags ||
+        instruction.reads_frm)
+        return {};
+    const auto *destination = std::get_if<RiscvRegister>(&instruction.operands[0]);
+    const auto *left = std::get_if<RiscvRegister>(&instruction.operands[1]);
+    const auto *right = std::get_if<RiscvRegister>(&instruction.operands[2]);
+    const auto is_fpr = [](const RiscvRegister *reg) {
+        return reg && reg->floating_point && !reg->vector && !reg->vector_configuration;
+    };
+    if (!is_fpr(destination) || !is_fpr(left) || !is_fpr(right) ||
+        std::find(instruction.register_reads.begin(), instruction.register_reads.end(), *left) ==
+            instruction.register_reads.end() ||
+        std::find(instruction.register_reads.begin(), instruction.register_reads.end(), *right) ==
+            instruction.register_reads.end() ||
+        std::find(instruction.register_writes.begin(), instruction.register_writes.end(), *destination) ==
+            instruction.register_writes.end())
+        return {};
+    return evaluate_riscv_fsgnj_operation(instruction.opcode, lhs, rhs);
+}
+
+std::optional<RiscvFloatMinMaxResult> evaluate_riscv_float_min_max(
+    RiscvOpcode opcode, std::uint64_t lhs, std::uint64_t rhs) noexcept {
+    const bool single = opcode == RiscvOpcode::fmin_s || opcode == RiscvOpcode::fmax_s;
+    const bool maximum = opcode == RiscvOpcode::fmax_s || opcode == RiscvOpcode::fmax_d;
+    if (!single && opcode != RiscvOpcode::fmin_d && opcode != RiscvOpcode::fmax_d) return {};
+    if (single && ((lhs | rhs) >> 32)) return {};
+    const unsigned fraction_bits = single ? 23u : 52u;
+    const unsigned exponent_bits = single ? 8u : 11u;
+    const auto mask = single ? UINT64_C(0xffffffff) : UINT64_MAX;
+    const auto sign = UINT64_C(1) << (fraction_bits + exponent_bits);
+    const auto fraction_mask = (UINT64_C(1) << fraction_bits) - 1;
+    const auto exponent_mask = (UINT64_C(1) << exponent_bits) - 1;
+    const auto is_nan = [&](std::uint64_t bits) {
+        return ((bits >> fraction_bits) & exponent_mask) == exponent_mask && (bits & fraction_mask) != 0;
+    };
+    const auto is_signaling_nan = [&](std::uint64_t bits) {
+        return is_nan(bits) && (bits & (UINT64_C(1) << (fraction_bits - 1))) == 0;
+    };
+    lhs &= mask;
+    rhs &= mask;
+    const bool lhs_nan = is_nan(lhs), rhs_nan = is_nan(rhs);
+    const std::uint8_t invalid = is_signaling_nan(lhs) || is_signaling_nan(rhs) ? 0x10u : 0u;
+    if (lhs_nan && rhs_nan)
+        return RiscvFloatMinMaxResult{single ? UINT64_C(0x7fc00000) : UINT64_C(0x7ff8000000000000), invalid};
+    if (lhs_nan) return RiscvFloatMinMaxResult{rhs, invalid};
+    if (rhs_nan) return RiscvFloatMinMaxResult{lhs, invalid};
+    if ((lhs & ~sign) == 0 && (rhs & ~sign) == 0)
+        return RiscvFloatMinMaxResult{maximum ? (lhs & rhs & sign) : ((lhs | rhs) & sign), 0};
+    const auto order_key = [sign, mask](std::uint64_t bits) {
+        return (bits & sign) ? (~bits & mask) : (bits ^ sign);
+    };
+    const bool lhs_precedes = order_key(lhs) < order_key(rhs);
+    return RiscvFloatMinMaxResult{maximum ? (lhs_precedes ? rhs : lhs) : (lhs_precedes ? lhs : rhs), 0};
+}
+
+std::optional<RiscvFloatMinMaxResult> evaluate_riscv_float_min_max_instruction(
+    const RiscvInstruction &instruction, std::uint64_t lhs,
+    std::uint64_t rhs) noexcept {
+    if ((instruction.opcode != RiscvOpcode::fmin_s && instruction.opcode != RiscvOpcode::fmax_s &&
+         instruction.opcode != RiscvOpcode::fmin_d && instruction.opcode != RiscvOpcode::fmax_d) ||
+        instruction.operands.size() != 3 || instruction.access.size() != 3 ||
+        instruction.access[0] != RiscvOperandAccess::write ||
+        instruction.access[1] != RiscvOperandAccess::read ||
+        instruction.access[2] != RiscvOperandAccess::read || instruction.memory_read ||
+        instruction.memory_write || !instruction.writes_fflags || !instruction.reads_fflags ||
+        instruction.reads_frm)
+        return {};
+    const auto *destination = std::get_if<RiscvRegister>(&instruction.operands[0]);
+    const auto *left = std::get_if<RiscvRegister>(&instruction.operands[1]);
+    const auto *right = std::get_if<RiscvRegister>(&instruction.operands[2]);
+    const auto valid_fpr = [](const RiscvRegister *reg) {
+        return reg && reg->floating_point && !reg->vector && !reg->vector_configuration;
+    };
+    if (!valid_fpr(destination) || !valid_fpr(left) || !valid_fpr(right) ||
+        std::find(instruction.register_reads.begin(), instruction.register_reads.end(), *left) ==
+            instruction.register_reads.end() ||
+        std::find(instruction.register_reads.begin(), instruction.register_reads.end(), *right) ==
+            instruction.register_reads.end() ||
+        std::find(instruction.register_writes.begin(), instruction.register_writes.end(), *destination) ==
+            instruction.register_writes.end())
+        return {};
+    return evaluate_riscv_float_min_max(instruction.opcode, lhs, rhs);
+}
+
+std::optional<RiscvFloatCompareResult> evaluate_riscv_float_compare(
+    RiscvOpcode opcode, std::uint64_t lhs, std::uint64_t rhs) noexcept {
+    const bool single = opcode == RiscvOpcode::feq_s || opcode == RiscvOpcode::flt_s ||
+                        opcode == RiscvOpcode::fle_s;
+    const bool equal = opcode == RiscvOpcode::feq_s || opcode == RiscvOpcode::feq_d;
+    const bool less = opcode == RiscvOpcode::flt_s || opcode == RiscvOpcode::flt_d;
+    const bool less_equal = opcode == RiscvOpcode::fle_s || opcode == RiscvOpcode::fle_d;
+    if (!single && !equal && !less && !less_equal) return {};
+    if (single && ((lhs | rhs) >> 32) != 0) return {};
+
+    const unsigned fraction_bits = single ? 23u : 52u;
+    const unsigned exponent_bits = single ? 8u : 11u;
+    const std::uint64_t mask = single ? UINT64_C(0xffffffff) : UINT64_MAX;
+    const std::uint64_t sign = UINT64_C(1) << (fraction_bits + exponent_bits);
+    const std::uint64_t fraction_mask = (UINT64_C(1) << fraction_bits) - 1;
+    const std::uint64_t exponent_mask = (UINT64_C(1) << exponent_bits) - 1;
+    lhs &= mask;
+    rhs &= mask;
+    const auto is_nan = [&](std::uint64_t bits) {
+        return ((bits >> fraction_bits) & exponent_mask) == exponent_mask &&
+               (bits & fraction_mask) != 0;
+    };
+    const auto is_signaling_nan = [&](std::uint64_t bits) {
+        return is_nan(bits) && (bits & (UINT64_C(1) << (fraction_bits - 1))) == 0;
+    };
+    const bool lhs_nan = is_nan(lhs), rhs_nan = is_nan(rhs);
+    if (lhs_nan || rhs_nan) {
+        const bool invalid = equal ? (is_signaling_nan(lhs) || is_signaling_nan(rhs)) : true;
+        return RiscvFloatCompareResult{0, static_cast<std::uint8_t>(invalid ? 0x10u : 0u)};
+    }
+    const bool both_zero = (lhs & ~sign) == 0 && (rhs & ~sign) == 0;
+    const auto order_key = [sign, mask](std::uint64_t bits) {
+        return (bits & sign) ? (~bits & mask) : (bits ^ sign);
+    };
+    const bool are_equal = both_zero || lhs == rhs;
+    const bool precedes = !both_zero && order_key(lhs) < order_key(rhs);
+    const bool result = equal ? are_equal : less ? precedes : (are_equal || precedes);
+    return RiscvFloatCompareResult{result ? 1u : 0u, 0};
+}
+
+std::optional<RiscvFloatCompareResult> evaluate_riscv_float_compare_instruction(
+    const RiscvInstruction &instruction, std::uint64_t lhs,
+    std::uint64_t rhs) noexcept {
+    const bool comparison = instruction.opcode == RiscvOpcode::feq_s ||
+                            instruction.opcode == RiscvOpcode::flt_s ||
+                            instruction.opcode == RiscvOpcode::fle_s ||
+                            instruction.opcode == RiscvOpcode::feq_d ||
+                            instruction.opcode == RiscvOpcode::flt_d ||
+                            instruction.opcode == RiscvOpcode::fle_d;
+    if (!comparison || instruction.length != 4 || instruction.flow != RiscvFlow::fallthrough ||
+        instruction.operands.size() != 3 || instruction.access.size() != 3 ||
+        instruction.access[0] != RiscvOperandAccess::write ||
+        instruction.access[1] != RiscvOperandAccess::read ||
+        instruction.access[2] != RiscvOperandAccess::read || instruction.memory_read ||
+        instruction.memory_write || !instruction.writes_fflags || !instruction.reads_fflags ||
+        instruction.reads_frm || instruction.rounding_mode)
+        return {};
+    const auto *destination = std::get_if<RiscvRegister>(&instruction.operands[0]);
+    const auto *left = std::get_if<RiscvRegister>(&instruction.operands[1]);
+    const auto *right = std::get_if<RiscvRegister>(&instruction.operands[2]);
+    const auto valid_register = [](const RiscvRegister *reg) {
+        return reg && reg->index < 32 && !reg->vector && !reg->vector_configuration;
+    };
+    if (!valid_register(destination) || !valid_register(left) || !valid_register(right) ||
+        destination->floating_point || !left->floating_point || !right->floating_point ||
+        std::find(instruction.register_reads.begin(), instruction.register_reads.end(), *left) ==
+            instruction.register_reads.end() ||
+        std::find(instruction.register_reads.begin(), instruction.register_reads.end(), *right) ==
+            instruction.register_reads.end() ||
+        std::find(instruction.register_writes.begin(), instruction.register_writes.end(), *destination) ==
+            instruction.register_writes.end())
+        return {};
+    return evaluate_riscv_float_compare(instruction.opcode, lhs, rhs);
+}
+
+std::optional<RiscvBitMoveResult>
+evaluate_riscv_fmv_instruction(const RiscvInstruction &instruction,
+                              unsigned xlen_bits, std::uint64_t source_bits) noexcept {
+    if ((xlen_bits != 32 && xlen_bits != 64) || instruction.operands.size() != 2 ||
+        instruction.access.size() != 2 || instruction.access[0] != RiscvOperandAccess::write ||
+        instruction.access[1] != RiscvOperandAccess::read || instruction.memory_read ||
+        instruction.memory_write || instruction.writes_fflags || instruction.reads_fflags ||
+        instruction.reads_frm)
+        return {};
+    const auto *destination = std::get_if<RiscvRegister>(&instruction.operands[0]);
+    const auto *source = std::get_if<RiscvRegister>(&instruction.operands[1]);
+    if (!destination || !source || destination->index >= 32 || source->index >= 32 ||
+        destination->vector || destination->vector_configuration || source->vector || source->vector_configuration)
+        return {};
+    const bool x_from_w = instruction.opcode == RiscvOpcode::fmv_x_w;
+    const bool w_from_x = instruction.opcode == RiscvOpcode::fmv_w_x;
+    const bool x_from_d = instruction.opcode == RiscvOpcode::fmv_x_d;
+    const bool d_from_x = instruction.opcode == RiscvOpcode::fmv_d_x;
+    if (!x_from_w && !w_from_x && !x_from_d && !d_from_x) return {};
+    const bool destination_fp = w_from_x || d_from_x;
+    const bool source_fp = x_from_w || x_from_d;
+    if (destination->floating_point != destination_fp || source->floating_point != source_fp ||
+        ((x_from_d || d_from_x) && xlen_bits != 64))
+        return {};
+    const auto contains = [](const auto &registers, RiscvRegister reg) {
+        return std::find(registers.begin(), registers.end(), reg) != registers.end();
+    };
+    if ((source_fp || source->index != 0) && !contains(instruction.register_reads, *source))
+        return {};
+    if ((destination_fp || destination->index != 0) &&
+        !contains(instruction.register_writes, *destination))
+        return {};
+    if (source->floating_point == false && source->index == 0) source_bits = 0;
+    if (x_from_w) {
+        const auto word = static_cast<std::uint32_t>(source_bits);
+        if (xlen_bits == 32) return RiscvBitMoveResult{word, 32};
+        const auto signed_word = std::bit_cast<std::int32_t>(word);
+        return RiscvBitMoveResult{static_cast<std::uint64_t>(static_cast<std::int64_t>(signed_word)), 64};
+    }
+    if (w_from_x)
+        return RiscvBitMoveResult{UINT64_C(0xffffffff00000000) | static_cast<std::uint32_t>(source_bits), 64};
+    return RiscvBitMoveResult{source_bits, 64};
+}
+
 std::optional<std::uint64_t> evaluate_riscv_zbb_count_operation(RiscvOpcode opcode, unsigned xlen,
                                                                 std::uint64_t value) noexcept {
     if (xlen != 32 && xlen != 64)
@@ -135,6 +690,62 @@ std::optional<std::uint64_t> evaluate_riscv_zbb_count_operation(RiscvOpcode opco
     default:
         return {};
     }
+}
+
+std::optional<std::uint64_t> evaluate_riscv_zbb_operation(RiscvOpcode opcode, unsigned xlen,
+                                                           std::uint64_t lhs,
+                                                           std::uint64_t rhs) noexcept {
+    if (xlen != 32 && xlen != 64) return {};
+    const bool word = opcode == RiscvOpcode::rolw || opcode == RiscvOpcode::rorw ||
+                      opcode == RiscvOpcode::roriw;
+    if (word && xlen != 64) return {};
+    const unsigned width = word ? 32 : xlen;
+    const auto mask = width_mask(width);
+    lhs &= mask;
+    rhs &= mask;
+    const auto sign_extend = [width](std::uint64_t value, unsigned source_width) {
+        const auto source_mask = width_mask(source_width);
+        value &= source_mask;
+        return negative(value, source_width) ? (value | ~source_mask) & width_mask(width) : value;
+    };
+    const auto signed_less = [width](std::uint64_t left, std::uint64_t right) {
+        const bool left_negative = negative(left, width), right_negative = negative(right, width);
+        return left_negative != right_negative ? left_negative : left < right;
+    };
+    std::uint64_t result = 0;
+    switch (opcode) {
+    case RiscvOpcode::andn: result = lhs & ~rhs; break;
+    case RiscvOpcode::orn: result = lhs | ~rhs; break;
+    case RiscvOpcode::xnor: result = ~(lhs ^ rhs); break;
+    case RiscvOpcode::min: result = signed_less(lhs, rhs) ? lhs : rhs; break;
+    case RiscvOpcode::max: result = signed_less(lhs, rhs) ? rhs : lhs; break;
+    case RiscvOpcode::minu: result = std::min(lhs, rhs); break;
+    case RiscvOpcode::maxu: result = std::max(lhs, rhs); break;
+    case RiscvOpcode::rol: case RiscvOpcode::rolw:
+    case RiscvOpcode::ror: case RiscvOpcode::rorw: case RiscvOpcode::rori: case RiscvOpcode::roriw: {
+        const unsigned shift = static_cast<unsigned>(rhs & (width - 1));
+        if (!shift) result = lhs;
+        else if (opcode == RiscvOpcode::rol || opcode == RiscvOpcode::rolw)
+            result = ((lhs << shift) | (lhs >> (width - shift))) & mask;
+        else
+            result = ((lhs >> shift) | (lhs << (width - shift))) & mask;
+        break;
+    }
+    case RiscvOpcode::sext_b: result = sign_extend(lhs, 8); break;
+    case RiscvOpcode::sext_h: result = sign_extend(lhs, 16); break;
+    case RiscvOpcode::zext_h: result = lhs & 0xffff; break;
+    case RiscvOpcode::orc_b:
+        for (unsigned shift = 0; shift < width; shift += 8)
+            if (((lhs >> shift) & 0xff) != 0) result |= UINT64_C(0xff) << shift;
+        break;
+    case RiscvOpcode::rev8:
+        for (unsigned byte = 0; byte < width / 8; ++byte)
+            result |= ((lhs >> (byte * 8)) & 0xff) << (width - 8 - byte * 8);
+        break;
+    default: return {};
+    }
+    result &= mask;
+    return word ? sign_extend_32(static_cast<std::uint32_t>(result)) : result;
 }
 
 std::optional<std::uint64_t> evaluate_riscv_zba_operation(RiscvOpcode opcode, unsigned xlen,
@@ -161,6 +772,83 @@ std::optional<std::uint64_t> evaluate_riscv_zba_operation(RiscvOpcode opcode, un
     case RiscvOpcode::slli_uw:
         if (xlen != 64 || rhs > 63) return {};
         return static_cast<std::uint64_t>(static_cast<std::uint32_t>(lhs)) << rhs;
+    default: return {};
+    }
+}
+
+std::optional<std::uint64_t> evaluate_riscv_zbs_operation(RiscvOpcode opcode, unsigned xlen,
+                                                           std::uint64_t lhs,
+                                                           std::uint64_t bit_index) noexcept {
+    if (xlen != 32 && xlen != 64) return {};
+    const auto mask = width_mask(xlen);
+    lhs &= mask;
+    const unsigned index = static_cast<unsigned>(bit_index & (xlen - 1));
+    const auto bit = UINT64_C(1) << index;
+    switch (opcode) {
+    case RiscvOpcode::bclr: case RiscvOpcode::bclri: return lhs & ~bit & mask;
+    case RiscvOpcode::bext: case RiscvOpcode::bexti: return (lhs >> index) & 1;
+    case RiscvOpcode::binv: case RiscvOpcode::binvi: return (lhs ^ bit) & mask;
+    case RiscvOpcode::bset: case RiscvOpcode::bseti: return (lhs | bit) & mask;
+    default: return {};
+    }
+}
+
+std::optional<std::uint64_t>
+evaluate_riscv_zbkb_pack_operation(RiscvOpcode opcode, unsigned xlen, std::uint64_t lhs,
+                                  std::uint64_t rhs) noexcept {
+    if (xlen != 32 && xlen != 64) return {};
+    if (opcode == RiscvOpcode::pack) {
+        const unsigned half = xlen / 2;
+        const auto half_mask = (UINT64_C(1) << half) - 1;
+        return ((rhs & half_mask) << half) | (lhs & half_mask);
+    }
+    if (opcode == RiscvOpcode::packh)
+        return ((rhs & 0xff) << 8) | (lhs & 0xff);
+    if (opcode == RiscvOpcode::packw && xlen == 64) {
+        const auto packed = static_cast<std::uint32_t>(((rhs & 0xffff) << 16) | (lhs & 0xffff));
+        return static_cast<std::uint64_t>(static_cast<std::int64_t>(static_cast<std::int32_t>(packed)));
+    }
+    return {};
+}
+
+std::optional<std::uint64_t>
+evaluate_riscv_zbc_operation(RiscvOpcode opcode, unsigned xlen, std::uint64_t lhs,
+                             std::uint64_t rhs) noexcept {
+    if (xlen != 32 && xlen != 64) return {};
+    const auto mask = width_mask(xlen);
+    lhs &= mask;
+    rhs &= mask;
+    std::uint64_t result = 0;
+    if (opcode == RiscvOpcode::clmul) {
+        for (unsigned bit = 0; bit < xlen; ++bit)
+            if ((rhs >> bit) & 1u) result ^= lhs << bit;
+        return result & mask;
+    }
+    if (opcode == RiscvOpcode::clmulh) {
+        // Product bits [2*XLEN-1:XLEN], accumulated without a wider integer.
+        for (unsigned bit = 1; bit < xlen; ++bit)
+            if ((rhs >> bit) & 1u) result ^= lhs >> (xlen - bit);
+        return result & mask;
+    }
+    if (opcode == RiscvOpcode::clmulr) {
+        // Product bits [2*XLEN-2:XLEN-1], the reversed-result window.
+        for (unsigned bit = 0; bit < xlen; ++bit)
+            if ((rhs >> bit) & 1u) result ^= lhs >> (xlen - bit - 1);
+        return result & mask;
+    }
+    return {};
+}
+
+std::optional<std::uint64_t>
+evaluate_riscv_zicond_operation(RiscvOpcode opcode, unsigned xlen, std::uint64_t value,
+                                std::uint64_t condition) noexcept {
+    if (xlen != 32 && xlen != 64) return {};
+    const auto mask = width_mask(xlen);
+    value &= mask;
+    condition &= mask;
+    switch (opcode) {
+    case RiscvOpcode::czero_eqz: return condition == 0 ? 0 : value;
+    case RiscvOpcode::czero_nez: return condition != 0 ? 0 : value;
     default: return {};
     }
 }
@@ -219,6 +907,75 @@ evaluate_riscv_fcvtmod_w_d(std::uint64_t source_bits, unsigned xlen) noexcept {
     }
     if (negative_input) low_bits = std::uint32_t{0} - low_bits;
     result.value = sign_extend_32(low_bits);
+    return result;
+}
+
+std::optional<RiscvFloatingRoundResult>
+evaluate_riscv_fround_operation(RiscvOpcode opcode, std::uint64_t source_bits,
+                                std::uint8_t rounding_mode) noexcept {
+    const bool single = opcode == RiscvOpcode::fround_s || opcode == RiscvOpcode::froundnx_s;
+    const bool exact = opcode == RiscvOpcode::froundnx_s || opcode == RiscvOpcode::froundnx_d;
+    if ((!single && opcode != RiscvOpcode::fround_d && opcode != RiscvOpcode::froundnx_d) ||
+        rounding_mode > 4)
+        return {};
+
+    const unsigned fraction_bits = single ? 23 : 52;
+    const unsigned exponent_bits = single ? 8 : 11;
+    const int bias = single ? 127 : 1023;
+    const std::uint64_t sign_mask = UINT64_C(1) << (fraction_bits + exponent_bits);
+    const std::uint64_t fraction_mask = (UINT64_C(1) << fraction_bits) - 1;
+    const std::uint64_t exponent_mask = (UINT64_C(1) << exponent_bits) - 1;
+    const std::uint64_t quiet_mask = UINT64_C(1) << (fraction_bits - 1);
+    const std::uint64_t input = single ? source_bits & UINT32_MAX : source_bits;
+    const std::uint64_t sign = input & sign_mask;
+    const auto encoded_exponent = static_cast<unsigned>((input >> fraction_bits) & exponent_mask);
+    const auto fraction = input & fraction_mask;
+    RiscvFloatingRoundResult result{input, 0};
+
+    if (encoded_exponent == exponent_mask) {
+        if (fraction != 0 && (fraction & quiet_mask) == 0) {
+            result.value = input | quiet_mask;
+            result.fflags_set = 0x10; // NV
+        }
+        return result;
+    }
+
+    if (encoded_exponent == 0 && fraction == 0) return result;
+    const int exponent = encoded_exponent == 0 ? 1 - bias : static_cast<int>(encoded_exponent) - bias;
+    bool fractional = false;
+    bool increment = false;
+    std::uint64_t magnitude = input & ~sign_mask;
+    if (exponent < 0) {
+        fractional = true;
+        const bool at_least_half = exponent == -1 && fraction != 0;
+        const bool exactly_half = exponent == -1 && fraction == 0;
+        switch (rounding_mode) {
+        case 0: increment = at_least_half && !exactly_half; break; // RNE; zero is even on ties.
+        case 1: break; // RTZ
+        case 2: increment = sign != 0; break; // RDN
+        case 3: increment = sign == 0; break; // RUP
+        case 4: increment = at_least_half || exactly_half; break; // RMM
+        }
+        magnitude = increment ? (static_cast<std::uint64_t>(bias) << fraction_bits) : 0;
+    } else if (exponent < static_cast<int>(fraction_bits)) {
+        const unsigned discarded = fraction_bits - static_cast<unsigned>(exponent);
+        const std::uint64_t discarded_mask = (UINT64_C(1) << discarded) - 1;
+        const auto remainder = magnitude & discarded_mask;
+        fractional = remainder != 0;
+        const auto halfway = UINT64_C(1) << (discarded - 1);
+        const auto truncated = magnitude & ~discarded_mask;
+        switch (rounding_mode) {
+        case 0: increment = remainder > halfway || (remainder == halfway && ((truncated >> discarded) & 1)); break;
+        case 1: break;
+        case 2: increment = sign != 0 && fractional; break;
+        case 3: increment = sign == 0 && fractional; break;
+        case 4: increment = remainder >= halfway; break;
+        }
+        magnitude = truncated + (increment ? (UINT64_C(1) << discarded) : 0);
+    }
+    result.value = sign | magnitude;
+    if (single) result.value &= UINT32_MAX;
+    if (exact && fractional) result.fflags_set |= 0x01; // NX
     return result;
 }
 
@@ -348,6 +1105,47 @@ evaluate_riscv_vector_integer_operation(RiscvOpcode opcode, const RiscvVectorInt
         operands.vs2.size() != vlmax ||
         operands.old_destination.size() != vlmax || (config.masked && operands.predicate_mask.size() != vlmax))
         return {};
+
+    bool reduction = true;
+    switch (opcode) {
+    case RiscvOpcode::vredsum: case RiscvOpcode::vredand: case RiscvOpcode::vredor:
+    case RiscvOpcode::vredxor: case RiscvOpcode::vredminu: case RiscvOpcode::vredmin:
+    case RiscvOpcode::vredmaxu: case RiscvOpcode::vredmax: break;
+    default: reduction = false; break;
+    }
+    if (reduction) {
+        if (config.vstart != 0 || operands.vs1.size() != vlmax ||
+            (config.masked && std::any_of(operands.predicate_mask.begin(), operands.predicate_mask.end(),
+                                          [](std::uint8_t bit) { return bit > 1; }))) return {};
+        const auto element_mask = width_mask(sew);
+        auto accumulator = operands.vs1[0] & element_mask;
+        const auto signed_less = [sew](std::uint64_t lhs, std::uint64_t rhs) {
+            const bool lhs_negative = negative(lhs, sew), rhs_negative = negative(rhs, sew);
+            return lhs_negative != rhs_negative ? lhs_negative : lhs < rhs;
+        };
+        for (std::uint64_t lane = 0; lane < config.vl; ++lane) {
+            if (config.masked && operands.predicate_mask[static_cast<std::size_t>(lane)] == 0) continue;
+            const auto value = operands.vs2[static_cast<std::size_t>(lane)] & element_mask;
+            switch (opcode) {
+            case RiscvOpcode::vredsum: accumulator = (accumulator + value) & element_mask; break;
+            case RiscvOpcode::vredand: accumulator &= value; break;
+            case RiscvOpcode::vredor: accumulator |= value; break;
+            case RiscvOpcode::vredxor: accumulator ^= value; break;
+            case RiscvOpcode::vredminu: accumulator = std::min(accumulator, value); break;
+            case RiscvOpcode::vredmaxu: accumulator = std::max(accumulator, value); break;
+            case RiscvOpcode::vredmin: if (signed_less(value, accumulator)) accumulator = value; break;
+            case RiscvOpcode::vredmax: if (signed_less(accumulator, value)) accumulator = value; break;
+            default: break;
+            }
+        }
+        RiscvVectorIntegerResult result;
+        result.vlmax = vlmax;
+        result.element_bits = static_cast<std::uint8_t>(sew);
+        result.lanes.assign(operands.old_destination.begin(), operands.old_destination.end());
+        if (config.vl == 0) return result;
+        result.lanes[0] = accumulator;
+        return result;
+    }
 
     const bool gather_vv = opcode == RiscvOpcode::vrgather_vv;
     const bool gather_vx = opcode == RiscvOpcode::vrgather_vx;
@@ -694,8 +1492,8 @@ evaluate_riscv_vector_floating_operation(RiscvOpcode opcode, const RiscvVectorIn
         (config.masked && operands.predicate_mask.size() != vlmax))
         return {};
 
-    enum class Operation { classification, sign_copy, sign_invert, sign_xor, min, max, equal, not_equal,
-                           less, less_equal, greater, greater_equal };
+    enum class Operation { classification, sign_copy, sign_invert, sign_xor, min, max, reduce_min, reduce_max,
+                           equal, not_equal, less, less_equal, greater, greater_equal };
     Operation operation;
     bool vector_rhs = false, mask_result = false;
     switch (opcode) {
@@ -715,8 +1513,12 @@ evaluate_riscv_vector_floating_operation(RiscvOpcode opcode, const RiscvVectorIn
 #undef RV_FLOAT_PAIR
     case RiscvOpcode::vmfgt_vf: operation = Operation::greater; break;
     case RiscvOpcode::vmfge_vf: operation = Operation::greater_equal; break;
+    case RiscvOpcode::vfredmin: operation = Operation::reduce_min; break;
+    case RiscvOpcode::vfredmax: operation = Operation::reduce_max; break;
     default: return {};
     }
+    const bool reduction = operation == Operation::reduce_min || operation == Operation::reduce_max;
+    if (reduction && (config.vstart != 0 || operands.vs1.size() != vlmax)) return {};
     if (vector_rhs && operands.vs1.size() != vlmax) return {};
     mask_result = operation == Operation::equal || operation == Operation::not_equal ||
                   operation == Operation::less || operation == Operation::less_equal ||
@@ -746,11 +1548,37 @@ evaluate_riscv_vector_floating_operation(RiscvOpcode opcode, const RiscvVectorIn
         return order_key(lhs) < order_key(rhs);
     };
 
+    const auto minmax = [&](std::uint64_t lhs, std::uint64_t rhs, bool maximum,
+                            std::uint8_t &fflags) {
+        lhs &= element_mask;
+        rhs &= element_mask;
+        const bool lhs_nan = is_nan(lhs), rhs_nan = is_nan(rhs);
+        if (is_signaling_nan(lhs) || is_signaling_nan(rhs)) fflags |= 0x10;
+        if (lhs_nan || rhs_nan) return lhs_nan && rhs_nan ? canonical_nan : lhs_nan ? rhs : lhs;
+        if (is_zero(lhs) && is_zero(rhs)) {
+            const auto signs = (lhs | rhs) & sign_mask;
+            return maximum ? (signs ? ((lhs & rhs) & sign_mask) : UINT64_C(0)) : signs;
+        }
+        const bool take_lhs = ordered_less(lhs, rhs);
+        return maximum ? (take_lhs ? rhs : lhs) : (take_lhs ? lhs : rhs);
+    };
+
     RiscvVectorFloatingResult result;
     result.vlmax = vlmax;
     result.mask_result = mask_result;
     result.element_bits = mask_result ? 1 : static_cast<std::uint8_t>(sew);
     result.lanes.assign(operands.old_destination.begin(), operands.old_destination.end());
+    if (reduction) {
+        auto accumulator = operands.vs1[0] & element_mask;
+        const bool maximum = operation == Operation::reduce_max;
+        for (std::uint64_t lane = 0; lane < config.vl; ++lane) {
+            if (config.masked && operands.predicate_mask[static_cast<std::size_t>(lane)] == 0) continue;
+            accumulator = minmax(accumulator, operands.vs2[static_cast<std::size_t>(lane)], maximum,
+                                 result.fflags_set);
+        }
+        result.lanes[0] = accumulator;
+        return result;
+    }
     for (std::uint64_t lane = config.vstart; lane < config.vl; ++lane) {
         if (config.masked && operands.predicate_mask[static_cast<std::size_t>(lane)] == 0) continue;
         const auto lhs = operands.vs2[static_cast<std::size_t>(lane)] & element_mask;
@@ -803,6 +1631,10 @@ evaluate_riscv_vector_floating_operation(RiscvOpcode opcode, const RiscvVectorIn
                                                     : (take_lhs ? rhs : lhs);
             }
             break;
+        case Operation::reduce_min:
+        case Operation::reduce_max:
+            // Handled by the scalar reduction path above.
+            break;
         case Operation::equal:
         case Operation::not_equal:
         case Operation::less:
@@ -843,11 +1675,22 @@ plan_riscv_vector_memory_accesses(RiscvOpcode opcode, const RiscvVectorIntegerCo
                                   std::uint64_t base, std::uint64_t stride_bits,
                                   std::uint8_t element_bits,
                                   std::span<const std::uint8_t> predicate_mask) {
+    return plan_riscv_vector_memory_accesses(opcode, config, base, stride_bits, element_bits,
+                                             predicate_mask, 1);
+}
+
+std::optional<RiscvVectorMemoryAccessPlan>
+plan_riscv_vector_memory_accesses(RiscvOpcode opcode, const RiscvVectorIntegerConfig &config,
+                                  std::uint64_t base, std::uint64_t stride_bits,
+                                  std::uint8_t element_bits,
+                                  std::span<const std::uint8_t> predicate_mask,
+                                  std::uint8_t segment_fields) {
     const bool load = opcode == RiscvOpcode::vle || opcode == RiscvOpcode::vlse;
     const bool unit_stride = opcode == RiscvOpcode::vle || opcode == RiscvOpcode::vse;
     const bool strided = opcode == RiscvOpcode::vlse || opcode == RiscvOpcode::vsse;
     if ((!unit_stride && !strided) || (element_bits != 8 && element_bits != 16 &&
         element_bits != 32 && element_bits != 64) ||
+        segment_fields == 0 || segment_fields > 8 ||
         (config.xlen_bits != 32 && config.xlen_bits != 64) ||
         (config.sew_bits != 8 && config.sew_bits != 16 &&
          config.sew_bits != 32 && config.sew_bits != 64) ||
@@ -861,7 +1704,8 @@ plan_riscv_vector_memory_accesses(RiscvOpcode opcode, const RiscvVectorIntegerCo
     const int eew_log2 = element_bits == 8 ? 3 : element_bits == 16 ? 4 :
                          element_bits == 32 ? 5 : 6;
     const int emul_log2 = static_cast<int>(config.lmul_log2) + eew_log2 - sew_log2;
-    if (emul_log2 < -3 || emul_log2 > 3)
+    if (emul_log2 < -3 || emul_log2 > 3 ||
+        (emul_log2 > 0 && segment_fields > (8u >> static_cast<unsigned>(emul_log2))))
         return {}; // EMUL outside mf8..m8 is reserved.
 
     const std::uint64_t base_lanes = config.vlen_bits / config.sew_bits;
@@ -897,14 +1741,17 @@ plan_riscv_vector_memory_accesses(RiscvOpcode opcode, const RiscvVectorIntegerCo
     plan.vlmax = vlmax;
     plan.element_bits = element_bits;
     plan.load = load;
-    plan.active_elements.reserve(static_cast<std::size_t>(config.vl - config.vstart));
+    const auto active_lanes = config.vl - config.vstart;
+    if (active_lanes > std::numeric_limits<std::size_t>::max() / segment_fields)
+        return {};
+    plan.active_elements.reserve(static_cast<std::size_t>(active_lanes * segment_fields));
     const std::uint64_t element_bytes = element_bits / 8;
     for (std::uint64_t lane = config.vstart; lane < config.vl; ++lane) {
         if (config.masked && predicate_mask[static_cast<std::size_t>(lane)] == 0)
             continue;
 
         const bool negative_stride = strided && signed_stride < 0;
-        const std::uint64_t magnitude = !strided ? element_bytes : negative_stride
+        const std::uint64_t magnitude = !strided ? element_bytes * segment_fields : negative_stride
             ? static_cast<std::uint64_t>(-(signed_stride + 1)) + 1
             : static_cast<std::uint64_t>(signed_stride);
         if (lane != 0 && magnitude > UINT64_MAX / lane)
@@ -918,7 +1765,11 @@ plan_riscv_vector_memory_accesses(RiscvOpcode opcode, const RiscvVectorIntegerCo
             if (displacement > xlen_mask - base) return {};
             address += displacement;
         }
-        plan.active_elements.push_back({lane, address});
+        for (std::uint8_t field = 0; field < segment_fields; ++field) {
+            const auto field_displacement = static_cast<std::uint64_t>(field) * element_bytes;
+            if (field_displacement > xlen_mask - address) return {};
+            plan.active_elements.push_back({lane, address + field_displacement, field});
+        }
     }
     return plan;
 }
@@ -928,11 +1779,22 @@ plan_riscv_vector_indexed_memory_accesses(RiscvOpcode opcode, const RiscvVectorI
                                           std::uint64_t base, std::uint8_t index_element_bits,
                                           std::span<const std::uint64_t> index_offsets,
                                           std::span<const std::uint8_t> predicate_mask) {
+    return plan_riscv_vector_indexed_memory_accesses(opcode, config, base, index_element_bits,
+                                                    index_offsets, predicate_mask, 1);
+}
+
+std::optional<RiscvVectorMemoryAccessPlan>
+plan_riscv_vector_indexed_memory_accesses(RiscvOpcode opcode, const RiscvVectorIntegerConfig &config,
+                                          std::uint64_t base, std::uint8_t index_element_bits,
+                                          std::span<const std::uint64_t> index_offsets,
+                                          std::span<const std::uint8_t> predicate_mask,
+                                          std::uint8_t segment_fields) {
     const bool load = opcode == RiscvOpcode::vluxei || opcode == RiscvOpcode::vloxei;
     const bool unordered = opcode == RiscvOpcode::vluxei || opcode == RiscvOpcode::vsuxei;
     const bool store = opcode == RiscvOpcode::vsuxei || opcode == RiscvOpcode::vsoxei;
     const auto valid_width = [](unsigned bits) { return bits == 8 || bits == 16 || bits == 32 || bits == 64; };
-    if ((!load && !store) || !valid_width(index_element_bits) || !valid_width(config.sew_bits) ||
+    if ((!load && !store) || segment_fields == 0 || segment_fields > 8 ||
+        !valid_width(index_element_bits) || !valid_width(config.sew_bits) ||
         (config.xlen_bits != 32 && config.xlen_bits != 64) ||
         config.vlen_bits < 64 || config.vlen_bits > 65528 || config.vlen_bits % 8 != 0 ||
         config.vlen_bits % config.sew_bits != 0 || config.lmul_log2 < -3 || config.lmul_log2 > 3)
@@ -943,7 +1805,9 @@ plan_riscv_vector_indexed_memory_accesses(RiscvOpcode opcode, const RiscvVectorI
     };
     const int index_emul_log2 = static_cast<int>(config.lmul_log2) +
                                 log2_width(index_element_bits) - log2_width(config.sew_bits);
-    if (index_emul_log2 < -3 || index_emul_log2 > 3)
+    const int data_emul_log2 = config.lmul_log2;
+    if (index_emul_log2 < -3 || index_emul_log2 > 3 ||
+        (data_emul_log2 > 0 && segment_fields > (8u >> static_cast<unsigned>(data_emul_log2))))
         return {}; // Index EEW derives an unrepresentable EMUL.
 
     const std::uint64_t base_lanes = config.vlen_bits / config.sew_bits;
@@ -968,7 +1832,10 @@ plan_riscv_vector_indexed_memory_accesses(RiscvOpcode opcode, const RiscvVectorI
     plan.index_element_bits = index_element_bits;
     plan.load = load;
     plan.ordered = !unordered;
-    plan.active_elements.reserve(static_cast<std::size_t>(config.vl - config.vstart));
+    const auto active_lanes = config.vl - config.vstart;
+    if (active_lanes > std::numeric_limits<std::size_t>::max() / segment_fields)
+        return {};
+    plan.active_elements.reserve(static_cast<std::size_t>(active_lanes * segment_fields));
     for (std::uint64_t lane = config.vstart; lane < config.vl; ++lane) {
         if (config.masked && predicate_mask[static_cast<std::size_t>(lane)] == 0)
             continue;
@@ -978,7 +1845,13 @@ plan_riscv_vector_indexed_memory_accesses(RiscvOpcode opcode, const RiscvVectorI
         const auto offset = raw_offset & xlen_mask; // Wider indices use their low XLEN bits.
         if (offset > xlen_mask - base)
             return {}; // Reject address wrap rather than silently wrapping.
-        plan.active_elements.push_back({lane, base + offset});
+        const auto address = base + offset;
+        const auto element_bytes = static_cast<std::uint64_t>(config.sew_bits / 8);
+        for (std::uint8_t field = 0; field < segment_fields; ++field) {
+            const auto field_displacement = static_cast<std::uint64_t>(field) * element_bytes;
+            if (field_displacement > xlen_mask - address) return {};
+            plan.active_elements.push_back({lane, address + field_displacement, field});
+        }
     }
     return plan;
 }

@@ -16,10 +16,12 @@ enum class CallingConvention {
     x86_32_stdcall, x86_32_fastcall, x86_32_thiscall, riscv32, riscv64,
     // Appended to preserve the ordinal values of previously shipped entries.
     x86_32_vectorcall, windows_x64_vectorcall, aapcs32,
-    // Explicit MIPS ABI selectors; Linux N32 and N64 scalar subsets are classified.
+    // Explicit MIPS ABI selectors; O32/N32 bounded scalar subsets and N64 are classified.
     mips_o32, mips_n32, mips_n64,
     // Explicit little-endian PowerPC64 ELFv2; ELF class alone cannot select it.
-    ppc64le_elfv2
+    ppc64le_elfv2,
+    // Explicit AAPCS32 VFP variant. Appended to preserve existing ordinals.
+    aapcs32_vfp
 };
 enum class AbiLocationKind { register_, stack };
 enum class AbiStackCleanup { caller, callee };
@@ -92,7 +94,10 @@ struct AbiSignatureClassification {
 // 8/16-byte SysV AMD64 and AAPCS64 vectors, plus 16-byte Microsoft x64 vectors,
 // are classified where their lane shape is modeled. Unsupported conventions,
 // target-dependent vector widths, and unresolved types remain explicit.
-// MIPS N32 is explicitly selected and models ILP32 pointers, eight 64-bit
+// MIPS O32 is explicitly selected and models integer/pointer scalars through
+// 32 bits, four argument registers, and overflow stack words; floating point,
+// wider scalars, aggregates, and variadics remain unsupported. MIPS N32 is
+// explicitly selected and models ILP32 pointers, eight 64-bit
 // argument slots, scalar integer/pointer and single/double floating locations,
 // scalar returns, and stack overflow arguments. Aggregates and variadics are
 // rejected. Its placement rules follow the MIPS N32/64 subprogram interface;
@@ -100,8 +105,9 @@ struct AbiSignatureClassification {
 // GPR/FPR locations, bounded integer-class aggregate chunks, and hidden result
 // pointers for larger aggregate returns. O32 remains recognized but unsupported.
 // AAPCS32 models the base PCS with R0-R3, split composites, and hidden result
-// pointers. It does not model VFP/Advanced SIMD register allocation or
-// AAPCS32 variadic call-site promotions.
+// pointers. aapcs32_vfp additionally models scalar FP and homogeneous FP
+// aggregates in VFP registers (non-variadic signatures); Advanced SIMD CPRCs
+// and AAPCS32 variadic call-site promotions are not modeled.
 // PowerPC64 ELFv2 is selected explicitly as ppc64le_elfv2. It models binary
 // float/double, 1/2/4/8-byte integer and pointer scalars, and bounded C-like
 // integer-only structures with complete 8-byte chunks. See
@@ -129,10 +135,13 @@ classify_abi_method(CallingConvention convention, const types::Method &method);
 
 // Classifies one variadic call from its prototype and actual argument types.
 // Fixed arguments use the declared parameter types; arguments after the fixed
-// parameter list use C default argument promotions. Only SysV AMD64 and
-// Microsoft x64 variadic calls are supported. For Microsoft x64, duplicate
-// floating argument locations are marked `AbiLocation::duplicate`; for SysV,
-// `sysv_vector_register_count` supplies the required %al value.
+// parameter list use C default argument promotions. Supported conventions are
+// SysV AMD64, Microsoft x64, AAPCS32 (which always uses its base PCS for
+// variadic calls, including VFP-qualified function types), and 32-bit x86
+// fastcall. Variadic fastcall calls use caller-cleaned cdecl stack placement.
+// For Microsoft x64, duplicate floating locations are marked
+// `AbiLocation::duplicate`; for SysV, `sysv_vector_register_count` supplies
+// the required %al value.
 HEXLAB_ANALYSIS_EXPORT AbiSignatureClassification
 classify_abi_call(CallingConvention convention, const types::Type &function_type,
                   std::span<const types::TypePtr> actual_argument_types);

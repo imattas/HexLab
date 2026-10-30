@@ -8,12 +8,15 @@
 #include <wx/choice.h>
 #include <wx/spinctrl.h>
 #include <functional>
+#include <filesystem>
 #include <optional>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace hexlab { struct Instruction; }
+class wxButton;
 namespace hexlab::desktop {
 std::optional<std::uint64_t> compare_instruction_fingerprint(const hexlab::Instruction &);
 wxString compare_kind_text(compare::ChangeKind);
@@ -45,20 +48,31 @@ class CompareView final : public wxFrame {
                 std::function<void(const compare::FunctionMatch &)> navigate_old_function,
                 std::vector<compare::FunctionBodyDiff> function_body_diffs = {},
                 std::function<void(const compare::ChangeRun &)> navigate_new = {},
-                std::function<void(const compare::FunctionMatch &)> navigate_new_function = {});
+                std::function<void(const compare::FunctionMatch &)> navigate_new_function = {},
+                std::function<void(const compare::FunctionAddress &)> navigate_old_instruction = {},
+                std::function<void(const compare::FunctionAddress &)> navigate_new_instruction = {});
+    void set_session_path(std::filesystem::path path) { session_path_ = std::move(path); }
+    const std::optional<std::filesystem::path> &session_path() const noexcept { return session_path_; }
   private:
     compare::Report report_;
     std::vector<compare::FunctionMatch> function_matches_;
     std::vector<compare::FunctionBodyDiff> function_body_diffs_;
     wxString old_name_, new_name_;
+    std::optional<std::filesystem::path> session_path_;
     std::function<void(const compare::ChangeRun &)> navigate_old_;
     std::function<void(const compare::FunctionMatch &)> navigate_old_function_;
     std::function<void(const compare::ChangeRun &)> navigate_new_;
     std::function<void(const compare::FunctionMatch &)> navigate_new_function_;
+    std::function<void(const compare::FunctionAddress &)> navigate_old_instruction_;
+    std::function<void(const compare::FunctionAddress &)> navigate_new_instruction_;
     wxListCtrl *runs_ = nullptr;
+    wxListCtrl *regions_ = nullptr;
+    wxTextCtrl *region_search_ = nullptr;
+    wxStaticText *region_count_ = nullptr;
     wxListCtrl *functions_ = nullptr;
     wxListCtrl *function_diff_runs_ = nullptr;
     wxStaticText *function_diff_summary_ = nullptr;
+    wxButton *function_diff_old_ = nullptr, *function_diff_new_ = nullptr;
     wxStaticText *function_count_ = nullptr;
     wxTextCtrl *run_search_ = nullptr;
     wxTextCtrl *function_search_ = nullptr;
@@ -68,9 +82,12 @@ class CompareView final : public wxFrame {
     wxCheckBox *show_changed_ = nullptr, *show_added_ = nullptr, *show_removed_ = nullptr;
     std::vector<std::size_t> visible_runs_;
     std::vector<std::size_t> visible_functions_;
+    std::vector<compare::InstructionDiffRun> visible_instruction_runs_;
     void refresh_runs();
+    void refresh_regions();
     void refresh_functions();
     void show_function_diff(std::size_t index);
+    void update_instruction_navigation();
     void navigate_visible_run(int direction);
     void activate_run(std::size_t index);
     void activate_run_new(std::size_t index);

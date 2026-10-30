@@ -4,6 +4,22 @@ namespace hexlab::derived_detail {
 namespace {
 using Facts = std::map<uint64_t, std::shared_ptr<const InstructionFact>>;
 constexpr std::array<std::byte, 4> magic{std::byte{'H'}, std::byte{'X'}, std::byte{'D'}, std::byte{'C'}};
+bool equal_payload(std::span<const std::byte> left, std::span<const std::byte> right, std::stop_token stop) {
+    canceled(stop);
+    if (left.size() != right.size())
+        return false;
+    constexpr size_t comparison_chunk = 64 * 1024;
+    for (size_t offset = 0; offset < left.size(); offset += comparison_chunk) {
+        canceled(stop);
+        const auto count = std::min(comparison_chunk, left.size() - offset);
+        if (!std::equal(left.begin() + static_cast<std::ptrdiff_t>(offset),
+                        left.begin() + static_cast<std::ptrdiff_t>(offset + count),
+                        right.begin() + static_cast<std::ptrdiff_t>(offset)))
+            return false;
+    }
+    canceled(stop);
+    return true;
+}
 Facts collect_facts(const FunctionSnapshot &snapshot, std::stop_token stop) {
     Facts facts;
     const auto add = [&](const std::shared_ptr<const InstructionFact> &fact) {
@@ -171,6 +187,43 @@ std::vector<std::byte> payload(const DerivedProposal &proposal, std::stop_token 
                 out.number(seed.pogo_evidence->file_offset);
                 out.number(seed.pogo_evidence->record_size);
             }
+            out.flag(seed.wasm_export_evidence.has_value());
+            if (seed.wasm_export_evidence) {
+                out.number(seed.wasm_export_evidence->function_index, 4);
+                out.number(seed.wasm_export_evidence->export_index, 4);
+                out.number(seed.wasm_export_evidence->type_index, 4);
+                out.number(seed.wasm_export_evidence->section_file_offset);
+                out.number(seed.wasm_export_evidence->entry_file_offset);
+            }
+            out.flag(seed.wasm_start_evidence.has_value());
+            if (seed.wasm_start_evidence) {
+                out.number(seed.wasm_start_evidence->function_index, 4);
+                out.number(seed.wasm_start_evidence->type_index, 4);
+                out.number(seed.wasm_start_evidence->section_file_offset);
+                out.number(seed.wasm_start_evidence->entry_file_offset);
+            }
+            out.flag(seed.wasm_element_evidence.has_value());
+            if (seed.wasm_element_evidence) {
+                out.number(seed.wasm_element_evidence->function_index, 4);
+                out.number(seed.wasm_element_evidence->type_index, 4);
+                out.number(seed.wasm_element_evidence->segment_index, 4);
+                out.number(seed.wasm_element_evidence->element_index, 4);
+                out.number(seed.wasm_element_evidence->section_file_offset);
+                out.number(seed.wasm_element_evidence->entry_file_offset);
+                out.number(seed.wasm_element_evidence->body_file_offset);
+            }
+            out.flag(seed.wasm_defined_evidence.has_value());
+            if (seed.wasm_defined_evidence) {
+                out.number(seed.wasm_defined_evidence->function_index, 4);
+                out.number(seed.wasm_defined_evidence->type_index, 4);
+                out.number(seed.wasm_defined_evidence->body_file_offset);
+            }
+            out.flag(seed.dwarf_evidence.has_value());
+            if (seed.dwarf_evidence) {
+                out.number(seed.dwarf_evidence->unit_offset);
+                out.number(seed.dwarf_evidence->die_offset);
+                out.number(seed.dwarf_evidence->record_size);
+            }
         }
         out.count(function->stops.size());
         for (auto &record : function->stops)
@@ -185,6 +238,19 @@ std::vector<std::byte> payload(const DerivedProposal &proposal, std::stop_token 
         if (call.callee)
             out.number(call.callee->value);
         out.flag(call.tail_candidate);
+        out.flag(call.external_target.has_value());
+        if (call.external_target) {
+            const auto &external = *call.external_target;
+            out.text(external.library);
+            out.flag(external.name.has_value());
+            if (external.name) out.text(*external.name);
+            out.flag(external.ordinal.has_value());
+            if (external.ordinal) out.number(*external.ordinal, 2);
+            out.flag(external.wasm_function_index.has_value());
+            if (external.wasm_function_index) out.number(*external.wasm_function_index, 4);
+            out.flag(external.host_binding.has_value());
+            if (external.host_binding) out.text(*external.host_binding);
+        }
     }
     out.count(functions.candidates.size());
     for (auto &candidate : functions.candidates) {
@@ -240,6 +306,7 @@ std::vector<std::byte> payload(const DerivedProposal &proposal, std::stop_token 
         require(proposal.stack_frames[i].function == functions.functions[i]->id,
                 "Derived cache stack table differs from function order");
     std::size_t total_stack_access_details = 0;
+    std::size_t total_stack_call_arguments = 0;
     for (const auto &record : proposal.stack_frames) {
         canceled(stop);
         out.number(record.function.value);
@@ -267,6 +334,19 @@ std::vector<std::byte> payload(const DerivedProposal &proposal, std::stop_token 
                 out.flag(access.written);
                 out.flag(access.address_taken);
             }
+            out.flag(slot.incoming_argument);
+            out.flag(slot.incoming_argument_abi.has_value());
+            if (slot.incoming_argument_abi)
+                out.number(static_cast<std::uint8_t>(*slot.incoming_argument_abi), 1);
+            require(slot.outgoing_call_arguments.size() <= 4'000'000 - total_stack_call_arguments,
+                    "Derived stack call-argument provenance exceeds budget", ErrorCode::resource_limit);
+            total_stack_call_arguments += slot.outgoing_call_arguments.size();
+            out.count(slot.outgoing_call_arguments.size());
+            for (const auto &argument : slot.outgoing_call_arguments) {
+                out.address(argument.source_instruction);
+                out.address(argument.call_instruction);
+                out.number(static_cast<std::uint8_t>(argument.source_kind), 1);
+            }
         }
     }
     return std::move(out.bytes);
@@ -291,13 +371,41 @@ struct Decoded {
     DerivedProposal proposal;
     Facts facts;
 };
+std::optional<std::size_t> utf8_scalar_count(std::string_view value) {
+    std::size_t count = 0;
+    for (std::size_t at = 0; at < value.size();) {
+        const auto first = static_cast<unsigned char>(value[at]);
+        std::size_t width = 0;
+        std::uint32_t scalar = 0;
+        if (first < 0x80) { width = 1; scalar = first; }
+        else if (first >= 0xc2 && first <= 0xdf) { width = 2; scalar = first & 0x1f; }
+        else if (first >= 0xe0 && first <= 0xef) { width = 3; scalar = first & 0x0f; }
+        else if (first >= 0xf0 && first <= 0xf4) { width = 4; scalar = first & 0x07; }
+        else return {};
+        if (width > value.size() - at) return {};
+        for (std::size_t i = 1; i < width; ++i) {
+            const auto next = static_cast<unsigned char>(value[at + i]);
+            if ((next & 0xc0) != 0x80) return {};
+            scalar = (scalar << 6) | (next & 0x3f);
+        }
+        if ((width == 2 && scalar < 0x80) || (width == 3 && scalar < 0x800) ||
+            (width == 4 && scalar < 0x10000) || scalar > 0x10ffff ||
+            (scalar >= 0xd800 && scalar <= 0xdfff)) return {};
+        at += width;
+        ++count;
+    }
+    return count;
+}
 Decoded read_payload(std::span<const std::byte> bytes, const Image &image, const AnalysisOptions &options,
                      const AnalysisKey &key, std::stop_token stop) {
     Reader in{bytes, stop};
     auto marker = in.read(4);
     require(std::equal(marker.begin(), marker.end(), magic.begin()), "Unknown derived cache magic");
-    require(in.number(2) == derived_cache_version, "Unknown derived cache version", ErrorCode::unsupported);
-    require(in.key() == key, "Derived cache source key differs from the requested revision");
+    const auto version = in.number(2);
+    require(version == 53 || version == 54 || version == 55 || version == 56 || version == 57 || version == 58 || version == 59 || version == 60 || version == 63 || version == 64 || version == 65 || version == 66 || version == 67 || version == 68 || version == 69 || version == 70 || version == 71 || version == 72 || version == 73 ||
+                version == 87 || version == 88 || version == 89 || version == 90 || version == 91 || version == derived_cache_version,
+            "Unknown derived cache version", ErrorCode::unsupported);
+    require(in.key(version >= 54) == key, "Derived cache source key differs from the requested revision");
     auto context = in.context();
     require(context == image.decode_context(), "Cached processor context differs from the current loaded image");
     Decoded out;
@@ -417,7 +525,11 @@ Decoded read_payload(std::span<const std::byte> bytes, const Image &image, const
         auto seeds = in.count(16);
         for (size_t j = 0; j < seeds; ++j) {
             auto kind = in.number(1);
-            require(kind <= static_cast<unsigned>(FunctionSeedKind::pogo), "Unknown cached function seed kind");
+            require(kind <= static_cast<unsigned>(version >= derived_cache_version ? FunctionSeedKind::dwarf_entry_point
+                                            : version >= 87 ? FunctionSeedKind::m6502_irq_vector
+                                            : version >= 59 ? FunctionSeedKind::dwarf_subprogram
+                                                            : FunctionSeedKind::wasm_defined),
+                    "Unknown cached function seed kind");
             FunctionSeed seed{static_cast<FunctionSeedKind>(kind), in.address(), in.optional_address(), {}};
             if (in.flag())
                 seed.decision = in.number();
@@ -427,7 +539,9 @@ Decoded read_payload(std::span<const std::byte> bytes, const Image &image, const
             if (in.flag()) {
                 FunctionSeedInitializerEvidence evidence;
                 const auto source = in.number(1);
-                require(source <= static_cast<unsigned>(FunctionInitializerSource::macho_routines),
+                require(source <= static_cast<unsigned>(version >= 91 ? FunctionInitializerSource::elf_dtors_section
+                                                 : version >= 74 ? FunctionInitializerSource::elf_fini_array_section
+                                                                       : FunctionInitializerSource::macho_mod_term_func),
                         "Unknown cached initializer source kind");
                 evidence.source = static_cast<FunctionInitializerSource>(source);
                 if (in.flag()) evidence.section = static_cast<std::uint32_t>(in.number(4));
@@ -448,11 +562,50 @@ Decoded read_payload(std::span<const std::byte> bytes, const Image &image, const
                 seed.pogo_evidence = FunctionSeedPogoEvidence{static_cast<std::uint32_t>(in.number(4)),
                                                                static_cast<std::uint32_t>(in.number(4)),
                                                                in.number(), in.number()};
+            if (in.flag())
+                seed.wasm_export_evidence = FunctionSeedWasmExportEvidence{
+                    static_cast<std::uint32_t>(in.number(4)), static_cast<std::uint32_t>(in.number(4)),
+                    static_cast<std::uint32_t>(in.number(4)), in.number(), in.number()};
+            if (in.flag())
+                seed.wasm_start_evidence = FunctionSeedWasmStartEvidence{
+                    static_cast<std::uint32_t>(in.number(4)), static_cast<std::uint32_t>(in.number(4)),
+                    in.number(), in.number()};
+            if (in.flag())
+                seed.wasm_element_evidence = FunctionSeedWasmElementEvidence{
+                    static_cast<std::uint32_t>(in.number(4)), static_cast<std::uint32_t>(in.number(4)),
+                    static_cast<std::uint32_t>(in.number(4)), static_cast<std::uint32_t>(in.number(4)),
+                    in.number(), in.number(), in.number()};
+            if (in.flag())
+                seed.wasm_defined_evidence = FunctionSeedWasmDefinedEvidence{
+                    static_cast<std::uint32_t>(in.number(4)), static_cast<std::uint32_t>(in.number(4)), in.number()};
+            if (version >= 59 && in.flag())
+                seed.dwarf_evidence = FunctionSeedDwarfEvidence{in.number(), in.number(), in.number()};
             require((seed.kind == FunctionSeedKind::unwind) == seed.unwind_evidence.has_value() &&
                         (!seed.unwind_evidence || seed.unwind_evidence->record_size > 0) &&
                         ((seed.kind == FunctionSeedKind::initializer) == seed.initializer_evidence.has_value()) &&
                         ((seed.kind == FunctionSeedKind::pogo) == seed.pogo_evidence.has_value()) &&
-                        (!seed.pogo_evidence || seed.pogo_evidence->record_size > 0),
+                        (!seed.pogo_evidence || seed.pogo_evidence->record_size > 0) &&
+                        ((seed.kind == FunctionSeedKind::wasm_export) == seed.wasm_export_evidence.has_value()) &&
+                        (!seed.wasm_export_evidence ||
+                         seed.wasm_export_evidence->section_file_offset <= seed.wasm_export_evidence->entry_file_offset) &&
+                        ((seed.kind == FunctionSeedKind::wasm_start) == seed.wasm_start_evidence.has_value()) &&
+                        (!seed.wasm_start_evidence ||
+                         seed.wasm_start_evidence->section_file_offset <= seed.wasm_start_evidence->entry_file_offset) &&
+                        ((seed.kind == FunctionSeedKind::wasm_element) == seed.wasm_element_evidence.has_value()) &&
+                        (!seed.wasm_element_evidence ||
+                         (seed.wasm_element_evidence->section_file_offset <= seed.wasm_element_evidence->entry_file_offset &&
+                          seed.wasm_element_evidence->function_index == seed.entry.space.value &&
+                          seed.entry.offset == 0)) &&
+                        ((seed.kind == FunctionSeedKind::wasm_defined) == seed.wasm_defined_evidence.has_value()) &&
+                        (!seed.wasm_defined_evidence ||
+                         (seed.wasm_defined_evidence->function_index == seed.entry.space.value && seed.entry.offset == 0 &&
+                          seed.wasm_defined_evidence->body_file_offset < image.storage()->size())) &&
+                        ((seed.kind == FunctionSeedKind::dwarf_subprogram ||
+                          seed.kind == FunctionSeedKind::dwarf_entry_point) == seed.dwarf_evidence.has_value()) &&
+                        (!seed.dwarf_evidence || seed.dwarf_evidence->record_size > 0) &&
+                        (!(seed.kind == FunctionSeedKind::m6502_nmi_vector ||
+                           seed.kind == FunctionSeedKind::m6502_reset_vector ||
+                           seed.kind == FunctionSeedKind::m6502_irq_vector) || seed.source.has_value()),
                     "Invalid cached function seed evidence");
             function->seeds.push_back(std::move(seed));
         }
@@ -470,6 +623,15 @@ Decoded read_payload(std::span<const std::byte> bytes, const Image &image, const
         if (in.flag())
             call.callee = FunctionId{in.number()};
         call.tail_candidate = in.flag();
+        if (in.flag()) {
+            ExternalIdentity external;
+            external.library = in.text();
+            if (in.flag()) external.name = in.text();
+            if (in.flag()) external.ordinal = static_cast<std::uint16_t>(in.number(2));
+            if (in.flag()) external.wasm_function_index = static_cast<std::uint32_t>(in.number(4));
+            if (in.flag()) external.host_binding = in.text();
+            call.external_target = std::move(external);
+        }
         snapshot->calls.push_back(call);
     }
     auto candidates = in.count(18);
@@ -523,7 +685,24 @@ Decoded read_payload(std::span<const std::byte> bytes, const Image &image, const
                 require(block_ids.contains(block), "Cached chunk refers to an unknown block");
     }
     for (auto &call : snapshot->calls)
-        require(function_ids.contains(call.owner) && (!call.callee || function_ids.contains(*call.callee)),
+        require(function_ids.contains(call.owner) && (!call.callee || function_ids.contains(*call.callee)) &&
+                    (!call.external_target || ([&] {
+                        const auto &external = *call.external_target;
+                        const bool common = !call.target && !call.callee && !call.tail_candidate &&
+                            external.library.size() <= 65536 &&
+                            external.library.find('\0') == std::string::npos &&
+                            (!external.name || (external.name->size() <= 65536 &&
+                                                external.name->find('\0') == std::string::npos));
+                        const bool wasm = external.wasm_function_index && external.name && !external.ordinal &&
+                            (!external.host_binding || (!external.host_binding->empty() &&
+                                external.host_binding->size() <= 4096 &&
+                                external.host_binding->find('\0') == std::string::npos));
+                        const bool native = !external.wasm_function_index && !external.host_binding &&
+                            !external.library.empty() &&
+                            (external.name.has_value() != external.ordinal.has_value()) &&
+                            (!external.name || !external.name->empty());
+                        return common && (wasm || native);
+                    }())),
                 "Cached call has an unknown function association");
     (void)take(DependencyIndex::create(snapshot->dependencies, stop));
     auto reference_size = in.number(4);
@@ -536,7 +715,15 @@ Decoded read_payload(std::span<const std::byte> bytes, const Image &image, const
     auto records = in.count(31);
     for (size_t i = 0; i < records; ++i) {
         auto kind = in.number(1);
-        require(kind <= static_cast<unsigned>(StringEncoding::iso8859_9), "Unknown cached string encoding");
+        const auto maximum_string_encoding = version >= 89 ? StringEncoding::windows932 :
+            version >= 75 ? StringEncoding::ebcdic_cp1140 :
+            version >= 72 ? StringEncoding::ebcdic_cp1047 :
+            version >= 68 ? StringEncoding::ebcdic_cp500 :
+            version >= 66 ? StringEncoding::ebcdic_cp037 :
+            version >= 62 ? StringEncoding::mac_cyrillic :
+            version >= 61 ? StringEncoding::koi8_u :
+            version >= 58 ? StringEncoding::windows874 : StringEncoding::iso8859_11;
+        require(kind <= static_cast<unsigned>(maximum_string_encoding), "Unknown cached string encoding");
         StringRecord record{};
         record.encoding = static_cast<StringEncoding>(kind);
         record.preview = in.text(1024);
@@ -548,6 +735,13 @@ Decoded read_payload(std::span<const std::byte> bytes, const Image &image, const
         require(record.characters && record.byte_length && record.file_offset.value <= image.storage()->size() &&
                     record.byte_length <= image.storage()->size() - record.file_offset.value,
                 "Cached string exceeds effective input");
+        const auto preview_characters = utf8_scalar_count(record.preview);
+        require(preview_characters && *preview_characters == std::min<std::uint64_t>(record.characters, 256),
+                "Cached string preview is malformed or inconsistent with its character count");
+        const auto expected_address = image.to_address(record.file_offset);
+        require(static_cast<bool>(expected_address) == record.address.has_value() &&
+                    (!record.address || *record.address == expected_address.value()),
+                "Cached string address does not match its source file offset");
         strings->records.push_back(std::move(record));
     }
     auto diagnostics = in.count(6);
@@ -561,6 +755,7 @@ Decoded read_payload(std::span<const std::byte> bytes, const Image &image, const
     auto stack_count = in.count(14);
     require(stack_count <= snapshot->functions.size(), "Cached stack frame table exceeds function count");
     std::size_t total_stack_access_details = 0;
+    std::size_t total_stack_call_arguments = 0;
     for (size_t i = 0; i < stack_count; ++i) {
         FunctionStackRecord record;
         record.function = {in.number()};
@@ -587,6 +782,42 @@ Decoded read_payload(std::span<const std::byte> bytes, const Image &image, const
             total_stack_access_details += details;
             for (size_t a = 0; a < details; ++a)
                 slot.access_details.push_back({in.address(), in.flag(), in.flag(), in.flag()});
+            slot.incoming_argument = in.flag();
+            if (version >= 54 && in.flag()) {
+                const auto abi = in.number(1);
+                const auto maximum_stack_argument_abi = version >= 88 ? StackArgumentAbi::mips_n64
+                    : version >= 83 ? StackArgumentAbi::x86_32_callee_cleanup
+                    : version >= 73 ? StackArgumentAbi::ppc64le_elfv2
+                    : version >= 65 ? StackArgumentAbi::mips_o32
+                    : version >= 64 ? StackArgumentAbi::aapcs32
+                                    : version >= 60 ? StackArgumentAbi::riscv64 : StackArgumentAbi::aapcs64;
+                require(abi <= static_cast<std::uint8_t>(maximum_stack_argument_abi),
+                        "Cached stack argument ABI is invalid");
+                slot.incoming_argument_abi = static_cast<StackArgumentAbi>(abi);
+            }
+            auto call_arguments = in.count(24);
+            require(call_arguments <= 4'000'000 - total_stack_call_arguments,
+                    "Cached stack call-argument provenance exceeds budget", ErrorCode::resource_limit);
+            total_stack_call_arguments += call_arguments;
+            for (size_t a = 0; a < call_arguments; ++a) {
+                const auto source = in.address();
+                const auto call = in.address();
+                StackCallArgumentSourceKind kind = StackCallArgumentSourceKind::x86_push;
+                if (version >= 56) {
+                    const auto raw_kind = in.number(1);
+                    const auto maximum_source_kind = version >= 71
+                        ? StackCallArgumentSourceKind::aapcs32_store
+                        : version >= 70 ? StackCallArgumentSourceKind::mips_store
+                        : version >= 69 ? StackCallArgumentSourceKind::powerpc_store
+                        : version >= 67 ? StackCallArgumentSourceKind::riscv_store
+                        : version >= 63 ? StackCallArgumentSourceKind::windows_x64_shadow_store
+                        : StackCallArgumentSourceKind::aarch64_store;
+                    require(raw_kind <= static_cast<std::uint8_t>(maximum_source_kind),
+                            "Cached stack call-argument source kind is invalid");
+                    kind = static_cast<StackCallArgumentSourceKind>(raw_kind);
+                }
+                slot.outgoing_call_arguments.push_back({source, call, kind});
+            }
             record.frame.slots.push_back(std::move(slot));
         }
         out.proposal.stack_frames.push_back(std::move(record));
@@ -619,6 +850,9 @@ Result<std::vector<std::byte>> encode_derived(const DerivedProposal &proposal, s
         using namespace derived_detail;
         validations = 0;
         canceled(stop);
+        require(semantic_decoder_read_set_complete(options),
+                "Cannot persist derived analysis with undeclared semantic decoder external reads",
+                ErrorCode::conflict);
         auto bytes = payload(proposal, stop, true, &validations, options);
         auto digest = checksum(bytes, stop);
         require(digest.size() <= derived_payload_limit - bytes.size(), "Derived cache checksum exceeds payload budget",
@@ -639,9 +873,12 @@ Result<AnalysisKey> inspect_derived_key(std::span<const std::byte> bytes, std::s
         Reader in{body, stop};
         auto marker = in.read(4);
         require(std::equal(marker.begin(), marker.end(), magic.begin()), "Unknown derived cache envelope magic");
-        require(in.number(2) == derived_cache_version, "Unknown derived cache envelope version",
+        const auto version = in.number(2);
+        require(version == 53 || version == 54 || version == 55 || version == 56 || version == 57 || version == 58 || version == 59 || version == 60 || version == 63 || version == 64 || version == 65 || version == 66 || version == 67 || version == 68 || version == 69 || version == 70 || version == 71 || version == 72 || version == 73 ||
+                    version == 87 || version == 88 || version == 89 || version == 90 || version == 91 || version == derived_cache_version,
+                "Unknown derived cache envelope version",
                 ErrorCode::unsupported);
-        auto key = in.key();
+        auto key = in.key(version >= 54);
         (void)in.context();
         return key;
     });
@@ -652,6 +889,9 @@ Result<DerivedProposal> decode_derived(std::span<const std::byte> bytes, const I
     return derived_detail::guarded([&]() -> Result<DerivedProposal> {
         using namespace derived_detail;
         canceled(stop);
+        require(semantic_decoder_read_set_complete(options),
+                "Cannot reuse derived cache with undeclared semantic decoder external reads",
+                ErrorCode::conflict);
         require(bytes.size() >= 180 && bytes.size() <= derived_payload_limit, "Invalid derived cache payload extent");
         require(key.input.size == image.storage()->size() &&
                     key.engine_fingerprint == function_engine_fingerprint(options),
@@ -691,14 +931,15 @@ Result<DerivedProposal> decode_derived(std::span<const std::byte> bytes, const I
                     function_view.blocks.push_back(block->second);
             }
             expected.stack_frames.push_back(
-                {function->id, take(analyze_stack_frame(*function, function_view, stop))});
+                {function->id, take(analyze_stack_frame(*function, function_view, stop,
+                                                       default_stack_calling_convention(metadata)))});
         }
         expected.references = take(derive_references(image, *expected.functions, metadata, decisions, stop));
         expected.strings = std::make_shared<const StringScan>(take(find_strings(image, options, stop)));
         expected.complete =
             expected.functions->complete && expected.references->complete() && expected.strings->complete;
         auto canonical = payload(expected, stop, false);
-        require(canonical.size() == body.size() && std::equal(canonical.begin(), canonical.end(), body.begin()),
+        require(equal_payload(canonical, body, stop),
                 "Cached derivation differs from current rooted analysis");
         auto &counters = decoded.proposal.counters;
         counters.cache_validation_decodes += recovery.decoded_instructions;

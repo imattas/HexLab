@@ -105,7 +105,9 @@ class ProjectPresentationIndex {
                 m.eh_frame_functions.size(),
                 eh_frame_call_site_rows_.size(),
                 eh_frame_action_rows_.size(),
-                eh_frame_type_info_rows_.size()};
+                eh_frame_type_info_rows_.size(),
+                m.chain_start_offsets.size(),
+                m.dyld_environments.size()};
             std::uint64_t end = 0;
             for (std::size_t n = 0; n < counts.size(); ++n) {
                 canceled(stop);
@@ -307,6 +309,12 @@ class ProjectPresentationIndex {
             source = m.chained_pointers[index].file_place
                          ? m.chained_pointers[index].file_place->value
                          : m.chained_starts[m.chained_pointers[index].starts].record_file_offset;
+            break;
+        case MachOMetadataKind::chain_start_offset:
+            source = m.chain_start_offsets[index].record_file_offset;
+            break;
+        case MachOMetadataKind::dyld_environment:
+            source = m.dyld_environments[index].record_file_offset;
             break;
         case MachOMetadataKind::data_in_code_table:
             source = m.data_in_code_tables[index].offset.value;
@@ -557,7 +565,7 @@ std::string presentation_name(const ProjectSnapshot &snapshot, Location location
         while (occupied(name))
             name += "_";
     }
-    auto rendered = hexlab::symbols::demangle_cpp_name(name);
+    auto rendered = hexlab::symbols::demangle_symbol_name(name);
     return rendered.status == hexlab::symbols::DemangleStatus::demangled ? rendered.text : name;
 }
 LocationPresentation presentation_at(const ProjectSnapshot &snapshot, Location location) {

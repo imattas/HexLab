@@ -60,11 +60,30 @@ those side effects. A sidecar is advisory metadata, not authentication or a
 sandbox.
 
 **Unload Selected** retains its existing refusal to remove a provider with live
-consumers. **Unload With Dependents** explicitly removes the selected plugin and
-all loaded plugins that depend on it, stopping consumers first. It preserves
+consumers. **Review Unload With Dependents...** previews the selected plugin and
+all loaded plugins that depend on it; after acceptance it stops consumers first. It preserves
 providers that the selected plugin uses and any unrelated plugins. Desktop
 shutdown also stops consumers before providers on the same lifecycle thread used
 for activation.
+
+## Reviewed cleanup API
+
+`PluginManager::plan_unload(root_plugin_id, all)` returns the exact consumer-first
+IDs plus directly retained providers without stopping code. `all=true` ignores
+the root and reviews the whole loaded inventory. The plan contains an opaque
+weak manager identity and generation. `unload_reviewed(plan)` holds the lifecycle
+lock, checks that same manager/generation, recomputes the set/order, and rejects
+any stale or changed plan before removal. Plans are limited to 256 loaded
+modules, 4,096 resolved edges and 64 KiB of loaded IDs.
+
+Successful execution returns `PluginUnloadResult::removed`. A normal failure
+after cleanup starts is returned in `failure` together with the exact removed
+prefix, allowing clients to invalidate providers even after partial cleanup.
+Pre-execution validation errors return an error without removing anything.
+Callers should refresh inventory after an unexpected exception; native code is
+trusted and neither unload API guarantees that a plugin's `stop` callback returns.
+The desktop prepares plans off the UI thread and asks the user to accept the
+complete bounded list before invoking this API.
 
 ## C++ host API
 

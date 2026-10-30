@@ -134,6 +134,7 @@ Result<std::size_t> read_load_configuration(const Image& image, const Directory&
         const std::size_t table_at = pe64 ? 128 : 80;
         const std::size_t count_at = pe64 ? 136 : 84;
         const std::size_t flags_at = pe64 ? 144 : 88;
+        const std::size_t code_integrity_at = pe64 ? 148 : 92;
         const std::size_t address_taken_table_at = pe64 ? 160 : 104;
         const std::size_t address_taken_count_at = pe64 ? 168 : 108;
         const std::size_t long_jump_table_at = pe64 ? 176 : 112;
@@ -196,10 +197,18 @@ Result<std::size_t> read_load_configuration(const Image& image, const Directory&
         PeLoadConfiguration result;
         result.declared_size = declared;
         result.directory_source = PeRecordSource{0, reader.sources(directory.location, declared)};
+        result.declared_size_source = PeRecordSource{0, reader.sources(directory.location, 4)};
         if (declared >= 12) {
             result.timestamp = u32(4);
             result.major_version = u16(8);
             result.minor_version = u16(10);
+            result.version_source = PeRecordSource{0, reader.sources(directory.location + 8, 4)};
+        }
+        if (declared >= code_integrity_at + 12) {
+            result.code_integrity = PeLoadConfigCodeIntegrity{
+                u16(code_integrity_at), u16(code_integrity_at + 2),
+                u32(code_integrity_at + 4), u32(code_integrity_at + 8),
+                PeRecordSource{0, reader.sources(directory.location + code_integrity_at, 12)}};
         }
         if (declared >= cookie_at + width) {
             const auto value = pointer(cookie_at);
@@ -248,6 +257,12 @@ Result<std::size_t> read_load_configuration(const Image& image, const Directory&
             const auto table = pointer(table_at);
             const auto count = pe64 ? u64(count_at) : u32(count_at);
             result.guard_flags = u32(flags_at);
+            result.guard_flags_source = PeRecordSource{0, reader.sources(directory.location + flags_at, 4)};
+            result.guard_function_table_count = count;
+            result.guard_function_table_pointer_source = PeRecordSource{
+                0, reader.sources(directory.location + table_at, width)};
+            result.guard_function_table_count_source = PeRecordSource{
+                0, reader.sources(directory.location + count_at, width)};
             if (check) result.guard_check_rva = normalize(check, "Guard CF check pointer");
             if (dispatch) result.guard_dispatch_rva = normalize(dispatch, "Guard CF dispatch pointer");
             require((table == 0) == (count == 0), "Inconsistent PE Guard CF function table and count");

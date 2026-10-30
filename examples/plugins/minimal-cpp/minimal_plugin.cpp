@@ -29,6 +29,14 @@ int32_t start(const HexLabHostApi* host, void** instance) {
         *instance = nullptr;
         return -1;
     }
+    if (HEXLAB_PLUGIN_HAS_FIELD(host, HexLabHostApi, register_menu_action) &&
+        host->register_menu_action &&
+        host->register_menu_action(host->host_context, "Examples/Native SDK",
+                                   "hello-cpp-menu", "Hello from menu", state, hello) != 0) {
+        delete state;
+        *instance = nullptr;
+        return -1;
+    }
     return 0;
 }
 

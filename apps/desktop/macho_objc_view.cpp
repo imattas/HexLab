@@ -84,7 +84,9 @@ void add_method(std::vector<MachOObjCViewRow> &rows, const MachOObjCMethod &meth
 void add_property(std::vector<MachOObjCViewRow> &rows, const MachOObjCProperty &property,
                   const std::string &owner, std::string kind) {
     add(rows, std::move(kind), owner, value(property.name),
-        "name=" + property.name_status + "; attributes=" + property.attributes_status + "; type=" + property.type_status,
+        "name=" + property.name_status + "; attributes=" + property.attributes_status + "; type=" + property.type_status +
+            "; backing-ivar-link=" + property.backing_ivar_link_status +
+            "; getter-link=" + property.getter_link_status + "; setter-link=" + property.setter_link_status,
         "property entry " + number(property.entry.offset),
         "attributes=" + value(property.attributes) + "; encoding=" + value(property.type_encoding) +
             "; semantics=" + property.attribute_semantics_status +
@@ -94,7 +96,12 @@ void add_property(std::vector<MachOObjCViewRow> &rows, const MachOObjCProperty &
             "; dynamic=" + (property.dynamic ? "yes" : "no") +
             "; getter=" + property.custom_getter.value_or("default") +
             "; setter=" + property.custom_setter.value_or("default") +
-            "; backing-ivar=" + property.backing_ivar.value_or("unspecified"), property.entry);
+            "; backing-ivar=" + property.backing_ivar.value_or("unspecified") +
+            "; backing-ivar-index=" + (property.backing_ivar_index
+                ? std::to_string(*property.backing_ivar_index) : "unavailable") +
+            "; getter-method=" + (property.getter_method ? number(property.getter_method->offset) : "unavailable") +
+            "; setter-method=" + (property.setter_method ? number(property.setter_method->offset) : "unavailable"),
+        property.entry);
 }
 
 void add_ivar(std::vector<MachOObjCViewRow> &rows, const MachOObjCIvar &ivar, const std::string &owner) {
@@ -108,8 +115,19 @@ void add_ivar(std::vector<MachOObjCViewRow> &rows, const MachOObjCIvar &ivar, co
 
 void add_protocol_reference(std::vector<MachOObjCViewRow> &rows, const MachOObjCProtocolReference &reference,
                             const std::string &owner, const std::string &kind) {
+    std::string requirements = "; required-methods=" + reference.conformance_status;
+    constexpr std::size_t shown_limit = 64;
+    for (std::size_t i = 0; i < std::min(shown_limit, reference.requirements.size()); ++i) {
+        const auto &requirement = reference.requirements[i];
+        requirements += "; ";
+        requirements += requirement.class_method ? "+" : "-";
+        requirements += requirement.selector + "=" + requirement.status;
+    }
+    if (reference.requirements.size() > shown_limit)
+        requirements += "; omitted-requirements=" +
+            std::to_string(reference.requirements.size() - shown_limit);
     add(rows, kind, owner, value(reference.name),
-        "pointer=" + reference.pointer_status + "; name=" + reference.name_status,
+        "pointer=" + reference.pointer_status + "; name=" + reference.name_status + requirements,
         "protocol slot " + number(reference.slot.offset),
         "address=" + (reference.address ? number(reference.address->offset) : "unavailable") +
             "; definition-index=" + (reference.definition_index ? std::to_string(*reference.definition_index) : "unlinked"),
@@ -157,7 +175,8 @@ std::vector<MachOObjCViewRow> macho_objc_view_rows(const MachOObjCScan &scan) {
         add(rows, "Class", owner, value(c.name), c.name_status + "; class pointer=" + c.class_pointer_status +
             (c.complete ? "; record=complete" : "; record=partial"), origin,
             "class=" + (c.class_address ? number(c.class_address->offset) : "unavailable") +
-            "; superclass=" + value(c.superclass_name) + " (" + c.superclass_pointer_status + ")" +
+            "; superclass=" + value(c.superclass_name) + " (pointer=" + c.superclass_pointer_status +
+            "; link=" + c.superclass_link_status + ")" +
             "; instance-size=" + opt_number(c.instance_size) + "; flags=" + opt_number(c.flags) +
             "; flag-semantics=" + (c.flags ? class_ro_flag_names(*c.flags) : "unavailable"),
             c.class_address ? c.class_address : std::optional<Address>{c.classlist_slot});
@@ -180,6 +199,7 @@ std::vector<MachOObjCViewRow> macho_objc_view_rows(const MachOObjCScan &scan) {
                             std::to_string(c.categorylist_index) + " slot " + number(c.categorylist_slot.offset);
         add(rows, "Category", owner, value(c.name), c.name_status + "; pointer=" + c.pointer_status +
             "; target=" + c.target_class_status + "; link=" + c.target_class_link_status +
+            "; class-properties=" + c.class_properties_status +
             (c.complete ? "; record=complete" : "; record=partial"), origin,
             "class=" + value(c.target_class_name) + "; address=" +
             (c.address ? number(c.address->offset) : "unavailable"),
@@ -188,6 +208,7 @@ std::vector<MachOObjCViewRow> macho_objc_view_rows(const MachOObjCScan &scan) {
         add_list(rows, c.class_methods, owner, "Class");
         add_list(rows, c.protocols, owner, "Category");
         add_list(rows, c.instance_properties, owner, "Instance");
+        add_list(rows, c.class_properties, owner, "Class");
     }
     for (std::size_t i = 0; i < scan.protocols.size(); ++i) {
         if (rows.size() >= macho_objc_view_row_limit) { mark_limit(rows); break; }
@@ -196,14 +217,17 @@ std::vector<MachOObjCViewRow> macho_objc_view_rows(const MachOObjCScan &scan) {
         const auto origin = "protolist section #" + std::to_string(p.protolist_section) + " index " +
                             std::to_string(p.protolist_index) + " slot " + number(p.protolist_slot.offset);
         add(rows, "Protocol", owner, value(p.name), p.name_status + "; pointer=" + p.pointer_status +
+            "; class-properties=" + p.class_properties_status +
             (p.complete ? "; record=complete" : "; record=partial"), origin,
-            "address=" + (p.address ? number(p.address->offset) : "unavailable"),
+            "address=" + (p.address ? number(p.address->offset) : "unavailable") +
+            "; runtime-size=" + opt_number(p.runtime_size),
             p.address ? p.address : std::optional<Address>{p.protolist_slot});
         add_list(rows, p.required_instance_methods, owner, "Required instance");
         add_list(rows, p.required_class_methods, owner, "Required class");
         add_list(rows, p.optional_instance_methods, owner, "Optional instance");
         add_list(rows, p.optional_class_methods, owner, "Optional class");
         add_list(rows, p.instance_properties, owner, "Instance");
+        add_list(rows, p.class_properties, owner, "Class");
         add_list(rows, p.adopted_protocols, owner, "Adopted");
     }
     return rows;
@@ -281,6 +305,118 @@ MachOObjCTypeImportPlan macho_objc_type_import_plan(
         }
         return methods;
     };
+    // Build storage independently of class-list order. The base is embedded as
+    // a concrete, method-free aggregate, so later same-name project conflicts
+    // cannot silently change the child's inherited storage.
+    struct ClassLayout {
+        types::TypePtr type;
+        std::string reason;
+        std::size_t depth = 0;
+        bool attempted = false;
+    };
+    std::vector<ClassLayout> layouts(scan.classes.size());
+    const auto make_layout = [&](std::size_t index, const ClassLayout *base) -> ClassLayout {
+        const auto &row = scan.classes[index];
+        const auto fail = [](std::string reason) -> ClassLayout { return {{}, std::move(reason), 0, true}; };
+        if (!row.name || row.name_status != "resolved" || !row.class_address || class_name_counts[*row.name] != 1)
+            return fail("layout lacks a unique resolved class identity");
+        if (!row.instance_start || !row.instance_size || !*row.instance_size ||
+            *row.instance_start > *row.instance_size)
+            return fail("layout has no proven consistent instance extent");
+        if (row.ivars.status != "null" && !row.ivars.status.ends_with("/extent-validated"))
+            return fail("layout has no validated ivar-list extent");
+        std::vector<types::Member> members;
+        std::uint64_t cursor = 0;
+        if (base) {
+            if (!base->type)
+                return fail("superclass has no validated layout: " + base->reason);
+            if (!base->type->size() || *base->type->size() > *row.instance_start)
+                return fail("superclass storage overlaps the declared instance start");
+            members.push_back({"__objc_super", base->type, 0, {}, {}, 1});
+            cursor = *base->type->size();
+        }
+        const auto add_opaque = [&](std::uint64_t end) {
+            if (end == cursor) return true;
+            if (members.size() == 100000) return false;
+            auto byte = types::Type::integer("objc_byte", 1, 1, false);
+            auto padding = byte ? types::Type::array(byte.value(), end - cursor)
+                                : hexlab::Result<types::TypePtr>(byte.error());
+            if (!padding) return false;
+            members.push_back({"__objc_opaque_" + std::to_string(cursor), padding.value(), cursor, {}, {}, 1});
+            cursor = end;
+            return true;
+        };
+        for (const auto &ivar : row.ivars.ivars) {
+            if (!ivar.name || ivar.name_status != "resolved" || !ivar.type_encoding ||
+                ivar.type_status != "resolved" || !ivar.offset || !ivar.size ||
+                *ivar.offset < *row.instance_start || *ivar.offset < cursor ||
+                *ivar.offset > *row.instance_size || *ivar.size > *row.instance_size - *ivar.offset)
+                return fail("ivar lacks a proven type, size, or non-overlapping instance offset");
+            if (members.size() + 1 + (*ivar.offset > cursor ? 1 : 0) > 100000)
+                return fail("layout exceeds the persistent aggregate-member limit");
+            auto parsed = parse_macho_objc_property_encoding(*ivar.type_encoding,
+                MachOObjCEncodingLimits{4096, 32, 256, scan.pointer_bytes});
+            if (!parsed || parsed.value().status != "parsed" || !parsed.value().type ||
+                !parsed.value().type->size() || *parsed.value().type->size() != *ivar.size)
+                return fail("ivar lacks a supported type with a matching encoded size");
+            if (!add_opaque(*ivar.offset))
+                return fail("layout has an unrepresentable opaque storage range");
+            members.push_back({*ivar.name, parsed.value().type, *ivar.offset, {}, {}, 1});
+            cursor = static_cast<std::uint64_t>(*ivar.offset) + *ivar.size;
+        }
+        if (!add_opaque(*row.instance_size))
+            return fail("layout exceeds the member limit or has an unrepresentable instance extent");
+        auto structure = types::Type::structure("ObjC2.Class." + objc_type_component(*row.name),
+                                                std::move(members), *row.instance_size, 1);
+        if (!structure) return fail("layout cannot form a project type: " + structure.error().message);
+        return {structure.value(), {}, base ? base->depth + 1 : 1, true};
+    };
+    constexpr std::size_t superclass_depth_limit = 32;
+    for (std::size_t root = 0; root < scan.classes.size(); ++root) {
+        if (layouts[root].attempted) continue;
+        std::vector<std::size_t> chain;
+        std::size_t current = root;
+        std::string failure;
+        while (!layouts[current].attempted) {
+            if (std::find(chain.begin(), chain.end(), current) != chain.end()) {
+                failure = "superclass chain contains a cycle";
+                break;
+            }
+            if (chain.size() == superclass_depth_limit) {
+                failure = "superclass chain exceeds the 32-class layout depth limit";
+                break;
+            }
+            chain.push_back(current);
+            const auto &row = scan.classes[current];
+            if (!row.superclass_address) {
+                if (row.superclass_pointer_status != "null")
+                    failure = "superclass pointer is unresolved";
+                else if (row.superclass_index)
+                    failure = "null superclass has an inconsistent scanned-class link";
+                break;
+            }
+            if (!row.superclass_index || *row.superclass_index >= scan.classes.size() ||
+                scan.classes[*row.superclass_index].class_address != row.superclass_address) {
+                failure = "superclass is not linked to a scanned class record";
+                break;
+            }
+            current = *row.superclass_index;
+        }
+        if (failure.empty() && layouts[current].attempted && layouts[current].type &&
+            chain.size() + layouts[current].depth > superclass_depth_limit)
+            failure = "superclass chain exceeds the 32-class layout depth limit";
+        if (!failure.empty()) {
+            // Only this root is rejected: an ancestor reached at the depth cap
+            // can still have a valid shorter chain when processed separately.
+            layouts[root] = {{}, std::move(failure), 0, true};
+            continue;
+        }
+        for (auto item = chain.rbegin(); item != chain.rend(); ++item) {
+            const auto &row = scan.classes[*item];
+            const auto *base = row.superclass_index ? &layouts[*row.superclass_index] : nullptr;
+            layouts[*item] = make_layout(*item, base);
+        }
+    }
     for (std::size_t index = 0; index < scan.classes.size(); ++index) {
         const auto &row = scan.classes[index];
         if (!row.name || row.name_status != "resolved" || !row.class_address) {
@@ -326,85 +462,20 @@ MachOObjCTypeImportPlan macho_objc_type_import_plan(
             plan.skipped.push_back("Class " + *row.name + " has too many parsed instance methods for project storage");
             continue;
         }
-        if (!row.instance_size || *row.instance_size == 0) {
-            plan.skipped.push_back("Class " + *row.name + " has no proven instance extent");
+        if (!layouts[index].type) {
+            plan.skipped.push_back("Class " + *row.name + ": " + layouts[index].reason);
             import_instance_methods_without_layout();
             continue;
         }
-        const bool ivar_extent_validated = row.ivars.status == "null" ||
-            row.ivars.status.ends_with("/extent-validated");
-        if (!ivar_extent_validated) {
-            plan.skipped.push_back("Class " + *row.name + " has no validated ivar-list extent");
-            import_instance_methods_without_layout();
-            continue;
-        }
-        std::vector<types::Member> members;
-        std::uint64_t cursor = 0;
-        bool valid = true;
-        bool member_limit_exceeded = false;
-        for (const auto &ivar : row.ivars.ivars) {
-            if (!ivar.name || ivar.name_status != "resolved" || !ivar.type_encoding ||
-                ivar.type_status != "resolved" || !ivar.offset || !ivar.size || *ivar.offset < cursor ||
-                *ivar.offset > *row.instance_size || *ivar.size > *row.instance_size - *ivar.offset) {
-                valid = false; break;
-            }
-            const std::size_t needed_members = 1 + (*ivar.offset > cursor ? 1 : 0);
-            if (members.size() + needed_members > 100000) {
-                member_limit_exceeded = true;
-                valid = false;
-                break;
-            }
-            auto parsed = parse_macho_objc_property_encoding(*ivar.type_encoding,
-                MachOObjCEncodingLimits{4096, 32, 256, scan.pointer_bytes});
-            if (!parsed || parsed.value().status != "parsed" || !parsed.value().type ||
-                !parsed.value().type->size() || *parsed.value().type->size() != *ivar.size) {
-                valid = false; break;
-            }
-            if (*ivar.offset > cursor) {
-                auto byte = types::Type::integer("objc_byte", 1, 1, false);
-                auto padding = byte ? types::Type::array(byte.value(), *ivar.offset - cursor) : hexlab::Result<types::TypePtr>(byte.error());
-                if (!padding) { valid = false; break; }
-                members.push_back({"__objc_opaque_" + std::to_string(cursor), padding.value(), cursor,
-                                   {}, {}, 1});
-            }
-            members.push_back({*ivar.name, parsed.value().type, *ivar.offset, {}, {}, 1});
-            cursor = static_cast<std::uint64_t>(*ivar.offset) + *ivar.size;
-        }
-        if (!valid) {
-            plan.skipped.push_back(member_limit_exceeded
-                ? "Class " + *row.name + " exceeds the persistent aggregate-member limit"
-                : "Class " + *row.name + " has an ivar without a proven type, size, or non-overlapping offset");
-            import_instance_methods_without_layout();
-            continue;
-        }
-        if (cursor < *row.instance_size) {
-            if (members.size() == 100000) {
-                plan.skipped.push_back("Class " + *row.name + " exceeds the persistent aggregate-member limit");
-                import_instance_methods_without_layout();
-                continue;
-            }
-            auto byte = types::Type::integer("objc_byte", 1, 1, false);
-            auto padding = byte ? types::Type::array(byte.value(), *row.instance_size - cursor) : hexlab::Result<types::TypePtr>(byte.error());
-            if (!padding) { plan.skipped.push_back("Class " + *row.name + " has an unrepresentable instance extent"); continue; }
-            members.push_back({"__objc_opaque_" + std::to_string(cursor), padding.value(), cursor, {}, {}, 1});
-        }
-        if (members.empty()) {
-            plan.skipped.push_back("Class " + *row.name + " has no representable instance storage");
-            import_instance_methods_without_layout();
-            continue;
-        }
-        auto structure = types::Type::structure(class_type_name, std::move(members),
-                                                *row.instance_size, 1);
-        if (!structure) { plan.skipped.push_back("Class " + *row.name + ": " + structure.error().message); import_instance_methods_without_layout(); continue; }
-        auto class_type = types::Type::with_methods(structure.value(), *instance_methods);
+        auto class_type = types::Type::with_methods(layouts[index].type, *instance_methods);
         if (!class_type) { plan.skipped.push_back("Class " + *row.name + " has invalid method declarations"); continue; }
         add_definition(class_type_name, class_type.value(), "__objc_classlist",
                        row.classlist_index, row.class_address->offset, *row.instance_size);
 
     }
-    // Category declarations have their own source records and provenance. Keep
-    // them as separate incomplete aggregates: merging category methods into a
-    // class layout would falsely attribute those declarations to class_ro_t.
+    // Category declarations have their own source records and provenance.
+    // Category properties describe accessors; they do not prove instance
+    // storage in the target class and must not be inserted into its layout.
     std::unordered_map<std::string, std::size_t> category_name_counts;
     for (const auto &category : scan.categories) {
         if (category.name && category.name_status == "resolved" && category.target_class_name &&
@@ -431,8 +502,113 @@ MachOObjCTypeImportPlan macho_objc_type_import_plan(
             plan.skipped.push_back("Category " + *category.name + " has too many parsed methods for project storage");
             continue;
         }
+
+        // A property declaration provides accessor selector/type semantics but
+        // no proof of backing storage. Model the accessors as instance methods
+        // on the category declaration and leave class instance layout alone.
+        const auto class_reference = types::Type::named_reference(
+            "ObjC2.Class." + objc_type_component(*category.target_class_name));
+        const auto self_type = class_reference
+            ? types::Type::pointer(class_reference.value(), scan.pointer_bytes, scan.pointer_bytes)
+            : hexlab::Result<types::TypePtr>(class_reference.error());
+        const auto selector_type = types::Type::pointer(types::Type::void_type(),
+                                                        scan.pointer_bytes, scan.pointer_bytes);
+        const auto accessor = [&](std::string selector, types::TypePtr return_type,
+                                  const types::TypePtr &argument) -> bool {
+            if (selector.empty()) return false;
+            const auto already_declared = std::any_of(instance_methods->begin(), instance_methods->end(),
+                [&](const auto &method) { return method.name == selector; });
+            if (already_declared) return true;
+            if (instance_methods->size() >= 100000 || !self_type || !selector_type || !return_type)
+                return false;
+            std::vector<types::Parameter> parameters;
+            parameters.push_back({"self", self_type.value()});
+            parameters.push_back({"_cmd", selector_type.value()});
+            if (argument) parameters.push_back({"value", argument});
+            auto signature = types::Type::function(std::move(return_type), std::move(parameters), false);
+            if (!signature) return false;
+            instance_methods->push_back({std::move(selector), signature.value(),
+                                         types::MemberAccess::unknown,
+                                         types::MemberDispatch::unknown, 0, false});
+            return true;
+        };
+        for (const auto &property : category.instance_properties.properties) {
+            if (!property.name || property.name_status != "resolved" || !property.type ||
+                property.type_status != "parsed" ||
+                (property.attribute_semantics_status != "parsed" &&
+                 property.attribute_semantics_status != "parsed-with-unknown-attributes"))
+                continue;
+            auto getter = property.custom_getter.value_or(*property.name);
+            if (!accessor(std::move(getter), property.type, {})) {
+                plan.skipped.push_back("Category " + *category.name + " property " + *property.name +
+                                       " getter could not be represented as a method signature");
+                continue;
+            }
+            if (property.readonly) continue;
+            std::string default_setter = "set";
+            default_setter += *property.name;
+            if (!default_setter.empty() && default_setter.size() > 3 &&
+                default_setter[3] >= 'a' && default_setter[3] <= 'z')
+                default_setter[3] = static_cast<char>(default_setter[3] - 'a' + 'A');
+            default_setter.push_back(':');
+            const auto setter = property.custom_setter.value_or(std::move(default_setter));
+            if (!accessor(setter, types::Type::void_type(), property.type))
+                plan.skipped.push_back("Category " + *category.name + " property " + *property.name +
+                                       " setter could not be represented as a method signature");
+        }
+        // Class properties are accessors on the category's class-method list.
+        // Their receiver is the target's metaclass object; they do not add
+        // storage to either the class instance or the metadata aggregate.
+        const auto meta_reference = types::Type::named_reference(
+            "ObjC2.Meta." + objc_type_component(*category.target_class_name));
+        const auto meta_self_type = meta_reference
+            ? types::Type::pointer(meta_reference.value(), scan.pointer_bytes, scan.pointer_bytes)
+            : hexlab::Result<types::TypePtr>(meta_reference.error());
+        const auto class_accessor = [&](std::string selector, types::TypePtr return_type,
+                                        const types::TypePtr &argument) -> bool {
+            if (selector.empty()) return false;
+            const auto already_declared = std::any_of(class_methods->begin(), class_methods->end(),
+                [&](const auto &method) { return method.name == selector; });
+            if (already_declared) return true;
+            if (class_methods->size() >= 100000 || !meta_self_type || !selector_type || !return_type)
+                return false;
+            std::vector<types::Parameter> parameters;
+            parameters.push_back({"self", meta_self_type.value()});
+            parameters.push_back({"_cmd", selector_type.value()});
+            if (argument) parameters.push_back({"value", argument});
+            auto signature = types::Type::function(std::move(return_type), std::move(parameters), false);
+            if (!signature) return false;
+            class_methods->push_back({std::move(selector), signature.value(),
+                                      types::MemberAccess::unknown,
+                                      types::MemberDispatch::unknown, 0, true});
+            return true;
+        };
+        for (const auto &property : category.class_properties.properties) {
+            if (!property.name || property.name_status != "resolved" || !property.type ||
+                property.type_status != "parsed" ||
+                (property.attribute_semantics_status != "parsed" &&
+                 property.attribute_semantics_status != "parsed-with-unknown-attributes"))
+                continue;
+            const auto getter = property.custom_getter.value_or(*property.name);
+            if (!class_accessor(getter, property.type, {})) {
+                plan.skipped.push_back("Category " + *category.name + " class property " + *property.name +
+                                       " getter could not be represented as a method signature");
+                continue;
+            }
+            if (property.readonly) continue;
+            std::string default_setter = "set";
+            default_setter += *property.name;
+            if (default_setter.size() > 3 && default_setter[3] >= 'a' && default_setter[3] <= 'z')
+                default_setter[3] = static_cast<char>(default_setter[3] - 'a' + 'A');
+            default_setter.push_back(':');
+            const auto setter = property.custom_setter.value_or(std::move(default_setter));
+            if (!class_accessor(setter, types::Type::void_type(), property.type))
+                plan.skipped.push_back("Category " + *category.name + " class property " + *property.name +
+                                       " setter could not be represented as a method signature");
+        }
         if (instance_methods->empty() && class_methods->empty()) {
-            plan.skipped.push_back("Category " + *category.name + " has no parsed method signatures to import");
+            plan.skipped.push_back("Category " + *category.name +
+                                   " has no parsed method signatures or representable property accessors to import");
             continue;
         }
         auto type_name = "ObjC2.Category." + objc_type_component(*category.target_class_name) + "." +

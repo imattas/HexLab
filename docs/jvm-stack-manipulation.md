@@ -18,3 +18,12 @@ identities and matching explicit StackMapTable frames. Category-2 values remain
 one logical expression and count as two physical slots. See
 [JVM stack transport](../libs/decompiler/docs/jvm-stack-transport.md) for exact
 frame requirements and the remaining verifier limitations.
+
+The processor API exposes `evaluate_jvm_stack_manipulation_instruction` for
+decoded `pop`, `pop2`, `dup*`, and `swap` bytecodes. Supply the category widths
+of exactly the consumed stack suffix, bottom-to-top, using 1 for category 1
+and 2 for category 2. The result reports the consumed value count and a
+bottom-to-top list of source indices describing the remaining/reordered
+suffix. Illegal category shapes, invalid widths, underflow, and mismatched
+decoded opcode metadata return no result. This is a local stack permutation;
+it does not verify operand types, method frames, or surrounding bytecode.

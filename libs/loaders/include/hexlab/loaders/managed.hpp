@@ -7,6 +7,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <stop_token>
 #include <string>
 #include <vector>
 namespace hexlab {
@@ -15,13 +16,23 @@ struct ManagedTypeSignature;
 struct ManagedStream { std::uint32_t offset=0, size=0; };
 struct ManagedTables { std::uint8_t major=0, minor=0, heap_sizes=0; std::uint64_t valid=0, sorted=0; std::size_t data_offset=0; std::map<std::uint8_t,std::uint32_t> row_counts; std::map<std::uint8_t,std::uint32_t> row_sizes; };
 struct ManagedMetadataRoot { std::string version; std::map<std::string,ManagedStream,std::less<>> streams; ManagedTables tables; };
-struct ManagedPeInfo { std::uint16_t major=0, minor=0; std::uint32_t flags=0, entry_point_token=0; ManagedMetadataRoot metadata; };
+struct ManagedPeInfo {
+  std::uint16_t major=0, minor=0;
+  std::uint32_t flags=0, entry_point_token=0;
+  ManagedMetadataRoot metadata;
+  // IMAGE_COR20_HEADER.Resources. Zero means the PE has no embedded resource directory.
+  std::uint32_t resources_rva=0, resources_size=0;
+};
 struct ManagedGenericParameter {
   std::uint32_t token=0, owner_token=0;
   std::uint16_t number=0, flags=0;
   std::string name;
+  // GenericParam row location relative to the metadata root.
+  std::uint64_t metadata_offset=0;
   // TypeDef, TypeRef, or TypeSpec metadata tokens from GenericParamConstraint.
   std::vector<std::uint32_t> constraint_tokens;
+  // Row locations relative to the metadata root, parallel to constraint_tokens.
+  std::vector<std::uint64_t> constraint_metadata_offsets;
   // Resolved identities in catalog contexts. The token list above remains the
   // authoritative metadata provenance; unresolved external scopes stay marked.
   struct ConstraintIdentity {
@@ -55,8 +66,167 @@ struct ManagedTypeSignature {
   std::shared_ptr<ManagedTypeSignature> type_spec_signature;
   std::vector<ManagedTypeSignature> children;
 };
-struct ManagedMethod { std::uint32_t token=0, rva=0; std::uint16_t impl_flags=0, flags=0; std::string name; std::uint32_t signature_index=0; std::string declaring_type; std::vector<ManagedGenericParameter> generic_parameters, declaring_type_generic_parameters; };
+// Constant table payloads retain exact integer/IEEE floating-point bits and
+// UTF-16 code units. ELEMENT_TYPE_CLASS (0x12) denotes a validated null value.
+// Parent tokens are Field (0x04), Param (0x08), or Property (0x17).
+struct ManagedConstant {
+  std::uint32_t token=0, parent_token=0, blob_index=0;
+  std::uint8_t element_type=0;
+  std::uint64_t scalar_bits=0;
+  std::u16string string_value;
+};
+HEXLAB_LOADERS_EXPORT Result<std::vector<ManagedConstant>> parse_managed_constants(std::span<const std::byte> metadata_root);
+// Custom-attribute values are retained as bounded opaque serialized payloads;
+// this catalog validates parent/constructor tokens and the required prolog.
+struct ManagedCustomAttribute {
+  std::uint32_t token=0, parent_token=0, constructor_token=0, value_blob_index=0;
+  std::uint64_t metadata_offset=0;
+  std::vector<std::byte> serialized_value;
+};
+HEXLAB_LOADERS_EXPORT Result<std::vector<ManagedCustomAttribute>> parse_managed_custom_attributes(std::span<const std::byte> metadata_root);
+// Declarative-security rows retain their HasDeclSecurity parent and the raw
+// permission-set blob. Permission attributes are not evaluated as policy.
+struct ManagedDeclarativeSecurity {
+  std::uint32_t token=0, parent_token=0, permission_set_blob_index=0;
+  std::uint16_t action=0;
+  std::uint64_t metadata_offset=0, permission_set_blob_offset=0;
+  std::vector<std::byte> permission_set;
+};
+HEXLAB_LOADERS_EXPORT Result<std::vector<ManagedDeclarativeSecurity>> parse_managed_declarative_security(
+    std::span<const std::byte> metadata_root);
+// MethodImpl rows bind a class-local method body to a MethodDef or MemberRef
+// declaration. Tokens and row provenance are retained without inferring runtime
+// dispatch or resolving external MemberRefs.
+struct ManagedMethodImplementation {
+  std::uint32_t token=0, class_token=0, body_token=0, declaration_token=0;
+  std::uint64_t metadata_offset=0;
+};
+HEXLAB_LOADERS_EXPORT Result<std::vector<ManagedMethodImplementation>> parse_managed_method_implementations(std::span<const std::byte> metadata_root);
+enum class ManagedMarshalDescriptorStatus : std::uint8_t {
+  decoded_scalar, decoded_array, decoded_custom_marshaler, opaque_unknown
+};
+// FieldMarshal NativeType blobs remain authoritative and are always retained
+// verbatim. Recognized descriptor fields are a bounded derived view.
+struct ManagedMarshalDescriptor {
+  std::uint32_t token=0, parent_token=0, blob_index=0;
+  std::uint64_t metadata_offset=0, blob_data_offset=0;
+  std::vector<std::byte> native_type;
+  ManagedMarshalDescriptorStatus decode_status=ManagedMarshalDescriptorStatus::opaque_unknown;
+  std::string native_type_name;
+  std::optional<std::uint8_t> array_element_type;
+  std::optional<std::uint32_t> array_parameter_index, array_element_count;
+  // Four CustomMarshaler SerStrings in wire order: GUID, unmanaged type,
+  // managed type, cookie. Null SerStrings remain empty optionals.
+  std::vector<std::optional<std::string>> custom_marshaler_strings;
+};
+HEXLAB_LOADERS_EXPORT Result<std::vector<ManagedMarshalDescriptor>> parse_managed_marshal_descriptors(std::span<const std::byte> metadata_root);
+enum class ManagedResourceImplementationKind : std::uint8_t { embedded, file, assembly_ref, exported_type };
+enum class ManagedResourceResolutionState : std::uint8_t {
+  embedded, unresolved, resolved_file, resolved_assembly, ambiguous, hash_mismatch, unsupported_hash
+};
+enum class ManagedResourcePayloadFormat : std::uint8_t { opaque, dotnet_resources_v2, unsupported_dotnet_resources };
+enum class ManagedResourceValueKind : std::uint8_t {
+  null_value, string_value, boolean, character, signed_integer, unsigned_integer,
+  single, double_value, decimal, date_time, time_span, byte_array, stream, user_type, unsupported
+};
+struct ManagedResourceRecord {
+  std::string name;
+  std::uint32_t type_code=0;
+  std::string type_name;
+  ManagedResourceValueKind kind=ManagedResourceValueKind::unsupported;
+  // Scalar records expose the low 64 serialized bits here. Their exact bytes,
+  // including 128-bit Decimal values, remain available through data_offset /
+  // data_size. String text is UTF-8 after strict validation; byte/stream/opaque
+  // data refers into the owning ManagedResource::payload without duplication.
+  std::uint64_t scalar_bits=0;
+  std::string string_value;
+  std::uint32_t data_offset=0, data_size=0;
+  bool supported=false;
+};
+struct ManagedAssemblyIdentity {
+  std::string name, culture;
+  std::uint16_t major=0, minor=0, build=0, revision=0;
+  std::uint32_t flags=0;
+  // The #Blob value is the full public key when flags bit 0 is set, otherwise
+  // the public-key token. It is retained byte-for-byte for exact binding.
+  std::vector<std::byte> public_key_or_token;
+  // Present for the module's Assembly manifest row; AssemblyRef identities
+  // leave these source-local fields unset.
+  std::optional<std::uint32_t> hash_algorithm_id, public_key_blob_index;
+  std::optional<std::uint64_t> metadata_offset, public_key_blob_offset;
+  bool operator==(const ManagedAssemblyIdentity&) const = default;
+};
+struct ManagedResource {
+  std::uint32_t token=0, flags=0, implementation_coded_index=0, implementation_token=0;
+  std::uint32_t data_offset=0, data_size=0;
+  ManagedResourceImplementationKind implementation=ManagedResourceImplementationKind::embedded;
+  std::string name;
+  // External ManifestResource implementations retain their metadata identity.
+  std::string implementation_name, implementation_culture;
+  std::uint16_t implementation_major=0, implementation_minor=0;
+  std::uint16_t implementation_build=0, implementation_revision=0;
+  std::uint32_t implementation_flags=0;
+  std::uint32_t implementation_key_or_token_blob_index=0, implementation_hash_blob_index=0;
+  std::uint32_t implementation_hash_algorithm=0;
+  std::vector<std::byte> implementation_key_or_token, implementation_hash;
+  bool implementation_file_contains_metadata=false;
+  ManagedResourceResolutionState resolution=ManagedResourceResolutionState::embedded;
+  std::string resolution_diagnostic;
+  // Metadata offset points at ManifestResource row. For embedded resources,
+  // payload preserves the exact bytes after the length prefix.
+  std::uint64_t metadata_offset=0;
+  std::uint32_t row_size=0;
+  std::vector<std::byte> payload;
+  ManagedResourcePayloadFormat payload_format=ManagedResourcePayloadFormat::opaque;
+  std::string payload_diagnostic;
+  std::vector<ManagedResourceRecord> records;
+};
+HEXLAB_LOADERS_EXPORT Result<std::vector<ManagedResource>> parse_managed_resources(
+    std::span<const std::byte> metadata_root);
+HEXLAB_LOADERS_EXPORT Result<std::vector<ManagedResource>> inspect_managed_resources(
+    const LoadedImage& loaded);
+class ByteStorage;
+struct ManagedResourceInput {
+  // Exact caller-supplied leaf name used to bind File table entries.
+  std::string file_name;
+  std::shared_ptr<const ByteStorage> storage;
+  // Required for AssemblyRef providers and File rows marked ContainsMetadata.
+  const LoadedImage* loaded_image=nullptr;
+};
+struct ManagedResourceResolutionLimits {
+  std::size_t max_inputs=256;
+  std::uint64_t max_input_bytes=512u*1024u*1024u;
+  std::uint64_t max_payload_bytes=64u*1024u*1024u;
+};
+// Resolves external resource entries only against explicitly supplied inputs.
+// File candidates require an exact name and supported, matching Assembly
+// HashAlgId/File.HashValue. AssemblyRef candidates require an exact identity
+// and unique resource-name match. No host paths are searched.
+HEXLAB_LOADERS_EXPORT Result<std::vector<ManagedResource>> inspect_managed_resources(
+    const LoadedImage& loaded, std::span<const ManagedResourceInput> supplied,
+    const ManagedResourceResolutionLimits& limits={}, std::stop_token stop={});
+struct ManagedParameter {
+  std::uint32_t token=0;
+  // Sequence zero denotes the method return parameter; positive values are
+  // one-based signature parameter indexes.
+  std::uint16_t sequence=0, flags=0;
+  std::string name;
+  std::optional<ManagedConstant> default_value;
+  // FieldMarshal row associated with this Param token, when present.
+  std::optional<ManagedMarshalDescriptor> marshal_descriptor;
+};
+struct ManagedMethodImport {
+  std::uint16_t flags=0;
+  std::string import_name, module_name;
+  std::uint32_t module_token=0;
+};
+struct ManagedMethod { std::uint32_t token=0, rva=0; std::uint16_t impl_flags=0, flags=0; std::string name; std::uint32_t signature_index=0; std::string declaring_type; std::optional<ManagedMethodImport> import_map; std::vector<ManagedGenericParameter> generic_parameters, declaring_type_generic_parameters; std::vector<ManagedParameter> parameters; };
 struct ManagedMethodSignature { std::uint32_t parameter_count=0; bool has_this=false, returns_value=false; std::uint32_t generic_arity=0; ManagedTypeSignature return_type; std::vector<ManagedTypeSignature> parameter_types, method_spec_arguments, declaring_type_arguments; std::uint32_t declaring_type_token=0; std::string declaring_type_name; std::optional<bool> declaring_type_is_value_type; bool declaring_type_generic_arguments_valid=true; };
+struct ManagedLocalVariable { ManagedTypeSignature type; bool pinned=false; };
+// ECMA-335 LocalVarSig entries keyed by their StandAloneSig metadata token.
+using ManagedLocalSignature = std::vector<ManagedLocalVariable>;
+HEXLAB_LOADERS_EXPORT Result<ManagedLocalSignature> decode_managed_local_signature(std::span<const std::byte> signature_blob);
+HEXLAB_LOADERS_EXPORT Result<std::map<std::uint32_t,ManagedLocalSignature>> parse_managed_local_signatures(std::span<const std::byte> metadata_root);
 using ManagedUserStringCatalog = std::map<std::uint32_t, std::u16string>;
 // Decodes a FieldSig blob payload (including the 0x06 FIELD calling-convention
 // byte). Metadata-token names are resolved when parsed through parse_managed_fields.
@@ -80,7 +250,72 @@ struct ManagedField {
   // fields have no substitution context and keep this empty.
   std::vector<ManagedTypeSignature> declaring_type_arguments;
   bool declaring_type_generic_arguments_valid=true;
+  std::optional<ManagedConstant> default_value;
+  // FieldMarshal row associated with this FieldDef token, when present.
+  std::optional<ManagedMarshalDescriptor> marshal_descriptor;
+  // FieldRVA location and metadata-row provenance for initialized static data.
+  std::optional<std::uint32_t> rva;
+  std::optional<std::uint64_t> rva_metadata_offset;
+  // FieldLayout offset and row provenance, when the explicit-layout table has one.
+  std::optional<std::uint32_t> explicit_layout_offset;
+  std::optional<std::uint64_t> layout_metadata_offset;
 };
+struct ManagedFieldLayout {
+  std::uint32_t field_token=0, offset=0;
+  std::uint64_t metadata_offset=0;
+};
+HEXLAB_LOADERS_EXPORT Result<std::vector<ManagedFieldLayout>> parse_managed_field_layouts(std::span<const std::byte> metadata_root);
+struct ManagedFieldRva {
+  std::uint32_t field_token=0, rva=0;
+  std::uint64_t metadata_offset=0;
+};
+HEXLAB_LOADERS_EXPORT Result<std::vector<ManagedFieldRva>> parse_managed_field_rvas(std::span<const std::byte> metadata_root);
+struct ManagedPropertySignature {
+  bool has_this=false;
+  ManagedTypeSignature property_type;
+  std::vector<ManagedTypeSignature> index_parameter_types;
+};
+enum class ManagedPropertyAccessorValidation : std::uint8_t { not_applicable, valid, invalid, unsupported };
+struct ManagedPropertyAccessor {
+  std::uint32_t method_token=0, semantics_token=0;
+  // Setter=1, Getter=2, Other=4. No accessor execution is inferred.
+  std::uint16_t semantics=0;
+  std::uint64_t metadata_offset=0;
+  std::uint32_t signature_index=0, signature_size=0;
+  std::uint64_t signature_metadata_offset=0;
+  ManagedPropertyAccessorValidation validation=ManagedPropertyAccessorValidation::not_applicable;
+  std::string validation_diagnostic;
+};
+struct ManagedProperty {
+  std::uint32_t token=0, declaring_type_token=0, signature_index=0;
+  std::uint16_t flags=0;
+  std::string name, declaring_type, signature_diagnostic;
+  std::optional<ManagedPropertySignature> signature;
+  std::vector<ManagedPropertyAccessor> accessors;
+  std::optional<ManagedConstant> default_value;
+  // Offsets are relative to the original CLR metadata root, not PE RVAs.
+  std::uint64_t metadata_offset=0, signature_metadata_offset=0;
+  std::uint32_t row_size=0, signature_size=0;
+};
+HEXLAB_LOADERS_EXPORT Result<ManagedPropertySignature> decode_managed_property_signature(std::span<const std::byte> signature_blob);
+HEXLAB_LOADERS_EXPORT Result<std::vector<ManagedProperty>> parse_managed_properties(std::span<const std::byte> metadata_root);
+enum class ManagedEventAccessorRole : std::uint16_t { other = 4, add_on = 8, remove_on = 16, fire = 32 };
+struct ManagedEventAccessor {
+  std::uint32_t method_token=0, semantics_token=0;
+  std::uint16_t semantics=0;
+  std::uint64_t metadata_offset=0;
+};
+struct ManagedEvent {
+  std::uint32_t token=0, declaring_type_token=0;
+  std::uint32_t event_type_coded_index=0, event_type_token=0;
+  std::uint16_t flags=0;
+  std::string name, declaring_type;
+  std::vector<ManagedEventAccessor> accessors;
+  // Offsets are relative to the original CLR metadata root.
+  std::uint64_t metadata_offset=0;
+  std::uint32_t row_size=0;
+};
+HEXLAB_LOADERS_EXPORT Result<std::vector<ManagedEvent>> parse_managed_events(std::span<const std::byte> metadata_root);
 struct ManagedTypeDefinition {
   std::uint32_t token=0, flags=0;
   // Zero for top-level types; otherwise the owning TypeDef token from
@@ -93,15 +328,10 @@ struct ManagedTypeDefinition {
   std::string name, namespace_name, full_name;
   std::vector<std::uint32_t> method_tokens;
   std::vector<ManagedGenericParameter> generic_parameters;
-};
-struct ManagedAssemblyIdentity {
-  std::string name, culture;
-  std::uint16_t major=0, minor=0, build=0, revision=0;
-  std::uint32_t flags=0;
-  // The #Blob value is the full public key when flags bit 0 is set, otherwise
-  // the public-key token. It is retained byte-for-byte for exact binding.
-  std::vector<std::byte> public_key_or_token;
-  bool operator==(const ManagedAssemblyIdentity&) const = default;
+  // ClassLayout row values; absent means the type has no explicit ClassLayout row.
+  std::optional<std::uint16_t> packing_size;
+  std::optional<std::uint32_t> declared_class_size;
+  std::optional<std::uint64_t> layout_metadata_offset;
 };
 enum class ManagedTypeResolutionScopeKind { module, module_ref, assembly_ref, nested_type_ref, null_scope };
 struct ManagedTypeReference {

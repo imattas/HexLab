@@ -1,8 +1,11 @@
 
 #include "hexlab/loaders/managed.hpp"
 #include "hexlab/loaders/loaded_image.hpp"
+#include "hexlab/core/sha256.hpp"
+#include "hexlab/image/byte_storage.hpp"
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <compare>
 #include <limits>
 #include <set>
@@ -19,10 +22,10 @@ bool fits(std::size_t p,std::uint64_t n,std::size_t total){return p<=total && n<
 const std::vector<int>& schema(std::uint8_t id){
   using V=std::vector<int>;static const std::array<V,45> s={
     V{2,100,101,101,101},V{300,100,100},V{4,100,100,301,204,206},V{203},V{2,100,102},V{206},V{4,2,2,100,102,208},V{208},V{2,2,100},V{202,301},
-    V{306,100,102},V{2,302,102},V{2,303,102},V{304,102},V{2,305,102},V{2,4,202},V{4,204},V{102},V{202,220},V{220},V{2,100,301},
+    V{306,100,102},V{2,302,102},V{303,311,102},V{304,102},V{2,305,102},V{2,4,202},V{4,204},V{102},V{202,220},V{220},V{2,100,301},
     V{202,223},V{223},V{2,100,102},V{2,206,307},V{202,308,308},V{100},V{102},V{2,309,100,226},V{4,204},V{4,4},V{4},
     V{4,2,2,2,2,4,102,100,100},V{4},V{4,4,4},V{2,2,2,2,4,102,100,100,102},V{4,235},V{4,4,4,235},V{4,100,102},V{4,4,100,100,310},
-    V{4,4,100,310},V{202,202},V{2,2,312,100},V{308,102},V{242,301}
+    V{4,4,100,310},V{202,308,308},V{2,2,312,100},V{308,102},V{242,301}
   };return s[id];
 }
 std::uint32_t coded_width(std::uint8_t id,const std::map<std::uint8_t,std::uint32_t>& rows){
@@ -138,6 +141,31 @@ Result<ManagedTypeSignature> substitute_signature(
   if(result.type_spec_signature){auto next=substitute_signature(*result.type_spec_signature,type_arguments,method_arguments,depth+1,&budget,&active);if(!next)return next.error();result.type_spec_signature=std::make_shared<ManagedTypeSignature>(std::move(next.value()));}
   return result;
 }
+std::optional<bool> same_property_type(const ManagedTypeSignature& left,
+                                      const ManagedTypeSignature& right,unsigned depth=0){
+  if(depth>16)return {};
+  if(left.element_type!=right.element_type)return false;
+  // The current array signature node retains rank but not its optional size
+  // and lower-bound vectors, so rank equality alone is insufficient proof.
+  if(left.element_type==0x14)return {};
+  if(left.generic_index!=right.generic_index||
+     left.metadata_type_token!=right.metadata_type_token||
+     left.metadata_type_coded_index!=right.metadata_type_coded_index||
+     left.generic_instance_is_value_type!=right.generic_instance_is_value_type||
+     left.generic_instance_arity_valid!=right.generic_instance_arity_valid||
+     left.array_rank!=right.array_rank||left.children.size()!=right.children.size()||
+     bool(left.type_spec_signature)!=bool(right.type_spec_signature))return false;
+  if(!left.generic_instance_arity_valid)return {};
+  for(std::size_t i=0;i<left.children.size();++i){
+    const auto equal=same_property_type(left.children[i],right.children[i],depth+1);
+    if(!equal||!*equal)return equal;
+  }
+  if(left.type_spec_signature){
+    const auto equal=same_property_type(*left.type_spec_signature,*right.type_spec_signature,depth+1);
+    if(!equal||!*equal)return equal;
+  }
+  return true;
+}
 }
 
 namespace {
@@ -166,6 +194,35 @@ Result<ManagedMethodSignature> decode_method_signature(std::span<const std::byte
 
 Result<ManagedMethodSignature> decode_managed_method_signature(std::span<const std::byte> b){
   return decode_method_signature(b, false);
+}
+
+Result<ManagedLocalSignature> decode_managed_local_signature(std::span<const std::byte> b){
+  if(b.empty()||std::to_integer<std::uint8_t>(b.front())!=0x07)
+    return malformed("Invalid ECMA-335 LocalVarSig calling convention");
+  std::size_t p=1;
+  auto count=compressed_uint(b,p);if(!count)return count.error();
+  if(count.value()>4096)return Error{ErrorCode::resource_limit,"ECMA-335 local variable count exceeds 4096"};
+  ManagedLocalSignature result;result.reserve(count.value());
+  for(std::uint32_t i=0;i<count.value();++i){
+    bool pinned=false;
+    if(p<b.size()&&std::to_integer<std::uint8_t>(b[p])==0x45){pinned=true;++p;}
+    auto type=signature_type(b,p,0);if(!type)return type.error();
+    result.push_back({std::move(type.value()),pinned});
+  }
+  if(p!=b.size())return malformed("Trailing bytes in ECMA-335 LocalVarSig");
+  return result;
+}
+
+Result<ManagedPropertySignature> decode_managed_property_signature(std::span<const std::byte> b){
+  if(b.empty()||(b[0]!=std::byte{0x08}&&b[0]!=std::byte{0x28}))return malformed("Invalid ECMA-335 PropertySig calling convention");
+  std::size_t p=1;auto count=compressed_uint(b,p);if(!count)return count.error();
+  if(count.value()>1024)return Error{ErrorCode::resource_limit,"PropertySig index parameter count exceeds 1024"};
+  ManagedPropertySignature out;out.has_this=b[0]==std::byte{0x28};
+  auto type=signature_type(b,p,0);if(!type)return type.error();out.property_type=std::move(type.value());
+  out.index_parameter_types.reserve(count.value());
+  for(std::uint32_t i=0;i<count.value();++i){auto parameter=signature_type(b,p,0);if(!parameter)return parameter.error();out.index_parameter_types.push_back(std::move(parameter.value()));}
+  if(p!=b.size())return malformed("Trailing bytes in ECMA-335 PropertySig");
+  return out;
 }
 
 Result<ManagedTypeSignature> decode_managed_field_signature(std::span<const std::byte> b){
@@ -308,6 +365,53 @@ Result<std::map<std::uint32_t,ManagedMethodSignature>> parse_managed_call_signat
     auto substitute=[&](ManagedTypeSignature& type)->Result<bool>{auto value=substitute_signature(type,signature.declaring_type_arguments,signature.method_spec_arguments,0,&substitution_budget);if(!value)return value.error();type=std::move(value.value());return true;};
     auto applied=substitute(signature.return_type);if(!applied)return applied.error();
     for(auto& parameter:signature.parameter_types){applied=substitute(parameter);if(!applied)return applied.error();}
+  }
+  return result;
+}
+
+Result<std::map<std::uint32_t,ManagedLocalSignature>> parse_managed_local_signatures(std::span<const std::byte> root){
+  if(root.size()>64u*1024u*1024u)return Error{ErrorCode::resource_limit,"CLR local-signature root exceeds 64 MiB"};
+  auto metadata=parse_cli_metadata(root);if(!metadata)return metadata.error();
+  const auto table_it=metadata.value().streams.find("#~");
+  const auto unoptimized=metadata.value().streams.find("#-");
+  const auto blob_it=metadata.value().streams.find("#Blob");
+  const auto tables_it=table_it!=metadata.value().streams.end()?table_it:unoptimized;
+  if(tables_it==metadata.value().streams.end()||blob_it==metadata.value().streams.end())
+    return malformed("Local-signature inspection requires tables and #Blob heaps");
+  const auto rows_it=metadata.value().tables.row_counts.find(17);
+  const auto count=rows_it==metadata.value().tables.row_counts.end()?0u:rows_it->second;
+  if(count>65536)return Error{ErrorCode::resource_limit,"CLR StandAloneSig row limit exceeded"};
+  if(!count)return std::map<std::uint32_t,ManagedLocalSignature>{};
+  const auto tables=root.subspan(tables_it->second.offset,tables_it->second.size);
+  const auto blob=root.subspan(blob_it->second.offset,blob_it->second.size);
+  const auto row_size=metadata.value().tables.row_sizes.at(17);
+  const auto blob_width=(metadata.value().tables.heap_sizes&4)?4u:2u;
+  std::uint64_t offset=metadata.value().tables.data_offset;
+  for(std::uint8_t table=0;table<17;++table)
+    if(const auto rows=metadata.value().tables.row_counts.find(table);rows!=metadata.value().tables.row_counts.end())
+      offset+=std::uint64_t{rows->second}*metadata.value().tables.row_sizes.at(table);
+  if(offset>tables.size()||std::uint64_t{count}*row_size>tables.size()-offset)
+    return malformed("StandAloneSig rows exceed tables stream");
+  const auto read_index=[&](std::size_t at){return blob_width==2?std::uint32_t(u16(tables,at)):u32(tables,at);};
+  auto catalog=parse_managed_type_catalog(root);if(!catalog)return catalog.error();
+  std::map<std::uint32_t,ManagedLocalSignature> result;
+  std::size_t signature_nodes=100000;
+  for(std::uint32_t row=0;row<count;++row){
+    const auto at=static_cast<std::size_t>(offset+std::uint64_t{row}*row_size);
+    const auto index=read_index(at);
+    if(!index||index>=blob.size())return malformed("StandAloneSig blob index is outside #Blob heap");
+    std::size_t cursor=index;auto length=compressed_uint(blob,cursor);if(!length)return length.error();
+    if(length.value()>blob.size()-cursor)return malformed("StandAloneSig blob exceeds #Blob heap");
+    const auto bytes=blob.subspan(cursor,length.value());
+    if(bytes.empty())return malformed("Empty StandAloneSig blob");
+    if(std::to_integer<std::uint8_t>(bytes.front())!=0x07)continue;
+    auto signature=decode_managed_local_signature(bytes);if(!signature)return signature.error();
+    std::set<std::uint32_t> active_specs;
+    for(auto& local:signature.value()){
+      auto resolved=resolve_type_signature(local.type,catalog.value(),active_specs,0,signature_nodes);
+      if(!resolved)return resolved.error();
+    }
+    result.emplace(0x11000000u|(row+1),std::move(signature.value()));
   }
   return result;
 }
@@ -528,6 +632,33 @@ Result<std::vector<ManagedTypeDefinition>> parse_managed_types(std::span<const s
     result[owner->second].generic_parameters.push_back(std::move(parameter));
   }
   for(auto &type:result)std::sort(type.generic_parameters.begin(),type.generic_parameters.end(),[](const auto &a,const auto &b){return a.number<b.number;});
+  const auto class_layout_count=rows(15);
+  if(class_layout_count) {
+    const auto class_row=metadata.tables.row_sizes.find(15);
+    const auto type_width=index_width(2);
+    std::uint64_t class_offset=metadata.tables.data_offset;
+    for(std::uint8_t id=0;id<15;++id)
+      if(const auto count=metadata.tables.row_counts.find(id);count!=metadata.tables.row_counts.end())
+        if(const auto size=metadata.tables.row_sizes.find(id);size!=metadata.tables.row_sizes.end())
+          class_offset+=std::uint64_t{count->second}*size->second;
+    if(class_row==metadata.tables.row_sizes.end() || class_row->second!=6+type_width ||
+       class_offset>tables.size() || std::uint64_t{class_layout_count}*class_row->second>tables.size()-class_offset)
+      return malformed("CLR ClassLayout rows exceed tables stream or have an inconsistent layout");
+    std::vector<bool> seen(type_count+1);
+    for(std::uint32_t n=0;n<class_layout_count;++n) {
+      const auto at=static_cast<std::size_t>(class_offset+std::uint64_t{n}*class_row->second);
+      const auto packing=u16(tables,at);
+      const auto size=u32(tables,at+2);
+      const auto parent=type_width==2?u16(tables,at+6):u32(tables,at+6);
+      if(!parent || parent>type_count || seen[parent])
+        return malformed("CLR ClassLayout has an invalid or duplicate TypeDef parent");
+      if(packing && (packing>128 || (packing&(packing-1))))
+        return malformed("CLR ClassLayout packing size is not a supported power of two");
+      seen[parent]=true;
+      auto &type=result[parent-1];type.packing_size=packing;type.declared_class_size=size;
+      type.layout_metadata_offset=std::uint64_t{table_it->second.offset}+class_offset+std::uint64_t{n}*class_row->second;
+    }
+  }
   return result;
 }
 
@@ -568,8 +699,18 @@ Result<ManagedTypeCatalog> parse_managed_type_catalog(std::span<const std::byte>
     if(row==metadata.tables.row_sizes.end()||row->second!=16+blob_width+2*string_width||offset>tables.size()||row->second>tables.size()-offset)
       return malformed("Assembly identity row exceeds tables stream");
     const auto at=static_cast<std::size_t>(offset);ManagedAssemblyIdentity identity;
+    identity.hash_algorithm_id=u32(tables,at);
+    identity.metadata_offset=table_it->second.offset+offset;
     identity.major=u16(tables,at+4);identity.minor=u16(tables,at+6);identity.build=u16(tables,at+8);identity.revision=u16(tables,at+10);identity.flags=u32(tables,at+12);
-    auto key=read_blob(read_index(tables,at+16,blob_width));if(!key)return key.error();identity.public_key_or_token=std::move(key.value());
+    const auto key_index=read_index(tables,at+16,blob_width);
+    identity.public_key_blob_index=key_index;
+    if(key_index){
+      std::size_t key_cursor=key_index;auto key_size=compressed_uint(blobs,key_cursor);if(!key_size)return key_size.error();
+      if(key_size.value()>blobs.size()-key_cursor)return malformed("Assembly public-key blob exceeds #Blob heap");
+      if(key_size.value()>1024u*1024u)return Error{ErrorCode::resource_limit,"Assembly public key exceeds 1 MiB"};
+      identity.public_key_blob_offset=blob_it->second.offset+key_cursor;
+    }
+    auto key=read_blob(key_index);if(!key)return key.error();identity.public_key_or_token=std::move(key.value());
     auto name=read_string(read_index(tables,at+16+blob_width,string_width));if(!name)return name.error();identity.name=std::move(name.value());
     auto culture=read_string(read_index(tables,at+16+blob_width+string_width,string_width));if(!culture)return culture.error();identity.culture=std::move(culture.value());
     if(identity.name.empty())return malformed("Assembly identity has an empty name");catalog.assembly_identity=std::move(identity);
@@ -1204,6 +1345,667 @@ bool managed_type_is_assignable_across_catalogs(std::span<const ManagedTypeCatal
   return false;
 }
 
+Result<std::vector<ManagedConstant>> parse_managed_constants(std::span<const std::byte> root){
+  auto parsed=parse_cli_metadata(root);if(!parsed)return parsed.error();
+  const auto& metadata=parsed.value();
+  const auto rows=[&](std::uint8_t id){const auto it=metadata.tables.row_counts.find(id);return it==metadata.tables.row_counts.end()?0u:it->second;};
+  const auto row_size=[&](std::uint8_t id){const auto it=metadata.tables.row_sizes.find(id);return it==metadata.tables.row_sizes.end()?0u:it->second;};
+  const auto table_offset=[&](std::uint8_t id){std::uint64_t offset=metadata.tables.data_offset;for(std::uint8_t table=0;table<id;++table)offset+=std::uint64_t{rows(table)}*row_size(table);return offset;};
+  const auto count=rows(11);
+  if(count>250000)return Error{ErrorCode::resource_limit,"CLR Constant catalog exceeds 250,000 rows"};
+  if(!count)return std::vector<ManagedConstant>{};
+  auto tables_it=metadata.streams.find("#~");if(tables_it==metadata.streams.end())tables_it=metadata.streams.find("#-");
+  const auto blob_it=metadata.streams.find("#Blob");
+  if(tables_it==metadata.streams.end()||blob_it==metadata.streams.end())return malformed("CLR Constant parsing requires tables and #Blob heaps");
+  const auto tables=root.subspan(tables_it->second.offset,tables_it->second.size);
+  const auto blobs=root.subspan(blob_it->second.offset,blob_it->second.size);
+  const auto parent_width=coded_width(2,metadata.tables.row_counts),blob_width=(metadata.tables.heap_sizes&4)?4u:2u;
+  const auto offset=table_offset(11);
+  if(row_size(11)!=2+parent_width+blob_width||offset>tables.size()||std::uint64_t{count}*row_size(11)>tables.size()-offset)
+    return malformed("CLR Constant rows exceed tables stream");
+  const auto read_index=[](std::span<const std::byte> bytes,std::size_t at,unsigned width){return width==2?std::uint32_t(u16(bytes,at)):u32(bytes,at);};
+  std::vector<ManagedConstant> result;result.reserve(count);
+  std::set<std::uint32_t> owners;
+  std::uint64_t payload_bytes=0;
+  for(std::uint32_t row=1;row<=count;++row){
+    const auto at=static_cast<std::size_t>(offset+std::uint64_t{row-1}*row_size(11));
+    ManagedConstant value;value.token=0x0b000000u|row;value.element_type=std::to_integer<std::uint8_t>(tables[at]);
+    if(tables[at+1]!=std::byte{0})return malformed("CLR Constant has nonzero padding");
+    const auto parent=read_index(tables,at+2,parent_width),tag=parent&3u,rid=parent>>2;
+    if(tag==3||!rid||rid>0x00ffffffu)return malformed("CLR Constant has an invalid HasConstant parent");
+    const std::uint8_t parent_table=tag==0?4:tag==1?8:23;
+    if(rid>rows(parent_table))return malformed("CLR Constant parent token is outside its metadata table");
+    value.parent_token=(std::uint32_t{parent_table}<<24)|rid;
+    if(!owners.insert(value.parent_token).second)return malformed("CLR Constant parent has duplicate default values");
+    const auto owner_at=table_offset(parent_table)+std::uint64_t{rid-1}*row_size(parent_table);
+    if(row_size(parent_table)<2||owner_at>tables.size()||2>tables.size()-owner_at)
+      return malformed("CLR Constant parent flags exceed tables stream");
+    const std::uint16_t has_default=tag==0?0x8000:0x1000;
+    if((u16(tables,static_cast<std::size_t>(owner_at))&has_default)==0)
+      return malformed("CLR Constant parent is not marked HasDefault");
+    value.blob_index=read_index(tables,at+2+parent_width,blob_width);
+    if(value.blob_index>=blobs.size())return malformed("CLR Constant value index exceeds #Blob heap");
+    std::size_t cursor=value.blob_index;auto length=compressed_uint(blobs,cursor);if(!length)return length.error();
+    if(length.value()>blobs.size()-cursor)return malformed("CLR Constant value exceeds #Blob heap");
+    if(length.value()>4u*1024*1024)return Error{ErrorCode::resource_limit,"CLR Constant value exceeds 4 MiB"};
+    if(length.value()>64u*1024*1024-payload_bytes)return Error{ErrorCode::resource_limit,"CLR Constant payloads exceed 64 MiB"};
+    payload_bytes+=length.value();
+    const auto payload=blobs.subspan(cursor,length.value());
+    std::size_t width=0;
+    switch(value.element_type){
+      case 0x02:case 0x04:case 0x05:width=1;break;
+      case 0x03:case 0x06:case 0x07:width=2;break;
+      case 0x08:case 0x09:case 0x0c:case 0x12:width=4;break;
+      case 0x0a:case 0x0b:case 0x0d:width=8;break;
+      case 0x0e:
+        if(payload.size()%2)return malformed("CLR Constant string has an odd UTF-16 byte count");
+        value.string_value.reserve(payload.size()/2);
+        for(std::size_t p=0;p<payload.size();p+=2)value.string_value.push_back(static_cast<char16_t>(u16(payload,p)));
+        break;
+      default:return malformed("CLR Constant has an invalid element type");
+    }
+    if(width){
+      if(payload.size()!=width)return malformed("CLR Constant scalar payload has an invalid width");
+      for(std::size_t p=0;p<width;++p)value.scalar_bits|=std::uint64_t{std::to_integer<std::uint8_t>(payload[p])}<<(8*p);
+      if(value.element_type==0x02&&value.scalar_bits>1)return malformed("CLR Constant Boolean is neither zero nor one");
+      if(value.element_type==0x12&&value.scalar_bits!=0)return malformed("CLR Constant class value is not null");
+    }
+    result.push_back(std::move(value));
+  }
+  return result;
+}
+
+Result<std::vector<ManagedCustomAttribute>> parse_managed_custom_attributes(std::span<const std::byte> root) try {
+  if(root.size()>64u*1024u*1024u)return Error{ErrorCode::resource_limit,"CLR custom-attribute inspection root exceeds 64 MiB"};
+  auto parsed=parse_cli_metadata(root);if(!parsed)return parsed.error();const auto& md=parsed.value();
+  const auto rows=[&](std::uint8_t id){const auto it=md.tables.row_counts.find(id);return it==md.tables.row_counts.end()?0u:it->second;};
+  const auto count=rows(12);if(count>250000)return Error{ErrorCode::resource_limit,"CLR CustomAttribute catalog exceeds 250,000 rows"};
+  if(!count)return std::vector<ManagedCustomAttribute>{};
+  auto table_it=md.streams.find("#~");if(table_it==md.streams.end())table_it=md.streams.find("#-");
+  const auto blob_it=md.streams.find("#Blob");if(table_it==md.streams.end()||blob_it==md.streams.end())return malformed("CustomAttribute parsing requires tables and #Blob heaps");
+  const auto tables=root.subspan(table_it->second.offset,table_it->second.size),blobs=root.subspan(blob_it->second.offset,blob_it->second.size);
+  const auto parent_width=coded_width(3,md.tables.row_counts),constructor_width=coded_width(11,md.tables.row_counts),blob_width=(md.tables.heap_sizes&4)?4u:2u;
+  const auto row_it=md.tables.row_sizes.find(12);if(row_it==md.tables.row_sizes.end()||row_it->second!=parent_width+constructor_width+blob_width)return malformed("CustomAttribute row layout is inconsistent");
+  std::uint64_t offset=md.tables.data_offset;for(std::uint8_t id=0;id<12;++id){const auto size=md.tables.row_sizes.find(id);if(rows(id)&&size==md.tables.row_sizes.end())return malformed("CustomAttribute preceding table has no row layout");if(size!=md.tables.row_sizes.end())offset+=std::uint64_t{rows(id)}*size->second;}
+  if(offset>tables.size()||std::uint64_t{count}*row_it->second>tables.size()-offset)return malformed("CustomAttribute rows exceed tables stream");
+  const auto index=[](std::span<const std::byte> b,std::size_t p,unsigned w){return w==2?std::uint32_t(u16(b,p)):u32(b,p);};
+  static constexpr std::array<std::uint8_t,22> parent_tables={6,4,1,2,8,9,10,0,14,23,20,17,26,27,32,35,38,39,40,42,44,43};
+  const auto parent_token=[&](std::uint32_t coded)->std::uint32_t{const auto tag=coded&31u,rid=coded>>5;if(tag>=parent_tables.size()||!rid||rid>0x00ffffffu)return 0;const auto table=parent_tables[tag];return rid<=rows(table)?(std::uint32_t{table}<<24)|rid:0;};
+  std::vector<ManagedCustomAttribute> result;result.reserve(count);std::uint64_t payload_total=0;
+  for(std::uint32_t rid=1;rid<=count;++rid){
+    const auto at=static_cast<std::size_t>(offset+std::uint64_t{rid-1}*row_it->second);ManagedCustomAttribute value;value.token=0x0c000000u|rid;value.metadata_offset=table_it->second.offset+at;
+    value.parent_token=parent_token(index(tables,at,parent_width));if(!value.parent_token)return malformed("CustomAttribute has an invalid HasCustomAttribute parent");
+    const auto ctor=index(tables,at+parent_width,constructor_width),tag=ctor&7u,ctor_rid=ctor>>3;if(!ctor_rid||ctor_rid>0x00ffffffu||(tag!=2&&tag!=3))return malformed("CustomAttribute has an invalid constructor coded index");
+    const auto ctor_table=tag==2?6u:10u;if(ctor_rid>rows(static_cast<std::uint8_t>(ctor_table)))return malformed("CustomAttribute constructor is outside its metadata table");value.constructor_token=(std::uint32_t{ctor_table}<<24)|ctor_rid;
+    value.value_blob_index=index(tables,at+parent_width+constructor_width,blob_width);if(value.value_blob_index>=blobs.size())return malformed("CustomAttribute value index exceeds #Blob heap");
+    std::size_t cursor=value.value_blob_index;auto length=compressed_uint(blobs,cursor);if(!length)return length.error();if(length.value()>blobs.size()-cursor)return malformed("CustomAttribute value exceeds #Blob heap");
+    if(length.value()>4u*1024u*1024u)return Error{ErrorCode::resource_limit,"CustomAttribute value exceeds 4 MiB"};if(length.value()>64u*1024u*1024u-payload_total)return Error{ErrorCode::resource_limit,"CustomAttribute payloads exceed 64 MiB"};payload_total+=length.value();
+    const auto payload=blobs.subspan(cursor,length.value());if(payload.size()<2||u16(payload,0)!=1)return malformed("CustomAttribute value has a missing or invalid prolog");value.serialized_value.assign(payload.begin()+2,payload.end());result.push_back(std::move(value));
+  }
+  return result;
+} catch(const std::bad_alloc&) {return Error{ErrorCode::resource_limit,"Cannot allocate CLR custom-attribute catalog"};}
+  catch(const std::length_error&) {return Error{ErrorCode::resource_limit,"CLR custom-attribute catalog exceeds container limits"};}
+
+Result<std::vector<ManagedDeclarativeSecurity>> parse_managed_declarative_security(
+    std::span<const std::byte> root) try {
+  if (root.size() > 64u * 1024u * 1024u)
+    return Error{ErrorCode::resource_limit, "CLR declarative-security inspection root exceeds 64 MiB"};
+  auto parsed = parse_cli_metadata(root);
+  if (!parsed) return parsed.error();
+  const auto &md = parsed.value();
+  const auto rows = [&](std::uint8_t id) {
+    const auto it = md.tables.row_counts.find(id);
+    return it == md.tables.row_counts.end() ? 0u : it->second;
+  };
+  const auto count = rows(14);
+  if (count > 250000)
+    return Error{ErrorCode::resource_limit, "CLR declarative-security catalog exceeds 250,000 rows"};
+  if (!count) return std::vector<ManagedDeclarativeSecurity>{};
+  auto tables_it = md.streams.find("#~");
+  if (tables_it == md.streams.end()) tables_it = md.streams.find("#-");
+  const auto blob_it = md.streams.find("#Blob");
+  if (tables_it == md.streams.end() || blob_it == md.streams.end())
+    return malformed("DeclSecurity parsing requires tables and #Blob heaps");
+  const auto tables = root.subspan(tables_it->second.offset, tables_it->second.size);
+  const auto blobs = root.subspan(blob_it->second.offset, blob_it->second.size);
+  const auto parent_width = coded_width(5, md.tables.row_counts);
+  const auto blob_width = (md.tables.heap_sizes & 4) ? 4u : 2u;
+  const auto row_it = md.tables.row_sizes.find(14);
+  if (row_it == md.tables.row_sizes.end() || row_it->second != 2 + parent_width + blob_width)
+    return malformed("DeclSecurity row layout is inconsistent");
+  std::uint64_t offset = md.tables.data_offset;
+  for (std::uint8_t id = 0; id < 14; ++id) {
+    const auto size = md.tables.row_sizes.find(id);
+    if (rows(id) && size == md.tables.row_sizes.end())
+      return malformed("DeclSecurity preceding table has no row layout");
+    if (size != md.tables.row_sizes.end()) offset += std::uint64_t{rows(id)} * size->second;
+  }
+  if (offset > tables.size() || std::uint64_t{count} * row_it->second > tables.size() - offset)
+    return malformed("DeclSecurity rows exceed tables stream");
+  const auto read_index = [](std::span<const std::byte> bytes, std::size_t at, unsigned width) {
+    return width == 2 ? std::uint32_t(u16(bytes, at)) : u32(bytes, at);
+  };
+  std::vector<ManagedDeclarativeSecurity> result;
+  result.reserve(count);
+  std::set<std::pair<std::uint32_t, std::uint16_t>> seen_parent_actions;
+  std::uint64_t payload_bytes = 0;
+  for (std::uint32_t rid = 1; rid <= count; ++rid) {
+    const auto at = static_cast<std::size_t>(offset + std::uint64_t{rid - 1} * row_it->second);
+    ManagedDeclarativeSecurity row;
+    row.token = 0x0e000000u | rid;
+    row.metadata_offset = tables_it->second.offset + at;
+    row.action = u16(tables, at);
+    const auto coded_parent = read_index(tables, at + 2, parent_width);
+    const auto tag = coded_parent & 3u;
+    const auto parent_rid = coded_parent >> 2;
+    const auto parent_table = static_cast<std::uint8_t>(tag == 0 ? 2 : tag == 1 ? 6 : 32);
+    if (tag == 3 || !parent_rid || parent_rid > 0x00ffffffu || parent_rid > rows(parent_table))
+      return malformed("DeclSecurity has an invalid HasDeclSecurity parent");
+    row.parent_token = (std::uint32_t{parent_table} << 24) | parent_rid;
+    if (!seen_parent_actions.emplace(row.parent_token, row.action).second)
+      return malformed("DeclSecurity parent/action pair is duplicated");
+    row.permission_set_blob_index = read_index(tables, at + 2 + parent_width, blob_width);
+    if (!row.permission_set_blob_index || row.permission_set_blob_index >= blobs.size())
+      return malformed("DeclSecurity PermissionSet index is null or outside #Blob heap");
+    std::size_t cursor = row.permission_set_blob_index;
+    auto length = compressed_uint(blobs, cursor);
+    if (!length) return length.error();
+    if (length.value() > blobs.size() - cursor)
+      return malformed("DeclSecurity PermissionSet exceeds #Blob heap");
+    if (length.value() > 4u * 1024u * 1024u)
+      return Error{ErrorCode::resource_limit, "DeclSecurity PermissionSet exceeds 4 MiB"};
+    if (length.value() > 64u * 1024u * 1024u - payload_bytes)
+      return Error{ErrorCode::resource_limit, "DeclSecurity payloads exceed 64 MiB"};
+    payload_bytes += length.value();
+    row.permission_set_blob_offset = blob_it->second.offset + cursor;
+    row.permission_set.assign(blobs.begin() + cursor, blobs.begin() + cursor + length.value());
+    result.push_back(std::move(row));
+  }
+  return result;
+} catch (const std::bad_alloc &) {
+  return Error{ErrorCode::resource_limit, "Cannot allocate CLR declarative-security catalog"};
+} catch (const std::length_error &) {
+  return Error{ErrorCode::resource_limit, "CLR declarative-security catalog exceeds container limits"};
+}
+
+Result<std::vector<ManagedMethodImplementation>> parse_managed_method_implementations(
+    std::span<const std::byte> root) try {
+  if (root.size() > 64u * 1024u * 1024u)
+    return Error{ErrorCode::resource_limit, "CLR MethodImpl inspection root exceeds 64 MiB"};
+  auto parsed = parse_cli_metadata(root);
+  if (!parsed) return parsed.error();
+  const auto &md = parsed.value();
+  const auto rows = [&](std::uint8_t id) {
+    const auto it = md.tables.row_counts.find(id);
+    return it == md.tables.row_counts.end() ? 0u : it->second;
+  };
+  const auto count = rows(25);
+  if (count > 250000)
+    return Error{ErrorCode::resource_limit, "CLR MethodImpl catalog exceeds 250,000 rows"};
+  if (!count) return std::vector<ManagedMethodImplementation>{};
+
+  auto table_it = md.streams.find("#~");
+  if (table_it == md.streams.end()) table_it = md.streams.find("#-");
+  if (table_it == md.streams.end()) return malformed("MethodImpl parsing requires a metadata tables stream");
+  const auto tables = root.subspan(table_it->second.offset, table_it->second.size);
+  const auto class_width = rows(2) < 65536 ? 2u : 4u;
+  const auto method_width = coded_width(8, md.tables.row_counts); // MethodDefOrRef
+  const auto row_it = md.tables.row_sizes.find(25);
+  if (row_it == md.tables.row_sizes.end() || row_it->second != class_width + 2 * method_width)
+    return malformed("MethodImpl row layout is inconsistent");
+
+  std::uint64_t offset = md.tables.data_offset;
+  for (std::uint8_t id = 0; id < 25; ++id) {
+    const auto size = md.tables.row_sizes.find(id);
+    if (rows(id) && size == md.tables.row_sizes.end())
+      return malformed("MethodImpl preceding table has no row layout");
+    if (size != md.tables.row_sizes.end()) offset += std::uint64_t{rows(id)} * size->second;
+  }
+  if (offset > tables.size() || std::uint64_t{count} * row_it->second > tables.size() - offset)
+    return malformed("MethodImpl rows exceed tables stream");
+
+  const auto index = [](std::span<const std::byte> bytes, std::size_t at, unsigned width) {
+    return width == 2 ? std::uint32_t(u16(bytes, at)) : u32(bytes, at);
+  };
+  const auto method_token = [&](std::uint32_t coded) -> std::uint32_t {
+    const auto tag = coded & 1u;
+    const auto rid = coded >> 1;
+    const auto table = static_cast<std::uint8_t>(tag == 0 ? 6 : 10);
+    if (!rid || rid > rows(table) || rid > 0x00ffffffu) return 0;
+    return (std::uint32_t{table} << 24) | rid;
+  };
+
+  std::vector<ManagedMethodImplementation> result;
+  result.reserve(count);
+  for (std::uint32_t rid = 1; rid <= count; ++rid) {
+    const auto at = static_cast<std::size_t>(offset + std::uint64_t{rid - 1} * row_it->second);
+    const auto owner = index(tables, at, class_width);
+    if (!owner || owner > rows(2) || owner > 0x00ffffffu)
+      return malformed("MethodImpl Class is outside the TypeDef table");
+    const auto body = method_token(index(tables, at + class_width, method_width));
+    const auto declaration = method_token(index(tables, at + class_width + method_width, method_width));
+    if (!body || !declaration)
+      return malformed("MethodImpl body or declaration is outside MethodDef/MemberRef tables");
+    result.push_back({0x19000000u | rid, 0x02000000u | owner, body, declaration,
+                      table_it->second.offset + at});
+  }
+  return result;
+} catch (const std::bad_alloc &) {
+  return Error{ErrorCode::resource_limit, "Cannot allocate CLR MethodImpl catalog"};
+} catch (const std::length_error &) {
+  return Error{ErrorCode::resource_limit, "CLR MethodImpl catalog exceeds container limits"};
+}
+
+namespace {
+bool resource_utf8_valid(std::string_view s);
+void decode_managed_marshal_descriptor(ManagedMarshalDescriptor& descriptor) {
+  if(descriptor.native_type.empty())return;
+  const auto code=std::to_integer<std::uint8_t>(descriptor.native_type[0]);
+  static constexpr std::array<std::pair<std::uint8_t,std::string_view>,20> scalar_types={{
+    {0x02,"boolean"},{0x03,"i1"},{0x04,"u1"},{0x05,"i2"},{0x06,"u2"},
+    {0x07,"i4"},{0x08,"u4"},{0x09,"i8"},{0x0a,"u8"},{0x0b,"r4"},
+    {0x0c,"r8"},{0x13,"bstr"},{0x14,"lpstr"},{0x15,"lpwstr"},{0x16,"lptstr"},
+    {0x23,"ansibstr"},{0x24,"tbstr"},
+    {0x1f,"int"},{0x20,"uint"},{0x26,"func"}}};
+  const auto scalar=std::find_if(scalar_types.begin(),scalar_types.end(),[&](const auto& item){return item.first==code;});
+  if(scalar!=scalar_types.end()&&descriptor.native_type.size()==1){
+    descriptor.decode_status=ManagedMarshalDescriptorStatus::decoded_scalar;
+    descriptor.native_type_name=scalar->second;
+    return;
+  }
+  if(code==0x2a&&descriptor.native_type.size()>=2){
+    const auto element=std::to_integer<std::uint8_t>(descriptor.native_type[1]);
+    const bool intrinsic_element=(element>=0x02&&element<=0x0c)||element==0x14||element==0x15||
+                                 element==0x1f||element==0x20||element==0x26;
+    if(intrinsic_element){
+      std::size_t cursor=2;
+      std::optional<std::uint32_t> parameter,count;
+      bool valid=true;
+      if(cursor<descriptor.native_type.size()){
+        auto value=compressed_uint(descriptor.native_type,cursor);
+        if(!value)valid=false;else parameter=value.value();
+      }
+      if(valid&&cursor<descriptor.native_type.size()){
+        auto value=compressed_uint(descriptor.native_type,cursor);
+        if(!value)valid=false;else count=value.value();
+      }
+      if(valid&&cursor==descriptor.native_type.size()&&
+         (!parameter||!*parameter||(descriptor.parent_token>>24)==8)){
+        descriptor.decode_status=ManagedMarshalDescriptorStatus::decoded_array;
+        descriptor.native_type_name="array";
+        descriptor.array_element_type=element;
+        descriptor.array_parameter_index=parameter;
+        descriptor.array_element_count=count;
+        return;
+      }
+    }
+  }
+  // CustomMarshaler is a widely emitted Microsoft extension (UnmanagedType
+  // value 44), with four serialized strings. Treat it as recognized only when
+  // all four fields are bounded and consume the complete descriptor.
+  if(code==0x2c){
+    std::size_t cursor=1;
+    std::vector<std::optional<std::string>> fields;
+    fields.reserve(4);
+    bool valid=true;
+    for(unsigned i=0;i<4&&valid;++i){
+      if(cursor>=descriptor.native_type.size()){valid=false;break;}
+      if(descriptor.native_type[cursor]==std::byte{0xff}){++cursor;fields.emplace_back(std::nullopt);continue;}
+      auto length=compressed_uint(descriptor.native_type,cursor);
+      if(!length||length.value()>descriptor.native_type.size()-cursor){valid=false;break;}
+      std::string value;value.reserve(length.value());
+      for(std::uint32_t n=0;n<length.value();++n)value.push_back(static_cast<char>(std::to_integer<unsigned char>(descriptor.native_type[cursor+n])));
+      if(!value.empty()&&value.back()=='\0')value.pop_back();
+      if(!resource_utf8_valid(value)){valid=false;break;}
+      cursor+=length.value();fields.emplace_back(std::move(value));
+    }
+    if(valid&&cursor==descriptor.native_type.size()){
+      descriptor.decode_status=ManagedMarshalDescriptorStatus::decoded_custom_marshaler;
+      descriptor.native_type_name="custom-marshaler";
+      descriptor.custom_marshaler_strings=std::move(fields);
+    }
+  }
+}
+}
+
+Result<std::vector<ManagedMarshalDescriptor>> parse_managed_marshal_descriptors(std::span<const std::byte> root) try {
+  if(root.size()>64u*1024u*1024u)return Error{ErrorCode::resource_limit,"CLR marshal metadata root exceeds 64 MiB"};
+  auto parsed=parse_cli_metadata(root);if(!parsed)return parsed.error();const auto& md=parsed.value();
+  const auto rows=[&](std::uint8_t id){const auto it=md.tables.row_counts.find(id);return it==md.tables.row_counts.end()?0u:it->second;};
+  const auto count=rows(13);if(count>250000)return Error{ErrorCode::resource_limit,"CLR FieldMarshal catalog exceeds 250,000 rows"};
+  if(!count)return std::vector<ManagedMarshalDescriptor>{};
+  auto table_it=md.streams.find("#~");if(table_it==md.streams.end())table_it=md.streams.find("#-");
+  const auto blob_it=md.streams.find("#Blob");if(table_it==md.streams.end()||blob_it==md.streams.end())return malformed("FieldMarshal parsing requires tables and #Blob heaps");
+  const auto tables=root.subspan(table_it->second.offset,table_it->second.size),blobs=root.subspan(blob_it->second.offset,blob_it->second.size);
+  const auto parent_width=coded_width(12,md.tables.row_counts),blob_width=(md.tables.heap_sizes&4)?4u:2u;
+  const auto row_it=md.tables.row_sizes.find(13);if(row_it==md.tables.row_sizes.end()||row_it->second!=parent_width+blob_width)return malformed("FieldMarshal row layout is inconsistent");
+  std::uint64_t offset=md.tables.data_offset;for(std::uint8_t id=0;id<13;++id){const auto size=md.tables.row_sizes.find(id);if(rows(id)&&size==md.tables.row_sizes.end())return malformed("FieldMarshal preceding table has no row layout");if(size!=md.tables.row_sizes.end())offset+=std::uint64_t{rows(id)}*size->second;}
+  if(offset>tables.size()||std::uint64_t{count}*row_it->second>tables.size()-offset)return malformed("FieldMarshal rows exceed tables stream");
+  const auto index=[](std::span<const std::byte> b,std::size_t p,unsigned w){return w==2?std::uint32_t(u16(b,p)):u32(b,p);};
+  std::vector<ManagedMarshalDescriptor> result;result.reserve(count);std::set<std::uint32_t> parents;std::uint64_t payload_total=0;
+  for(std::uint32_t rid=1;rid<=count;++rid){
+    const auto at=static_cast<std::size_t>(offset+std::uint64_t{rid-1}*row_it->second);ManagedMarshalDescriptor value;value.token=0x0d000000u|rid;value.metadata_offset=table_it->second.offset+at;
+    const auto coded=index(tables,at,parent_width),tag=coded&1u,parent_rid=coded>>1;
+    const auto parent_table=tag==0?4u:8u;
+    if(!parent_rid||parent_rid>rows(static_cast<std::uint8_t>(parent_table)))return malformed("FieldMarshal has an invalid HasFieldMarshal parent");
+    value.parent_token=(std::uint32_t{parent_table}<<24)|parent_rid;
+    if(!parents.insert(value.parent_token).second)return malformed("FieldMarshal parent has duplicate descriptors");
+    value.blob_index=index(tables,at+parent_width,blob_width);if(!value.blob_index||value.blob_index>=blobs.size())return malformed("FieldMarshal NativeType index is null or outside #Blob heap");
+    std::size_t cursor=value.blob_index;auto length=compressed_uint(blobs,cursor);if(!length)return length.error();
+    if(!length.value())return malformed("FieldMarshal NativeType descriptor is empty");
+    if(length.value()>blobs.size()-cursor)return malformed("FieldMarshal NativeType descriptor exceeds #Blob heap");
+    if(length.value()>1024u*1024u)return Error{ErrorCode::resource_limit,"FieldMarshal NativeType descriptor exceeds 1 MiB"};
+    if(length.value()>16u*1024u*1024u-payload_total)return Error{ErrorCode::resource_limit,"FieldMarshal payloads exceed 16 MiB"};payload_total+=length.value();
+    value.blob_data_offset=blob_it->second.offset+cursor;const auto payload=blobs.subspan(cursor,length.value());value.native_type.assign(payload.begin(),payload.end());
+    decode_managed_marshal_descriptor(value);result.push_back(std::move(value));
+  }
+  return result;
+} catch(const std::bad_alloc&) {return Error{ErrorCode::resource_limit,"Cannot allocate CLR FieldMarshal catalog"};}
+  catch(const std::length_error&) {return Error{ErrorCode::resource_limit,"CLR FieldMarshal catalog exceeds container limits"};}
+
+Result<std::vector<ManagedResource>> parse_managed_resources(std::span<const std::byte> root) try {
+  if(root.size()>64u*1024u*1024u)return Error{ErrorCode::resource_limit,"CLR resource metadata root exceeds 64 MiB"};
+  auto parsed=parse_cli_metadata(root);if(!parsed)return parsed.error();const auto& md=parsed.value();
+  const auto rows=[&](std::uint8_t id){const auto it=md.tables.row_counts.find(id);return it==md.tables.row_counts.end()?0u:it->second;};
+  const auto count=rows(40);if(count>65536)return Error{ErrorCode::resource_limit,"CLR ManifestResource catalog exceeds 65,536 rows"};
+  if(!count)return std::vector<ManagedResource>{};
+  auto table_it=md.streams.find("#~");if(table_it==md.streams.end())table_it=md.streams.find("#-");
+  const auto strings_it=md.streams.find("#Strings");
+  if(table_it==md.streams.end()||strings_it==md.streams.end())return malformed("ManifestResource parsing requires tables and #Strings heaps");
+  const auto tables=root.subspan(table_it->second.offset,table_it->second.size),strings=root.subspan(strings_it->second.offset,strings_it->second.size);
+  const auto string_width=(md.tables.heap_sizes&1)?4u:2u;
+  const auto implementation_width=coded_width(10,md.tables.row_counts);
+  const auto expected_size=8u+string_width+implementation_width;
+  const auto row_it=md.tables.row_sizes.find(40);
+  if(row_it==md.tables.row_sizes.end()||row_it->second!=expected_size)return malformed("ManifestResource row layout is inconsistent");
+  std::uint64_t offset=md.tables.data_offset;
+  for(std::uint8_t id=0;id<40;++id){const auto size=md.tables.row_sizes.find(id);if(rows(id)&&size==md.tables.row_sizes.end())return malformed("ManifestResource preceding table has no row layout");if(size!=md.tables.row_sizes.end())offset+=std::uint64_t{rows(id)}*size->second;}
+  if(offset>tables.size()||std::uint64_t{count}*row_it->second>tables.size()-offset)return malformed("ManifestResource rows exceed tables stream");
+  const auto index=[](std::span<const std::byte> bytes,std::size_t at,unsigned width){return width==2?std::uint32_t(u16(bytes,at)):u32(bytes,at);};
+  const auto read_string=[&](std::uint32_t value)->Result<std::string>{
+    if(!value||value>=strings.size())return malformed("ManifestResource implementation name index exceeds #Strings heap");
+    std::string text;text.reserve(std::min<std::size_t>(strings.size()-value,128));
+    for(auto p=value;p<strings.size();++p){if(strings[p]==std::byte{0}){if(text.empty())return malformed("ManifestResource implementation name is empty");if(text.size()>4096)return Error{ErrorCode::resource_limit,"ManifestResource implementation name exceeds 4096 bytes"};return text;}text.push_back(static_cast<char>(std::to_integer<unsigned char>(strings[p])));if(text.size()>4096)return Error{ErrorCode::resource_limit,"ManifestResource implementation name exceeds 4096 bytes"};}
+    return malformed("ManifestResource implementation name is unterminated");
+  };
+  const auto read_table_row=[&](std::uint8_t table,std::uint32_t rid)->Result<std::span<const std::byte>>{
+    if(!rid||rid>rows(table))return malformed("ManifestResource implementation row is outside its metadata table");
+    std::uint64_t table_offset=md.tables.data_offset;
+    for(std::uint8_t id=0;id<table;++id){
+      const auto size=md.tables.row_sizes.find(id);
+      if(rows(id)&&size==md.tables.row_sizes.end())return malformed("ManifestResource implementation table has a missing row layout");
+      if(size!=md.tables.row_sizes.end())table_offset+=std::uint64_t{rows(id)}*size->second;
+    }
+    const auto size=md.tables.row_sizes.find(table);
+    if(size==md.tables.row_sizes.end()||table_offset>tables.size()||
+       std::uint64_t{rows(table)}*size->second>tables.size()-table_offset)
+      return malformed("ManifestResource implementation rows exceed tables stream");
+    const auto row_offset=table_offset+std::uint64_t{rid-1}*size->second;
+    return tables.subspan(static_cast<std::size_t>(row_offset),size->second);
+  };
+  const auto validate_blob=[&](std::uint32_t value)->Result<bool>{
+    if(!value)return true;
+    const auto blob_it=md.streams.find("#Blob");
+    if(blob_it==md.streams.end())return malformed("ManifestResource implementation blob index has no #Blob heap");
+    const auto blobs=root.subspan(blob_it->second.offset,blob_it->second.size);
+    if(value>=blobs.size())return malformed("ManifestResource implementation blob index exceeds #Blob heap");
+    std::size_t cursor=value;auto length=compressed_uint(blobs,cursor);if(!length)return length.error();
+    if(length.value()>blobs.size()-cursor)return malformed("ManifestResource implementation blob exceeds #Blob heap");
+    return true;
+  };
+  const auto read_blob_value=[&](std::uint32_t value)->Result<std::vector<std::byte>>{
+    if(!value)return std::vector<std::byte>{};
+    const auto blob_it=md.streams.find("#Blob");
+    if(blob_it==md.streams.end())return malformed("ManifestResource implementation blob index has no #Blob heap");
+    const auto blobs=root.subspan(blob_it->second.offset,blob_it->second.size);
+    if(value>=blobs.size())return malformed("ManifestResource implementation blob index exceeds #Blob heap");
+    std::size_t cursor=value;auto length=compressed_uint(blobs,cursor);if(!length)return length.error();
+    if(length.value()>blobs.size()-cursor)return malformed("ManifestResource implementation blob exceeds #Blob heap");
+    return std::vector<std::byte>(blobs.begin()+static_cast<std::ptrdiff_t>(cursor),
+                                  blobs.begin()+static_cast<std::ptrdiff_t>(cursor+length.value()));
+  };
+  const auto file_width=4u+string_width+((md.tables.heap_sizes&4)?4u:2u);
+  const auto assembly_ref_width=12u+((md.tables.heap_sizes&4)?4u:2u)+2u*string_width+((md.tables.heap_sizes&4)?4u:2u);
+  const auto assembly_count=rows(32);
+  if(assembly_count>1)return malformed("Assembly table has more than one row while resolving resource hashes");
+  std::uint32_t assembly_hash_algorithm=0;
+  if(assembly_count){
+    const auto assembly_row_size=md.tables.row_sizes.find(32);
+    const auto expected_assembly_size=16u+((md.tables.heap_sizes&4)?4u:2u)+2u*string_width;
+    if(assembly_row_size==md.tables.row_sizes.end()||assembly_row_size->second!=expected_assembly_size)
+      return malformed("Assembly table row layout is inconsistent while resolving resource hashes");
+    auto assembly_row=read_table_row(32,1);if(!assembly_row)return assembly_row.error();
+    assembly_hash_algorithm=u32(assembly_row.value(),0);
+  }
+  if(rows(38)&&(!md.tables.row_sizes.contains(38)||md.tables.row_sizes.at(38)!=file_width))return malformed("File table row layout is inconsistent");
+  if(rows(35)&&(!md.tables.row_sizes.contains(35)||md.tables.row_sizes.at(35)!=assembly_ref_width))return malformed("AssemblyRef table row layout is inconsistent");
+  std::vector<ManagedResource> result;result.reserve(count);std::size_t name_bytes=0;std::set<std::string> names;
+  for(std::uint32_t rid=1;rid<=count;++rid){
+    const auto at=static_cast<std::size_t>(offset+std::uint64_t{rid-1}*row_it->second);
+    ManagedResource value;value.token=0x28000000u|rid;value.metadata_offset=table_it->second.offset+at;value.row_size=row_it->second;
+    value.data_offset=u32(tables,at);value.flags=u32(tables,at+4);
+    if((value.flags&~std::uint32_t{7})||(value.flags&7u)<1||(value.flags&7u)>2)return malformed("ManifestResource has invalid visibility flags");
+    const auto name_index=index(tables,at+8,string_width);
+    if(!name_index||name_index>=strings.size())return malformed("ManifestResource name index exceeds #Strings heap");
+    auto end=name_index;while(end<strings.size()&&strings[end]!=std::byte{0}){if(end-name_index>=4096)return Error{ErrorCode::resource_limit,"ManifestResource name exceeds 4096 bytes"};++end;}
+    if(end>=strings.size()||end==name_index)return malformed("ManifestResource name is empty or unterminated");
+    value.name.reserve(end-name_index);for(auto p=name_index;p<end;++p)value.name.push_back(static_cast<char>(std::to_integer<unsigned char>(strings[p])));
+    if(!names.insert(value.name).second)return malformed("ManifestResource names are duplicated");
+    name_bytes+=value.name.size();if(name_bytes>8u*1024u*1024u)return Error{ErrorCode::resource_limit,"ManifestResource names exceed 8 MiB"};
+    value.implementation_coded_index=index(tables,at+8+string_width,implementation_width);
+    const auto tag=value.implementation_coded_index&3u,rid_value=value.implementation_coded_index>>2;
+    if(!value.implementation_coded_index)value.implementation=ManagedResourceImplementationKind::embedded;
+    else {
+      if(!rid_value||rid_value>0x00ffffffu||tag==3)return malformed("ManifestResource has an invalid Implementation coded index");
+      const std::uint8_t table=tag==0?38:tag==1?35:39;
+      if(rid_value>rows(table))return malformed("ManifestResource Implementation is outside its metadata table");
+      value.implementation_token=(std::uint32_t{table}<<24)|rid_value;
+      value.implementation=tag==0?ManagedResourceImplementationKind::file:
+          tag==1?ManagedResourceImplementationKind::assembly_ref:ManagedResourceImplementationKind::exported_type;
+      if(value.implementation==ManagedResourceImplementationKind::file&&value.data_offset!=0)
+        return malformed("File-backed ManifestResource must have a zero offset");
+      if(value.implementation==ManagedResourceImplementationKind::file){
+        auto file_row=read_table_row(38,rid_value);if(!file_row)return file_row.error();
+        const auto file_flags=u32(file_row.value(),0);
+        if(file_flags&~std::uint32_t{1})return malformed("File implementation has invalid flags");
+        auto file_name=read_string(index(file_row.value(),4,string_width));if(!file_name)return file_name.error();
+        value.implementation_name=std::move(file_name.value());
+        value.implementation_file_contains_metadata=(file_flags&1u)==0;
+        value.implementation_hash_blob_index=index(file_row.value(),4+string_width,(md.tables.heap_sizes&4)?4u:2u);
+        auto hash_valid=validate_blob(value.implementation_hash_blob_index);if(!hash_valid)return hash_valid.error();
+        auto file_hash=read_blob_value(value.implementation_hash_blob_index);if(!file_hash)return file_hash.error();
+        value.implementation_hash=std::move(file_hash.value());
+        value.implementation_hash_algorithm=assembly_hash_algorithm;
+        value.resolution=ManagedResourceResolutionState::unresolved;
+        value.resolution_diagnostic="File resource has not been resolved against caller-supplied input";
+      }else if(value.implementation==ManagedResourceImplementationKind::assembly_ref){
+        auto assembly_row=read_table_row(35,rid_value);if(!assembly_row)return assembly_row.error();
+        const auto row=assembly_row.value();
+        value.implementation_major=u16(row,0);value.implementation_minor=u16(row,2);
+        value.implementation_build=u16(row,4);value.implementation_revision=u16(row,6);
+        value.implementation_flags=u32(row,8);
+        const auto blob_width=(md.tables.heap_sizes&4)?4u:2u;
+        value.implementation_key_or_token_blob_index=index(row,12,blob_width);
+        auto key_valid=validate_blob(value.implementation_key_or_token_blob_index);if(!key_valid)return key_valid.error();
+        auto key_or_token=read_blob_value(value.implementation_key_or_token_blob_index);if(!key_or_token)return key_or_token.error();
+        value.implementation_key_or_token=std::move(key_or_token.value());
+        auto assembly_name=read_string(index(row,12+blob_width,string_width));if(!assembly_name)return assembly_name.error();
+        const auto culture_index=index(row,12+blob_width+string_width,string_width);
+        if(culture_index){auto culture=read_string(culture_index);if(!culture)return culture.error();value.implementation_culture=std::move(culture.value());}
+        const auto hash_index=index(row,12+blob_width+2*string_width,blob_width);
+        auto hash_valid=validate_blob(hash_index);if(!hash_valid)return hash_valid.error();
+        value.implementation_name=std::move(assembly_name.value());
+        value.resolution=ManagedResourceResolutionState::unresolved;
+        value.resolution_diagnostic="AssemblyRef resource has not been resolved against caller-supplied input";
+      }else{
+        value.resolution=ManagedResourceResolutionState::unresolved;
+        value.resolution_diagnostic="ExportedType resource implementations are not resolved";
+      }
+    }
+    result.push_back(std::move(value));
+  }
+  return result;
+} catch(const std::bad_alloc&) {return Error{ErrorCode::resource_limit,"Cannot allocate CLR ManifestResource catalog"};}
+  catch(const std::length_error&) {return Error{ErrorCode::resource_limit,"CLR ManifestResource catalog exceeds container limits"};}
+
+namespace {
+Result<std::uint32_t> resource_7bit(std::span<const std::byte> b,std::size_t limit,std::size_t& p){
+  std::uint32_t value=0;for(unsigned i=0;i<5;++i){if(p>=limit)return malformed("Truncated .resources 7-bit integer");const auto v=std::to_integer<std::uint8_t>(b[p++]);if(i==4&&(v&0xf0))return malformed("Overflowing .resources 7-bit integer");value|=std::uint32_t(v&0x7f)<<(i*7);if(!(v&0x80)){if(i&&value<(std::uint32_t{1}<<(i*7)))return malformed("Noncanonical .resources 7-bit integer");return value;}}return malformed("Overlong .resources 7-bit integer");
+}
+bool resource_utf8_valid(std::string_view s){
+  for(std::size_t p=0;p<s.size();){const auto a=static_cast<std::uint8_t>(s[p++]);if(a<0x80)continue;std::uint32_t cp=0,min=0;unsigned n=0;if(a>=0xc2&&a<=0xdf){cp=a&31;min=0x80;n=1;}else if(a>=0xe0&&a<=0xef){cp=a&15;min=0x800;n=2;}else if(a>=0xf0&&a<=0xf4){cp=a&7;min=0x10000;n=3;}else return false;if(s.size()-p<n)return false;for(unsigned i=0;i<n;++i){const auto c=static_cast<std::uint8_t>(s[p++]);if((c&0xc0)!=0x80)return false;cp=(cp<<6)|(c&63);}if(cp<min||cp>0x10ffff||(cp>=0xd800&&cp<=0xdfff))return false;}return true;
+}
+bool append_resource_scalar(std::string& s,std::uint32_t cp){
+  if(cp<=0x7f)s.push_back(static_cast<char>(cp));else if(cp<=0x7ff){s.push_back(static_cast<char>(0xc0|(cp>>6)));s.push_back(static_cast<char>(0x80|(cp&63)));}else if(cp<=0xffff){s.push_back(static_cast<char>(0xe0|(cp>>12)));s.push_back(static_cast<char>(0x80|((cp>>6)&63)));s.push_back(static_cast<char>(0x80|(cp&63)));}else if(cp<=0x10ffff){s.push_back(static_cast<char>(0xf0|(cp>>18)));s.push_back(static_cast<char>(0x80|((cp>>12)&63)));s.push_back(static_cast<char>(0x80|((cp>>6)&63)));s.push_back(static_cast<char>(0x80|(cp&63)));}else return false;return true;
+}
+Result<std::string> resource_name_utf16(std::span<const std::byte> b,std::size_t p,std::size_t n){
+  if(n&1u)return malformed(".resources name has an odd UTF-16 byte count");std::string out;out.reserve(n);
+  for(std::size_t i=0;i<n;i+=2){const auto hi=u16(b,p+i);std::uint32_t cp=hi;if(hi>=0xd800&&hi<=0xdbff){if(i+4>n)return malformed(".resources name has an unpaired UTF-16 high surrogate");const auto lo=u16(b,p+i+2);if(lo<0xdc00||lo>0xdfff)return malformed(".resources name has an invalid UTF-16 surrogate pair");cp=0x10000+((hi-0xd800)<<10)+(lo-0xdc00);i+=2;}else if(hi>=0xdc00&&hi<=0xdfff)return malformed(".resources name has an unpaired UTF-16 low surrogate");if(!append_resource_scalar(out,cp))return malformed(".resources name cannot be encoded as UTF-8");}return out;
+}
+Result<std::string> resource_string(std::span<const std::byte> b,std::size_t limit,std::size_t& p){
+  auto n=resource_7bit(b,limit,p);if(!n)return n.error();if(n.value()>1024u*1024u)return Error{ErrorCode::resource_limit,".resources string exceeds 1 MiB"};if(n.value()>limit-p)return malformed(".resources string exceeds its data extent");std::string s;s.reserve(n.value());for(std::uint32_t i=0;i<n.value();++i)s.push_back(static_cast<char>(std::to_integer<unsigned char>(b[p+i])));p+=n.value();if(!resource_utf8_valid(s))return malformed(".resources string is invalid UTF-8");return s;
+}
+std::uint32_t resource_name_hash(std::span<const std::byte> b,std::size_t p,std::size_t n){
+  std::uint32_t hash=5381;for(std::size_t i=0;i<n;i+=2)hash=((hash<<5)+hash)^u16(b,p+i);return hash;
+}
+Result<bool> parse_dotnet_resources(ManagedResource& resource){
+  auto b=std::span<const std::byte>(resource.payload);if(b.size()<4||u32(b,0)!=0xbeefcaceu)return true;
+  resource.payload_format=ManagedResourcePayloadFormat::dotnet_resources_v2;if(b.size()<12)return malformed("Truncated .resources header");
+  const auto header_version=u32(b,4),header_size=u32(b,8);if(header_version!=1){resource.payload_format=ManagedResourcePayloadFormat::unsupported_dotnet_resources;resource.payload_diagnostic="Unsupported ResourceManager header version";return true;}
+  if(header_size>64u*1024u||header_size>b.size()-12)return malformed(".resources ResourceManager header extent is invalid");
+  const auto header_end=std::size_t{12}+header_size;std::size_t p=12;auto reader=resource_string(b,header_end,p);if(!reader)return reader.error();auto set=resource_string(b,header_end,p);if(!set)return set.error();
+  if(!reader.value().starts_with("System.Resources.ResourceReader")||!set.value().starts_with("System.Resources.RuntimeResourceSet")){resource.payload_format=ManagedResourcePayloadFormat::unsupported_dotnet_resources;resource.payload_diagnostic="Nonstandard ResourceReader or ResourceSet implementation";return true;}
+  p=header_end;if(b.size()-p<12)return malformed("Truncated .resources RuntimeResourceSet header");const auto version=u32(b,p);p+=4;if(version!=2){resource.payload_format=ManagedResourcePayloadFormat::unsupported_dotnet_resources;resource.payload_diagnostic="Unsupported RuntimeResourceSet version";return true;}
+  const auto count=u32(b,p);p+=4;const auto type_count=u32(b,p);p+=4;if(count>65536||type_count>4096)return Error{ErrorCode::resource_limit,".resources exceeds 65,536 records or 4,096 type names"};
+  std::vector<std::string> types;types.reserve(type_count);std::size_t type_bytes=0;for(std::uint32_t i=0;i<type_count;++i){auto type=resource_string(b,b.size(),p);if(!type)return type.error();if(type.value().empty())return malformed(".resources type name is empty");if(type.value().size()>4u*1024u*1024u-type_bytes)return Error{ErrorCode::resource_limit,".resources type names exceed 4 MiB"};type_bytes+=type.value().size();types.push_back(std::move(type.value()));}
+  while(p&7u){if(p>=b.size())return malformed("Truncated .resources hash alignment");++p;}
+  const auto arrays=std::uint64_t{count}*8;if(arrays>b.size()-p)return malformed(".resources hash/position arrays exceed the file");
+  std::vector<std::uint32_t> name_hashes;name_hashes.reserve(count);std::uint32_t previous_hash_order=0;
+  for(std::uint32_t i=0;i<count;++i){const auto hash=u32(b,p);p+=4;const auto order=hash^0x80000000u;if(i&&order<previous_hash_order)return malformed(".resources name hashes are not signed-sorted");previous_hash_order=order;name_hashes.push_back(hash);}
+  std::vector<std::uint32_t> name_positions;name_positions.reserve(count);for(std::uint32_t i=0;i<count;++i){name_positions.push_back(u32(b,p));p+=4;}
+  if(b.size()-p<4)return malformed("Truncated .resources data-section offset");const auto data_section=u32(b,p);p+=4;if(data_section<p||data_section>b.size())return malformed(".resources data-section offset overlaps its tables or exceeds the payload");
+  const auto names_begin=p,name_size=std::size_t(data_section)-names_begin;std::set<std::uint32_t> seen_name_pos;std::set<std::string> seen_names;std::size_t name_bytes=0;
+  struct NameEntry{std::string name;std::uint32_t data=0;};std::vector<NameEntry> names;names.reserve(count);std::vector<std::pair<std::size_t,std::size_t>> name_extents;name_extents.reserve(count);
+  for(std::size_t name_index=0;name_index<name_positions.size();++name_index){const auto offset=name_positions[name_index];if(offset>=name_size||!seen_name_pos.insert(offset).second)return malformed(".resources name offset is duplicate or outside the name section");std::size_t q=names_begin+offset;auto byte_count=resource_7bit(b,data_section,q);if(!byte_count)return byte_count.error();if(byte_count.value()>data_section-q||data_section-q-byte_count.value()<4)return malformed(".resources name entry exceeds its section");if(byte_count.value()>4u*1024u*1024u-name_bytes)return Error{ErrorCode::resource_limit,".resources names exceed 4 MiB"};if(byte_count.value()&1u)return malformed(".resources name has an odd UTF-16 byte count");if(resource_name_hash(b,q,byte_count.value())!=name_hashes[name_index])return malformed(".resources name hash does not match its UTF-16 name");auto name=resource_name_utf16(b,q,byte_count.value());if(!name)return name.error();q+=byte_count.value();if(name.value().empty()||!seen_names.insert(name.value()).second)return malformed(".resources names are empty or duplicated");const auto data=u32(b,q);q+=4;if(count&&data>=b.size()-data_section)return malformed(".resources record data offset is outside the data section");names.push_back({std::move(name.value()),data});name_extents.emplace_back(names_begin+offset,q);name_bytes+=byte_count.value();}
+  std::sort(name_extents.begin(),name_extents.end());for(std::size_t i=1;i<name_extents.size();++i)if(name_extents[i].first<name_extents[i-1].second)return malformed(".resources name entries overlap");
+  std::vector<std::pair<std::uint32_t,std::size_t>> order;order.reserve(count);for(std::size_t i=0;i<names.size();++i)order.emplace_back(names[i].data,i);std::sort(order.begin(),order.end());
+  for(std::size_t ri=0;ri<order.size();++ri){if((ri==0&&order[ri].first!=0)||(ri&&order[ri-1].first==order[ri].first))return malformed(".resources data offsets are not unique and contiguous");const auto start=std::size_t(data_section)+order[ri].first;const auto end=ri+1<order.size()?std::size_t(data_section)+order[ri+1].first:b.size();if(start>=end)return malformed(".resources record has an empty extent");std::size_t q=start;auto code=resource_7bit(b,end,q);if(!code)return code.error();ManagedResourceRecord rec;rec.name=names[order[ri].second].name;rec.type_code=code.value();rec.data_offset=static_cast<std::uint32_t>(q);rec.data_size=static_cast<std::uint32_t>(end-q);const auto body=q;
+    if(rec.type_code>=64){const auto ti=rec.type_code-64;if(ti>=types.size())return malformed(".resources user type index exceeds its type table");rec.type_name=types[ti];rec.kind=ManagedResourceValueKind::user_type;rec.supported=false;}
+    else {const auto n=end-q;const auto fixed=[&](std::size_t width,ManagedResourceValueKind kind)->Result<bool>{if(n!=width)return malformed(".resources fixed-width value has an incorrect size");rec.kind=kind;rec.supported=true;rec.scalar_bits=0;for(std::size_t i=0;i<std::min<std::size_t>(width,8);++i)rec.scalar_bits|=std::uint64_t(std::to_integer<std::uint8_t>(b[q+i]))<<(8*i);rec.data_size=static_cast<std::uint32_t>(width);q=end;return true;};
+      switch(rec.type_code){case 0:rec.kind=ManagedResourceValueKind::null_value;rec.supported=true;rec.data_size=0;if(n)return malformed(".resources null record has trailing bytes");break;
+      case 1:{rec.kind=ManagedResourceValueKind::string_value;auto value=resource_string(b,end,q);if(!value)return value.error();if(q!=end)return malformed(".resources string has trailing bytes");rec.string_value=std::move(value.value());rec.supported=true;rec.data_offset=static_cast<std::uint32_t>(body+(q-body-rec.string_value.size()));rec.data_size=static_cast<std::uint32_t>(rec.string_value.size());break;}
+      case 2:if(n!=1||std::to_integer<std::uint8_t>(b[q])>1)return malformed("Invalid .resources Boolean value");{auto ok=fixed(1,ManagedResourceValueKind::boolean);if(!ok)return ok.error();}break;
+      case 3:{auto ok=fixed(2,ManagedResourceValueKind::character);if(!ok)return ok.error();break;}
+      case 4:case 5:{auto ok=fixed(1,rec.type_code==4?ManagedResourceValueKind::unsigned_integer:ManagedResourceValueKind::signed_integer);if(!ok)return ok.error();break;}
+      case 6:case 7:{auto ok=fixed(2,rec.type_code==6?ManagedResourceValueKind::signed_integer:ManagedResourceValueKind::unsigned_integer);if(!ok)return ok.error();break;}
+      case 8:case 9:{auto ok=fixed(4,rec.type_code==8?ManagedResourceValueKind::signed_integer:ManagedResourceValueKind::unsigned_integer);if(!ok)return ok.error();break;}
+      case 10:case 11:{auto ok=fixed(8,rec.type_code==10?ManagedResourceValueKind::signed_integer:ManagedResourceValueKind::unsigned_integer);if(!ok)return ok.error();break;}
+      case 12:{auto ok=fixed(4,ManagedResourceValueKind::single);if(!ok)return ok.error();break;}case 13:{auto ok=fixed(8,ManagedResourceValueKind::double_value);if(!ok)return ok.error();break;}
+      case 14:{auto ok=fixed(16,ManagedResourceValueKind::decimal);if(!ok)return ok.error();break;}case 15:{auto ok=fixed(8,ManagedResourceValueKind::date_time);if(!ok)return ok.error();break;}case 16:{auto ok=fixed(8,ManagedResourceValueKind::time_span);if(!ok)return ok.error();break;}
+      case 32:case 33:{if(n<4)return malformed("Truncated .resources byte-array/stream length");const auto length=u32(b,q);q+=4;if(length!=end-q)return malformed(".resources byte-array/stream length mismatches its record extent");rec.kind=rec.type_code==32?ManagedResourceValueKind::byte_array:ManagedResourceValueKind::stream;rec.supported=true;rec.data_offset=static_cast<std::uint32_t>(q);rec.data_size=length;q=end;break;}
+      default:rec.kind=ManagedResourceValueKind::unsupported;rec.supported=false;break;}
+    }
+    if(rec.supported&&q!=end)return malformed(".resources record parser did not consume its extent");resource.records.push_back(std::move(rec));
+  }
+  return true;
+}
+} // namespace
+
+Result<std::vector<ManagedFieldRva>> parse_managed_field_rvas(std::span<const std::byte> root) try {
+  if (root.size() > 64u * 1024u * 1024u)
+    return Error{ErrorCode::resource_limit, "CLR FieldRVA inspection root exceeds 64 MiB"};
+  auto parsed = parse_cli_metadata(root);
+  if (!parsed) return parsed.error();
+  const auto &metadata = parsed.value();
+  const auto rows = [&](std::uint8_t id) {
+    const auto it = metadata.tables.row_counts.find(id);
+    return it == metadata.tables.row_counts.end() ? 0u : it->second;
+  };
+  const auto count = rows(29);
+  if (count > 250000)
+    return Error{ErrorCode::resource_limit, "CLR FieldRVA catalog exceeds 250,000 rows"};
+  if (!count) return std::vector<ManagedFieldRva>{};
+  if (!rows(4)) return malformed("FieldRVA rows have no FieldDef owners");
+  auto tables_it = metadata.streams.find("#~");
+  if (tables_it == metadata.streams.end()) tables_it = metadata.streams.find("#-");
+  if (tables_it == metadata.streams.end()) return malformed("FieldRVA parsing requires a metadata tables stream");
+  const auto tables = root.subspan(tables_it->second.offset, tables_it->second.size);
+  const auto field_width = rows(4) < 65536 ? 2u : 4u;
+  const auto row_it = metadata.tables.row_sizes.find(29);
+  if (row_it == metadata.tables.row_sizes.end() || row_it->second != 4 + field_width)
+    return malformed("FieldRVA row layout is inconsistent");
+  std::uint64_t offset = metadata.tables.data_offset;
+  for (std::uint8_t id = 0; id < 29; ++id) {
+    const auto table_rows = metadata.tables.row_counts.find(id);
+    const auto size = metadata.tables.row_sizes.find(id);
+    if (table_rows != metadata.tables.row_counts.end() && table_rows->second &&
+        size == metadata.tables.row_sizes.end())
+      return malformed("FieldRVA preceding table has no row layout");
+    if (size != metadata.tables.row_sizes.end())
+      offset += std::uint64_t{rows(id)} * size->second;
+  }
+  if (offset > tables.size() || std::uint64_t{count} * row_it->second > tables.size() - offset)
+    return malformed("FieldRVA rows exceed tables stream");
+  const auto read_index = [](std::span<const std::byte> bytes, std::size_t at, unsigned width) {
+    return width == 2 ? std::uint32_t(u16(bytes, at)) : u32(bytes, at);
+  };
+  std::vector<ManagedFieldRva> result;
+  result.reserve(count);
+  std::set<std::uint32_t> seen_fields;
+  for (std::uint32_t rid = 1; rid <= count; ++rid) {
+    const auto at = static_cast<std::size_t>(offset + std::uint64_t{rid - 1} * row_it->second);
+    const auto rva = u32(tables, at);
+    const auto field = read_index(tables, at + 4, field_width);
+    if (!rva || !field || field > rows(4) || field > 0x00ffffffu)
+      return malformed("FieldRVA has an invalid RVA or FieldDef index");
+    const auto token = 0x04000000u | field;
+    if (!seen_fields.insert(token).second)
+      return malformed("FieldDef has multiple FieldRVA rows");
+    result.push_back({token, rva, tables_it->second.offset + at});
+  }
+  return result;
+} catch (const std::bad_alloc &) {
+  return Error{ErrorCode::resource_limit, "Cannot allocate CLR FieldRVA catalog"};
+} catch (const std::length_error &) {
+  return Error{ErrorCode::resource_limit, "CLR FieldRVA catalog exceeds container limits"};
+}
+
+Result<std::vector<ManagedFieldLayout>> parse_managed_field_layouts(std::span<const std::byte> root){
+  auto parsed=parse_cli_metadata(root);if(!parsed)return parsed.error();
+  const auto &metadata=parsed.value();
+  const auto count_it=metadata.tables.row_counts.find(16);
+  if(count_it==metadata.tables.row_counts.end() || !count_it->second)return std::vector<ManagedFieldLayout>{};
+  const auto field_rows=metadata.tables.row_counts.find(4);
+  const auto field_count=field_rows==metadata.tables.row_counts.end()?0u:field_rows->second;
+  const auto index_width=field_count<65536?2u:4u;
+  const auto row=metadata.tables.row_sizes.find(16);
+  auto table_it=metadata.streams.find("#~");if(table_it==metadata.streams.end())table_it=metadata.streams.find("#-");
+  if(row==metadata.tables.row_sizes.end() || row->second!=4+index_width || table_it==metadata.streams.end())
+    return malformed("CLR FieldLayout row layout is inconsistent");
+  const auto tables=root.subspan(table_it->second.offset,table_it->second.size);
+  std::uint64_t offset=metadata.tables.data_offset;
+  for(std::uint8_t id=0;id<16;++id)
+    if(const auto rows=metadata.tables.row_counts.find(id);rows!=metadata.tables.row_counts.end())
+      if(const auto size=metadata.tables.row_sizes.find(id);size!=metadata.tables.row_sizes.end())
+        offset+=std::uint64_t{rows->second}*size->second;
+  if(offset>tables.size() || std::uint64_t{count_it->second}*row->second>tables.size()-offset)
+    return malformed("CLR FieldLayout rows exceed tables stream");
+  std::vector<ManagedFieldLayout> result;result.reserve(count_it->second);
+  std::vector<bool> seen(field_count+1);
+  std::uint32_t previous=0;
+  for(std::uint32_t n=0;n<count_it->second;++n) {
+    const auto at=static_cast<std::size_t>(offset+std::uint64_t{n}*row->second);
+    const auto field=index_width==2?u16(tables,at+4):u32(tables,at+4);
+    if(!field || field>field_count || seen[field])
+      return malformed("CLR FieldLayout contains an invalid or duplicate FieldDef index");
+    if(n && field<previous)return malformed("CLR FieldLayout rows are not sorted by FieldDef");
+    seen[field]=true;previous=field;
+    result.push_back({0x04000000u|field,u32(tables,at),
+      std::uint64_t{table_it->second.offset}+offset+std::uint64_t{n}*row->second});
+  }
+  return result;
+}
+
 Result<std::vector<ManagedField>> parse_managed_fields(std::span<const std::byte> root){
   auto parsed=parse_cli_metadata(root);if(!parsed)return parsed.error();
   const auto& metadata=parsed.value();
@@ -1211,7 +2013,21 @@ Result<std::vector<ManagedField>> parse_managed_fields(std::span<const std::byte
   const auto field_count=row_count(4),type_count=row_count(2),pointer_count=row_count(3);
   if(field_count>250000)return Error{ErrorCode::resource_limit,"CLR FieldDef catalog exceeds 250,000 rows"};
   if(pointer_count && pointer_count!=field_count)return malformed("CLR FieldPtr count does not match FieldDef count");
+  auto field_rvas = parse_managed_field_rvas(root);
+  if (!field_rvas) return field_rvas.error();
+  std::map<std::uint32_t, ManagedFieldRva> field_rva_by_token;
+  for (const auto &field_rva : field_rvas.value()) field_rva_by_token.emplace(field_rva.field_token, field_rva);
+  auto field_layouts=parse_managed_field_layouts(root);if(!field_layouts)return field_layouts.error();
+  std::map<std::uint32_t,ManagedFieldLayout> field_layout_by_token;
+  for(const auto &layout:field_layouts.value())field_layout_by_token.emplace(layout.field_token,layout);
   if(!field_count)return std::vector<ManagedField>{};
+  auto constants=parse_managed_constants(root);if(!constants)return constants.error();
+  std::map<std::uint32_t,ManagedConstant> defaults;
+  for(auto& value:constants.value())if((value.parent_token>>24)==4)defaults.emplace(value.parent_token,std::move(value));
+  auto marshal_rows=parse_managed_marshal_descriptors(root);if(!marshal_rows)return marshal_rows.error();
+  std::map<std::uint32_t,ManagedMarshalDescriptor> marshal_descriptors;
+  for(auto& value:marshal_rows.value())if((value.parent_token>>24)==4)
+    marshal_descriptors.emplace(value.parent_token,std::move(value));
   if(!type_count)return malformed("CLR FieldDef rows have no owning TypeDef rows");
   auto tables_it=metadata.streams.find("#~");if(tables_it==metadata.streams.end())tables_it=metadata.streams.find("#-");
   const auto strings_it=metadata.streams.find("#Strings"),blobs_it=metadata.streams.find("#Blob");
@@ -1255,6 +2071,18 @@ Result<std::vector<ManagedField>> parse_managed_fields(std::span<const std::byte
   for(std::uint32_t row=1;row<=field_count;++row){
     const auto at=static_cast<std::size_t>(field_offset+std::uint64_t{row-1}*field_row_size);
     ManagedField field;field.token=0x04000000u|row;field.flags=u16(tables,at);
+    if(const auto layout=field_layout_by_token.find(field.token);layout!=field_layout_by_token.end()) {
+      field.explicit_layout_offset=layout->second.offset;
+      field.layout_metadata_offset=layout->second.metadata_offset;
+    }
+    const auto rva = field_rva_by_token.find(field.token);
+    const bool has_rva_flag = (field.flags & 0x0100u) != 0;
+    if (has_rva_flag != (rva != field_rva_by_token.end()))
+      return malformed("FieldDef HasFieldRVA flag does not match FieldRVA table");
+    if (rva != field_rva_by_token.end()) {
+      field.rva = rva->second.rva;
+      field.rva_metadata_offset = rva->second.metadata_offset;
+    }
     const auto name=read_string(read_index(tables,at+2,string_width));if(!name)return name.error();
     if(name.value().empty())return malformed("CLR FieldDef has an empty name");
     field.name=std::move(name.value());field.signature_index=read_index(tables,at+2+string_width,blob_width);field.declaring_type=owners[row];
@@ -1272,10 +2100,205 @@ Result<std::vector<ManagedField>> parse_managed_fields(std::span<const std::byte
       if(!status)return status.error();
       field.type_signature=std::move(resolved);
     }
+    if(const auto value=defaults.find(field.token);value!=defaults.end())field.default_value=std::move(value->second);
+    if(const auto marshal=marshal_descriptors.find(field.token);marshal!=marshal_descriptors.end())
+      field.marshal_descriptor=std::move(marshal->second);
     result.push_back(std::move(field));
   }
   return result;
 }
+
+Result<std::vector<ManagedProperty>> parse_managed_properties(std::span<const std::byte> root) try {
+  if(root.size()>64u*1024u*1024u)return Error{ErrorCode::resource_limit,"CLR property inspection root exceeds 64 MiB"};
+  auto parsed=parse_cli_metadata(root);if(!parsed)return parsed.error();const auto& md=parsed.value();
+  const auto rows=[&](std::uint8_t id){const auto it=md.tables.row_counts.find(id);return it==md.tables.row_counts.end()?0u:it->second;};
+  const auto count=rows(23),maps=rows(21),pointers=rows(22),semantics=rows(24);
+  if(count>65536||maps>65536||semantics>250000)return Error{ErrorCode::resource_limit,"CLR property table count exceeds its limit"};
+  if(pointers&&pointers!=count)return malformed("PropertyPtr count does not match Property count");
+  if(!count){if(maps)return malformed("PropertyMap has no Property rows");return std::vector<ManagedProperty>{};}
+  if(!maps)return malformed("Property rows have no PropertyMap owners");
+  auto tables_it=md.streams.find("#~");if(tables_it==md.streams.end())tables_it=md.streams.find("#-");
+  const auto strings_it=md.streams.find("#Strings"),blobs_it=md.streams.find("#Blob");
+  if(tables_it==md.streams.end()||strings_it==md.streams.end()||blobs_it==md.streams.end())return malformed("Property parsing requires tables, #Strings and #Blob");
+  const auto tables=root.subspan(tables_it->second.offset,tables_it->second.size),strings=root.subspan(strings_it->second.offset,strings_it->second.size),blobs=root.subspan(blobs_it->second.offset,blobs_it->second.size);
+  const auto sw=(md.tables.heap_sizes&1)?4u:2u,bw=(md.tables.heap_sizes&4)?4u:2u;
+  const auto index_width=[&](std::uint8_t id){return rows(id)<65536?2u:4u;};
+  const auto read_index=[&](std::span<const std::byte> bytes,std::size_t at,std::uint32_t width){return width==2?std::uint32_t(u16(bytes,at)):u32(bytes,at);};
+  const auto row_size=[&](std::uint8_t id){const auto it=md.tables.row_sizes.find(id);return it==md.tables.row_sizes.end()?0u:it->second;};
+  const auto table_offset=[&](std::uint8_t id){std::uint64_t offset=md.tables.data_offset;for(std::uint8_t n=0;n<id;++n)offset+=std::uint64_t{rows(n)}*row_size(n);return offset;};
+  const auto table_valid=[&](std::uint8_t id,std::uint32_t expected){const auto at=table_offset(id);return row_size(id)==expected&&at<=tables.size()&&std::uint64_t{rows(id)}*expected<=tables.size()-at;};
+  const auto pw=index_width(23),tw=index_width(2),mw=index_width(6),aw=coded_width(7,md.tables.row_counts);
+  if(!table_valid(23,2+sw+bw)||!table_valid(21,tw+pw)||(pointers&&!table_valid(22,pw))||(semantics&&!table_valid(24,2+mw+aw)))return malformed("Property table layout or extent is inconsistent");
+  std::vector<std::uint32_t> order(count);std::vector<bool> seen(count+1);
+  for(std::uint32_t n=0;n<count;++n){const auto rid=pointers?read_index(tables,static_cast<std::size_t>(table_offset(22)+std::uint64_t{n}*pw),pw):n+1;if(!rid||rid>count||seen[rid])return malformed("PropertyPtr contains an invalid or duplicate Property index");seen[rid]=true;order[n]=rid;}
+  auto catalog=parse_managed_type_catalog(root);if(!catalog)return catalog.error();
+  std::vector<std::uint32_t> owners(count+1),starts,parents;starts.reserve(maps);parents.reserve(maps);std::set<std::uint32_t> seen_parents;
+  for(std::uint32_t n=0;n<maps;++n){const auto at=static_cast<std::size_t>(table_offset(21)+std::uint64_t{n}*row_size(21));const auto parent=read_index(tables,at,tw),first=read_index(tables,at+tw,pw);if(!parent||parent>catalog.value().definitions.size()||!seen_parents.insert(parent).second||!first||first>count||(!starts.empty()&&first<=starts.back()))return malformed("PropertyMap has invalid parents or list boundaries");parents.push_back(parent);starts.push_back(first);}
+  if(starts.front()!=1)return malformed("PropertyMap leaves initial Property rows unowned");
+  for(std::size_t n=0;n<starts.size();++n){const auto end=n+1<starts.size()?starts[n+1]:count+1;for(auto pos=starts[n];pos<end;++pos)owners[order[pos-1]]=parents[n];}
+  auto constants=parse_managed_constants(root);if(!constants)return constants.error();std::map<std::uint32_t,ManagedConstant> defaults;for(auto& value:constants.value())if((value.parent_token>>24)==23)defaults.emplace(value.parent_token,std::move(value));
+  std::size_t name_bytes=0,signature_bytes=0,signature_nodes=100000;std::set<std::uint32_t> active_specs;
+  const auto read_name=[&](std::uint32_t index)->Result<std::string>{if(!index||index>=strings.size())return malformed("Property name index is outside #Strings");std::string text;for(auto at=index;at<strings.size();++at){if(strings[at]==std::byte{0}){if(text.empty())return malformed("Property has an empty name");name_bytes+=text.size();if(name_bytes>8u*1024u*1024u)return Error{ErrorCode::resource_limit,"Property names exceed 8 MiB"};return text;}if(text.size()>=4096)return Error{ErrorCode::resource_limit,"Property name exceeds 4096 bytes"};text.push_back(static_cast<char>(std::to_integer<unsigned char>(strings[at])));}return malformed("Property name is unterminated");};
+  std::vector<ManagedProperty> result;result.reserve(count);
+  for(std::uint32_t rid=1;rid<=count;++rid){
+    const auto at=static_cast<std::size_t>(table_offset(23)+std::uint64_t{rid-1}*row_size(23));ManagedProperty property;property.token=0x17000000u|rid;property.flags=u16(tables,at);property.declaring_type_token=0x02000000u|owners[rid];
+    const auto& owner_name=catalog.value().definitions[owners[rid]-1].full_name;if(owner_name.size()>8u*1024u*1024u-name_bytes)return Error{ErrorCode::resource_limit,"Property names and owners exceed 8 MiB"};name_bytes+=owner_name.size();property.declaring_type=owner_name;
+    if((property.flags&~0x1600u)||((property.flags&0x400u)&&!(property.flags&0x200u)))return malformed("Property has reserved or inconsistent flags");
+    auto name=read_name(read_index(tables,at+2,sw));if(!name)return name.error();property.name=std::move(name.value());property.signature_index=read_index(tables,at+2+sw,bw);property.metadata_offset=tables_it->second.offset+at;property.row_size=row_size(23);
+    if(!property.signature_index||property.signature_index>=blobs.size())return malformed("Property signature index is outside #Blob");
+    std::size_t cursor=property.signature_index;auto length=compressed_uint(blobs,cursor);if(!length)return length.error();if(length.value()>blobs.size()-cursor)return malformed("Property signature exceeds #Blob");
+    if(length.value()>65536||length.value()>16u*1024u*1024u-signature_bytes)return Error{ErrorCode::resource_limit,"Property signature byte budget exceeded"};signature_bytes+=length.value();property.signature_metadata_offset=blobs_it->second.offset+cursor;property.signature_size=length.value();
+    auto signature=decode_managed_property_signature(blobs.subspan(cursor,length.value()));if(!signature){if(signature.error().code!=ErrorCode::unsupported)return signature.error();property.signature_diagnostic=signature.error().message;}else{auto status=resolve_type_signature(signature.value().property_type,catalog.value(),active_specs,0,signature_nodes);if(!status)return status.error();for(auto& parameter:signature.value().index_parameter_types){status=resolve_type_signature(parameter,catalog.value(),active_specs,0,signature_nodes);if(!status)return status.error();}property.signature=std::move(signature.value());}
+    const auto value=defaults.find(property.token);if(bool(property.flags&0x1000u)!=(value!=defaults.end()))return malformed("Property HasDefault flag disagrees with Constant metadata");if(value!=defaults.end())property.default_value=std::move(value->second);result.push_back(std::move(property));
+  }
+  std::map<std::uint32_t,std::uint32_t> method_owners;for(const auto& type:catalog.value().definitions)for(auto method:type.method_tokens)method_owners.emplace(method,type.token);
+  std::set<std::pair<std::uint32_t,std::uint32_t>> seen_accessors;
+  for(std::uint32_t n=0;n<semantics;++n){const auto at=static_cast<std::size_t>(table_offset(24)+std::uint64_t{n}*row_size(24));const auto flags=u16(tables,at);const auto method=read_index(tables,at+2,mw),association=read_index(tables,at+2+mw,aw),rid=association>>1;
+    if(!rid||rid>rows((association&1)?23:20)||!method||method>rows(6))return malformed("MethodSemantics has an invalid method or association");if(!(association&1))continue;
+    if(flags!=1&&flags!=2&&flags!=4)return malformed("Property MethodSemantics has an invalid accessor role");auto& property=result[rid-1];const auto token=0x06000000u|method;const auto owner=method_owners.find(token);if(owner==method_owners.end()||owner->second!=property.declaring_type_token)return malformed("Property accessor belongs to a different TypeDef");
+    if(!seen_accessors.emplace(rid,method).second)return malformed("Property has duplicate accessor methods");if(flags!=4&&std::any_of(property.accessors.begin(),property.accessors.end(),[&](const auto& accessor){return accessor.semantics==flags;}))return malformed("Property has duplicate getter or setter roles");
+    property.accessors.push_back({token,0x18000000u|(n+1),flags,tables_it->second.offset+at});
+  }
+  // Validate only methods explicitly associated with a Property. An unrelated
+  // unsupported method signature must not make property inspection fail.
+  const auto method_count=rows(6);
+  if(method_count>1000000)return Error{ErrorCode::resource_limit,"MethodDef table exceeds property accessor validation limit"};
+  const auto method_string_width=(md.tables.heap_sizes&1)?4u:2u;
+  const auto method_blob_width=(md.tables.heap_sizes&4)?4u:2u;
+  const auto parameter_rows=rows(8), parameter_pointer_rows=rows(7);
+  const bool has_parameter_pointers=md.tables.row_counts.contains(7);
+  if(has_parameter_pointers&&parameter_pointer_rows!=parameter_rows)
+    return malformed("ParamPtr count does not match Param count during accessor validation");
+  const auto parameter_list_rows=has_parameter_pointers?parameter_pointer_rows:parameter_rows;
+  const auto parameter_list_width=parameter_list_rows<65536?2u:4u;
+  const auto method_size=row_size(6);
+  const auto method_offset=table_offset(6);
+  if(method_count && (method_size!=8+method_string_width+method_blob_width+parameter_list_width ||
+      method_offset>tables.size() || std::uint64_t{method_count}*method_size>tables.size()-method_offset))
+    return malformed("MethodDef table layout is inconsistent during property accessor validation");
+  std::size_t accessor_signature_bytes=0, accessor_signature_nodes=100000;
+  for(auto& property:result)for(auto& accessor:property.accessors){
+    if(accessor.semantics==4)continue;
+    if(!property.signature){
+      accessor.validation=ManagedPropertyAccessorValidation::unsupported;
+      accessor.validation_diagnostic="property signature could not be decoded";
+      continue;
+    }
+    const auto rid=accessor.method_token&0x00ffffffu;
+    const auto at=static_cast<std::size_t>(method_offset+std::uint64_t{rid-1}*method_size);
+    accessor.signature_index=read_index(tables,at+8+method_string_width,method_blob_width);
+    if(!accessor.signature_index||accessor.signature_index>=blobs.size())return malformed("Property accessor signature index is outside #Blob");
+    std::size_t cursor=accessor.signature_index;auto length=compressed_uint(blobs,cursor);if(!length)return length.error();
+    if(length.value()>blobs.size()-cursor)return malformed("Property accessor signature exceeds #Blob");
+    if(length.value()>65536||length.value()>16u*1024u*1024u-accessor_signature_bytes)
+      return Error{ErrorCode::resource_limit,"Property accessor signature byte budget exceeded"};
+    accessor_signature_bytes+=length.value();accessor.signature_size=length.value();
+    accessor.signature_metadata_offset=blobs_it->second.offset+cursor;
+    auto decoded=decode_managed_method_signature(blobs.subspan(cursor,length.value()));
+    if(!decoded){
+      if(decoded.error().code!=ErrorCode::unsupported)return decoded.error();
+      accessor.validation=ManagedPropertyAccessorValidation::unsupported;
+      accessor.validation_diagnostic=decoded.error().message;
+      continue;
+    }
+    auto method_signature=std::move(decoded.value());
+    if(method_signature.generic_arity){
+      accessor.validation=ManagedPropertyAccessorValidation::unsupported;
+      accessor.validation_diagnostic="generic property accessors are outside this validator";
+      continue;
+    }
+    auto resolved=resolve_type_signature(method_signature.return_type,catalog.value(),active_specs,0,accessor_signature_nodes);
+    bool resolution_complete=true;
+    if(!resolved){
+      if(resolved.error().code==ErrorCode::unsupported)resolution_complete=false;
+      else return resolved.error();
+    }
+    for(auto& parameter:method_signature.parameter_types){
+      if(!resolution_complete)break;
+      resolved=resolve_type_signature(parameter,catalog.value(),active_specs,0,accessor_signature_nodes);
+      if(!resolved){
+        if(resolved.error().code==ErrorCode::unsupported){resolution_complete=false;break;}
+        return resolved.error();
+      }
+    }
+    if(!resolution_complete){
+      accessor.validation=ManagedPropertyAccessorValidation::unsupported;
+      accessor.validation_diagnostic="accessor signature contains an unresolved unsupported type";
+      continue;
+    }
+    bool matches=method_signature.has_this==property.signature->has_this;
+    if(accessor.semantics==2){
+      matches=matches&&method_signature.returns_value&&
+          method_signature.parameter_types.size()==property.signature->index_parameter_types.size();
+      if(matches){
+        const auto equal=same_property_type(method_signature.return_type,property.signature->property_type);
+        if(!equal){accessor.validation=ManagedPropertyAccessorValidation::unsupported;accessor.validation_diagnostic="return/property type shape is not fully retained";continue;}
+        matches=*equal;
+      }
+      for(std::size_t i=0;matches&&i<method_signature.parameter_types.size();++i){
+        const auto equal=same_property_type(method_signature.parameter_types[i],property.signature->index_parameter_types[i]);
+        if(!equal){accessor.validation=ManagedPropertyAccessorValidation::unsupported;accessor.validation_diagnostic="index parameter type shape is not fully retained";matches=false;break;}
+        matches=*equal;
+      }
+    }else{
+      matches=matches&&!method_signature.returns_value&&
+          method_signature.parameter_types.size()==property.signature->index_parameter_types.size()+1;
+      for(std::size_t i=0;matches&&i<property.signature->index_parameter_types.size();++i){
+        const auto equal=same_property_type(method_signature.parameter_types[i],property.signature->index_parameter_types[i]);
+        if(!equal){accessor.validation=ManagedPropertyAccessorValidation::unsupported;accessor.validation_diagnostic="index parameter type shape is not fully retained";matches=false;break;}
+        matches=*equal;
+      }
+      if(matches){
+        const auto equal=same_property_type(method_signature.parameter_types.back(),property.signature->property_type);
+        if(!equal){accessor.validation=ManagedPropertyAccessorValidation::unsupported;accessor.validation_diagnostic="setter value type shape is not fully retained";continue;}
+        matches=*equal;
+      }
+    }
+    accessor.validation=matches?ManagedPropertyAccessorValidation::valid:ManagedPropertyAccessorValidation::invalid;
+    if(!matches)accessor.validation_diagnostic=accessor.semantics==2
+        ?"getter signature does not match PropertySig" : "setter signature does not match PropertySig";
+  }
+  return result;
+} catch(const std::bad_alloc&) {return Error{ErrorCode::resource_limit,"Cannot allocate CLR property catalog"};}
+  catch(const std::length_error&) {return Error{ErrorCode::resource_limit,"CLR property catalog exceeds container limits"};}
+
+Result<std::vector<ManagedEvent>> parse_managed_events(std::span<const std::byte> root) try {
+  if(root.size()>64u*1024u*1024u)return Error{ErrorCode::resource_limit,"CLR event inspection root exceeds 64 MiB"};
+  auto parsed=parse_cli_metadata(root);if(!parsed)return parsed.error();const auto& md=parsed.value();
+  const auto rows=[&](std::uint8_t id){const auto it=md.tables.row_counts.find(id);return it==md.tables.row_counts.end()?0u:it->second;};
+  const auto count=rows(20),maps=rows(18),pointers=rows(19),semantics=rows(24);
+  if(count>65536||maps>65536||semantics>250000)return Error{ErrorCode::resource_limit,"CLR event table count exceeds its limit"};
+  if(pointers&&pointers!=count)return malformed("EventPtr count does not match Event count");
+  if(!count){if(maps)return malformed("EventMap has no Event rows");return std::vector<ManagedEvent>{};}
+  if(!maps)return malformed("Event rows have no EventMap owners");
+  auto tables_it=md.streams.find("#~");if(tables_it==md.streams.end())tables_it=md.streams.find("#-");
+  const auto strings_it=md.streams.find("#Strings");
+  if(tables_it==md.streams.end()||strings_it==md.streams.end())return malformed("Event parsing requires tables and #Strings");
+  const auto tables=root.subspan(tables_it->second.offset,tables_it->second.size),strings=root.subspan(strings_it->second.offset,strings_it->second.size);
+  const auto sw=(md.tables.heap_sizes&1)?4u:2u;
+  const auto index_width=[&](std::uint8_t id){return rows(id)<65536?2u:4u;};
+  const auto read_index=[&](std::span<const std::byte> bytes,std::size_t at,std::uint32_t width){return width==2?std::uint32_t(u16(bytes,at)):u32(bytes,at);};
+  const auto row_size=[&](std::uint8_t id){const auto it=md.tables.row_sizes.find(id);return it==md.tables.row_sizes.end()?0u:it->second;};
+  const auto table_offset=[&](std::uint8_t id){std::uint64_t offset=md.tables.data_offset;for(std::uint8_t n=0;n<id;++n)offset+=std::uint64_t{rows(n)}*row_size(n);return offset;};
+  const auto table_valid=[&](std::uint8_t id,std::uint32_t expected){const auto at=table_offset(id);return row_size(id)==expected&&at<=tables.size()&&std::uint64_t{rows(id)}*expected<=tables.size()-at;};
+  const auto ew=index_width(20),tw=index_width(2),mw=index_width(6),event_type_width=coded_width(1,md.tables.row_counts),association_width=coded_width(7,md.tables.row_counts);
+  if(!table_valid(20,2+sw+event_type_width)||!table_valid(18,tw+ew)||(pointers&&!table_valid(19,ew))||
+     (semantics&&!table_valid(24,2+mw+association_width)))return malformed("Event table layout or extent is inconsistent");
+  auto catalog=parse_managed_type_catalog(root);if(!catalog)return catalog.error();
+  std::vector<std::uint32_t> order(count),owners(count+1),starts,parents;std::vector<bool> seen(count+1);
+  for(std::uint32_t n=0;n<count;++n){const auto rid=pointers?read_index(tables,static_cast<std::size_t>(table_offset(19)+std::uint64_t{n}*ew),ew):n+1;if(!rid||rid>count||seen[rid])return malformed("EventPtr contains an invalid or duplicate Event index");seen[rid]=true;order[n]=rid;}
+  starts.reserve(maps);parents.reserve(maps);std::set<std::uint32_t> seen_parents;
+  for(std::uint32_t n=0;n<maps;++n){const auto at=static_cast<std::size_t>(table_offset(18)+std::uint64_t{n}*row_size(18));const auto parent=read_index(tables,at,tw),first=read_index(tables,at+tw,ew);if(!parent||parent>catalog.value().definitions.size()||!seen_parents.insert(parent).second||!first||first>count||(!starts.empty()&&first<=starts.back()))return malformed("EventMap has invalid parents or list boundaries");parents.push_back(parent);starts.push_back(first);}
+  if(starts.front()!=1)return malformed("EventMap leaves initial Event rows unowned");
+  for(std::size_t n=0;n<starts.size();++n){const auto end=n+1<starts.size()?starts[n+1]:count+1;for(auto pos=starts[n];pos<end;++pos)owners[order[pos-1]]=parents[n];}
+  std::size_t name_bytes=0;std::vector<ManagedEvent> result;result.reserve(count);
+  for(std::uint32_t rid=1;rid<=count;++rid){const auto at=static_cast<std::size_t>(table_offset(20)+std::uint64_t{rid-1}*row_size(20));const auto owner=owners[rid];if(!owner)return malformed("Event row is not owned by an EventMap");ManagedEvent event;event.token=0x14000000u|rid;event.declaring_type_token=0x02000000u|owner;event.flags=u16(tables,at);event.metadata_offset=tables_it->second.offset+at;event.row_size=row_size(20);const auto name_index=read_index(tables,at+2,sw);std::size_t name_at=name_index;if(!name_index||name_at>=strings.size())return malformed("Event name index is outside #Strings");for(;name_at<strings.size()&&strings[name_at]!=std::byte{0};++name_at){if(name_at-name_index>=4096)return Error{ErrorCode::resource_limit,"CLR event name exceeds 4096 bytes"};event.name.push_back(static_cast<char>(std::to_integer<unsigned char>(strings[name_at])));}if(name_at>=strings.size()||event.name.empty())return malformed("Event name is empty or unterminated");name_bytes+=event.name.size();if(name_bytes>8u*1024u*1024u)return Error{ErrorCode::resource_limit,"CLR event names exceed 8 MiB"};const auto coded=read_index(tables,at+2+sw,event_type_width),tag=coded&3u,type_rid=coded>>2;if(!type_rid||tag==3)return malformed("EventType has an invalid TypeDefOrRef coded index");const auto type_table=tag==0?2u:tag==1?1u:27u;if(type_rid>rows(static_cast<std::uint8_t>(type_table)))return malformed("EventType token is outside its metadata table");event.event_type_coded_index=coded;event.event_type_token=(type_table<<24)|type_rid;event.declaring_type=catalog.value().definitions[owner-1].full_name;result.push_back(std::move(event));}
+  std::map<std::uint32_t,std::uint32_t> method_owners;for(const auto& type:catalog.value().definitions)for(auto method:type.method_tokens)method_owners.emplace(method,type.token);
+  std::set<std::pair<std::uint32_t,std::uint32_t>> seen_accessors;
+  for(std::uint32_t n=0;n<semantics;++n){const auto at=static_cast<std::size_t>(table_offset(24)+std::uint64_t{n}*row_size(24));const auto flags=u16(tables,at);const auto method=read_index(tables,at+2,mw);const auto association=read_index(tables,at+2+mw,association_width);const auto rid=association>>1;if(!rid||!method||method>rows(6))return malformed("MethodSemantics has an invalid method or association");if(association&1u){if(rid>rows(23))return malformed("MethodSemantics Property association is out of range");continue;}if(rid>count)return malformed("MethodSemantics Event association is out of range");if(flags!=4&&flags!=8&&flags!=16&&flags!=32)return malformed("Event MethodSemantics has an invalid accessor role");auto& event=result[rid-1];const auto token=0x06000000u|method;const auto owner=method_owners.find(token);if(owner==method_owners.end()||owner->second!=event.declaring_type_token)return malformed("Event accessor belongs to a different TypeDef");if(!seen_accessors.emplace(rid,method).second)return malformed("Event has duplicate accessor methods");if(flags!=4&&std::any_of(event.accessors.begin(),event.accessors.end(),[&](const auto& accessor){return accessor.semantics==flags;}))return malformed("Event has duplicate add, remove, or fire roles");event.accessors.push_back({token,0x18000000u|(n+1),flags,tables_it->second.offset+at});}
+  return result;
+} catch(const std::bad_alloc&) {return Error{ErrorCode::resource_limit,"Cannot allocate CLR event catalog"};}
+  catch(const std::length_error&) {return Error{ErrorCode::resource_limit,"CLR event catalog exceeds container limits"};}
 
 Result<std::vector<ManagedField>> parse_managed_field_references(std::span<const std::byte> root) {
   auto parsed=parse_cli_metadata(root);if(!parsed)return parsed.error();const auto& metadata=parsed.value();
@@ -1339,6 +2362,8 @@ Result<std::vector<ManagedGenericParameter>> parse_managed_generic_parameters(st
   const auto index_width=[&](std::uint32_t count){return count<65536?2u:4u;};
   const auto read_index=[](std::span<const std::byte> bytes,std::size_t at,unsigned width){return width==2?std::uint32_t(u16(bytes,at)):u32(bytes,at);};
   const auto generic_count=rows(42),constraint_count=rows(44);
+  if(generic_count>250000)return Error{ErrorCode::resource_limit,"CLR GenericParam catalog exceeds 250,000 rows"};
+  if(constraint_count>1000000)return Error{ErrorCode::resource_limit,"CLR GenericParamConstraint catalog exceeds 1,000,000 rows"};
   if(!generic_count){if(constraint_count)return malformed("GenericParamConstraint rows have no GenericParam owners");return std::vector<ManagedGenericParameter>{};}
   auto tables_it=metadata.streams.find("#~");if(tables_it==metadata.streams.end())tables_it=metadata.streams.find("#-");
   const auto strings_it=metadata.streams.find("#Strings");
@@ -1357,6 +2382,7 @@ Result<std::vector<ManagedGenericParameter>> parse_managed_generic_parameters(st
     return malformed("GenericParam name is unterminated in #Strings heap");
   };
   std::vector<ManagedGenericParameter> result;result.reserve(generic_count);
+  std::size_t generic_name_bytes=0;
   std::map<std::uint32_t,std::set<std::uint16_t>> seen_numbers;
   for(std::uint32_t rid=1;rid<=generic_count;++rid){
     const auto at=static_cast<std::size_t>(generic_offset+std::uint64_t{rid-1}*row_size(42));
@@ -1370,7 +2396,10 @@ Result<std::vector<ManagedGenericParameter>> parse_managed_generic_parameters(st
     if(owner_rid>rows(static_cast<std::uint8_t>(owner_table)))return malformed("GenericParam owner token is outside its metadata table");
     parameter.owner_token=(owner_table<<24)|owner_rid;
     if(tag&&(parameter.flags&0x0003))return malformed("Method GenericParam cannot declare variance");
-    auto name=read_string(read_index(tables,at+4+owner_width,string_width));if(!name)return name.error();parameter.name=std::move(name.value());
+    auto name=read_string(read_index(tables,at+4+owner_width,string_width));if(!name)return name.error();
+    if(name.value().size()>8u*1024u*1024u-generic_name_bytes)return Error{ErrorCode::resource_limit,"CLR generic parameter names exceed 8 MiB"};
+    generic_name_bytes+=name.value().size();parameter.name=std::move(name.value());
+    parameter.metadata_offset=tables_it->second.offset+at;
     if(parameter.number>1023)return Error{ErrorCode::resource_limit,"GenericParam number exceeds 1023"};
     if(!seen_numbers[parameter.owner_token].insert(parameter.number).second)return malformed("GenericParam owner has duplicate parameter numbers");
     result.push_back(std::move(parameter));
@@ -1387,6 +2416,7 @@ Result<std::vector<ManagedGenericParameter>> parse_managed_generic_parameters(st
       const auto type_table=tag==0?2u:tag==1?1u:27u;
       if(rid>rows(static_cast<std::uint8_t>(type_table)))return malformed("GenericParamConstraint type token is outside its metadata table");
       result[owner-1].constraint_tokens.push_back((type_table<<24)|rid);
+      result[owner-1].constraint_metadata_offsets.push_back(tables_it->second.offset+at);
     }
   }
   return result;
@@ -1409,8 +2439,330 @@ Result<ManagedPeInfo> parse_managed_pe(const LoadedImage& loaded){
   const auto metadata_va=checked_add(base,std::uint64_t{metadata_rva});if(!metadata_va)return metadata_va.error();
   auto data=loaded.image->read({loaded.image->layout().space.id,metadata_va.value()},metadata_size);if(!data)return data.error();
   auto root=parse_cli_metadata(data.value());if(!root)return root.error();
-  ManagedPeInfo out;out.major=u16(h,4);out.minor=u16(h,6);out.flags=u32(h,16);out.entry_point_token=u32(h,20);out.metadata=std::move(root.value());return out;
+  ManagedPeInfo out;out.major=u16(h,4);out.minor=u16(h,6);out.flags=u32(h,16);out.entry_point_token=u32(h,20);out.metadata=std::move(root.value());
+  out.resources_rva=u32(h,24);out.resources_size=u32(h,28);
+  if((out.resources_rva==0)!=(out.resources_size==0))return malformed("CLR Resources RVA and size must either both be zero or both be nonzero");
+  return out;
 }
+
+namespace {
+Result<std::vector<std::byte>> managed_metadata_root_bytes(const LoadedImage& loaded){
+  if(!loaded.image||!loaded.metadata.pe)return Error{ErrorCode::invalid_argument,"Managed metadata input requires a loaded PE image"};
+  const auto directory=std::find_if(loaded.metadata.directories.begin(),loaded.metadata.directories.end(),[](const Directory& d){return d.index==14;});
+  if(directory==loaded.metadata.directories.end()||!directory->location||directory->size<72)return malformed("CLR metadata input requires a complete runtime header");
+  const auto base=loaded.load_base.value_or(loaded.metadata.preferred_base);
+  auto header_va=checked_add(base,std::uint64_t{directory->location});if(!header_va)return header_va.error();
+  auto header=loaded.image->read({loaded.image->layout().space.id,header_va.value()},72);if(!header)return header.error();
+  const auto metadata_rva=u32(header.value(),8),metadata_size=u32(header.value(),12);
+  if(u32(header.value(),0)<72||u32(header.value(),0)>directory->size||!metadata_rva||!metadata_size||metadata_size>64u*1024u*1024u)
+    return malformed("Invalid CLR metadata extent during resource binding");
+  auto metadata_va=checked_add(base,std::uint64_t{metadata_rva});if(!metadata_va)return metadata_va.error();
+  return loaded.image->read({loaded.image->layout().space.id,metadata_va.value()},metadata_size);
+}
+
+class ManagedSha1 {
+public:
+  void update(std::span<const std::byte> bytes){
+    total_+=bytes.size();
+    while(!bytes.empty()){
+      const auto count=std::min(bytes.size(),block_.size()-used_);
+      std::copy_n(bytes.begin(),count,block_.begin()+static_cast<std::ptrdiff_t>(used_));
+      used_+=count;bytes=bytes.subspan(count);
+      if(used_==block_.size()){compress(block_);used_=0;}
+    }
+  }
+  std::array<std::byte,20> finish(){
+    const auto bits=total_*8;
+    block_[used_++]=std::byte{0x80};
+    if(used_>56){std::fill(block_.begin()+static_cast<std::ptrdiff_t>(used_),block_.end(),std::byte{});compress(block_);used_=0;}
+    std::fill(block_.begin()+static_cast<std::ptrdiff_t>(used_),block_.begin()+56,std::byte{});
+    for(unsigned i=0;i<8;++i)block_[63-i]=std::byte(static_cast<unsigned char>(bits>>(i*8)));
+    compress(block_);
+    std::array<std::byte,20> digest{};
+    for(unsigned word=0;word<5;++word)for(unsigned byte=0;byte<4;++byte)
+      digest[word*4+byte]=std::byte(static_cast<unsigned char>(state_[word]>>(24-byte*8)));
+    return digest;
+  }
+private:
+  void compress(const std::array<std::byte,64>& block){
+    std::array<std::uint32_t,80> words{};
+    for(unsigned i=0;i<16;++i)words[i]=(std::uint32_t(std::to_integer<std::uint8_t>(block[i*4]))<<24)|
+      (std::uint32_t(std::to_integer<std::uint8_t>(block[i*4+1]))<<16)|
+      (std::uint32_t(std::to_integer<std::uint8_t>(block[i*4+2]))<<8)|
+      std::uint32_t(std::to_integer<std::uint8_t>(block[i*4+3]));
+    for(unsigned i=16;i<80;++i)words[i]=std::rotl(words[i-3]^words[i-8]^words[i-14]^words[i-16],1);
+    auto a=state_[0],b=state_[1],c=state_[2],d=state_[3],e=state_[4];
+    for(unsigned i=0;i<80;++i){
+      std::uint32_t f=0,k=0;
+      if(i<20){f=(b&c)|(~b&d);k=0x5a827999u;}
+      else if(i<40){f=b^c^d;k=0x6ed9eba1u;}
+      else if(i<60){f=(b&c)|(b&d)|(c&d);k=0x8f1bbcdcu;}
+      else {f=b^c^d;k=0xca62c1d6u;}
+      const auto next=std::rotl(a,5)+f+e+k+words[i];e=d;d=c;c=std::rotl(b,30);b=a;a=next;
+    }
+    state_[0]+=a;state_[1]+=b;state_[2]+=c;state_[3]+=d;state_[4]+=e;
+  }
+  std::array<std::uint32_t,5> state_{0x67452301u,0xefcdab89u,0x98badcfeu,0x10325476u,0xc3d2e1f0u};
+  std::array<std::byte,64> block_{};
+  std::uint64_t total_=0;
+  std::size_t used_=0;
+};
+
+Result<std::vector<std::byte>> managed_resource_hash(const ByteStorage& storage,std::uint32_t algorithm,
+                                                      std::stop_token stop){
+  if(algorithm==0x800cu){
+    auto hash=hash_source(storage,stop);if(!hash)return hash.error();
+    return std::vector<std::byte>(hash.value().begin(),hash.value().end());
+  }
+  if(algorithm!=0x8004u)return Error{ErrorCode::unsupported,"Unsupported CLR Assembly.HashAlgId for File resource binding"};
+  ManagedSha1 sha1;constexpr std::size_t chunk_size=1024u*1024u;
+  for(std::uint64_t offset=0;offset<storage.size();){
+    if(stop.stop_requested())return Error{ErrorCode::canceled,"CLR resource file hashing canceled"};
+    const auto count=static_cast<std::size_t>(std::min<std::uint64_t>(chunk_size,storage.size()-offset));
+    auto view=storage.read_at({offset},count);if(!view)return view.error();
+    if(view.value().bytes.size()!=count)return Error{ErrorCode::io,"Short read while hashing CLR resource file"};
+    sha1.update(view.value().bytes);offset+=count;
+  }
+  const auto digest=sha1.finish();return std::vector<std::byte>(digest.begin(),digest.end());
+}
+
+bool managed_resource_assembly_identity_matches(const ManagedAssemblyIdentity& requested,
+                                                const ManagedAssemblyIdentity& candidate){
+  const auto equal_folded=[](std::string_view left,std::string_view right){
+    if(left.size()!=right.size())return false;
+    for(std::size_t i=0;i<left.size();++i){
+      auto a=static_cast<unsigned char>(left[i]),b=static_cast<unsigned char>(right[i]);
+      if(a>='A'&&a<='Z')a=static_cast<unsigned char>(a+('a'-'A'));
+      if(b>='A'&&b<='Z')b=static_cast<unsigned char>(b+('a'-'A'));
+      if(a!=b)return false;
+    }
+    return true;
+  };
+  if(!equal_folded(requested.name,candidate.name)||!equal_folded(requested.culture,candidate.culture)||
+     requested.major!=candidate.major||requested.minor!=candidate.minor||requested.build!=candidate.build||
+     requested.revision!=candidate.revision||((requested.flags^candidate.flags)&~std::uint32_t{1})!=0)
+    return false;
+  const bool requested_full_key=(requested.flags&1u)!=0,candidate_full_key=(candidate.flags&1u)!=0;
+  if(requested_full_key)return candidate_full_key&&requested.public_key_or_token==candidate.public_key_or_token;
+  if(candidate_full_key){
+    ManagedSha1 sha1;sha1.update(candidate.public_key_or_token);const auto digest=sha1.finish();
+    std::array<std::byte,8> token{};
+    for(unsigned i=0;i<8;++i)token[i]=digest[19-i];
+    return requested.public_key_or_token.size()==token.size()&&
+      std::equal(token.begin(),token.end(),requested.public_key_or_token.begin());
+  }
+  return requested.public_key_or_token==candidate.public_key_or_token;
+}
+}
+
+Result<std::vector<ManagedResource>> inspect_managed_resources(const LoadedImage& loaded) try {
+  if(!loaded.image||!loaded.metadata.pe)return Error{ErrorCode::invalid_argument,"Managed resource inspection requires a loaded PE image"};
+  auto managed=parse_managed_pe(loaded);if(!managed)return managed.error();
+  const auto directory=std::find_if(loaded.metadata.directories.begin(),loaded.metadata.directories.end(),[](const Directory& d){return d.index==14;});
+  if(directory==loaded.metadata.directories.end()||!directory->location||directory->size<72)return malformed("CLR Resources inspection requires a complete runtime header");
+  const auto base=loaded.load_base.value_or(loaded.metadata.preferred_base);
+  auto header_va=checked_add(base,std::uint64_t{directory->location});if(!header_va)return header_va.error();
+  auto header=loaded.image->read({loaded.image->layout().space.id,header_va.value()},72);if(!header)return header.error();
+  const auto metadata_rva=u32(header.value(),8),metadata_size=u32(header.value(),12);
+  if(!metadata_rva||!metadata_size||metadata_size>64u*1024u*1024u)return malformed("Invalid CLR metadata RVA or size during resource inspection");
+  auto metadata_va=checked_add(base,std::uint64_t{metadata_rva});if(!metadata_va)return metadata_va.error();
+  auto root=loaded.image->read({loaded.image->layout().space.id,metadata_va.value()},metadata_size);if(!root)return root.error();
+  auto resources=parse_managed_resources(root.value());if(!resources)return resources.error();
+  const auto embedded=std::count_if(resources.value().begin(),resources.value().end(),[](const auto& resource){return resource.implementation==ManagedResourceImplementationKind::embedded;});
+  if(!embedded)return resources.value();
+  if(!managed.value().resources_rva||!managed.value().resources_size)return malformed("Embedded ManifestResource rows exist without a CLR Resources directory");
+  if(managed.value().resources_size>256u*1024u*1024u)return Error{ErrorCode::resource_limit,"CLR Resources directory exceeds 256 MiB"};
+  std::uint64_t total=0;constexpr std::uint32_t single_limit=16u*1024u*1024u;constexpr std::uint64_t total_limit=64u*1024u*1024u;
+  const auto image_space=loaded.image->layout().space.id;
+  for(auto& resource:resources.value()){
+    if(resource.implementation!=ManagedResourceImplementationKind::embedded)continue;
+    if(resource.data_offset>managed.value().resources_size||managed.value().resources_size-resource.data_offset<4)
+      return malformed("Embedded ManifestResource length prefix exceeds the CLR Resources directory");
+    auto rva=checked_add(std::uint64_t{managed.value().resources_rva},std::uint64_t{resource.data_offset});if(!rva)return rva.error();
+    auto address=checked_add(base,rva.value());if(!address)return address.error();
+    auto prefix=loaded.image->read({image_space,address.value()},4);if(!prefix)return prefix.error();
+    const auto length=u32(prefix.value(),0);resource.data_size=length;
+    if(length>managed.value().resources_size-resource.data_offset-4)return malformed("Embedded ManifestResource payload exceeds the CLR Resources directory");
+    if(length>single_limit)return Error{ErrorCode::resource_limit,"Embedded CLR resource exceeds 16 MiB"};
+    if(length>total_limit-total)return Error{ErrorCode::resource_limit,"Embedded CLR resources exceed 64 MiB total"};
+    total+=length;
+    if(!length){resource.payload.clear();continue;}
+    auto payload_rva=checked_add(rva.value(),std::uint64_t{4});if(!payload_rva)return payload_rva.error();
+    auto payload_va=checked_add(base,payload_rva.value());if(!payload_va)return payload_va.error();
+    auto payload=loaded.image->read({image_space,payload_va.value()},length);if(!payload)return payload.error();
+    resource.payload=std::move(payload.value());
+    auto decoded=parse_dotnet_resources(resource);if(!decoded)return decoded.error();
+  }
+  return resources;
+} catch(const std::bad_alloc&) {return Error{ErrorCode::resource_limit,"Cannot allocate embedded CLR resource catalog"};}
+  catch(const std::length_error&) {return Error{ErrorCode::resource_limit,"Embedded CLR resource catalog exceeds container limits"};}
+
+Result<std::vector<ManagedResource>> inspect_managed_resources(
+    const LoadedImage& loaded,std::span<const ManagedResourceInput> supplied,
+    const ManagedResourceResolutionLimits& limits,std::stop_token stop) try {
+  if(supplied.size()>limits.max_inputs||limits.max_inputs>256||
+     limits.max_input_bytes>512u*1024u*1024u||limits.max_payload_bytes>512u*1024u*1024u)
+    return Error{ErrorCode::resource_limit,"CLR resource input or payload budget is invalid or exceeded"};
+  auto resources=inspect_managed_resources(loaded);if(!resources)return resources.error();
+  struct Candidate {
+    const ManagedResourceInput* input=nullptr;
+    std::shared_ptr<const ByteStorage> storage;
+    std::optional<ManagedAssemblyIdentity> identity;
+    bool identity_checked=false;
+    std::optional<std::vector<ManagedResource>> resources;
+    std::uint64_t cached_payload_bytes=0;
+    std::map<std::uint32_t,std::vector<std::byte>> hashes;
+    std::map<std::uint32_t,std::string> hash_errors;
+  };
+  std::vector<Candidate> candidates; candidates.reserve(supplied.size());
+  std::uint64_t input_bytes=0;
+  for(const auto& input:supplied){
+    if(stop.stop_requested())return Error{ErrorCode::canceled,"CLR resource binding canceled"};
+    auto storage=input.storage;
+    if(input.loaded_image){
+      if(!input.loaded_image->image)return Error{ErrorCode::invalid_argument,"Supplied CLR resource image has no mapped image"};
+      const auto image_storage=input.loaded_image->image->storage();
+      if(storage&&storage!=image_storage)return Error{ErrorCode::invalid_argument,"Supplied CLR resource storage does not match its loaded image"};
+      storage=image_storage;
+    }
+    if(!storage)return Error{ErrorCode::invalid_argument,"Supplied CLR resource input has no byte storage"};
+    if(storage->size()>limits.max_input_bytes-input_bytes)
+      return Error{ErrorCode::resource_limit,"Supplied CLR resource inputs exceed the cumulative byte budget"};
+    input_bytes+=storage->size();
+    candidates.push_back({&input,std::move(storage)});
+  }
+  std::uint64_t external_payload_bytes=0,cached_payload_bytes=0;
+  const auto candidate_identity=[&](Candidate& candidate)->std::optional<ManagedAssemblyIdentity>{
+    if(candidate.identity_checked)return candidate.identity;
+    candidate.identity_checked=true;
+    if(!candidate.input->loaded_image)return {};
+    auto root=managed_metadata_root_bytes(*candidate.input->loaded_image);if(!root)return {};
+    auto catalog=parse_managed_type_catalog(root.value());if(!catalog)return {};
+    candidate.identity=std::move(catalog.value().assembly_identity);
+    return candidate.identity;
+  };
+  const auto candidate_resources=[&](Candidate& candidate)->Result<const std::vector<ManagedResource>*>{
+    if(!candidate.input->loaded_image)return Error{ErrorCode::unsupported,"Supplied resource provider is not a managed PE image"};
+    if(!candidate.resources){
+      auto parsed=inspect_managed_resources(*candidate.input->loaded_image);if(!parsed)return parsed.error();
+      std::uint64_t bytes=0;for(const auto& item:parsed.value())bytes+=item.payload.size();
+      if(bytes>limits.max_payload_bytes-cached_payload_bytes)
+        return Error{ErrorCode::resource_limit,"Supplied managed resource catalogs exceed the binding cache budget"};
+      cached_payload_bytes+=bytes;candidate.cached_payload_bytes=bytes;
+      candidate.resources=std::move(parsed.value());
+    }
+    return &*candidate.resources;
+  };
+  const auto copy_payload=[&](ManagedResource& destination,const ManagedResource& source,
+                              ManagedResourceResolutionState state)->Result<bool>{
+    if(source.implementation!=ManagedResourceImplementationKind::embedded)
+      return Error{ErrorCode::unsupported,"Nested external CLR resource providers are not followed"};
+    if(source.payload.size()>limits.max_payload_bytes-external_payload_bytes)
+      return Error{ErrorCode::resource_limit,"Resolved CLR resource payloads exceed the cumulative byte budget"};
+    external_payload_bytes+=source.payload.size();
+    destination.data_size=source.data_size;destination.payload=source.payload;
+    destination.payload_format=source.payload_format;destination.payload_diagnostic=source.payload_diagnostic;
+    destination.records=source.records;destination.resolution=state;destination.resolution_diagnostic.clear();
+    return true;
+  };
+
+  for(auto& resource:resources.value()){
+    if(stop.stop_requested())return Error{ErrorCode::canceled,"CLR resource binding canceled"};
+    if(resource.implementation==ManagedResourceImplementationKind::embedded)continue;
+    if(resource.implementation==ManagedResourceImplementationKind::file){
+      if(resource.implementation_hash.empty()||resource.implementation_hash_algorithm==0){
+        resource.resolution=ManagedResourceResolutionState::unsupported_hash;
+        resource.resolution_diagnostic="File resource has no usable Assembly.HashAlgId/File.HashValue pair";
+        continue;
+      }
+      std::vector<std::size_t> named,matched;
+      bool saw_unsupported_hash=false,saw_hash_mismatch=false;
+      for(std::size_t i=0;i<candidates.size();++i){
+        auto& candidate=candidates[i];
+        if(candidate.input->file_name!=resource.implementation_name)continue;
+        named.push_back(i);
+        if(const auto found=candidate.hashes.find(resource.implementation_hash_algorithm);found!=candidate.hashes.end()){
+          if(found->second==resource.implementation_hash)matched.push_back(i);else saw_hash_mismatch=true;
+          continue;
+        }
+        if(candidate.hash_errors.contains(resource.implementation_hash_algorithm)){
+          saw_unsupported_hash=true;continue;
+        }
+        auto hash=managed_resource_hash(*candidate.storage,resource.implementation_hash_algorithm,stop);
+        if(!hash){
+          if(hash.error().code==ErrorCode::canceled)return hash.error();
+          if(hash.error().code==ErrorCode::unsupported){candidate.hash_errors[resource.implementation_hash_algorithm]=hash.error().message;saw_unsupported_hash=true;}
+          else return hash.error();
+        }else if(hash.value()==resource.implementation_hash){
+          candidate.hashes.emplace(resource.implementation_hash_algorithm,std::move(hash.value()));matched.push_back(i);
+        }else{
+          candidate.hashes.emplace(resource.implementation_hash_algorithm,std::move(hash.value()));saw_hash_mismatch=true;
+        }
+      }
+      if(matched.empty()){
+        resource.resolution=saw_hash_mismatch?ManagedResourceResolutionState::hash_mismatch:
+            saw_unsupported_hash?ManagedResourceResolutionState::unsupported_hash:ManagedResourceResolutionState::unresolved;
+        resource.resolution_diagnostic=named.empty()?"No exact caller-supplied File.Name candidate":
+            saw_hash_mismatch?"Supplied File.Name candidate hash does not match File.HashValue":
+            saw_unsupported_hash?"Supplied File.Name candidate uses an unsupported Assembly.HashAlgId":
+            "No supplied File.Name candidate could be verified";
+        continue;
+      }
+      if(matched.size()!=1){resource.resolution=ManagedResourceResolutionState::ambiguous;resource.resolution_diagnostic="Multiple supplied File.Name candidates match File.HashValue";continue;}
+      auto& candidate=candidates[matched.front()];
+      if(resource.implementation_file_contains_metadata){
+        auto parsed=candidate_resources(candidate);
+        if(!parsed){resource.resolution_diagnostic=parsed.error().message;continue;}
+        const ManagedResource* target=nullptr;
+        for(const auto& item:*parsed.value())if(item.name==resource.name){if(target){target=nullptr;resource.resolution=ManagedResourceResolutionState::ambiguous;resource.resolution_diagnostic="Multiple same-name ManifestResource rows exist in supplied File module";break;}target=&item;}
+        if(resource.resolution==ManagedResourceResolutionState::ambiguous)continue;
+        if(!target){resource.resolution_diagnostic="Supplied File module has no same-name ManifestResource";continue;}
+        auto copied=copy_payload(resource,*target,ManagedResourceResolutionState::resolved_file);
+        if(!copied){if(copied.error().code==ErrorCode::resource_limit)return copied.error();resource.resolution_diagnostic=copied.error().message;}
+      }else{
+        constexpr std::uint64_t item_limit=16u*1024u*1024u;
+        const auto size=candidate.storage->size();
+        if(size>item_limit||size>limits.max_payload_bytes-external_payload_bytes)
+          return Error{ErrorCode::resource_limit,"Supplied raw CLR resource file exceeds its payload budget"};
+        if(stop.stop_requested())return Error{ErrorCode::canceled,"CLR resource file read canceled"};
+        if(size){auto bytes=candidate.storage->read_at({0},static_cast<std::size_t>(size));if(!bytes)return bytes.error();if(bytes.value().bytes.size()!=size)return Error{ErrorCode::io,"Short read from supplied CLR resource file"};resource.payload.assign(bytes.value().bytes.begin(),bytes.value().bytes.end());}
+        resource.data_size=static_cast<std::uint32_t>(size);external_payload_bytes+=size;
+        auto decoded=parse_dotnet_resources(resource);if(!decoded)return decoded.error();
+        resource.resolution=ManagedResourceResolutionState::resolved_file;resource.resolution_diagnostic.clear();
+      }
+      continue;
+    }
+    if(resource.implementation==ManagedResourceImplementationKind::assembly_ref){
+      ManagedAssemblyIdentity wanted{resource.implementation_name,resource.implementation_culture,
+        resource.implementation_major,resource.implementation_minor,resource.implementation_build,
+        resource.implementation_revision,resource.implementation_flags,resource.implementation_key_or_token};
+      std::vector<std::size_t> matches;
+      for(std::size_t i=0;i<candidates.size();++i){
+        if(stop.stop_requested())return Error{ErrorCode::canceled,"CLR AssemblyRef resource binding canceled"};
+        auto& candidate=candidates[i];
+        const auto identity=candidate_identity(candidate);
+        if(identity&&managed_resource_assembly_identity_matches(wanted,*identity))matches.push_back(i);
+      }
+      if(matches.empty()){resource.resolution=ManagedResourceResolutionState::unresolved;resource.resolution_diagnostic="No supplied managed assembly has the exact AssemblyRef identity";continue;}
+      if(matches.size()!=1){resource.resolution=ManagedResourceResolutionState::ambiguous;resource.resolution_diagnostic="Multiple supplied managed assemblies have the exact AssemblyRef identity";continue;}
+      auto parsed=candidate_resources(candidates[matches.front()]);
+      if(!parsed){resource.resolution_diagnostic=parsed.error().message;continue;}
+      const ManagedResource* target=nullptr;
+      for(const auto& item:*parsed.value())if(item.name==resource.name){if(target){target=nullptr;resource.resolution=ManagedResourceResolutionState::ambiguous;resource.resolution_diagnostic="Multiple same-name resources exist in supplied AssemblyRef target";break;}target=&item;}
+      if(resource.resolution==ManagedResourceResolutionState::ambiguous)continue;
+      if(!target){resource.resolution_diagnostic="Supplied AssemblyRef target has no same-name ManifestResource";continue;}
+      if(target->data_offset!=resource.data_offset){
+        resource.resolution_diagnostic="Supplied AssemblyRef resource offset differs from the referenced ManifestResource";
+        continue;
+      }
+      auto copied=copy_payload(resource,*target,ManagedResourceResolutionState::resolved_assembly);
+      if(!copied&&copied.error().code==ErrorCode::resource_limit)return copied.error();
+      if(!copied)resource.resolution_diagnostic=copied.error().message;
+    }
+  }
+  return resources;
+} catch(const std::bad_alloc&) {return Error{ErrorCode::resource_limit,"Cannot allocate supplied CLR resource binding state"};}
+  catch(const std::length_error&) {return Error{ErrorCode::resource_limit,"Supplied CLR resource binding exceeds container limits"};}
 
 Result<std::vector<ManagedMethod>> parse_managed_methods(std::span<const std::byte> root){
   auto parsed=parse_cli_metadata(root);if(!parsed)return parsed.error();
@@ -1425,18 +2777,103 @@ Result<std::vector<ManagedMethod>> parse_managed_methods(std::span<const std::by
   const auto count_it=metadata.tables.row_counts.find(6);if(count_it==metadata.tables.row_counts.end())return std::vector<ManagedMethod>{};
   const auto row_size_it=metadata.tables.row_sizes.find(6);if(row_size_it==metadata.tables.row_sizes.end())return malformed("CLR MethodDef table has no row layout");
   const auto tables=root.subspan(table_it->second.offset,table_it->second.size);const auto strings=root.subspan(strings_it->second.offset,strings_it->second.size);
+  const auto table_offset=[&](std::uint8_t id)->std::uint64_t{std::uint64_t offset=metadata.tables.data_offset;for(std::uint8_t prior=0;prior<id;++prior){const auto rows=metadata.tables.row_counts.find(prior);const auto width=metadata.tables.row_sizes.find(prior);if(rows!=metadata.tables.row_counts.end()&&width!=metadata.tables.row_sizes.end())offset+=std::uint64_t{rows->second}*width->second;}return offset;};
+  const auto read_index=[](std::span<const std::byte> bytes,std::size_t at,unsigned width){return width==2?std::uint32_t(u16(bytes,at)):u32(bytes,at);};
   std::uint64_t row_offset=metadata.tables.data_offset;
   for(std::uint8_t id=0;id<6;++id){auto rows=metadata.tables.row_counts.find(id);auto width=metadata.tables.row_sizes.find(id);if(rows!=metadata.tables.row_counts.end() && width!=metadata.tables.row_sizes.end())row_offset+=std::uint64_t{rows->second}*width->second;}
   const auto count=count_it->second, row_size=row_size_it->second;const bool wide_strings=(metadata.tables.heap_sizes&1)!=0,wide_blobs=(metadata.tables.heap_sizes&4)!=0;
   const std::uint32_t string_width=wide_strings?4:2;
   if(row_offset>tables.size() || std::uint64_t{count}*row_size>tables.size()-row_offset)return malformed("CLR MethodDef rows exceed tables stream");
-  std::vector<ManagedMethod> methods;methods.reserve(count);
-  for(std::uint32_t i=0;i<count;++i){const auto at=static_cast<std::size_t>(row_offset+std::uint64_t{i}*row_size);ManagedMethod method;method.token=0x06000000u|(i+1);method.rva=u32(tables,at);method.impl_flags=u16(tables,at+4);method.flags=u16(tables,at+6);const auto name_at=at+8;const auto name_index=wide_strings?u32(tables,name_at):u16(tables,name_at);const auto blob_at=name_at+string_width;method.signature_index=wide_blobs?u32(tables,blob_at):u16(tables,blob_at);
+  const auto param_count_it=metadata.tables.row_counts.find(8);const std::uint32_t param_count=param_count_it==metadata.tables.row_counts.end()?0:param_count_it->second;
+  const auto param_ptr_count_it=metadata.tables.row_counts.find(7);const bool has_param_ptr=param_ptr_count_it!=metadata.tables.row_counts.end();
+  if(has_param_ptr&&param_ptr_count_it->second!=param_count)return malformed("CLR ParamPtr count does not match Param count");
+  const std::uint32_t param_list_count=has_param_ptr?param_ptr_count_it->second:param_count;
+  const auto param_index_width=param_count<65536?2u:4u;
+  const auto param_ptr_index_width=param_list_count<65536?2u:4u;
+  const auto list_width=has_param_ptr?param_ptr_index_width:param_index_width;
+  if(row_size<8+string_width+ (wide_blobs?4u:2u)+list_width)return malformed("CLR MethodDef row is shorter than its ParamList field");
+  const auto list_at=8+string_width+(wide_blobs?4u:2u);
+  if(row_size!=list_at+list_width)return malformed("CLR MethodDef row layout has unexpected trailing bytes");
+  std::vector<std::uint32_t> parameter_order(param_list_count);
+  if(has_param_ptr){const auto pointer_offset=table_offset(7);const auto pointer_width=metadata.tables.row_sizes.find(7);if(pointer_width==metadata.tables.row_sizes.end()||pointer_width->second!=param_ptr_index_width)return malformed("CLR ParamPtr row layout is inconsistent");if(pointer_offset>tables.size()||std::uint64_t{param_list_count}*pointer_width->second>tables.size()-pointer_offset)return malformed("CLR ParamPtr rows exceed tables stream");std::vector<bool> seen(param_count+1,false);for(std::uint32_t p=0;p<param_list_count;++p){const auto at=static_cast<std::size_t>(pointer_offset+std::uint64_t{p}*pointer_width->second);const auto row=pointer_width->second==2?u16(tables,at):u32(tables,at);if(!row||row>param_count||seen[row])return malformed("CLR ParamPtr contains an invalid or duplicate Param index");seen[row]=true;parameter_order[p]=row;}}
+  else for(std::uint32_t p=0;p<param_count;++p)parameter_order[p]=p+1;
+  std::vector<ManagedParameter> parameter_rows(param_count+1);
+  if(param_count){const auto parameter_offset=table_offset(8);const auto param_row_size_it=metadata.tables.row_sizes.find(8);const auto param_row_size=param_row_size_it==metadata.tables.row_sizes.end()?0:param_row_size_it->second;const auto param_string_width=(metadata.tables.heap_sizes&1)?4u:2u;if(param_row_size!=4+param_string_width)return malformed("CLR Param row layout is inconsistent");if(parameter_offset>tables.size()||std::uint64_t{param_count}*param_row_size>tables.size()-parameter_offset)return malformed("CLR Param rows exceed tables stream");for(std::uint32_t p=1;p<=param_count;++p){const auto at=static_cast<std::size_t>(parameter_offset+std::uint64_t{p-1}*param_row_size);ManagedParameter parameter;parameter.token=0x08000000u|p;parameter.flags=u16(tables,at);parameter.sequence=u16(tables,at+2);if(parameter.flags&~std::uint16_t{0x3013})return malformed("CLR Param has reserved flag bits set");const auto name_at=at+4;const auto name_index=param_string_width==4?u32(tables,name_at):u16(tables,name_at);if(name_index){if(name_index>=strings.size())return malformed("CLR Param name index exceeds #Strings heap");auto end=name_index;while(end<strings.size()&&strings[end]!=std::byte{0})++end;if(end==strings.size())return malformed("CLR Param name is unterminated in #Strings heap");parameter.name.reserve(end-name_index);for(auto n=name_index;n<end;++n)parameter.name.push_back(static_cast<char>(std::to_integer<unsigned char>(strings[n])));}parameter_rows[p]=std::move(parameter);}}
+  auto constants=parse_managed_constants(root);if(!constants)return constants.error();
+  for(auto& value:constants.value())if((value.parent_token>>24)==8)
+    parameter_rows[value.parent_token&0x00ffffffu].default_value=std::move(value);
+  auto marshal_rows=parse_managed_marshal_descriptors(root);if(!marshal_rows)return marshal_rows.error();
+  for(auto& value:marshal_rows.value())if((value.parent_token>>24)==8){
+    const auto rid=value.parent_token&0x00ffffffu;
+    if(!rid||rid>param_count)return malformed("FieldMarshal Param parent is outside the Param table");
+    parameter_rows[rid].marshal_descriptor=std::move(value);
+  }
+  std::vector<ManagedMethod> methods;methods.reserve(count);std::vector<std::uint32_t> param_starts;param_starts.reserve(count);
+  for(std::uint32_t i=0;i<count;++i){const auto at=static_cast<std::size_t>(row_offset+std::uint64_t{i}*row_size);ManagedMethod method;method.token=0x06000000u|(i+1);method.rva=u32(tables,at);method.impl_flags=u16(tables,at+4);method.flags=u16(tables,at+6);const auto name_at=at+8;const auto name_index=wide_strings?u32(tables,name_at):u16(tables,name_at);const auto blob_at=name_at+string_width;method.signature_index=wide_blobs?u32(tables,blob_at):u16(tables,blob_at);const auto param_start=read_index(tables,at+list_at,list_width);if(param_start==0||param_start>param_list_count+1)return malformed("CLR MethodDef ParamList index is out of range");param_starts.push_back(param_start);
     if(name_index){if(name_index>=strings.size())return malformed("CLR MethodDef name index exceeds #Strings heap");auto end=name_index;while(end<strings.size() && strings[end]!=std::byte{0})++end;if(end==strings.size())return malformed("CLR MethodDef name is unterminated in #Strings heap");method.name.reserve(end-name_index);for(auto p=name_index;p<end;++p)method.name.push_back(static_cast<char>(std::to_integer<unsigned char>(strings[p])));}
     if(const auto owner=owners.find(method.token);owner!=owners.end()){method.declaring_type=owner->second->full_name;method.declaring_type_generic_parameters=owner->second->generic_parameters;}
     if(const auto generic=method_generics.find(method.token);generic!=method_generics.end())method.generic_parameters=generic->second;
     methods.push_back(std::move(method));
   }
+  for(std::size_t m=0;m<methods.size();++m){const auto end=m+1<param_starts.size()?param_starts[m+1]:param_list_count+1;if(end<param_starts[m]||end>param_list_count+1)return malformed("CLR MethodDef ParamList indexes are not monotonic");std::set<std::uint16_t> sequences;for(auto index=param_starts[m];index<end;++index){const auto row=parameter_order[index-1];auto parameter=parameter_rows[row];if(!sequences.insert(parameter.sequence).second)return malformed("CLR method has duplicate Param sequence numbers");methods[m].parameters.push_back(std::move(parameter));}}
+  std::vector<bool> assigned(param_count+1,false);for(const auto& method:methods)for(const auto& parameter:method.parameters){const auto row=parameter.token&0x00ffffffu;if(row>param_count||assigned[row])return malformed("CLR Param row is assigned to multiple methods");assigned[row]=true;}if(std::find(assigned.begin()+1,assigned.end(),false)!=assigned.end())return malformed("CLR MethodDef ParamList leaves a Param row unowned");
+  const auto import_count_it=metadata.tables.row_counts.find(28);
+  const auto import_count=import_count_it==metadata.tables.row_counts.end()?0u:import_count_it->second;
+  if(import_count>250000)return Error{ErrorCode::resource_limit,"CLR ImplMap row limit exceeded"};
+  if(import_count){
+    const auto row_size_it=metadata.tables.row_sizes.find(28),module_count_it=metadata.tables.row_counts.find(26);
+    const auto module_count=module_count_it==metadata.tables.row_counts.end()?0u:module_count_it->second;
+    const auto member_width=coded_width(9,metadata.tables.row_counts),module_width=module_count<65536?2u:4u;
+    const auto module_row_size_it=metadata.tables.row_sizes.find(26);
+    const auto import_offset=table_offset(28),module_offset=table_offset(26);
+    const auto module_row_size=module_row_size_it==metadata.tables.row_sizes.end()?0u:module_row_size_it->second;
+    if(row_size_it==metadata.tables.row_sizes.end()||row_size_it->second!=2+member_width+string_width+module_width||
+       import_offset>tables.size()||std::uint64_t{import_count}*row_size_it->second>tables.size()-import_offset||
+       !module_count||!module_row_size||module_row_size!=string_width||module_offset>tables.size()||
+       std::uint64_t{module_count}*module_row_size>tables.size()-module_offset)
+      return malformed("CLR ImplMap or ModuleRef rows exceed their metadata tables");
+    const auto read_string=[&](std::uint32_t index)->Result<std::string>{
+      if(index==0)return std::string{};
+      if(index>=strings.size())return malformed("CLR ImplMap string index exceeds #Strings heap");
+      auto end=index;while(end<strings.size()&&strings[end]!=std::byte{0})++end;
+      if(end==strings.size())return malformed("CLR ImplMap string is unterminated in #Strings heap");
+      std::string value;value.reserve(end-index);
+      for(auto p=index;p<end;++p)value.push_back(static_cast<char>(std::to_integer<unsigned char>(strings[p])));
+      return value;
+    };
+    std::map<std::uint32_t,std::size_t> methods_by_token;
+    for(std::size_t i=0;i<methods.size();++i)methods_by_token.emplace(methods[i].token,i);
+    std::set<std::uint32_t> mapped_members;
+    for(std::uint32_t i=0;i<import_count;++i){
+      const auto at=static_cast<std::size_t>(import_offset+std::uint64_t{i}*row_size_it->second);
+      const auto flags=u16(tables,at);constexpr std::uint16_t known_flags=0x3777;
+      if((flags&~known_flags)||((flags&0x0030)==0x0030)||((flags&0x3000)==0x3000)||((flags&0x0700)>0x0500))
+        return malformed("CLR ImplMap has reserved or invalid mapping flags");
+      const auto forwarded=read_index(tables,at+2,member_width),tag=forwarded&1u,rid=forwarded>>1;
+      const auto field_count_it=metadata.tables.row_counts.find(4);
+      const auto field_count=field_count_it==metadata.tables.row_counts.end()?0u:field_count_it->second;
+      if(!rid||(tag==0?rid>field_count:rid>count))return malformed("CLR ImplMap MemberForwarded index is out of range");
+      const auto token=(tag==0?0x04000000u:0x06000000u)|rid;
+      if(!mapped_members.insert(token).second)return malformed("CLR member has duplicate ImplMap rows");
+      const auto name_index=read_index(tables,at+2+member_width,string_width);
+      auto import_name=read_string(name_index);if(!import_name)return import_name.error();
+      const auto module_index=read_index(tables,at+2+member_width+string_width,module_width);
+      if(!module_index||module_index>module_count)return malformed("CLR ImplMap ModuleRef index is out of range");
+      const auto module_name_index=read_index(tables,static_cast<std::size_t>(module_offset+std::uint64_t{module_index-1}*module_row_size),string_width);
+      auto module_name=read_string(module_name_index);if(!module_name)return module_name.error();
+      if(module_name.value().empty())return malformed("CLR ImplMap ModuleRef has an empty name");
+      if(tag==1){
+        const auto method=methods_by_token.find(token);
+        if(method==methods_by_token.end()||(methods[method->second].flags&0x2000)==0)
+          return malformed("CLR ImplMap MethodDef is not marked PInvokeImpl");
+        methods[method->second].import_map=ManagedMethodImport{flags,std::move(import_name.value()),
+            std::move(module_name.value()),0x1a000000u|module_index};
+      }
+    }
+  }
+  for(const auto &method:methods)
+    if((method.flags&0x2000)!=0&&!method.import_map)
+      return malformed("CLR PInvokeImpl MethodDef has no ImplMap row");
   return methods;
 }
 

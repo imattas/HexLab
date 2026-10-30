@@ -31,3 +31,10 @@ instruction-pair semantics require additional shape checks; they remain
 unsupported and preserved as raw relocation records. `PREL31` is a data-field
 relocation: its top bit is unrelated metadata and is not part of its signed
 relocation expression.
+
+The separate copy-on-write runtime API also applies `ABS16` and `ABS8` when
+they are owned by an `ET_DYN` dynamic relocation table. Its exact field widths,
+signed REL addends, byte alignment, modulo-32-bit arithmetic, and range
+diagnostics are described in [the runtime relocation view](elf-runtime-relocations.md).
+Relocatable section-domain objects retain metadata and analysis provenance;
+this API does not link or patch those objects.

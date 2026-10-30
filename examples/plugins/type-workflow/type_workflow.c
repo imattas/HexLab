@@ -6,8 +6,7 @@
 static int32_t import_project_types(void *context, const HexLabProjectApi *api,
                                     const char *path, char *output, uint32_t capacity) {
     (void)context;
-    if (!api || !path || !output || capacity == 0 ||
-        api->struct_size < offsetof(HexLabProjectApi, enum_values) + sizeof(api->enum_values) ||
+    if (!HEXLAB_PLUGIN_HAS_FIELD(api, HexLabProjectApi, enum_values) || !path || !output || capacity == 0 ||
         !api->open || !api->close || !api->import_header || !api->declarations || !api->enum_values) return -1;
     void *project = NULL;
     if (api->open(api->host_context, path, 0, &project) != 0) return -1;
@@ -67,8 +66,7 @@ static int32_t import_project_types(void *context, const HexLabProjectApi *api,
 static int32_t start(const HexLabHostApi *host, void **instance) {
     if (instance) *instance = NULL;
     if (!host || !instance ||
-        host->struct_size < offsetof(HexLabHostApi, register_analysis_provider) +
-                            sizeof(host->register_analysis_provider) ||
+        !HEXLAB_PLUGIN_HAS_FIELD(host, HexLabHostApi, register_analysis_provider) ||
         !host->register_analysis_provider) return -1;
     const HexLabAnalysisProvider provider = {
         sizeof(HexLabAnalysisProvider), HEXLAB_ANALYSIS_PROVIDER_API_VERSION,
@@ -83,8 +81,8 @@ HEXLAB_PLUGIN_EXPORT int32_t hexlab_plugin_query(uint32_t host_abi_major,
                                                  const HexLabHostApi *host,
                                                  HexLabPluginApi *plugin_api) {
     (void)host;
-    if (host_abi_major != HEXLAB_PLUGIN_ABI_MAJOR || !plugin_api ||
-        plugin_api->struct_size < offsetof(HexLabPluginApi, stop) + sizeof(plugin_api->stop)) return -1;
+    if (host_abi_major != HEXLAB_PLUGIN_ABI_MAJOR ||
+        !HEXLAB_PLUGIN_HAS_FIELD(plugin_api, HexLabPluginApi, stop)) return -1;
     plugin_api->abi_major = HEXLAB_PLUGIN_ABI_MAJOR;
     plugin_api->abi_minor = HEXLAB_PLUGIN_ABI_MINOR;
     plugin_api->plugin_id = "org.hexlab.example.type-workflow";

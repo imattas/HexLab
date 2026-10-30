@@ -15,6 +15,7 @@ namespace {
 struct Failure { Error error; };
 constexpr std::size_t max_coff_name_bytes = 4096;
 constexpr std::uint16_t machine_amd64 = 0x8664, machine_arm64 = 0xaa64;
+constexpr std::size_t max_bigobj_sections = 1'000'000;
 constexpr std::array<std::uint8_t,16> bigobj_class_id{
     0xc7,0xa1,0xba,0xd1,0xee,0xba,0xa9,0x4b,0xaf,0x20,0xfa,0xf6,0x6a,0xa4,0xdc,0xb8};
 void require(bool ok, std::string message, ErrorCode code = ErrorCode::malformed) {
@@ -278,7 +279,6 @@ Object parse(const ByteStorage &storage, std::stop_token stop, std::size_t &symb
     const auto machine = le(b, bigobj ? 6 : 0, 2);
     require(machine == machine_amd64 || machine == machine_arm64,
             "COFF link subset requires AMD64 or ARM64 objects", ErrorCode::unsupported);
-    require(machine != machine_arm64 || !bigobj, "ARM64 COFF BigObj linking is unsupported", ErrorCode::unsupported);
     const auto header_size = bigobj ? 56u : 20u;
     const auto count = static_cast<std::size_t>(bigobj ? le(b, 44, 4) : le(b, 2, 2));
     const auto symoff = bigobj ? le(b, 48, 4) : le(b, 8, 4);
@@ -287,7 +287,9 @@ Object parse(const ByteStorage &storage, std::stop_token stop, std::size_t &symb
     require(optsize == 0, "COFF link input must be an object without optional header", ErrorCode::unsupported);
     if (machine == machine_arm64)
         require((le(b, 18, 2) & 0x2002u) == 0, "ARM64 COFF link input cannot be an executable or DLL", ErrorCode::unsupported);
-    require(count && count <= 96 && header_size + count * 40 <= b.size(), "Invalid COFF section table");
+    require(count && count <= (bigobj ? max_bigobj_sections : 96) &&
+                count <= (b.size() - std::min<std::size_t>(header_size, b.size())) / 40,
+            "Invalid or over-limit COFF section table", bigobj ? ErrorCode::resource_limit : ErrorCode::malformed);
     require(symcount <= limits.max_symbols - symbols_total, "COFF link symbol limit exceeded", ErrorCode::resource_limit);
     symbols_total += static_cast<std::size_t>(symcount);
     const auto symbol_size = bigobj ? 20u : 18u;

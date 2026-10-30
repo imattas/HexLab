@@ -12,12 +12,15 @@ Decision trees whose leaves all return are also structured when each block is
 reachable exactly once from the entry, every non-entry block has one incoming
 edge, and the leaves are terminal returns. This covers two-return conditionals
 and nested return-only branches without requiring a common post-dominator.
-Shared return blocks, SSA phis, unresolved edges, and mixed return/non-return
-leaves remain on the label/goto path unless another existing recognizer handles
-them. Return-only trees use iterative validation and emission, so nesting depth
-does not consume recursive C++ stack frames. This recognizer accepts at most
-4,096 blocks and 1,024 nodes on any root-to-leaf path; larger or deeper trees
-retain the fallback.
+Shared return blocks remain on the label/goto path unless they are terminal
+returns with bounded fan-in and valid edge-specific register phis. Unresolved
+edges and mixed return/non-return leaves also retain the fallback unless
+another existing recognizer handles them. Return-only trees use iterative validation and emission, so nesting depth
+does not consume recursive C++ stack frames. The recognizer accepts up to
+4,096 blocks and a path as deep as that block bound. To keep generated source
+size bounded for unusually deep trees, indentation stops increasing after 256
+spaces; the braces and branch nesting remain explicit. Larger trees retain the
+fallback.
 
 Ghidra's native C++ decompiler is a useful architectural reference for this
 stage. Its `blockaction.cc` tracks loop heads, tails, and loop containment, then
@@ -50,6 +53,17 @@ emits each arm as a `case`/`default` body and resumes the loop body at that
 continuation, including when it is the latch. Switch edges and arm predecessors
 must match the CFG exactly; side entries, side exits, and ambiguous joins retain
 the conservative fallback.
+
+A post-tested loop's exit cleanup may end in one terminal conditional whose two
+arms are bounded straight-line paths ending in explicit returns. Direct return
+arms remain supported. Each arm path is capped at 64 blocks, phi-free (including
+memory-partition phis), and every block must have exactly its preceding cleanup
+block as its CFG predecessor. The loop exit must enter the cleanup chain
+uniquely; the conditional must have exactly the two validated arm edges, and the
+arm paths cannot share blocks. The formatter emits the cleanup chain once after
+the `do ... while`, then emits the conditional and each return path. Additional
+cleanup branches, shared return blocks, cleanup joins, side entries, and
+non-return leaves retain the existing fallback.
 
 Pre-tested loop-header SSA phis are lowered from the unique preheader and every
 recognized backedge. Initial copies execute before the loop; recurrent copies
@@ -96,7 +110,13 @@ input for every recognized continue edge and the ordinary latch edge; each
 back-edge copy is emitted immediately before its corresponding `continue` or
 the latch transfer. Conditional continues nested inside child diamonds,
 continue paths through side blocks, and other unrecognized back edges retain
-the fallback. A
+the fallback. A guarded return path from a pre-tested parent loop may end in a
+terminal return block with register phis when that return has exactly one CFG
+predecessor: the previous cleanup block or the guarded branch for a direct
+return. Every phi must have exactly one input from that predecessor, and the
+formatter emits parallel copies immediately before the return inside the
+guard. Intermediate cleanup blocks remain phi-free; malformed or multiply
+entered return blocks retain the fallback. A
 pre-tested parent loop can also
 contain a one-level conditional diamond when each arm is a disjoint, phi-free
 straight-line chain ending at the same continuation; one arm may be empty when
@@ -118,8 +138,7 @@ arm blocks, and ambiguous joins retain the state-machine or goto fallback.
 
 A pre-tested parent loop accepts a bounded conditional decision tree whose
 leaves follow disjoint, phi-free unconditional chains back to the loop header.
-The number of latch leaves is derived from the validated CFG rather than a
-separate leaf-count threshold: every distinct leaf tail must be an exact
+At most 64 distinct latch tails are accepted. Every tail must be an exact
 predecessor of the header, and the header predecessor set must equal the
 preheader plus all of those tails. Every header phi must contain exactly one
 input for each predecessor. Each leaf emits its own simultaneous edge copies
@@ -129,7 +148,7 @@ shared latches, overlapping paths, extra header predecessors, and malformed
 phis use the state-machine or explicit label/goto path. Parent and child
 diamonds use the same bounded validation: at most 1,024 blocks and 4,096
 edges, unique block IDs and addresses, resolved edges matching recorded block
-IDs, a 32-level nested-child depth budget, and complete
+IDs, a 64-level nested-child depth budget, and complete
 whole-memory and partition-memory phi predecessor inputs on the consumed
 region. The prepass rejects loop-diamond structuring for functions with more
 than 65,536 combined whole-memory and partition-memory phi inputs, and each
@@ -169,8 +188,9 @@ body, latch, and cleanup blocks may carry register phis when each phi has
 exactly one input for every actual CFG predecessor; function-entry phis are
 rejected. Header predecessors must be exactly the preheader and latch, and
 each other non-entry chain block must have exactly its preceding chain block as its
-sole predecessor. The body may contain one `if`/`else` diamond after the loop
-header: each arm follows at most 64 disjoint straight-line blocks and both
+sole predecessor, except for validated diamond joins. After the loop header,
+the body may contain a sequence of `if`/`else` diamonds: each arm follows at
+most 64 disjoint straight-line blocks and both
 arms converge at one join, which may be the latch. Arm blocks have exactly
 their preceding edge as predecessor, and the join has exactly the two arm
 tails as predecessors. Register phi copies execute on each actual branch,
@@ -181,14 +201,36 @@ use simultaneous copies, including loop-carried swaps. Whole-memory and
 per-partition memory phis require the same exact predecessor coverage and
 remain analysis-only; partition names must be nonempty and unique per block.
 
-Alternatively, one body conditional may leave through a unique side-return
-chain of at most 64 blocks while its other edge continues toward the latch.
-Each return-chain block has exactly its preceding edge as predecessor; the
-last block has a terminal return. The formatter emits that chain only under
-the original branch predicate, lowers register phi copies on its actual
-incoming edges, and lowers the continuing edge before the remaining loop body.
-This shape cannot share return blocks with the latch cleanup path or contain
-another body conditional region; those CFGs retain explicit flow.
+A body conditional may also leave through a return-only decision tree of at
+most 64 blocks while its other edge continues toward the latch. Multiple such
+regions may occur in sequence and may mix with the body diamonds.
+The tree may contain straight-line blocks and nested two-way conditionals;
+every leaf ends in a terminal return. Each nonterminal tree block has exactly
+its parent edge as its sole CFG predecessor, and every nested branch has two
+resolved, distinct successors matching the true and false edges. Terminal
+returns may be shared by multiple guarded side arms or by a side arm and the
+ordinary loop-exit cleanup. Every actual predecessor of a shared terminal
+return must be one of those recognized edges, with an exact SSA phi input.
+The formatter emits
+the tree only under the original side-return predicate, preserves each nested
+branch polarity, and lowers register phi copies on each actual incoming edge.
+It lowers the continuing edge before the remaining loop body. Each shared
+terminal return is emitted on its selected path after that edge's phi copies;
+only one such path executes. Shared nonterminal cleanup, other joins, cycles,
+and unrecognized side entries retain explicit flow.
+
+Each accepted conditional region records its branch and unique continuing
+block on the body spine. All arms and nonterminal return-tree blocks must be
+disjoint from previously claimed blocks. Every region must lie inside the loop, and its join
+or continuing block must be the next spine block. Exact diamond-join
+predecessors replace the ordinary single-spine-predecessor rule only at that
+join. The formatter emits each body branch once, copies each arm's phi inputs
+on its own edge, and emits the continuing join once before handling the next
+region. A join may itself begin the next diamond or guarded return, and the
+last join may be the latch. This avoids losing updates when multiple regions
+carry different register or memory SSA versions. Region count shares the
+existing whole-function block/edge/phi budgets; the 64-block limits apply to
+each arm and each return tree.
 
 The latch predicate is evaluated into `__hexlab_do_repeat` before recurrent
 copies can overwrite header values used by that predicate. The emitted
@@ -198,12 +240,28 @@ accepts at most 1,024 blocks, 4,096 edges, 4,096 register phis and 4,096 memory
 partition phis per block, 65,536 combined register/memory phi inputs, and 64
 cleanup blocks. It requires unique block IDs and addresses, exact resolved
 edge kinds and target block
-identities, complete function coverage, and a terminal return. Further body branches,
-switches, side entries or ambiguous exits, multiple latches, extra or duplicated edges,
+identities, complete function coverage, and a terminal return. Nested or overlapping
+body branches, switches, nonterminal side entries or ambiguous exits, multiple latches,
+extra or duplicated edges,
 and malformed phis proceed to the existing region/state-machine/goto paths.
 
-The earlier function-entry post-tested recognizer still requires a phi-free
-latch and branches directly to the body entry or a straight-line return path.
+Explicit-preheader post-tested loops also accept bounded nested body-decision
+trees when every nested conditional reconverges at the same validated body
+join. Each nested arm may contain a disjoint linear chain or another
+conditional tree; all leaf predecessor edges into the common join are checked
+against the exact register and memory phi inputs. The formatter emits nested
+`if` regions in place and lowers each leaf's copies on its own edge before
+emitting the shared join once. Decision trees are limited to depth 32 and 64
+blocks per outer arm. Trees with an intermediate join followed by more body
+instructions, shared/side-entered leaves, return leaves, cycles, switches,
+overlaps, or non-exact phi inputs retain the existing fallback output.
+
+The function-entry post-tested recognizer accepts a bounded, phi-free straight-
+line cleanup chain on the repeat edge. It emits this form as `while (true)` with
+the latch predicate guarding the cleanup and an explicit `continue`; the other
+edge still follows the validated exit path. The chain is limited to 64 blocks,
+requires exact single-predecessor links through to the body entry, and cannot
+contain memory/register phis, branches, switches, returns, or side entries.
 Unsupported or ambiguous loop shapes retain lossless explicit gotos.
 
 The acyclic structurer also handles nested regions with multiple explicit
@@ -326,9 +384,32 @@ loops with single- and multi-block bodies, loop-header SSA copies from the
 actual latch, post-tested do-while loops with single- and multi-block
 straight-line bodies, and conservative side-exit,
 multi-exit, and malformed-phi fallbacks.
+In the bounded nested-early-return shape that reconverges on a shared
+nonterminal join, the direct early-return block may carry register phis when
+its sole actual predecessor is the inner conditional. Their values are copied
+in parallel inside the selected arm before the return. Memory phis, duplicate
+phi destinations, missing predecessor inputs, and additional return-block
+predecessors retain the fallback.
 Return-only decision trees, including nested branches with distinct return
-leaves, are covered as structured output; shared or malformed trees continue
-to use the explicit fallback.
+leaves, are covered as structured output. They may converge on shared terminal
+return blocks when each shared block has at most 64 incoming edges. Register
+phis at a shared terminal return are accepted only when every actual
+predecessor supplies exactly one input. The formatter duplicates the return
+block into each guarded arm and emits that predecessor's parallel phi copies
+before the return, preserving path-specific values without creating a shared
+merge statement. It also duplicates a shared conditional block when both of
+its distinct successors are terminal returns. The block may have up to 64
+incoming edges; any register phis must have exactly one input for each actual
+predecessor with the same source version on every edge, so phi copies cannot
+change the condition's value across copies. Those parallel copies execute
+before the duplicated condition.
+Whole-memory and partition-memory phis are accepted when
+their inputs exactly cover the block's CFG predecessors; these analysis-only
+tokens need no source assignment because the original memory operations remain
+in their guarded blocks. Partition names must be nonempty and unique, with at
+most 65,536 combined memory-phi inputs and 4,096 partition phis per block.
+Other shared interior blocks, malformed edges or phis, and higher fan-in
+continue to use the explicit fallback.
 
 Canonical pre-tested loops also accept a conditional side edge from a loop-body
 branch to a unique return path. The formatter emits the path under the branch
@@ -348,7 +429,7 @@ pre-tested loop, each with one shared continuation. Incomplete switch
 metadata retains the explicit goto fallback.
 
 A pre-tested loop-body diamond may contain nested conditional child bodies up
-to 32 levels deep. Discovery, phi validation, ownership checks, and emission
+to 64 levels deep. Discovery, phi validation, ownership checks, and emission
 remain recursive, but that explicit depth budget bounds native call-stack use;
 the CFG is separately limited to 1,024 blocks and each nested child must claim
 distinct blocks. Deeper trees retain the explicit fallback. A diamond may also
@@ -411,20 +492,27 @@ follows the region bookkeeping in Ghidra's native
 HexLab adds an explicit predecessor and SSA-phi proof before emitting C-like
 breaks, and does not copy Ghidra source.
 
-Nested pre-tested child loops accept a bounded cleanup chain of up to 256 blocks
-on a conditional break edge. Every cleanup block must be single-entry from its
-predecessor, phi-free, and end in one unconditional edge; paths cannot overlap
-the child body or another claimed region. Child-exit register phis are copied
-in parallel at the final cleanup edge while still inside the original break
-condition. The child exit predecessor proof uses the cleanup tail, so the
-header's condition-failure edge and every break edge must exactly account for
-the exit's phi inputs. Longer, shared, branched, or side-entered paths retain
-the existing fallback. This extends HexLab's bounded region walk using the
+Nested pre-tested child loops accept a cleanup chain of up to 1,024 blocks on a
+conditional break edge, matching the enclosing CFG block budget. Cleanup
+blocks are phi-free and each ends in one unconditional edge. A chain head may
+have only the recognized break branches that use that exact chain as
+predecessors; later blocks must have only the preceding cleanup block as their
+predecessor. Paths cannot overlap the child body or another claimed region,
+except that multiple child break predicates may use the exact same complete
+cleanup chain. That chain is emitted under each predicate, while its
+shared tail contributes one CFG predecessor and one exit-phi input. Child-exit
+register phis are copied in parallel at the final cleanup edge while still
+inside the original break condition. The child exit predecessor proof uses the
+cleanup tail, so the header's condition-failure edge and every distinct break
+tail must exactly account for the exit's phi inputs. Partially overlapping,
+branched, or side-entered paths retain the existing fallback. This extends
+HexLab's bounded region walk using the
 same region-first structuring principle visible in Ghidra's native
 [`blockaction.cc`](https://github.com/NationalSecurityAgency/ghidra/blob/master/Ghidra/Features/Decompiler/src/decompile/cpp/blockaction.cc); no Ghidra source is copied.
 
 Nested pre-tested child loops also accept conditional continue edges that pass
-through up to 256 phi-free cleanup blocks before returning to the child header.
+through up to 1,024 phi-free cleanup blocks before returning to the child header,
+matching the enclosing CFG block budget.
 The cleanup chain must be single-entry, unconditional, and free of side entries,
 returns, switches, and memory phis. Its final block must be an actual CFG
 predecessor of the header. The child header's register phis are validated
@@ -433,10 +521,48 @@ are emitted after the guarded cleanup statements immediately before `continue`.
 Direct conditional continues remain the zero-block case; ambiguous or
 side-entered cleanup paths retain the existing fallback.
 
+A nested pre-tested child loop may contain a guarded return-only side path while
+its other conditional edge continues along the child body. The return side may
+contain up to 64 single-entry, phi-free straight-line blocks and must end in a
+terminal return. Its blocks are emitted only under the original branch
+predicate; the sibling continuation remains in the child loop's ordinary body
+spine. Return paths cannot be shared, re-enter either loop, contain nested
+branches or switches, or carry register, whole-memory, or partition-memory
+phis. Malformed edges and unrecognized return paths retain the existing
+state-machine or label/goto fallback.
+
 Structured acyclic two-arm conditionals also accept a direct edge from either
 arm to the common join. The other arm may contain the existing bounded linear
 region. Join phis must still have exactly one input for each actual predecessor;
 copies for a direct arm are emitted inside that conditional arm. This covers
 guarded straight-line work without inventing an SSA predecessor or hoisting
-edge-specific copies across the branch. More general branching arms keep the
-state-machine or label/goto fallback.
+edge-specific copies across the branch.
+
+The general acyclic-region formatter also handles overlapping joins and
+side-entered cleanup/return regions by bounded tail duplication. For example,
+one outer arm may enter a shared cleanup chain directly while the sibling
+branches either into that same chain or into a separate return. The cleanup
+may itself contain further conditionals, joins, complete switches, and multiple
+return leaves. It need not be a terminal return or a single terminal-decision
+block. Each incoming guarded path gets a copy of the shared region until its
+nearest common post-dominator; ordinary local joins still emit once after their
+own conditional or switch. Duplication never hoists effects out of a predicate,
+and only one of the duplicated paths executes on a given invocation.
+
+Every copy receives the actual original CFG predecessor's register-phi values
+before its statements execute. Multiple values use simultaneous parallel
+copies, including when different side entries select different values. Complete
+whole-memory and partition-memory phis remain analysis-only; all original
+memory statements stay in their guarded path. Recorded addresses, block IDs,
+branch targets, predecessor coverage, and unique register-phi destinations must
+validate before this formatter runs. Branch traversal uses explicit true/false
+targets and grouped switch metadata rather than block storage order.
+
+This path requires a reachable acyclic graph of at most 1,024 blocks and 4,096
+edges, with explicit returns on every leaf of a multi-exit graph. Expansion is
+limited to 4,096 emitted block occurrences, at most 64 copies of any one block,
+and 64 nested conditional/switch regions. These bounds prevent exponential
+source growth and bound the recursive emitter's native stack use. Exceeding a
+bound discards the entire partial rendering and uses the existing state-machine
+or label/goto fallback. Cycles, unresolved edges, incomplete switch metadata,
+and malformed phi inputs retain that fallback as well.

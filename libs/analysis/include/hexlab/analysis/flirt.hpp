@@ -76,8 +76,9 @@ HEXLAB_ANALYSIS_EXPORT Result<FlirtCatalog>
 parse_flirt_pat_gz(std::span<const std::byte>, Architecture, ExecutionMode,
                    std::string provenance, const FlirtCatalogLimits & = {}, std::stop_token = {});
 
-// Imports binary IDA FLIRT catalogs, versions 5 through 10. Compressed zlib
-// bodies are inflated in cancellable chunks within max_inflated_bytes.
+// Imports binary IDA FLIRT catalogs, versions 5 through 10. Compressed v5/v6
+// bodies use raw DEFLATE; v7-v10 use zlib-wrapped DEFLATE. Inflation is
+// cancellable and bounded by max_inflated_bytes.
 HEXLAB_ANALYSIS_EXPORT Result<FlirtCatalog>
 parse_flirt_sig(std::span<const std::byte>, std::string provenance,
                 const FlirtCatalogLimits & = {}, std::stop_token = {});

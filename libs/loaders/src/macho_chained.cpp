@@ -1,4 +1,5 @@
 #include "macho_dyld_internal.hpp"
+#include "hexlab/image/macho_mapping.hpp"
 #include "miniz_tinfl.h"
 #include <queue>
 #include <map>
@@ -87,12 +88,13 @@ std::pair<std::uint8_t, std::uint8_t> layout(std::uint16_t format) {
     case 5: // DYLD_CHAINED_PTR_32_FIRMWARE
         return {std::uint8_t{4}, std::uint8_t{4}};
     case 1:
-    case 7: // DYLD_CHAINED_PTR_ARM64E_KERNEL: 8-byte word, 4-byte chain stride
-    case 10: // DYLD_CHAINED_PTR_ARM64E_FIRMWARE: 8-byte word, 4-byte stride
     case 9:
     case 12:
     case 13: // DYLD_CHAINED_PTR_ARM64E_SHARED_CACHE
         return {std::uint8_t{8}, std::uint8_t{8}};
+    case 7: // DYLD_CHAINED_PTR_ARM64E_KERNEL
+    case 10: // DYLD_CHAINED_PTR_ARM64E_FIRMWARE
+        return {std::uint8_t{8}, std::uint8_t{4}};
     case 14: // DYLD_CHAINED_PTR_ARM64E_SEGMENTED: 8-byte word, 4-byte stride
         return {std::uint8_t{8}, std::uint8_t{4}};
     default:
@@ -137,6 +139,7 @@ void pointer_bits(MachOChainedPointer &row, const MachOChainedStarts &starts) {
         row.next = static_cast<std::uint16_t>((raw >> 30) & 0x3);
         row.target = raw & UINT64_C(0x3fffffff);
         row.target_is_offset = true;
+        row.target_base_kind = MachOChainedTargetBaseKind::shared_cache;
         row.complete = false;
     } else if (format == 5) {
         // Firmware pointers store the target VM address directly, with a
@@ -145,8 +148,10 @@ void pointer_bits(MachOChainedPointer &row, const MachOChainedStarts &starts) {
         row.target = raw & UINT64_C(0x03ffffff);
     } else if (format == 14) {
         // Preserve the packed 4-bit segment index and 28-bit segment offset
-        // as an unassembled target payload. Resolution needs the segmented
-        // format's address table, which this image model does not carry.
+        // as a target payload. The caller maps it through the segment list
+        // while retaining the original encoding in target/raw. For rebases,
+        // bits 32..50 are reserved and must be zero. Authenticated variants
+        // assign those bits to diversity/address-diversity/key instead.
         row.target = raw & UINT32_MAX;
         row.next = static_cast<std::uint16_t>((raw >> 51) & 0xfff);
         row.authenticated = bool(raw >> 63);
@@ -154,8 +159,9 @@ void pointer_bits(MachOChainedPointer &row, const MachOChainedStarts &starts) {
             row.diversity = static_cast<std::uint16_t>((raw >> 32) & 0xffff);
             row.address_diversity = bool((raw >> 48) & 1);
             row.key = static_cast<std::uint8_t>((raw >> 49) & 3);
+        } else if ((raw >> 32) & 0x7ffff) {
+            row.complete = false;
         }
-        row.complete = false;
     } else if (format == 8 || format == 11) {
         // Kernel-cache targets are relative to one of several cache images.
         // Retain their encoded target/authentication fields, but keep the row
@@ -163,6 +169,9 @@ void pointer_bits(MachOChainedPointer &row, const MachOChainedStarts &starts) {
         row.authenticated = bool(raw >> 63);
         row.next = static_cast<std::uint16_t>((raw >> 51) & 0xfff);
         row.target = raw & 0x3fffffff;
+        row.cache_level = static_cast<std::uint8_t>((raw >> 30) & 0x3);
+        row.target_is_offset = true;
+        row.target_base_kind = MachOChainedTargetBaseKind::cache_level;
         row.diversity = static_cast<std::uint16_t>((raw >> 32) & 0xffff);
         row.address_diversity = bool((raw >> 48) & 1);
         row.key = static_cast<std::uint8_t>((raw >> 49) & 3);
@@ -174,6 +183,10 @@ void pointer_bits(MachOChainedPointer &row, const MachOChainedStarts &starts) {
         row.authenticated = bool(raw >> 63);
         row.next = static_cast<std::uint16_t>((raw >> 52) & 0x7ff);
         row.target = raw & UINT64_C(0x3ffffffff);
+        row.target_is_offset = true;
+        row.target_base_kind = MachOChainedTargetBaseKind::shared_cache;
+        if (!row.authenticated && ((raw >> 42) & 0x3ff))
+            row.complete = false;
         if (row.authenticated) {
             row.diversity = static_cast<std::uint16_t>((raw >> 34) & 0xffff);
             row.address_diversity = bool((raw >> 50) & 1);
@@ -489,13 +502,67 @@ void read_chained(const Reader &reader, const Image &image, MachOMetadata &metad
         if (contiguous)
             row.file_place = first;
         pointer_bits(row, starts);
+        // The on-disk word may be ciphertext; never interpret its packed
+        // destination as an address unless this source range is plaintext.
+        const bool encrypted = image.plaintext_window(*row.place, width) != width;
+        if (!encrypted && starts.pointer_format == 14 && row.target) {
+            const auto target_segment_index = static_cast<std::uint32_t>((*row.target >> 28) & 0xf);
+            const auto target_segment_offset = *row.target & UINT64_C(0x0fffffff);
+            if (target_segment_index < metadata.segments.size()) {
+                const auto &target_segment = metadata.segments[target_segment_index];
+                if (target_segment_offset < target_segment.memory_size &&
+                    target_segment.address <= UINT64_MAX - target_segment_offset) {
+                    const Address target{row.place->space, target_segment.address + target_segment_offset};
+                    if (image.segment_at(target)) row.target_address = target;
+                }
+            }
+        }
+        // The vmaddr-based formats carry enough context to identify an
+        // in-image rebase without a slide or shared-cache mapping. Keep
+        // offset-based/cache formats unresolved here; their bases differ.
+        const auto pointer_format = starts.pointer_format;
+        const bool vmaddr_target = pointer_format == 1 || pointer_format == 2 ||
+            pointer_format == 3 || pointer_format == 5 || pointer_format == 10;
+        if (!encrypted && row.complete && vmaddr_target && !row.bind && !row.authenticated &&
+            row.target && !row.non_pointer) {
+            const auto target = *row.target | (std::uint64_t(row.high8) << 56);
+            const Address destination{row.place->space, target};
+            if (image.segment_at(destination)) row.target_address = destination;
+        }
+        // Userland offset formats are relative to the preferred image base.
+        // Resolve only complete, unauthenticated rebases whose preferred-base
+        // target is mapped to plaintext file bytes. Authenticated pointers keep
+        // their decoded target/PAC fields but need runtime signing context;
+        // Shared-cache and kernel-cache formats need external base metadata.
+        const bool in_image_offset_target = pointer_format == 6 || pointer_format == 7 ||
+                                            pointer_format == 9 || pointer_format == 12;
+        const auto &mapped_segments = image.layout().segments;
+        if (!encrypted && row.complete && in_image_offset_target && !row.bind &&
+            !row.authenticated && row.target && !row.non_pointer && !mapped_segments.empty() &&
+            metadata.container.slices.at(metadata.selected_slice).header.file_type != 1) {
+            const auto base = std::min_element(mapped_segments.begin(), mapped_segments.end(),
+                [](const auto &left, const auto &right) {
+                    return left.begin.offset < right.begin.offset;
+                })->begin.offset;
+            if (*row.target <= UINT64_MAX - base) {
+                const auto target = (base + *row.target) | (std::uint64_t(row.high8) << 56);
+                const Address destination{row.place->space, target};
+                if (image.segment_at(destination) && image.to_file_offset(destination) &&
+                    image.plaintext_window(destination, 1) == 1)
+                    row.target_address = destination;
+            }
+        }
         // Preserve the literal bits for inspection, but ciphertext is not a
         // chain link or an import-index equation.
-        const bool encrypted = image.plaintext_window(*row.place, width) != width;
-        if (encrypted) row.complete = false;
+        if (encrypted) {
+            row.complete = false;
+            row.source_interpretation_valid = false;
+        }
         const auto overlap = [&](auto entry) {
             auto &previous = metadata.chained_pointers[entry->second];
             previous.complete = false;
+            previous.source_interpretation_valid = false;
+            row.source_interpretation_valid = false;
             row.complete = false;
         };
         if (after != visited.begin()) {
@@ -525,4 +592,288 @@ void read_chained(const Reader &reader, const Image &image, MachOMetadata &metad
     stream.complete = stream.complete && header.complete;
     metadata.dyld_complete = metadata.dyld_complete && stream.complete;
 }
+namespace {
+void walk_firmware_chains(const Reader &reader, const Image &image, MachOMetadata &metadata,
+                          Budget &budget, std::stop_token stop) {
+    const auto &slice = metadata.container.slices.at(metadata.selected_slice);
+    const auto anchor = take(macho_header_anchor(image, slice, stop));
+    std::optional<Address> text_anchor;
+    bool duplicate_text = false;
+    for (const auto &segment : metadata.segments) if (segment.name == "__TEXT") {
+        if (text_anchor) { duplicate_text = true; break; }
+        text_anchor = Address{{0}, segment.address};
+    }
+    if (duplicate_text) text_anchor.reset();
+    struct Task {
+        std::uint32_t start, node;
+        Address place;
+        FileOffset file;
+        const Segment *segment;
+    };
+    const auto later = [](const Task &a, const Task &b) {
+        return std::tie(a.file.value, a.start, a.node) > std::tie(b.file.value, b.start, b.node);
+    };
+    std::priority_queue<Task, std::vector<Task>, decltype(later)> pending(later);
+    std::map<std::uint64_t, std::size_t> visited;
+    budget.include(metadata.chain_start_offsets.size());
+    std::vector<bool> failed(metadata.chain_start_offsets.size(), false);
+    const auto fail = [&](std::uint32_t start) {
+        failed[start] = true;
+        metadata.chain_start_offsets[start].chain_complete = false;
+        metadata.dyld_complete = false;
+    };
+    const auto enqueue = [&](std::uint32_t start, std::uint32_t node, Address place, const Segment *segment) {
+        const auto width = layout(static_cast<std::uint16_t>(metadata.chain_start_offsets[start].pointer_format)).first;
+        if (!segment || place.space != segment->begin.space || place.offset < segment->begin.offset ||
+            place.offset - segment->begin.offset > segment->size ||
+            width > segment->size - (place.offset - segment->begin.offset)) { fail(start); return; }
+        const auto file = image.to_file_offset(place);
+        if (!file || file.value().value < slice.offset || file.value().value - slice.offset > slice.size ||
+            width > slice.size - (file.value().value - slice.offset)) { fail(start); return; }
+        for (unsigned byte = 0; byte < width; ++byte) {
+            const Address at{place.space, add(place.offset, byte)};
+            const auto mapped = image.to_file_offset(at);
+            if (image.segment_at(at) != segment || !mapped || mapped.value().value != add(file.value().value, byte)) {
+                fail(start); return;
+            }
+        }
+        budget.include(sizeof(Task));
+        pending.push({start, node, place, file.value(), segment});
+    };
+    for (std::uint32_t start = 0; start < metadata.chain_start_offsets.size(); ++start) {
+        canceled(stop);
+        const auto &row = metadata.chain_start_offsets[start];
+        if (row.complete && row.pointer_address)
+            enqueue(start, 0, *row.pointer_address, image.segment_at(*row.pointer_address));
+    }
+    while (!pending.empty()) {
+        canceled(stop);
+        const auto task = pending.top(); pending.pop();
+        if (failed[task.start]) continue;
+        auto &start = metadata.chain_start_offsets[task.start];
+        const auto [width, stride] = layout(static_cast<std::uint16_t>(start.pointer_format));
+        const auto after = visited.lower_bound(task.place.offset);
+        const auto invalidate = [&](auto entry) {
+            auto &previous = metadata.firmware_chained_pointers[entry->second];
+            previous.complete = false; previous.target_address.reset();
+            fail(previous.chain_start_row); fail(task.start);
+        };
+        if (after != visited.begin()) {
+            const auto previous = std::prev(after);
+            const auto &row = metadata.firmware_chained_pointers[previous->second];
+            if (task.place.offset - previous->first < row.field_size) invalidate(previous);
+        }
+        for (auto entry = after; entry != visited.end() && entry->first - task.place.offset < width; ++entry)
+            invalidate(entry);
+        if (failed[task.start]) continue;
+        require(metadata.chained_pointers.size() < 1'000'000 &&
+                    metadata.firmware_chained_pointers.size() < 1'000'000 - metadata.chained_pointers.size(),
+                "Mach-O chained pointer count exceeds budget", ErrorCode::resource_limit);
+        budget.include(sizeof(MachOFirmwareChainedPointer) + 64);
+        const auto bytes = reader.bytes(task.file.value - slice.offset, width);
+        MachOFirmwareChainedPointer row;
+        row.chain_start_row = task.start; row.node_index = task.node;
+        row.place = task.place; row.file_place = task.file; row.field_size = width; row.stride = stride;
+        row.raw = reader.value(bytes.bytes, 0, width);
+        if (image.plaintext_window(task.place, width) != width) row.complete = false;
+        else {
+            MachOChainedPointer decoded; decoded.raw = row.raw;
+            MachOChainedStarts starts; starts.pointer_format = static_cast<std::uint16_t>(start.pointer_format);
+            pointer_bits(decoded, starts);
+            row.next = decoded.next; row.target = decoded.target; row.high8 = decoded.high8;
+            row.bind = decoded.bind; row.authenticated = decoded.authenticated;
+            row.diversity = decoded.diversity; row.address_diversity = decoded.address_diversity; row.key = decoded.key;
+            row.target_is_offset = decoded.target_is_offset || start.coordinate_flags == 2;
+            row.import_index = decoded.import_index; row.addend = decoded.addend;
+            row.complete = decoded.complete;
+            if (row.complete && !row.bind && !row.authenticated && row.target) {
+                auto target = *row.target | (std::uint64_t(row.high8) << 56);
+                const auto base = start.coordinate_flags == 2 ? text_anchor : anchor;
+                const bool overflow = row.target_is_offset && (!base || target > UINT64_MAX - base->offset);
+                if (!overflow) {
+                    if (row.target_is_offset) target += base->offset;
+                    const Address address{task.place.space, target};
+                    if (image.segment_at(address)) row.target_address = address;
+                }
+            }
+        }
+        if (!start.pointer_count) start.first_pointer_row = static_cast<std::uint32_t>(metadata.firmware_chained_pointers.size());
+        ++start.pointer_count;
+        visited.emplace_hint(after, task.place.offset, metadata.firmware_chained_pointers.size());
+        const auto next = row.next;
+        const auto complete = row.complete;
+        metadata.firmware_chained_pointers.push_back(std::move(row));
+        if (!complete) fail(task.start);
+        else if (!next) start.chain_complete = true;
+        else if (std::uint64_t(next) * stride > UINT64_MAX - task.place.offset) fail(task.start);
+        else enqueue(task.start, task.node + 1, {task.place.space, task.place.offset + std::uint64_t(next) * stride}, task.segment);
+    }
+}
+} // namespace
+void read_chain_starts_section(const Reader &reader, const Image &image, MachOMetadata &metadata,
+                               Budget &budget, std::stop_token stop) {
+    const auto &slice = metadata.container.slices.at(metadata.selected_slice);
+    for (const auto &section : metadata.sections) {
+        if (section.name != "__chain_starts" || section.segment_name != "__TEXT") continue;
+        canceled(stop);
+        if (!section.file_offset || section.size < 8) {
+            metadata.dyld_complete = false;
+            continue;
+        }
+        const auto fixed = reader.bytes(section.raw_file_offset, 8);
+        const auto pointer_format = static_cast<std::uint32_t>(reader.value(fixed.bytes, 0, 4));
+        const auto count = reader.value(fixed.bytes, 4, 4);
+        const std::uint64_t width = pointer_format == 5 ? 4 : pointer_format == 7 ? 8 : 0;
+        const bool supported = width != 0 && width == (slice.header.is_64 ? 8u : 4u) &&
+                               slice.header.order == ByteOrder::little && slice.header.file_type != 1;
+        const bool coordinate_known = section.reserved1 == 1 || section.reserved1 == 2;
+        const bool bounded = count <= 1'000'000 && count <= (section.size - 8) / 4;
+        const auto entries = std::min<std::uint64_t>({count, (section.size - 8) / 4, 1'000'000});
+        if (!bounded) metadata.dyld_complete = false;
+        if (!supported || !coordinate_known) metadata.dyld_complete = false;
+        for (std::uint32_t index = 0; index < entries; ++index) {
+            canceled(stop);
+            budget.include(sizeof(MachOChainStartOffset));
+            const auto rel = std::uint64_t(section.raw_file_offset) + 8 + std::uint64_t(index) * 4;
+            const auto bytes = reader.bytes(rel, 4);
+            MachOChainStartOffset row;
+            row.section_ordinal = section.ordinal;
+            row.index = index;
+            row.pointer_format = pointer_format;
+            row.coordinate_flags = section.reserved1;
+            row.raw_offset = reader.value(bytes.bytes, 0, 4);
+            row.record_file_offset = reader.file(rel, 4).value;
+            row.complete = bounded && supported && coordinate_known;
+            if (row.complete && row.coordinate_flags == 1) {
+                // Apple defines these values as file offsets within the image.
+                if (row.raw_offset <= slice.size && width <= slice.size - row.raw_offset) {
+                    const auto file = reader.file(row.raw_offset, width);
+                    const auto address = image.to_address(file);
+                    if (address) {
+                        bool contiguous = true;
+                        for (std::uint64_t byte = 0; byte < width; ++byte) {
+                            const auto mapped = image.to_file_offset({address.value().space, add(address.value().offset, byte)});
+                            if (!mapped || mapped.value().value != file.value + byte) { contiguous = false; break; }
+                        }
+                        if (contiguous) {
+                            row.pointer_address = address.value();
+                            row.pointer_file_offset = file;
+                        } else row.complete = false;
+                    } else row.complete = false;
+                } else row.complete = false;
+            } else if (row.complete && row.coordinate_flags == 2) {
+                const MachOSegment *text = nullptr;
+                for (const auto &segment : metadata.segments) if (segment.name == "__TEXT") {
+                    if (text) { text = nullptr; break; }
+                    text = &segment;
+                }
+                // VM offsets are relative to __TEXT's base, but may name
+                // pointers in other mapped segments such as __DATA.
+                if (text && row.raw_offset <= UINT64_MAX - text->address) {
+                    const Address address{{0}, add(text->address, row.raw_offset)};
+                    bool contiguous = true;
+                    std::optional<FileOffset> first;
+                    for (std::uint64_t byte = 0; byte < width; ++byte) {
+                        const auto mapped = image.to_file_offset({address.space, add(address.offset, byte)});
+                        if (!mapped) { contiguous = false; break; }
+                        if (byte == 0) first = mapped.value();
+                        else if (!first || mapped.value().value != add(first->value, byte)) { contiguous = false; break; }
+                    }
+                    if (contiguous) {
+                        row.pointer_address = address;
+                        row.pointer_file_offset = first;
+                    } else row.complete = false;
+                } else row.complete = false;
+            }
+            if (!row.complete) metadata.dyld_complete = false;
+            metadata.chain_start_offsets.push_back(std::move(row));
+        }
+    }
+    walk_firmware_chains(reader, image, metadata, budget, stop);
+}
 } // namespace hexlab::macho_detail
+
+namespace hexlab {
+Result<std::vector<MachOChainedExternalTarget>> resolve_macho_chained_external_targets(
+    const MachOMetadata &metadata, const MachOChainedTargetBases &bases, std::stop_token stop,
+    MachOChainedTargetResolutionLimits limits) {
+    if (metadata.chained_pointers.size() > limits.max_pointer_rows || limits.max_pointer_rows > 1'000'000)
+        return Error{ErrorCode::resource_limit, "Mach-O chained target resolution exceeds its pointer-row limit"};
+    try {
+        std::vector<MachOChainedExternalTarget> output;
+        for (std::size_t index = 0; index < metadata.chained_pointers.size(); ++index) {
+            if (stop.stop_requested())
+                return Error{ErrorCode::canceled, "Mach-O chained target resolution canceled"};
+            const auto &row = metadata.chained_pointers[index];
+            if (row.bind || !row.target_base_kind) continue;
+            MachOChainedExternalTarget resolved;
+            resolved.pointer_index = index;
+            resolved.authentication_required = row.authenticated;
+            resolved.base_kind = *row.target_base_kind;
+            resolved.cache_level = row.cache_level;
+            if (!row.source_interpretation_valid || !row.place || !row.target || row.non_pointer || !row.field_size) {
+                resolved.status = MachOChainedExternalTargetStatus::invalid_encoding;
+                output.push_back(std::move(resolved));
+                continue;
+            }
+            const auto pointer_format = row.starts < metadata.chained_starts.size()
+                ? metadata.chained_starts[row.starts].pointer_format : 0;
+            std::optional<std::uint64_t> base;
+            if (*row.target_base_kind == MachOChainedTargetBaseKind::cache_level) {
+                if ((pointer_format != 8 && pointer_format != 11) || !row.cache_level || *row.cache_level >= 4) {
+                    resolved.status = MachOChainedExternalTargetStatus::invalid_encoding;
+                    output.push_back(std::move(resolved));
+                    continue;
+                }
+                const bool reserved = !row.authenticated && ((row.raw >> 32) & 0x7ffff) != 0;
+                if (reserved) {
+                    resolved.status = MachOChainedExternalTargetStatus::invalid_encoding;
+                    output.push_back(std::move(resolved));
+                    continue;
+                }
+                base = bases.cache_level_bases[*row.cache_level];
+            } else {
+                if (pointer_format != 4 && pointer_format != 13) {
+                    resolved.status = MachOChainedExternalTargetStatus::invalid_encoding;
+                    output.push_back(std::move(resolved));
+                    continue;
+                }
+                const bool reserved = pointer_format == 13 && !row.authenticated &&
+                    ((row.raw >> 42) & 0x3ff) != 0;
+                if (reserved) {
+                    resolved.status = MachOChainedExternalTargetStatus::invalid_encoding;
+                    output.push_back(std::move(resolved));
+                    continue;
+                }
+                base = bases.shared_cache_base;
+            }
+            if (!base) {
+                resolved.status = MachOChainedExternalTargetStatus::missing_base;
+                output.push_back(std::move(resolved));
+                continue;
+            }
+            resolved.base_address = *base;
+            if (*row.target > UINT64_MAX - *base) {
+                resolved.status = MachOChainedExternalTargetStatus::overflow;
+                output.push_back(std::move(resolved));
+                continue;
+            }
+            auto target = *base + *row.target;
+            if (pointer_format == 13 && !row.authenticated) {
+                if (target > UINT64_C(0x00ffffffffffffff)) {
+                    resolved.status = MachOChainedExternalTargetStatus::overflow;
+                    output.push_back(std::move(resolved));
+                    continue;
+                }
+                target |= std::uint64_t(row.high8) << 56;
+            }
+            resolved.status = MachOChainedExternalTargetStatus::resolved;
+            resolved.target_address = target;
+            output.push_back(std::move(resolved));
+        }
+        return output;
+    } catch (const std::bad_alloc &) {
+        return Error{ErrorCode::resource_limit, "Cannot allocate Mach-O chained target resolution rows"};
+    }
+}
+} // namespace hexlab

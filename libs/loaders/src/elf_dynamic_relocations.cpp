@@ -436,18 +436,19 @@ Result<ElfRuntimeImage> apply_elf_runtime_relocations(const LoadedImage &source,
                 throw RuntimeRelocationFailure{{ErrorCode::canceled, "ELF runtime relocation canceled"}};
             const auto &relocation = metadata.relocations[static_cast<std::size_t>(index)];
             const bool packed_relative = relr_rows.contains(index);
-            const bool arm32 = !metadata.header.is_64 && metadata.header.machine == 40 &&
-                               metadata.header.order == ByteOrder::little;
+            const bool arm32 = !metadata.header.is_64 && metadata.header.machine == 40;
             const bool i386 = !metadata.header.is_64 && metadata.header.machine == 3 &&
                               metadata.header.order == ByteOrder::little;
             const bool x64 = metadata.header.machine == 62;
             const bool x32 = !metadata.header.is_64 && x64 && metadata.header.order == ByteOrder::little;
-            const bool ppc64 = metadata.header.machine == 21;
+            const bool ppc32 = !metadata.header.is_64 && metadata.header.machine == 20;
+            const bool ppc64 = metadata.header.is_64 && metadata.header.machine == 21;
             const bool s390x = metadata.header.is_64 && metadata.header.machine == 22;
             const bool riscv = metadata.header.machine == 243;
             const bool riscv64 = riscv && metadata.header.is_64;
             const bool riscv32 = riscv && !metadata.header.is_64;
-            const auto relative_type = i386 || x64 ? 8u : arm32 ? 23u : ppc64 ? 22u :
+            const bool mips32 = metadata.header.machine == 8 && !metadata.header.is_64;
+            const auto relative_type = i386 || x64 ? 8u : arm32 ? 23u : (ppc32 || ppc64) ? 22u :
                                        s390x ? 12u : riscv ? 3u : 1027u;
             const auto jump_slot_type = i386 || x64 ? 7u : arm32 ? 22u : ppc64 ? 21u :
                                         s390x ? 11u : riscv ? 5u : 1026u;
@@ -455,12 +456,16 @@ Result<ElfRuntimeImage> apply_elf_runtime_relocations(const LoadedImage &source,
                                       relocation.kind == ElfRelocationKind::base_relative;
             const bool x32_relative64 = x32 && relocation.type == 38 &&
                                         relocation.kind == ElfRelocationKind::base_relative;
+            const bool x64_relative64 = metadata.header.is_64 && x64 && relocation.type == 38 &&
+                                        relocation.kind == ElfRelocationKind::base_relative;
             const bool ordinary_subset = metadata.header.order == ByteOrder::little &&
                                          ((metadata.header.is_64 &&
-                                           (metadata.header.machine == 62 || metadata.header.machine == 183 || ppc64 || riscv64)) ||
+                                           (metadata.header.machine == 62 || metadata.header.machine == 183 || riscv64)) ||
                                           i386 || arm32 || riscv32 || x32_relative || x32_relative64);
             const bool s390x_subset = s390x && metadata.header.order == ByteOrder::big;
-            const bool supported_architecture = ordinary_subset || s390x_subset;
+            const bool arm32_big_endian = arm32 && metadata.header.order == ByteOrder::big;
+            const bool supported_architecture = ordinary_subset || ppc64 || s390x_subset || mips32 || ppc32 ||
+                                                arm32_big_endian;
             if (!packed_relative && !supported_architecture) {
                 skip(index, "Ordinary REL/RELA runtime relocations are unsupported for this ELF class, byte order, or architecture");
                 continue;
@@ -473,8 +478,16 @@ Result<ElfRuntimeImage> apply_elf_runtime_relocations(const LoadedImage &source,
                 skip(index, "s390x runtime relocation support requires big-endian RELA explicit addends");
                 continue;
             }
+            if (!packed_relative && mips32 && relocation.type == 3 && relocation.explicit_addend) {
+                skip(index, "MIPS32 R_MIPS_REL32 runtime support requires REL implicit addends");
+                continue;
+            }
+            const bool mips32_rel32 = mips32 && relocation.type == 3 &&
+                                      relocation.kind == ElfRelocationKind::absolute;
             const bool relative = relocation.kind == ElfRelocationKind::base_relative &&
-                                  (packed_relative || relocation.type == relative_type || x32_relative64);
+                                  (packed_relative || relocation.type == relative_type || x32_relative64 ||
+                                   x64_relative64) ||
+                                  (mips32_rel32 && relocation.symbol_index == 0);
             const bool symbol_slot = (!riscv &&
                                       ((relocation.type == (arm32 ? 21u : s390x ? 10u : i386 || x64 ? 6u : 1025u) &&
                                         relocation.kind == ElfRelocationKind::global_data) ||
@@ -488,17 +501,37 @@ Result<ElfRuntimeImage> apply_elf_runtime_relocations(const LoadedImage &source,
                                      relocation.kind == ElfRelocationKind::absolute;
             const bool ppc64_abs32 = ppc64 && relocation.type == 1 &&
                                      relocation.kind == ElfRelocationKind::absolute;
+            const bool ppc32_addr32 = ppc32 && relocation.type == 1 &&
+                                      relocation.kind == ElfRelocationKind::absolute;
+            const bool ppc32_glob_dat = ppc32 && relocation.type == 20 &&
+                                        relocation.kind == ElfRelocationKind::global_data;
             const bool s390x_abs64 = s390x && relocation.type == 22 &&
+                                     relocation.kind == ElfRelocationKind::absolute;
+            const bool s390x_abs8 = s390x && relocation.type == 1 &&
+                                    relocation.kind == ElfRelocationKind::absolute;
+            const bool s390x_abs16 = s390x && relocation.type == 3 &&
+                                     relocation.kind == ElfRelocationKind::absolute;
+            const bool s390x_abs32 = s390x && relocation.type == 4 &&
                                      relocation.kind == ElfRelocationKind::absolute;
             const bool s390x_pc32 = s390x && relocation.type == 5 &&
                                     relocation.kind == ElfRelocationKind::pc_relative;
+            const bool s390x_pc16 = s390x && relocation.type == 16 &&
+                                    relocation.kind == ElfRelocationKind::pc_relative;
+            const bool s390x_pc16dbl = s390x && relocation.type == 17 &&
+                                       relocation.kind == ElfRelocationKind::pc_relative;
+            const bool s390x_pc32dbl = s390x && relocation.type == 19 &&
+                                       relocation.kind == ElfRelocationKind::pc_relative;
             const bool s390x_glob_dat = s390x && relocation.type == 10 &&
                                         relocation.kind == ElfRelocationKind::global_data;
             const bool riscv_32 = riscv && relocation.type == 1 &&
                                   relocation.kind == ElfRelocationKind::absolute;
             const bool riscv_64 = riscv64 && relocation.type == 2 &&
                                   relocation.kind == ElfRelocationKind::absolute;
-            const bool symbol_with_addend = riscv_32 || riscv_64;
+            const bool mips32_symbol_rel32 = mips32_rel32 && relocation.symbol_index != 0 &&
+                                              !relocation.explicit_addend;
+            const bool symbol_with_addend = riscv_32 || riscv_64 || mips32_symbol_rel32 ||
+                                            ppc32_addr32 || ppc32_glob_dat || s390x_abs8 || s390x_abs16 ||
+                                            s390x_abs32 || s390x_pc16 || s390x_pc16dbl || s390x_pc32dbl;
             const bool aarch64_abs64 = metadata.header.machine == 183 && relocation.type == 257 &&
                                        relocation.kind == ElfRelocationKind::absolute;
             const bool aarch64_abs32 = metadata.header.machine == 183 && relocation.type == 258 &&
@@ -517,6 +550,10 @@ Result<ElfRuntimeImage> apply_elf_runtime_relocations(const LoadedImage &source,
                                           relocation.kind == ElfRelocationKind::pc_relative;
             const bool arm32_absolute = arm32 && relocation.type == 2 &&
                                         relocation.kind == ElfRelocationKind::absolute;
+            const bool arm32_abs16 = arm32 && relocation.type == 5 &&
+                                     relocation.kind == ElfRelocationKind::absolute;
+            const bool arm32_abs8 = arm32 && relocation.type == 8 &&
+                                    relocation.kind == ElfRelocationKind::absolute;
             const bool arm32_pc_relative = arm32 && relocation.type == 3 &&
                                            relocation.kind == ElfRelocationKind::pc_relative;
             const bool arm32_prel31 = arm32 && relocation.type == 42 &&
@@ -531,33 +568,41 @@ Result<ElfRuntimeImage> apply_elf_runtime_relocations(const LoadedImage &source,
                                          relocation.kind == ElfRelocationKind::jump_slot;
             const bool x64_64 = x64 && relocation.type == 1 && relocation.kind == ElfRelocationKind::absolute;
             const bool x64_pc32 = x64 && relocation.type == 2 && relocation.kind == ElfRelocationKind::pc_relative;
+            const bool x64_pc64 = x64 && relocation.type == 24 && relocation.kind == ElfRelocationKind::pc_relative;
+            const bool x64_pc16 = x64 && relocation.type == 13 && relocation.kind == ElfRelocationKind::pc_relative;
+            const bool x64_pc8 = x64 && relocation.type == 15 && relocation.kind == ElfRelocationKind::pc_relative;
             const bool x64_32 = x64 && relocation.type == 10 && relocation.kind == ElfRelocationKind::absolute;
             const bool x64_32s = x64 && relocation.type == 11 && relocation.kind == ElfRelocationKind::absolute;
+            const bool x64_size32 = x64 && relocation.type == 32 && relocation.kind == ElfRelocationKind::symbol_size;
+            const bool x64_size64 = x64 && relocation.type == 33 && relocation.kind == ElfRelocationKind::symbol_size;
             if (!relative && !symbol_slot && !symbol_with_addend && !i386_absolute && !i386_pc_relative &&
-                !arm32_absolute && !arm32_pc_relative && !arm32_prel31 && !arm32_abs32_noi &&
+                !arm32_absolute && !arm32_abs16 && !arm32_abs8 && !arm32_pc_relative && !arm32_prel31 && !arm32_abs32_noi &&
                 !arm32_rel32_noi && !arm32_glob_dat && !arm32_jump_slot &&
-                !x64_64 && !x64_pc32 && !x64_32 && !x64_32s &&
+                !x64_64 && !x64_pc32 && !x64_pc64 && !x64_pc16 && !x64_pc8 && !x64_32 && !x64_32s &&
+                !x64_size32 && !x64_size64 &&
                 !aarch64_abs64 && !aarch64_abs32 && !aarch64_abs16 &&
                 !aarch64_prel64 && !aarch64_prel32 && !aarch64_prel16 &&
-                !ppc64_glob_dat && !ppc64_abs64 && !ppc64_abs32 && !s390x_glob_dat && !s390x_abs64 && !s390x_pc32) {
+                !ppc64_glob_dat && !ppc64_abs64 && !ppc64_abs32 && !s390x_glob_dat && !s390x_abs64 &&
+                !s390x_abs8 && !s390x_abs16 && !s390x_abs32 && !s390x_pc32 && !s390x_pc16 &&
+                !s390x_pc16dbl && !s390x_pc32dbl) {
                 skip(index, i386
                     ? "Supported dynamic types are R_386_32, R_386_PC32, R_386_RELATIVE, R_386_GLOB_DAT, and R_386_JMP_SLOT"
                     : arm32
-                    ? "Supported dynamic types are R_ARM_ABS32/REL32/PREL31/ABS32_NOI/REL32_NOI, RELATIVE, GLOB_DAT, and JUMP_SLOT"
+                    ? "Supported dynamic types are R_ARM_ABS32/16/8, REL32/PREL31/ABS32_NOI/REL32_NOI, RELATIVE, GLOB_DAT, and JUMP_SLOT"
+                    : mips32
+                    ? "Supported MIPS32 dynamic type is R_MIPS_REL32 (REL) with a validated symbol index"
                     : riscv
                     ? (riscv64 ? "Supported dynamic types are R_RISCV_RELATIVE, R_RISCV_64, and R_RISCV_JUMP_SLOT"
                                : "Supported dynamic types are R_RISCV_RELATIVE, R_RISCV_32, and R_RISCV_JUMP_SLOT")
                     : x64
-                    ? "Supported dynamic types are R_X86_64_64, PC32, 32, 32S, RELATIVE, GLOB_DAT, and JUMP_SLOT"
+                    ? "Supported dynamic types are R_X86_64_64, PC64/32/16/8, 32, 32S, SIZE32/64, RELATIVE/RELATIVE64, GLOB_DAT, and JUMP_SLOT"
                     : s390x
-                    ? "Supported dynamic types are big-endian R_390_PC32, R_390_RELATIVE, R_390_64, R_390_GLOB_DAT, and R_390_JMP_SLOT"
+                    ? "Supported dynamic types are big-endian R_390_8/16/32, PC16/PC16DBL/PC32/PC32DBL, RELATIVE, 64, GLOB_DAT, and JMP_SLOT"
                     : ppc64
                     ? "Supported dynamic types are R_PPC64_RELATIVE, ADDR32/ADDR64, GLOB_DAT, and JMP_SLOT"
+                    : ppc32
+                    ? "Supported dynamic PPC32 types are R_PPC_RELATIVE, R_PPC_ADDR32, and R_PPC_GLOB_DAT"
                     : "Supported dynamic types are R_AARCH64_ABS64/32/16, PREL64/32/16, RELATIVE, GLOB_DAT, and JUMP_SLOT");
-                continue;
-            }
-            if (i386 && relocation.explicit_addend) {
-                skip(index, "ELF32 i386 runtime relocation support requires REL implicit addends");
                 continue;
             }
             if (relative && !relocation.addend) {
@@ -577,7 +622,10 @@ Result<ElfRuntimeImage> apply_elf_runtime_relocations(const LoadedImage &source,
                     // REL addends are unsigned ELF32 words. The parser keeps
                     // the sampled word in a signed carrier; recover its exact
                     // 32-bit pattern before applying B + A.
-                    if (i386 || arm32 || (riscv32 && !relocation.explicit_addend) ||
+                    if ((i386 && !relocation.explicit_addend) ||
+                        (arm32 && !relocation.explicit_addend) || mips32 ||
+                        (ppc32 && !relocation.explicit_addend) ||
+                        (riscv32 && !relocation.explicit_addend) ||
                         (x32_relative && !relocation.explicit_addend)) {
                         const auto addend = static_cast<std::uint64_t>(
                             static_cast<std::uint32_t>(*relocation.addend));
@@ -589,7 +637,7 @@ Result<ElfRuntimeImage> apply_elf_runtime_relocations(const LoadedImage &source,
                     skip(index, "Relative relocation result overflows the runtime address space");
                     continue;
                 }
-                if ((i386 || arm32 || riscv32 || x32_relative) && value > UINT32_MAX) {
+                if ((i386 || arm32 || riscv32 || mips32 || ppc32 || x32_relative) && value > UINT32_MAX) {
                     skip(index, "ELF32 relative relocation result exceeds the 32-bit address space");
                     continue;
                 }
@@ -638,7 +686,14 @@ Result<ElfRuntimeImage> apply_elf_runtime_relocations(const LoadedImage &source,
                         continue;
                     }
                 }
-                if ((i386 || riscv32) && value > UINT32_MAX) {
+                if (x64_size32 || x64_size64) {
+                    if (symbol->state == ElfSymbolState::undefined) {
+                        value = bindings[external_resolution->binding_index].symbol_size;
+                    } else {
+                        value = symbol->size;
+                    }
+                }
+                if ((i386 || riscv32 || mips32 || ppc32) && value > UINT32_MAX) {
                     skip(index, "ELF32 symbol address exceeds the 32-bit address space");
                     continue;
                 }
@@ -674,13 +729,39 @@ Result<ElfRuntimeImage> apply_elf_runtime_relocations(const LoadedImage &source,
                     // the specified low 32 bits, including negative addends.
                     value = static_cast<std::uint32_t>(
                         static_cast<std::uint32_t>(value) + addend - static_cast<std::uint32_t>(place));
+                } else if (arm32_abs16 || arm32_abs8) {
+                    if (!relocation.addend) {
+                        skip(index, "ARM narrow absolute relocation addend is unavailable");
+                        continue;
+                    }
+                    // AAELF32 computes expressions modulo 2^32 before checking
+                    // the signed-or-unsigned narrow range. S excludes the Thumb
+                    // discriminator for STT_FUNC; odd data addresses retain bit 0.
+                    const auto symbol_address = static_cast<std::uint32_t>(value) &
+                        (symbol->type == 2 ? UINT32_C(0xfffffffe) : UINT32_MAX);
+                    const auto sum = static_cast<std::uint32_t>(symbol_address +
+                        static_cast<std::uint32_t>(*relocation.addend));
+                    const auto bits = arm32_abs16 ? 16u : 8u;
+                    const auto unsigned_max = (UINT32_C(1) << bits) - 1;
+                    const auto signed_min = UINT32_MAX - (UINT32_C(1) << (bits - 1)) + 1;
+                    if (sum > unsigned_max && sum < signed_min) {
+                        skip(index, arm32_abs16
+                            ? "R_ARM_ABS16 result does not fit its signed-or-unsigned 16-bit ABI range"
+                            : "R_ARM_ABS8 result does not fit its signed-or-unsigned 8-bit ABI range");
+                        continue;
+                    }
+                    value = sum & unsigned_max;
                 } else if (arm32_absolute || arm32_pc_relative || arm32_prel31 || arm32_abs32_noi ||
                            arm32_rel32_noi || arm32_glob_dat || arm32_jump_slot) {
-                    // ARM ELF32 dynamic relocations write a 32-bit word. Preserve
-                    // the Thumb function bit from S after arithmetic on S + A.
+                    // ARM ELF32 dynamic relocations write a 32-bit word.
+                    // Preserve the Thumb function bit where the ABI includes
+                    // T; the NOI forms deliberately omit it.
                     std::uint32_t addend = 0;
-                    if (arm32_jump_slot && !relocation.explicit_addend) {
-                        addend = 0; // R_ARM_JUMP_SLOT REL always uses A = 0.
+                    if (arm32_glob_dat || arm32_jump_slot) {
+                        // AAELF32 defines GLOB_DAT and JUMP_SLOT as S; unlike
+                        // ordinary data relocations their result does not use
+                        // an addend in either REL or RELA form.
+                        addend = 0;
                     } else {
                         if (!relocation.addend) {
                             skip(index, "ARM symbol relocation addend is unavailable");
@@ -724,7 +805,8 @@ Result<ElfRuntimeImage> apply_elf_runtime_relocations(const LoadedImage &source,
                     }
                 } else if (symbol_with_addend || aarch64_abs64 || aarch64_abs32 || aarch64_abs16 ||
                            aarch64_prel64 || aarch64_prel32 || aarch64_prel16 || ppc64_glob_dat || ppc64_abs64 || ppc64_abs32 ||
-                           s390x_glob_dat || s390x_abs64 || s390x_pc32) {
+                           s390x_glob_dat || s390x_abs64 || s390x_pc32 || s390x_abs8 || s390x_abs16 ||
+                           s390x_abs32 || s390x_pc16 || s390x_pc16dbl || s390x_pc32dbl) {
                     if (!relocation.addend) {
                         const auto relocation_name = aarch64_abs64 ? "R_AARCH64_ABS64" :
                             aarch64_abs32 ? "R_AARCH64_ABS32" : aarch64_abs16 ? "R_AARCH64_ABS16" :
@@ -732,7 +814,11 @@ Result<ElfRuntimeImage> apply_elf_runtime_relocations(const LoadedImage &source,
                             aarch64_prel16 ? "R_AARCH64_PREL16" :
                             ppc64_glob_dat ? "R_PPC64_GLOB_DAT" : ppc64_abs64 ? "R_PPC64_ADDR64" :
                             ppc64_abs32 ? "R_PPC64_ADDR32" :
-                            s390x_glob_dat ? "R_390_GLOB_DAT" : s390x_abs64 ? "R_390_64" : s390x_pc32 ? "R_390_PC32" :
+                            s390x_glob_dat ? "R_390_GLOB_DAT" : s390x_abs64 ? "R_390_64" :
+                            s390x_abs8 ? "R_390_8" : s390x_abs16 ? "R_390_16" : s390x_abs32 ? "R_390_32" :
+                            s390x_pc32 ? "R_390_PC32" : s390x_pc16 ? "R_390_PC16" :
+                            s390x_pc16dbl ? "R_390_PC16DBL" : s390x_pc32dbl ? "R_390_PC32DBL" :
+                            ppc32_addr32 ? "R_PPC_ADDR32" : ppc32_glob_dat ? "R_PPC_GLOB_DAT" :
                             riscv_32 ? "R_RISCV_32" : "R_RISCV_64";
                         skip(index, std::string(relocation_name) +
                                         (relocation.explicit_addend ? " relocation addend is unavailable"
@@ -761,6 +847,26 @@ Result<ElfRuntimeImage> apply_elf_runtime_relocations(const LoadedImage &source,
                             skip(index, "AArch64 PREL result does not fit its signed ABI range");
                             continue;
                         }
+                    } else if (mips32_symbol_rel32) {
+                        if (!relocation.addend) {
+                            skip(index, "R_MIPS_REL32 symbol relocation's implicit addend is unavailable");
+                            continue;
+                        }
+                        // The MIPS32 ABI defines this field as T-word32 S + A.
+                        // Arithmetic is performed modulo the 32-bit relocation
+                        // field; an external symbol has already been resolved
+                        // through the caller-supplied exact binding inventory.
+                        value = static_cast<std::uint32_t>(
+                            static_cast<std::uint32_t>(value) + static_cast<std::uint32_t>(*relocation.addend));
+                    } else if (ppc32_addr32 || ppc32_glob_dat) {
+                        std::uint32_t encoded = 0;
+                        if (!ppc64_addr32_result(value, *relocation.addend, encoded)) {
+                            skip(index, ppc32_addr32
+                                ? "R_PPC_ADDR32 result does not fit signed-or-unsigned 32 bits"
+                                : "R_PPC_GLOB_DAT result does not fit signed-or-unsigned 32 bits");
+                            continue;
+                        }
+                        value = encoded;
                     } else if (riscv_32) {
                         std::uint64_t sum = 0;
                         if (!add_signed_to_unsigned(value, *relocation.addend, sum) || sum > UINT32_MAX) {
@@ -775,6 +881,53 @@ Result<ElfRuntimeImage> apply_elf_runtime_relocations(const LoadedImage &source,
                             continue;
                         }
                         value = encoded;
+                    } else if (s390x_abs8 || s390x_abs16 || s390x_abs32) {
+                        // The zSeries ABI evaluates S + A modulo 64 bits;
+                        // narrow fields then require sign/zero extension.
+                        const auto sum = value + static_cast<std::uint64_t>(*relocation.addend);
+                        if (s390x_abs8 && (sum >> 8) != 0) {
+                            skip(index, "R_390_8 result has nonzero upper 56 bits");
+                            continue;
+                        }
+                        if (s390x_abs16 && (sum >> 16) != 0 && (sum >> 16) != UINT64_C(0x0000ffffffffffff)) {
+                            skip(index, "R_390_16 result does not fit signed-or-unsigned 16 bits");
+                            continue;
+                        }
+                        value = s390x_abs32 ? static_cast<std::uint32_t>(sum) : sum;
+                    } else if (s390x_pc16 || s390x_pc16dbl || s390x_pc32dbl) {
+                        if (!relocation.place) {
+                            skip(index, "s390x PC-relative relocation place is unavailable");
+                            continue;
+                        }
+                        std::uint64_t place = 0;
+                        try { place = shifted(relocation.place->offset, load_bias); }
+                        catch (const RuntimeRelocationFailure &) {
+                            skip(index, "s390x PC-relative runtime place overflows the address space");
+                            continue;
+                        }
+                        const auto difference = value + static_cast<std::uint64_t>(*relocation.addend) - place;
+                        if (s390x_pc16) {
+                            const auto upper = difference >> 16;
+                            if (upper != 0 && upper != UINT64_C(0x0000ffffffffffff)) {
+                                skip(index, "R_390_PC16 result does not fit signed-or-unsigned 16 bits");
+                                continue;
+                            }
+                            value = difference;
+                        } else {
+                            if (difference & 1) {
+                                skip(index, "s390x doubleword PC-relative relocation result is not halfword aligned");
+                                continue;
+                            }
+                            const auto signed_difference = std::bit_cast<std::int64_t>(difference);
+                            const auto scaled = signed_difference / 2;
+                            if ((s390x_pc16dbl && (scaled < INT16_MIN || scaled > INT16_MAX)) ||
+                                (s390x_pc32dbl && (scaled < INT32_MIN || scaled > INT32_MAX))) {
+                                skip(index, s390x_pc16dbl ? "R_390_PC16DBL result does not fit signed 16 bits"
+                                                         : "R_390_PC32DBL result does not fit signed 32 bits");
+                                continue;
+                            }
+                            value = static_cast<std::uint64_t>(scaled);
+                        }
                     } else if (s390x_pc32) {
                         if (!relocation.place) {
                             skip(index, "R_390_PC32 relocation place is unavailable");
@@ -799,29 +952,49 @@ Result<ElfRuntimeImage> apply_elf_runtime_relocations(const LoadedImage &source,
                     } else {
                         value += static_cast<std::uint64_t>(*relocation.addend);
                     }
-                } else if (x64_64 || x64_pc32 || x64_32 || x64_32s) {
+                } else if (x64_64 || x64_pc32 || x64_pc64 || x64_pc16 || x64_pc8 || x64_32 || x64_32s ||
+                           x64_size32 || x64_size64) {
                     if (!relocation.addend) {
                         skip(index, "x86-64 symbol-addend relocation addend is unavailable");
                         continue;
                     }
                     const auto addend = *relocation.addend;
-                    if (x64_64) {
+                    if (x64_size32 || x64_size64) {
+                        if (x64_size32) {
+                            std::uint64_t sum = 0;
+                            if (!add_signed_to_unsigned(value, addend, sum) || sum > UINT32_MAX) {
+                                skip(index, "R_X86_64_SIZE32 result does not fit unsigned 32 bits");
+                                continue;
+                            }
+                            value = sum;
+                        } else {
+                            value += static_cast<std::uint64_t>(addend);
+                        }
+                    } else if (x64_64) {
                         // R_X86_64_64 stores the 64-bit S + A result.
                         value += static_cast<std::uint64_t>(addend);
-                    } else if (x64_pc32) {
+                    } else if (x64_pc32 || x64_pc64 || x64_pc16 || x64_pc8) {
                         if (!relocation.place) {
-                            skip(index, "R_X86_64_PC32 relocation place is unavailable");
+                            skip(index, "x86-64 PC-relative relocation place is unavailable");
                             continue;
                         }
                         std::uint64_t place = 0;
                         try { place = shifted(relocation.place->offset, load_bias); }
                         catch (const RuntimeRelocationFailure &) {
-                            skip(index, "R_X86_64_PC32 runtime place overflows the address space");
+                            skip(index, "x86-64 PC-relative runtime place overflows the address space");
                             continue;
                         }
-                        std::uint32_t encoded = 0;
-                        if (!pc32_result(value, addend, place, encoded)) {
-                            skip(index, "R_X86_64_PC32 result does not fit signed 32 bits");
+                        const auto bits = x64_pc64 ? 64u : x64_pc32 ? 32u : x64_pc16 ? 16u : 8u;
+                        std::uint64_t encoded = 0;
+                        if (bits == 32) {
+                            std::uint32_t narrow = 0;
+                            if (!pc32_result(value, addend, place, narrow)) {
+                                skip(index, "R_X86_64_PC32 result does not fit signed 32 bits");
+                                continue;
+                            }
+                            encoded = narrow;
+                        } else if (!signed_prel_result(value, addend, place, bits, encoded)) {
+                            skip(index, "x86-64 PC-relative result does not fit its signed field");
                             continue;
                         }
                         value = encoded;
@@ -859,10 +1032,16 @@ Result<ElfRuntimeImage> apply_elf_runtime_relocations(const LoadedImage &source,
                 }
             }
             const auto word = metadata.header.is_64 ? UINT64_C(8) : UINT64_C(4);
-            const auto expected_width = packed_relative || i386 || arm32 || riscv32 || x32_relative ? word :
-                (riscv_32 || x64_pc32 || x64_32 || x64_32s || ppc64_abs32 || aarch64_abs32 || aarch64_prel32 || s390x_pc32)
+            const auto expected_width = packed_relative ? word :
+                s390x_abs8 ? UINT64_C(1) :
+                s390x_abs16 || s390x_pc16 || s390x_pc16dbl ? UINT64_C(2) :
+                s390x_abs32 || s390x_pc32dbl ? UINT64_C(4) :
+                arm32_abs16 ? UINT64_C(2) : arm32_abs8 ? UINT64_C(1) :
+                i386 || arm32 || riscv32 || ppc32 || x32_relative ? word :
+                (riscv_32 || x64_pc32 || x64_32 || x64_32s || x64_size32 || ppc64_abs32 || aarch64_abs32 || aarch64_prel32 || s390x_pc32)
                     ? UINT64_C(4)
-                    : (aarch64_abs16 || aarch64_prel16) ? UINT64_C(2) : UINT64_C(8);
+                    : (aarch64_abs16 || aarch64_prel16 || x64_pc16) ? UINT64_C(2)
+                    : x64_pc8 ? UINT64_C(1) : UINT64_C(8);
             if (!relocation.place || !relocation.file_place || relocation.field_size != expected_width) {
                 skip(index, "Relocation target is not a complete file-backed field of the supported width");
                 continue;
@@ -875,11 +1054,29 @@ Result<ElfRuntimeImage> apply_elf_runtime_relocations(const LoadedImage &source,
                 skip(index, "R_PPC64_ADDR32 target is not 4-byte aligned");
                 continue;
             }
-            if (!packed_relative && s390x && !s390x_pc32 && (relocation.place->offset & 7) != 0) {
+            if (!packed_relative && ppc32 && (relocation.place->offset & 3) != 0) {
+                skip(index, "PPC32 dynamic relocation target is not 4-byte aligned");
+                continue;
+            }
+            if (!packed_relative && s390x && !s390x_pc32 && !s390x_abs8 && !s390x_abs16 &&
+                !s390x_abs32 && !s390x_pc16 && !s390x_pc16dbl && !s390x_pc32dbl &&
+                (relocation.place->offset & 7) != 0) {
                 skip(index, "s390x dynamic relocation target is not 8-byte aligned");
                 continue;
             }
-            if (arm32 && (relocation.place->offset & 3) != 0) {
+            if ((s390x_abs16 || s390x_pc16 || s390x_pc16dbl) && (relocation.place->offset & 1) != 0) {
+                skip(index, "s390x 16-bit relocation target is not 2-byte aligned");
+                continue;
+            }
+            if (s390x_abs32 && (relocation.place->offset & 3) != 0) {
+                skip(index, "R_390_32 relocation target is not 4-byte aligned");
+                continue;
+            }
+            if (s390x_pc32dbl && (relocation.place->offset & 1) != 0) {
+                skip(index, "R_390_PC32DBL target is not 2-byte aligned");
+                continue;
+            }
+            if (arm32 && !arm32_abs16 && !arm32_abs8 && (relocation.place->offset & 3) != 0) {
                 skip(index, "ARM dynamic relocation target is not 4-byte aligned");
                 continue;
             }

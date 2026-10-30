@@ -23,6 +23,9 @@ public:
         const std::filesystem::path&, std::stop_token);
     HEXLAB_DATABASE_EXPORT std::shared_ptr<ProjectStore> project() const;
     HEXLAB_DATABASE_EXPORT Result<std::shared_ptr<const ProjectState>> refresh(std::stop_token);
+    // Connection-local SQLite data_version used to cheaply detect commits
+    // made through another collaboration peer, including inbox-only changes.
+    HEXLAB_DATABASE_EXPORT Result<std::uint64_t> external_change_version(std::stop_token = {});
     HEXLAB_DATABASE_EXPORT Result<CollaborationSubmission> submit(
         std::uint64_t base_revision, const StateDelta&, std::uint64_t group_id,
         std::stop_token);

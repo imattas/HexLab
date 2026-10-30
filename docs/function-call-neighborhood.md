@@ -14,8 +14,13 @@ At each hop, both caller and callee edges are followed. The graph displays
 known call and tail-transfer edges whose endpoints are in the resulting
 neighborhood, plus unresolved/external endpoints reached from included
 functions. It does not expand beyond the chosen depth. As with the image-wide graph,
-edges come from current reference facts and function ownership; unresolved
-indirect transfers remain unresolved, and partial analysis or graph budgets
+edges come from current reference facts and function ownership. For native
+memory-form calls whose decoded effective address exactly matches one
+unambiguous loader-reported import slot, the `FunctionCall` record now retains
+the import's library and name or ordinal as an external endpoint. This does not
+read the slot's runtime contents or infer a local executable target. Register
+indirect calls, dynamically computed slots, and conflicting import metadata
+remain unresolved. Partial analysis or graph budgets
 are represented in the model's completeness and omitted counts. Selecting a
 location without a recovered function produces a clear request error rather
 than an empty graph.

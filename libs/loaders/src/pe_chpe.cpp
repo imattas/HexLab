@@ -100,6 +100,40 @@ Result<std::size_t> read_chpe_metadata(const Image &image, const Directory &dire
                 first = false;
             }
         }
+        chpe.redirection_metadata_rva = reader.integer<std::uint32_t>(metadata_rva + 16);
+        chpe.redirection_metadata_count = reader.integer<std::uint32_t>(metadata_rva + 52);
+        require((chpe.redirection_metadata_rva == 0) == (chpe.redirection_metadata_count == 0),
+                "Inconsistent PE CHPE redirection metadata RVA and count");
+        if (chpe.redirection_metadata_count) {
+            constexpr std::uint64_t row_size = 8;
+            reader.array(chpe.redirection_metadata_rva, chpe.redirection_metadata_count, row_size);
+            const auto table_size = std::uint64_t{chpe.redirection_metadata_count} * row_size;
+            chpe.redirection_metadata_source = PeRecordSource{
+                0, reader.sources(chpe.redirection_metadata_rva, table_size)};
+            chpe.redirections.reserve(chpe.redirection_metadata_count);
+            std::uint32_t previous_source = 0;
+            bool first = true;
+            for (std::uint32_t index = 0; index < chpe.redirection_metadata_count; ++index) {
+                canceled(stop);
+                const auto row_rva = std::uint64_t{chpe.redirection_metadata_rva} +
+                                     std::uint64_t{index} * row_size;
+                PeChpeRedirection row;
+                row.source_rva = reader.integer<std::uint32_t>(row_rva);
+                row.destination_rva = reader.integer<std::uint32_t>(row_rva + 4);
+                require(first || row.source_rva > previous_source,
+                        "PE CHPE redirection sources are not strictly ordered");
+                for (const auto endpoint : {row.source_rva, row.destination_rva}) {
+                    const auto address = reader.address(endpoint);
+                    const auto *segment = image.segment_at(address);
+                    require(segment && segment->executable && reader.initialized_extent(endpoint) != 0,
+                            "PE CHPE redirection endpoint is not initialized executable code");
+                }
+                row.source = PeRecordSource{index, reader.sources(row_rva, row_size)};
+                chpe.redirections.push_back(std::move(row));
+                previous_source = chpe.redirections.back().source_rva;
+                first = false;
+            }
+        }
         if (!metadata.pe || !metadata.pe->load_configuration)
             throw Failure{{ErrorCode::malformed,
                            "PE CHPE metadata was found without a parsed load configuration"}};

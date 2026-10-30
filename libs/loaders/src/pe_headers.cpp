@@ -5,6 +5,8 @@
 namespace hexlab {
 namespace {
 constexpr std::uint64_t arm64x_apply_limit = 1'000'000;
+constexpr std::uint64_t max_pe_checksum_bytes = 512ull * 1024 * 1024;
+constexpr std::size_t pe_checksum_chunk_size = 64 * 1024;
 struct Arm64xRange {
     std::uint64_t begin = 0, end = 0;
 };
@@ -151,10 +153,76 @@ Result<LoadedImage> load_pe_impl(std::shared_ptr<const ByteStorage> storage,
         metadata.format=pe64?"PE32+":"PE32";
         metadata.pe.emplace();
         metadata.machine=machine;
+        PeHeaderMetadata header_metadata;
+        header_metadata.timestamp = r.integer<std::uint32_t>(coff+4,"COFF timestamp");
+        header_metadata.characteristics = r.integer<std::uint16_t>(coff+18,"COFF characteristics");
+        header_metadata.coff_timestamp_source = {coff+4};
+        header_metadata.coff_characteristics_source = {coff+18};
+        header_metadata.optional_header_source = {optional};
+        header_metadata.linker_major = r.integer<std::uint8_t>(optional+2,"linker major version");
+        header_metadata.linker_minor = r.integer<std::uint8_t>(optional+3,"linker minor version");
+        header_metadata.os_major = r.integer<std::uint16_t>(optional+40,"OS major version");
+        header_metadata.os_minor = r.integer<std::uint16_t>(optional+42,"OS minor version");
+        header_metadata.image_major = r.integer<std::uint16_t>(optional+44,"image major version");
+        header_metadata.image_minor = r.integer<std::uint16_t>(optional+46,"image minor version");
+        header_metadata.subsystem_major = r.integer<std::uint16_t>(optional+48,"subsystem major version");
+        header_metadata.subsystem_minor = r.integer<std::uint16_t>(optional+50,"subsystem minor version");
+        header_metadata.win32_version_value = r.integer<std::uint32_t>(optional+52,"Win32 version value");
+        header_metadata.dll_characteristics = r.integer<std::uint16_t>(optional+70,"DLL characteristics");
+        if (pe64) {
+            header_metadata.stack_reserve = r.integer<std::uint64_t>(optional+72,"stack reserve");
+            header_metadata.stack_commit = r.integer<std::uint64_t>(optional+80,"stack commit");
+            header_metadata.heap_reserve = r.integer<std::uint64_t>(optional+88,"heap reserve");
+            header_metadata.heap_commit = r.integer<std::uint64_t>(optional+96,"heap commit");
+            header_metadata.loader_flags = r.integer<std::uint32_t>(optional+104,"loader flags");
+            header_metadata.number_of_rva_and_sizes = r.integer<std::uint32_t>(optional+108,"directory count");
+        } else {
+            header_metadata.stack_reserve = r.integer<std::uint32_t>(optional+72,"stack reserve");
+            header_metadata.stack_commit = r.integer<std::uint32_t>(optional+76,"stack commit");
+            header_metadata.heap_reserve = r.integer<std::uint32_t>(optional+80,"heap reserve");
+            header_metadata.heap_commit = r.integer<std::uint32_t>(optional+84,"heap commit");
+            header_metadata.loader_flags = r.integer<std::uint32_t>(optional+88,"loader flags");
+            header_metadata.number_of_rva_and_sizes = r.integer<std::uint32_t>(optional+92,"directory count");
+        }
+        metadata.pe->headers = header_metadata;
         metadata.preferred_base=pe64?r.integer<std::uint64_t>(optional+24,"image base"):r.integer<std::uint32_t>(optional+28,"image base");
         metadata.image_size=r.integer<std::uint32_t>(optional+56,"image size");
         metadata.header_size=r.integer<std::uint32_t>(optional+60,"header size");
         metadata.subsystem=r.integer<std::uint16_t>(optional+68,"subsystem");
+        PeImageChecksum image_checksum;
+        image_checksum.stored=r.integer<std::uint32_t>(optional+64,"checksum");
+        image_checksum.file_size=storage->size();
+        image_checksum.source_file_offset={optional+64};
+        if (image_checksum.file_size > max_pe_checksum_bytes) {
+            image_checksum.status=PeImageChecksumStatus::not_checked_limit;
+        } else {
+            std::uint64_t sum=0;
+            std::optional<std::uint8_t> low_byte;
+            for (std::uint64_t offset=0; offset<image_checksum.file_size;) {
+                canceled(stop);
+                const auto amount=static_cast<std::size_t>(std::min<std::uint64_t>(
+                    pe_checksum_chunk_size,image_checksum.file_size-offset));
+                const auto chunk=r.bytes(offset,amount,"checksum input");
+                for (std::size_t i=0;i<amount;++i) {
+                    const auto file_offset=offset+i;
+                    auto value=std::to_integer<std::uint8_t>(chunk.bytes[i]);
+                    if (file_offset>=optional+64 && file_offset<optional+68) value=0;
+                    if (!low_byte) low_byte=value;
+                    else {
+                        sum += std::uint16_t(*low_byte) | (std::uint16_t(value)<<8);
+                        low_byte.reset();
+                    }
+                }
+                offset+=amount;
+            }
+            if (low_byte) sum += *low_byte;
+            while (sum>>16) sum=(sum&0xffffu)+(sum>>16);
+            image_checksum.computed=static_cast<std::uint32_t>(sum+image_checksum.file_size);
+            image_checksum.status=image_checksum.stored==0 ? PeImageChecksumStatus::unset :
+                image_checksum.stored==*image_checksum.computed ? PeImageChecksumStatus::matches :
+                                                                    PeImageChecksumStatus::mismatch;
+        }
+        metadata.pe->image_checksum=image_checksum;
         const auto section_alignment=r.integer<std::uint32_t>(optional+32,"section alignment");
         const auto file_alignment=r.integer<std::uint32_t>(optional+36,"file alignment");
         auto power_two=[](std::uint32_t value) {return value!=0 && (value&(value-1))==0;};
@@ -164,7 +232,7 @@ Result<LoadedImage> load_pe_impl(std::shared_ptr<const ByteStorage> storage,
         (void)add(metadata.preferred_base,metadata.image_size,"image extent");
         const auto entry=r.integer<std::uint32_t>(optional+16,"entry RVA");
         require(entry==0 || entry<metadata.image_size,"PE entry exceeds image");
-        const auto directories=r.integer<std::uint32_t>(optional+(pe64?108:92),"directory count");
+        const auto directories=header_metadata.number_of_rva_and_sizes;
         require(directories<=(optional_size-directory_offset)/8,"PE directories exceed optional header");
         for (std::uint32_t i=0;i<directories;++i) {
             canceled(stop);
@@ -183,6 +251,8 @@ Result<LoadedImage> load_pe_impl(std::shared_ptr<const ByteStorage> storage,
             layout.architecture=Architecture::arm;
             layout.mode=machine==0x1c4?ExecutionMode::thumb:ExecutionMode::a32;
         }
+        std::vector<Arm64xRange> section_rva_ranges{{0, metadata.header_size}};
+        std::vector<Arm64xRange> section_file_ranges{{0, metadata.header_size}};
         layout.segments.push_back({"headers",{{0},metadata.preferred_base},metadata.header_size,{0},metadata.header_size,true,false,false});
         for (std::uint32_t i=0;i<count;++i) {
             canceled(stop);
@@ -195,16 +265,36 @@ Result<LoadedImage> load_pe_impl(std::shared_ptr<const ByteStorage> storage,
             const auto extent=std::max(section.virtual_size,section.raw_size);
             require(add(section.rva.value,extent,"section virtual extent")<=metadata.image_size,"PE section exceeds image size");
             require(section.rva.value%section_alignment==0,"Unaligned PE section RVA");
-            if (section.raw_size) require(section.raw_position.value%file_alignment==0 && section.raw_size%file_alignment==0,"Unaligned PE raw section");
+            if (extent)
+                section_rva_ranges.push_back({section.rva.value, std::uint64_t{section.rva.value} + extent});
+            if (section.raw_size) {
+                require(section.raw_position.value%file_alignment==0 && section.raw_size%file_alignment==0,"Unaligned PE raw section");
+                require(section.raw_position.value <= storage->size() &&
+                        section.raw_size <= storage->size() - section.raw_position.value,
+                        "PE raw section exceeds input file");
+                section_file_ranges.push_back({section.raw_position.value,
+                    std::uint64_t{section.raw_position.value} + section.raw_size});
+            }
             layout.segments.push_back({name,{{0},add(metadata.preferred_base,section.rva.value,"section VA")},extent,
                 {section.raw_size?section.raw_position.value:0},section.raw_size,(section.characteristics&0x40000000)!=0,
                 (section.characteristics&0x80000000)!=0,(section.characteristics&0x20000000)!=0});
             metadata.sections.push_back(std::move(section));
         }
+        require(!overlaps(std::move(section_rva_ranges)), "PE section virtual ranges overlap each other or headers");
+        require(!overlaps(std::move(section_file_ranges)), "PE section raw ranges overlap each other or headers");
         if (entry) layout.entries.push_back({{0},add(metadata.preferred_base,entry,"entry VA")});
         auto image=Image::create(std::move(storage),std::move(layout));
         if (!image) return image.error();
         LoadedImage loaded{image.value(),std::move(metadata),{},true};
+        if (loaded.metadata.pe->image_checksum->status==PeImageChecksumStatus::mismatch) {
+            loaded.metadata_complete=false;
+            loaded.diagnostics.push_back({DiagnosticSeverity::warning,
+                "PE optional-header checksum does not match the bounded file calculation",{}});
+        } else if (loaded.metadata.pe->image_checksum->status==PeImageChecksumStatus::not_checked_limit) {
+            loaded.metadata_complete=false;
+            loaded.diagnostics.push_back({DiagnosticSeverity::warning,
+                "PE optional-header checksum calculation skipped: 512 MiB work limit exceeded",{}});
+        }
         auto coff_symbols=read_pe_coff_symbols(loaded,stop);
         if (!coff_symbols) {
             if (coff_symbols.error().code==ErrorCode::canceled) return coff_symbols.error();
@@ -221,6 +311,12 @@ Result<LoadedImage> load_pe_impl(std::shared_ptr<const ByteStorage> storage,
                 symbol.storage_class=source_symbol.storage_class;
                 symbol.auxiliary_count=static_cast<std::uint8_t>(source_symbol.auxiliary_records.size());
                 symbol.source_file_offset=source_symbol.source_file_offset;
+                symbol.function_size=source_symbol.function_size;
+                symbol.function_aux_file_offset=source_symbol.function_aux_file_offset;
+                symbol.section_definition=source_symbol.section_definition;
+                symbol.weak_external_tag_index=source_symbol.weak_external_tag_index;
+                symbol.weak_external_search=source_symbol.weak_external_search;
+                symbol.weak_external_target_name=source_symbol.weak_external_target_name;
                 if (source_symbol.section_rva) {
                     const auto address=checked_add(loaded.metadata.preferred_base,*source_symbol.section_rva);
                     if (address) symbol.address=Address{{0},address.value()};
@@ -245,13 +341,13 @@ Result<LoadedImage> load_pe_impl(std::shared_ptr<const ByteStorage> storage,
                     loaded.metadata.pe->global_pointer_rva=directory.location;
                     parsed=std::size_t{0};
                 }
-            } else if (directory.location==0 || directory.size==0)
+            } else if (directory.index==4)
+                parsed=read_certificates(*loaded.image,directory,loaded.metadata,stop);
+            else if (directory.location==0 || directory.size==0)
                 parsed=Error{ErrorCode::malformed,"Directory has an empty location or size"};
             else if (directory.file_offset) {
                 const auto view=loaded.image->storage()->read_at({directory.location},directory.size);
                 if (!view) parsed=Error{ErrorCode::malformed,"Certificate file range exceeds input"};
-                else if (directory.index==4)
-                    parsed=read_certificates(*loaded.image,directory,loaded.metadata,stop);
             } else if (directory_end>loaded.metadata.image_size)
                 parsed=Error{ErrorCode::malformed,"Directory RVA range exceeds image"};
             else if (directory.index==1) parsed=read_imports(*loaded.image,directory,pe64,loaded.metadata,stop);
@@ -315,27 +411,16 @@ Result<LoadedImage> load_pe_impl(std::shared_ptr<const ByteStorage> storage,
                     ErrorCode::unsupported);
             auto rebased = apply_pe_relocations(*loaded.image, loaded.metadata, requested_base, stop);
             if (!rebased) return rebased.error();
-            auto overlay = make_overlay(original, rebased.value().patches);
+            auto overlay = make_overlay(storage, rebased.value().patches);
             if (!overlay) return overlay.error();
             auto moved = Image::create(std::move(overlay.value()), std::move(rebased.value().layout));
             if (!moved) return moved.error();
             loaded.image = std::move(moved.value());
         }
-        loaded.metadata_reads=tracking.value()->reads();
-        loaded.metadata_reads_complete=true;
-        auto published_storage = requested_base == loaded.metadata.preferred_base
-            ? original : loaded.image->storage();
-        auto published=Image::create(std::move(published_storage),loaded.image->layout());
-        if(!published)return published.error();
-        loaded.image=std::move(published.value());
-        loaded.pe_native_image = loaded.image;
         if (loaded.metadata.pe && loaded.metadata.pe->load_configuration &&
             loaded.metadata.pe->load_configuration->dynamic_value_relocations) {
-            // ARM64X effective-view construction reads additional target bytes
-            // after the parsed image has been rebound to its source storage.
-            // Until those reads are routed through TrackingStorage, do not
-            // certify the earlier read snapshot as exhaustive.
-            loaded.metadata_reads_complete = false;
+            // Build this view while the image still uses TrackingStorage, so
+            // each fixup's implicit target-byte dependency is captured.
             auto &dynamic = *loaded.metadata.pe->load_configuration->dynamic_value_relocations;
             auto arm64x = build_arm64x_view(*loaded.image, loaded.metadata, dynamic, requested_base, stop);
             if (arm64x) {
@@ -358,6 +443,14 @@ Result<LoadedImage> load_pe_impl(std::shared_ptr<const ByteStorage> storage,
                     "PE ARM64X effective view was not created: " + arm64x.error().message, {}});
             }
         }
+        loaded.metadata_reads=tracking.value()->reads();
+        loaded.metadata_reads_complete=true;
+        auto published_storage = requested_base == loaded.metadata.preferred_base
+            ? original : loaded.image->storage();
+        auto published=Image::create(std::move(published_storage),loaded.image->layout());
+        if(!published)return published.error();
+        loaded.image=std::move(published.value());
+        loaded.pe_native_image = loaded.image;
         return loaded;
     } catch (const Failure& failure) {return failure.error;}
       catch (const std::bad_alloc&) {return Error{ErrorCode::resource_limit,"Cannot allocate PE image metadata"};}

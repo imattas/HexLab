@@ -1,6 +1,12 @@
 ﻿add_library(hexlab_desktop_components STATIC main_frame.cpp document_controller.cpp session_controller.cpp session_search.cpp session_listing.cpp session_graph.cpp graph_canvas.cpp graph_view.cpp reference_view.cpp document_tabs.cpp project_actions.cpp reference_dialog.cpp close_coordinator.cpp project_view.cpp edit_dialogs.cpp search_view.cpp data_views.cpp open_dialogs.cpp type_symbols_view.cpp type_editor.cpp debugger_view.cpp debugger_locals.cpp plugins_view.cpp)
+if(MSVC)
+  # main_frame.cpp aggregates most desktop actions and can exceed COFF's
+  # default section-count limit as the UI grows.
+  set_source_files_properties(main_frame.cpp PROPERTIES COMPILE_OPTIONS /bigobj)
+endif()
 target_include_directories(hexlab_desktop_components PRIVATE "${PROJECT_SOURCE_DIR}/libs/workspace/src")
 target_sources(hexlab_desktop_components PRIVATE string_view.cpp analysis_issues_view.cpp)
+target_sources(hexlab_desktop_components PRIVATE automatic_backups.cpp)
 target_sources(hexlab_desktop_components PRIVATE minidump_view.cpp)
 target_sources(hexlab_desktop_components PRIVATE macho_view.cpp macho_objc_view.cpp pseudocode_view.cpp source_view.cpp pe_view.cpp compare_view.cpp compare_adapter.cpp archive_view.cpp history_view.cpp)
 if(BUILD_TESTING)
@@ -54,11 +60,22 @@ foreach(_target IN ITEMS wxbase wxcore wxaui)
     set_target_properties(${_target} PROPERTIES INSTALL_RPATH "${_hexlab_wx_install_rpath}")
   endif()
 endforeach()
-install(TARGETS wxbase wxcore wxaui
-  RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
-  LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"
-  ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}")
-install(TARGETS hexlab RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
+if(WIN32)
+  install(TARGETS wxbase wxcore wxaui
+    RUNTIME_DEPENDENCY_SET hexlab_windows_runtime_dependencies
+    RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
+    LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+    ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}")
+  install(TARGETS hexlab
+    RUNTIME_DEPENDENCY_SET hexlab_windows_runtime_dependencies
+    RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
+else()
+  install(TARGETS wxbase wxcore wxaui
+    RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
+    LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+    ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}")
+  install(TARGETS hexlab RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
+endif()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   # Desktop environments discover the application from the standard XDG

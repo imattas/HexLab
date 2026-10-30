@@ -47,8 +47,7 @@ static int32_t decode_semantic_v2(void* context, uint64_t address, const uint8_t
 
 static int32_t start(const HexLabHostApi* host, void** instance) {
     if (instance) *instance = NULL;
-    if (!host || host->struct_size < offsetof(HexLabHostApi, register_processor_extension) +
-                                   sizeof(host->register_processor_extension) ||
+    if (!HEXLAB_PLUGIN_HAS_FIELD(host, HexLabHostApi, register_processor_extension) ||
         !host->register_processor_extension) return -1;
     HexLabProcessorExtension extension = {0};
     extension.struct_size = (uint32_t)sizeof(extension);

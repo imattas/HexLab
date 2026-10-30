@@ -25,9 +25,43 @@ void three_registers(Instruction &instruction, Opcode opcode, std::uint32_t word
     if (vector_bits == 64)
         instruction.register_writes.push_back(vreg(word & 31, 128));
 }
+
+void scalar_three_registers(Instruction &instruction, Opcode opcode, std::uint32_t word,
+                            unsigned element_bits) {
+    const auto destination = vreg(word & 31, element_bits);
+    const auto left = vreg((word >> 5) & 31, element_bits);
+    const auto right = vreg((word >> 16) & 31, element_bits);
+    instruction.opcode = opcode;
+    instruction.vector_bits = static_cast<std::uint16_t>(element_bits);
+    instruction.vector_element_bits = static_cast<std::uint16_t>(element_bits);
+    operand(instruction, destination, OperandAccess::write);
+    operand(instruction, left, OperandAccess::read);
+    operand(instruction, right, OperandAccess::read);
+    // Scalar FP instructions update the architectural V register; FPCR merge
+    // behavior means the untouched upper bits may be preserved or cleared.
+    instruction.register_writes.push_back(vreg(word & 31, 128));
+}
 } // namespace
 
 bool simd(Instruction &instruction, std::uint32_t word) {
+    // Scalar FP three-register arithmetic, restricted to the baseline S/D
+    // forms. Ftype 2 is reserved and ftype 3 is half precision, which this
+    // decoder does not feature-gate.
+    const auto scalar_fp_class = word & 0xff20fc00u;
+    std::optional<Opcode> scalar_fp_opcode;
+    if (scalar_fp_class == 0x1e202800u) scalar_fp_opcode = Opcode::a64_fadd;
+    else if (scalar_fp_class == 0x1e203800u) scalar_fp_opcode = Opcode::a64_fsub;
+    else if (scalar_fp_class == 0x1e200800u) scalar_fp_opcode = Opcode::a64_fmul;
+    else if (scalar_fp_class == 0x1e201800u) scalar_fp_opcode = Opcode::a64_fdiv;
+    else if (scalar_fp_class == 0x1e204800u) scalar_fp_opcode = Opcode::a64_fmax;
+    else if (scalar_fp_class == 0x1e205800u) scalar_fp_opcode = Opcode::a64_fmin;
+    if (scalar_fp_opcode) {
+        const auto type = (word >> 22) & 3;
+        if (type > 1) return false;
+        scalar_three_registers(instruction, *scalar_fp_opcode, word, type == 0 ? 32 : 64);
+        return true;
+    }
+
     const unsigned vector_bits = (word & (1u << 30)) ? 128 : 64;
     const unsigned size = (word >> 22) & 3;
 
@@ -54,6 +88,20 @@ bool simd(Instruction &instruction, std::uint32_t word) {
         const unsigned element_bits = 8u << size;
         three_registers(instruction, (word & (1u << 29)) ? Opcode::a64_vsub : Opcode::a64_vadd,
                         word, vector_bits, element_bits);
+        return true;
+    }
+
+    // Signed/unsigned maximum and minimum (vector), integer three-same.
+    // Bits 23:22 select 8/16/32-bit lanes; size 11 is reserved.
+    const auto minmax_class = word & 0xbf20fc00u;
+    std::optional<Opcode> minmax_opcode;
+    if (minmax_class == 0x0e206400u) minmax_opcode = Opcode::a64_vsmax;
+    else if (minmax_class == 0x0e206c00u) minmax_opcode = Opcode::a64_vsmin;
+    else if (minmax_class == 0x2e206400u) minmax_opcode = Opcode::a64_vumax;
+    else if (minmax_class == 0x2e206c00u) minmax_opcode = Opcode::a64_vumin;
+    if (minmax_opcode) {
+        if (size == 3) return false;
+        three_registers(instruction, *minmax_opcode, word, vector_bits, 8u << size);
         return true;
     }
 

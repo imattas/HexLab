@@ -231,7 +231,8 @@ std::optional<TypeEditorResult> show_type_editor(
     auto *convention = new wxChoice(&dialog, wxID_ANY);
     convention->SetName("type-editor-convention");
     for (const auto *label : {"Platform default", "cdecl", "stdcall", "fastcall", "thiscall",
-                              "vectorcall", "sysv_abi", "ms_abi", "aapcs64"})
+                              "vectorcall", "sysv_abi", "ms_abi", "aapcs64", "aapcs32",
+                              "mips_n64", "mips_n32", "aapcs32_vfp"})
         convention->Append(label);
     auto *details_label = new wxStaticText(&dialog, wxID_ANY, "Definition");
     auto *details = new wxTextCtrl(&dialog, wxID_ANY, {}, wxDefaultPosition, dialog.FromDIP(wxSize(-1, 190)),
@@ -478,15 +479,9 @@ std::optional<TypeEditorResult> show_type_editor(
             }
             if (!return_type) problem = "Choose a function return type.";
             if (problem.empty()) {
-                static constexpr types::FunctionConvention conventions[] = {
-                    types::FunctionConvention::platform_default, types::FunctionConvention::c_decl,
-                    types::FunctionConvention::stdcall, types::FunctionConvention::fastcall,
-                    types::FunctionConvention::thiscall, types::FunctionConvention::vectorcall,
-                    types::FunctionConvention::sysv_abi, types::FunctionConvention::ms_abi,
-                    types::FunctionConvention::aapcs64};
-                const auto convention_index = std::clamp(convention->GetSelection(), 0, 8);
+                const auto convention_index = std::clamp(convention->GetSelection(), 0, 12);
                 auto value = types::Type::function(return_type, std::move(parameters), variadic->GetValue(),
-                                                   conventions[convention_index]);
+                                                   static_cast<types::FunctionConvention>(convention_index));
                 if (value) made = value.value(); else problem = value.error().message;
             }
         } else {

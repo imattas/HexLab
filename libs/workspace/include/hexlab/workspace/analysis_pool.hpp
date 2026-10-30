@@ -16,7 +16,12 @@ struct AnalysisTicket {
 };
 struct AnalysisSubmission {AnalysisTicket ticket;std::shared_future<Result<AnalysisPayload>> result;};
 struct AnalysisCompletion {AnalysisTicket ticket;std::shared_future<Result<AnalysisPayload>> result;};
-struct PoolLimits {std::size_t max_sessions=128;};
+struct PoolLimits {
+    std::size_t max_sessions=128;
+    // Number of independent session jobs allowed to run at once. A session
+    // still owns at most one active job, regardless of this pool-wide limit.
+    std::size_t max_workers=2;
+};
 struct PoolStatistics {std::size_t workers=0,running=0,pending=0,ready=0,sessions=0;};
 // Read-only jobs capture immutable engine inputs, never windows or SQL writers.
 // A document has one active job, one replaceable pending job and one unread

@@ -124,4 +124,92 @@ std::optional<Statement> lift_riscv_fp_conversion(const Instruction &instruction
     }
     return Statement{std::move(effect)};
 }
+
+std::optional<Statement> lift_riscv_fstatus_csr(const Instruction &instruction,
+                                               std::span<const ExpressionPtr> operands) {
+    const auto op = instruction.opcode;
+    if (op < Opcode::rv_csrrw || op > Opcode::rv_csrrci) return {};
+    if (instruction.operands.size() != 3 || operands.size() != 3) return {};
+    const auto *destination = std::get_if<RegisterOperand>(&instruction.operands[0]);
+    const auto *csr = std::get_if<ImmediateOperand>(&instruction.operands[1]);
+    if (!destination || destination->bank != RegisterBank::riscv_gpr ||
+        (destination->width != 32 && destination->width != 64) || !csr || csr->is_signed ||
+        csr->encoded_width != 12 || (csr->value != 0x001 && csr->value != 0x002 && csr->value != 0x003))
+        return {};
+
+    const bool immediate_source = op >= Opcode::rv_csrrwi;
+    const bool write_only = op == Opcode::rv_csrrw || op == Opcode::rv_csrrwi;
+    const bool set_bits = op == Opcode::rv_csrrs || op == Opcode::rv_csrrsi;
+    const bool clear_bits = op == Opcode::rv_csrrc || op == Opcode::rv_csrrci;
+    if (!write_only && !set_bits && !clear_bits) return {};
+    if (!instruction.csr_read && !write_only) return {};
+    const auto *source_register = std::get_if<RegisterOperand>(&instruction.operands[2]);
+    const auto *source_immediate = std::get_if<ImmediateOperand>(&instruction.operands[2]);
+    if (immediate_source) {
+        if (!source_immediate || source_immediate->is_signed || source_immediate->encoded_width != 5 ||
+            source_immediate->value > 31) return {};
+    } else if (!source_register || source_register->bank != RegisterBank::riscv_gpr ||
+               source_register->width != destination->width) {
+        return {};
+    }
+    const auto source_index = 2u;
+    if (!operands[source_index] || operands[source_index]->type.kind != TypeKind::integer)
+        return {};
+    auto source = typed(operands[source_index], integer(destination->width));
+
+    const RegisterOperand flags_register{RegisterBank::riscv_fstatus, 0, 5, false};
+    const RegisterOperand rounding_register{RegisterBank::riscv_fstatus, 1, 3, false};
+    const auto flags = [&] { return status(0, 5); };
+    const auto rounding = [&] { return status(1, 3); };
+    const auto zero_extend = [&](ExpressionPtr value, std::uint16_t width) {
+        return unary("zext", std::move(value), integer(width));
+    };
+    const auto compose_fcsr = [&] {
+        auto high = binary("shl", zero_extend(rounding(), 8), constant(5, 8), integer(8));
+        auto low = zero_extend(flags(), 8);
+        return binary("or", std::move(high), std::move(low), integer(8));
+    };
+    ExpressionPtr old_csr;
+    if (csr->value == 0x001) old_csr = flags();
+    else if (csr->value == 0x002) old_csr = rounding();
+    else old_csr = compose_fcsr();
+
+    Intrinsic effect{"riscv.csr.fstatus", {source}, IntrinsicMemoryEffect::none};
+    if (instruction.csr_read && destination->index != 0) {
+        effect.register_writes.push_back(*destination);
+        effect.register_output_values.push_back(zero_extend(old_csr, destination->width));
+    }
+    if (instruction.csr_write) {
+        const std::uint16_t state_width = csr->value == 0x001 ? 5 : csr->value == 0x002 ? 3 : 8;
+        const auto mask = (UINT64_C(1) << state_width) - 1;
+        const auto masked_source = binary("and", source, constant(mask, destination->width),
+                                          integer(destination->width));
+        const auto source_bits = typed(std::move(masked_source), integer(state_width));
+        const auto update = [&](ExpressionPtr old_value) {
+            if (write_only) return source_bits;
+            if (set_bits) return binary("or", std::move(old_value), source_bits, integer(state_width));
+            auto selected = binary("and", source_bits, constant(mask, state_width), integer(state_width));
+            auto inverse = binary("xor", std::move(selected), constant(mask, state_width), integer(state_width));
+            return binary("and", std::move(old_value), std::move(inverse), integer(state_width));
+        };
+        if (csr->value == 0x001) {
+            effect.register_writes.push_back(flags_register);
+            effect.register_output_values.push_back(update(flags()));
+        } else if (csr->value == 0x002) {
+            effect.register_writes.push_back(rounding_register);
+            effect.register_output_values.push_back(update(rounding()));
+        } else {
+            auto updated_fcsr = update(compose_fcsr());
+            effect.register_writes.push_back(flags_register);
+            effect.register_output_values.push_back(typed(
+                binary("and", updated_fcsr, constant(0x1f, 8), integer(8)), integer(5)));
+            effect.register_writes.push_back(rounding_register);
+            auto shifted = binary("shr", std::move(updated_fcsr), constant(5, 8), integer(8));
+            effect.register_output_values.push_back(typed(
+                binary("and", std::move(shifted), constant(7, 8), integer(8)), integer(3)));
+        }
+    }
+    if (effect.register_writes.size() != effect.register_output_values.size()) return {};
+    return Statement{std::move(effect)};
+}
 } // namespace hexlab::decompiler

@@ -557,6 +557,104 @@ std::optional<PeStringTable> parse_string_table(const ImageReader &reader, const
         table.complete = false;
     return table;
 }
+
+std::optional<PeGroupIcon> parse_group_icon(const ImageReader &reader, const PeResource &resource,
+                                           std::uint64_t &remaining_budget) {
+    if (!resource.size) return {};
+    constexpr std::uint64_t maximum_size = 6 + 14 * 256;
+    const auto bounded_size = std::min<std::uint64_t>({resource.size, maximum_size, remaining_budget});
+    if (!bounded_size) return {};
+    remaining_budget -= bounded_size;
+    const auto bytes = reader.bytes(resource.data_rva, static_cast<std::size_t>(bounded_size));
+    PeGroupIcon result;
+    result.source = {resource.data_entry.index, reader.sources(resource.data_rva, bounded_size)};
+    const auto u16 = [&](std::size_t at) -> std::optional<std::uint16_t> {
+        if (at > bytes.size() || bytes.size() - at < 2) return {};
+        return static_cast<std::uint16_t>(std::to_integer<std::uint8_t>(bytes[at]) |
+            (std::uint16_t{std::to_integer<std::uint8_t>(bytes[at + 1])} << 8));
+    };
+    const auto u32 = [&](std::size_t at) -> std::optional<std::uint32_t> {
+        if (at > bytes.size() || bytes.size() - at < 4) return {};
+        return std::to_integer<std::uint8_t>(bytes[at]) |
+            (std::uint32_t{std::to_integer<std::uint8_t>(bytes[at + 1])} << 8) |
+            (std::uint32_t{std::to_integer<std::uint8_t>(bytes[at + 2])} << 16) |
+            (std::uint32_t{std::to_integer<std::uint8_t>(bytes[at + 3])} << 24);
+    };
+    const auto reserved = u16(0), type = u16(2), count = u16(4);
+    if (!reserved || !type || !count || *reserved != 0 || *type != 1 || !*count || *count > 256) {
+        result.complete = false;
+        return result;
+    }
+    const auto required = std::uint64_t{6} + std::uint64_t{*count} * 14;
+    if (resource.size < required || bounded_size < required) result.complete = false;
+    const auto available = bytes.size() < 6 ? 0 : std::min<std::size_t>(*count, (bytes.size() - 6) / 14);
+    result.entries.reserve(available);
+    for (std::size_t index = 0; index < available; ++index) {
+        const auto at = 6 + index * 14;
+        PeGroupIconEntry entry;
+        entry.width = std::to_integer<std::uint8_t>(bytes[at]);
+        entry.height = std::to_integer<std::uint8_t>(bytes[at + 1]);
+        entry.color_count = std::to_integer<std::uint8_t>(bytes[at + 2]);
+        if (bytes[at + 3] != std::byte{0}) result.complete = false;
+        entry.planes = *u16(at + 4);
+        entry.bit_count = *u16(at + 6);
+        entry.bytes_in_resource = *u32(at + 8);
+        entry.icon_id = *u16(at + 12);
+        entry.source = {resource.data_entry.index, reader.sources(resource.data_rva + at, 14)};
+        if (!entry.icon_id || !entry.bytes_in_resource) result.complete = false;
+        result.entries.push_back(std::move(entry));
+    }
+    if (available != *count) result.complete = false;
+    return result;
+}
+
+std::optional<PeGroupCursor> parse_group_cursor(const ImageReader &reader, const PeResource &resource,
+                                                std::uint64_t &remaining_budget) {
+    if (!resource.size) return {};
+    constexpr std::uint64_t maximum_size = 6 + 14 * 256;
+    const auto bounded_size = std::min<std::uint64_t>({resource.size, maximum_size, remaining_budget});
+    if (!bounded_size) return {};
+    remaining_budget -= bounded_size;
+    const auto bytes = reader.bytes(resource.data_rva, static_cast<std::size_t>(bounded_size));
+    PeGroupCursor result;
+    result.source = {resource.data_entry.index, reader.sources(resource.data_rva, bounded_size)};
+    const auto u16 = [&](std::size_t at) -> std::optional<std::uint16_t> {
+        if (at > bytes.size() || bytes.size() - at < 2) return {};
+        return static_cast<std::uint16_t>(std::to_integer<std::uint8_t>(bytes[at]) |
+            (std::uint16_t{std::to_integer<std::uint8_t>(bytes[at + 1])} << 8));
+    };
+    const auto u32 = [&](std::size_t at) -> std::optional<std::uint32_t> {
+        if (at > bytes.size() || bytes.size() - at < 4) return {};
+        return std::to_integer<std::uint8_t>(bytes[at]) |
+            (std::uint32_t{std::to_integer<std::uint8_t>(bytes[at + 1])} << 8) |
+            (std::uint32_t{std::to_integer<std::uint8_t>(bytes[at + 2])} << 16) |
+            (std::uint32_t{std::to_integer<std::uint8_t>(bytes[at + 3])} << 24);
+    };
+    const auto reserved = u16(0), type = u16(2), count = u16(4);
+    if (!reserved || !type || !count || *reserved != 0 || *type != 2 || !*count || *count > 256) {
+        result.complete = false;
+        return result;
+    }
+    const auto required = std::uint64_t{6} + std::uint64_t{*count} * 14;
+    if (resource.size < required || bounded_size < required) result.complete = false;
+    const auto available = bytes.size() < 6 ? 0 : std::min<std::size_t>(*count, (bytes.size() - 6) / 14);
+    result.entries.reserve(available);
+    for (std::size_t index = 0; index < available; ++index) {
+        const auto at = 6 + index * 14;
+        PeGroupCursorEntry entry;
+        entry.width = *u16(at);
+        entry.height = *u16(at + 2);
+        entry.planes = *u16(at + 4);
+        entry.bit_count = *u16(at + 6);
+        entry.bytes_in_resource = *u32(at + 8);
+        entry.cursor_id = *u16(at + 12);
+        entry.source = {resource.data_entry.index, reader.sources(resource.data_rva + at, 14)};
+        if (!entry.cursor_id || !entry.bytes_in_resource) result.complete = false;
+        result.entries.push_back(std::move(entry));
+    }
+    if (available != *count) result.complete = false;
+    return result;
+}
 }
 
 Result<std::size_t> read_exports(const Image& image,const Directory& directory,ImageMetadata& metadata,std::stop_token stop) {
@@ -635,6 +733,8 @@ Result<std::size_t> read_resources(const Image& image,const Directory& directory
         std::uint64_t version_parse_budget = 16u * 1024u * 1024u;
         std::uint64_t manifest_parse_budget = 16u * 1024u * 1024u;
         std::uint64_t string_parse_budget = 16u * 1024u * 1024u;
+        std::uint64_t group_icon_parse_budget = 4u * 1024u * 1024u;
+        std::uint64_t group_cursor_parse_budget = 4u * 1024u * 1024u;
         std::size_t string_row_budget = 65536;
         std::vector<PeResourceIdentifier> path;
         std::set<std::uint32_t> active;
@@ -714,12 +814,57 @@ Result<std::size_t> read_resources(const Image& image,const Directory& directory
                         resource.manifest_info = parse_manifest(r, resource, manifest_parse_budget);
                     else if (resource.type.id == 6)
                         resource.string_table = parse_string_table(r, resource, string_parse_budget, string_row_budget);
+                    else if (resource.type.id == 14)
+                        resource.group_icon = parse_group_icon(r, resource, group_icon_parse_budget);
+                    else if (resource.type.id == 12)
+                        resource.group_cursor = parse_group_cursor(r, resource, group_cursor_parse_budget);
                     metadata.pe->resources.push_back(std::move(resource));
                 }
             }
             active.erase(relative);
         };
         walk(0,0);
+        for (auto &group : metadata.pe->resources) {
+            if (!group.group_icon) continue;
+            for (auto &entry : group.group_icon->entries) {
+                std::optional<std::uint32_t> match;
+                bool ambiguous = false;
+                for (std::size_t index = 0; index < metadata.pe->resources.size(); ++index) {
+                    const auto &icon = metadata.pe->resources[index];
+                    const bool same_language = icon.language.id == group.language.id &&
+                                               icon.language.name == group.language.name;
+                    if (icon.type.id != 3 || icon.name.id != entry.icon_id || !same_language)
+                        continue;
+                    if (match) { ambiguous = true; break; }
+                    match = static_cast<std::uint32_t>(index);
+                }
+                if (match && !ambiguous) entry.icon_resource_index = *match;
+            }
+        }
+        for (auto &group : metadata.pe->resources) {
+            if (!group.group_cursor) continue;
+            for (auto &entry : group.group_cursor->entries) {
+                std::optional<std::uint32_t> match;
+                bool ambiguous = false;
+                for (std::size_t index = 0; index < metadata.pe->resources.size(); ++index) {
+                    const auto &cursor = metadata.pe->resources[index];
+                    const bool same_language = cursor.language.id == group.language.id &&
+                                               cursor.language.name == group.language.name;
+                    if (cursor.type.id != 1 || cursor.name.id != entry.cursor_id || !same_language)
+                        continue;
+                    if (match) { ambiguous = true; break; }
+                    match = static_cast<std::uint32_t>(index);
+                }
+                if (match && !ambiguous) {
+                    entry.cursor_resource_index = *match;
+                    entry.resource_size_matches =
+                        metadata.pe->resources[*match].size == entry.bytes_in_resource;
+                    if (!*entry.resource_size_matches) group.group_cursor->complete = false;
+                } else {
+                    group.group_cursor->complete = false;
+                }
+            }
+        }
         return total;
     });
 }

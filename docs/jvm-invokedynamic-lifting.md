@@ -11,6 +11,15 @@ retains the class-level `BootstrapMethods` attribute, including each method
 handle index and ordered argument indices, and validates all entries and
 bootstrap references.
 
+The loader also gates modern constant-pool forms by classfile version:
+`MethodHandle`, `MethodType`, and `InvokeDynamic` require version 51 or newer,
+`Module` and `Package` require 53 or newer, and `Dynamic` requires 55 or newer.
+Method-handle reference kinds are checked against special method names:
+`REF_newInvokeSpecial` must target `<init>`, while other invocation kinds may
+not target `<init>` or `<clinit>`. This is static classfile validation only;
+bootstrap methods and dynamic constants are not resolved or executed. These
+version and name constraints follow the [JVM Specification, Chapter 4](https://docs.oracle.com/javase/specs/jvms/se25/html/jvms-4.html).
+
 This represents the data flow of modern Java call sites such as string
 concatenation, lambdas, and method references without executing bootstrap code
 or pretending that the bootstrap target has been resolved. Call sites have no

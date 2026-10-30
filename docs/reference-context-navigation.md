@@ -2,6 +2,17 @@
 
 The References page shows context beside each source and target. For mapped locations the endpoint context includes the persisted or imported name, an exact-address comment when present, the containing recovered function (with an offset from its entry), and the mapped image segment. File-offset endpoints resolve their segment through the segment's file-backed range; external or unresolved targets keep their target description and show `-` for endpoint context.
 
+When an endpoint belongs to a recovered function, its context may also show
+`calls` and `called by` summaries. These use only resolved `call` references
+from the current, key-matched reference index; indirect calls without a proven
+address are omitted. A relationship is shown only when its address maps to an
+executable image segment and resolves to a recovered function. The inspection
+is bounded to eight function chunks, 128 indexed references per direction and
+chunk, and six displayed functions per direction. Repeated edges to the same
+function are collapsed. Consequently, large functions or incomplete reference
+pages can have omitted relationships; this is a compact context hint, not a
+complete call graph.
+
 Use **Navigate → Incoming References** (`Ctrl+Shift+X`) or **Outgoing References** (`Ctrl+Alt+X`) to open references for the current selection. The listing context menu offers the same operations for the row under the pointer, or the selected row when opened with the keyboard. Opening this menu or a reference set leaves the workspace address and history unchanged. When an interior-byte selection falls inside a decoded instruction in the current listing page, the query uses that instruction's start without changing the selected byte. Other address and file-offset queries keep their original domain.
 
 These commands open the References page with **Pin context** enabled. The origin label identifies the queried location. Clicking an incoming row navigates to its source; clicking an outgoing row navigates to its resolved target, or to its source when the target is external or unresolved. With the context pinned, navigation updates the listing, bytes, and other context views while preserving the reference origin, direction, page, and selected reference. Use **Go to source** or **Go to target** to visit either endpoint of the selected reference, and **Go to origin** to return to the queried location. Target navigation is disabled for external and unresolved targets; no numeric destination is invented. These navigation actions use the ordinary Back/Forward history.
@@ -25,3 +36,10 @@ Validation for this increment is limited to source-only MSVC compilation. No tes
 ## Relation details
 
 Selecting a row shows a bounded relation inspector below the table. It presents the stable reference identity, endpoints, kind, operand access and index, instruction or user identity, association, and provenance origin counts. Dataflow producer instruction IDs are capped at 16 in the display, with the remaining count summarized. The inspector follows the selected row as pages and analysis snapshots refresh; when no selected reference remains, it clears rather than showing stale metadata. Existing source, target, origin, and row navigation remain available.
+
+Choose **Copy selected TSV** to copy the selected reference as field/value rows
+for the document ID, stable reference ID, source, target, kind, and the current
+bounded relation-inspector details. Tabs, line breaks, carriage returns,
+backslashes, and other control bytes are escaped. The 64 KiB clipboard cap
+rejects oversized or invalid UTF-8 output; copying uses the retained reference
+page and does not issue a new query or navigate either endpoint.

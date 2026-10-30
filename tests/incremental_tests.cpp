@@ -152,6 +152,32 @@ void ownership_and_decision_tests(){
 void string_and_metadata_tests(){
     auto data=std::vector<std::byte>(140004,std::byte{'A'});data.back()=std::byte{0};data[0]=std::byte{0xc3};auto old=basis(data);auto next=patch(old,70000,bytes({0}));auto key=old.key;++key.byte_revision;FileRange range{{70000},1};auto plan=plan_invalidation(old,std::span(&range,1),old.decisions,key,{}).value();check(!plan.string_ranges.ranges().empty() && !plan.string_reason.empty(),"unbounded string run explicitly invalidates its established scan range");auto proposal=reanalyze(old,next,old.metadata,old.decisions,plan,key,{}).value();std::vector<StringRecord> ascii;for(auto& record:proposal.strings->records)if(record.encoding==StringEncoding::ascii)ascii.push_back(record);check(ascii.size()==2 && ascii[0].byte_length==69999 && ascii[1].file_offset.value==70001,"changed terminator splits long run across chunk boundaries");
     auto tracked=old;check(bool(tracked.metadata_reads.include({0},16)),"metadata read fixture recorded");FileRange header{{0},1};auto invalid=plan_invalidation(tracked,std::span(&header,1),tracked.decisions,key,{}).value();check(invalid.metadata_invalid && !invalid.full_reason.empty(),"metadata byte patch explicitly requests fresh mapping and full rebuild");
+    ImageMetadata rooted;rooted.exports.push_back({1,"before",Address{{0},0x1000},{}});
+    auto metadata_edit=basis(bytes({0x90,0x90,0xc3,0,0,0,0,0,0x11}),rooted);
+    check(bool(metadata_edit.metadata_reads.include({8},1)),"metadata edit fixture records its loader dependency");
+    metadata_edit.metadata_reads_complete=true;
+    auto after_metadata=std::make_shared<ImageMetadata>(*metadata_edit.metadata);
+    after_metadata->exports.clear();after_metadata->exports.push_back({2,"after",Address{{0},0x1001},{}});
+    auto edited_image=patch(metadata_edit,8,bytes({0x12}));auto metadata_key=metadata_edit.key;++metadata_key.byte_revision;
+    FileRange metadata_byte{{8},1};auto metadata_plan=plan_invalidation(metadata_edit,std::span(&metadata_byte,1),
+        metadata_edit.decisions,metadata_key,{},false,true).value();
+    auto metadata_proposal=reanalyze(metadata_edit,edited_image,after_metadata,metadata_edit.decisions,
+        metadata_plan,metadata_key,{}).value();
+    check(metadata_plan.metadata_invalid && metadata_proposal.counters.reused_instructions==2 &&
+          metadata_proposal.counters.decoded_instructions==0 && function(*metadata_proposal.functions,0x1001),
+          "certified loader-metadata edit reuses unaffected decodes while rebuilding roots and ownership");
+    auto metadata_cancellation=std::make_shared<std::stop_source>();
+    auto cancel_metadata_image=Image::create(std::make_shared<CancelOnReadStorage>(edited_image->storage(),
+        metadata_cancellation),edited_image->layout()).value();
+    auto canceled_metadata=reanalyze(metadata_edit,cancel_metadata_image,after_metadata,metadata_edit.decisions,
+        metadata_plan,metadata_key,metadata_cancellation->get_token());
+    check(!canceled_metadata && canceled_metadata.error().code==ErrorCode::canceled &&
+          metadata_cancellation->stop_requested() && metadata_edit.functions->key==metadata_edit.key,
+          "cancellation during certified metadata reuse publishes no partial proposal or mutates prior facts");
+    auto stale_metadata_key=metadata_key;++stale_metadata_key.byte_revision;
+    check(!reanalyze(metadata_edit,edited_image,after_metadata,metadata_edit.decisions,metadata_plan,
+                     stale_metadata_key,{}),
+          "metadata invalidation plan cannot publish under a different byte revision");
     auto engine=old.key;engine.engine_fingerprint[0]^=std::byte{1};auto incompatible=plan_invalidation(old,{},old.decisions,engine,{}).value();check(!incompatible.full_reason.empty(),"engine key changes cannot reuse old facts silently");check(!reanalyze(old,old.image,old.metadata,old.decisions,incompatible,engine,{}),"unknown engine fingerprint is rejected by enabled implementation");
     auto unicode=std::vector<std::byte>(24);unicode[0]=std::byte{0xc3};for(size_t i=0;i<8;++i)unicode[4+2*i]=std::byte('A'+i);auto utf16=basis(unicode);auto split=patch(utf16,12,bytes({0,0}));auto unicode_key=utf16.key;++unicode_key.byte_revision;FileRange utf_range{{12},2};auto utf_plan=plan_invalidation(utf16,std::span(&utf_range,1),utf16.decisions,unicode_key,{}).value();auto rescanned=reanalyze(utf16,split,utf16.metadata,utf16.decisions,utf_plan,unicode_key,{}).value();bool exact=false,obsolete=false;for(auto& record:rescanned.strings->records)if(record.encoding==StringEncoding::utf16le){exact=exact || (record.file_offset.value==4 && record.characters==4 && record.byte_length==8 && record.terminated);obsolete=obsolete || (record.file_offset.value==4 && record.characters==8);}check(exact && !obsolete,"UTF-16 terminator edit rescans alignment and removes obsolete full run");
 }

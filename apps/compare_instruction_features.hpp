@@ -30,7 +30,23 @@ inline compare::InstructionSemanticFeature compare_semantic_feature(const Instru
     }
     for(auto access:ins.access) effects.add(static_cast<std::uint64_t>(access));
     effects.add(ins.memory_read);effects.add(ins.memory_write);effects.add(ins.lock_prefix);effects.add(ins.delay_slots);
-    if(ins.arm){effects.add(static_cast<std::uint64_t>(ins.arm->predicate));effects.add(static_cast<std::uint64_t>(ins.arm->exchange));effects.add(ins.arm->flags_written);effects.add(ins.arm->flags_known);effects.add(ins.arm->writes_pc);effects.add(ins.arm->writeback);}
+    if(ins.arm){effects.add(static_cast<std::uint64_t>(ins.arm->predicate));effects.add(static_cast<std::uint64_t>(ins.arm->exchange));effects.add(ins.arm->flags_written);effects.add(ins.arm->flags_known);effects.add(ins.arm->q_flag_may_set);effects.add(ins.arm->writes_pc);effects.add(ins.arm->writeback);}
     return {fingerprint,static_cast<std::uint32_t>(ins.opcode),static_cast<std::uint32_t>(ins.flow),operands.value,effects.value};
+}
+inline bool attach_instruction_addresses(compare::FunctionInstructionDiff &diff,
+                                         const compare::FunctionFeature &old_feature,
+                                         const compare::FunctionFeature &new_feature,
+                                         std::stop_token stop = {}) {
+    const bool old_complete = old_feature.instruction_addresses.size() == old_feature.instruction_fingerprints.size();
+    const bool new_complete = new_feature.instruction_addresses.size() == new_feature.instruction_fingerprints.size();
+    for (std::size_t index = 0; index < diff.runs.size(); ++index) {
+        if ((index & 0xffu) == 0 && stop.stop_requested()) return false;
+        auto &run = diff.runs[index];
+        if (run.old_count && old_complete && run.old_start < old_feature.instruction_addresses.size())
+            run.old_address = old_feature.instruction_addresses[static_cast<std::size_t>(run.old_start)];
+        if (run.new_count && new_complete && run.new_start < new_feature.instruction_addresses.size())
+            run.new_address = new_feature.instruction_addresses[static_cast<std::size_t>(run.new_start)];
+    }
+    return !stop.stop_requested();
 }
 }

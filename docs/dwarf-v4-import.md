@@ -10,14 +10,39 @@ unit. `DW_FORM_ref_addr` type references and subprogram
 compile unit in the same `.debug_info` section, including a later unit. All
 units are decoded and indexed before resolution, then resolved in a bounded
 dependency order so target types and function signatures are available first.
+Named enumeration types retain each enumerator's numeric value in the project
+type graph, including unsigned constants through `UINT64_MAX`. Values use the
+existing 64-bit two's-complement representation, so negative signed constants
+remain exact; the importer checks each value against its declared integer base
+type before constructing the enum. `ImportedEnumerator` preserves its original
+signed `value` member for source compatibility and appends `exact_value`, which
+contains the raw 64-bit value bits and an `is_signed` flag. New consumers should
+use `exact_value` when present; the legacy `value` remains a signed projection
+and may appear negative for unsigned constants above `INT64_MAX`.
 Integral bitfield members with a positive `DW_AT_bit_size` may omit
 `DW_AT_name`; these remain unnamed fields with their storage position and bit
 range intact in the imported aggregate. Unnamed non-bitfield members remain
 unsupported.
+Const, volatile, restrict, and atomic wrapper DIEs retain their qualification
+in the persisted type graph; restrict requires an unqualified pointer target.
+Atomic wrappers preserve the referenced type's layout unless an explicit
+supported alignment is present. Atomic byte sizes that differ from the
+referenced type remain unsupported.
 Ranged subprogram DIEs inherit missing names, return types, and parameter lists
 from same-unit or cross-unit targets; cycles and non-subprogram targets are
 malformed. Cross-unit function inheritance is limited to complete named
 declarations whose return and parameter types resolve in the same import.
+When a ranged subprogram DIE has a direct standard `DW_AT_linkage_name`, the
+imported symbol retains that raw string in `ImportedSymbol::linkage_name`;
+`ImportedSymbol::name` remains the source name. The linkage-name field is not
+inherited from specification/origin DIEs and is not demangled.
+Direct `DW_AT_decl_file`, `DW_AT_decl_line`, and `DW_AT_decl_column` values on
+imported ranged functions and variable/parameter records are retained in the
+optional `declaration_location` metadata. For v2-v4, `file_index` preserves the
+one-based file number from the owning unit's line table; zero or missing values
+are not rewritten. The importer does not resolve this index to a path or line
+row. Values must be nonnegative integer forms; unsupported or negative values
+are rejected.
 Function ranges handle address-form `DW_AT_high_pc` and
 constant-form offsets. Subprogram `DW_AT_ranges` with `DW_FORM_sec_offset`
 reads the optional legacy `.debug_ranges` section and retains every half-open

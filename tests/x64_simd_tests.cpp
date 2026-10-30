@@ -298,6 +298,21 @@ void vex_avx_forms() {
           "unsupported VEX opcode map is not misdecoded as an instruction");
     result = decode(x64, {0xc5, 0xf8, 0x58});
     check(result.status == DecodeStatus::truncated && !result.instruction, "truncated VEX opcode is reported");
+
+    const std::vector<std::pair<unsigned, Opcode>> evex_unpack = {
+        {0x60, Opcode::vpunpcklbw}, {0x61, Opcode::vpunpcklwd},
+        {0x62, Opcode::vpunpckldq}, {0x6c, Opcode::vpunpcklqdq},
+        {0x68, Opcode::vpunpckhbw}, {0x69, Opcode::vpunpckhwd},
+        {0x6a, Opcode::vpunpckhdq}, {0x6d, Opcode::vpunpckhqdq}};
+    for (const auto &[opcode_byte, opcode] : evex_unpack) {
+        result = decode(x64, {0x62, 0xf1, 0x7d, 0x48, opcode_byte, 0xc1});
+        check(result.instruction && result.instruction->opcode == opcode &&
+                  result.instruction->x86_evex && result.instruction->vector_bits == 512 &&
+                  result.instruction->operands.size() == 3 &&
+                  result.instruction->access == std::vector{OperandAccess::write, OperandAccess::read,
+                                                             OperandAccess::read},
+              "EVEX unpack decodes with three-operand ZMM dataflow and destination writemask semantics");
+    }
 }
 
 } // namespace

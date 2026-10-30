@@ -3,8 +3,11 @@
 `link_coff_executable` accepts homogeneous ordinary little-endian ARM64 COFF
 objects (`Machine = 0xaa64`) and emits a fixed-base PE32+ console image.
 The existing `link_coff_amd64_executable` wrapper still rejects other machines.
-The generic API retains AMD64 BigObj, import and unwind handling on that path;
-ARM64 does not reuse those architecture-specific encodings.
+The generic API accepts ARM64 BigObj files as well as ordinary COFF objects.
+BigObj uses its 56-byte anonymous-object header, 32-bit section ordinals and
+20-byte symbol rows; the same ARM64 section, symbol, COMDAT, and relocation
+validation applies to both object encodings. AMD64 import and unwind handling
+remain architecture-specific.
 
 The existing archive command selects its machine from the root object:
 
@@ -13,13 +16,13 @@ hexlab_cli archive link-pe helpers.lib --root-object entry.obj --entry entry --o
 ```
 
 Before fixed-point symbol selection, the CLI filters ordinary and anonymous
-member prefixes by root machine. The existing bounded COFF symbol reader then
-uses ordinary ARM64's 18-byte symbol/auxiliary layout to collect external and
-common definitions and unresolved references. Members with another machine,
-including ARM64EC/ARM64X, cannot provide a same-named symbol. The final linker
-also checks every selected object's machine. Selection can encounter an ARM64
-import or BigObj provider, but linking that selected form fails explicitly.
-No archive mutation or external library discovery is performed.
+member prefixes by root machine. The bounded COFF symbol reader handles both
+ordinary ARM64's 18-byte symbol rows and BigObj's 20-byte rows, including
+auxiliary-row skipping, section ordinals and common definitions. Members with
+another machine, including ARM64EC/ARM64X, cannot provide a same-named symbol.
+The final linker checks every selected object's machine and accepts regular
+ARM64 BigObj members selected from archives. ARM64 import-object members remain
+unsupported. No archive mutation or external library discovery is performed.
 
 ## Sections, symbols and image properties
 
@@ -80,7 +83,7 @@ implemented. Range failures return unsupported instead of truncating.
 ## Explicit gaps and validation evidence
 
 ARM64 `.pdata`/`.xdata`, packed/full unwind records, short/import objects,
-BigObj, ARM64EC/ARM64X, directives, debug sections, weak-external aliases,
+ARM64EC/ARM64X, directives, debug sections, weak-external aliases,
 TLS, base relocations, section-relative relocation families, token/section
 relocations, unsupported opcode forms and branch veneers remain unsupported.
 Non-no-op relocations stored in BSS reject. Runtime imports, CRT startup and

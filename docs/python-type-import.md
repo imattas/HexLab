@@ -28,12 +28,22 @@ with hexlab.Project.open("sample.hxproj", readonly=False) as project:
 
 `Project.import_types(definitions, assignments=(), group=0)` accepts either a
 mapping from names to `TypeSpec` values or an iterable of `(name, TypeSpec)`
-pairs. Assignments are `(Address, type_name)` pairs. Every named reference may
-point to a definition in this batch or an existing project type. The workspace
-validates the complete batch before committing it, so an invalid assignment or
-duplicate/changed destination does not leave some definitions imported. The
-whole import is one normal project-history command; `undo()` and `redo()` keep
-definitions and assignments together.
+pairs. Assignments are `(Address, type_name)` or `(FileOffset, type_name)` pairs.
+Virtual addresses remain address-space-qualified; file offsets identify bytes
+in the imported input directly. For example:
+
+```python
+project.import_types(
+    {"Node": node},
+    [(hexlab.FileOffset(0x40), "Node")],
+)
+```
+
+Every named reference may point to a definition in this batch or an existing
+project type. The workspace validates the complete batch before committing it,
+so an invalid assignment or duplicate/changed destination does not leave some
+definitions imported. The whole import is one normal project-history command;
+`undo()` and `redo()` keep definitions and assignments together.
 
 If a destination already has a type with the same name, the import carries the
 current destination ID as an optimistic update check and updates the definition

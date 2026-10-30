@@ -1,4 +1,5 @@
 #include "hexlab/plugins/plugins.hpp"
+#include "hexlab/core/sha256.hpp"
 #include "scalar_ir.hpp"
 #include "hexlab/automation/api.hpp"
 #include "hexlab/debugger/debugger.hpp"
@@ -24,6 +25,16 @@
 #include <shared_mutex>
 #include <memory>
 #include <atomic>
+#include <cstdlib>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
 
 namespace hexlab::plugins {
 namespace {
@@ -33,12 +44,13 @@ constexpr std::size_t max_string_length = 1024;
 constexpr std::size_t max_actions = 256;
 constexpr std::size_t max_extensions = 128;
 constexpr std::size_t max_manifest_bytes = 64 * 1024;
+constexpr std::uint64_t max_plugin_hash_bytes = 1024ull * 1024ull * 1024ull;
 constexpr std::size_t max_manifest_capabilities = 256;
-constexpr std::array<HexLabCapability, 17> host_capabilities{{
+constexpr std::array<HexLabCapability, 24> host_capabilities{{
     {sizeof(HexLabCapability), 1, HEXLAB_PLUGIN_ABI_MINOR, 0, "hexlab.host"},
     {sizeof(HexLabCapability), 1, 0, 0, "project.api"},
     {sizeof(HexLabCapability), 1, 2, 0, "project.queries"},
-    {sizeof(HexLabCapability), 1, 5, 0, "project.edits"},
+    {sizeof(HexLabCapability), 1, 6, 0, "project.edits"},
     {sizeof(HexLabCapability), 1, 11, 0, "project.read"},
     {sizeof(HexLabCapability), 1, 14, 0, "project.types"},
     {sizeof(HexLabCapability), 1, 8, 0, "debugger.api"},
@@ -46,12 +58,19 @@ constexpr std::array<HexLabCapability, 17> host_capabilities{{
     {sizeof(HexLabCapability), 1, 10, 0, "loader.image"},
     {sizeof(HexLabCapability), 1, 7, 0, "processor.semantic.v2"},
     {sizeof(HexLabCapability), 1, 16, 0, "processor.semantic.v3"},
-    {sizeof(HexLabCapability), 1, 25, 0, "processor.ir.scalar"},
+    {sizeof(HexLabCapability), 1, 29, 0, "processor.ir.scalar"},
     {sizeof(HexLabCapability), 1, 9, 0, "analysis.provider"},
     {sizeof(HexLabCapability), 1, 15, 0, "document.active"},
     {sizeof(HexLabCapability), 1, 17, 0, "debugger.active"},
     {sizeof(HexLabCapability), 1, 18, 0, "project.breakpoint.active"},
     {sizeof(HexLabCapability), 1, 21, 0, "project.cfg"},
+    {sizeof(HexLabCapability), 1, 28, 0, "project.history"},
+    {sizeof(HexLabCapability), 1, 29, 0, "project.function-owners"},
+    {sizeof(HexLabCapability), 1, 30, 0, "project.instruction-text"},
+    {sizeof(HexLabCapability), 1, 31, 0, "debugger.event-text"},
+    {sizeof(HexLabCapability), 1, 32, 0, "project.string-preview"},
+    {sizeof(HexLabCapability), 1, 0, 0, "plugin.state"},
+    {sizeof(HexLabCapability), 1, 0, 0, "project.references.range"},
 }};
 
 struct ActiveDocumentServicesState {
@@ -66,6 +85,155 @@ struct ActiveProjectBreakpointServicesState {
     std::mutex mutex;
     ActiveProjectBreakpointServices services;
 };
+struct PluginStateStore {
+    struct Entry { std::uint64_t revision = 0; bool present = false; std::vector<std::uint8_t> value; };
+    std::mutex mutex;
+    std::size_t total_bytes = 0;
+    std::unordered_map<std::string, std::map<std::string, Entry>> plugins;
+    std::filesystem::path path;
+    bool loaded = false;
+    bool failed = false;
+};
+
+constexpr std::size_t plugin_state_file_limit = 80u * 1024u * 1024u;
+void state_u32(std::vector<std::uint8_t>& out, std::uint32_t value) {
+    for (unsigned i = 0; i < 4; ++i) out.push_back(static_cast<std::uint8_t>(value >> (i * 8)));
+}
+void state_u64(std::vector<std::uint8_t>& out, std::uint64_t value) {
+    for (unsigned i = 0; i < 8; ++i) out.push_back(static_cast<std::uint8_t>(value >> (i * 8)));
+}
+void state_string(std::vector<std::uint8_t>& out, std::string_view value) {
+    state_u32(out, static_cast<std::uint32_t>(value.size()));
+    out.insert(out.end(), value.begin(), value.end());
+}
+struct StateReader {
+    std::span<const std::uint8_t> bytes;
+    std::size_t at = 0;
+    bool u32(std::uint32_t& value) {
+        if (bytes.size() - at < 4) return false;
+        value = 0; for (unsigned i = 0; i < 4; ++i) value |= std::uint32_t(bytes[at++]) << (i * 8);
+        return true;
+    }
+    bool u64(std::uint64_t& value) {
+        if (bytes.size() - at < 8) return false;
+        value = 0; for (unsigned i = 0; i < 8; ++i) value |= std::uint64_t(bytes[at++]) << (i * 8);
+        return true;
+    }
+    bool string(std::string& value, std::size_t limit) {
+        std::uint32_t size = 0;
+        if (!u32(size) || size > limit || bytes.size() - at < size) return false;
+        value.assign(reinterpret_cast<const char*>(bytes.data() + at), size); at += size; return true;
+    }
+};
+bool load_plugin_state(PluginStateStore& store) {
+    if (store.loaded) return !store.failed;
+    store.loaded = true;
+    if (store.path.empty()) return true;
+    std::error_code ec;
+    auto status = std::filesystem::symlink_status(store.path, ec);
+    if (ec == std::errc::no_such_file_or_directory || (!ec && status.type() == std::filesystem::file_type::not_found)) return true;
+    if (ec || std::filesystem::is_symlink(status) || !std::filesystem::is_regular_file(status)) {
+        store.failed = true; return false;
+    }
+    auto size = std::filesystem::file_size(store.path, ec);
+    if (ec || size < 48 || size > plugin_state_file_limit) { store.failed = true; return false; }
+    std::ifstream input(store.path, std::ios::binary);
+    std::vector<std::uint8_t> data(static_cast<std::size_t>(size));
+    if (!input || !input.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(data.size()))) {
+        store.failed = true; return false;
+    }
+    const std::array<std::uint8_t, 8> magic{'H','X','P','S','T','A','T','1'};
+    if (!std::equal(magic.begin(), magic.end(), data.begin())) { store.failed = true; return false; }
+    const auto payload_size = data.size() - 32;
+    Sha256 hash;
+    if (!hash.update(std::as_bytes(std::span(data.data(), payload_size)))) { store.failed = true; return false; }
+    const auto digest = hash.digest();
+    if (!std::equal(digest.begin(), digest.end(), reinterpret_cast<const std::byte*>(data.data() + payload_size))) {
+        store.failed = true; return false;
+    }
+    StateReader reader{std::span(data.data() + 8, payload_size - 8)};
+    std::uint32_t version = 0, plugin_count = 0;
+    if (!reader.u32(version) || version != 1 || !reader.u32(plugin_count) || plugin_count > 4096) {
+        store.failed = true; return false;
+    }
+    std::unordered_map<std::string, std::map<std::string, PluginStateStore::Entry>> loaded;
+    std::size_t total = 0;
+    for (std::uint32_t p = 0; p < plugin_count; ++p) {
+        std::string id; std::uint32_t count = 0;
+        if (!reader.string(id, 1024) || id.empty() || !reader.u32(count) || count > 1024 || loaded.contains(id)) {
+            store.failed = true; return false;
+        }
+        auto& entries = loaded[id]; std::size_t plugin_total = 0;
+        for (std::uint32_t k = 0; k < count; ++k) {
+            std::string key; std::uint64_t revision = 0; std::uint32_t present = 0, value_size = 0;
+            if (!reader.string(key, HEXLAB_PLUGIN_STATE_MAX_KEY) || key.empty() ||
+                !reader.u64(revision) || revision == 0 || !reader.u32(present) || present > 1 ||
+                !reader.u32(value_size) || value_size > HEXLAB_PLUGIN_STATE_MAX_VALUE ||
+                reader.bytes.size() - reader.at < value_size || entries.contains(key) || (!present && value_size)) {
+                store.failed = true; return false;
+            }
+            if (!std::all_of(key.begin(), key.end(), [](unsigned char ch) {
+                    return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+                           (ch >= '0' && ch <= '9') || ch == '.' || ch == '_' || ch == '-';
+                })) { store.failed = true; return false; }
+            PluginStateStore::Entry entry; entry.revision = revision; entry.present = present != 0;
+            entry.value.assign(reader.bytes.begin() + static_cast<std::ptrdiff_t>(reader.at),
+                               reader.bytes.begin() + static_cast<std::ptrdiff_t>(reader.at + value_size));
+            reader.at += value_size;
+            if (entry.present) { plugin_total += value_size; total += value_size; }
+            entries.emplace(std::move(key), std::move(entry));
+        }
+        if (plugin_total > 4u * 1024u * 1024u || total > 64u * 1024u * 1024u) {
+            store.failed = true; return false;
+        }
+    }
+    if (reader.at != reader.bytes.size()) { store.failed = true; return false; }
+    store.plugins = std::move(loaded); store.total_bytes = total;
+    return true;
+}
+bool save_plugin_state(const PluginStateStore& store) {
+    if (store.path.empty()) return true;
+    std::vector<std::uint8_t> data{'H','X','P','S','T','A','T','1'};
+    state_u32(data, 1); state_u32(data, static_cast<std::uint32_t>(store.plugins.size()));
+    for (const auto& [id, entries] : store.plugins) {
+        state_string(data, id); state_u32(data, static_cast<std::uint32_t>(entries.size()));
+        for (const auto& [key, entry] : entries) {
+            state_string(data, key); state_u64(data, entry.revision); state_u32(data, entry.present ? 1 : 0);
+            state_u32(data, static_cast<std::uint32_t>(entry.value.size()));
+            data.insert(data.end(), entry.value.begin(), entry.value.end());
+            if (data.size() > plugin_state_file_limit - 32) return false;
+        }
+    }
+    Sha256 hash;
+    if (!hash.update(std::as_bytes(std::span(data.data(), data.size())))) return false;
+    const auto digest = hash.digest();
+    for (const auto byte : digest) data.push_back(std::to_integer<std::uint8_t>(byte));
+    std::error_code ec;
+    if (!store.path.parent_path().empty()) {
+        std::filesystem::create_directories(store.path.parent_path(), ec);
+        if (ec) return false;
+    }
+    static std::atomic_uint64_t sequence{0};
+    auto temporary = store.path;
+    temporary += ".tmp-" + std::to_string(sequence.fetch_add(1, std::memory_order_relaxed));
+    {
+        std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+        if (!output || !output.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()))) {
+            std::filesystem::remove(temporary, ec); return false;
+        }
+        output.flush();
+        if (!output) { output.close(); std::filesystem::remove(temporary, ec); return false; }
+    }
+#ifdef _WIN32
+    if (!MoveFileExW(temporary.c_str(), store.path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        std::filesystem::remove(temporary, ec); return false;
+    }
+#else
+    std::filesystem::rename(temporary, store.path, ec);
+    if (ec) { std::filesystem::remove(temporary, ec); return false; }
+#endif
+    return true;
+}
 
 struct RegisteredAction {
     std::string id;
@@ -124,6 +292,8 @@ struct HostContext {
     HexLabActiveDebuggerApi active_debugger_api{};
     std::shared_ptr<ActiveProjectBreakpointServicesState> active_project_breakpoint_services;
     HexLabActiveProjectBreakpointApi active_project_breakpoint_api{};
+    std::shared_ptr<PluginStateStore> plugin_state_store;
+    HexLabPluginStateApi plugin_state_api{};
 };
 
 void close_debugger_sessions(HostContext& host) noexcept {
@@ -233,9 +403,43 @@ bool parse_manifest_u32(std::string_view text, std::uint32_t& result) {
     const auto parsed = std::from_chars(text.data(), text.data() + text.size(), result);
     return parsed.ec == std::errc{} && parsed.ptr == text.data() + text.size();
 }
+bool valid_sha256(std::string_view text) {
+    return text.size() == 64 && std::all_of(text.begin(), text.end(), [](char ch) {
+        return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f');
+    });
+}
+Result<std::string> hash_plugin_file(const std::filesystem::path& path) {
+    std::error_code ec;
+    const auto status = std::filesystem::symlink_status(path, ec);
+    if (ec || std::filesystem::is_symlink(status) || !std::filesystem::is_regular_file(status))
+        return Error{ErrorCode::io, "declared SHA-256 requires a regular, non-symlink module file"};
+    const auto size = std::filesystem::file_size(path, ec);
+    if (ec) return Error{ErrorCode::io, "cannot size module for SHA-256: " + ec.message()};
+    if (size > max_plugin_hash_bytes)
+        return Error{ErrorCode::resource_limit, "module exceeds the 1 GiB SHA-256 scan limit"};
+    std::ifstream input(path, std::ios::binary);
+    if (!input) return Error{ErrorCode::io, "cannot open module for SHA-256"};
+    Sha256 hash;
+    std::array<char, 64 * 1024> buffer{};
+    std::uint64_t total = 0;
+    while (input) {
+        input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+        const auto amount = input.gcount();
+        if (amount > 0) {
+            total += static_cast<std::uint64_t>(amount);
+            if (total > max_plugin_hash_bytes)
+                return Error{ErrorCode::resource_limit, "module grew beyond the 1 GiB SHA-256 scan limit"};
+            const auto bytes = std::as_bytes(std::span(buffer.data(), static_cast<std::size_t>(amount)));
+            if (!hash.update(bytes)) return Error{ErrorCode::io, "cannot update module SHA-256"};
+        }
+    }
+    if (!input.eof() || total != size)
+        return Error{ErrorCode::io, "module changed or could not be read completely for SHA-256"};
+    return digest_hex(hash.digest());
+}
 Result<PluginCandidate::Manifest> parse_plugin_manifest(std::string_view bytes) {
     PluginCandidate::Manifest manifest;
-    bool have_format = false, have_id = false, have_name = false, have_version = false;
+    bool have_format = false, have_id = false, have_name = false, have_version = false, have_sha256 = false;
     std::unordered_set<std::string> capability_ids;
     std::unordered_set<std::string> required_capability_ids;
     std::size_t line_number = 0;
@@ -265,6 +469,9 @@ Result<PluginCandidate::Manifest> parse_plugin_manifest(std::string_view bytes) 
             if (have_version || value.size() > 64 || !valid_manifest_text(value, false))
                 return invalid("plugin manifest version is invalid or repeated");
             manifest.version.assign(value); have_version = true;
+        } else if (key == "sha256") {
+            if (have_sha256 || !valid_sha256(value)) return invalid("plugin manifest SHA-256 is invalid or repeated");
+            manifest.sha256.assign(value); have_sha256 = true;
         } else if (key == "capability") {
             if (manifest.capabilities.size() >= max_manifest_capabilities)
                 return Error{ErrorCode::resource_limit, "plugin manifest capability limit exceeded"};
@@ -558,13 +765,14 @@ std::optional<Instruction> convert_semantic_v3(const HexLabSemanticInstructionV3
         updated_operands[update.operand_index] = true;
         const auto& source = decoded.semantic.operands[update.operand_index];
         if (source.kind != HEXLAB_SEMANTIC_BASE_INDEX_MEMORY_V2 ||
-            source.base_index == UINT32_MAX || source.index_index != UINT32_MAX) return {};
+            source.base_index == UINT32_MAX) return {};
         auto* memory = std::get_if<MemoryOperand>(&result->operands[update.operand_index]);
         if (!memory || !memory->base || memory->writeback) return {};
         switch (update.kind) {
         case HEXLAB_SEMANTIC_MEMORY_PRE_INDEX_WRITEBACK_V3:
             // The effective memory address and the updated base must describe
-            // the same pre-indexed displacement.
+            // the same pre-indexed address. A present index is already part
+            // of the decoded address expression (including scale/extension).
             if (source.displacement != update.writeback_displacement) return {};
             memory->writeback = true;
             memory->post_index = false;
@@ -573,7 +781,9 @@ std::optional<Instruction> convert_semantic_v3(const HexLabSemanticInstructionV3
         case HEXLAB_SEMANTIC_MEMORY_POST_INDEX_WRITEBACK_V3:
             // Post-index accesses use the old base; the separate update record
             // describes the value written back after the memory operation.
-            if (source.displacement != 0) return {};
+            // V3 has no independent post-index register field, so its index
+            // cannot also be used as the update expression.
+            if (source.displacement != 0 || source.index_index != UINT32_MAX) return {};
             memory->writeback = true;
             memory->post_index = true;
             memory->writeback_displacement = update.writeback_displacement;
@@ -919,6 +1129,7 @@ struct PluginManager::Impl {
         std::make_shared<ActiveDebuggerServicesState>();
     std::shared_ptr<ActiveProjectBreakpointServicesState> active_project_breakpoint_services =
         std::make_shared<ActiveProjectBreakpointServicesState>();
+    std::shared_ptr<PluginStateStore> plugin_state_store = std::make_shared<PluginStateStore>();
     std::vector<Loaded> loaded;
     std::shared_ptr<const std::vector<std::byte>> make_semantic_identity_locked() const {
         std::vector<std::array<std::string, 5>> rows;
@@ -1023,11 +1234,35 @@ int32_t project_analyze(void* context, void* handle) {
     if (!project) return -1;
     try { return (*project)->analyze() ? 0 : -2; } catch (...) { return -2; }
 }
+int32_t project_move_history(void* context, void* handle, uint64_t expected_revision, bool redo) {
+    if (!context) return HEXLAB_PROJECT_HISTORY_INVALID;
+    std::lock_guard lock(static_cast<HostContext*>(context)->mutex);
+    auto* project = project_handle(context, handle);
+    if (!project) return HEXLAB_PROJECT_HISTORY_INVALID;
+    try {
+        auto snapshot = (*project)->snapshot();
+        if (!snapshot || !snapshot.value()->state) return HEXLAB_PROJECT_HISTORY_FAILED;
+        if (snapshot.value()->state->revisions.edit != expected_revision) return HEXLAB_PROJECT_HISTORY_STALE;
+        // ProjectSession also checks this generation at the durable history
+        // transaction, covering edits committed by another project connection.
+        auto result = redo ? (*project)->redo() : (*project)->undo();
+        if (result) return HEXLAB_PROJECT_HISTORY_OK;
+        return result.error().code == ErrorCode::conflict
+            ? HEXLAB_PROJECT_HISTORY_STALE : HEXLAB_PROJECT_HISTORY_FAILED;
+    } catch (...) { return HEXLAB_PROJECT_HISTORY_FAILED; }
+}
+int32_t project_undo(void* context, void* handle, uint64_t expected_revision) {
+    return project_move_history(context, handle, expected_revision, false);
+}
+int32_t project_redo(void* context, void* handle, uint64_t expected_revision) {
+    return project_move_history(context, handle, expected_revision, true);
+}
 int32_t project_summary(void* context, void* handle, HexLabProjectSummary* output) {
     if (!context) return -1;
     std::lock_guard lock(static_cast<HostContext*>(context)->mutex);
     auto* project = project_handle(context, handle);
-    if (!project || !output || output->struct_size < sizeof(*output)) return -1;
+    constexpr auto legacy_size = offsetof(HexLabProjectSummary, edit_revision);
+    if (!project || !output || output->struct_size < legacy_size) return -1;
     try {
         auto snapshot = (*project)->snapshot();
         if (!snapshot) return -2;
@@ -1035,6 +1270,8 @@ int32_t project_summary(void* context, void* handle, HexLabProjectSummary* outpu
         output->function_count = snapshot.value()->functions ? snapshot.value()->functions->functions.size() : 0;
         output->instruction_count = snapshot.value()->functions ? snapshot.value()->functions->instructions.size() : 0;
         output->input_size = snapshot.value()->effective ? snapshot.value()->effective->size() : 0;
+        if (output->struct_size >= offsetof(HexLabProjectSummary, edit_revision) + sizeof(output->edit_revision))
+            output->edit_revision = snapshot.value()->state->revisions.edit;
         return 0;
     } catch (...) { return -2; }
 }
@@ -1057,6 +1294,34 @@ int32_t project_functions(void* context, void* handle, uint64_t start, uint32_t 
             target.entry = row.entry.offset;
             target.chunk_count = row.chunks.size();
             target.complete = row.complete ? 1u : 0u;
+            ++*written;
+        }
+        return 0;
+    } catch (...) { return -2; }
+}
+int32_t project_function_owners(void* context, void* handle, uint32_t address_space,
+                                uint64_t address, uint64_t start, uint32_t capacity,
+                                HexLabFunctionOwner* output, uint32_t* written) {
+    if (written) *written = 0;
+    if (!context || !written || !capacity || capacity > HEXLAB_PROJECT_MAX_PAGE || !output ||
+        start > std::numeric_limits<std::size_t>::max()) return -1;
+    std::lock_guard lock(static_cast<HostContext*>(context)->mutex);
+    auto* project = project_handle(context, handle);
+    if (!project) return -1;
+    try {
+        auto rows = (*project)->function_owners(Address{{address_space}, address});
+        if (!rows) return -2;
+        const auto begin = std::min<std::size_t>(static_cast<std::size_t>(start), rows.value().size());
+        const auto end = begin + std::min<std::size_t>(capacity, rows.value().size() - begin);
+        for (std::size_t i = begin; i < end; ++i)
+            if (output[i - begin].struct_size < sizeof(HexLabFunctionOwner)) return -1;
+        for (std::size_t i = begin; i < end; ++i) {
+            auto& target = output[*written];
+            target.struct_size = sizeof(target);
+            target.address_space = rows.value()[i].entry.space.value;
+            target.function_id = rows.value()[i].id.value;
+            target.entry = rows.value()[i].entry.offset;
+            std::fill(std::begin(target.reserved), std::end(target.reserved), std::uint8_t{0});
             ++*written;
         }
         return 0;
@@ -1095,6 +1360,34 @@ int32_t project_instructions(void* context, void* handle, uint64_t start, uint32
         return 0;
     } catch (...) { return -2; }
 }
+int32_t project_instructions_text(void* context, void* handle, uint64_t start, uint32_t capacity,
+                                  HexLabInstructionText* output, uint32_t* written) {
+    if (written) *written = 0;
+    if (!context) return -1;
+    std::lock_guard lock(static_cast<HostContext*>(context)->mutex);
+    auto* project = project_handle(context, handle);
+    if (!project || !written || !capacity || capacity > HEXLAB_PROJECT_MAX_PAGE || !output ||
+        start > std::numeric_limits<std::size_t>::max()) return -1;
+    try {
+        auto rows = (*project)->instructions(static_cast<std::size_t>(start), capacity);
+        if (!rows) return -2;
+        for (std::size_t i = 0; i < rows.value().size(); ++i)
+            if (output[i].struct_size < sizeof(HexLabInstructionText)) return -1;
+        for (const auto& row : rows.value()) {
+            auto& target = output[*written];
+            const auto text = format_instruction(row);
+            if (text.size() >= sizeof(target.text)) return -2;
+            target.address_space = row.address.space.value;
+            target.address = row.address.offset;
+            target.length = row.length;
+            for (std::size_t i = 0; i < row.length; ++i)
+                target.bytes[i] = std::to_integer<std::uint8_t>(row.bytes[i]);
+            copy_field(target.text, text);
+            ++*written;
+        }
+        return 0;
+    } catch (...) { return -2; }
+}
 int32_t project_references(void* context, void* handle, uint32_t source_space, uint64_t source,
                            uint64_t start, uint32_t capacity, HexLabReference* output, uint32_t* written) {
     if (written) *written = 0;
@@ -1110,6 +1403,55 @@ int32_t project_references(void* context, void* handle, uint32_t source_space, u
         for (std::size_t i = 0; i < rows.value().size(); ++i)
             if (output[i].struct_size < sizeof(HexLabReference)) return -1;
         for (const auto& row : rows.value()) {
+            auto& target = output[*written];
+            if (const auto* address = std::get_if<Address>(&row.source)) {
+                target.source_space = address->space.value;
+                target.source = address->offset;
+            } else {
+                target.source_is_file = 1;
+                target.source = std::get<FileOffset>(row.source).value;
+            }
+            target.kind = static_cast<uint32_t>(row.kind);
+            if (const auto* address = std::get_if<Location>(&row.target)) {
+                target.target_kind = HEXLAB_REFERENCE_TARGET_LOCATION;
+                if (const auto* mapped = std::get_if<Address>(address)) {
+                    target.target_space = mapped->space.value;
+                    target.target = mapped->offset;
+                } else {
+                    target.target_is_file = 1;
+                    target.target = std::get<FileOffset>(*address).value;
+                }
+            } else if (const auto* external = std::get_if<ExternalIdentity>(&row.target)) {
+                target.target_kind = HEXLAB_REFERENCE_TARGET_EXTERNAL;
+                if (!copy_field(target.external_library, external->library) ||
+                    (external->name && !copy_field(target.external_name, *external->name))) return -2;
+            } else if (std::holds_alternative<UnresolvedTarget>(row.target)) {
+                target.target_kind = HEXLAB_REFERENCE_TARGET_UNRESOLVED;
+            } else target.target_kind = HEXLAB_REFERENCE_TARGET_NONE;
+            ++*written;
+        }
+        return 0;
+    } catch (...) { return -2; }
+}
+int32_t project_outgoing_references_range(void* context, void* handle,
+                                          uint32_t begin_space, uint64_t begin,
+                                          uint64_t size, uint64_t start,
+                                          uint32_t capacity, HexLabReference* output,
+                                          uint32_t* written) {
+    if (written) *written = 0;
+    if (!context) return -1;
+    std::lock_guard lock(static_cast<HostContext*>(context)->mutex);
+    auto* project = project_handle(context, handle);
+    if (!project || !written || !capacity || capacity > HEXLAB_PROJECT_MAX_PAGE || !output ||
+        start > std::numeric_limits<std::size_t>::max() || size == 0) return -1;
+    try {
+        auto page = (*project)->outgoing_references_range(
+            Address{{begin_space}, begin}, size, static_cast<std::size_t>(start), capacity);
+        if (!page) return -2;
+        if (page.value().rows.size() > capacity) return -2;
+        for (std::size_t i = 0; i < page.value().rows.size(); ++i)
+            if (output[i].struct_size < sizeof(HexLabReference)) return -1;
+        for (const auto& row : page.value().rows) {
             auto& target = output[*written];
             if (const auto* address = std::get_if<Address>(&row.source)) {
                 target.source_space = address->space.value;
@@ -1171,6 +1513,37 @@ int32_t project_strings(void* context, void* handle, uint64_t start, uint32_t ca
         return 0;
     } catch (...) { return -2; }
 }
+int32_t project_strings_text(void* context, void* handle, uint64_t start, uint32_t capacity,
+                             HexLabStringText* output, uint32_t* written) {
+    if (written) *written = 0;
+    if (!context) return -1;
+    std::lock_guard lock(static_cast<HostContext*>(context)->mutex);
+    auto* project = project_handle(context, handle);
+    if (!project || !written || !capacity || capacity > HEXLAB_PROJECT_MAX_PAGE || !output ||
+        start > std::numeric_limits<std::size_t>::max()) return -1;
+    try {
+        auto rows = (*project)->strings(static_cast<std::size_t>(start), capacity);
+        if (!rows) return -2;
+        for (std::size_t i = 0; i < rows.value().size(); ++i)
+            if (output[i].struct_size < sizeof(HexLabStringText)) return -1;
+        for (const auto& row : rows.value()) {
+            auto& target = output[*written];
+            if (!copy_field(target.preview, row.preview)) return -2;
+            target.encoding = static_cast<uint32_t>(row.encoding);
+            target.file_offset = row.file_offset.value;
+            target.characters = row.characters;
+            target.byte_length = row.byte_length;
+            target.has_address = row.address ? 1u : 0u;
+            if (row.address) {
+                target.address_space = row.address->space.value;
+                target.address = row.address->offset;
+            }
+            target.terminated = row.terminated ? 1u : 0u;
+            ++*written;
+        }
+        return 0;
+    } catch (...) { return -2; }
+}
 int32_t project_rename(void* context, void* handle, uint32_t address_space,
                        uint64_t address, const char* name) {
     std::string copied;
@@ -1204,6 +1577,46 @@ int32_t project_bookmark(void* context, void* handle, const HexLabProjectLocatio
     try { return (*project)->execute(BookmarkCommand{location, std::move(copied), remove != 0}) ? 0 : -2; }
     catch (...) { return -2; }
 }
+int32_t project_annotation_batch(void* context, void* handle, uint64_t expected_revision,
+                                 uint64_t group, const HexLabProjectAnnotationEdit* edits,
+                                 uint32_t count) {
+    if (!context || !edits || !count || count > HEXLAB_PROJECT_MAX_ANNOTATION_BATCH) return -1;
+    std::vector<ProjectCommand> commands;
+    try { commands.reserve(count); } catch (...) { return -2; }
+    try {
+        for (uint32_t index = 0; index < count; ++index) {
+            const auto& edit = edits[index];
+            Location location;
+            if (edit.struct_size < sizeof(HexLabProjectAnnotationEdit) || edit.reserved != 0 ||
+                !project_location(&edit.location, location) || !edit.value) return -1;
+            std::string value;
+            switch (edit.kind) {
+            case HEXLAB_PROJECT_EDIT_RENAME: {
+                const auto* address = std::get_if<Address>(&location);
+                if (!address || edit.flags != 0 || !copy_user_text(edit.value, 512, value)) return -1;
+                commands.emplace_back(Rename{*address, std::move(value)});
+                break;
+            }
+            case HEXLAB_PROJECT_EDIT_COMMENT:
+                if (edit.flags != 0 || !copy_user_text(edit.value, 1024 * 1024, value)) return -1;
+                commands.emplace_back(Comment{std::move(location), std::move(value)});
+                break;
+            case HEXLAB_PROJECT_EDIT_BOOKMARK:
+                if (edit.flags > 1 || !copy_user_text(edit.value, 512, value)) return -1;
+                commands.emplace_back(BookmarkCommand{std::move(location), std::move(value), edit.flags != 0});
+                break;
+            default: return -1;
+            }
+        }
+    } catch (...) { return -2; }
+    std::lock_guard lock(static_cast<HostContext*>(context)->mutex);
+    auto* project = project_handle(context, handle);
+    if (!project) return -1;
+    try {
+        auto result = (*project)->execute_batch(commands, group, expected_revision);
+        return result ? 0 : -2;
+    } catch (...) { return -2; }
+}
 int32_t project_read(void* context, void* handle, const HexLabProjectLocation* input,
                      uint32_t size, uint8_t* output) {
     Location location;
@@ -1227,7 +1640,8 @@ int32_t project_import_header(void* context, void* handle, const char* source,
         !copy_user_text(source, HEXLAB_PROJECT_MAX_HEADER_BYTES, copied)) return -1;
     types::HeaderImportOptions options;
     if (input_options) {
-        if (input_options->struct_size < sizeof(*input_options)) return -1;
+        constexpr auto legacy_options_size = offsetof(HexLabHeaderImportOptions, long_double_bytes);
+        if (input_options->struct_size < legacy_options_size) return -1;
         const std::uint8_t sizes[] = {input_options->pointer_bytes, input_options->char_bytes,
             input_options->short_bytes, input_options->int_bytes, input_options->long_bytes,
             input_options->long_long_bytes, input_options->float_bytes, input_options->double_bytes};
@@ -1240,6 +1654,17 @@ int32_t project_import_header(void* context, void* handle, const char* source,
         options.long_long_bytes = input_options->long_long_bytes;
         options.float_bytes = input_options->float_bytes;
         options.double_bytes = input_options->double_bytes;
+        options.long_double_bytes = input_options->pointer_bytes == 8 && input_options->long_bytes == 4
+            ? input_options->double_bytes : 16;
+        if (input_options->struct_size >= sizeof(*input_options)) {
+            if ((input_options->long_double_bytes && input_options->long_double_bytes > 16) ||
+                input_options->float_alignment > 16 || input_options->double_alignment > 16 ||
+                input_options->long_double_alignment > 16) return -1;
+            if (input_options->long_double_bytes) options.long_double_bytes = input_options->long_double_bytes;
+            options.float_alignment = input_options->float_alignment;
+            options.double_alignment = input_options->double_alignment;
+            options.long_double_alignment = input_options->long_double_alignment;
+        }
     }
     std::lock_guard lock(static_cast<HostContext*>(context)->mutex);
     auto* project = project_handle(context, handle);
@@ -1253,6 +1678,10 @@ int32_t project_import_header(void* context, void* handle, const char* source,
             if (bits != 32 && bits != 64) return -2;
             options.pointer_bytes = static_cast<std::uint8_t>(bits / 8);
             options.long_bytes = bits == 32 || snapshot.value()->state->recipe.format == Format::pe ? 4 : 8;
+            if (options.pointer_bytes == 8 && options.long_bytes == 4) {
+                options.long_double_bytes = 8;
+                options.long_double_alignment = 8;
+            }
         }
         auto parsed = types::import_c_header(copied, options);
         if (!parsed) return -2;
@@ -1479,6 +1908,35 @@ int32_t project_block_instructions(void* context, void* handle, uint64_t block_i
             const auto text = format_instruction(row);
             if (text.size() >= sizeof(target.text)) return -2;
             target.struct_size = sizeof(target);
+            target.address_space = row.address.space.value;
+            target.address = row.address.offset;
+            target.length = row.length;
+            for (std::size_t i = 0; i < row.length; ++i)
+                target.bytes[i] = std::to_integer<std::uint8_t>(row.bytes[i]);
+            copy_field(target.text, text);
+            ++*written;
+        }
+        return 0;
+    } catch (...) { return -2; }
+}
+int32_t project_block_instructions_text(void* context, void* handle, uint64_t block_id,
+                                        uint64_t start, uint32_t capacity,
+                                        HexLabInstructionText* output, uint32_t* written) {
+    if (written) *written = 0;
+    if (!context || !block_id || !written || !capacity || capacity > HEXLAB_PROJECT_MAX_PAGE || !output ||
+        start > std::numeric_limits<std::size_t>::max()) return -1;
+    std::lock_guard lock(static_cast<HostContext*>(context)->mutex);
+    auto* project = project_handle(context, handle);
+    if (!project) return -1;
+    try {
+        auto rows = (*project)->block_instructions(BlockId{block_id}, static_cast<std::size_t>(start), capacity);
+        if (!rows) return -2;
+        for (std::size_t i = 0; i < rows.value().size(); ++i)
+            if (output[i].struct_size < sizeof(HexLabInstructionText)) return -1;
+        for (const auto& row : rows.value()) {
+            auto& target = output[*written];
+            const auto text = format_instruction(row);
+            if (text.size() >= sizeof(target.text)) return -2;
             target.address_space = row.address.space.value;
             target.address = row.address.offset;
             target.length = row.length;
@@ -1739,7 +2197,8 @@ int32_t debugger_interrupt(void* context, void* handle) {
     auto* session = entry->value.get();
     try { return session->request_interrupt() ? 0 : -2; } catch (...) { return -2; }
 }
-int32_t debugger_wait_event(void* context, void* handle, std::uint32_t timeout_ms, HexLabDebugEvent* output) {
+template <typename EventRecord>
+int32_t debugger_wait_event_impl(void* context, void* handle, std::uint32_t timeout_ms, EventRecord* output) {
     if (!context || timeout_ms > HEXLAB_DEBUGGER_MAX_WAIT_MS || !output || output->struct_size < sizeof(*output)) return -1;
     auto entry = debugger_handle(context, handle); if (!entry) return -1;
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
@@ -1762,9 +2221,8 @@ int32_t debugger_wait_event(void* context, void* handle, std::uint32_t timeout_m
                 output->first_chance_present = event.value().first_chance ? 1u : 0u;
                 output->first_chance = event.value().first_chance.value_or(false) ? 1u : 0u;
                 std::fill(std::begin(output->reserved), std::end(output->reserved), 0);
-                // The stable plugin ABI keeps a 256-byte event message field,
-                // while the core may aggregate up to 4096 bytes. Preserve the
-                // event and report a visibly bounded prefix to older clients.
+                // Preserve the event and report a visibly bounded UTF-8 prefix
+                // if a future core message exceeds this record's capacity.
                 constexpr std::string_view marker = "...[truncated]";
                 constexpr auto capacity = sizeof(output->message) - 1;
                 const auto& message = event.value().message;
@@ -1790,6 +2248,14 @@ int32_t debugger_wait_event(void* context, void* handle, std::uint32_t timeout_m
         lock.unlock();
     } while (std::chrono::steady_clock::now() < deadline);
     return -2;
+}
+int32_t debugger_wait_event(void* context, void* handle, std::uint32_t timeout_ms,
+                            HexLabDebugEvent* output) {
+    return debugger_wait_event_impl(context, handle, timeout_ms, output);
+}
+int32_t debugger_wait_event_text(void* context, void* handle, std::uint32_t timeout_ms,
+                                 HexLabDebugEventText* output) {
+    return debugger_wait_event_impl(context, handle, timeout_ms, output);
 }
 int32_t debugger_continue(void* context, void* handle, std::uint64_t sequence, std::uint32_t status) {
     if (!context || status > HEXLAB_DEBUGGER_CONTINUE_NOT_HANDLED) return -1;
@@ -1947,6 +2413,129 @@ int32_t debugger_breakpoint_rule(void* context, void* handle, std::uint64_t id,
     } catch (...) { return -2; }
 }
 void host_log(void*, std::uint32_t, const char*) {}
+bool plugin_state_key(const char* raw, std::string& key) {
+    if (!raw) return false;
+    std::size_t size = 0;
+    while (size <= HEXLAB_PLUGIN_STATE_MAX_KEY && raw[size]) ++size;
+    if (!size || size > HEXLAB_PLUGIN_STATE_MAX_KEY) return false;
+    key.assign(raw, size);
+    return std::all_of(key.begin(), key.end(), [](unsigned char ch) {
+        return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+               (ch >= '0' && ch <= '9') || ch == '.' || ch == '_' || ch == '-';
+    });
+}
+int32_t host_plugin_state_get(void* raw, const char* raw_key, uint32_t capacity,
+                              uint8_t* output, uint32_t* required, uint64_t* revision) {
+    if (required) *required = 0;
+    if (revision) *revision = 0;
+    try {
+        std::string key;
+        if (!raw || !required || !revision || capacity > HEXLAB_PLUGIN_STATE_MAX_VALUE ||
+            (capacity && !output) || !plugin_state_key(raw_key, key))
+            return HEXLAB_PLUGIN_STATE_INVALID;
+        auto* context = static_cast<HostContext*>(raw);
+        if (!context->plugin_state_store || context->plugin_id.empty()) return HEXLAB_PLUGIN_STATE_FAILED;
+        auto& store = *context->plugin_state_store;
+        std::lock_guard lock(store.mutex);
+        if (!load_plugin_state(store)) return HEXLAB_PLUGIN_STATE_FAILED;
+        const auto plugin = store.plugins.find(context->plugin_id);
+        if (plugin == store.plugins.end()) return HEXLAB_PLUGIN_STATE_NOT_FOUND;
+        const auto entry = plugin->second.find(key);
+        if (entry == plugin->second.end()) return HEXLAB_PLUGIN_STATE_NOT_FOUND;
+        *revision = entry->second.revision;
+        if (!entry->second.present) return HEXLAB_PLUGIN_STATE_NOT_FOUND;
+        if (entry->second.value.size() > HEXLAB_PLUGIN_STATE_MAX_VALUE)
+            return HEXLAB_PLUGIN_STATE_FAILED;
+        *required = static_cast<uint32_t>(entry->second.value.size());
+        if (capacity < *required) return HEXLAB_PLUGIN_STATE_BUFFER_TOO_SMALL;
+        if (*required) std::memcpy(output, entry->second.value.data(), *required);
+        return HEXLAB_PLUGIN_STATE_OK;
+    } catch (...) { return HEXLAB_PLUGIN_STATE_FAILED; }
+}
+int32_t host_plugin_state_set(void* raw, const char* raw_key, uint64_t expected_revision,
+                              const uint8_t* value, uint32_t size, uint64_t* new_revision) {
+    if (new_revision) *new_revision = 0;
+    try {
+        std::string key;
+        if (!raw || !new_revision || size > HEXLAB_PLUGIN_STATE_MAX_VALUE || (size && !value) ||
+            !plugin_state_key(raw_key, key)) return HEXLAB_PLUGIN_STATE_INVALID;
+        auto* context = static_cast<HostContext*>(raw);
+        if (!context->plugin_state_store || context->plugin_id.empty()) return HEXLAB_PLUGIN_STATE_FAILED;
+        auto& store = *context->plugin_state_store;
+        std::lock_guard lock(store.mutex);
+        if (!load_plugin_state(store)) return HEXLAB_PLUGIN_STATE_FAILED;
+        auto plugin = store.plugins.find(context->plugin_id);
+        if (plugin == store.plugins.end()) {
+            if (store.plugins.size() >= 4096) return HEXLAB_PLUGIN_STATE_LIMIT;
+            plugin = store.plugins.try_emplace(context->plugin_id).first;
+        }
+        auto& entries = plugin->second;
+        auto entry = entries.find(key);
+        const auto current_revision = entry == entries.end() ? 0 : entry->second.revision;
+        *new_revision = current_revision;
+        if (current_revision != expected_revision) return HEXLAB_PLUGIN_STATE_CONFLICT;
+        if (current_revision == std::numeric_limits<uint64_t>::max()) return HEXLAB_PLUGIN_STATE_LIMIT;
+        if (entry == entries.end() && entries.size() >= 1024) return HEXLAB_PLUGIN_STATE_LIMIT;
+        std::size_t total = 0;
+        for (const auto& [existing_key, existing] : entries) {
+            (void)existing_key;
+            if (existing.present) total += existing.value.size();
+        }
+        const auto old_size = entry != entries.end() && entry->second.present ? entry->second.value.size() : 0;
+        constexpr std::size_t max_plugin_total = 4u * 1024u * 1024u;
+        constexpr std::size_t max_store_total = 64u * 1024u * 1024u;
+        if (total - old_size > max_plugin_total - size ||
+            store.total_bytes - old_size > max_store_total - size)
+            return HEXLAB_PLUGIN_STATE_LIMIT;
+        auto previous_plugins = store.plugins;
+        const auto previous_total_bytes = store.total_bytes;
+        std::vector<uint8_t> replacement;
+        if (size) replacement.assign(value, value + size);
+        auto& destination = entries[key];
+        destination.value = std::move(replacement);
+        destination.present = true;
+        destination.revision = current_revision + 1;
+        store.total_bytes = store.total_bytes - old_size + size;
+        *new_revision = destination.revision;
+        if (!save_plugin_state(store)) {
+            store.plugins = std::move(previous_plugins); store.total_bytes = previous_total_bytes;
+            *new_revision = current_revision; return HEXLAB_PLUGIN_STATE_FAILED;
+        }
+        return HEXLAB_PLUGIN_STATE_OK;
+    } catch (...) { return HEXLAB_PLUGIN_STATE_FAILED; }
+}
+int32_t host_plugin_state_erase(void* raw, const char* raw_key, uint64_t expected_revision,
+                                uint64_t* new_revision) {
+    if (new_revision) *new_revision = 0;
+    try {
+        std::string key;
+        if (!raw || !new_revision || !plugin_state_key(raw_key, key)) return HEXLAB_PLUGIN_STATE_INVALID;
+        auto* context = static_cast<HostContext*>(raw);
+        if (!context->plugin_state_store || context->plugin_id.empty()) return HEXLAB_PLUGIN_STATE_FAILED;
+        auto& store = *context->plugin_state_store;
+        std::lock_guard lock(store.mutex);
+        if (!load_plugin_state(store)) return HEXLAB_PLUGIN_STATE_FAILED;
+        const auto plugin = store.plugins.find(context->plugin_id);
+        if (plugin == store.plugins.end()) return HEXLAB_PLUGIN_STATE_NOT_FOUND;
+        const auto entry = plugin->second.find(key);
+        if (entry == plugin->second.end()) return HEXLAB_PLUGIN_STATE_NOT_FOUND;
+        *new_revision = entry->second.revision;
+        if (!entry->second.present) return HEXLAB_PLUGIN_STATE_NOT_FOUND;
+        if (entry->second.revision != expected_revision) return HEXLAB_PLUGIN_STATE_CONFLICT;
+        if (entry->second.revision == std::numeric_limits<uint64_t>::max()) return HEXLAB_PLUGIN_STATE_LIMIT;
+        auto previous_plugins = store.plugins;
+        const auto previous_total_bytes = store.total_bytes;
+        store.total_bytes -= entry->second.value.size();
+        entry->second.value.clear();
+        entry->second.present = false;
+        *new_revision = ++entry->second.revision;
+        if (!save_plugin_state(store)) {
+            store.plugins = std::move(previous_plugins); store.total_bytes = previous_total_bytes;
+            *new_revision = expected_revision; return HEXLAB_PLUGIN_STATE_FAILED;
+        }
+        return HEXLAB_PLUGIN_STATE_OK;
+    } catch (...) { return HEXLAB_PLUGIN_STATE_FAILED; }
+}
 int32_t host_register_action_impl(void* context, const char* menu_path, const char* id, const char* label,
                                   void* action_context, void (*invoke)(void*)) {
     if (!context || !id || !label || !invoke) return -1;
@@ -1974,9 +2563,30 @@ int32_t host_register_menu_action(void* context, const char* menu_path, const ch
 
 PluginManager::PluginManager(std::shared_ptr<ModuleProvider> provider)
     : impl_(std::make_shared<Impl>(std::move(provider))) {}
+PluginManager::PluginManager(std::shared_ptr<ModuleProvider> provider, std::filesystem::path state_store_path)
+    : impl_(std::make_shared<Impl>(std::move(provider))) {
+    impl_->plugin_state_store->path = std::move(state_store_path);
+}
 PluginManager::~PluginManager() = default;
 PluginManager::PluginManager(PluginManager&&) noexcept = default;
 PluginManager& PluginManager::operator=(PluginManager&&) noexcept = default;
+
+std::filesystem::path default_plugin_state_path() {
+#ifdef _WIN32
+    if (const auto* base = _wgetenv(L"LOCALAPPDATA"); base && *base)
+        return std::filesystem::path(base) / L"HexLab" / L"plugin-state-v1.bin";
+#else
+    if (const auto* base = std::getenv("XDG_STATE_HOME"); base && *base)
+        return std::filesystem::path(base) / "hexlab" / "plugin-state-v1.bin";
+    if (const auto* home = std::getenv("HOME"); home && *home)
+#ifdef __APPLE__
+        return std::filesystem::path(home) / "Library" / "Application Support" / "HexLab" / "plugin-state-v1.bin";
+#else
+        return std::filesystem::path(home) / ".local" / "state" / "hexlab" / "plugin-state-v1.bin";
+#endif
+#endif
+    return {};
+}
 
 Result<PluginCandidate::Manifest> read_manifest(const std::string& path) {
     if (path.empty()) return invalid("plugin manifest path is empty");
@@ -2053,15 +2663,44 @@ Result<PluginInfo> PluginManager::load(const std::string& path) {
     return load_locked(path);
 }
 
+Result<PluginInfo> PluginManager::load_candidate(const PluginCandidate& candidate) {
+    if (!impl_ || !impl_->provider || candidate.path.empty() || candidate.path.size() > 32768 ||
+        candidate.path.find('\0') != std::string::npos)
+        return invalid("plugin candidate path or module provider is missing or invalid");
+    std::lock_guard manager_lock(impl_->mutex);
+    if (!candidate.manifest) return load_locked(candidate.path);
+    if (!candidate.manifest->sha256.empty() && !valid_sha256(candidate.manifest->sha256))
+        return invalid("plugin candidate SHA-256 pin is malformed");
+    return load_locked(candidate.path, &*candidate.manifest);
+}
+
 Result<PluginInfo> PluginManager::load_locked(
     const std::string& path, const PluginCandidate::Manifest* expected) {
     if(impl_->scalar_ir_callback_depth)return Error{ErrorCode::busy,"Cannot load plugins during a scalar IR callback"};
+    std::filesystem::path expected_path;
+    try { expected_path = std::filesystem::u8path(path); }
+    catch (const std::filesystem::filesystem_error& error) {
+        return Error{ErrorCode::invalid_argument, std::string("plugin path is invalid: ") + error.what()};
+    }
+    if (expected && !expected->sha256.empty()) {
+        auto actual = hash_plugin_file(expected_path);
+        if (!actual) return Error{ErrorCode::integrity, "cannot verify plugin SHA-256 pin before open: " + actual.error().message};
+        if (actual.value() != expected->sha256)
+            return Error{ErrorCode::integrity, "plugin SHA-256 no longer matches the scanned manifest pin"};
+    }
     auto opened = impl_->provider->open(path);
     if (!opened) return opened.error();
     Impl::Loaded candidate;
     candidate.module = opened.value();
+    candidate.info.module_path = path;
     if (!candidate.module.handle || !candidate.module.lookup || !candidate.module.close)
         return Error{ErrorCode::malformed, "module provider returned an incomplete module"};
+    if (expected && !expected->sha256.empty()) {
+        auto actual = hash_plugin_file(expected_path);
+        if (!actual) return Error{ErrorCode::integrity, "cannot verify plugin SHA-256 pin after open: " + actual.error().message};
+        if (actual.value() != expected->sha256)
+            return Error{ErrorCode::integrity, "plugin changed while it was being opened; activation stopped"};
+    }
     auto* query_raw = candidate.module.lookup(candidate.module.handle, HEXLAB_PLUGIN_QUERY_SYMBOL);
     if (!query_raw) return Error{ErrorCode::malformed, "plugin query entry point is missing"};
     const auto query = reinterpret_cast<HexLabPluginQuery>(query_raw);
@@ -2072,6 +2711,7 @@ Result<PluginInfo> PluginManager::load_locked(
     candidate.host->abi_minor = HEXLAB_PLUGIN_ABI_MINOR;
     candidate.host->declared_capabilities = host_capabilities.data();
     candidate.host->declared_capability_count = static_cast<std::uint32_t>(host_capabilities.size());
+    candidate.host->plugin_state_api = &candidate.context->plugin_state_api;
     candidate.host->host_context = candidate.context.get();
     candidate.host->log = host_log;
     candidate.host->register_action = host_register_action;
@@ -2098,12 +2738,19 @@ Result<PluginInfo> PluginManager::load_locked(
         active_project_breakpoints_query,
         active_project_breakpoint_set};
     candidate.host->active_project_breakpoint_api = &candidate.context->active_project_breakpoint_api;
+    candidate.context->plugin_state_store = impl_->plugin_state_store;
+    candidate.context->plugin_state_api = HexLabPluginStateApi{
+        sizeof(HexLabPluginStateApi), HEXLAB_PLUGIN_STATE_API_VERSION,
+        candidate.context.get(), host_plugin_state_get, host_plugin_state_set, host_plugin_state_erase};
     candidate.context->project_api = HexLabProjectApi{sizeof(HexLabProjectApi), HEXLAB_PROJECT_API_VERSION,
         candidate.context.get(), project_create, project_open, project_close, project_analyze,
         project_summary, project_functions, project_instructions, project_references, project_strings,
         project_rename, project_comment, project_bookmark, project_read,
         project_import_header, project_types, project_assign_type, project_declarations, project_enum_values,
-        project_function_blocks, project_block_instructions, project_block_successors};
+        project_function_blocks, project_block_instructions, project_block_successors,
+        project_annotation_batch, project_undo, project_redo, project_function_owners,
+        project_instructions_text, project_block_instructions_text, project_strings_text,
+        project_outgoing_references_range};
     candidate.host->project_api = &candidate.context->project_api;
     candidate.context->debugger_api = HexLabDebuggerApi{sizeof(HexLabDebuggerApi), HEXLAB_DEBUGGER_API_VERSION,
         candidate.context.get(), debugger_create, debugger_close, debugger_processes, debugger_launch,
@@ -2113,7 +2760,7 @@ Result<PluginInfo> PluginManager::load_locked(
         debugger_write_registers, debugger_add_breakpoint, debugger_remove_breakpoint,
         debugger_enable_breakpoint, debugger_breakpoints, debugger_set_breakpoint_ignore_count,
         debugger_set_breakpoint_condition, debugger_set_breakpoint_logpoint,
-        debugger_breakpoint_rule};
+        debugger_breakpoint_rule, debugger_wait_event_text};
     candidate.host->debugger_api = &candidate.context->debugger_api;
     int32_t query_status = -1;
     try { query_status = query(HEXLAB_PLUGIN_ABI_MAJOR, candidate.host.get(), &api); }
@@ -2609,14 +3256,28 @@ Result<std::vector<PluginCandidate>> PluginManager::scan_directory(
                     const auto manifest_status = std::filesystem::symlink_status(manifest_path, manifest_ec);
                     if (!manifest_ec) {
                         if (std::filesystem::exists(manifest_status)) {
-                            const auto manifest_utf8 = manifest_path.u8string();
-                            const std::string manifest_name(reinterpret_cast<const char*>(manifest_utf8.data()),
-                                                            manifest_utf8.size());
-                            auto parsed = read_manifest(manifest_name);
-                            if (parsed) {
-                                candidate.manifest = std::move(parsed.value());
+                            if (std::filesystem::is_symlink(manifest_status) ||
+                                !std::filesystem::is_regular_file(manifest_status)) {
+                                candidate.manifest_error =
+                                    "rejected plugin manifest: sidecar must be a regular, non-symlink file";
+                            } else {
+                                const auto manifest_utf8 = manifest_path.u8string();
+                                const std::string manifest_name(reinterpret_cast<const char*>(manifest_utf8.data()),
+                                                                manifest_utf8.size());
+                                auto parsed = read_manifest(manifest_name);
+                                if (parsed) {
+                                    candidate.manifest = std::move(parsed.value());
+                                    if (!candidate.manifest->sha256.empty()) {
+                                        auto actual = hash_plugin_file(absolute);
+                                        if (actual) {
+                                            candidate.module_sha256 = std::move(actual.value());
+                                            if (candidate.module_sha256 != candidate.manifest->sha256)
+                                                candidate.integrity_error = "module SHA-256 does not match manifest";
+                                        } else candidate.integrity_error = actual.error().message;
+                                    }
+                                }
+                                else candidate.manifest_error = parsed.error().message;
                             }
-                            else candidate.manifest_error = parsed.error().message;
                         }
                     } else if (manifest_ec != std::errc::no_such_file_or_directory) {
                         candidate.manifest_error = "cannot inspect plugin manifest: " + manifest_ec.message();
@@ -2689,6 +3350,74 @@ Result<std::vector<std::string>> PluginManager::unload_with_dependents(const std
         if (!removed) return removed.error();
     }
     return order;
+}
+
+Result<PluginUnloadPlan> PluginManager::plan_unload_locked(const std::string& root_id, bool all) const {
+    if (impl_->loaded.size() > 256)
+        return Error{ErrorCode::resource_limit, "Cleanup review exceeds 256 loaded plugins"};
+    std::size_t edges = 0, id_bytes = 0;
+    for (const auto &item : impl_->loaded) {
+        if (item.info.resolved_dependencies.size() > 4096 - edges || item.info.id.size() > 65536 - id_bytes)
+            return Error{ErrorCode::resource_limit, "Cleanup review exceeds 4096 dependency edges or 64 KiB of plugin IDs"};
+        edges += item.info.resolved_dependencies.size();
+        id_bytes += item.info.id.size();
+    }
+    if (!all && std::none_of(impl_->loaded.begin(), impl_->loaded.end(), [&](const auto &item) {
+            return item.info.id == root_id;
+        })) return Error{ErrorCode::out_of_bounds, "Cleanup root plugin is no longer loaded"};
+    PluginUnloadPlan plan;
+    plan.manager_identity = impl_;
+    plan.generation = impl_->semantic_generation;
+    plan.root_plugin_id = all ? std::string{} : root_id;
+    plan.all = all;
+    std::unordered_set<std::string> selected;
+    if (!all) selected.insert(root_id);
+    for (const auto &item : impl_->loaded) {
+        if (all || selected.contains(item.info.id) ||
+            std::any_of(item.info.resolved_dependencies.begin(), item.info.resolved_dependencies.end(),
+                [&](const auto &dependency) { return selected.contains(dependency); })) {
+            selected.insert(item.info.id);
+            plan.plugin_ids.push_back(item.info.id);
+        }
+    }
+    std::reverse(plan.plugin_ids.begin(), plan.plugin_ids.end());
+    std::unordered_set<std::string> retained;
+    for (const auto &item : impl_->loaded)
+        if (selected.contains(item.info.id))
+            for (const auto &dependency : item.info.resolved_dependencies)
+                if (!selected.contains(dependency)) retained.insert(dependency);
+    plan.retained_provider_ids.assign(retained.begin(), retained.end());
+    std::sort(plan.retained_provider_ids.begin(), plan.retained_provider_ids.end());
+    return plan;
+}
+
+Result<PluginUnloadPlan> PluginManager::plan_unload(const std::string& root_id, bool all) const {
+    if (!impl_) return invalid("plugin manager is unavailable");
+    std::lock_guard lock(impl_->mutex);
+    return plan_unload_locked(root_id, all);
+}
+
+Result<PluginUnloadResult> PluginManager::unload_reviewed(const PluginUnloadPlan& plan) {
+    if (!impl_) return invalid("plugin manager is unavailable");
+    std::lock_guard lock(impl_->mutex);
+    const auto owner = plan.manager_identity.lock();
+    if (owner.get() != impl_.get())
+        return Error{ErrorCode::conflict, "Plugin cleanup plan belongs to another or expired manager"};
+    if (plan.generation != impl_->semantic_generation)
+        return Error{ErrorCode::conflict, "Plugin inventory changed after cleanup review; review it again"};
+    auto current = plan_unload_locked(plan.root_plugin_id, plan.all);
+    if (!current) return current.error();
+    if (plan.root_plugin_id != current.value().root_plugin_id || plan.plugin_ids != current.value().plugin_ids ||
+        plan.retained_provider_ids != current.value().retained_provider_ids)
+        return Error{ErrorCode::conflict, "Plugin cleanup plan changed; review it again"};
+    PluginUnloadResult result;
+    result.removed.reserve(plan.plugin_ids.size());
+    for (const auto &id : plan.plugin_ids) {
+        auto removed = unload_locked(id);
+        if (!removed) { result.failure = removed.error(); return result; }
+        result.removed.push_back(id);
+    }
+    return result;
 }
 
 Status PluginManager::unload_all() {

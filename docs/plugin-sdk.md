@@ -10,9 +10,34 @@ public ABI headers. An external module can call
 `.hexlab-plugin` sidecar. The package includes a same-major-compatible version
 file and the packaging helper, so the example does not need a source checkout.
 See [`examples/plugins/minimal-cpp`](../examples/plugins/minimal-cpp/README.md)
-for a complete action plugin and build/install commands.
+for a complete action plugin and build/install commands. The standalone [`examples/plugins/flat-image-loader-cpp`](../examples/plugins/flat-image-loader-cpp/README.md) module demonstrates the optional ABI 1.10 loader image callback with a bounded magic probe, exact input reads, cancellation, and a single flat mapping. The standalone [`examples/plugins/debugger-processes-cpp`](../examples/plugins/debugger-processes-cpp/README.md) module shows RAII ownership and paged process enumeration through `DebuggerClient`.
+
+The standalone [`examples/plugins/project-annotation-batch-cpp`](../examples/plugins/project-annotation-batch-cpp/README.md) analysis provider demonstrates the ABI 1.5+ atomic annotation batch through `ProjectClient`: it reads an edit revision, selects a function, then applies a rename and bookmark together. A stale revision rejects the batch without partially applying edits.
 
 Native modules include `hexlab/plugins/sdk.h` from C or `sdk.hpp` from C++. The public ABI is a versioned C ABI: `HexLabPluginApi`, `HexLabHostApi`, and the project service table contain fixed-width integers, borrowed strings, opaque contexts, and C function pointers only. `HEXLAB_PLUGIN_QUERY_SYMBOL` is the exported entry-point name. Modules negotiate the major version during query; minor version and `struct_size` permit append-only growth. The SDK does not pass C++ objects, exceptions, or allocator-owned containers across the module boundary.
+
+`sdk.h` provides `HEXLAB_PLUGIN_HAS_FIELD(table, TableType, field)` for every
+versioned table. It handles null pointers, reads `struct_size` once, and checks
+the requested field extent without overflowing size arithmetic. Use it before
+reading optional callbacks or table tails; a present field can still be null
+when that callback is optional. The C++ `ProjectClient`, `DebuggerClient`,
+`ActiveDocumentClient`, `ActiveProjectBreakpointClient`, and
+`ActiveDebuggerClient` use the same helper internally. For example:
+
+```c
+if (HEXLAB_PLUGIN_HAS_FIELD(host, HexLabHostApi, register_processor_extension) &&
+    host->register_processor_extension) {
+    /* register an optional processor extension */
+}
+```
+
+This makes source compiled against a newer SDK safe to run with older hosts:
+the descriptor's reported size, rather than the SDK header's current size,
+decides whether an appended field may be read.
+
+The C++ debugger-rule wrappers check each field's extent before loading its
+callback pointer. They do not convert function pointers to object pointers,
+so the public header also compiles with standard C++17 GCC.
 
 ABI 1.4 keeps the legacy string `capabilities` array intact and appends an optional `declared_capabilities` table to `HexLabPluginApi`. Each `HexLabCapability` names a service contract and declares its own nonzero major version, minor version, and flags. Hosts read the table only when `struct_size` covers both appended fields, validate bounded IDs and unique declarations, and copy it into `PluginInfo`; ABI 1.0–1.3 modules therefore remain valid. Unknown IDs and versions remain descriptive metadata: a host does not infer support for a newer contract from a matching string. The C SDK offers `HEXLAB_PLUGIN_API_INITIALIZER_V14`; the original initializer remains source-compatible.
 
@@ -21,6 +46,14 @@ Capability consumers can call `PluginManager::supports_capability(plugin_id, cap
 The desktop Plugins panel shows each versioned capability as `capability.id@major.minor` alongside legacy labels, making the actual extension contract visible during load and review.
 
 For C modules, define `hexlab_plugin_query` with `HEXLAB_PLUGIN_EXPORT`, populate the descriptor with `HEXLAB_PLUGIN_API_INITIALIZER`, and implement `start`/`stop`. C++ modules can use `hexlab::plugins::sdk::make_api` to produce the identical C layout. Link the CMake interface target `hexlab::plugin_sdk` for the public include path; host applications use `hexlab::plugins::PluginManager` from `hexlab::plugins` to load modules.
+
+On Windows, the host opens a plugin with `LoadLibraryExW` and restricts
+dependent-module lookup to the plugin module's directory plus Windows' default
+system directories. The process working directory is not searched for plugin
+dependencies. Package private DLL dependencies beside the plugin module (or in
+a standard system location); do not rely on the application's current
+directory. This narrows accidental DLL preloading, but native plugins and their
+dependencies still execute in-process with the host's privileges.
 
 The host initializes the `start` output instance to null before calling the callback. A nonzero return means initialization failed; the host then calls `stop` exactly once before unloading the module, passing the value left in the output slot. The value can be null, so `stop` must accept null and release resources acquired before the failure. The module must keep the stop callback and its code valid until that cleanup call completes.
 
@@ -34,7 +67,65 @@ throwing `stop` callback may still leave plugin-owned resources unreleased.
 
 ABI 1.1 appends an optional `project_api` pointer to `HexLabHostApi`; older action-only plugins remain valid. A plugin must check `host->struct_size` before reading the pointer and tolerate a null pointer. The table has its own `struct_size` and `api_version` fields. It supports project create, open, close, analyze, summary, and paged function queries. Create accepts automatic format selection and PE, ELF, or Mach-O explicitly. Archive and raw imports are omitted because the table currently requires a single mapped image and raw loader options need an architecture-specific profile.
 
+ABI 1.28 appends `undo` and `redo` to `HexLabProjectApi`, preserving the entire
+preceding table prefix and `HEXLAB_PROJECT_API_VERSION` 1. Check `struct_size`
+through the desired callback, or use `ProjectClient::supports_history()` and
+the C++ `undo(expected_edit_revision)`/`redo(expected_edit_revision)` wrappers.
+The host declares `project.history` v1.28 for modules requiring this contract.
+Pass `HexLabProjectSummary::edit_revision` from a current summary; each call
+moves one durable workspace history group using the same project path as native
+automation. Adjacent steps with the same nonzero group ID move together; an
+ungrouped step moves alone, and an atomic annotation batch stays intact.
+A successful change
+can invalidate derived facts and prior entity IDs; read a new summary and
+refresh or analyze before consuming those facts.
+
+ABI 1.29 appends `function_owners` to `HexLabProjectApi` and declares the
+`project.function-owners` v1.29 capability. The paged query maps one address to
+every recovered function that owns it, returning stable function IDs and entry
+addresses. This preserves shared-tail ownership instead of forcing a provider
+to guess which function a block belongs to. Each output record is
+`HexLabFunctionOwner` and is size-checked like other append-only records. Its
+IDs are tied to the current derived analysis and can expire after analysis is
+replaced or the project is reopened. `ProjectClient::supports_function_owners`
+and `function_owners` provide the C++ wrapper; older host tables remain valid
+and report the capability as unavailable.
+
+ABI 1.30 appends `instructions_text` and `block_instructions_text` to
+`HexLabProjectApi` and declares `project.instruction-text` v1.30. These pages
+return the same address and bytes as the original instruction callbacks, with
+`HexLabInstructionText.text` holding up to 1023 UTF-8 bytes plus its terminator.
+The ABI 1 `HexLabInstruction.text[256]` record and its callbacks keep their
+original layout and behavior. Use `ProjectClient::supports_instruction_text()`
+and the two `*_text` page methods; the C++ wrapper size-initializes the output
+records. The CFG report example requires this capability and consumes the
+extended block-instruction pages.
+
+ABI 1.32 appends `strings_text` to `HexLabProjectApi` and declares the
+`project.string-preview` v1.32 capability. Its `HexLabStringText.preview`
+buffer carries up to 1023 UTF-8 bytes from the analysis preview. The original
+`HexLabString.preview[256]` layout and `strings` callback remain unchanged.
+Use `ProjectClient::supports_string_preview()` and `strings_preview()` to query
+the larger page; old host tables report it as unavailable. The CFG report
+example pages a bounded sample of these larger previews.
+
+The result is `HEXLAB_PROJECT_HISTORY_OK` (0), `INVALID` (-1) for an invalid or
+closed handle, `FAILED` (-2) for a read-only handle, an unavailable history
+step, wrong owner thread, or another project failure, and `STALE` (-3) for an
+edit-revision conflict. The full constant names use the
+`HEXLAB_PROJECT_HISTORY_` prefix. Revision validation occurs before moving
+history and again at the database transaction, so another connection's edits
+cannot be silently undone against an obsolete snapshot. A stale request keeps
+the history position unchanged. Call summary again after success before
+issuing the inverse operation. Callbacks use the existing per-plugin handle
+ownership, serialization, and exception containment; they do not affect the
+desktop-owned active project unless that is the saved project explicitly
+opened by the module. Read-only history listing/preview and history state
+notifications are not yet exposed by this C ABI.
+
 ABI 1.13 appends native type authoring callbacks to `HexLabProjectApi`: `import_header`, `types`, and `assign_type`. Check the table's `struct_size` through each callback before using it. Header import accepts at most 4 MiB of bounded C declarations and stores typedefs, struct/union/enum tags, global object types, and function prototypes in one atomic project command. Enumerator names and exact signed numeric values remain inside the enum type body. Identical reimports succeed without adding redundant history. There is no implicit filesystem or include resolution. Null options derive pointer width from the primary 32-bit or 64-bit project address space: ILP32 for 32-bit images, LLP64 for PE64, and LP64 for other 64-bit images. Other target models require explicit scalar byte widths in `HexLabHeaderImportOptions`; callers may override the inferred model. Legacy `types` pages keep their original layout and logical row set: only `DeclarationKind::type` definitions participate in paging, so imported object/function declarations do not alter ABI 1.13 indices. ABI 1.14 `declarations` pages include all three roles. `assign_type` assigns/removes a declaration's type at a mapped address through normal project history. Imports and assignments require writable project handles. Header replacement planning carries the complete expected destination row; a changed type body, name, origin, or declaration role rejects the import as a conflict instead of overwriting a newer edit.
+
+ABI 1.35 extends `HexLabHeaderImportOptions` with `long_double_bytes` and explicit floating-point alignments. The fields are an optional struct tail, so callers that provide the older struct size remain accepted. A zero `long_double_bytes` selects the host's model default; zero alignment uses storage width. Non-power-of-two floating storage sizes require an explicit power-of-two alignment. Check the host's `abi_minor` before relying on the extended layout controls.
 
 ABI 1.14 appends `declarations` and `enum_values`, preserving every ABI 1.0-1.13 table prefix. `HexLabDeclarationRecord` adds a durable role (`TYPE`, `OBJECT`, or `FUNCTION`) and enum constant count. `enum_values(type_id, start, capacity, ...)` pages through exact stored enum name/value pairs, including named enum references, with signedness and 64-bit two's-complement value bits. Initialize every output record's `struct_size`. Object/function declarations carry no inferred runtime address; address assignment is explicit. `HexLabHeaderImportSummary.imported_types` keeps its ABI 1.13 typedef-plus-tag count; object/function rows are visible through declaration pages. `types::format_enumerators` formats exact stored values in signed decimal notation when appropriate.
 
@@ -211,7 +302,7 @@ which downstream IR consumers can use. Generic extension instructions use
 `Opcode::opaque`, so opcode-specific lifting, stack modeling, and architecture
 state effects are not inferred. Absolute-memory operands carry a single
 resolved address; the ABI cannot represent base-plus-index memory addressing.
-The record does not describe flags, implicit
+The ABI 1.3 record does not describe flags, implicit
 effects, delay slots, or architecture-specific predicates. Callbacks receive
 at most 32 input bytes and results have fixed capacities. As with other
 in-process callbacks, execution time cannot be preempted; dispatch holds the
@@ -235,7 +326,7 @@ UI event thread and prevents an action callback from racing a lifecycle change.
 The panel reports the action result when the callback returns; the callback is
 synchronous and cannot be forcibly interrupted by the host.
 
-Project paths are limited to 32,767 UTF-8 bytes; a function page must contain 1–4,096 entries. Callback return `0` means success, `-1` means invalid arguments or incompatible data, and `-2` means the host operation failed. No C++ exception crosses the ABI. Projects are synchronous and thread-affine: create/open, analyze, query, and close a handle on the same thread. A plugin should close every handle before returning from `stop`. The host also releases remaining handles after `stop` and before unloading the module. Handles become invalid when closed or when the plugin unloads. Callers initialize `HexLabProjectSummary.struct_size` and every output `HexLabFunction.struct_size` before invoking the corresponding callback. The host reports derived status using the `DerivedStatus` ordinal (fresh, pending, stale, incomplete, file-only); callers should treat unknown future values conservatively.
+Project paths are limited to 32,767 UTF-8 bytes; a function page must contain 1–4,096 entries. Callback return `0` means success, `-1` means invalid arguments or incompatible data, and `-2` means the host operation failed. No C++ exception crosses the ABI. Projects are synchronous and thread-affine: create/open, analyze, query, and close a handle on the same thread. A plugin should close every handle before returning from `stop`. The host also releases remaining handles after `stop` and before unloading the module. Handles become invalid when closed or when the plugin unloads. C callers initialize `HexLabProjectSummary.struct_size` and every output record's `struct_size` before invoking callbacks. The C++ `ProjectClient` initializes `struct_size` for every record in a paged query's provided capacity before calling the host, so zero-initialized arrays can be passed directly. The host reports derived status using the `DerivedStatus` ordinal (fresh, pending, stale, incomplete, file-only); callers should treat unknown future values conservatively.
 
 The C++ `hexlab::plugins::sdk::ProjectClient` wraps the table with move-only RAII ownership. It is header-only and keeps the C ABI unchanged. For example:
 
@@ -251,7 +342,7 @@ if (project.available() &&
 }
 ```
 
-The same wrapper exposes `import_header`, paged `types`, and `assign_type`; `supports_types()` checks that the complete ABI 1.13 tail is present. For example, after opening a writable project, call `import_header(source, nullptr, summary)`, initialize a page of `HexLabTypeRecord` entries and call `types(0, count, records, written)`, then pass a chosen record's ID and mapped address to `assign_type`. ABI 1.14 adds `declarations`, `enum_values`, and `supports_declarations()` for role-aware queries and exact enumerator values.
+The same wrapper exposes `import_header`, paged `types`, and `assign_type`; `supports_types()` checks that the complete ABI 1.13 tail is present. For example, after opening a writable project, call `import_header(source, nullptr, summary)`, pass a zero-initialized page of `HexLabTypeRecord` entries to `types(0, count, records, written)`, then pass a chosen record's ID and mapped address to `assign_type`. ABI 1.14 adds `declarations`, `enum_values`, and `supports_declarations()` for role-aware queries and exact enumerator values. Automatic record initialization applies to all paged `ProjectClient` queries; direct C callback callers keep the explicit initialization requirement.
 
 `tests/plugins_sdk/example_plugin.c` exercises the C callbacks during module startup. `tests/plugins_sdk/sdk_tests.cpp` is a runnable native host example and contract test: it writes a tiny ELF executable, loads the module with the real platform loader, and verifies create/analyze/summary/function-page/close/open plus C++ RAII and page-bound checks. In the full build, run it through `ctest -R '^plugin_sdk$'`; to run manually, invoke `hexlab_sdk_tests <path-to-hexlab_sdk_example-module>`.
 
@@ -392,20 +483,28 @@ larger than 64 KiB. `read_manifest(path)` exposes the same bounded parser for
 package managers. Scan results leave `manifest` empty when there is no sidecar;
 `manifest_error` records an invalid/unreadable sidecar without hiding the
 module candidate. Neither scanning nor manifest parsing opens or queries the
-module. Metadata is advisory: after explicit load, call
-`manifest_matches(candidate.manifest.value(), loaded_info)` before presenting
-it as verified. A manifest is not a signature or trust boundary.
+module. When a manifest pins `sha256`, directory scanning records the
+scan-time module digest or an integrity error. `PluginManager::load_candidate`
+rechecks the pin before and after opening the module and checks declared
+identity/capabilities before `start`; dependency activation applies the same
+checks. A mismatch rejects candidate activation. Direct `load(path)` is an
+explicit path load and has no sidecar snapshot to enforce. A manifest is not a
+signature, does not identify a publisher, and does not sandbox native code.
 
-Scanning does not open, query, or execute any candidate. It only identifies plausible module filenames; it cannot prove that a file exports the HexLab query symbol or has a compatible ABI. The host should show candidates to the user and call `PluginManager::load` only after selection. Loading a native module executes code in the host process (including platform loader initializers), so directory discovery is not a trust or sandbox boundary. Symlinked scan roots are rejected, and symlink entries are skipped.
+Scanning does not open, query, or execute any candidate. It only identifies plausible module filenames; it cannot prove that a file exports the HexLab query symbol or has a compatible ABI. The host should show candidates to the user and call `PluginManager::load_candidate` only after selection. Loading a native module executes code in the host process (including platform loader initializers), so directory discovery is not a trust or sandbox boundary. Symlinked scan roots are rejected, and symlink entries are skipped.
 
 The desktop Plugins view exposes this as **Scan Directory...**. Its separate “Discovered modules (not loaded)” list shows each candidate path, declared identity, version, and a bounded summary of declared capabilities; absent or invalid sidecar metadata is shown as a status. Scanning runs on the plugin operation worker without quiescing analysis or changing extension state. No candidate is preselected or loaded; the user must select a row and press **Load Selected Candidate**. That action then uses the normal serialized load and extension-quiescence path. The existing **Load Plugin** file/path action also remains an explicit load.
 
-After loading a selected candidate, the desktop compares the scan-time sidecar
-snapshot with the identity, provided capabilities, and required
-capabilities returned by the module. The operation status reports a match,
-mismatch, invalid/unreadable
-sidecar, or no manifest; a mismatch does not silently present the sidecar as
-verified. This remains advisory and does not establish module authenticity.
+The candidate review pane shows the full path, sidecar identity, SHA-256 pin
+and scan result, and each requirement's preflight resolution. **Load Selected
+Candidate** calls `PluginManager::load_candidate`; any declared hash pin is
+rechecked before and after module open, and loaded identity/capabilities are
+checked before `start`. Direct path loading has no scanned sidecar pin.
+
+For a selected candidate, identity and capability mismatches are rejected
+before `start`. The operation status reports a match, mismatch, invalid or
+unreadable sidecar, or no manifest. Direct path loading can still proceed
+without a manifest snapshot; it does not establish module authenticity.
 
 ABI 1.8 appends the optional `debugger_api` pointer to `HexLabHostApi`. Check
 `HexLabHostApi.struct_size` through that field, then check the debugger table's
@@ -439,8 +538,58 @@ synchronous, and a plugin must not unload while one of its own worker threads
 is still using a session. The C++ SDK offers move-only RAII
 `hexlab::plugins::sdk::DebuggerClient`; it checks the appended host field and
 creates/closes a session while exposing the versioned table for operations.
-For example, `DebuggerClient debug(host); if (debug.create() == 0) { auto* api
-= debug.api(); /* call api->launch(api->host_context, debug.native_handle(), …) */ }`.
+`create()` initializes its output handle, closes a non-null handle returned on
+failure, and rejects a host that reports success without returning a handle.
+`processes(start, capacity, output, written)` pages the backend process list and
+initializes each output record, up to the debugger page limit. It also wraps
+launch/attach/remote-connect/state/detach, interrupt requests, event
+continuation, bounded memory reads/writes, thread/module/memory-region pages,
+breakpoint add/remove/enable/list, and paged register reads/writes. These
+methods check callback availability in the runtime table and initialize the
+records they pass. For example:
+
+```cpp
+#include <array>
+
+void inspect(hexlab::plugins::sdk::DebuggerClient& debug,
+            std::uint64_t process_id, std::uint64_t thread_id,
+            std::uint64_t address) {
+    HexLabDebugProcess process{};
+    if (debug.attach(process_id, process) == 0) {
+        std::uint32_t state = 0;
+        std::uint8_t has_process = 0;
+        debug.state(state, has_process, process);
+        std::array<HexLabDebugThread, 32> threads{};
+        std::uint32_t thread_count = 0;
+        debug.threads(0, static_cast<std::uint32_t>(threads.size()), threads.data(), thread_count);
+        std::array<HexLabDebugModule, 32> modules{};
+        std::uint32_t module_count = 0;
+        debug.modules(0, static_cast<std::uint32_t>(modules.size()), modules.data(), module_count);
+        std::array<HexLabDebugMemoryRegion, 32> regions{};
+        std::uint32_t region_count = 0;
+        debug.memory_regions(0, static_cast<std::uint32_t>(regions.size()), regions.data(), region_count);
+        std::array<HexLabDebugBreakpoint, 32> breakpoints{};
+        std::uint32_t breakpoint_count = 0;
+        debug.breakpoints(0, static_cast<std::uint32_t>(breakpoints.size()),
+                          breakpoints.data(), breakpoint_count);
+        std::array<std::uint8_t, 16> bytes{};
+        debug.read_memory(address, static_cast<std::uint32_t>(bytes.size()), bytes.data());
+        std::array<HexLabDebugRegister, 32> registers{};
+        std::uint32_t written = 0;
+        debug.read_registers(thread_id, 0, static_cast<std::uint32_t>(registers.size()),
+                             registers.data(), written);
+    }
+}
+```
+
+`launch` accepts a `HexLabDebuggerTarget` and initializes a local copy's size
+field before calling the host. `write_registers` initializes each input
+record's size field; callers still supply the desired register values and byte
+counts. `connect_remote`, `add_breakpoint`, and other output-record methods
+initialize the returned process or breakpoint. The process inventory example
+shows page ownership, while its event-text snippet shows the larger ABI 1.31
+message record. The legacy 256-byte event callback remains available through
+the raw table for modules that need to support older hosts.
 
 Backend support depends on platform and target. The native backend is only
 available where the host's native debugger implementation is supported;
@@ -452,7 +601,22 @@ of the native plugin API.
 
 The `desktop_sdk_plugin` GUI integration test loads the same compiled C module through the desktop Plugins panel, creates and analyzes a fixture project during module startup, displays its metadata and action, invokes the action, and verifies unload. Its missing-module case verifies failed loading returns a nonzero test result without leaving a modal dialog open.
 
-ABI 1.2 appends optional paged instruction, outgoing-reference, and string callbacks to `HexLabProjectApi`. Check `struct_size` through the individual callback offset before using each extension; the C++ `ProjectClient` exposes `supports_instructions()`, `supports_references()`, and `supports_strings()`. Every output row's `struct_size` must be initialized before invoking a page callback. Instruction text and string previews use fixed 256-byte buffers; records too large for those buffers fail the page rather than being silently truncated. Reference targets distinguish mapped locations, external identities, and unresolved references. The native SDK integration fixture now includes a direct call and a string, and verifies each query through the C plugin module.
+ABI 1.2 appends optional paged instruction, outgoing-reference, and string callbacks to `HexLabProjectApi`. Check `struct_size` through the individual callback offset before using each extension; the C++ `ProjectClient` exposes `supports_instructions()`, `supports_references()`, and `supports_strings()`. Instruction text and string previews in the legacy records use fixed 256-byte buffers; records too large for those buffers fail the page rather than being silently truncated. ABI 1.30 adds a separate larger instruction-text record while preserving those legacy layouts. Reference targets distinguish mapped locations, external identities, and unresolved references. The native SDK integration fixture now includes a direct call and a string, and verifies each query through the C plugin module.
+
+ABI 1.34 appends `outgoing_references_range` to `HexLabProjectApi` and declares
+`project.references.range` v1.0. It pages references whose source address is
+inside a nonempty half-open virtual range `[begin, begin + size)`. The request
+rejects address overflow, requires current derived analysis, and accepts page
+capacities from 1 through `HEXLAB_PROJECT_MAX_PAGE`. Returned `HexLabReference`
+records retain mapped, file-offset, external, and unresolved targets. Callers
+advance `start` by the number of written records and stop when a page is short.
+The C++ `ProjectClient` exposes `supports_outgoing_references_range()` and the
+corresponding wrapper. Older project-table prefixes remain unchanged.
+
+The standalone Function CFG Report example queries the first byte of each
+inspected block with this API, counts returned outgoing-reference rows, and
+marks the report truncated when its 16-row per-block page fills. It does not
+assume a block extent from its start address.
 
 ABI 1.5 appends optional `rename`, `comment`, and `bookmark` callbacks to
 `HexLabProjectApi`. Older hosts and plugins remain compatible through the
@@ -468,6 +632,39 @@ return `-1`, host command failures return `-2`, and success returns `0`.
 The SDK integration fixture now edits the sample project from its C module,
 checks malformed locations and oversized names are rejected, and reopens the
 project to verify the name, comment, and bookmark were persisted.
+
+The append-only `annotation_batch` tail groups up to 4,096 rename, comment, and
+bookmark edits into one atomic project command. Each entry has a fixed-size
+record, tagged edit kind, address/file location, bookmark-removal flag, and a
+borrowed UTF-8 value copied by the host before it returns. The caller supplies
+the edit revision from `HexLabProjectSummary.edit_revision` and an undo group;
+the host rejects stale revisions before applying any entries. A successful
+batch creates one history step, so undo and redo act on the complete group.
+`ProjectClient::supports_annotation_batch()` and
+`ProjectClient::annotation_batch()` check and invoke this optional table tail.
+Older summary records remain valid; the host writes the appended revision only
+when the caller's `struct_size` includes it.
+
+```cpp
+HexLabProjectSummary summary{};
+if (project.summary(summary) == 0) {
+    HexLabProjectAnnotationEdit edits[2]{};
+    for (auto& edit : edits) {
+        edit.struct_size = sizeof(edit);
+        edit.location.struct_size = sizeof(edit.location);
+        edit.location.kind = HEXLAB_PROJECT_LOCATION_ADDRESS;
+    }
+    edits[0].kind = HEXLAB_PROJECT_EDIT_RENAME;
+    edits[0].location.address_space = 0;
+    edits[0].location.offset = 0x401000;
+    edits[0].value = "entry_point";
+    edits[1].kind = HEXLAB_PROJECT_EDIT_BOOKMARK;
+    edits[1].location.address_space = 0;
+    edits[1].location.offset = 0x401000;
+    edits[1].value = "reviewed";
+    project.annotation_batch(summary.edit_revision, 7, edits, 2);
+}
+```
 
 ABI 1.11 appends an optional exact `read` callback to `HexLabProjectApi`. It
 copies bytes from the project's effective image at either a mapped address or
@@ -508,7 +705,7 @@ ABI 1.7 appends `decode_semantic_v2` to the processor descriptor and leaves the 
 
 `examples/plugins/semantic-v2` is a standalone CMake module example. It registers an x86-64 processor extension and recognizes `8B 04 88` as a `mov` from `[rax+rcx*4]` into `eax`, demonstrating typed register and base-index memory operands. Configure it with CMake, build the module, then load that module using the CLI's `--plugin` option with a matching x86-64 disassembly request. The example deliberately declines all unrelated byte sequences.
 
-ABI 1.16 appends optional `decode_semantic_v3` to `HexLabProcessorExtension`. The callback embeds an unchanged V2 semantic record and adds up to four per-operand base writeback records. A record describes pre-index writeback (`[base + displacement]!`) or post-index writeback (`[base], displacement`). The host currently accepts only base-only address updates: the selected operand must be base-plus-index kind with a base and no index. Pre-index requires the memory displacement to equal the writeback displacement; post-index requires the effective memory displacement to be zero. In both cases the host marks the base register written, persists the writeback fields in derived and reference caches, and includes the notation in generic disassembly formatting. Malformed records and indexed writeback are rejected. V3 is preferred over V2 and V1 when present; existing descriptors and modules remain compatible through the append-only descriptor size check.
+ABI 1.16 appends optional `decode_semantic_v3` to `HexLabProcessorExtension`. The callback embeds an unchanged V2 semantic record and adds up to four per-operand base writeback records. A record describes pre-index writeback (`[base + displacement]!`) or post-index writeback (`[base], displacement`). The selected operand must be base-plus-index kind with a base. Pre-index accepts a decoded index register, scale, and extension as part of the same address expression; its memory displacement must equal the writeback displacement, and the host marks the base register written. Post-index requires zero effective memory displacement and no index because V3 has no separate post-index register field. The host persists writeback metadata in derived and reference caches and includes the notation in generic disassembly formatting. Malformed records and indexed post-index updates are rejected. V3 is preferred over V2 and V1 when present; existing descriptors and modules remain compatible through the append-only descriptor size check.
 
 Semantic extensions use the same processor dispatch path in CLI and desktop analysis. Load them through the existing CLI `--plugin` option or desktop Plugins manager; no V3-specific setting is required.
 
@@ -565,11 +762,28 @@ if (debugger.query(snapshot) == HEXLAB_ACTIVE_DEBUGGER_OK &&
 
 Calls are safe from plugin worker threads; debugger backend access is serialized with desktop inspection. The token is a snapshot guard, not a lock: resumption may occur immediately after an operation succeeds.
 
+The standalone [`active-debugger-cpp` example](../examples/plugins/active-debugger-cpp/README.md)
+demonstrates the complete read-only sequence: query a snapshot, page stopped
+threads, read one thread's registers, locate a recognized PC register, and
+read a bounded byte prefix at that PC. It reuses the same token for every
+operation and reports stale or unavailable results without attempting a
+write or resume.
+
 ## Breakpoint rules on owned debugger sessions (ABI 1.19)
 
 ABI 1.19 appends optional rule callbacks to `HexLabDebuggerApi`, preserving the preceding table prefix and the existing `HexLabDebugBreakpoint` record layout. `DebuggerClient` exposes setters for ignore counts, conditions, and logpoint state/message, plus `breakpoint_rule` for querying runtime hit count and configured rule fields. Use `supports()` or check the table size before calling an appended callback when supporting older hosts. Conditions are limited to 256 UTF-8 bytes and log messages to 1024 bytes; the host rejects oversized or invalid text. Unsupported callback behavior is reported by the callback status instead of being silently accepted.
 
-`HexLabDebugBreakpointRule` is an optional separate record with fixed-size condition and log-message fields, so existing list consumers remain layout-compatible. Runtime hit counts reset with the debugger session. The desktop persists rule configuration in project breakpoints; plugin-owned runtime session rules remain session-scoped. Core event messages are bounded to 4096 bytes, while `HexLabDebugEvent.message` retains its 256-byte capacity and receives a marked UTF-8-safe prefix if output must be shortened. See [the breakpoint workflow](debugger-breakpoint-workflow.md) for expression semantics and backend limits.
+`HexLabDebugBreakpointRule` is an optional separate record with fixed-size condition and log-message fields, so existing list consumers remain layout-compatible. Runtime hit counts reset with the debugger session. The desktop persists rule configuration in project breakpoints; plugin-owned runtime session rules remain session-scoped. Core event messages are bounded to 4096 bytes. The legacy `HexLabDebugEvent.message` retains its 256-byte capacity and receives a marked UTF-8-safe prefix when longer output is shortened. See [the breakpoint workflow](debugger-breakpoint-workflow.md) for expression semantics and backend limits.
+
+ABI 1.31 appends `wait_event_text` to `HexLabDebuggerApi` and declares the
+`debugger.event-text` v1.31 capability. It returns the same event fields and
+sequence number as `wait_event`, with `HexLabDebugEventText.message` holding up
+to 4096 UTF-8 bytes plus a terminator. The prior `HexLabDebugEvent` record and
+callback retain their exact ABI layout and bounded-prefix behavior. C++ callers
+can check `DebuggerClient::supports_event_text()` and use
+`wait_event_text(timeout_ms, event)`; the wrapper initializes the output
+record. A returned event's sequence must still be passed to the matching
+continue or single-step callback.
 
 ## Capability requirements (ABI 1.20)
 
@@ -585,17 +799,81 @@ module; a valid but unavailable requirement makes `PluginManager::load` return
 loader initializers and `hexlab_plugin_query` have already executed by then,
 so this is compatibility negotiation, not a sandbox or trust check.
 
-The host currently declares `hexlab.host` v1.21; `project.api` v1.0,
-`project.queries` v1.2, `project.edits` v1.5, `project.read` v1.11, and
+The host currently declares `hexlab.host` v1.35; `project.api` v1.0,
+`project.queries` v1.2, `project.edits` v1.6, `project.read` v1.11, and
 `project.types` v1.14; `debugger.api` v1.8 and `debugger.rules` v1.19;
 `loader.image` v1.10; `processor.semantic.v2` v1.7 and
 `processor.semantic.v3` v1.16; `analysis.provider` v1.9; `document.active`
 v1.15; `debugger.active` v1.17; `project.breakpoint.active` v1.18; and
-`project.cfg` v1.21. These
+`project.cfg` v1.21, `project.history` v1.28, and
+`project.function-owners` v1.29, `project.instruction-text` v1.30,
+`debugger.event-text` v1.31, `project.string-preview` v1.32, and
+`plugin.state` v1.33, and `project.references.range` v1.0. These
 versions describe table contracts; they do not promise that an active project,
 document, or debug target exists at the moment a callback runs. Existing ABI
 1.x modules with the old descriptor prefix remain loadable and have no declared
 requirements.
+
+## Plugin-owned state (ABI 1.33)
+
+ABI 1.33 appends `plugin_state_api` to `HexLabHostApi` and declares the
+versioned `plugin.state` v1.0 capability. `PluginStateClient` in `sdk.hpp`
+checks the host-table tail, service-table size, and service version before use.
+Older host prefixes are unchanged. The service stores opaque byte values under
+the calling plugin's loaded plugin ID and retains them across unload/reload.
+Desktop and plugin-enabled CLI managers persist them across process restarts in
+the current user's state directory (`%LOCALAPPDATA%\HexLab` on Windows,
+`$XDG_STATE_HOME/hexlab` on non-Windows systems when set, otherwise
+`$HOME/.local/state/hexlab` on Linux or
+`$HOME/Library/Application Support/HexLab` on macOS). The file is host-owned and is
+separate from project files. Managers constructed with the legacy one-argument
+constructor, including embedded/test managers, remain in-memory only; hosts can
+opt in by passing a state file path to the two-argument constructor.
+
+The v1 file is bounded to 80 MiB and uses a versioned binary representation
+with a SHA-256 corruption check. A missing file starts with empty state. Invalid,
+truncated, unsupported, oversized, or unreadable files cause state callbacks to
+return `HEXLAB_PLUGIN_STATE_FAILED`; the host does not replace the bad file with
+an empty store. A failed write also returns `FAILED` and rolls back that
+operation in memory. Writes use a temporary sibling file and atomic replacement.
+Persistence is local to one user profile and does not encrypt plugin data.
+Concurrent managers or HexLab processes sharing the same state file are not
+coordinated; the last atomic replacement may overwrite another writer's newer
+state.
+
+Keys are 1 to 128 ASCII characters from `[A-Za-z0-9._-]`. Values are arbitrary
+bytes up to 64 KiB. Each key has a monotonically increasing revision; reads
+return the current revision, and `set` or `erase` requires the caller's expected
+revision. Use revision zero to create a new key. A stale write returns
+`HEXLAB_PLUGIN_STATE_CONFLICT` with the current revision, so callers can reread
+and reconcile instead of silently overwriting concurrent state. Erasure leaves
+a revision tombstone, preventing an old writer from recreating a just-deleted
+key using revision zero. Empty values are supported. Reads report the required
+buffer size and current revision; if the provided buffer is too small, the
+output bytes remain untouched and `HEXLAB_PLUGIN_STATE_BUFFER_TOO_SMALL` is
+returned.
+
+The host bounds each plugin to 1024 keys and 4 MiB of live values, and the
+manager-wide store to 4096 plugin IDs and 64 MiB of live values. Those limits
+include state left behind by unloaded plugins. Revisions and erase tombstones
+are persisted too, so compare-and-set behavior continues after restart.
+
+```cpp
+hexlab::plugins::sdk::PluginStateClient state(host);
+uint64_t revision = 0;
+uint64_t next_revision = 0;
+const uint8_t mode[] = {1};
+if (state.available() &&
+    state.set("view.mode", revision, mode, sizeof(mode), next_revision) ==
+        HEXLAB_PLUGIN_STATE_OK) {
+    // Keep next_revision and pass it to a later set or erase.
+}
+```
+
+For a value read, first call `get(key, nullptr, 0, required, revision)`; a
+nonempty value returns `BUFFER_TOO_SMALL` and its required size. Allocate that
+many bytes and call again. If another writer changes the value between calls,
+the second call reports its current size and revision; retry with the new size.
 
 The sidecar's optional `requires=id,major,minimum_minor` records mirror the
 module requirements for picker display and post-load identity comparison. The
@@ -650,19 +928,35 @@ if (project.open(project_path, true) == 0 && project.analyze() == 0) {
 }
 ```
 
-## Pure scalar instruction IR (ABI 1.22–1.25)
+The standalone C++ [`function-cfg-report-cpp` example](../examples/plugins/function-cfg-report-cpp/README.md)
+shows how to require `project.cfg` v1.21, open a project read-only, page
+functions, blocks, instructions, and successor edges, and stop at explicit
+resource limits while clearly marking the report as truncated.
+
+## Pure scalar instruction IR (ABI 1.22-1.29)
 
 `HexLabProcessorExtension` now has a size-gated, append-only `decode_ir` callback.
-The `processor.ir.scalar` v1.25 host capability accepts bounded typed integer
+The `processor.ir.scalar` v1.29 host capability accepts bounded typed integer
 DAGs with exact register effects and parallel outputs. ABI 1.23 adds exact
 equality and signed/unsigned ordering predicates; ABI 1.24 adds logical and
-arithmetic shifts, and ABI 1.25 adds modulo-width rotates, without changing the
-record layout. Existing modules
+arithmetic shifts, ABI 1.25 adds modulo-width rotates, ABI 1.26 allows exact
+full-width x86 FLAGS inputs/outputs, and ABI 1.27 adds CLZ/CTZ/POPCOUNT,
+without changing the record layout. ABI 1.28 adds same-width `BSWAP` byte reversal;
+ABI 1.29 adds same-width modular integer `NEG`.
+FLAG outputs must equal the complete
+16/32/64-bit mode register, be declared in the semantic effects, and be
+computed as a same-width output formula; partial or non-x86 status writes
+remain unsupported. Existing modules
 requiring v1.22 remain compatible and can use the original operation set; a
 module requiring newer operations is rejected by a host that only implements
 an earlier capability minor. Hosts opt into common-IR lifting through
 `plugins::lift_function_with_extensions`; snapshot fingerprints
 and semantic generations are validated before formulas reach SSA/pseudocode.
+Scalar IR currently has no memory-value operations. Although semantic V3 can
+describe indexed pre-index writeback for ordinary decoded instructions, a
+scalar-IR callback must still decline such instructions; adding it there needs
+a versioned memory-IR representation so loads/stores and updated bases remain
+one coherent effect.
 Older processor descriptors and core lift overloads remain supported. See
 [plugin scalar instruction IR](plugin-scalar-ir.md) for the precise record,
 register, lifecycle and resource limits and the C-only custom-opcode example.

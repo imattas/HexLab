@@ -9,6 +9,9 @@ namespace {
 struct Edge { std::uint32_t kind = 0, target = 0; };
 struct Node {
     std::uint64_t fingerprint = 0;
+    std::uint64_t instruction_count = 0;
+    std::uint64_t known_instruction_count = 0;
+    bool instruction_sequence_complete = true;
     std::vector<Edge> outgoing, incoming;
     std::vector<std::uint32_t> outgoing_kinds, incoming_kinds;
     std::vector<std::uint64_t> instructions, adjacency;
@@ -44,6 +47,11 @@ BlockInstructionEvidence instruction_evidence(const Node& left, const Node& righ
     BlockInstructionEvidence result;
     if (left.instructions.empty() || right.instructions.empty()) return result;
     result.available = true;
+    result.complete = left.instruction_sequence_complete && right.instruction_sequence_complete;
+    result.old_coverage_percent = left.instruction_count
+        ? static_cast<std::uint8_t>(left.known_instruction_count * 100 / left.instruction_count) : 100;
+    result.new_coverage_percent = right.instruction_count
+        ? static_cast<std::uint8_t>(right.known_instruction_count * 100 / right.instruction_count) : 100;
     result.fingerprint_similarity = overlap(left.instructions, right.instructions, stop);
     if (!left.adjacency.empty() && !right.adjacency.empty()) {
         result.adjacency_available = true;
@@ -82,7 +90,9 @@ std::uint32_t score_pair(const Node &old_node, const Node &new_node,
         const auto content = evidence.adjacency_available
             ? (70u * evidence.fingerprint_similarity + 30u * evidence.adjacency_similarity) / 100u
             : evidence.fingerprint_similarity;
-        score = (score * (100u - instruction_weight) + content * instruction_weight) / 100u;
+        const auto coverage = std::min(evidence.old_coverage_percent, evidence.new_coverage_percent);
+        const auto covered_content = content * coverage / 100u;
+        score = (score * (100u - instruction_weight) + covered_content * instruction_weight) / 100u;
     }
     return std::min(score, 100u);
 }
@@ -96,12 +106,21 @@ bool prepare(std::span<const CfgBlockFeature> source, std::vector<Node> &nodes,
         nodes[i].fingerprint = source[i].fingerprint;
         if (use_instructions && source[i].instruction_fingerprints_available) {
             const auto& sequence = source[i].instruction_fingerprints;
+            nodes[i].instruction_count = source[i].instruction_count ? source[i].instruction_count : sequence.size();
+            nodes[i].known_instruction_count = sequence.size();
+            nodes[i].instruction_sequence_complete = source[i].instruction_fingerprints_complete;
             nodes[i].instructions = sequence;
             std::sort(nodes[i].instructions.begin(), nodes[i].instructions.end());
             if (sequence.size() > 1) nodes[i].adjacency.reserve(sequence.size() - 1);
+            const auto position = [&](std::size_t instruction) {
+                return source[i].instruction_fingerprint_positions.empty()
+                    ? static_cast<std::uint64_t>(instruction)
+                    : source[i].instruction_fingerprint_positions[instruction];
+            };
             for (std::size_t instruction = 1; instruction < sequence.size(); ++instruction) {
                 if ((instruction & 0x3ffu) == 0 && stop.stop_requested()) return false;
-                nodes[i].adjacency.push_back(instruction_pair(sequence[instruction - 1], sequence[instruction]));
+                if (position(instruction) == position(instruction - 1) + 1)
+                    nodes[i].adjacency.push_back(instruction_pair(sequence[instruction - 1], sequence[instruction]));
             }
             std::sort(nodes[i].adjacency.begin(), nodes[i].adjacency.end());
         }
@@ -141,13 +160,33 @@ Result<FunctionBlockCorrespondence> correspond_function_blocks(
     std::uint64_t edge_count = 0, instruction_items = 0;
     for (const auto blocks : {old_blocks, new_blocks}) for (const auto& block : blocks) {
         if (options.stop_token.stop_requested()) return Error{ErrorCode::canceled, "block correspondence canceled"};
-        if (!block.instruction_fingerprints_available && !block.instruction_fingerprints.empty())
+        const auto total = block.instruction_count ? block.instruction_count : block.instruction_fingerprints.size();
+        if ((!block.instruction_fingerprints_available &&
+             (!block.instruction_fingerprints.empty() || !block.instruction_fingerprint_positions.empty())) ||
+            (!block.instruction_semantics.empty() &&
+             (!block.instruction_fingerprints_available ||
+              block.instruction_semantics.size() != block.instruction_fingerprints.size())) ||
+            (!block.instruction_fingerprint_positions.empty() &&
+             block.instruction_fingerprint_positions.size() != block.instruction_fingerprints.size()) ||
+            block.instruction_fingerprints.size() > total ||
+            (block.instruction_fingerprints_complete && block.instruction_fingerprints.size() != total) ||
+            (!block.instruction_fingerprints_available && block.instruction_fingerprints_complete && total))
             return Error{ErrorCode::invalid_argument, "unavailable block instruction fingerprints must be empty"};
+        std::uint64_t previous_position = 0;
+        for (std::size_t index = 0; index < block.instruction_fingerprint_positions.size(); ++index) {
+            const auto position = block.instruction_fingerprint_positions[index];
+            if (position >= total || (index && position <= previous_position))
+                return Error{ErrorCode::invalid_argument, "invalid block instruction fingerprint positions"};
+            previous_position = position;
+        }
         const auto items = static_cast<std::uint64_t>(block.instruction_fingerprints.size());
         const auto adjacency = options.instruction_similarity_weight && items ? items - 1 : 0;
         if (items > options.max_instruction_fingerprint_items - instruction_items)
             return Error{ErrorCode::resource_limit, "block instruction feature budget exceeded"};
         instruction_items += items;
+        if (block.instruction_fingerprint_positions.size() > options.max_instruction_fingerprint_items - instruction_items)
+            return Error{ErrorCode::resource_limit, "block instruction position budget exceeded"};
+        instruction_items += block.instruction_fingerprint_positions.size();
         if (adjacency > options.max_instruction_fingerprint_items - instruction_items)
             return Error{ErrorCode::resource_limit, "block instruction feature budget exceeded"};
         instruction_items += adjacency;
@@ -196,7 +235,7 @@ Result<FunctionBlockCorrespondence> correspond_function_blocks(
             if (!compare_instructions(oi, ni, evidence)) { budget_exhausted = true; break; }
             // A coarse block hash must not force an anchor when complete
             // normalized instruction evidence visibly disagrees.
-            if (evidence.available && (evidence.fingerprint_similarity != 100 ||
+            if (evidence.available && (!evidence.complete || evidence.fingerprint_similarity != 100 ||
                 (evidence.adjacency_available && evidence.adjacency_similarity != 100))) continue;
             old_to_new[oi] = ni;
             new_to_old[ni] = oi;
@@ -301,9 +340,11 @@ Result<FunctionBlockCorrespondence> correspond_function_blocks(
         if (options.stop_token.stop_requested()) return Error{ErrorCode::canceled, "block correspondence canceled"};
         if (row.kind == BlockMatchKind::ambiguous) continue;
         const auto old_available = !row.old_block ||
-            old_blocks[*row.old_block].instruction_fingerprints_available;
+            (old_blocks[*row.old_block].instruction_fingerprints_available &&
+             old_blocks[*row.old_block].instruction_fingerprints_complete);
         const auto new_available = !row.new_block ||
-            new_blocks[*row.new_block].instruction_fingerprints_available;
+            (new_blocks[*row.new_block].instruction_fingerprints_available &&
+             new_blocks[*row.new_block].instruction_fingerprints_complete);
         if (!old_available || !new_available) continue;
         const auto old_sequence = row.old_block
             ? std::span<const std::uint64_t>(old_blocks[*row.old_block].instruction_fingerprints)

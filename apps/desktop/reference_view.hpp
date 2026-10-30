@@ -22,6 +22,8 @@ class ReferenceView final : public wxPanel {
     wxChoice *direction_;
     wxButton *previous_, *next_;
     wxButton *source_, *target_, *origin_;
+    wxButton *copy_selected_;
+    wxButton *call_callees_, *call_callers_;
     wxCheckBox *pin_;
     wxCheckBox *range_;
     wxCheckBox *mapped_range_;
@@ -50,6 +52,8 @@ class ReferenceView final : public wxPanel {
     const Reference *selected_reference() const;
     void update_actions();
     void update_detail();
+    void copy_selected_reference();
     void follow_selected(bool target);
+    void navigate_call_relations(bool callers);
 };
 } // namespace hexlab::desktop

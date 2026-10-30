@@ -52,6 +52,14 @@ zoom, and layout while the graph model remains current. Nodes sharing a source
 address keep their distinct graph focus, including after a background refresh;
 the multi-selection range anchor is also preserved.
 
+**Copy graph JSON** places the current graph model and its computed layout on
+the clipboard as versioned JSON. The export retains graph kind, completeness
+and omitted-node/edge counts, node and edge identities, labels and locations,
+and layout bounds and routes when available. It is capped at 4 MiB for the
+clipboard; oversized graphs report that the user should reduce graph scope.
+The export describes the current immutable graph snapshot, not unsaved local
+node drags or graph selection state.
+
 Selection synchronization captures the immutable source graph and validates
 the active document, displayed document revision, image identity, controller
 graph result, and project analysis revision before changing the global location.

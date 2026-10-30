@@ -14,11 +14,17 @@ selection.
 
 | Host platform and architecture | Native backend selection | Scope |
 | --- | --- | --- |
-| Windows | Win32 backend | x86/x64 process control and four-slot execution/data hardware breakpoints; native ARM32 builds expose stopped-thread GPR/NEON context edits, ARM/Thumb software breakpoints, bounded sequential-instruction steps and up to eight hardware execute breakpoints; native ARM64 builds support stopped-thread GPR/FPSIMD context access and safe edits, software BRK breakpoints with PSTATE single-step, and up to two execution plus two data hardware breakpoints |
-| Linux x86-64 | x86-64 ptrace backend | x86-64 and compat i386 targets, including register, memory, event, and breakpoint operations described in [Linux ptrace debugging](linux-ptrace-debugging.md) |
-| Linux AArch64 | AArch64 ptrace backend | AArch64 GPR/FPSIMD and conditional SVE state, optional read-only TTBR0 PAC masks, process lifecycle, memory, software breakpoints, hardware execute/watchpoints, and per-thread run-state |
-| macOS x86-64 / Apple Silicon | Darwin Mach/ptrace backend | Bounded named-thread and process-stop-state snapshots, task-suspended per-thread register inspection/editing, memory and module/region inspection; single-thread process execution, stepping, and software breakpoints; multi-thread stop attribution/stepping and hardware watchpoints are unsupported |
+| Windows | Win32 backend | x86/x64 process control and four-slot execution/data hardware breakpoints; exception events expose chance metadata and up to 15 raw `EXCEPTION_RECORD.ExceptionInformation` values; `OutputDebugStringA/W` events read bounded target memory and display their text; x64 stopped-thread register inspection includes AVX-512 ZMM/opmask state when CPU, OS, and XState components support it; native ARM32 builds expose stopped-thread GPR/NEON context edits, ARM/Thumb software breakpoints, bounded sequential-instruction steps and up to eight hardware execute breakpoints; native ARM64 builds support stopped-thread GPR/FPSIMD context access and safe edits, software BRK breakpoints with PSTATE single-step, and up to two execution plus two data hardware breakpoints |
+| Linux x86-64 | x86-64 ptrace backend | x86-64 and compat i386 targets, including register, memory, event, breakpoint, raw pending-event siginfo, and thread-qualified PTRACE_INTERRUPT for one known-running seized thread while peers keep running, as described in [Linux ptrace debugging](linux-ptrace-debugging.md); hardware execute and data breakpoints for both target widths |
+| Linux AArch64 | AArch64 ptrace backend | AArch64 GPR/FPSIMD and conditional SVE state, optional read-only TTBR0 PAC masks, MTE allocation-tag reads when supported by the kernel and mapping, raw pending-event siginfo, thread-qualified PTRACE_INTERRUPT for one known-running seized thread while peers keep running, process lifecycle, memory, software breakpoints, hardware execute/watchpoints, and per-thread run-state |
+| macOS x86-64 / Apple Silicon | Darwin Mach/ptrace backend | Bounded named-thread and process-stop-state snapshots, task-suspended per-thread register inspection/editing, memory and module/region inspection; AArch64 exposes X/W registers, SP/WSP, FP/LR, and NEON state; single-thread execution, stepping, and software breakpoints; x86-64 write/access watchpoint hits map through DR6, and AArch64 precise watchpoint exceptions map through ESR comparator indices to owned breakpoint IDs; read-only data watchpoints and multi-thread stop attribution/stepping remain unsupported; x86-64 supports one-byte hardware execute breakpoints in the same four DR0-DR3 slots, while AArch64 execute comparators remain unsupported |
 | Other OS/architecture combinations | Explicit unsupported backend | Native calls return `unsupported`; the library and RSP backend remain usable |
+
+Native Windows launch converts the executable, arguments and working directory
+from strict UTF-8. Invalid UTF-8 and embedded NUL characters are rejected before
+calling `CreateProcessW`; the quoted command line is bounded to 32,766 UTF-16
+characters so its terminator fits the Win32 32,767-character limit. This avoids
+silently replacing malformed input or passing a truncated command line.
 
 Darwin selects its Mach/ptrace backend only on macOS. Linux backend selection is
 explicit. Known x86-64 and AArch64 CMake processor names select their matching
@@ -26,6 +32,20 @@ ptrace implementation. Other Linux processor names select the unsupported
 backend instead of compiling x86-64-only ptrace code and failing later with an
 architecture preprocessor error. This is a build-selection safeguard, not
 native support for those architectures.
+
+On Darwin AArch64, a SIGTRAP is attributed to an owned data watchpoint only
+when the saved ESR identifies a watchpoint exception, marks the comparator
+index valid and precise, and that index names an enabled debugger-owned slot.
+Other traps, invalid or possibly false-positive ESR records, and unowned
+comparator hits remain generic breakpoint events.
+
+The Linux x86-64 ptrace backend uses the x86 debug-register slots for both
+64-bit and compat i386 processes. i386 requests are range-checked to 32-bit
+addresses, and data breakpoint widths are limited by the i386 debug-register
+encoding. Both modes expose four hardware slots; execute breakpoints use a
+one-byte encoding, while data breakpoints support write or read/write access
+at aligned 1-, 2-, or 4-byte widths. The x86 debug registers cannot represent
+read-only watchpoints.
 
 Native ARM32 builds use the Windows [Arm32 `CONTEXT`](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-context-r1)
 through `GetThreadContext`/`SetThreadContext` only while a debug event is
@@ -51,15 +71,71 @@ ARM32 has no CPSR single-step bit exposed by this API. The bounded step path
 accepts verified sequential instructions: common 16-bit Thumb scalar and
 load/store forms, 32-bit Thumb MOVW/MOVT, and ARM data-processing immediates
 that do not write PC. It also follows A32 B/BL (including known NZCV
-conditions), A32 BX/BLX register, Thumb 16-bit B/B<cond>, and Thumb BX/BLX
-register. Branch targets and ARM/Thumb interworking are derived from the
-stopped context; unconditional Thumb-2 B.W is decoded with its T4
+conditions), A32 BX/BLX register and BLX immediate, Thumb 16-bit B/B<cond>,
+Thumb BX/BLX register, and Thumb BL/BLX immediate. A32 BLX immediate uses the
+split signed displacement from PC+8, applies H as displacement bit 1, and
+switches the successor to Thumb state. Thumb BL reconstructs the signed
+25-bit displacement from S/J1/J2 and the immediate fields relative to PC+4;
+Thumb BLX immediate uses the same J-bit transform, word-aligns PC+4, and
+switches the successor to ARM state. These wide branches require the final IT
+slot when inside an IT block and use checked target alignment and range,
+following the [Arm BL/BLX immediate definitions](https://documentation-service.arm.com/static/5f8daeb7f86e16515cdb8c4e).
+Branch targets and ARM/Thumb interworking are derived from the
+stopped context. A32 `LDR pc, [pc, #+/-imm12]` now reads the literal word
+from the stopped process, evaluates the instruction condition, and derives the
+successor instruction state from the loaded address low bit; unreadable literal
+data and unaligned ARM-state targets fail the step without resuming the target.
+Thumb `POP {reglist, pc}` T1 is followed by reading only the PC word at
+`SP + 4 * popcount(reglist)`. The encoded stack extent and alignment are checked;
+the loaded low bit selects Thumb versus ARM state, and the remaining target
+alignment is validated. An unreadable stack word, malformed range, or invalid
+ARM-state target fails closed. Inside an IT block, this PC-writing form is
+accepted only in the final slot and the active predicate determines whether
+the stack word is read. The debugger does not emulate the POP register or SP
+updates; the target executes the original instruction after its successor trap
+is installed. The PC load's interworking behavior follows Arm's
+[Thumb POP definition](https://class.ece.iastate.edu/cpre288/resources/docs/Thumb-2SupplementReferenceManual.pdf).
+A32 ordinary `LDMIA`, `LDMIB`, `LDMDA` and `LDMDB` with PC in the register
+list are followed using one four-byte read of the highest register's transfer
+slot. The condition is evaluated before any memory read. General and control
+registers are both requested from Windows so register-based successors use
+captured values. The debugger checks word alignment, the complete transfer
+extent, optional writeback range, and loaded ARM/Thumb target alignment.
+PC bases, writeback with the base in the list, big-endian data state, and
+`S=1` user-bank/exception-return forms reject before mutation. A successor
+trap overlapping the current instruction or any loaded register's transfer
+slot also rejects, preventing the trap from changing values the instruction
+will read. The target executes the original LDM, including register/writeback
+updates, under the existing peer-suspension and temporary-trap rollback path.
+Addressing order and PC interworking follow the
+[Armv7-A/R LDM definitions](https://documentation-service.arm.com/static/5f8daeb7f86e16515cdb8c4e).
+The A32 LDM addition passed a Windows x64 Debug debugger build and an ARMv7
+Windows clang-cl syntax check against the installed MSVC/Windows SDK headers;
+native ARM32 linking and runtime stepping remain unverified. The context
+request follows Windows' [GetThreadContext flags contract](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getthreadcontext).
+Unconditional Thumb-2 B.W is decoded with its T4
 J1/J2-immediate transformation and 25-bit signed displacement, and conditional
 Thumb-2 B<cond>.W uses the T3 direct J1/J2 fields and signed 21-bit
 displacement. Conditional wide branches require a valid condition and, inside
-an IT block, a matching final-slot predicate. BL/BLX, PC-relative register
+an IT block, a matching final-slot predicate. Thumb CBZ/CBNZ are also decoded
+from their low-register operands; they compare without consuming NZCV and
+branch forward from Align(PC, 4) using the encoded imm6 offset. CBZ/CBNZ are
+prohibited in IT blocks, so the backend rejects them there. If the comparison
+is false, the step successor is the next halfword. Other PC-relative register
 branches, other PC-writing instructions, unknown encodings, and a successor
-overlapping a user breakpoint remain unsupported. A Thumb branch in an active IT block is
+overlapping a user breakpoint remain unsupported. Thumb-2 LDMIA/LDMDB forms with
+PC in the register list are followed for supported non-PC bases and unambiguous
+register lists, including writeback when the base is outside the list. A32
+exception-return loads remain unsupported because the backend cannot prove the
+restored SPSR state. Thumb-2 TBB/TBH is followed
+using the stopped register context and the selected byte or little-endian
+halfword table entry; the entry is scaled by two and added to PC+4. The PC may
+serve as the table base, while SP/PC index registers and SP base use are
+rejected. A false IT predicate advances to the next instruction; an executed
+table branch is accepted only in the final IT slot. Unreadable table entries
+fail the step without resuming the target. The implementation follows the
+[Arm TBB/TBH operation and constraints](https://web.eecs.umich.edu/~prabal/teaching/eecs373-f10/readings/ARMv7-M_ARM.pdf).
+A Thumb branch in an active IT block is
 accepted only in the final slot, and the IT predicate is applied before
 choosing its destination; conditional branches in IT must match the active IT
 condition. Sequential instructions may be stepped from any IT
@@ -101,7 +177,12 @@ already used by another debugger or changed outside HexLab cause a conflict
 rather than being overwritten.
 
 Windows ARM64 context access uses `GetThreadContext`/`SetThreadContext` with
-the ARM64 context flags ([`ARM64_NT_CONTEXT`](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-arm64_nt_context), [`GetThreadContext`](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getthreadcontext)) and is restricted to the stop window while a debug event is pending. Register reads expose X0 through X30, SP, PC, CPSR, V0 through V31, FPCR, and FPSR. Writes validate register sizes, keep PC instruction aligned and SP 16-byte aligned, restrict CPSR changes to NZCV flags, and reject X18 writes because Windows reserves it for the thread environment pointer. Vector state is the fixed 128-bit V register bank; scalable SVE/SME state is not exposed.
+the ARM64 context flags ([`ARM64_NT_CONTEXT`](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-arm64_nt_context), [`GetThreadContext`](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getthreadcontext)) and is restricted to the stop window while a debug event is pending. Register reads expose X0 through X30 and their W0 through W30 low-word aliases, SP/WSP, PC, CPSR, FP/LR aliases, V0 through V31 and their Q/B/H/S/D aliases, FPCR, and FPSR. W-register writes zero-extend into X; writes through overlapping aliases in one batch are rejected. Writes validate register sizes, keep PC instruction aligned and SP 16-byte aligned, restrict CPSR changes to NZCV flags, and reject X18/W18 writes because Windows reserves that register for the thread environment pointer. Vector state is the fixed 128-bit V register bank; scalable SVE/SME state is not exposed.
+
+All Windows register reads and writes require a nonzero 32-bit thread ID and
+verify that the opened thread still belongs to the debugged process before
+requesting or changing its context. This prevents a truncated or
+foreign-process thread ID from reaching the native context APIs.
 
 ARM64 software breakpoints use the four-byte `BRK #0xF000` encoding and can
 only be added, removed, or toggled while the process is stopped at a debug
@@ -117,7 +198,7 @@ Hardware breakpoint updates are transactional across the process's current
 threads and are reapplied to new threads. They preserve slots not owned by this
 backend and reject external changes to owned slots. The backend uses two
 execution slots and two data-watch slots, matching the Windows ARM64 debugger
-limit documented in [Debugging on Arm64](https://learn.microsoft.com/en-us/windows-hardware/drivers/debugger/debugging-arm64). Execution hit IDs are matched from the reported event address. Windows does not provide a hit-slot mask in the exposed ARM64 context, so a data-watchpoint stop is reported without an exact breakpoint ID. Hardware breakpoints can only be changed during a pending debug event.
+limit documented in [Debugging on Arm64](https://learn.microsoft.com/en-us/windows-hardware/drivers/debugger/debugging-arm64). Execution hit IDs are matched from the reported event address. For data watchpoints, Windows supplies the access kind and accessed address in the exception record; the backend matches that address against enabled owned watchpoint ranges and reports matching IDs. A missing or unmatched access record remains a generic watchpoint stop. Hardware breakpoints can only be changed during a pending debug event.
 
 When a handled ARM64 execution-breakpoint event is continued, the backend
 temporarily disables the matching execute slot on the event thread, sets

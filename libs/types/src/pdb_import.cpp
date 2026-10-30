@@ -320,13 +320,41 @@ Result<PdbTypeImportResult> import_pdb_type_graph(const PdbTypeGraph &graph) {
             if (ambiguous_names.contains(entry->record.name))
                 for (const auto *node : full_definitions_by_name[entry->record.name])
                     storage_names.erase({node->name_space, node->record.index});
+    using OdrKey = std::tuple<CodeViewTypeKind, std::string_view, std::string_view>;
+    std::map<OdrKey, std::string> storage_names_by_odr;
+    std::set<OdrKey> ambiguous_odr_names;
+    for (const auto &node : graph.nodes) {
+        const auto &record = node.record;
+        if (record.forward_declaration || !aggregate_identity_kind(record.kind) ||
+            !valid_type_name(record.name) || !valid_type_name(record.unique_name, 4096) ||
+            ambiguous_names.contains(record.name)) continue;
+        const auto storage = storage_names.find({node.name_space, record.index});
+        if (storage == storage_names.end()) continue;
+        const OdrKey identity{record.kind, record.name, record.unique_name};
+        const auto [found, inserted] = storage_names_by_odr.emplace(identity, storage->second);
+        if (!inserted && found->second != storage->second)
+            ambiguous_odr_names.insert(identity);
+    }
     for (const auto &node : graph.nodes) {
         if (!node.record.forward_declaration || node.record.name.empty()) continue;
         const TypeKey key{node.name_space, node.record.index};
         if (node.canonical_index) {
             const auto canonical = storage_names.find({node.name_space, node.canonical_index});
-            if (canonical != storage_names.end()) storage_names.emplace(key, canonical->second);
-        } else if (!ambiguous_names.contains(node.record.name) && node.record.unique_name.empty()) {
+            if (canonical != storage_names.end()) {
+                storage_names.emplace(key, canonical->second);
+                continue;
+            }
+        }
+        if (!node.record.unique_name.empty()) {
+            if (!valid_type_name(node.record.name) || !valid_type_name(node.record.unique_name, 4096) ||
+                ambiguous_names.contains(node.record.name)) continue;
+            const OdrKey identity{node.record.kind, node.record.name, node.record.unique_name};
+            const auto canonical = storage_names_by_odr.find(identity);
+            if (canonical != storage_names_by_odr.end() && !ambiguous_odr_names.contains(identity))
+                storage_names.emplace(key, canonical->second);
+            continue;
+        }
+        if (!ambiguous_names.contains(node.record.name)) {
             const auto same_display = full_definitions_by_name.find(node.record.name);
             if (same_display != full_definitions_by_name.end() && same_display->second.size() == 1) {
                 if (same_display->second.front()->record.kind != node.record.kind) continue;
@@ -420,12 +448,24 @@ Result<PdbTypeImportResult> import_pdb_type_graph(const PdbTypeGraph &graph) {
             made = Type::qualified(base.value(), record.qualifier_bits);
             break;
         }
-        case CodeViewTypeKind::array: {
+        case CodeViewTypeKind::array:
+        case CodeViewTypeKind::strided_array: {
             auto element = convert(target_namespace, record.referenced_type);
             if (!element) return fail(element.error());
-            if (!record.size || !element.value()->size() || !*element.value()->size() || record.size % *element.value()->size())
+            if (!record.size || !element.value()->size() || !*element.value()->size())
                 return fail(Error{ErrorCode::unsupported, "PDB array has an incomplete element, zero length, or incompatible size"});
-            made = Type::array(element.value(), record.size / *element.value()->size());
+            const auto element_size = *element.value()->size();
+            if (record.kind == CodeViewTypeKind::strided_array) {
+                if (record.array_stride < element_size || record.size < element_size ||
+                    (record.size - element_size) % record.array_stride)
+                    return fail(Error{ErrorCode::unsupported, "PDB strided array size is inconsistent with its element stride"});
+                made = Type::strided_array(element.value(), (record.size - element_size) / record.array_stride + 1,
+                                           record.array_stride);
+            } else {
+                if (record.size % element_size)
+                    return fail(Error{ErrorCode::unsupported, "PDB array size is not a whole number of elements"});
+                made = Type::array(element.value(), record.size / element_size);
+            }
             break;
         }
         case CodeViewTypeKind::vector: {
@@ -701,24 +741,37 @@ Result<PdbTypeImportResult> import_pdb_type_graph(const PdbTypeGraph &graph) {
         std::uint32_t ordinal = 0;
         const auto append = [&](PdbAggregateDeclarationKind kind, const CodeViewField &field,
                                 std::uint32_t type_index, std::uint16_t attributes,
-                                std::optional<std::uint32_t> vtable_offset) -> Result<bool> {
+                                std::optional<std::uint32_t> vtable_offset,
+                                std::optional<std::uint32_t> vfptr_byte_offset = {}) -> Result<bool> {
             if (ordinal == std::numeric_limits<std::uint32_t>::max())
                 return Error{ErrorCode::resource_limit, "PDB aggregate declaration ordinal exceeds limit"};
             ++ordinal;
             const auto encoded_namespace = static_cast<std::uint8_t>(type_index >> 24);
             const auto target_namespace = encoded_namespace ? encoded_namespace : node.name_space;
-            auto type = convert(target_namespace, type_index & 0x00ffffffu);
-            if (!type) return type.error();
+            TypePtr declaration_type;
+            if (kind == PdbAggregateDeclarationKind::vftable_pointer) {
+                const auto pointer = nodes.find({target_namespace, type_index & 0x00ffffffu});
+                const auto byte_offset = vfptr_byte_offset.value_or(0);
+                if (pointer == nodes.end() || pointer->second->record.kind != CodeViewTypeKind::pointer ||
+                    !pointer->second->record.size || byte_offset > record.size ||
+                    pointer->second->record.size > record.size - byte_offset)
+                    return Error{ErrorCode::unsupported,
+                        "PDB virtual table pointer has an unresolved pointer type or lies outside its aggregate"};
+            } else {
+                auto type = convert(target_namespace, type_index & 0x00ffffffu);
+                if (!type) return type.error();
+                declaration_type = type.value();
+            }
             PdbAggregateDeclaration declaration;
             declaration.name_space = node.name_space;
             declaration.aggregate_type_index = record.index;
             declaration.declaration_ordinal = ordinal;
             declaration.kind = kind;
             declaration.name = kind == PdbAggregateDeclarationKind::vftable_pointer
-                ? "implicit vfptr" : field.name;
-            declaration.type = type.value();
+                ? (vfptr_byte_offset.value_or(0) ? "vfptr" : "implicit vfptr") : field.name;
+            declaration.type = std::move(declaration_type);
             if (kind == PdbAggregateDeclarationKind::friend_class && declaration.name.empty())
-                declaration.name = type.value()->name();
+                declaration.name = declaration.type->name();
             declaration.attributes = attributes;
             switch (attributes & 3) {
             case 1: declaration.access = MemberAccess::private_; break;
@@ -729,6 +782,11 @@ Result<PdbTypeImportResult> import_pdb_type_graph(const PdbTypeGraph &graph) {
             declaration.virtual_dispatch = kind == PdbAggregateDeclarationKind::method
                 ? dispatch_kind(attributes) : PdbVirtualDispatchKind::non_virtual;
             declaration.introducing_vtable_offset = vtable_offset;
+            if (kind == PdbAggregateDeclarationKind::vftable_pointer) {
+                declaration.source_type_index = type_index;
+                declaration.source_record_offset = field.record_offset;
+                declaration.vfptr_byte_offset = vfptr_byte_offset.value_or(0);
+            }
             if (kind == PdbAggregateDeclarationKind::method) {
                 const auto method_namespace_byte = static_cast<std::uint8_t>(type_index >> 24);
                 const auto method_namespace = method_namespace_byte ? method_namespace_byte : node.name_space;
@@ -786,7 +844,7 @@ Result<PdbTypeImportResult> import_pdb_type_graph(const PdbTypeGraph &graph) {
         };
         for (const auto &field : node.expanded_fields) {
             if (field.leaf == 0x150e || field.leaf == 0x1510 || field.leaf == 0x1512 ||
-                field.leaf == 0x1511 || field.leaf == 0x1409 || field.leaf == 0x140a ||
+                field.leaf == 0x1511 || field.leaf == 0x1409 || field.leaf == 0x140c || field.leaf == 0x140a ||
                 field.leaf == 0x150c) {
                 if (field.leaf == 0x140a || field.leaf == 0x150c) {
                     const auto encoded_namespace = static_cast<std::uint8_t>(field.type >> 24);
@@ -807,7 +865,7 @@ Result<PdbTypeImportResult> import_pdb_type_graph(const PdbTypeGraph &graph) {
                 }
                 const auto kind = field.leaf == 0x150e ? PdbAggregateDeclarationKind::static_data :
                     (field.leaf == 0x1510 || field.leaf == 0x1512) ? PdbAggregateDeclarationKind::nested_type :
-                    field.leaf == 0x1409 ? PdbAggregateDeclarationKind::vftable_pointer :
+                    (field.leaf == 0x1409 || field.leaf == 0x140c) ? PdbAggregateDeclarationKind::vftable_pointer :
                     field.leaf == 0x140a ? PdbAggregateDeclarationKind::friend_class :
                     field.leaf == 0x150c ? PdbAggregateDeclarationKind::friend_function :
                                           PdbAggregateDeclarationKind::method;
@@ -815,7 +873,11 @@ Result<PdbTypeImportResult> import_pdb_type_graph(const PdbTypeGraph &graph) {
                     kind == PdbAggregateDeclarationKind::method &&
                     (dispatch_kind(field.attributes) == PdbVirtualDispatchKind::introducing_virtual ||
                      dispatch_kind(field.attributes) == PdbVirtualDispatchKind::pure_introducing_virtual)
-                        ? std::optional<std::uint32_t>(static_cast<std::uint32_t>(field.value)) : std::nullopt);
+                        ? std::optional<std::uint32_t>(static_cast<std::uint32_t>(field.value)) : std::nullopt,
+                    kind == PdbAggregateDeclarationKind::vftable_pointer
+                        ? std::optional<std::uint32_t>(field.leaf == 0x140c
+                            ? static_cast<std::uint32_t>(field.value) : 0)
+                        : std::nullopt);
                 if (!status) {
                     if (status.error().code == ErrorCode::unsupported) { ++result.skipped_unsupported; continue; }
                     return status.error();

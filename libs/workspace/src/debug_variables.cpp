@@ -2,6 +2,31 @@
 #include <algorithm>
 
 namespace hexlab {
+namespace {
+Result<std::vector<symbols::LocationOperation>> materialize_operations(
+    const std::vector<database::DebugLocationOperation> &stored) {
+    std::vector<symbols::LocationOperation> operations;
+    operations.reserve(stored.size());
+    for (const auto &operation : stored) {
+        if (operation.kind > static_cast<std::uint8_t>(symbols::LocationOperationKind::entry_value))
+            return Error{ErrorCode::malformed, "project DWARF variable has an unknown location operation"};
+        symbols::LocationOperation decoded{static_cast<symbols::LocationOperationKind>(operation.kind),
+            operation.unsigned_operand, operation.signed_operand, operation.expression_offset,
+            operation.second_unsigned_operand};
+        if (decoded.kind == symbols::LocationOperationKind::implicit_value) {
+            if (operation.second_unsigned_operand > 9)
+                return Error{ErrorCode::malformed, "project DWARF implicit-value payload length is invalid"};
+            const auto length = static_cast<std::size_t>(operation.second_unsigned_operand);
+            decoded.block_operand.reserve(length);
+            if (length == 9) decoded.block_operand.resize(length);
+            else for (std::size_t i = 0; i < length; ++i)
+                decoded.block_operand.push_back(static_cast<std::uint8_t>(operation.unsigned_operand >> (i * 8)));
+        }
+        operations.push_back(std::move(decoded));
+    }
+    return operations;
+}
+}
 
 std::vector<const database::DebugVariable *> debug_variables_at(
     const ProjectSnapshot &snapshot, Address function_entry, std::uint64_t pc) {
@@ -34,16 +59,9 @@ Result<symbols::EvaluatedLocation> evaluate_debug_variable(
         stored_operations = &found->operations;
     }
     if (!stored_operations->empty()) {
-        std::vector<symbols::LocationOperation> operations;
-        operations.reserve(stored_operations->size());
-        for (const auto &operation : *stored_operations) {
-            if (operation.kind > static_cast<std::uint8_t>(symbols::LocationOperationKind::branch_if_nonzero))
-                return Error{ErrorCode::malformed, "project DWARF variable has an unknown location operation"};
-            operations.push_back({static_cast<symbols::LocationOperationKind>(operation.kind),
-                operation.unsigned_operand, operation.signed_operand, operation.expression_offset,
-                operation.second_unsigned_operand});
-        }
-        return symbols::evaluate_location_expression(operations, context);
+        auto operations = materialize_operations(*stored_operations);
+        if (!operations) return operations.error();
+        return symbols::evaluate_location_expression(operations.value(), context);
     }
     if (variable.address) return symbols::EvaluatedLocation{symbols::EvaluatedLocationKind::memory, *variable.address};
     if (variable.cfa_offset && context.call_frame_cfa) {
@@ -69,16 +87,9 @@ Result<symbols::EvaluatedLocationSequence> evaluate_debug_variable_sequence(
         stored_operations = &found->operations;
     }
     if (!stored_operations->empty()) {
-        std::vector<symbols::LocationOperation> operations;
-        operations.reserve(stored_operations->size());
-        for (const auto &operation : *stored_operations) {
-            if (operation.kind > static_cast<std::uint8_t>(symbols::LocationOperationKind::branch_if_nonzero))
-                return Error{ErrorCode::malformed, "project DWARF variable has an unknown location operation"};
-            operations.push_back({static_cast<symbols::LocationOperationKind>(operation.kind),
-                operation.unsigned_operand, operation.signed_operand, operation.expression_offset,
-                operation.second_unsigned_operand});
-        }
-        return symbols::evaluate_location_expression_sequence(operations, context);
+        auto operations = materialize_operations(*stored_operations);
+        if (!operations) return operations.error();
+        return symbols::evaluate_location_expression_sequence(operations.value(), context);
     }
     symbols::EvaluatedLocationSequence result;
     if (variable.address) {

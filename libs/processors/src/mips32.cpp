@@ -83,6 +83,14 @@ DecodeResult decode_mips32(ByteOrder order, std::span<const std::byte> bytes, Ad
             i.operands = {reg(rd), reg(rt), ImmediateOperand{shamt, 5, 32, false, EncodedField{3, 1}}};
             i.access = {OperandAccess::write, OperandAccess::read, OperandAccess::read};
             i.register_reads = {reg(rt)}; if (rd) i.register_writes = {reg(rd)}; break;
+        case 0x0a: case 0x0b: // MOVZ / MOVN
+            if (shamt != 0) return invalid("Reserved MOVZ/MOVN encoding");
+            i.opcode = funct == 0x0a ? Opcode::mips32_movz : Opcode::mips32_movn;
+            i.operands = {reg(rd), reg(rs), reg(rt)};
+            i.access = {OperandAccess::read_write, OperandAccess::read, OperandAccess::read};
+            i.register_reads = {reg(rd), reg(rs), reg(rt)};
+            if (rd) i.register_writes = {reg(rd)};
+            break;
         case 0x04: case 0x06: case 0x07:
             if (shamt != 0) return invalid("Reserved variable-shift encoding");
             i.opcode = funct == 4 ? Opcode::mips_sllv : funct == 6 ? Opcode::mips_srlv : Opcode::mips_srav;
@@ -173,6 +181,30 @@ DecodeResult decode_mips32(ByteOrder order, std::span<const std::byte> bytes, Ad
         if (insert && rt) i.register_reads = {reg(rt)};
         if (rs) i.register_reads.push_back(reg(rs));
         if (rt) i.register_writes = {reg(rt)};
+    } else if (op == 0x1c) {
+        // MIPS32 Release 2 SPECIAL2 low-word multiply and count-leading ops.
+        if (funct == 0x02) {
+            if (shamt != 0) return invalid("Reserved MIPS32 MUL encoding");
+            i.opcode = Opcode::mips_mul;
+            i.operands = {reg(rd), reg(rs), reg(rt)};
+            i.access = {OperandAccess::write, OperandAccess::read, OperandAccess::read};
+            if (rs) i.register_reads.push_back(reg(rs));
+            if (rt) i.register_reads.push_back(reg(rt));
+            if (rd) i.register_writes.push_back(reg(rd));
+            // MIPS32 specifies the HI/LO contents as unpredictable after MUL.
+            i.register_writes.push_back(hilo(0));
+            i.register_writes.push_back(hilo(1));
+            return {DecodeStatus::decoded, std::move(i), {}};
+        }
+        if (funct != 0x20 && funct != 0x21)
+            return {DecodeStatus::unsupported, {}, "MIPS32 SPECIAL2 operation is outside the CLZ/CLO subset"};
+        if (rt != rd || shamt != 0)
+            return invalid("Reserved MIPS32 CLZ/CLO encoding");
+        i.opcode = funct == 0x20 ? Opcode::mips_clz : Opcode::mips_clo;
+        i.operands = {reg(rd), reg(rs)};
+        i.access = {OperandAccess::write, OperandAccess::read};
+        if (rs) i.register_reads = {reg(rs)};
+        if (rd) i.register_writes = {reg(rd)};
     } else if (op == 2 || op == 3) {
         i.opcode = op == 2 ? Opcode::mips_j : Opcode::mips_jal;
         const auto pc4 = static_cast<std::uint32_t>(static_cast<std::uint32_t>(at.offset) + 4u);
@@ -278,6 +310,28 @@ DecodeResult decode_mips32(ByteOrder order, std::span<const std::byte> bytes, Ad
                 }
                 if (rs != 16 && rs != 17 && rs != 20)
                     return {DecodeStatus::unsupported, {}, "MIPS32 COP1 format is outside the implemented S/D/W subset"};
+                if ((rs == 16 || rs == 17) && (funct == 0x11 || funct == 0x12 || funct == 0x13)) {
+                    const bool double_format = rs == 17;
+                    const bool fcc_move = funct == 0x11;
+                    if (fcc_move && (rt & 2u))
+                        return invalid("Reserved MIPS32 MOVF/MOVT condition field");
+                    i.opcode = double_format
+                        ? (fcc_move ? ((rt & 1u) ? Opcode::mips_movt_d : Opcode::mips_movf_d)
+                                    : funct == 0x12 ? Opcode::mips_movz_d : Opcode::mips_movn_d)
+                        : (fcc_move ? ((rt & 1u) ? Opcode::mips_movt_s : Opcode::mips_movf_s)
+                                    : funct == 0x12 ? Opcode::mips_movz_s : Opcode::mips_movn_s);
+                    const auto destination = fpr(shamt, double_format ? 64 : 32);
+                    const auto source = fpr(rd, double_format ? 64 : 32);
+                    const auto condition_code = static_cast<std::uint8_t>((rt >> 2) & 7);
+                    const auto condition_register = fcc_move ? fcc(condition_code) : reg(rt);
+                    i.operands = {destination, source, condition_register};
+                    i.access = {OperandAccess::read_write, OperandAccess::read, OperandAccess::read};
+                    i.register_reads = {destination, source};
+                    if (fcc_move || rt != 0) i.register_reads.push_back(condition_register);
+                    i.register_writes = {destination};
+                    if (fcc_move) i.condition = condition_code;
+                    return {DecodeStatus::decoded, std::move(i), {}};
+                }
                 const unsigned ft = rt, fs = rd, fd = shamt;
                 const unsigned fp_function = funct;
                 bool unary = false, compare = false, explicit_operands = false;

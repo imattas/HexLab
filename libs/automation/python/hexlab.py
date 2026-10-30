@@ -23,7 +23,7 @@ FUNCTION_CONVENTIONS = (
 )
 
 class AnalysisCancelled(Exception):
-    """Raised when a cooperative batch analysis/export is canceled."""
+    """Raised when native analysis, search, export, or a cooperative batch is canceled."""
 
 class ProjectChangedDuringExport(Exception):
     """Raised when a project changes while its paged report is collected."""
@@ -72,13 +72,24 @@ class StackFrameInfo:
 
 @dataclass(frozen=True)
 class StackSlotInfo:
-    """One local/argument slot measured from the function-entry stack pointer."""
+    """One entry-SP-relative slot and its bounded ABI classification."""
     offset_from_entry_sp: int
     width: int
     access_count: int
     read: bool
     written: bool
     address_taken: bool
+    incoming_argument: bool = False
+    outgoing_call_argument_count: int = 0
+    incoming_argument_abi: str | None = None
+
+@dataclass(frozen=True)
+class StackSlotCallArgumentInfo:
+    """One outgoing stack argument source and the call boundary that consumes it."""
+    push_instruction: Address
+    call_instruction: Address
+    source_instruction: Address
+    source_kind: str
 
 @dataclass(frozen=True)
 class StackSlotAccessInfo:
@@ -115,6 +126,18 @@ class HistoryPage:
     history_count: int
     entries: list
     next: object
+
+@dataclass(frozen=True)
+class HistoryAuditPage:
+    """Verified structural-audit progress for one durable history page."""
+    project_uuid: str
+    source_revisions: dict
+    history_cursor: int
+    history_count: int
+    next_after_step: int | None
+    entries_verified: int
+    delta_bytes: int
+    has_more: bool
 
 @dataclass(frozen=True)
 class DebugImportPreview:
@@ -159,12 +182,14 @@ class DebugLocationRangeInfo:
 
 @dataclass(frozen=True)
 class ArchiveSummary:
-    """Archive inventory and symbol-index status."""
+    """Archive inventory, format, and symbol-index status."""
     member_count: int
     symbol_count: int
     has_symbol_index: bool
     symbol_index_complete: bool
     diagnostics: tuple
+    thin: bool = False
+    aix_big: bool = False
 
 @dataclass(frozen=True)
 class ArchiveMember:
@@ -460,6 +485,63 @@ class Project:
             page = self.history(after_step=page.next, count=page_size,
                                 expected_revision=expected_revision, cancel=cancel)
 
+    def audit_history(self, *, after_step=0, max_steps=256,
+                      max_delta_bytes=16 * 1024 * 1024,
+                      expected_revision=None, cancel=None):
+        """Verify one bounded page of database-defined history invariants.
+
+        The page checks stored command metadata, payload extents and inverse
+        pairing. It does not prove integrity of the external input file. For
+        another page, pass ``next_after_step`` and the returned edit revision.
+        """
+        _unsigned(after_step, "after_step")
+        _unsigned(max_steps, "max_steps", 4096)
+        _unsigned(max_delta_bytes, "max_delta_bytes", 128 * 1024 * 1024)
+        if not max_steps or not max_delta_bytes:
+            raise ValueError("audit limits must be positive")
+        if expected_revision is not None:
+            _unsigned(expected_revision, "expected_revision")
+        return HistoryAuditPage(**self._history_call(
+            "audit_history", after_step, max_steps, max_delta_bytes,
+            expected_revision, cancel=cancel))
+
+    def iter_history_audit(self, *, page_steps=256,
+                           page_bytes=16 * 1024 * 1024,
+                           after_step=0, expected_revision=None,
+                           max_pages=4096, total_bytes=512 * 1024 * 1024,
+                           cancel=None):
+        """Yield verified pages, pinning the edit revision across the walk.
+
+        The iterator stops at ``max_pages`` or the aggregate byte budget. A
+        yielded page with ``has_more`` true can be resumed by passing its
+        ``next_after_step`` and ``source_revisions['edit']`` to a new iterator.
+        """
+        _unsigned(after_step, "after_step")
+        _unsigned(page_steps, "page_steps", 4096)
+        _unsigned(page_bytes, "page_bytes", 128 * 1024 * 1024)
+        _unsigned(max_pages, "max_pages", 4096)
+        _unsigned(total_bytes, "total_bytes", 2 * 1024 * 1024 * 1024)
+        if not page_steps or not page_bytes or not max_pages or not total_bytes:
+            raise ValueError("audit iterator limits must be positive")
+        if expected_revision is not None:
+            _unsigned(expected_revision, "expected_revision")
+        consumed = 0
+        for _ in range(max_pages):
+            remaining = total_bytes - consumed
+            if not remaining:
+                return
+            page = self.audit_history(
+                after_step=after_step, max_steps=page_steps,
+                max_delta_bytes=min(page_bytes, remaining),
+                expected_revision=expected_revision, cancel=cancel)
+            if expected_revision is None:
+                expected_revision = page.source_revisions["edit"]
+            consumed += page.delta_bytes
+            yield page
+            if not page.has_more:
+                return
+            after_step = page.next_after_step
+
     def preview_history(self, target_step, *, max_steps=256,
                         max_delta_bytes=16 * 1024 * 1024,
                         expected_revision=None, cancel=None):
@@ -657,6 +739,125 @@ class Project:
     def functions(self, *, start=0, count=256):
         return self._call("functions", start, count)
 
+    def function_fingerprint_catalog(self, function_ids, provenance, *,
+                                     max_instructions=512, max_blocks=1024,
+                                     max_token_bytes=1024 * 1024,
+                                     expected_revision=None, cancel=None):
+        """Create a serialized normalized-fingerprint catalog in selection order.
+
+        ``function_ids`` must contain 1..4096 unique recovered IDs. Stale IDs,
+        duplicates, or functions that cannot be fingerprinted fail the whole
+        operation. Pass ``expected_revision`` from ``snapshot()`` to reject a
+        project edit that occurred before the catalog snapshot was captured;
+        an edit or byte change during extraction raises
+        :class:`ProjectChangedDuringQuery`.
+        """
+        if not isinstance(function_ids, (list, tuple)):
+            raise TypeError("function_ids must be a list or tuple")
+        if not 1 <= len(function_ids) <= 4096:
+            raise ValueError("function_ids must contain 1 through 4,096 IDs")
+        if expected_revision is not None:
+            _unsigned(expected_revision, "expected_revision")
+        try:
+            return self._workspace_read_call(
+                "function_fingerprint_catalog", function_ids, provenance,
+                max_instructions, max_blocks, max_token_bytes,
+                expected_revision, cancel=cancel)
+        except Error as error:
+            if error.code == _hexlab.CONFLICT_ERROR_CODE:
+                raise ProjectChangedDuringQuery("project changed during fingerprint catalog creation") from None
+            raise
+
+    def recognize_flirt_catalogs(self, catalogs, *, expected_revision=None, cancel=None):
+        """Read-only recognition over ordered ``(catalog_bytes, provenance)`` pairs.
+
+        Each byte string may contain FLAIR text, gzip-wrapped text, or binary
+        IDASGN v5-v10 data. Catalog order and duplicates are retained in each
+        candidate's ``catalog_index``. The aggregate input and inflated bytes
+        are each capped at 64 MiB, with 256 catalogs and 65,536 patterns.
+        Results include every candidate, provenance, match count, and explicit
+        ambiguity; no project names or annotations are changed. An edit or byte
+        change during recognition raises :class:`ProjectChangedDuringQuery`.
+        """
+        if not isinstance(catalogs, (list, tuple)):
+            raise TypeError("catalogs must be a list or tuple")
+        if not 1 <= len(catalogs) <= 256:
+            raise ValueError("catalogs must contain 1 through 256 entries")
+        total_bytes = 0
+        for item in catalogs:
+            if not isinstance(item, (list, tuple)) or len(item) != 2:
+                raise TypeError("each catalog must be a (bytes, provenance) pair")
+            data, provenance = item
+            if not isinstance(data, bytes):
+                raise TypeError("catalog contents must be bytes")
+            if not isinstance(provenance, str):
+                raise TypeError("catalog provenance must be str")
+            if len(provenance.encode("utf-8")) > 256:
+                raise ValueError("catalog provenance exceeds 256 UTF-8 bytes")
+            total_bytes += len(data)
+            if total_bytes > 64 * 1024 * 1024:
+                raise ValueError("aggregate catalog bytes exceed 64 MiB")
+        if expected_revision is not None:
+            _unsigned(expected_revision, "expected_revision")
+        try:
+            return self._workspace_read_call(
+                "recognize_flirt_catalogs", catalogs, expected_revision, cancel=cancel)
+        except Error as error:
+            if error.code == _hexlab.CONFLICT_ERROR_CODE:
+                raise ProjectChangedDuringQuery("project changed during FLAIR recognition") from None
+            raise
+
+    def function_signature_catalog(self, function_ids, provenance, *, max_bytes=128,
+                                   min_exact_bytes=8, expected_revision=None, cancel=None):
+        """Create a serialized, target scoped byte signature catalog.
+
+        Selection order is retained. The selection must contain 1..4096 unique
+        recovered function IDs; invalid or unsignable functions fail the whole
+        operation. Catalog extraction is cancellation aware and raises
+        :class:`ProjectChangedDuringQuery` if project bytes or edits change.
+        """
+        if not isinstance(function_ids, (list, tuple)):
+            raise TypeError("function_ids must be a list or tuple")
+        if not 1 <= len(function_ids) <= 4096:
+            raise ValueError("function_ids must contain 1 through 4,096 IDs")
+        if not isinstance(provenance, str):
+            raise TypeError("provenance must be str")
+        if len(provenance.encode("utf-8")) > 256:
+            raise ValueError("provenance exceeds 256 UTF-8 bytes")
+        if expected_revision is not None:
+            _unsigned(expected_revision, "expected_revision")
+        try:
+            return self._workspace_read_call(
+                "function_signature_catalog", function_ids, provenance,
+                max_bytes, min_exact_bytes, expected_revision, cancel=cancel)
+        except Error as error:
+            if error.code == _hexlab.CONFLICT_ERROR_CODE:
+                raise ProjectChangedDuringQuery("project changed during signature catalog creation") from None
+            raise
+
+    def recognize_function_signatures(self, catalog, *, expected_revision=None, cancel=None):
+        """Recognize one serialized signature catalog at recovered entries.
+
+        ``catalog`` is the text returned by :meth:`function_signature_catalog`
+        (or another compatible signature catalog). Input is capped at 64 MiB;
+        native recognition uses bounded candidate, comparison and result limits.
+        Results retain ambiguity and never rename functions. Project changes
+        during recognition raise :class:`ProjectChangedDuringQuery`.
+        """
+        if not isinstance(catalog, str):
+            raise TypeError("catalog must be str")
+        if len(catalog.encode("utf-8")) > 64 * 1024 * 1024:
+            raise ValueError("signature catalog exceeds 64 MiB")
+        if expected_revision is not None:
+            _unsigned(expected_revision, "expected_revision")
+        try:
+            return self._workspace_read_call(
+                "recognize_function_signatures", catalog, expected_revision, cancel=cancel)
+        except Error as error:
+            if error.code == _hexlab.CONFLICT_ERROR_CODE:
+                raise ProjectChangedDuringQuery("project changed during signature recognition") from None
+            raise
+
     def function_at(self, address):
         """Return the unique recovered owner containing an address, or None.
 
@@ -679,9 +880,14 @@ class Project:
         return None if row is None else StackFrameInfo(**row)
 
     def stack_slots(self, address, *, start=0, count=256):
-        """Page local/argument slots with aggregate access flags and site counts."""
+        """Page stack slots with aggregate access flags and ABI argument facts."""
         rows = self._call("stack_slots", _location(address), start, count)
         return [StackSlotInfo(**row) for row in rows]
+
+    def stack_slot_call_arguments(self, address, slot_index, *, start=0, count=256):
+        """Page source/call provenance for one outgoing argument slot."""
+        rows = self._call("stack_slot_call_arguments", _location(address), slot_index, start, count)
+        return [StackSlotCallArgumentInfo(**row) for row in rows]
 
     def stack_slot_accesses(self, address, slot_index, *, start=0, count=256):
         """Page exact instruction sites for a slot from the current analysis."""
@@ -691,6 +897,11 @@ class Project:
     def iter_stack_slots(self, address, *, page_size=256, max_rows=None, cancel=None):
         """Yield stack slots through bounded native pages."""
         return self._iterate_rows("stack_slots", page_size, address, max_rows=max_rows, cancel=cancel)
+
+    def iter_stack_slot_call_arguments(self, address, slot_index, *, page_size=256, max_rows=None, cancel=None):
+        """Yield outgoing source/call provenance through bounded native pages."""
+        return self._iterate_rows("stack_slot_call_arguments", page_size, address, slot_index,
+                                  max_rows=max_rows, cancel=cancel)
 
     def iter_stack_slot_accesses(self, address, slot_index, *, page_size=256, max_rows=None, cancel=None):
         """Yield one slot's read/write sites through bounded native pages."""
@@ -735,6 +946,22 @@ class Project:
     def segments(self, *, start=0, count=256):
         """Return mapped segment ranges, original file backing, and permissions."""
         return self._call("segments", start, count)
+
+    def addresses_for_file_offset(self, offset):
+        """Return every mapped virtual address backed by this source file byte."""
+        return self._call("addresses_for_file_offset", offset)
+
+    def pe_imports(self, *, start=0, count=256):
+        """Page PE imports with name/ordinal, thunk, IAT, and delay-load status."""
+        return self._call("pe_imports", start, count)
+
+    def pe_exports(self, *, start=0, count=256):
+        """Page PE exports, including ordinal-only rows and forwarders."""
+        return self._call("pe_exports", start, count)
+
+    def elf_dynamic_entries(self, *, start=0, count=256):
+        """Page ELF dynamic entries with their table source and decoded string value."""
+        return self._call("elf_dynamic_entries", start, count)
 
     def strings(self, *, start=0, count=256):
         return self._call("strings", start, count)
@@ -807,6 +1034,18 @@ class Project:
         """Yield all mapped segments in bounded pages."""
         return self._iterate_rows("segments", page_size, max_rows=max_rows, cancel=cancel)
 
+    def iter_pe_imports(self, *, page_size=256, max_rows=None, cancel=None):
+        """Yield PE imports across bounded pages."""
+        return self._iterate_rows("pe_imports", page_size, max_rows=max_rows, cancel=cancel)
+
+    def iter_pe_exports(self, *, page_size=256, max_rows=None, cancel=None):
+        """Yield PE exports across bounded pages."""
+        return self._iterate_rows("pe_exports", page_size, max_rows=max_rows, cancel=cancel)
+
+    def iter_elf_dynamic_entries(self, *, page_size=256, max_rows=None, cancel=None):
+        """Yield ELF dynamic entries in table order using bounded pages."""
+        return self._iterate_rows("elf_dynamic_entries", page_size, max_rows=max_rows, cancel=cancel)
+
     def iter_strings(self, *, page_size=256, max_rows=None, cancel=None):
         """Yield all scanned strings in bounded pages."""
         return self._iterate_rows("strings", page_size, max_rows=max_rows, cancel=cancel)
@@ -874,6 +1113,86 @@ class Project:
                     return
                 if page.next <= start or page.next != start + len(page.references):
                     raise RuntimeError("incoming reference page cursor did not advance consistently")
+                start = page.next
+
+    def iter_incoming_references_range(self, address, size, *, page_size=256,
+                                       max_rows=None, cancel=None):
+        """Yield references to any byte in a half-open virtual-address range.
+
+        One captured project generation backs every page. References whose
+        target or resolved association falls in the range appear once.
+        """
+        if not isinstance(address, Address):
+            raise TypeError("address must be an Address")
+        _unsigned(size, "size")
+        if size == 0:
+            raise ValueError("size must be greater than zero")
+        self._check_page_size(page_size)
+        if max_rows is not None:
+            _unsigned(max_rows, "max_rows")
+        if cancel is None:
+            cancel = globals().get("_hexlab_console_cancellation_token")
+        if cancel is not None and not isinstance(cancel, CancellationToken):
+            raise TypeError("cancel must be a CancellationToken")
+        if max_rows == 0:
+            return
+        with self.capture(cancel=cancel) as reader:
+            start = 0
+            while max_rows is None or start < max_rows:
+                if cancel is not None and cancel.cancelled:
+                    raise AnalysisCancelled("reference iteration canceled")
+                amount = page_size if max_rows is None else min(page_size, max_rows - start)
+                page = reader.incoming_references_range(address, size, start=start, count=amount)
+                for row in page.references:
+                    if cancel is not None and cancel.cancelled:
+                        raise AnalysisCancelled("reference iteration canceled")
+                    yield row
+                if cancel is not None and cancel.cancelled:
+                    raise AnalysisCancelled("reference iteration canceled")
+                if page.next is None:
+                    return
+                if page.next <= start or page.next != start + len(page.references):
+                    raise RuntimeError("incoming range reference cursor did not advance consistently")
+                start = page.next
+
+    def iter_outgoing_references_range(self, address, size, *, page_size=256,
+                                       max_rows=None, cancel=None):
+        """Yield references whose source is in a half-open virtual range.
+
+        Pages come from one captured project generation. All reference kinds,
+        including unresolved and external targets, are retained.
+        """
+        if not isinstance(address, Address):
+            raise TypeError("address must be an Address")
+        _unsigned(size, "size")
+        if size == 0:
+            raise ValueError("size must be greater than zero")
+        self._check_page_size(page_size)
+        if max_rows is not None:
+            _unsigned(max_rows, "max_rows")
+        if cancel is None:
+            cancel = globals().get("_hexlab_console_cancellation_token")
+        if cancel is not None and not isinstance(cancel, CancellationToken):
+            raise TypeError("cancel must be a CancellationToken")
+        if max_rows == 0:
+            return
+        with self.capture(cancel=cancel) as reader:
+            start = 0
+            while max_rows is None or start < max_rows:
+                if cancel is not None and cancel.cancelled:
+                    raise AnalysisCancelled("reference iteration canceled")
+                amount = page_size if max_rows is None else min(page_size, max_rows - start)
+                page = reader.outgoing_references_range(address, size, start=start, count=amount)
+                for row in page.references:
+                    if cancel is not None and cancel.cancelled:
+                        raise AnalysisCancelled("reference iteration canceled")
+                    yield row
+                if cancel is not None and cancel.cancelled:
+                    raise AnalysisCancelled("reference iteration canceled")
+                if page.next is None:
+                    return
+                if page.next <= start or page.next != start + len(page.references):
+                    raise RuntimeError("outgoing range reference cursor did not advance consistently")
                 start = page.next
 
     def call_graph(self, address, *, max_functions=1024, max_edges=16384,
@@ -1009,17 +1328,43 @@ class Project:
                 "unresolved_call_count": unresolved_calls,
                 "instructions_examined": instructions_examined}
 
-    def export_analysis_json(self, path, *, page_size=4096, cancel=None, progress=None):
+    def call_graph_model(self, address, *, call_depth=1, node_budget=1000,
+                         edge_budget=10000, cancel=None):
+        """Return the native, detached function-call ``GraphModel`` as JSON data.
+
+        ``call_depth`` is limited to 1..4, ``node_budget`` to 1..1,000,000,
+        and ``edge_budget`` to 1..4,000,000. A ``CancellationToken`` can stop
+        collection and serialization in the native graph builder. The graph is
+        based on current analysis and raises the native ambiguity error when the
+        selected address belongs to multiple recovered functions.
+        """
+        for name, value, minimum, maximum in (
+                ("call_depth", call_depth, 1, 4),
+                ("node_budget", node_budget, 1, 1000000),
+                ("edge_budget", edge_budget, 1, 4000000)):
+            if not isinstance(value, int) or isinstance(value, bool) or not minimum <= value <= maximum:
+                raise ValueError(f"{name} must be in {minimum}..{maximum}")
+        encoded = self._workspace_read_call(
+            "call_graph_model", _location(address), call_depth, node_budget,
+            edge_budget, cancel=cancel)
+        return json.loads(encoded)
+
+    def export_analysis_json(self, path, *, page_size=4096, cancel=None, progress=None,
+                             include_cfg=False):
         """Refresh and atomically export a versioned, machine-readable analysis.
 
         Pages are streamed into a temporary sibling file, so row memory stays
         bounded by ``page_size`` and cancellation/failure never publishes a
         partial report. ``cancel`` is an optional zero-argument predicate;
         ``progress(stage, completed, total)`` is called at stage/page boundaries.
+        ``include_cfg=True`` opts into schema version 2 with bounded block and
+        successor tables; the default preserves the version-1 document shape.
         A CancellationToken can interrupt native analysis; plain predicates are
         checked between native operations. Edits during collection abort export.
         """
         self._check_page_size(page_size)
+        if not isinstance(include_cfg, bool):
+            raise TypeError("include_cfg must be a bool")
         if cancel is None:
             cancel = globals().get("_hexlab_console_cancellation_token")
         if cancel is not None and not callable(cancel):
@@ -1063,7 +1408,8 @@ class Project:
         prefix = "." + os.path.basename(destination) + "."
         descriptor, temporary = tempfile.mkstemp(prefix=prefix, suffix=".tmp", dir=directory)
         row_counts = {"functions": 0, "instructions": 0, "segments": 0,
-                      "references": 0, "strings": 0}
+                      "references": 0, "strings": 0, "blocks": 0,
+                      "block_successors": 0}
         encoded_bytes = 0
         encoder = json.JSONEncoder(ensure_ascii=False, indent=2, sort_keys=True)
 
@@ -1078,7 +1424,8 @@ class Project:
                     for part in encoder.iterencode(_json_value(value)):
                         write(part)
 
-                write("{\n  \"schema_version\": 1,\n  \"api_version\": ")
+                schema_version = 2 if include_cfg else 1
+                write("{\n  \"schema_version\": " + str(schema_version) + ",\n  \"api_version\": ")
                 write_json(API_VERSION)
                 write(",\n  \"project\": ")
                 write_json(snapshot)
@@ -1121,6 +1468,67 @@ class Project:
                     if not first:
                         write("\n  ")
                     write("]")
+                if include_cfg:
+                    # CFG identities are valid for this captured analysis only.
+                    # Nest iteration by function so all block rows retain a
+                    # stable owner even when block ids are process-local.
+                    for table in ("blocks", "block_successors"):
+                        write(",\n  " + json.dumps(table) + ": [")
+                        first = True
+                        completed = 0
+                        function_start = 0
+                        while True:
+                            check_cancel()
+                            check_revision(snapshot_revision)
+                            function_page = reader.functions(start=function_start, count=page_size)
+                            if not function_page:
+                                break
+                            for function in function_page:
+                                owner = function["entry"]
+                                block_start = 0
+                                while block_start < function["block_count"]:
+                                    check_cancel()
+                                    check_revision(snapshot_revision)
+                                    blocks = reader.function_blocks(owner, start=block_start,
+                                                                    count=min(page_size, function["block_count"] - block_start))
+                                    if not blocks:
+                                        raise RuntimeError("captured CFG block page ended before its declared count")
+                                    for block in blocks:
+                                        if table == "blocks":
+                                            row = dict(block)
+                                            row["function_entry"] = owner
+                                            write("," if not first else "")
+                                            write("\n    ")
+                                            write_json(row)
+                                            first = False
+                                            completed += 1
+                                        else:
+                                            edge_start = 0
+                                            while edge_start < block["successor_count"]:
+                                                check_cancel()
+                                                check_revision(snapshot_revision)
+                                                edges = reader.block_successors(
+                                                    block["id"], start=edge_start,
+                                                    count=min(page_size, block["successor_count"] - edge_start))
+                                                if not edges:
+                                                    raise RuntimeError("captured CFG edge page ended before its declared count")
+                                                for edge in edges:
+                                                    row = dict(edge)
+                                                    row["block_id"] = block["id"]
+                                                    row["function_entry"] = owner
+                                                    write("," if not first else "")
+                                                    write("\n    ")
+                                                    write_json(row)
+                                                    first = False
+                                                    completed += 1
+                                                edge_start += len(edges)
+                                        report(table, completed, None)
+                                    block_start += len(blocks)
+                            function_start += len(function_page)
+                        row_counts[table] = completed
+                        if not first:
+                            write("\n  ")
+                        write("]")
                 write("\n}\n")
                 output.flush()
                 os.fsync(output.fileno())
@@ -1136,11 +1544,13 @@ class Project:
                 pass
             finally:
                 reader.close()
-        return {"path": destination, "schema_version": 1,
+        return {"path": destination, "schema_version": schema_version,
                 "function_count": row_counts["functions"],
                 "instruction_count": row_counts["instructions"],
                 "reference_count": row_counts["references"],
                 "string_count": row_counts["strings"],
+                "block_count": row_counts["blocks"],
+                "block_successor_count": row_counts["block_successors"],
                 "segment_count": row_counts["segments"],
                 "bytes": encoded_bytes}
 
@@ -1152,12 +1562,36 @@ class Project:
         row = self._call("incoming_references", _location(location), start, count)
         return ReferencePage(row["references"], row["total"], row["next"])
 
+    def incoming_references_range(self, address, size, *, start=0, count=256):
+        """Find references targeting any byte in ``[address, address + size)``."""
+        if not isinstance(address, Address):
+            raise TypeError("address must be an Address")
+        _unsigned(size, "size")
+        if size == 0:
+            raise ValueError("size must be greater than zero")
+        _unsigned(start, "start")
+        self._check_page_size(count)
+        row = self._call("incoming_references_range", _location(address), size, start, count)
+        return ReferencePage(row["references"], row["total"], row["next"])
+
+    def outgoing_references_range(self, address, size, *, start=0, count=256):
+        """Page references whose source is in ``[address, address + size)``."""
+        if not isinstance(address, Address):
+            raise TypeError("address must be an Address")
+        _unsigned(size, "size")
+        if size == 0:
+            raise ValueError("size must be greater than zero")
+        _unsigned(start, "start")
+        self._check_page_size(count)
+        row = self._call("outgoing_references_range", _location(address), size, start, count)
+        return ReferencePage(row["references"], row["total"], row["next"])
+
     def all_references(self, *, start=0, count=256):
         """Page every current reference row, including imports and relocations."""
         row = self._call("all_references", start, count)
         return ReferencePage(row["references"], row["total"], row["next"])
 
-    def _search(self, query, cursor, max_results, cancel=None):
+    def _search(self, query, cursor, max_results, cancel=None, start=None):
         if not isinstance(max_results, int) or isinstance(max_results, bool) or not 1 <= max_results <= 4096:
             raise ValueError("max_results must be in 1..4096")
         if cursor is not None and not isinstance(cursor, SearchCursor):
@@ -1166,9 +1600,10 @@ class Project:
             cancel = globals().get("_hexlab_console_cancellation_token")
         if cancel is not None and not isinstance(cancel, CancellationToken):
             raise TypeError("cancel must be a CancellationToken")
+        native_start = None if start is None else _location(start)
         try:
             row = self._call("search", query, None if cursor is None else cursor._handle,
-                             max_results, None if cancel is None else cancel._handle)
+                             max_results, None if cancel is None else cancel._handle, native_start)
         except Error as error:
             if cancel is not None and cancel.cancelled and error.code == _hexlab.CANCELED_ERROR_CODE:
                 raise AnalysisCancelled("search canceled") from None
@@ -1177,18 +1612,22 @@ class Project:
         row["next"] = None if continuation is None else SearchCursor(continuation)
         return SearchPage(**row)
 
-    def search_bytes(self, pattern, *, cursor=None, max_results=256, cancel=None):
-        """Search effective bytes; a CancellationToken interrupts the native scan."""
-        return self._search(("bytes", pattern), cursor, max_results, cancel)
+    def search_bytes(self, pattern, *, cursor=None, max_results=256, cancel=None, start=None):
+        """Search effective bytes; start may be a mapped Address or FileOffset."""
+        return self._search(("bytes", pattern), cursor, max_results, cancel, start)
 
-    def search_text(self, text, *, encoding="utf8", cursor=None, max_results=256, cancel=None):
-        """Search effective bytes for text; cancel may be a CancellationToken."""
-        encodings = {"ascii": 0, "utf8": 1, "utf16le": 2, "utf16be": 3, "utf32le": 4, "utf32be": 5}
+    def search_text(self, text, *, encoding="utf8", case_sensitive=True, cursor=None,
+                    max_results=256, cancel=None, start=None):
+        """Search encoded text with optional ASCII-only case folding."""
+        if type(case_sensitive) is not bool:
+            raise TypeError("case_sensitive must be bool")
+        encodings = {"ascii": 0, "utf8": 1, "utf16le": 2, "utf16be": 3, "utf32le": 4, "utf32be": 5,
+                     "windows1252": 6, "iso8859_1": 7}
         try:
             selected = encodings[encoding.lower()]
         except (AttributeError, KeyError):
-            raise ValueError("encoding must be ascii, utf8, utf16le, utf16be, utf32le, or utf32be") from None
-        return self._search(("text", text, selected), cursor, max_results, cancel)
+            raise ValueError("encoding must be ascii, utf8, utf16le, utf16be, utf32le, utf32be, windows1252, or iso8859_1") from None
+        return self._search(("text", text, selected, case_sensitive), cursor, max_results, cancel, start)
 
     def _iterate_search(self, method, *args, page_size=256, max_rows=None, cancel=None, **kwargs):
         self._check_page_size(page_size)
@@ -1225,22 +1664,34 @@ class Project:
             if page.next is None:
                 raise RuntimeError("search stopped before completion: " + page.reason)
             cursor = page.next
+            if "start" in kwargs:
+                kwargs["start"] = None
 
-    def iter_search_bytes(self, pattern, *, page_size=256, max_rows=None, cancel=None):
+    def iter_search_bytes(self, pattern, *, page_size=256, max_rows=None, cancel=None, start=None):
         """Yield effective-byte matches across revision-bound pages."""
         return self._iterate_search("search_bytes", pattern, page_size=page_size,
-                                    max_rows=max_rows, cancel=cancel)
+                                    max_rows=max_rows, cancel=cancel, start=start)
 
-    def iter_search_text(self, text, *, encoding="utf8", page_size=256, max_rows=None, cancel=None):
-        """Yield encoded-text matches across revision-bound pages."""
-        return self._iterate_search("search_text", text, encoding=encoding, page_size=page_size,
-                                    max_rows=max_rows, cancel=cancel)
+    def iter_search_text(self, text, *, encoding="utf8", case_sensitive=True,
+                         page_size=256, max_rows=None, cancel=None, start=None):
+        """Yield encoded-text matches; case folding is limited to ASCII A-Z."""
+        return self._iterate_search("search_text", text, encoding=encoding, case_sensitive=case_sensitive,
+                                    page_size=page_size,
+                                    max_rows=max_rows, cancel=cancel, start=start)
 
-    def search_immediate(self, value, *, width=64, signed=False, cursor=None, max_results=256, cancel=None):
-        """Search decoded instructions for an immediate; cancel may be a CancellationToken."""
+    def iter_search_immediate(self, value, *, width=64, signed=False,
+                              page_size=256, max_rows=None, cancel=None, start=None):
+        """Yield immediate-operand matches across revision-bound pages."""
         if not isinstance(width, int) or isinstance(width, bool) or width not in (8, 16, 32, 64):
             raise ValueError("width must be 8, 16, 32, or 64")
-        return self._search(("immediate", str(value), width, bool(signed)), cursor, max_results, cancel)
+        return self._iterate_search("search_immediate", value, width=width, signed=bool(signed),
+                                    page_size=page_size, max_rows=max_rows, cancel=cancel, start=start)
+
+    def search_immediate(self, value, *, width=64, signed=False, cursor=None, max_results=256, cancel=None, start=None):
+        """Search decoded instructions; start may be an Address or FileOffset."""
+        if not isinstance(width, int) or isinstance(width, bool) or width not in (8, 16, 32, 64):
+            raise ValueError("width must be 8, 16, 32, or 64")
+        return self._search(("immediate", str(value), width, bool(signed)), cursor, max_results, cancel, start)
 
     def rename(self, location, name, *, group=0):
         return self._call("rename", _location(location), name, group)
@@ -1251,7 +1702,7 @@ class Project:
     def bookmark(self, location, label="", *, remove=False, group=0):
         return self._call("bookmark", _location(location), label, remove, group)
 
-    def apply_annotations(self, rows, *, group=0, expected_revision=None, merge="replace", return_report=False):
+    def apply_annotations(self, rows, *, group=0, expected_revision=None, merge="replace", return_report=False, cancel=None):
         """Atomically import a bounded batch of names, comments, and bookmarks.
 
         Each row is a mapping with ``location`` and any of ``name``,
@@ -1265,16 +1716,27 @@ class Project:
         a complete snapshot of no more than 4096 existing annotations and
         bookmarks, so it never treats truncated state as absent.
         When ``return_report=True``, return a mapping containing the resulting
-        ``snapshot`` plus the number of requested annotation fields that were
-        ``applied`` and ``skipped``. The default return value remains the
-        snapshot for compatibility.
+        ``snapshot``, per-field ``applied`` and ``skipped`` counts, the pinned
+        ``expected_revision``, the resulting ``result_revision``, the number
+        of ``planned_edits``, and whether the project revision changed in
+        ``committed``. A preserve-mode no-op reports the same revision before
+        and after and ``committed=False``. The default return value remains
+        the snapshot for compatibility. ``cancel`` may be a CancellationToken;
+        cancellation stops bounded planning and native validation before the
+        atomic commit.
         """
+        if cancel is None:
+            cancel = globals().get("_hexlab_console_cancellation_token")
+        if cancel is not None and not isinstance(cancel, CancellationToken):
+            raise TypeError("cancel must be a CancellationToken")
         if merge not in ("replace", "preserve"):
             raise ValueError("merge must be 'replace' or 'preserve'")
         current = None
         existing_annotations = {}
         existing_bookmarks = set()
         existing_names = {}
+        pending_annotations = {}
+        pending_bookmarks = set()
         if merge == "preserve":
             current = self.snapshot()
             if expected_revision is None:
@@ -1307,6 +1769,8 @@ class Project:
         skipped_fields = 0
         allowed = {"location", "name", "comment", "bookmark"}
         for row in rows:
+            if cancel is not None and cancel.cancelled:
+                raise AnalysisCancelled("annotation import canceled during planning")
             row_count += 1
             if row_count > 4096:
                 raise ValueError("annotation import requires at most 4096 rows")
@@ -1340,13 +1804,17 @@ class Project:
                     raise ValueError("annotation import expands to more than 4096 edits")
             if merge == "preserve":
                 current_annotation = existing_annotations.get(location_key, {})
+                pending_fields = pending_annotations.setdefault(location_key, set())
                 for command in row_commands:
                     field, _, value, *extra = command
                     if field == "bookmark":
-                        if location_key in existing_bookmarks or extra[0]:
+                        if location_key in existing_bookmarks or location_key in pending_bookmarks or extra[0]:
                             skipped_fields += 1
                             continue
                     elif current_annotation.get(field):
+                        skipped_fields += 1
+                        continue
+                    elif field in pending_fields:
                         skipped_fields += 1
                         continue
                     elif value == "":
@@ -1358,6 +1826,12 @@ class Project:
                             skipped_fields += 1
                             continue
                     commands.append(command)
+                    if field == "bookmark":
+                        pending_bookmarks.add(location_key)
+                    else:
+                        pending_fields.add(field)
+                        if field == "name" and isinstance(row["location"], Address):
+                            existing_names[(row["location"].space, value)] = location_key
             else:
                 commands.extend(row_commands)
             if len(commands) > 4096:
@@ -1365,13 +1839,18 @@ class Project:
         if row_count == 0:
             raise ValueError("annotation import requires at least one row")
         if not commands and merge == "preserve":
+            if cancel is not None and cancel.cancelled:
+                raise AnalysisCancelled("annotation import canceled")
             if expected_revision is None:
                 expected_revision = current["edit_revision"]
             _unsigned(expected_revision, "expected_revision")
             if expected_revision != current["edit_revision"]:
                 raise ValueError("expected_revision does not match the preserve snapshot")
             if return_report:
-                return {"snapshot": current, "applied": 0, "skipped": skipped_fields}
+                return {"snapshot": current, "applied": 0, "skipped": skipped_fields,
+                        "expected_revision": expected_revision,
+                        "result_revision": current["edit_revision"],
+                        "planned_edits": 0, "committed": False}
             return current
         if not commands:
             raise ValueError("annotation import contains no edits")
@@ -1383,10 +1862,396 @@ class Project:
         if (merge == "preserve" and
                 expected_revision != current["edit_revision"]):
             raise ValueError("expected_revision does not match the preserve snapshot")
-        result = self._call("apply_annotations", commands, group, expected_revision)
+        try:
+            result = self._call("apply_annotations", commands, group, expected_revision,
+                                None if cancel is None else cancel._handle)
+        except Error as error:
+            if cancel is not None and cancel.cancelled and error.code == _hexlab.CANCELED_ERROR_CODE:
+                raise AnalysisCancelled("annotation import canceled") from None
+            raise
         if return_report:
-            return {"snapshot": result, "applied": len(commands), "skipped": skipped_fields}
+            result_revision = result["edit_revision"]
+            return {"snapshot": result, "applied": len(commands), "skipped": skipped_fields,
+                    "expected_revision": expected_revision, "result_revision": result_revision,
+                    "planned_edits": len(commands), "committed": result_revision != expected_revision}
         return result
+
+    def export_annotations_csv(self, path, *, cancel=None):
+        """Atomically export a bounded CSV of names, comments, and bookmarks.
+
+        The snapshot and output are limited to 4096 annotation and bookmark
+        rows and 16 MiB. The destination must not already exist. A sibling
+        temporary file and hard link prevent partial output from being published.
+        """
+        if cancel is None:
+            cancel = globals().get("_hexlab_console_cancellation_token")
+        if cancel is not None and not isinstance(cancel, CancellationToken):
+            raise TypeError("cancel must be a CancellationToken")
+        if cancel is not None and cancel.cancelled:
+            raise AnalysisCancelled("annotation export canceled")
+        snapshot = self.snapshot()
+        if (snapshot["annotation_count"] != len(snapshot["annotations"]) or
+                snapshot["bookmark_count"] != len(snapshot["bookmarks"])):
+            raise ValueError("annotation CSV export is limited to 4096 annotations and bookmarks")
+
+        by_location = {}
+        for annotation in snapshot["annotations"]:
+            if cancel is not None and cancel.cancelled:
+                raise AnalysisCancelled("annotation export canceled while collecting rows")
+            location = annotation["location"]
+            if isinstance(location, Address):
+                key = ("va", location.space, location.offset)
+            elif isinstance(location, FileOffset):
+                key = ("file", location.offset)
+            else:
+                raise ValueError("project snapshot contains an unsupported annotation location")
+            by_location[key] = {"name": annotation["name"], "comment": annotation["comment"], "bookmark": ""}
+        for bookmark in snapshot["bookmarks"]:
+            if cancel is not None and cancel.cancelled:
+                raise AnalysisCancelled("annotation export canceled while collecting rows")
+            location = bookmark["location"]
+            if isinstance(location, Address):
+                key = ("va", location.space, location.offset)
+            elif isinstance(location, FileOffset):
+                key = ("file", location.offset)
+            else:
+                raise ValueError("project snapshot contains an unsupported bookmark location")
+            by_location.setdefault(key, {"name": "", "comment": "", "bookmark": ""})["bookmark"] = bookmark["label"]
+        if len(by_location) > 4096:
+            raise ValueError("annotation CSV export exceeds 4096 combined location rows")
+
+        import csv
+        import io
+        buffer = io.StringIO(newline="")
+        writer = csv.writer(buffer, lineterminator="\n")
+        writer.writerow(("location_kind", "space", "offset", "name", "comment", "bookmark"))
+        for key in sorted(by_location):
+            if cancel is not None and cancel.cancelled:
+                raise AnalysisCancelled("annotation export canceled while collecting rows")
+            values = by_location[key]
+            writer.writerow((key[0], str(key[1]) if key[0] == "va" else "", hex(key[-1]),
+                             values["name"], values["comment"], values["bookmark"]))
+        encoded = buffer.getvalue().encode("utf-8")
+        if len(encoded) > 16 * 1024 * 1024:
+            raise ValueError("annotation CSV manifest exceeds 16 MiB")
+        if cancel is not None and cancel.cancelled:
+            raise AnalysisCancelled("annotation export canceled")
+        if self.snapshot()["edit_revision"] != snapshot["edit_revision"]:
+            raise ProjectChangedDuringExport("project changed during annotation export")
+
+        destination = os.path.abspath(os.fspath(path))
+        directory = os.path.dirname(destination) or os.curdir
+        descriptor, temporary = tempfile.mkstemp(prefix="." + os.path.basename(destination) + ".",
+                                                 suffix=".tmp", dir=directory)
+        try:
+            with os.fdopen(descriptor, "wb") as output:
+                output.write(encoded)
+                output.flush()
+                os.fsync(output.fileno())
+            if cancel is not None and cancel.cancelled:
+                raise AnalysisCancelled("annotation export canceled")
+            if self.snapshot()["edit_revision"] != snapshot["edit_revision"]:
+                raise ProjectChangedDuringExport("project changed during annotation export")
+            os.link(temporary, destination)
+        finally:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+        return {"path": destination, "row_count": len(by_location), "bytes": len(encoded),
+                "source_edit_revision": snapshot["edit_revision"]}
+
+    def export_annotations_json(self, path, *, cancel=None):
+        """Atomically export a bounded, versioned names/comments/bookmarks manifest.
+
+        The snapshot and output are limited to 4096 annotation and bookmark
+        rows and 16 MiB of UTF-8 JSON. The destination must not already exist.
+        A same-directory temporary file and hard link prevent a canceled or
+        failed export from publishing a partial manifest.
+        """
+        if cancel is None:
+            cancel = globals().get("_hexlab_console_cancellation_token")
+        if cancel is not None and not isinstance(cancel, CancellationToken):
+            raise TypeError("cancel must be a CancellationToken")
+        if cancel is not None and cancel.cancelled:
+            raise AnalysisCancelled("annotation export canceled")
+        snapshot = self.snapshot()
+        if (snapshot["annotation_count"] != len(snapshot["annotations"]) or
+                snapshot["bookmark_count"] != len(snapshot["bookmarks"])):
+            raise ValueError("annotation manifest export is limited to 4096 annotations and bookmarks")
+
+        rows = []
+        by_location = {}
+        def location_value(location):
+            if isinstance(location, Address):
+                return {"kind": "va", "space": location.space, "offset": location.offset}
+            if isinstance(location, FileOffset):
+                return {"kind": "file", "offset": location.offset}
+            raise ValueError("project snapshot contains an unsupported annotation location")
+
+        def key(location):
+            if isinstance(location, Address):
+                return ("va", location.space, location.offset)
+            return ("file", location.offset)
+
+        for annotation in snapshot["annotations"]:
+            if cancel is not None and cancel.cancelled:
+                raise AnalysisCancelled("annotation export canceled while collecting rows")
+            location = annotation["location"]
+            record = {"location": location_value(location)}
+            if annotation["name"]:
+                record["name"] = annotation["name"]
+            if annotation["comment"]:
+                record["comment"] = annotation["comment"]
+            by_location[key(location)] = record
+            rows.append(record)
+        for bookmark in snapshot["bookmarks"]:
+            if cancel is not None and cancel.cancelled:
+                raise AnalysisCancelled("annotation export canceled while collecting rows")
+            location = bookmark["location"]
+            record = by_location.get(key(location))
+            if record is None:
+                record = {"location": location_value(location)}
+                by_location[key(location)] = record
+                rows.append(record)
+            record["bookmark"] = bookmark["label"]
+        manifest = {"schema_version": 1, "api_version": API_VERSION,
+                    "source_edit_revision": snapshot["edit_revision"], "rows": rows}
+        encoded = json.dumps(manifest, ensure_ascii=False, sort_keys=True,
+                             separators=(",", ":")).encode("utf-8") + b"\n"
+        if len(encoded) > 16 * 1024 * 1024:
+            raise ValueError("annotation manifest exceeds 16 MiB")
+        if cancel is not None and cancel.cancelled:
+            raise AnalysisCancelled("annotation export canceled")
+        if self.snapshot()["edit_revision"] != snapshot["edit_revision"]:
+            raise ProjectChangedDuringExport("project changed during annotation export")
+
+        destination = os.path.abspath(os.fspath(path))
+        directory = os.path.dirname(destination) or os.curdir
+        prefix = "." + os.path.basename(destination) + "."
+        descriptor, temporary = tempfile.mkstemp(prefix=prefix, suffix=".tmp", dir=directory)
+        try:
+            with os.fdopen(descriptor, "wb") as output:
+                output.write(encoded)
+                output.flush()
+                os.fsync(output.fileno())
+            if cancel is not None and cancel.cancelled:
+                raise AnalysisCancelled("annotation export canceled")
+            if self.snapshot()["edit_revision"] != snapshot["edit_revision"]:
+                raise ProjectChangedDuringExport("project changed during annotation export")
+            os.link(temporary, destination)
+        finally:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+        return {"path": destination, "schema_version": 1, "row_count": len(rows),
+                "bytes": len(encoded), "source_edit_revision": snapshot["edit_revision"]}
+
+    def import_annotations_json(self, path, *, group=0, expected_revision=None,
+                                merge="replace", return_report=False, cancel=None):
+        """Import a strict versioned annotation manifest as one atomic edit batch.
+
+        Input is bounded to 16 MiB and 4096 rows. Duplicate JSON keys and
+        unknown fields are rejected. Unless overridden, the native batch pins
+        the target project's current edit revision before it validates changes.
+        """
+        if cancel is None:
+            cancel = globals().get("_hexlab_console_cancellation_token")
+        if cancel is not None and not isinstance(cancel, CancellationToken):
+            raise TypeError("cancel must be a CancellationToken")
+        if cancel is not None and cancel.cancelled:
+            raise AnalysisCancelled("annotation import canceled")
+        try:
+            with open(path, "rb") as source:
+                raw = source.read(16 * 1024 * 1024 + 1)
+        except OSError:
+            raise
+        if len(raw) > 16 * 1024 * 1024:
+            raise ValueError("annotation manifest exceeds 16 MiB")
+
+        def strict_object(pairs):
+            value = {}
+            for name, item in pairs:
+                if name in value:
+                    raise ValueError("annotation manifest contains a duplicate JSON key")
+                value[name] = item
+            return value
+
+        try:
+            manifest = json.loads(raw.decode("utf-8"), object_pairs_hook=strict_object,
+                                  parse_constant=lambda value: (_ for _ in ()).throw(
+                                      ValueError("invalid JSON constant: " + value)))
+        except (UnicodeError, json.JSONDecodeError) as error:
+            raise ValueError("annotation manifest is not valid UTF-8 JSON") from error
+        except RecursionError as error:
+            raise ValueError("annotation manifest nesting exceeds parser limits") from error
+        if not isinstance(manifest, dict) or set(manifest) != {
+                "schema_version", "api_version", "source_edit_revision", "rows"}:
+            raise ValueError("annotation manifest has an unsupported shape")
+        _unsigned(manifest["schema_version"], "schema_version", 1)
+        _unsigned(manifest["api_version"], "api_version", API_VERSION)
+        if manifest["schema_version"] != 1 or manifest["api_version"] != API_VERSION:
+            raise ValueError("annotation manifest version is not supported")
+        _unsigned(manifest["source_edit_revision"], "source_edit_revision")
+        rows = manifest["rows"]
+        if not isinstance(rows, list) or len(rows) > 4096:
+            raise ValueError("annotation manifest rows must contain at most 4096 items")
+        decoded_rows = []
+        for index, row in enumerate(rows):
+            if cancel is not None and cancel.cancelled:
+                raise AnalysisCancelled("annotation import canceled during parsing")
+            if not isinstance(row, dict) or "location" not in row or not set(row) <= {
+                    "location", "name", "comment", "bookmark"}:
+                raise ValueError("annotation manifest row " + str(index) + " has an unsupported shape")
+            where = row["location"]
+            if not isinstance(where, dict):
+                raise ValueError("annotation manifest location must be an object")
+            if where.get("kind") == "va" and set(where) == {"kind", "space", "offset"}:
+                location = Address(_unsigned(where["space"], "space"),
+                                   _unsigned(where["offset"], "offset"))
+            elif where.get("kind") == "file" and set(where) == {"kind", "offset"}:
+                location = FileOffset(_unsigned(where["offset"], "offset"))
+            else:
+                raise ValueError("annotation manifest location has an unsupported shape")
+            item = {"location": location}
+            for field in ("name", "comment", "bookmark"):
+                if field in row:
+                    value = row[field]
+                    if not isinstance(value, str):
+                        raise ValueError("annotation manifest " + field + " must be text")
+                    try:
+                        value.encode("utf-8")
+                    except UnicodeEncodeError as error:
+                        raise ValueError("annotation manifest " + field + " must contain valid Unicode") from error
+                    item[field] = value
+            if len(item) == 1:
+                raise ValueError("annotation manifest row has no annotation fields")
+            decoded_rows.append(item)
+        if not decoded_rows:
+            _unsigned(group, "group")
+            if merge not in ("replace", "preserve"):
+                raise ValueError("merge must be 'replace' or 'preserve'")
+            current = self.snapshot()
+            if expected_revision is not None:
+                _unsigned(expected_revision, "expected_revision")
+                if expected_revision != current["edit_revision"]:
+                    raise ValueError("expected_revision does not match the current project")
+            result = {"snapshot": current, "applied": 0, "skipped": 0}
+            return result if return_report else current
+        return self.apply_annotations(decoded_rows, group=group,
+            expected_revision=expected_revision, merge=merge,
+            return_report=return_report, cancel=cancel)
+
+    def import_annotations_csv(self, path, *, group=0, expected_revision=None,
+                               merge="replace", return_report=False, cancel=None):
+        """Import a bounded UTF-8 annotation CSV through one atomic batch.
+
+        The header requires ``location_kind`` and ``offset`` and may include
+        ``space``, ``name``, ``comment``, and ``bookmark``. CSV exported by
+        :meth:`export_annotations_csv` is accepted directly. Input is capped
+        at 16 MiB and 4096 data rows; edits use the same revision, merge, and
+        cancellation rules as :meth:`apply_annotations`.
+        """
+        if cancel is None:
+            cancel = globals().get("_hexlab_console_cancellation_token")
+        if cancel is not None and not isinstance(cancel, CancellationToken):
+            raise TypeError("cancel must be a CancellationToken")
+        if cancel is not None and cancel.cancelled:
+            raise AnalysisCancelled("annotation CSV import canceled")
+        with open(os.fspath(path), "rb") as source:
+            raw = source.read(16 * 1024 * 1024 + 1)
+        if len(raw) > 16 * 1024 * 1024:
+            raise ValueError("annotation CSV manifest exceeds 16 MiB")
+        try:
+            text = raw.decode("utf-8-sig")
+        except UnicodeError as error:
+            raise ValueError("annotation CSV manifest is not valid UTF-8") from error
+
+        import csv
+        import io
+        try:
+            reader = csv.reader(io.StringIO(text, newline=""), strict=True)
+            header = next(reader, None)
+            if not header:
+                raise ValueError("annotation CSV manifest is empty")
+            if len(set(header)) != len(header):
+                raise ValueError("annotation CSV manifest contains duplicate column names")
+            allowed = {"location_kind", "space", "offset", "name", "comment", "bookmark"}
+            if (not set(header) <= allowed or
+                    not {"location_kind", "offset"} <= set(header)):
+                raise ValueError("annotation CSV header requires location_kind and offset and allows only space/name/comment/bookmark")
+            if not set(header) & {"name", "comment", "bookmark"}:
+                raise ValueError("annotation CSV header must include an annotation column")
+            decoded_rows = []
+            text_bytes = 0
+            for row_number, values in enumerate(reader, 2):
+                if cancel is not None and cancel.cancelled:
+                    raise AnalysisCancelled("annotation CSV import canceled during parsing")
+                if not values:
+                    continue
+                if len(values) != len(header):
+                    raise ValueError("annotation CSV row " + str(row_number) + " has the wrong number of columns")
+                fields = dict(zip(header, values))
+
+                def parse_number(value, field):
+                    stripped = value.strip()
+                    if not stripped:
+                        raise ValueError(field + " must contain an integer")
+                    try:
+                        number = int(stripped, 0)
+                    except ValueError:
+                        if not stripped.isdecimal():
+                            raise ValueError(field + " must contain a decimal or prefixed integer")
+                        number = int(stripped, 10)
+                    return _unsigned(number, field)
+
+                try:
+                    offset = parse_number(fields["offset"], "offset")
+                    kind = fields["location_kind"]
+                    if kind == "va":
+                        if "space" not in fields or not fields["space"].strip():
+                            raise ValueError("VA location requires space")
+                        location = Address(parse_number(fields["space"], "space"), offset)
+                    elif kind == "file":
+                        if "space" in fields and fields["space"].strip():
+                            raise ValueError("file location must leave space blank")
+                        location = FileOffset(offset)
+                    else:
+                        raise ValueError("location_kind must be va or file")
+                except ValueError as error:
+                    raise ValueError("annotation CSV row " + str(row_number) + ": " + str(error)) from error
+
+                item = {"location": location}
+                for field in ("name", "comment", "bookmark"):
+                    value = fields.get(field, "")
+                    if value:
+                        text_bytes += len(value.encode("utf-8"))
+                        if text_bytes > 16 * 1024 * 1024:
+                            raise ValueError("annotation CSV text exceeds 16 MiB")
+                        item[field] = value
+                if len(item) == 1:
+                    raise ValueError("annotation CSV row " + str(row_number) + " has no nonempty annotation fields")
+                decoded_rows.append(item)
+                if len(decoded_rows) > 4096:
+                    raise ValueError("annotation CSV manifest exceeds 4096 rows")
+        except csv.Error as error:
+            raise ValueError("malformed annotation CSV manifest: " + str(error)) from error
+
+        if not decoded_rows:
+            _unsigned(group, "group")
+            if merge not in ("replace", "preserve"):
+                raise ValueError("merge must be 'replace' or 'preserve'")
+            current = self.snapshot()
+            if expected_revision is not None:
+                _unsigned(expected_revision, "expected_revision")
+                if expected_revision != current["edit_revision"]:
+                    raise ValueError("expected_revision does not match the current project")
+            result = {"snapshot": current, "applied": 0, "skipped": 0}
+            return result if return_report else current
+        return self.apply_annotations(decoded_rows, group=group,
+            expected_revision=expected_revision, merge=merge,
+            return_report=return_report, cancel=cancel)
 
     def apply_batch(self, operations, *, group=0, expected_revision=None, cancel=None):
         """Apply diverse project edits as one bounded, revision-pinned action.
@@ -1560,12 +2425,13 @@ class Project:
         return self._call("assign_type", _location(address), type_id, remove, group)
 
     def import_types(self, definitions, assignments=(), *, group=0):
-        """Atomically import a recursive named type graph and its address assignments.
+        """Atomically import a recursive named type graph and location assignments.
 
         ``definitions`` may be a name-to-TypeSpec mapping or an iterable of
-        ``(name, TypeSpec)`` pairs. Assignments are ``(Address, type_name)`` pairs.
-        Existing destination names are updated in place, preserving their IDs.
-        Both input collections are limited to 4096 rows per command.
+        ``(name, TypeSpec)`` pairs. Assignments are ``(Address | FileOffset,
+        type_name)`` pairs. Existing destination names are updated in place,
+        preserving their IDs. Both input collections are limited to 4096 rows
+        per command.
         """
         rows = list(definitions.items()) if isinstance(definitions, dict) else list(definitions)
         assignment_rows = list(assignments)
@@ -1605,10 +2471,10 @@ class Project:
         encoded_assignments = []
         for row in assignment_rows:
             if len(row) != 2:
-                raise ValueError("assignments must contain (Address, type_name) pairs")
+                raise ValueError("assignments must contain (Address or FileOffset, type_name) pairs")
             at, type_name = row
-            if not isinstance(at, Address):
-                raise TypeError("type assignments require Address values")
+            if not isinstance(at, (Address, FileOffset)):
+                raise TypeError("type assignments require Address or FileOffset values")
             if not isinstance(type_name, str):
                 raise TypeError("assigned type names must be strings")
             if type_name not in available_names:
@@ -1623,25 +2489,73 @@ class Project:
     def redo(self):
         return self._call("redo")
 
-    def analyze(self, *, cancel=None):
+    def analyze(self, *, instruction_budget=None, function_budget=None,
+                 block_budget=None, membership_budget=None, string_budget=None,
+                 string_scan_work_budget=None, min_string_characters=None,
+                 progress=None, cancel=None):
+        """Refresh derived analysis with optional bounded budgets and progress.
+
+        Progress receives ``(stage, completed, total)`` while native work runs
+        without holding the GIL. Return False to cancel, return None to
+        continue, or raise to propagate the callback exception unchanged.
+        Omitted budget values keep this project's current configuration.
+        """
+        if cancel is None:
+            cancel = globals().get("_hexlab_console_cancellation_token")
+        if cancel is not None and not isinstance(cancel, CancellationToken):
+            raise TypeError("cancel must be a CancellationToken")
+        if progress is not None and not callable(progress):
+            raise TypeError("progress must be callable or None")
+        bounds = {
+            "instruction_budget": (instruction_budget, 50_000_000),
+            "function_budget": (function_budget, 1_000_000),
+            "block_budget": (block_budget, 10_000_000),
+            "membership_budget": (membership_budget, 100_000_000),
+            "string_budget": (string_budget, 10_000_000),
+            "string_scan_work_budget": (string_scan_work_budget, 500_000_000),
+            "min_string_characters": (min_string_characters, 64),
+        }
+        options = {}
+        for name, (value, maximum) in bounds.items():
+            if value is not None:
+                options[name] = _unsigned(value, name, maximum)
+                if options[name] == 0:
+                    raise ValueError(f"{name} must be greater than zero")
+        try:
+            return self._call("analyze", options, progress,
+                              None if cancel is None else cancel._handle)
+        except Error as error:
+            if error.code == _hexlab.CANCELED_ERROR_CODE and (
+                    (cancel is not None and cancel.cancelled) or progress is not None):
+                raise AnalysisCancelled("native analysis canceled") from None
+            raise
+
+    def save(self, *, cancel=None):
+        """Checkpoint the project, optionally canceling the native checkpoint."""
         if cancel is None:
             cancel = globals().get("_hexlab_console_cancellation_token")
         if cancel is not None and not isinstance(cancel, CancellationToken):
             raise TypeError("cancel must be a CancellationToken")
         try:
-            return self._call("analyze", *((cancel._handle,) if cancel is not None else ()))
+            return self._call("save", None if cancel is None else cancel._handle)
         except Error as error:
             if cancel is not None and cancel.cancelled and error.code == _hexlab.CANCELED_ERROR_CODE:
-                raise AnalysisCancelled("native analysis canceled") from None
+                raise AnalysisCancelled("project checkpoint canceled") from None
             raise
 
-    def save(self):
-        """Checkpoint the existing project; successful commands are already durable."""
-        return self._call("save")
-
-    def save_as(self, path):
-        """Write an independent copy without rebinding this object's project."""
-        return self._call("save_as", os.fspath(path))
+    def save_as(self, path, *, cancel=None):
+        """Write an independent copy, optionally canceling the native copy."""
+        if cancel is None:
+            cancel = globals().get("_hexlab_console_cancellation_token")
+        if cancel is not None and not isinstance(cancel, CancellationToken):
+            raise TypeError("cancel must be a CancellationToken")
+        try:
+            return self._call("save_as", os.fspath(path),
+                              None if cancel is None else cancel._handle)
+        except Error as error:
+            if cancel is not None and cancel.cancelled and error.code == _hexlab.CANCELED_ERROR_CODE:
+                raise AnalysisCancelled("project copy canceled") from None
+            raise
 
     def backup_to(self, path, *, replace=False, cancel=None):
         """Create a consistent restore point without changing this project's path.
@@ -1659,6 +2573,51 @@ class Project:
         except Error as error:
             if cancel is not None and cancel.cancelled and error.code == _hexlab.CANCELED_ERROR_CODE:
                 raise AnalysisCancelled("project backup canceled") from None
+            raise
+
+    def archive_external_source(self, path, *, max_bytes=256 * 1024 * 1024, cancel=None):
+        """Archive the saved project's external input with UUID and digest identity."""
+        _unsigned(max_bytes, "max_bytes")
+        if cancel is None:
+            cancel = globals().get("_hexlab_console_cancellation_token")
+        if cancel is not None and not isinstance(cancel, CancellationToken):
+            raise TypeError("cancel must be a CancellationToken")
+        try:
+            return self._call("archive_external_source", os.fspath(path), max_bytes,
+                              None if cancel is None else cancel._handle)
+        except Error as error:
+            if cancel is not None and cancel.cancelled and error.code == _hexlab.CANCELED_ERROR_CODE:
+                raise AnalysisCancelled("source archive creation canceled") from None
+            raise
+
+    def verify_source_archive(self, path, *, max_bytes=1024 * 1024 * 1024, cancel=None):
+        """Verify an external source archive against this project's saved input identity."""
+        _unsigned(max_bytes, "max_bytes")
+        if cancel is None:
+            cancel = globals().get("_hexlab_console_cancellation_token")
+        if cancel is not None and not isinstance(cancel, CancellationToken):
+            raise TypeError("cancel must be a CancellationToken")
+        try:
+            return self._call("verify_source_archive", os.fspath(path), max_bytes,
+                              None if cancel is None else cancel._handle)
+        except Error as error:
+            if cancel is not None and cancel.cancelled and error.code == _hexlab.CANCELED_ERROR_CODE:
+                raise AnalysisCancelled("source archive verification canceled") from None
+            raise
+
+    def restore_source_archive(self, archive, output, *, max_bytes=1024 * 1024 * 1024, cancel=None):
+        """Restore a verified source archive to a new path without editing project provenance."""
+        _unsigned(max_bytes, "max_bytes")
+        if cancel is None:
+            cancel = globals().get("_hexlab_console_cancellation_token")
+        if cancel is not None and not isinstance(cancel, CancellationToken):
+            raise TypeError("cancel must be a CancellationToken")
+        try:
+            return self._call("restore_source_archive", os.fspath(archive), os.fspath(output), max_bytes,
+                              None if cancel is None else cancel._handle)
+        except Error as error:
+            if cancel is not None and cancel.cancelled and error.code == _hexlab.CANCELED_ERROR_CODE:
+                raise AnalysisCancelled("source archive restore canceled") from None
             raise
 
     def backup_to_rotating(self, base, *, retain=5, cancel=None):
@@ -1706,6 +2665,46 @@ class Project:
             raise
 
     @staticmethod
+    def inspect_recovery_directory(directory, *, api_version=API_VERSION, cancel=None):
+        """Inspect bounded, complete HexLab recovery artifacts without changing files.
+
+        Returns validated candidates, bounded rejection diagnostics, and scan
+        counts, including ``complete`` and ``omitted_candidates`` when directory
+        or candidate caps are reached. Only interrupted-save and previous-version
+        staging names are considered; this does not repair arbitrary damaged
+        databases.
+        """
+        if cancel is not None and not isinstance(cancel, CancellationToken):
+            raise TypeError("cancel must be a CancellationToken")
+        try:
+            return _hexlab.inspect_recovery_directory(
+                os.fspath(directory), api_version,
+                None if cancel is None else cancel._handle)
+        except Error as error:
+            if cancel is not None and cancel.cancelled and error.code == _hexlab.CANCELED_ERROR_CODE:
+                raise AnalysisCancelled("project recovery scan canceled") from None
+            raise
+
+    @staticmethod
+    def restore_recovery_artifact(artifact, output, *, replace=False,
+                                  api_version=API_VERSION, cancel=None):
+        """Restore a discovered recovery artifact as an independent project.
+
+        The artifact is rediscovered and revalidated before publication. The
+        returned project receives a fresh UUID; the source artifact is retained.
+        """
+        if cancel is not None and not isinstance(cancel, CancellationToken):
+            raise TypeError("cancel must be a CancellationToken")
+        try:
+            return _hexlab.restore_recovery_artifact(
+                os.fspath(artifact), os.fspath(output), bool(replace), api_version,
+                None if cancel is None else cancel._handle)
+        except Error as error:
+            if cancel is not None and cancel.cancelled and error.code == _hexlab.CANCELED_ERROR_CODE:
+                raise AnalysisCancelled("project recovery restore canceled") from None
+            raise
+
+    @staticmethod
     def restore_backup_in_place(backup, target, *, api_version=API_VERSION, cancel=None):
         """Restore a backup after closing all project owners for target.
 
@@ -1722,9 +2721,23 @@ class Project:
                 raise AnalysisCancelled("project restore canceled") from None
             raise
 
-    def export_binary(self, path):
-        """Export canonical effective bytes; refuse to replace existing paths."""
-        return self._call("export", os.fspath(path))
+    def export_binary(self, path, *, cancel=None):
+        """Export effective bytes, optionally canceling the native write.
+
+        The exporter refuses to replace existing paths and runs without holding
+        the interpreter lock while it snapshots and writes the project image.
+        """
+        if cancel is None:
+            cancel = globals().get("_hexlab_console_cancellation_token")
+        if cancel is not None and not isinstance(cancel, CancellationToken):
+            raise TypeError("cancel must be a CancellationToken")
+        try:
+            return self._call("export", os.fspath(path),
+                              None if cancel is None else cancel._handle)
+        except Error as error:
+            if cancel is not None and cancel.cancelled and error.code == _hexlab.CANCELED_ERROR_CODE:
+                raise AnalysisCancelled("binary export canceled") from None
+            raise
 
 class Archive:
     """Read-only, thread-affine ar archive with bounded member reads."""
@@ -1757,7 +2770,7 @@ class Archive:
         row = self._call("summary")
         return ArchiveSummary(row["member_count"], row["symbol_count"],
                               row["has_symbol_index"], row["symbol_index_complete"],
-                              tuple(row["diagnostics"]))
+                              tuple(row["diagnostics"]), row["thin"], row["aix_big"])
 
     def members(self, *, start=0, count=256):
         return [ArchiveMember(**row) for row in self._call("members", start, count)]
@@ -1928,8 +2941,44 @@ class DebuggerSession:
         """Return a bounded snapshot of processes visible to this backend."""
         return tuple(self._call("processes"))
 
-    def launch(self, executable, arguments=(), *, working_directory=""):
-        return self._call("launch", os.fspath(executable), tuple(os.fspath(arg) for arg in arguments), os.fspath(working_directory))
+    def launch(self, executable, arguments=(), *, working_directory="", environment=()):
+        """Launch locally or start a new inferior through an extended-remote session.
+
+        ``environment`` is an ordered sequence of ``(name, value)`` changes;
+        ``None`` unsets a name and ``\"\"`` sets it to an empty value. Remote
+        launch supports at most 256 unique changes and 64 KiB of UTF-8 name and
+        value data. Local launch rejects nonempty remote environment changes.
+        """
+        if not isinstance(environment, (list, tuple)):
+            raise TypeError("environment must be a list or tuple of (name, value-or-None) pairs")
+        if len(environment) > 256:
+            raise ValueError("remote environment exceeds 256 changes")
+        normalized_environment = []
+        seen_names = set()
+        total_bytes = 0
+        for change in environment:
+            if not isinstance(change, (list, tuple)) or len(change) != 2:
+                raise TypeError("each environment change must be a (name, value-or-None) pair")
+            name, value = change
+            if not isinstance(name, str):
+                raise TypeError("remote environment names must be str")
+            if value is not None and not isinstance(value, str):
+                raise TypeError("remote environment values must be str or None")
+            name_bytes = name.encode("utf-8")
+            value_bytes = b"" if value is None else value.encode("utf-8")
+            if not name_bytes or b"=" in name_bytes or b"\0" in name_bytes or b"\0" in value_bytes:
+                raise ValueError("remote environment names must be nonempty without '=' or NUL, and values cannot contain NUL")
+            if len(name_bytes) > 4096 or len(value_bytes) > 16 * 1024:
+                raise ValueError("remote environment name or value exceeds its byte limit")
+            if name in seen_names:
+                raise ValueError("remote environment repeats a variable name")
+            seen_names.add(name)
+            total_bytes += len(name_bytes) + len(value_bytes)
+            if total_bytes > 64 * 1024:
+                raise ValueError("remote environment exceeds the 64 KiB byte limit")
+            normalized_environment.append((name, value))
+        return self._call("launch", os.fspath(executable), tuple(os.fspath(arg) for arg in arguments),
+                          os.fspath(working_directory), tuple(normalized_environment))
 
     def attach(self, process_id):
         return self._call("attach", process_id)
@@ -2162,6 +3211,22 @@ class DebuggerJob:
         self._future.add_done_callback(lambda _future: callback(self))
 
 
+@dataclass(frozen=True)
+class DebuggerWorkerStatus:
+    """Detached point-in-time worker lifecycle and bounded-queue counters."""
+    ready: bool
+    closing: bool
+    stopped: bool
+    failed: bool
+    failure_type: str | None
+    active_job_id: int | None
+    queued_jobs: int
+    queued_input_bytes: int
+    queued_input_items: int
+    queued_events: int
+    pending_sequence: int | None
+
+
 class DebuggerWorker:
     """Asynchronous thread-safe command and event bridge for one debugger.
 
@@ -2307,6 +3372,60 @@ class DebuggerWorker:
                 return self._events.get(timeout=wait)
             except Empty:
                 continue
+
+    @property
+    def status(self):
+        """Return a detached, nonblocking snapshot of worker and queue state.
+
+        Queue counters are instantaneous observations, not reservations; submit
+        and event consumption may change them immediately after this property
+        returns. No debugger backend call is made on the caller thread.
+        """
+        with self._lock:
+            active_job_id = None if self._active_job is None else self._active_job.job_id
+            failure = self._failure
+            return DebuggerWorkerStatus(
+                ready=self._ready.done() and self._ready.exception() is None,
+                closing=self._closed,
+                stopped=self._stopped.is_set(),
+                failed=failure is not None,
+                failure_type=None if failure is None else type(failure).__name__,
+                active_job_id=active_job_id,
+                queued_jobs=self._commands.qsize(),
+                queued_input_bytes=self._queued_input_bytes,
+                queued_input_items=self._queued_input_items,
+                queued_events=self._events.qsize(),
+                pending_sequence=self._pending_sequence,
+            )
+
+    def iter_events(self, *, poll_interval=0.1, max_events=None, cancel=None):
+        """Yield detached stop events until worker exit, a row cap, or cancellation.
+
+        ``poll_interval`` bounds cancellation latency while waiting for the
+        worker's bounded event queue. Cancellation is observed between waits;
+        events already removed from the queue are yielded before another check.
+        """
+        if (not isinstance(poll_interval, (int, float)) or isinstance(poll_interval, bool) or
+                not math.isfinite(poll_interval) or not 0.01 <= poll_interval <= 10):
+            raise ValueError("poll_interval must be in 0.01..10 seconds")
+        if max_events is not None:
+            _unsigned(max_events, "max_events")
+        if cancel is None:
+            cancel = globals().get("_hexlab_console_cancellation_token")
+        if cancel is not None and not isinstance(cancel, CancellationToken):
+            raise TypeError("cancel must be a CancellationToken")
+        yielded = 0
+        while max_events is None or yielded < max_events:
+            if cancel is not None and cancel.cancelled:
+                raise AnalysisCancelled("debugger event iteration canceled")
+            try:
+                event = self.get_event(timeout=poll_interval)
+            except TimeoutError:
+                continue
+            if event is None:
+                return
+            yielded += 1
+            yield event
 
     def close(self, *, timeout=None):
         """Request orderly detach and join; return False if the call outlives timeout."""

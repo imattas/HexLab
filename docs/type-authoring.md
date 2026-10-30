@@ -24,7 +24,8 @@ values 0, 3, 4, and -1. Values are checked against the underlying integer
 width, and duplicate names, empty entries, and overflowing implicit values are
 rejected before the project command is submitted. Function prototypes select a
 return type (including `void`), parameter names and existing parameter types,
-variadic status, and a retained calling-convention qualifier. Parameter lines
+variadic status, and a retained calling-convention qualifier, including the
+explicit `aapcs32_vfp` option. Parameter lines
 use `name type_name`; empty input creates a no-argument prototype. Structures use
 `member_name type_name byte_offset`; offsets accept decimal or `0x` hexadecimal
 values. Append `bit_width bit_offset` to author an integral bitfield, for
@@ -41,6 +42,12 @@ stored aggregate size in **Stored size for forward members**. That size is
 metadata until the referenced definition exists; the layout inspector then
 resolves the member and calculates its actual size and alignment. Direct
 by-value cycles remain unlayoutable and are reported rather than guessed.
+
+The immutable aggregate model validates declaration-name collisions across
+instance data members, static data members, and methods. Multiple methods may
+share a name to represent overloads; a method and a data declaration cannot
+share one. Unnamed bitfields remain exempt because they have no declaration
+name.
 
 A final structure member can be written with a `[]` suffix to author a C-style
 flexible array, for example `payload byte[] 4`. The element type must have a

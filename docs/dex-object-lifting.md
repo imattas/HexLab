@@ -10,8 +10,13 @@ analysis snapshot does not link handler entries to declared exception types.
 `instance-of` keeps its validated type index, reads the object reference, and
 defines a boolean result whose runtime value remains unknown. `check-cast`
 retains the type index and object operand as an opaque operation, since the
-runtime type check may throw. Monitor enter/exit and `throw` are preserved as
-opaque operations with unknown effects so they are not silently discarded.
+runtime type check may throw. With retained DEX metadata, both instructions and
+`const-class` reject out-of-range type indexes; primitive descriptors remain
+valid indexes and preserve the DEX runtime behavior. `new-instance` requires a
+class descriptor, while `new-array` requires an array descriptor. Without
+metadata, the lifter retains the prior opaque type-index form. Monitor
+enter/exit and `throw` are preserved as opaque operations with unknown effects
+so they are not silently discarded.
 
 The processor validates each instruction's encoded size and register form before
 lifting. Reference values remain 32-bit because this implementation targets the

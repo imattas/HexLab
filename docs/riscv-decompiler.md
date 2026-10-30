@@ -8,19 +8,35 @@ RV32M and RV64M arithmetic is preserved as explicit pseudocode operations such a
 
 F/D scalar instructions enter the shared pipeline with a distinct floating value type. FLW/FLD produce typed memory reads and FSW/FSD produce typed stores. Arithmetic, FMA, comparisons, classification, moves, and conversions retain named typed intrinsics; their decoded FPR/GPR outputs and `fflags` effects participate in SSA. Rounding mode remains available on the generic instruction for analysis and assembly formatting.
 
+Zicsr operations on `fflags` (0x001), `frm` (0x002), and `fcsr` (0x003) are
+lifted as bit-accurate operations on the separate five-bit `fflags` and
+three-bit `frm` SSA fields. Register and immediate CSRRW forms replace the
+selected field; CSRRS/CSRRC forms apply set/clear masks, and reads return the
+pre-instruction CSR value. `fcsr` reads and writes compose or split the two
+fields. This allows constant CSR
+writes and read/modify/write sequences to feed later dynamic rounding-mode
+uses and preserves sticky flag state. Other CSR numbers remain opaque;
+privilege, access permissions, and architectural initial values are not
+modeled.
+
 Scalar FCVT conversions additionally carry explicit parallel output formulas.
 W/WU and L/LU inputs retain signedness and 32/64-bit width; an RV64 W/WU
 integer source is truncated to its low word. Float-to-W/WU results are explicitly
 sign-extended to XLEN, including the unsigned WU variants. FCLASS.S/D produce
 a ten-bit class mask zero-extended to XLEN and do not touch FCSR. Integer output
 types are recovered independently of the floating result and status outputs.
+When SSA propagation supplies a constant raw S/D payload, the optimizer folds
+FCLASS.S/D through the processor's bit-pattern classifier. This preserves the
+architectural distinction among signed zeros, subnormals, infinities, and
+signaling/quiet NaNs without converting through host floating-point values.
 
 Each rounding-sensitive FCVT formula consumes either its encoded static
 rounding mode or the pre-instruction three-bit `frm` value for `rm=111`.
 FCVT.D.S and exact FCVT.D.W/WU still validate and retain the encoded `rm`
 field, but have no semantic `frm` dependency or rounding operand. Reserved
-static modes 101/110 and RV32 L/LU forms remain invalid. The dynamic mode is
-not evaluated or assumed to contain a legal value.
+static modes 101/110 and RV32 L/LU forms remain invalid. A dynamic mode stays
+symbolic unless SSA propagation proves the three-bit `frm` value is a legal
+constant from the modeled status CSR updates.
 
 Conversions that may raise exceptions read the old five-bit `fflags` and write
 `old_fflags | raised_flags` in parallel with their value result. Raised flags
@@ -42,9 +58,13 @@ Zfa `FROUND.S/D` and `FROUNDNX.S/D` use the FCVT.S.D/FCVT.D.S encoding
 families with `rs2=4/5`, respectively. They preserve the S/D source and
 destination types, validate and retain `rm`, and use `frm` only for `rm=111`.
 The typed intrinsics preserve round-to-integral behavior; symbolic accrued
-flags are bounded to NV for FROUND and NV/NX for FROUNDNX. Exact values,
-signaling-NaN detection, and whether an input changes after rounding remain
-unevaluated.
+flags are bounded to NV for FROUND and NV/NX for FROUNDNX. The processor
+semantics API now supplies exact optimizer folding for non-NaN binary32/64
+source constants with a known valid effective rounding mode (0 through 4).
+Both value and raised-exception formulas fold; the intrinsic and sticky
+`old_fflags | raised_flags` output remain explicit. Unknown/reserved modes,
+NaNs, and mismatched value types stay symbolic. See
+[Zfa round-to-integral evaluation](riscv-zfa-rounding.md).
 
 Zfa `FLI.S` and `FLI.D` decode the complete five-bit immediate selector table
 from the FMV encoding with `rs2=1`. The selector is retained as an immediate,
@@ -129,6 +149,29 @@ This is effect-preserving lifting rather than an IEEE-754 evaluator: it does not
 
 The processor semantics API separately evaluates bit-exact vector floating classification, sign-injection, min/max, and comparison families for SEW 32/64. Classification returns the ten IEEE-754 classes as a SEW-wide bit field; the other evaluable operations accept already-unboxed scalar FPR element bits, apply active-lane and old-destination rules, and report accrued exception bits. Single-width fused multiply-add/subtract VV/VF forms are represented by named floating-vector intrinsics that preserve `frm`, `fflags`, masked `v0`, and old `vd` dependencies; lane evaluation remains unsupported because the helper has no rounding-mode input and does not compute exact fused exception flags. Unary `vfsqrt.v`, `vfrsqrt7.v`, and `vfrec7.v` are lifted as typed vector intrinsics: square root carries `frm`/`fflags`, reciprocal-square-root estimate carries `fflags`, and reciprocal estimate carries `frm`/`fflags` for its rounding-dependent overflow behavior. Exact square-root and estimate lane values are not calculated. The generic lifter remains an opaque effect record because dynamic SEW, VLEN, and mask/tail policies are not carried into typed lane expressions.
 
+## Integer vector reductions
+
+The eight `vred*.vs` integer reductions accept both `vm=1` and masked `vm=0`
+encodings. Masked instructions read the predicate bits from `v0`, and the
+intrinsic retains that input separately from the `vs2` values and `vs1[0]`
+seed. The scalar reduction output remains opaque in decompiled functions;
+runtime SEW, active length, and vector contents are not inferred.
+
+The standalone integer lane evaluator applies active `v0` bits, performs the
+sum/bitwise/min/max fold from `vs1[0]` in lane order (the seed always
+participates), wraps `vredsum` to SEW, and writes the result to destination
+element zero. When `vl` is zero it leaves the full destination unchanged. It
+preserves the other destination elements and rejects `vstart != 0`, as
+required by the ISA. Tail policy and vector-register group legality remain
+caller-owned. These rules follow the [RISC-V V extension specification](https://docs.riscv.org/reference/isa/unpriv/v-st-ext.html).
+
+The RVV mask-register logical operations (`vmand.mm`, `vmnand.mm`, `vmandn.mm`,
+`vmxor.mm`, `vmor.mm`, `vmnor.mm`, `vmorn.mm`, and `vmxnor.mm`) lift to named
+intrinsics with one-bit boolean-vector source and result types. Their old
+destination, `vl`, `vtype`, and `vstart` dependencies remain explicit; they
+are unmasked operations and do not read `v0` as a predicate. The lifter does
+not evaluate mask bitstrings or choose a concrete VLEN.
+
 The RVV gather/slide subset (`vrgather.vv/vx/vi`, `vslideup.vx/vi`, and
 `vslidedown.vx/vi`) is represented as named intrinsics with explicit source
 operands, destination writes, masked `v0` reads, and implicit vector
@@ -149,10 +192,22 @@ The scalar Zba forms `sh1add`, `sh2add`, `sh3add`, `add.uw`, their supported
 and addition expressions. The shift amount and 32-bit truncation are explicit;
 the lifter does not treat an unknown register index as a constant address.
 
+The Zicond `czero.eqz` and `czero.nez` forms lift to typed conditional-select
+expressions. Both GPR inputs remain explicit; the condition register is tested
+against zero and the result selects either the value source or an XLEN-wide
+zero. This preserves the architectural zeroing behavior without requiring
+constant propagation.
+
 Scalar Zfa `fminm.s/d` and `fmaxm.s/d` decode with their exact OP-FP forms and
 carry typed floating results, both FPR input dependencies, accrued `fflags`
 reads, and `fflags` writes into named intrinsics. Their minimum/maximum-number
 NaN behavior remains intrinsic semantics; no floating constant evaluation is
 performed for these operations.
+
+Scalar Zbc `clmul`, `clmulh`, and `clmulr` now lift for RV32/RV64 to typed
+XLEN-wide binary operations with both source operands retained. Their operation
+names preserve the low, high, and reversed carry-less product windows defined
+by Zbc; the lifter does not expand the polynomial product into an XOR network
+or evaluate dynamic operands.
 
 Focused validation is provided by `decompiler_riscv_lifting`; it exercises RV64 scalar and M operations, x0 semantics, signed and unsigned byte loads, branch predicates, SSA versions, constant M folding, signed RV64 word results, and typed F/D effects.

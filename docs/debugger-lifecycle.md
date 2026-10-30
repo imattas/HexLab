@@ -21,6 +21,20 @@ thread as needed, and acknowledge that exact sequence with `continue_execution`
 or `single_step_execution`. A process-exit event is terminal and must also be
 acknowledged before detaching the session object.
 
+Windows debug-output events also own a stopped OS event. They surface as
+`EventKind::output` with the session stopped and require acknowledgement of
+their exact sequence. This prevents a debug string from leaving the native
+backend waiting for an acknowledgement that the session discarded. RSP console
+output and automatically continued logpoints remain informational output while
+the session is running. Backend routers preserve this ownership distinction,
+queued-notification acknowledgement behavior, and scheduled signal-disposition
+support from the selected backend.
+
+Continue, thread-qualified continue, single-step, and scheduled signal
+dispositions reject unknown `ContinueStatus` enum values before invoking a
+backend resume operation. Rejection retains the pending event for correction
+and retry.
+
 `continue_thread_execution` is supported for Windows debug events when the
 selected thread owns that exact pending event. The backend validates both the
 event sequence and thread ID before using the normal Windows event-acknowledge
@@ -93,3 +107,12 @@ For GDB Remote Serial Protocol sessions, detach clears the session only after
 the target replies `OK` to `D`. An empty response means the peer does not
 support detach; the error is returned and the session remains connected so the
 caller can choose another cleanup path or retry.
+
+Session-owned automatic breakpoint continuation filters and step tracking are
+scoped to the current running interval. They are cleared when termination or
+detach succeeds (including a switch away from a detached multiprocess
+inferior), while a failed cleanup retains the active session state for retry.
+Destroying an active `DebugSession`, including replacing an active destination
+through move assignment, attempts the normal detach path before releasing its
+backend ownership. Move assignment preserves the moved-from session as empty;
+the cleanup attempt follows the destructor's best-effort behavior.

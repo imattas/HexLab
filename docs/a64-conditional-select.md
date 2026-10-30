@@ -17,10 +17,20 @@ the instruction's width, so the 32-bit forms wrap at 32 bits. These
 instructions do not change NZCV. `AL` and `NV` are treated as always true and
 do not read NZCV; all other conditions read the current NZCV value.
 
-The lifter represents the operation as a typed conditional expression. When a
-preceding comparison can be propagated safely, the condition may be rendered
-from that comparison; otherwise the expression refers to the current NZCV
-state. The existing bounded comparison propagation also carries conditional
-compare results through compatible control-flow predecessors. This feature
-covers the integer conditional-select family; floating-point conditional
-select instructions are outside its scope.
+`evaluate_a64_conditional_select_instruction` applies the decoded W/X
+operation using caller-supplied source values and a resolved condition result.
+It validates the instruction's three-register form, handles XZR/WZR as zero,
+and returns a width-masked value. `AL`/`NV` select `Rn` regardless of the
+supplied predicate. The helper does not resolve NZCV conditions or commit the
+destination.
+
+The lifter represents ordinary forms as a typed conditional expression. For
+the `CSET` alias, it emits the inverted predicate zero-extended to the selected
+register width. For `CSETM`, it emits the inverted predicate sign-extended to
+that width, producing either zero or an all-ones mask. When a preceding
+comparison can be propagated safely, the predicate may be rendered from that
+comparison; otherwise it refers to the current NZCV state. The existing
+bounded comparison propagation also carries conditional compare results
+through compatible control-flow predecessors. This feature covers the integer
+conditional-select family; floating-point conditional select instructions are
+outside its scope.

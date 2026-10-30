@@ -155,6 +155,9 @@ class Image {
     HEXLAB_IMAGE_EXPORT Result<std::vector<std::byte>> read(Address, std::size_t) const;
     HEXLAB_IMAGE_EXPORT Result<FileOffset> to_file_offset(Address) const;
     HEXLAB_IMAGE_EXPORT Result<Address> to_address(FileOffset) const;
+    // Return every virtual alias of an initialized source byte, in stable
+    // address-space/offset order. An unmapped file offset returns an empty list.
+    HEXLAB_IMAGE_EXPORT Result<std::vector<Address>> to_addresses(FileOffset) const;
 
   private:
     Result<bool> validate_profile() const;

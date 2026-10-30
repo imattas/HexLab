@@ -154,8 +154,24 @@ struct MachODyldResolver::State {
                 slice.header.order != ByteOrder::little || size != (slice.header.is_64 ? 8 : 4) ||
                 (format == 3 || format == 5) == slice.header.is_64)
                 return fail(R::unsupported);
-            if (row.authenticated)
+            if (row.authenticated) {
+                // PAC cannot be checked or applied here, but an authenticated
+                // bind still names a concrete chained import. Preserve that
+                // association in provenance while keeping the pointer unresolved.
+                if (row.bind) {
+                    if (!row.import_row)
+                        return fail(R::unsupported);
+                    const auto &import = metadata->chained_imports[static_cast<std::size_t>(*row.import_row)];
+                    if (!import.complete || !import.name)
+                        return fail(R::unsupported);
+                    std::int64_t addend = 0;
+                    if (!plus(import.addend, row.addend, addend))
+                        return fail(R::overflow);
+                    out.binding = MachODyldBinding{import.library_ordinal, *import.name, addend,
+                                                   import.weak_import, row.import_row};
+                }
                 return fail(R::authenticated);
+            }
             if (row.non_pointer) {
                 if (row.scalar_value)
                     out.constant = *row.scalar_value;

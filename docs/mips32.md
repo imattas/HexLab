@@ -13,7 +13,11 @@ remain unsupported. Both expose exact GPR effects: `EXT` writes the extracted
 zero-extended field, and `INS` reads/writes `rt`, reads `rs`, preserves all bits
 outside the selected destination range, and inserts the low `size` bits of
 `rs`. The MIPS32 decompiler expresses these as logical shifts, masks, and
-merge operations.
+merge operations. `evaluate_mips32_bitfield_instruction` evaluates the exact
+decoded EXT/INS operands from a supplied source value and, for INS, the prior
+destination. It validates position/size bounds and register effects, and
+forces `$zero` source/destination values to zero. The caller still commits the
+result; writes to `$zero` have no architectural effect.
 
 Every decoded control transfer records `delay_slots = 1`. Automatic reachable analysis and function recovery decode and own the instruction at PC+4 before following a transfer's target or post-slot continuation. Calls and classic conditional branches continue at PC+8; likely branches send the not-taken edge directly to PC+8 and route the taken edge through the delay slot. Jumps have no invented fallthrough; returns terminate after their slot. A control transfer in a delay slot is explicitly unsupported, and missing, excluded, malformed, or truncated slots stop recovery without fabricating an edge. Instruction and membership budgets and cancellation continue to bound traversal. JAL and JALR expose link-register writes, and `jr $ra` is identified as return. Compressed/MIPS16/microMIPS, unsupported COP1 formats/functions, exception instructions, REGIMM link-likely forms, and complete ISA semantics remain unsupported. COP1 `BC1TL`/`BC1FL` select FCC0-FCC7 like `BC1T`/`BC1F`; their not-taken edges annul the delay slot.
 
@@ -41,17 +45,35 @@ and alias behavior are not modeled. FCSR31 transfers are represented as exact
 32-bit SSA copies, and CTC1 writes also project FCC0-FCC7 from the FCSR condition
 bits. FCCR25 writes conservatively invalidate all FCC SSA values; separate
 FCCR/FEXR/FENR views remain named effects without fabricated bit-level aliases.
-COP1 likely branches, long-word conversion forms, other formats, and functions
-remain unsupported.
+Long-word conversion forms and other formats/functions remain unsupported.
+Classic S/D `MOVF`, `MOVT`, `MOVZ`, and `MOVN` now decode with a read/write
+FPR destination and an exact selected-FCC or 32-bit GPR condition dependency.
+They lift as full-width bit-preserving conditional copies without FCSR writes;
+see [conditional move lifting](mips32-decompiler.md#exact-cop1-conditional-moves).
+COP1 branch-likely forms retain their separately modeled delay-slot behavior.
 
 This slice does not evaluate IEEE arithmetic or conversions, runtime rounding
 modes, exception flags, or compare-result truth at runtime. The standalone
 semantic helper evaluates `ABS.S/D`, `MOV.S/D`, and `NEG.S/D` exactly as
 sign-bit operations, preserving all payload bits and leaving FCSR unchanged.
+These six decoded operations now also lower to typed full-width bitcast and
+mask/XOR/copy assignments in the MIPS32 decompiler; see
+[sign/move lifting](mips32-decompiler.md#exact-cop1-sign-and-move-operations).
 The decompiler retains floating operations and conversions as typed `mips.*`
 intrinsics with their decoded FPR/FCSR effects. Conversion intrinsics carry
-the proper scalar result type but do not produce a computed value. Exact
-rounding and exception behavior remain unsupported by the semantic evaluator.
+the proper scalar result type but do not produce a computed value. The
+standalone helper now evaluates all eight S/D `ROUND.W`, `TRUNC.W`, `CEIL.W`,
+and `FLOOR.W` forms from exact IEEE source bits, using their named rounding
+rules independently of FCSR.RM. It returns the low-word result, Cause/Flag
+updates, and destination suppression when an enabled Invalid or Inexact
+exception occurs. Invalid conversions use the architecture's default
+`INT32_MAX` result when the exception is disabled. With FCSR.FS set, the
+standalone word-conversion evaluator follows Release 5+ behavior: a subnormal
+source becomes same-sign zero and raises Inexact, which can suppress the
+destination write when enabled. Other conversions and general arithmetic
+still have no standalone evaluator.
+These conversion rules follow the `ROUND.W`, `TRUNC.W`, `CEIL.W`, and
+`FLOOR.W` entries in the [MIPS32 Instruction Set Manual, Volume II, Revision 0.95](https://www.ece.lsu.edu/ee4720/mips32v2.pdf).
 Malformed fixed fields
 (including nonzero unused unary `ft` and reserved compare bits) are invalid;
 recognized but unmodeled formats/functions report unsupported.
@@ -62,10 +84,71 @@ FCSR rounding modes, normal/subnormal rounding, signed zero/infinity, overflow,
 underflow, divide-by-zero, invalid, and inexact conditions. It replaces the
 FCSR Cause field on each operation, accumulates Flag bits only when no enabled
 exception is taken, and reports whether the destination write is suppressed.
-Flush-subnormal mode (`FCSR.FS=1`) is explicitly unsupported. NaN propagation
-quietens the first NaN payload; invalid `0/0` and `inf/inf` produce the
-canonical quiet NaN. Tininess is detected after rounding. The current decompiler
-still emits `DIV.S` as an intrinsic and does not connect this helper to function
-execution. The rounding, flag, and Cause behavior follows the MIPS32
+When FCSR.FS is set, this helper follows Release 5+ alternate flush behavior:
+subnormal inputs become same-sign zero and raise Inexact; exact nonzero results
+below the normal range are detected before rounding, flushed to same-sign zero,
+and raise Underflow plus Inexact. Enabled exceptions suppress the FPR write,
+and the unimplemented-operation exception is not modeled. With FS clear, the
+helper retains gradual underflow and detects tininess after rounding. NaN
+propagation quietens the first NaN payload; invalid `0/0` and `inf/inf` produce
+the canonical quiet NaN. `evaluate_mips32_div_s_instruction` now connects the
+decoded `DIV.S` operands and FCSR read/write effects to this evaluator while
+keeping FPR/FCSR sampling and state commit caller-owned. The decompiler still
+emits `DIV.S` as an intrinsic and does not execute the helper. The rounding,
+flag, and Cause behavior follows the MIPS32
 [Instruction Set Manual, `DIV.fmt`](https://courses.cs.washington.edu/courses/cse378/documentation/MIPS32_Architecture_For_Programmers_Volume_II.pdf)
 and [Volume I FCSR field definitions](https://courses.grainger.illinois.edu/cs426/fa2022/Resources/MIPS32INT-AFP-03.02.pdf).
+The Release 5+ flush behavior follows [MIPS32 Architecture Volume I-A, Revision 6.01, §6.7.2.4](https://www.ece.lsu.edu/ee4720/doc/mips32-r6-1a.pdf).
+
+## SPECIAL2 multiply and count-leading operations
+
+MIPS32 Release 2 `MUL rd, rs, rt` decodes SPECIAL2 function `0x02` when `shamt` is zero. It writes the low 32 bits of the signed word product to `rd`; the standalone helper computes those low bits with modulo-2^32 semantics (the low bits match for signed and unsigned multiplication). The architecture leaves HI/LO unpredictable after this instruction, so decoding reports both writes and lifting preserves the exact GPR result while assigning unknown values to HI and LO. Writes to `$zero` remain suppressed. `CLZ rd, rs` and `CLO rd, rs` decode from functions `0x20` and `0x21`; their `rt` field must duplicate `rd` and `shamt` must be zero. Other SPECIAL2 functions remain unsupported. The encoding and behavior are specified in the [MIPS32 Instruction Set Manual, Volume II](https://pages.hmc.edu/jspjut/class/f2013/e155/docs/MIPS32InstructionSet.pdf).
+
+`evaluate_mips32_fcc_branch_instruction` evaluates decoded `BC1T`, `BC1F`,
+`BC1TL`, and `BC1FL` from the selected caller-supplied FCC value. It validates
+the FCC index/read effect, relative target, and one-delay-slot branch facts.
+The result is only the taken predicate; branch-target transfer and likely-form
+delay-slot annulment remain caller-owned.
+
+`evaluate_mips32_integer_branch_instruction` evaluates decoded `BEQ`/`BNE`,
+`BLEZ`/`BGTZ`, and `BLTZ`/`BGEZ`, including their supported likely variants,
+from caller-supplied GPR values. It validates the GPR operands and read facts,
+relative target, and classic one-delay-slot metadata, and treats `$zero` as
+zero. It returns only the predicate; target transfer and likely-form delay-slot
+annulment remain caller-owned.
+
+`evaluate_mips32_add_immediate_instruction` evaluates `ADDI` and `ADDIU` from
+the decoded signed 16-bit immediate and caller-supplied source GPR. `ADDI`
+reports signed overflow and suppresses the destination write on that exception;
+`ADDIU` wraps modulo 2^32. Writes to `$zero` are suppressed for both forms.
+Exception delivery and committing a successful result remain caller-owned.
+
+`evaluate_mips32_set_less_than_immediate_instruction` evaluates `SLTI` and
+`SLTIU`. Both compare against the sign-extended 16-bit immediate; `SLTI`
+interprets both operands as signed words, while `SLTIU` compares their 32-bit
+patterns as unsigned values. It returns the architectural 0/1 result and
+validates destination/source GPR and immediate metadata. `$zero` writes are
+suppressed in the decoded effects; state commit remains caller-owned.
+
+`evaluate_mips32_set_less_than_instruction` evaluates R-type `SLT` and
+`SLTU` using caller-supplied source GPR values. `SLT` compares signed 32-bit
+values; `SLTU` compares unsigned bit patterns. The helper validates decoded
+GPR effects and treats `$zero` sources as zero. It returns the 0/1 result;
+destination commit remains caller-owned.
+
+`evaluate_mips32_logical_immediate_instruction` evaluates `ANDI`, `ORI`, and
+`XORI` using the decoded zero-extended 16-bit immediate. It validates the
+source/destination effects and suppresses writes to `$zero`; the caller
+supplies the source register and commits the returned value.
+
+`evaluate_mips32_logical_instruction` evaluates R-type `AND`, `OR`, `XOR`,
+and `NOR` on caller-supplied GPR values. It checks the decoded register
+operands/effects, treats `$zero` sources as zero, and returns the 32-bit
+result. The caller commits the destination; writes to `$zero` are discarded
+by the decoded register effects.
+
+`evaluate_mips32_count_leading` computes SPECIAL2 `CLZ` and `CLO` over all 32
+source bits, returning values from 0 through 32. Its instruction adapter checks
+the decoded GPR shape/effects and forces `$zero` source reads to zero. The
+caller supplies other source values and commits the destination; HI/LO and
+other SPECIAL2 operations are not part of this helper.

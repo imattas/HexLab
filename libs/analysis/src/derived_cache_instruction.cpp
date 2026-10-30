@@ -17,6 +17,7 @@ void arm_info(Writer &out, const std::optional<ArmInstructionInfo> &value) {
     out.number(static_cast<unsigned>(a.exchange), 1);
     out.number(a.flags_written, 1);
     out.flag(a.flags_known);
+    out.flag(a.q_flag_may_set);
     out.flag(a.writes_pc);
     out.flag(a.writeback);
     out.number(static_cast<unsigned>(a.multiple_mode), 1);
@@ -42,6 +43,7 @@ ThumbITState read_arm_info(Reader &in, DecodeContext context) {
     require(in.number(1) <= static_cast<unsigned>(ArmPredicate::unknown_it), "Invalid ARM predicate");
     require(in.number(1) <= static_cast<unsigned>(ArmExchange::forced_thumb), "Invalid ARM exchange");
     require(in.number(1) <= 15, "Invalid ARM flags mask");
+    in.flag();
     in.flag();
     in.flag();
     in.flag();
@@ -75,7 +77,7 @@ void field(Writer &out, const std::optional<EncodedField> &value) {
 }
 void reg(Writer &out, const RegisterOperand &value) {
     out.number(static_cast<unsigned>(value.bank), 1);
-    out.number(value.index, 1);
+    out.number(value.index, 2);
     out.number(value.width, 2);
     out.flag(value.high_byte);
 }
@@ -182,11 +184,11 @@ std::vector<std::byte> instruction_bytes(const Instruction &value, std::stop_tok
         const auto &table = *value.dex_switch;
         require(value.context.architecture == Architecture::dex && value.opcode == Opcode::dex_switch &&
                     value.flow == FlowKind::switch_dispatch && table.validated &&
-                    table.payload.space == value.address.space && table.cases.size() <= 64,
+                    table.payload.space == value.address.space && table.cases.size() <= 1024,
                 "Invalid cached DEX switch table");
         out.flag(table.packed);
         out.address(table.payload);
-        out.count(table.cases.size(), 64);
+        out.count(table.cases.size(), 1024);
         for (const auto &item : table.cases) {
             require(item.target.space == value.address.space,
                     "Cached DEX switch case escapes its method address space");

@@ -18,6 +18,28 @@ bool arithmetic(State &s, std::uint8_t opcode, bool extended) {
     const auto wide = s.width();
     if (extended) {
         if (opcode == 0xc7) {
+            const auto group = (s.peek() >> 3) & 7;
+            if (group == 6 || group == 7) {
+                const auto m = modrm(s, wide);
+                // Memory /6 and /7 select VMX system instructions, not
+                // malformed RDRAND/RDSEED operands.
+                if (m.mod != 3)
+                    unsupported("0F C7 memory system forms are outside the scalar random subset");
+                s.i.opcode = group == 6 ? Opcode::rdrand : Opcode::rdseed;
+                s.operand(m.rm, OperandAccess::write);
+                const auto destination = std::get<RegisterOperand>(m.rm);
+                const auto full_width = s.rules.pointer_width();
+                if (wide < full_width) {
+                    const auto full = gpr(static_cast<std::uint8_t>(destination.index), full_width);
+                    if (wide == 16) s.i.register_reads.push_back(full);
+                    s.i.register_writes.push_back(full);
+                }
+                // CF reports availability; OF/SF/ZF/AF/PF clear. Preserve
+                // all remaining bits through the incoming whole-FLAGS value.
+                s.flags_read = true;
+                s.flags_write = true;
+                return true;
+            }
             auto m = modrm(s, s.rules.long_mode() && (s.rex & 8) ? 128 : 64);
             if (m.group != 1)
                 return false;

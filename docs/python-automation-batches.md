@@ -63,10 +63,83 @@ complete project snapshot and refuses to merge if more than 4096 annotations
 or bookmarks exist, because omitted rows cannot safely be treated as absent.
 Pass `expected_revision` to pin that snapshot; if all requested fields are
 already populated, preserve mode returns the unchanged snapshot without adding
-a history step. Pass `return_report=True` to receive
-`{"snapshot": ..., "applied": N, "skipped": N}` instead of the snapshot
-alone. The counts are per requested name/comment/bookmark field; preserve mode
+a history step. Pass `return_report=True` to receive the resulting snapshot,
+per-field `applied` and `skipped` counts, the pinned `expected_revision`, the
+`result_revision`, `planned_edits`, and `committed` instead of the snapshot
+alone. `committed` is true only when the result revision differs from the
+expected revision; a preserve-mode no-op reports the same revisions and false.
+The counts are per requested name/comment/bookmark field; preserve mode
 counts empty values, attempted removals, occupied values, and names already in
-use elsewhere as skipped. The default return value remains the snapshot. Use
+use elsewhere as skipped. It also reserves fields accepted earlier in the same
+preserve batch, so duplicate incoming names/bookmarks are skipped consistently
+without mutating the detached snapshot used for the report. The default return
+value remains the snapshot. Use
 `Project.apply_batch()` for references, types, patches,
 regions, functions, and other mixed project edits.
+
+`Project.export_annotations_json(path)` writes a stable versioned manifest of
+the current names, comments, and bookmarks. It is limited to 4096 annotation
+and bookmark rows and 16 MiB, and publishes through a sibling temporary file
+without replacing an existing destination. The export records the source edit
+revision and uses explicit `va` or `file` location objects. For example:
+
+```python
+project.export_annotations_json("labels.json")
+project.import_annotations_json(
+    "labels.json",
+    expected_revision=project.snapshot()["edit_revision"],
+    merge="preserve",
+)
+```
+
+`Project.export_annotations_csv(path)` writes the same bounded snapshot as
+UTF-8 CSV with `location_kind,space,offset,name,comment,bookmark` columns.
+It combines annotations and bookmarks by location, uses hexadecimal offsets,
+checks the edit revision before publishing, and atomically creates the target
+without replacing an existing file. Both exporters reject snapshots above
+4096 annotation or bookmark rows and outputs above 16 MiB. The CLI helper can
+produce this CSV with `hexlab_python import_annotations.py project.hxproj
+labels.csv --export`; the output can then be imported through its normal CSV
+mode as one revision-pinned atomic annotation batch.
+
+The same CSV format can be imported directly through
+`Project.import_annotations_csv(path, expected_revision=..., merge=...)`:
+
+```python
+revision = project.snapshot()["edit_revision"]
+report = project.import_annotations_csv(
+    "labels.csv", expected_revision=revision, merge="preserve",
+    return_report=True,
+)
+```
+
+The reader accepts a UTF-8 or UTF-8-with-BOM file up to 16 MiB and 4096 data
+rows. Its strict CSV header requires `location_kind` and `offset`, allows
+`space`, `name`, `comment`, and `bookmark`, and rejects duplicate/unknown
+columns, malformed quoting, incomplete locations, and rows with no annotation
+fields. Decimal and prefixed integer addresses are accepted. Parsed rows use
+the same revision-pinned, bounded, cancellable atomic batch as
+`apply_annotations`; CSV parsing itself checks cancellation between rows.
+An empty data section is a no-op that still validates an explicitly supplied
+revision. The existing example importer remains available for command-line
+workflows.
+
+`Project.import_annotations_json()` rejects duplicate JSON keys, unsupported
+versions, unknown fields, invalid locations, oversized input, and more than
+4096 rows before it calls the same atomic annotation batch path. An omitted
+`expected_revision` pins the target project's current revision when the batch
+is planned; pass it explicitly when the caller needs a previously captured
+revision. An empty manifest is a no-op. Cancellation is checked while parsing
+and by the native validation/commit path.
+
+The `examples/import_annotations.py` command-line importer accepts both the
+versioned manifest produced by `export_annotations_json()` and the older
+plain row-array format. It keeps its `--merge replace|preserve` behavior for
+either input shape.
+
+For large manifests, `apply_annotations(..., cancel=token)` accepts the same
+`CancellationToken` as `apply_batch()`. It checks cancellation while validating
+rows and the native projected-state validation checks again before commit. A
+canceled import raises `AnalysisCancelled` and does not commit any annotation
+changes. When called from the automation console, its current cancellation
+token is used if `cancel` is omitted.

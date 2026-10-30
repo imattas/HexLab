@@ -1,17 +1,39 @@
-# C++ symbol presentation
+# Symbol demangling
 
 HexLab keeps imported and user-provided symbol spellings unchanged. The reusable
-`hexlab::symbols::demangle_cpp_name` helper returns a bounded presentation
-result; it never replaces names in loader metadata, project storage, or symbol
+`hexlab::symbols::demangle_symbol_name` dispatcher returns a bounded
+presentation result; `demangle_cpp_name` remains available for callers that
+want C++ ABI parsing only. Demangling never replaces names in loader metadata, project storage, or symbol
 identity/index keys. Workspace-generated labels and CLI ELF, Mach-O, and PE PDB
-symbol rows display a demangled spelling only when parsing succeeds.
+symbol rows display a demangled spelling only when parsing succeeds. These
+presentation call sites use the dispatcher, so supported Rust v0 spellings
+receive the same bounded display treatment as supported C++ ABI names.
+
+The same presentation layer dispatches Rust v0 symbols (`_R...`) to a
+separate bounded parser. This subset renders crate roots and recursively nested
+paths with UTF-8 identifiers, ignores nonzero identifier disambiguators for
+named items, and labels closure (`C`) and shim (`S`) namespace paths. Unicode
+identifiers marked with `u` are decoded with the Rust v0 modified Punycode
+encoding, including its underscore escape for the final Punycode delimiter.
+The decoder bounds output by the existing demangler limit and rejects invalid
+digits, arithmetic overflow, surrogate values, and out-of-range Unicode
+scalars. It validates UTF-8 but does not enforce Rust's Unicode XID identifier
+profile or normalization. Impl and trait paths, generic arguments, backreferences,
+and other namespace-specific forms remain unsupported and preserve the raw
+name. An optional direct instantiating-crate path and opaque `.suffix`/`$suffix`
+are accepted and omitted from display. Rust symbols remain untouched in stored
+metadata and identity keys. The format is documented in the
+[rustc book](https://doc.rust-lang.org/stable/rustc/symbol-mangling/v0.html).
 
 The current parser recognizes common Itanium ABI `_Z` names: length-prefixed
 identifiers, nested namespaces/classes, template identifier arguments, common
 operator names, ordinary function parameter lists, and built-in, pointer,
 reference, rvalue-reference, const, and volatile types. Function and
 member-function pointer declarators preserve C++ precedence, rendering forms
-such as `int (*)(float)` and `int (Widget::*)(float)`. Template arguments
+such as `int (*)(float)` and `int (Widget::*)(float)`. Itanium function types
+retain the bounded `Do` non-throwing exception specification as `noexcept`,
+including when combined with cv-qualified member-function types and pointer
+declarators. Template arguments
 support bounded integer literals and recursive `X <expression> E` arithmetic,
 comparison, bitwise, logical, assignment, unary, and conditional (`qu`)
 expression forms. The
@@ -19,23 +41,50 @@ supported expression operands are themselves integer literals; calls, casts,
 template-parameter references inside expressions, and other expression
 productions remain unsupported. Vendor-qualified types
 using `U <source-name> <type>` are presented as a GNU-style
-`__attribute__((name))` suffix. It recognizes a
-bounded set of additional encoded floating types: `Df`/`Dd`/`De` for
-decimal32/decimal64/decimal128, `Dh` for `_Float16`, and `DF<number>_` for
-`_Float<number>`. They are rendered as type names only; the parser does not
-infer target availability or floating representation. It recognizes a
+`__attribute__((name))` suffix. Vendor qualifiers may also carry the bounded
+template argument list `I...E`; these render with their arguments, for example
+as `__attribute__((address_space<1>))`. Type, integral, expression, and pack
+arguments use the same bounded presentation grammar as ordinary template
+arguments. It recognizes a
+bounded Itanium ABI-tag suffix `B<source-name>` on ordinary names and tagged
+standard substitutions. Tags are shown explicitly as `[abi:name]` (multiple
+tags retain their encoded order) and remain part of the demangler's semantic
+substitution key. The syntax follows the
+[Itanium ABI tag production](https://itanium-cxx-abi.github.io/cxx-abi/abi.html#abi-tags).
+A bounded set of additional encoded floating types is also recognized:
+`Df`/`Dd`/`De` for
+decimal32/decimal64/decimal128, `Dh` for `_Float16`, `Du` for `char8_t`, and
+`DF<number>_` for `_Float<number>`. It also recognizes the bounded Itanium
+pack-expansion type form `Dp <type>` and renders its ellipsis after the
+expanded type. The GNU/Clang vector extension `Dv<lane-count>_<element-type>`
+is rendered symbolically as `vector<element-type, lane-count>`. Lane counts
+must be positive and are retained as a number in the display, so their size
+does not cause dimension-sized allocation. This presentation identifies the
+encoded vector shape only; the parser does not infer target ABI, register
+class, alignment, target availability, or floating representation. It recognizes a
+bounded C99 complex and imaginary type wrapper: `C <type>` and `G <type>` are
+shown with `_Complex` and `_Imaginary` prefixes (for example, `Cf` becomes
+`_Complex float`). This reports the encoded type spelling and does not infer
+whether a target compiler supports that extension. It recognizes a
 bounded subset of Microsoft decorated free and member functions. In addition
 to `?name@scope@@Y...` global functions, it parses ordinary
 `?method@Class@@...` and nested namespace/class names, access and
 static/virtual member-function classes, `const`/`volatile` and
 lvalue/rvalue-ref-qualified members, common scalar/pointer/reference types,
-bounded rank/dimension encoded array types, and simple type-parameter
+bounded rank/dimension encoded array types, non-member and member-function
+pointer types with supported calling conventions and parameter lists, and simple type-parameter
 class/function template names. Template arguments now recurse through nested
 class/struct/union/enum types and nested template instantiations. The bounded
 integral non-type subset recognizes MSVC `$0` arguments using single-digit
 biased values or rebased hexadecimal `A`Ã¢â‚¬â€œ`P` nibbles terminated by `@`, with
 the optional `?` negative marker (for example, `?$Buffer@$03@@` presents as
-`Buffer<4>`). Common overloaded
+`Buffer<4>`). MSVC variable symbols now support storage classes `0` through
+`4`: private/protected/public static members, globals, and static locals.
+Their bounded type grammar covers the same scalar, pointer, reference, array,
+and named types as function signatures, with the encoded top-level `const`,
+`volatile`, and `const volatile` qualifiers. Unsupported trailing type
+qualifiers and malformed or truncated encodings preserve the original symbol.
+Common overloaded
 operators are rendered from their Microsoft operator codes, including arithmetic,
 comparisons, shifts, logical/bitwise operators, indexing, calls, comma,
 compound assignments, allocation, and deallocation. The bounded MSVC special-name
@@ -46,8 +95,22 @@ subset also renders vftables (`??_7`), vbtables (`??_8`), RTTI type descriptors
 terminators and name/type encodings are valid. Scalar and vector deleting
 destructor symbols (`??_G` and `??_E`) are also rendered from their member
 function encoding, including access/virtual qualifiers, return type, calling
-convention, and the hidden `unsigned int` parameter when present. Vcall and
-adjustment thunks, local tables, and other special names remain unsupported.
+convention, and the hidden `unsigned int` parameter when present. Microsoft
+local-static guard symbols (`??_B`) are rendered from a bounded qualified name,
+as are thread-local local-static guard symbols (`??__J`). Both forms accept the
+visibility marker (`5` or `4IA`) and an optional encoded scope-depth value.
+The marker and depth are presented as encoded metadata; they do not describe
+runtime guard behavior. The parser accepts ordinary and supported simple
+template scope components here. Local vftables (`??_S`) parse the owner, the
+`6B` table qualifiers, and an optional bounded base-path name. Dynamic
+initializers (`??__E`) and dynamic atexit destructors (`??__F`) parse qualified
+global or static-data-member names and require the exact generated `void
+__cdecl()` stub signature. These labels identify compiler-generated symbols;
+they do not infer initialization or destruction behavior. Vcall thunks parse the owning scope, the `$B`
+marker, the encoded vftable byte offset, the `A` marker, and a supported
+calling-convention code. The rendered label reports the offset and convention
+without resolving the target or inferring dispatch behavior. Adjustment thunks
+and other special names remain unsupported.
 For `??_R1`, the bounded presentation grammar is
 `??_R1<number><signed-number><number><number><qualified-name>8`; the numeric
 fields follow the MSVC number syntax below, and only the second field accepts
@@ -91,20 +154,33 @@ between closures without pretending to reconstruct source capture syntax.
 These forms remain bounded by the usual input, depth, component, and output
 limits. Nested local entities and lambda signatures use the same supported
 type grammar as ordinary names.
+Discriminator decimals must use canonical spelling (no leading zeroes); the
+short `_<number>` form is accepted only below 10, and `__<number>_` only from
+10 onward. Noncanonical or incomplete discriminator encodings are malformed
+and preserve the original symbol.
 
 This is not a complete implementation of either ABI. The Itanium substitutions
 described below, array/function/member-pointer types, and selected template
-parameters are recognized; vendor extensions, default-argument local-name
+parameters are recognized; vector support covers the bounded GNU/Clang
+`Dv<count>_<type>` production, while other vendor extensions,
+default-argument local-name
 forms, expression-valued template arguments beyond the bounded integer
 expression grammar, and broader operator/type
 encodings remain incomplete, including expression calls/casts,
 template parameter references inside expressions, and unrecognized vendor
 qualifiers. Other Itanium builtin extensions and newer instantiation-dependent
-builtin encodings remain unsupported. Microsoft thunks and other special names,
+builtin encodings remain unsupported. Microsoft adjustment thunks and other special names,
 non-integral template values (including pointers, member pointers, symbol
 references, `auto` values, and parameter packs), template backreferences,
-pointer-to-member and function-pointer types, and many calling-convention/type
-codes are unsupported in the Microsoft grammar. The Itanium pointer forms
+many calling-convention/type codes remain unsupported in the Microsoft grammar.
+Data-member pointers support the `Q`/`R`/`S`/`T` member-cv qualifier forms with
+a bounded owner name and a pointee accepted by the existing type grammar.
+Function-pointer support covers non-member
+`P`/`Q`/`R`/`S` pointer types with the `6` marker and member-function pointers
+with the `8` marker, a bounded owning-class name, supported calling conventions,
+and recognized `const`/`volatile` and `&`/`&&` qualifiers. Unsupported owner,
+calling-convention, qualifier, or nested declarator forms retain the raw name.
+The Itanium pointer forms
 described above are supported. Malformed numeric values, missing hexadecimal terminators,
 and configured size/depth/component overflows retain the original symbol text.
 The `??_R1` integer fields use MSVC's `<number> ::= [?] <non-negative integer>`
@@ -120,6 +196,39 @@ Array ranks and dimensions use ABI-encoded integer forms and remain bounded by
 the configured nesting/component limits. The parser deliberately
 does not invoke platform demangling libraries or external processes, so results
 are consistent across platforms and unsupported names safely remain raw.
+
+The Itanium ABI special-name subset recognizes `TV`, `TT`, `TI`, and `TS` for
+virtual tables, VTTs, typeinfo objects, and typeinfo-name objects. The encoded
+type is parsed with the same bounded type grammar as ordinary names. It also
+recognizes `GV`, `TH`, and `TW` as guard-variable, TLS-initializer, and
+thread-local wrapper names, respectively. Those forms parse one complete
+mangled object name and reject trailing bytes. Non-virtual (`Th`), virtual
+(`Tv`), and covariant-return (`Tc`) thunks parse bounded signed call offsets
+and a complete target function encoding. Their rendered names include the
+encoded `this` and optional vcall/return adjustments, for example
+`virtual thunk [this=-8, vcall=+16] to Widget::run()`. Offset values are
+reported as encoded; HexLab does not infer runtime adjustment behavior.
+`GR` lifetime-extended temporary names parse their complete object name and
+optional base-36 sequence ID; the first temporary has no encoded sequence ID.
+Output labels distinguish the first temporary from later sequence IDs without
+guessing source-level object contents. Construction vtables (`TC`) are also
+recognized in the bounded form `TC <complete-type> <offset>_ <base-type>` and
+render as `construction vtable for Base in Complete [offset=+N]`. The signed
+offset is reported as encoded; it is not interpreted as a runtime object-layout
+adjustment. Both types use the ordinary bounded type grammar, the offset must
+fit the signed 64-bit limit, and trailing bytes or malformed encodings preserve
+the raw symbol. Other Itanium special names remain unsupported. These
+encodings follow the [Itanium C++ ABI](https://itanium-cxx-abi.github.io/cxx-abi/abi.html),
+which specifies the special-name and lifetime-extended temporary productions.
+
+The ABI transaction-safe entry-point special name `GTt <encoding>` is rendered
+as **transaction-safe entry point to** the bounded ordinary function spelling.
+Transaction-safe function types encoded with `DxF...E` retain a
+`transaction_safe` qualifier in pointer and other declarator contexts; the
+combined `DoDxF...E` form preserves both `noexcept` and the transaction-safe
+qualifier. These labels report mangled type/name facts only and do not assert
+that HexLab can execute the function transactionally. The productions follow
+the Itanium ABI's [transaction-safe function entry-point and type rules](https://itanium-cxx-abi.github.io/cxx-abi/abi.html#transaction-safe-function-entry-points).
 
 ## Itanium compression and backreferences
 
@@ -159,9 +268,10 @@ Parsing depth and total component work remain bounded even when a symbol uses
 many references. Unsupported productions fail the complete parse; no partial
 presentation replaces raw identity. Unrecognized local/lambda/special forms,
 dependent qualified/template-template names, ref-qualified function-type
-encodings, expression calls/casts, and vendor qualifier template arguments
-remain outside this slice. Incomplete/cv-qualified array declarators and other
-unproven qualifier forms also fail closed.
+encodings, and expression calls/casts remain outside this slice.
+Incomplete/cv-qualified array declarators, dependent `noexcept(expression)` and
+dynamic exception specifications, and other unproven qualifier forms also fail
+closed.
 
 Source review covered substitution ordering, kind checks, standard forms,
 base-36 overflow and indexes, nested template scope, declarator reuse, member

@@ -220,6 +220,94 @@ std::optional<Statement> lift_control(const Instruction &i, std::uint16_t width,
     return Statement{Branch{name, direct ? i.direct_target : std::optional<Address>{}, {},
         conditional ? condition(decrements) : ExpressionPtr{}, direct ? ExpressionPtr{} : std::move(target)}};
 }
+ExpressionPtr ppc_select(ExpressionPtr condition,ExpressionPtr yes,ExpressionPtr no,std::uint16_t bits) {
+    return binary("select_if",std::move(condition),binary("pair",std::move(yes),std::move(no),bits),bits);
+}
+std::optional<Statement> lift_shift(const Instruction &i,std::uint16_t width) {
+    const auto op=i.opcode;
+    const bool word=op==Opcode::ppc_slw||op==Opcode::ppc_srw||op==Opcode::ppc_sraw||op==Opcode::ppc_srawi;
+    const bool doubleword=op==Opcode::ppc_sld||op==Opcode::ppc_srd||op==Opcode::ppc_srad||op==Opcode::ppc_sradi;
+    if(!word&&!doubleword)return {};
+    const bool arithmetic=op==Opcode::ppc_sraw||op==Opcode::ppc_srawi||op==Opcode::ppc_srad||op==Opcode::ppc_sradi;
+    const bool immediate=op==Opcode::ppc_srawi||op==Opcode::ppc_sradi;
+    const bool left=op==Opcode::ppc_slw||op==Opcode::ppc_sld;
+    const auto bits=static_cast<std::uint16_t>(word?32:64);
+    const auto valid_gpr=[width](const R *r){
+        return r&&r->bank==RegisterBank::ppc_gpr&&r->width==width&&r->index<32&&!r->high_byte;
+    };
+    const auto *destination=i.operands.size()==3?std::get_if<R>(&i.operands[0]):nullptr;
+    const auto *source=i.operands.size()==3?std::get_if<R>(&i.operands[1]):nullptr;
+    const auto *count=i.operands.size()==3?std::get_if<R>(&i.operands[2]):nullptr;
+    const auto *amount=i.operands.size()==3?std::get_if<ImmediateOperand>(&i.operands[2]):nullptr;
+    const R xer{RegisterBank::ppc_xer,0,32,false},cr0{RegisterBank::ppc_cr,0,4,false};
+    const bool record=std::find(i.register_writes.begin(),i.register_writes.end(),cr0)!=i.register_writes.end();
+    if(!valid_gpr(destination)||!valid_gpr(source)||(doubleword&&width!=64)||i.length!=4||
+       i.flow!=FlowKind::fallthrough||i.memory_read||i.memory_write||
+       i.access!=std::vector<OperandAccess>{OperandAccess::write,OperandAccess::read,OperandAccess::read})
+        return effect(i,"ppc_malformed_shift");
+    if(immediate){
+        if(!amount||amount->is_signed||amount->value>=bits||amount->encoded_width!=(word?5:6)||
+           amount->effective_width!=(word?5:6))return effect(i,"ppc_malformed_shift_immediate");
+    }else if(!valid_gpr(count))return effect(i,"ppc_malformed_shift_count");
+    std::vector<R> expected_reads{*source},expected_writes{*destination};
+    if(!immediate)expected_reads.push_back(*count);
+    if(arithmetic)expected_writes.push_back(xer);
+    if(record)expected_writes.push_back(cr0);
+    if(i.register_writes!=expected_writes)return effect(i,"ppc_malformed_shift_writes");
+    if(i.register_reads!=expected_reads){
+        // Current decoder facts list explicit GPR sources. Accept a future
+        // declaration of the implicit XER preservation/SO input as well.
+        if(!arithmetic&&!record)return effect(i,"ppc_malformed_shift_reads");
+        expected_reads.push_back(xer);
+        if(i.register_reads!=expected_reads)return effect(i,"ppc_malformed_shift_reads");
+    }
+    auto input=reg(*source);
+    if(word&&width==64)input=unary("trunc32",std::move(input),32);
+    ExpressionPtr raw_count=immediate?constant(amount->value,bits):reg(*count);
+    if(!immediate&&word&&width==64)raw_count=unary("trunc32",std::move(raw_count),32);
+    // Word variable counts use six low bits; doubleword counts use seven.
+    // Separate the overshift bit before masking the actual IR shift operand,
+    // so no expression ever shifts by its width or more.
+    auto low_count=binary("and",raw_count,constant(bits-1,bits),bits);
+    auto overshift=immediate?boolean(false):predicate("ne",
+        binary("and",raw_count,constant(bits,bits),bits),constant(0,bits));
+    auto shifted=binary(left?"shl":arithmetic?"sar":"shr",input,low_count,bits);
+    auto negative=predicate("ne",binary("and",input,constant(std::uint64_t{1}<<(bits-1),bits),bits),constant(0,bits));
+    auto fill=arithmetic?unary("sext",negative,bits):constant(0,bits);
+    auto result=ppc_select(overshift,std::move(fill),std::move(shifted),bits);
+    if(word&&width==64)result=unary(arithmetic?"sext":"zext",std::move(result),64);
+    if(!arithmetic&&!record)return Statement{Assign{*destination,std::move(result)}};
+
+    std::vector<ExpressionPtr> outputs{result};
+    if(arithmetic){
+        // CA is negative && any discarded 1-bit. Overshifting a negative
+        // source discards its sign bit too, while a zero shift clears CA.
+        auto discarded_mask=binary("sub",binary("shl",constant(1,bits),low_count,bits),constant(1,bits),bits);
+        auto discarded=predicate("ne",binary("and",input,std::move(discarded_mask),bits),constant(0,bits));
+        auto carry=predicate("bool_and",negative,predicate("bool_or",overshift,std::move(discarded)));
+        // CA32 is ISA-revision dependent in the generic PPC profile. Preserve
+        // every other bit, give CA its exact formula, and keep CA32 unknown
+        // rather than asserting that a legacy reserved bit is implemented.
+        constexpr std::uint32_t carry_mask=UINT32_C(1)<<29,carry32_mask=UINT32_C(1)<<18;
+        auto next_xer=binary("and",reg(xer),constant(~(carry_mask|carry32_mask),32),32);
+        next_xer=binary("or",std::move(next_xer),
+            binary("shl",unary("zext",std::move(carry),32),constant(29,32),32),32);
+        auto ca32=std::make_shared<Expression>(Expression{integer(1),UnknownValue{"ppc_shift_ca32_profile_dependent"}});
+        next_xer=binary("or",std::move(next_xer),
+            binary("shl",unary("zext",std::move(ca32),32),constant(18,32),32),32);
+        outputs.push_back(std::move(next_xer));
+    }
+    if(record)outputs.push_back(ppc_record_cr0(result,width));
+    const auto *name=op==Opcode::ppc_slw?"slw":op==Opcode::ppc_srw?"srw":op==Opcode::ppc_sld?"sld":
+        op==Opcode::ppc_srd?"srd":op==Opcode::ppc_sraw?"sraw":op==Opcode::ppc_srawi?"srawi":
+        op==Opcode::ppc_srad?"srad":"sradi";
+    Intrinsic shifted_effect{std::string("ppc_")+name+(record?"_record":""),
+        {reg(*source),raw_count,reg(xer)},IntrinsicMemoryEffect::none};
+    shifted_effect.register_writes=i.register_writes;
+    shifted_effect.register_output_values=std::move(outputs);
+    shifted_effect.result_type=integer(width);
+    return Statement{std::move(shifted_effect)};
+}
 std::uint32_t ppc_word_mask(unsigned mb, unsigned me) {
     std::uint32_t mask = 0;
     for (unsigned bit = mb; ; bit = (bit + 1) & 31) {
@@ -252,6 +340,27 @@ std::optional<Statement> lift_ppc_instruction(const Instruction &i, std::vector<
     if (i.opcode == Opcode::ppc_b || i.opcode == Opcode::ppc_bc ||
         i.opcode == Opcode::ppc_bclr || i.opcode == Opcode::ppc_bcctr)
         return lift_control(i, width, before);
+    if (i.opcode == Opcode::ppc_tw || i.opcode == Opcode::ppc_td) {
+        const auto *to = ops.size() == 3 ? std::get_if<ImmediateOperand>(&ops[0]) : nullptr;
+        const auto *left = ops.size() == 3 ? std::get_if<R>(&ops[1]) : nullptr;
+        const auto *right = ops.size() == 3 ? std::get_if<R>(&ops[2]) : nullptr;
+        const auto bits = i.opcode == Opcode::ppc_tw ? 32u : 64u;
+        if (!to || to->value > 31 || !left || !right || left->bank != RegisterBank::ppc_gpr ||
+            right->bank != RegisterBank::ppc_gpr || left->width != bits || right->width != bits ||
+            i.flow != FlowKind::fallthrough || i.register_reads != std::vector<R>{*left, *right} ||
+            !i.register_writes.empty() || i.memory_read || i.memory_write)
+            return effect(i, "ppc_malformed_conditional_trap");
+        std::vector<ExpressionPtr> conditions;
+        const auto add = [&](unsigned flag, const char *name) {
+            if (to->value & flag) conditions.push_back(predicate(name, reg(*left), reg(*right)));
+        };
+        add(16, "slt"); add(8, "sgt"); add(4, "eq"); add(2, "ult"); add(1, "ugt");
+        ExpressionPtr condition = boolean(false);
+        for (auto &part : conditions) condition = predicate("bool_or", std::move(condition), std::move(part));
+        return Intrinsic{i.opcode == Opcode::ppc_tw ? "ppc_tw_conditional_trap" : "ppc_td_conditional_trap",
+                         {std::move(condition)}, IntrinsicMemoryEffect::none};
+    }
+    if(auto shift=lift_shift(i,width))return shift;
 
     if (i.opcode == Opcode::ppc_mcrf) {
         const auto *destination = ops.size() == 2 ? std::get_if<R>(&ops[0]) : nullptr;
@@ -265,6 +374,55 @@ std::optional<Statement> lift_ppc_instruction(const Instruction &i, std::vector<
             i.register_reads != std::vector<R>{*source} || i.memory_read || i.memory_write)
             return effect(i, "ppc_malformed_mcrf");
         return Assign{*destination, reg(*source)};
+    }
+
+    if (i.opcode == Opcode::ppc_isel) {
+        const auto *yes = ops.size() == 4 ? std::get_if<R>(&ops[1]) : nullptr;
+        const auto *no = ops.size() == 4 ? std::get_if<R>(&ops[2]) : nullptr;
+        const auto *condition = ops.size() == 4 ? std::get_if<R>(&ops[3]) : nullptr;
+        const auto valid_gpr = [width](const R *r) {
+            return r && r->bank == RegisterBank::ppc_gpr && r->width == width && r->index < 32 && !r->high_byte;
+        };
+        if (!valid_gpr(dst) || !valid_gpr(yes) || !valid_gpr(no) ||
+            !condition || condition->bank != RegisterBank::ppc_crbit || condition->width != 1 || condition->index >= 32 ||
+            i.access != std::vector<OperandAccess>{OperandAccess::write, OperandAccess::read, OperandAccess::read, OperandAccess::read} ||
+            i.register_writes != std::vector<R>{*dst} || i.register_reads != std::vector<R>{*yes, *no, *condition} ||
+            i.memory_read || i.memory_write || i.flow != FlowKind::fallthrough)
+            return effect(i, "ppc_malformed_isel");
+        auto predicate_value = predicate("ne", reg(*condition), constant(0, 1));
+        return Assign{*dst, ppc_select(std::move(predicate_value), reg(*yes), reg(*no), width)};
+    }
+
+    const bool cr_logical = i.opcode == Opcode::ppc_crand || i.opcode == Opcode::ppc_crandc ||
+        i.opcode == Opcode::ppc_creqv || i.opcode == Opcode::ppc_crnand ||
+        i.opcode == Opcode::ppc_crnor || i.opcode == Opcode::ppc_cror ||
+        i.opcode == Opcode::ppc_crorc || i.opcode == Opcode::ppc_crxor;
+    if (cr_logical) {
+        const auto *left = ops.size() == 3 ? std::get_if<R>(&ops[1]) : nullptr;
+        const auto *right = ops.size() == 3 ? std::get_if<R>(&ops[2]) : nullptr;
+        const auto valid_bit = [](const R *bit) {
+            return bit && bit->bank == RegisterBank::ppc_crbit && bit->width == 1 && bit->index < 32;
+        };
+        if (!valid_bit(dst) || !valid_bit(left) || !valid_bit(right) ||
+            i.access != std::vector<OperandAccess>{OperandAccess::write, OperandAccess::read, OperandAccess::read} ||
+            i.register_writes != std::vector<R>{*dst} || i.register_reads != std::vector<R>{*left, *right} ||
+            i.memory_read || i.memory_write || i.flow != FlowKind::fallthrough)
+            return effect(i, "ppc_malformed_cr_logical");
+        const auto as_bool = [](R bit) { return predicate("ne", reg(bit), constant(0, 1)); };
+        auto a = as_bool(*left), b = as_bool(*right);
+        ExpressionPtr value;
+        switch (i.opcode) {
+        case Opcode::ppc_crand: value = predicate("bool_and", std::move(a), std::move(b)); break;
+        case Opcode::ppc_crandc: value = predicate("bool_and", std::move(a), predicate("eq", std::move(b), boolean(false))); break;
+        case Opcode::ppc_creqv: value = predicate("eq", std::move(a), std::move(b)); break;
+        case Opcode::ppc_crnand: value = predicate("eq", predicate("bool_and", std::move(a), std::move(b)), boolean(false)); break;
+        case Opcode::ppc_crnor: value = predicate("eq", predicate("bool_or", std::move(a), std::move(b)), boolean(false)); break;
+        case Opcode::ppc_cror: value = predicate("bool_or", std::move(a), std::move(b)); break;
+        case Opcode::ppc_crorc: value = predicate("bool_or", std::move(a), predicate("eq", std::move(b), boolean(false))); break;
+        case Opcode::ppc_crxor: value = predicate("ne", std::move(a), std::move(b)); break;
+        default: return effect(i, "ppc_malformed_cr_logical");
+        }
+        return Assign{*dst, std::move(value)};
     }
 
     if (const auto vmx = vmx_operation(i.opcode)) {
@@ -529,6 +687,72 @@ std::optional<Statement> lift_ppc_instruction(const Instruction &i, std::vector<
         return statement;
     }
     if (i.opcode == Opcode::ppc_nop) return Intrinsic{"nop", {}, IntrinsicMemoryEffect::none};
+    if ((i.opcode == Opcode::ppc_addze || i.opcode == Opcode::ppc_addze_dot ||
+         i.opcode == Opcode::ppc_addme || i.opcode == Opcode::ppc_addme_dot) && ops.size() == 2) {
+        const auto *source = std::get_if<R>(&ops[1]);
+        const bool add_minus_one = i.opcode == Opcode::ppc_addme || i.opcode == Opcode::ppc_addme_dot;
+        const bool record = i.opcode == Opcode::ppc_addze_dot || i.opcode == Opcode::ppc_addme_dot;
+        const R status{RegisterBank::ppc_xer, 0, 32, false};
+        if (!dst || dst->bank != RegisterBank::ppc_gpr || dst->width != width || !source ||
+            source->bank != RegisterBank::ppc_gpr || source->width != width || source->index >= 32)
+            return effect(i, "ppc_malformed_addze_addme");
+        std::vector<R> expected_writes{*dst, status};
+        if (record) expected_writes.push_back({RegisterBank::ppc_cr, 0, 4, false});
+        if (i.access != std::vector<OperandAccess>{OperandAccess::write, OperandAccess::read} ||
+            i.register_reads != std::vector<R>{*source, status} || i.register_writes != expected_writes ||
+            i.memory_read || i.memory_write || i.flow != FlowKind::fallthrough)
+            return effect(i, "ppc_malformed_addze_addme");
+
+        const auto left = reg(*source);
+        const auto xer_value = reg(status);
+        auto carry_in = binary("and", binary("shr", xer_value, constant(29, 32), 32), constant(1, 32), 32);
+        const auto carry_in_bool = predicate("ne", carry_in, constant(0, 32));
+        if (width == 64) carry_in = unary("zext", std::move(carry_in), width);
+        auto value = binary("add", left, carry_in, width);
+        if (add_minus_one) value = binary("sub", std::move(value), constant(1, width), width);
+
+        const auto carry_boolean = add_minus_one
+            ? predicate("bool_or", carry_in_bool,
+                        predicate("ne", left, constant(0, width)))
+            : predicate("bool_and", carry_in_bool,
+                        predicate("eq", left, constant(width == 32 ? UINT32_MAX : UINT64_MAX, width)));
+        constexpr std::uint64_t xer_ca = UINT64_C(1) << 29;
+        auto next_xer = binary("and", reg(status), constant(UINT32_MAX ^ xer_ca, 32), 32);
+        auto carry_bit = binary("shl", unary("zext", carry_boolean, 32), constant(29, 32), 32);
+        next_xer = binary("or", std::move(next_xer), std::move(carry_bit), 32);
+        std::vector<ExpressionPtr> outputs{value, std::move(next_xer)};
+        if (record) outputs.push_back(ppc_record_cr0(value, width));
+        auto statement = effect_with_outputs(i, add_minus_one ? "ppc_addme_carry" : "ppc_addze_carry",
+                                             std::move(outputs));
+        if (auto *intrinsic = statement ? std::get_if<Intrinsic>(&*statement) : nullptr)
+            intrinsic->operands.push_back(reg(status));
+        return statement;
+    }
+    if ((i.opcode == Opcode::ppc_addic || i.opcode == Opcode::ppc_addic_dot ||
+         i.opcode == Opcode::ppc_subfic) && ops.size() == 3 && dst &&
+        dst->bank == RegisterBank::ppc_gpr && ops.size() > 1 &&
+        std::holds_alternative<R>(ops[1]) && std::holds_alternative<ImmediateOperand>(ops[2])) {
+        const bool subtract_immediate = i.opcode == Opcode::ppc_subfic;
+        const bool record = i.opcode == Opcode::ppc_addic_dot;
+        const auto left = operand(ops[1]);
+        const auto immediate = operand(ops[2]);
+        const auto value = subtract_immediate
+            ? binary("sub", immediate, left, width)
+            : binary("add", left, immediate, width);
+        const auto carry = subtract_immediate
+            ? predicate("uge", immediate, left)
+            : predicate("ult", value, left);
+        constexpr std::uint64_t xer_ca = UINT64_C(1) << 29;
+        auto next_xer = binary("and", reg({RegisterBank::ppc_xer, 0, 32, false}),
+                               constant(UINT32_MAX ^ xer_ca, 32), 32);
+        auto carry_bit = binary("shl", unary("zext", carry, 32), constant(29, 32), 32);
+        next_xer = binary("or", std::move(next_xer), std::move(carry_bit), 32);
+        std::vector<ExpressionPtr> outputs{value, std::move(next_xer)};
+        if (record) outputs.push_back(ppc_record_cr0(value, width));
+        return effect_with_outputs(i, subtract_immediate ? "ppc_subfic_carry" :
+                                   record ? "ppc_addic_record_carry" : "ppc_addic_carry",
+                                   std::move(outputs));
+    }
     if ((i.opcode == Opcode::ppc_addi || i.opcode == Opcode::ppc_addis) && ops.size() == 3) {
         auto value = operand(ops[2]);
         if (const auto *base = std::get_if<R>(&ops[1]); base && base->index != 0)
@@ -548,18 +772,35 @@ std::optional<Statement> lift_ppc_instruction(const Instruction &i, std::vector<
                              operand(ops[1]), std::move(imm), width));
     }
     if (i.opcode == Opcode::ppc_add || i.opcode == Opcode::ppc_add_dot ||
+        i.opcode == Opcode::ppc_addo || i.opcode == Opcode::ppc_addo_dot ||
         i.opcode == Opcode::ppc_subf || i.opcode == Opcode::ppc_subf_dot || i.opcode == Opcode::ppc_or ||
+        i.opcode == Opcode::ppc_subfo || i.opcode == Opcode::ppc_subfo_dot ||
         i.opcode == Opcode::ppc_or_dot || i.opcode == Opcode::ppc_xor || i.opcode == Opcode::ppc_xor_dot ||
         i.opcode == Opcode::ppc_and || i.opcode == Opcode::ppc_and_dot) {
         if (ops.size() < 3) return effect(i, "ppc_malformed");
-        const bool subf = i.opcode == Opcode::ppc_subf || i.opcode == Opcode::ppc_subf_dot;
+        const bool subf = i.opcode == Opcode::ppc_subf || i.opcode == Opcode::ppc_subf_dot ||
+                          i.opcode == Opcode::ppc_subfo || i.opcode == Opcode::ppc_subfo_dot;
         const bool record = i.opcode == Opcode::ppc_add_dot || i.opcode == Opcode::ppc_subf_dot ||
+                            i.opcode == Opcode::ppc_addo_dot || i.opcode == Opcode::ppc_subfo_dot ||
                             i.opcode == Opcode::ppc_or_dot || i.opcode == Opcode::ppc_xor_dot || i.opcode == Opcode::ppc_and_dot;
-        const char *name = (i.opcode == Opcode::ppc_add || i.opcode == Opcode::ppc_add_dot) ? "add" :
+        const bool overflow = i.opcode == Opcode::ppc_addo || i.opcode == Opcode::ppc_addo_dot ||
+                              i.opcode == Opcode::ppc_subfo || i.opcode == Opcode::ppc_subfo_dot;
+        const char *name = (i.opcode == Opcode::ppc_add || i.opcode == Opcode::ppc_add_dot ||
+                            i.opcode == Opcode::ppc_addo || i.opcode == Opcode::ppc_addo_dot) ? "add" :
                            subf ? "sub" : (i.opcode == Opcode::ppc_or || i.opcode == Opcode::ppc_or_dot) ? "or" :
                            (i.opcode == Opcode::ppc_xor || i.opcode == Opcode::ppc_xor_dot) ? "xor" : "and";
         auto value = subf ? binary(name, operand(ops[2]), operand(ops[1]), width)
                           : binary(name, operand(ops[1]), operand(ops[2]), width);
+        if (overflow) {
+            std::vector<ExpressionPtr> outputs{value,
+                std::make_shared<Expression>(Expression{integer(32), UnknownValue{"ppc_xer_after_addo_subfo"}})};
+            if (record) outputs.push_back(ppc_record_cr0(value, width));
+            auto statement = effect_with_outputs(i, record ? "ppc_overflow_record_add_sub" : "ppc_overflow_add_sub",
+                                                 std::move(outputs));
+            if (auto *intrinsic = statement ? std::get_if<Intrinsic>(&*statement) : nullptr)
+                intrinsic->operands.push_back(reg({RegisterBank::ppc_xer, 0, 32, false}));
+            return statement;
+        }
         if (record) return effect_with_outputs(i, "ppc_record_integer", {value, ppc_record_cr0(value, width)});
         return assign(std::move(value));
     }
@@ -597,6 +838,9 @@ std::optional<Statement> lift_ppc_instruction(const Instruction &i, std::vector<
         case Opcode::ppc_extsb: case Opcode::ppc_extsb_dot: source_bits = 8; operation = "sext"; break;
         case Opcode::ppc_extsh: case Opcode::ppc_extsh_dot: source_bits = 16; operation = "sext"; break;
         case Opcode::ppc_extsw: case Opcode::ppc_extsw_dot: source_bits = 32; operation = "sext"; break;
+        case Opcode::ppc_popcntw: source_bits = 32; operation = "popcount"; break;
+        case Opcode::ppc_popcntd: source_bits = 64; operation = "popcount"; break;
+        case Opcode::ppc_popcntb: source_bits = width; operation = "popcount_bytes"; break;
         default: break;
         }
         if (operation) {
@@ -610,6 +854,43 @@ std::optional<Statement> lift_ppc_instruction(const Instruction &i, std::vector<
     }
     if (i.opcode == Opcode::ppc_mulli && ops.size() == 3)
         return assign(binary("mul", operand(ops[1]), operand(ops[2]), width));
+    if (ops.size() == 3 && dst && dst->bank == RegisterBank::ppc_gpr &&
+        (i.opcode == Opcode::ppc_mulhw || i.opcode == Opcode::ppc_mulhwu)) {
+        const auto *left = std::get_if<R>(&ops[1]);
+        const auto *right = std::get_if<R>(&ops[2]);
+        if (!left || !right || width != (dst->width) || (width != 32 && width != 64) ||
+            left->bank != RegisterBank::ppc_gpr || right->bank != RegisterBank::ppc_gpr ||
+            i.register_reads.size() != 2 || i.register_writes.empty() || i.register_writes.front() != *dst)
+            return effect(i, "ppc_malformed_mulhw");
+        auto lhs = reg({left->bank, left->index, 32, false});
+        auto rhs = reg({right->bank, right->index, 32, false});
+        const bool signed_product = i.opcode == Opcode::ppc_mulhw;
+        auto high_word = binary(signed_product ? "mul_hi_signed32" : "mul_hi_unsigned32",
+                                std::move(lhs), std::move(rhs), 32);
+        const bool record = std::any_of(i.register_writes.begin(), i.register_writes.end(), [](const R &write) {
+            return write.bank == RegisterBank::ppc_cr && write.index == 0;
+        });
+        if (width == 32) {
+            if (!record) return assign(std::move(high_word));
+            return effect_with_outputs(i, "ppc_record_mulhw", {
+                high_word, ppc_record_cr0(std::move(high_word), 32)});
+        }
+        // In PPC64 the low word receives the high product while the upper
+        // word is architecturally undefined. Keep the destination opaque
+        // instead of fabricating a sign or zero extension. CR0 LT/GT/EQ are
+        // likewise undefined in this mode; SO remains the XER summary bit.
+        std::vector<ExpressionPtr> outputs;
+        outputs.push_back(std::make_shared<Expression>(Expression{
+            integer(64), UnknownValue{"ppc_mulhw_upper32_undefined"}}));
+        if (record) {
+            auto unknown_flag = [] {
+                return std::make_shared<Expression>(Expression{
+                    {TypeKind::boolean, 1, false}, UnknownValue{"ppc_mulhw_cr0_lt_gt_eq_undefined"}});
+            };
+            outputs.push_back(pack_ppc_cr_field(unknown_flag(), unknown_flag(), unknown_flag(), ppc_xer_so()));
+        }
+        return effect_with_outputs(i, "ppc_mulhw_undefined_upper_word", std::move(outputs));
+    }
     // The word multiply/divide instructions operate on 32-bit operands even
     // in PPC64 mode and sign- or zero-extend their 32-bit result. Keep the
     // architectural divide operations named so their divide-by-zero and
@@ -662,6 +943,36 @@ std::optional<Statement> lift_ppc_instruction(const Instruction &i, std::vector<
         const bool signed_compare = i.opcode == Opcode::ppc_cmpi || i.opcode == Opcode::ppc_cmp;
         auto value = ppc_compare_cr_field(reg(*left), operand(ops[2]), signed_compare);
         return effect_with_outputs(i, "ppc_compare", {std::move(value)});
+    }
+
+    if (i.opcode == Opcode::ppc_lwa || i.opcode == Opcode::ppc_lwax || i.opcode == Opcode::ppc_lwaux) {
+        const bool update = i.opcode == Opcode::ppc_lwaux;
+        const bool indexed = i.opcode != Opcode::ppc_lwa;
+        const auto valid_gpr = [](const R &value) {
+            return value.bank == RegisterBank::ppc_gpr && value.width == 64 &&
+                value.index < 32 && !value.high_byte;
+        };
+        const auto *memory = ops.size() == 2 ? std::get_if<MemoryOperand>(&ops[1]) : nullptr;
+        if (width != 64 || !dst || !valid_gpr(*dst) || !memory || memory->data_width != 32 ||
+            memory->address_width != 64 || memory->segment || memory->ip_relative || memory->scale != 1 ||
+            memory->writeback || !memory->index_extend.empty() || memory->index_shift_amount ||
+            (memory->base && (!valid_gpr(*memory->base) || memory->base->index == 0)) ||
+            (indexed ? (!memory->index || !valid_gpr(*memory->index) || memory->displacement != 0)
+                     : (memory->index || memory->displacement < -32768 || memory->displacement > 32764 ||
+                        memory->displacement % 4 != 0)) ||
+            i.access != std::vector<OperandAccess>{OperandAccess::write, OperandAccess::address} ||
+            !i.memory_read || i.memory_write ||
+            (update && (!memory->base || *memory->base == *dst)))
+            return effect(i, "ppc_malformed_algebraic_word_load");
+        const auto expected_writes = update ? std::vector<R>{*dst, *memory->base} : std::vector<R>{*dst};
+        if (i.register_writes != expected_writes)
+            return effect(i, "ppc_malformed_algebraic_word_load");
+        auto value = unary("sext", operand(ops[1]), 64);
+        if (!update) return assign(std::move(value));
+        // Both formulas use the pre-instruction register state. RB may alias
+        // RT or RA; the memory read and base update must not become sequential.
+        auto address = binary("add", reg(*memory->base), reg(*memory->index), 64);
+        return effect_with_outputs(i, "ppc_lwaux", {std::move(value), std::move(address)});
     }
 
     const bool byte_reverse_load = i.opcode == Opcode::ppc_lwbrx || i.opcode == Opcode::ppc_lhbrx ||

@@ -10,4 +10,16 @@ For ELF64 little-endian AArch64 relocatable objects, the signed-offset switch re
 
 Each recovered case records whether its target came from encoded bytes, an ELF relocation, a Mach-O relocation, or a Mach-O dyld rebase. Relocation record indexes and classic/chained dyld row indexes are preserved in the API and emitted by the CLI `switches` JSON output.
 
+The x86-64 unsigned dword base-relative form accepts an exact supported
+RIP-relative LEA operand relocation when it establishes the register base.
+`table_base_source` is `operand_relocation`, and the base instruction's row
+indexes are retained separately from per-case metadata. `base_definition`
+identifies that LEA and `selector_use` identifies the indexed MOV. The table
+address is the checked base plus the constant load displacement; the target
+base remains separately visible. A relocation on that displacement, a dyld
+base fixup, or a relocation/fixup-associated table slot declines recovery or
+ends its verified prefix. A relocation resolver's final symbolic address does
+not establish the unsigned stored-offset equation, so this form never uses
+such an address directly or falls back to its raw slot bytes.
+
 The analyzer does not apply runtime bindings, authenticated pointers, unsupported relocation equations, or runtime process slides. TBB/TBH byte/halfword offsets continue using their architectural PC-relative encoding. Table-base and target discovery remain limited to the existing recognized instruction patterns; arbitrary register-value propagation is not implied.

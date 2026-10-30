@@ -13,6 +13,24 @@ interrupt, detaches, and terminates. Stop events retain their sequence until
 the caller explicitly continues them. Detach restores owned software
 breakpoints before releasing the target.
 
+On native AArch64, stopped single-thread targets can install read, write, or
+read/write data watchpoints through Mach `ARM_DEBUG_STATE64`. Widths are 1, 2,
+4, or 8 bytes; each must be naturally aligned and stay within one eight-byte
+granule. Native x86-64 supports one-byte execution breakpoints and write or
+read/write data watchpoints through Mach `x86_DEBUG_STATE64`; read-only
+watchpoints are unsupported by x86 debug registers. Data widths are 1, 2, 4,
+or 8 bytes and addresses must be naturally aligned. Execute and data
+comparators share four slots. Both architectures preserve the selected
+comparator's prior disabled state, verify the programmed comparator, and
+restore that state on disable, removal, and detach. Comparator changes made by
+another debugger are reported as conflicts rather than overwritten. Both
+remain limited to single-thread targets; AArch64 hardware execute breakpoints
+remain unsupported.
+On x86-64, DR6 identifies owned execution and data comparator hits and the
+backend clears the reported hit bits before the stop is resumed. On AArch64,
+the backend attributes a data-watchpoint stop only when ESR identifies a valid,
+precise comparator hit owned by the session; other traps remain generic.
+
 Lifecycle waits use a backend-local steady-clock deadline and
 `waitpid(WNOHANG | WUNTRACED)` polling with one-millisecond sleeps. The default
 budget is 5,000 ms. `HEXLAB_DARWIN_PTRACE_TIMEOUT_MS`, read at backend
@@ -111,6 +129,20 @@ snapshot error suppresses notifications for that stop and retains the previous
 snapshot so a later stop can report the change. This polling approach observes
 image changes only when the single-thread target stops; it does not report
 loader changes while the target runs, and it does not synthesize JIT events.
+
+## Thread snapshots
+
+Thread enumeration uses Mach thread identifiers and names as before, and now
+also queries `THREAD_BASIC_INFO` for each thread's run state. `RUNNING`,
+`WAITING`, and `UNINTERRUPTIBLE` map to the debugger's running state; `STOPPED`
+and `HALTED` map to stopped. Unknown kernel values or a failed optional
+`THREAD_BASIC_INFO` query remain unknown rather than being guessed. While the
+backend owns a task-wide suspension for a debugger stop, every enumerated
+thread is reported stopped regardless of its individual query result. This
+snapshot reflects Mach's reported scheduler state; it does not distinguish
+application-level blocking reasons or provide atomic per-thread scheduling.
+The public run-state definitions and `THREAD_BASIC_INFO` layout are in Apple's
+[XNU thread information header](https://github.com/apple-oss-distributions/xnu/blob/main/osfmk/mach/thread_info.h).
 
 ## Registers and breakpoints
 

@@ -83,6 +83,17 @@ hexlab::Result<EvaluatedLocation> evaluate_location_expression_impl(
         case LocationOperationKind::call_frame_cfa:
             if (!context.call_frame_cfa) return unsupported_eval("DW_OP_call_frame_cfa requires a CFA value");
             push(*context.call_frame_cfa); break;
+        case LocationOperationKind::tls_address: {
+            auto offset = pop(); if (!offset) return offset.error();
+            if (offset.value().register_location)
+                return malformed_eval("DW_OP_form_tls_address uses an unmaterialized register location");
+            if (!context.resolve_tls_address)
+                return unsupported_eval("DW_OP_form_tls_address requires a thread-specific TLS resolver");
+            auto address = context.resolve_tls_address(offset.value().value & mask);
+            if (!address) return unsupported_eval("DW_OP_form_tls_address could not resolve the selected thread's TLS address");
+            push(*address);
+            break;
+        }
         case LocationOperationKind::dereference: case LocationOperationKind::dereference_sized: {
             auto address = pop(); if (!address) return address.error();
             if (address.value().register_location) return malformed_eval("DWARF dereference uses an unmaterialized register location");
@@ -198,6 +209,21 @@ hexlab::Result<EvaluatedLocation> evaluate_location_expression_impl(
                 stack.back() = {*value & mask, false};
             }
             stack_value = true; break;
+        case LocationOperationKind::implicit_value: {
+            if (op.block_operand.empty()) return unsupported_eval("DW_OP_implicit_value has no bytes to represent");
+            if (op.block_operand.size() > sizeof(std::uint64_t))
+                return unsupported_eval("DW_OP_implicit_value blocks wider than 8 bytes cannot be represented as a scalar");
+            std::uint64_t value = 0;
+            if (context.target_big_endian) {
+                for (const auto byte : op.block_operand) value = (value << 8) | byte;
+            } else {
+                for (auto it = op.block_operand.rbegin(); it != op.block_operand.rend(); ++it)
+                    value = (value << 8) | *it;
+            }
+            push(value);
+            stack_value = true;
+            break;
+        }
         case LocationOperationKind::branch:
             if (!branch_to(op.second_unsigned_operand)) return malformed_eval("DWARF branch target is not an operation boundary");
             break;
@@ -291,6 +317,8 @@ hexlab::Result<EvaluatedLocationSequence> evaluate_location_expression_sequence(
     };
     const auto first = std::find_if(operations.begin(), operations.end(), [&](const auto &op) { return is_piece(op.kind); });
     EvaluatedLocationSequence result;
+    std::size_t wide_implicit_value_bytes = 0;
+    constexpr std::size_t max_wide_implicit_value_bytes = 64 * 1024;
     if (first == operations.end()) {
         auto location = evaluate_location_expression_impl(
             operations, context, 0, remaining_operations, remaining_memory_reads);
@@ -321,13 +349,29 @@ hexlab::Result<EvaluatedLocationSequence> evaluate_location_expression_sequence(
             ? boundary.second_unsigned_operand : 0;
         piece.destination_bit_offset = destination_bit;
         if (index > expression_begin) {
-            auto location = evaluate_location_expression_impl(
-                operations.subspan(expression_begin, index - expression_begin), context,
-                0, remaining_operations, remaining_memory_reads);
-            if (!location) return location.error();
-            piece.available = true;
-            piece.kind = location.value().kind;
-            piece.value = location.value().value;
+            const auto fragment = operations.subspan(expression_begin, index - expression_begin);
+            const bool wide_implicit_value = fragment.front().kind == LocationOperationKind::implicit_value &&
+                fragment.front().block_operand.size() > sizeof(std::uint64_t) &&
+                std::all_of(fragment.begin() + 1, fragment.end(), [](const auto &op) {
+                    return op.kind == LocationOperationKind::stack_value;
+                });
+            if (wide_implicit_value) {
+                if (fragment.front().block_operand.size() >
+                    max_wide_implicit_value_bytes - wide_implicit_value_bytes)
+                    return hexlab::Error{hexlab::ErrorCode::resource_limit,
+                        "DWARF composite wide implicit values exceed 65536 bytes"};
+                wide_implicit_value_bytes += fragment.front().block_operand.size();
+                piece.available = true;
+                piece.kind = EvaluatedLocationKind::value;
+                piece.bytes = fragment.front().block_operand;
+            } else {
+                auto location = evaluate_location_expression_impl(
+                    fragment, context, 0, remaining_operations, remaining_memory_reads);
+                if (!location) return location.error();
+                piece.available = true;
+                piece.kind = location.value().kind;
+                piece.value = location.value().value;
+            }
         }
         result.pieces.push_back(piece);
         destination_bit += bit_size;

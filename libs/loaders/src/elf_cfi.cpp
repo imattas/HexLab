@@ -56,13 +56,15 @@ std::uint64_t dwarf_register(bool arm64, MachOUnwindRegister reg) {
 
 Result<ElfUnwindResult> evaluate_elf_unwind(const ElfMetadata &metadata, Address pc,
                                              const ElfUnwindContext &context,
-                                             const ElfUnwindMemoryReader &read) {
+                                             const ElfUnwindMemoryReader &read,
+                                             ElfMipsInstructionMode mips_mode) {
     const bool arm64 = metadata.header.machine == 183 && metadata.header.is_64;
     const bool x86_64 = metadata.header.machine == 62 && metadata.header.is_64;
     const bool arm = metadata.header.machine == 40 && !metadata.header.is_64;
+    const bool mips32 = metadata.header.machine == 8 && !metadata.header.is_64;
     const bool riscv = metadata.header.machine == 243;
-    if (!arm64 && !x86_64 && !arm && !riscv)
-        return Error{ErrorCode::unsupported, "ELF live CFI requires x86-64, AArch64, ARM32 or RV32/RV64"};
+    if (!arm64 && !x86_64 && !arm && !mips32 && !riscv)
+        return Error{ErrorCode::unsupported, "ELF live CFI requires x86-64, AArch64, ARM32, MIPS32 or RV32/RV64"};
     if (arm) pc.offset &= ~UINT64_C(1);
     // The legacy Mach-O bridge decodes fixed CFI operands as little-endian.
     // Do not silently interpret a big-endian AArch64 recipe through that path.
@@ -83,7 +85,9 @@ Result<ElfUnwindResult> evaluate_elf_unwind(const ElfMetadata &metadata, Address
     if (match->cie_instructions.size() > max_cfi_program_bytes ||
         match->instructions.size() > max_cfi_program_bytes - match->cie_instructions.size())
         return Error{ErrorCode::resource_limit, "Combined ELF CIE/FDE program exceeds the 1 MiB evaluation limit"};
-    if (arm || riscv) return evaluate_elf_integer_unwind(metadata, *match, pc, context, read);
+    if (arm || mips32 || riscv)
+        return evaluate_elf_integer_unwind(metadata, *match, pc, context, read,
+            mips32 && mips_mode != ElfMipsInstructionMode::classic);
 
     MachOMetadata bridge;
     MachOSlice slice;

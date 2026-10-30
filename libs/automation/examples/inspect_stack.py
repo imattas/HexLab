@@ -29,7 +29,15 @@ with hexlab.Project.open(sys.argv[1]) as project:
         for index, slot in enumerate(project.iter_stack_slots(entry, page_size=256)):
             print(f"  slot {index}: SP{slot.offset_from_entry_sp:+#x} width={slot.width} "
                   f"read={slot.read} written={slot.written} address_taken={slot.address_taken} "
+                  f"incoming_argument={slot.incoming_argument} "
+                  f"outgoing_call_arguments={slot.outgoing_call_argument_count} "
                   f"sites={slot.access_count}")
+            for call_index, argument in enumerate(
+                    project.iter_stack_slot_call_arguments(entry, index, page_size=256)):
+                if call_index == 16:
+                    print("    ... additional call boundaries omitted")
+                    break
+                print(f"    outgoing {argument.source_kind} {argument.source_instruction} -> call {argument.call_instruction}")
             for site_index, site in enumerate(
                     project.iter_stack_slot_accesses(entry, index, page_size=256)):
                 if site_index == 16:

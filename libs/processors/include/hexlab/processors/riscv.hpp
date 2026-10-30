@@ -75,6 +75,8 @@ enum class RiscvOpcode {
     vwsubu_vv, vwsubu_vx, vwsubu_wv, vwsubu_wx,
     // Zba address-generation operations; appended for stable decoded IDs.
     sh1add, sh2add, sh3add, add_uw, sh1add_uw, sh2add_uw, sh3add_uw, slli_uw,
+    // Zbs single-bit operations; appended for stable decoded IDs.
+    bclr, bext, binv, bset, bclri, bexti, binvi, bseti,
     // RVV non-accumulating widening integer multiply; appended for ID stability.
     vwmulu_vv, vwmulu_vx, vwmulsu_vv, vwmulsu_vx, vwmul_vv, vwmul_vx,
     // RVV base floating-point VV/VF arithmetic, sign, min/max, and compare forms.
@@ -100,7 +102,24 @@ enum class RiscvOpcode {
     // Quiet scalar comparisons; appended to preserve decoder IDs.
     fleq_s, fltq_s, fleq_d, fltq_d,
     // Zifencei instruction-cache synchronization, appended for stable IDs.
-    fence_i
+    fence_i,
+    // Remaining scalar Zbb integer bit-manipulation forms (appended for ID stability).
+    andn, orn, xnor, min, minu, max, maxu, rol, ror, rori,
+    sext_b, sext_h, zext_h, orc_b, rev8, rolw, rorw, roriw,
+    // RVV single-width floating-point reductions; appended for decoder ID stability.
+    vfredusum, vfredosum, vfredmin, vfredmax,
+    // RVV mask-register logical operations, appended for opcode stability.
+    vmand_mm, vmnand_mm, vmandn_mm, vmxor_mm, vmor_mm, vmnor_mm, vmorn_mm, vmxnor_mm,
+    // Zbc scalar carry-less multiply forms; append to preserve decoder IDs.
+    clmul, clmulh, clmulr,
+    // Zicond conditional-zero forms; appended to preserve serialized decoder IDs.
+    czero_eqz, czero_nez,
+    // Ztso FENCE.TSO encoding; appended to preserve serialized decoder IDs.
+    fence_tso,
+    // Zbkb scalar packing operations; append for stable decoded IDs.
+    pack, packh, packw,
+    // RVV mask prefix, index, and reduction-to-GPR forms; preserve IDs above.
+    vcpop_m, vfirst_m, vmsbf_m, vmsof_m, vmsif_m, viota_m, vid_v
 };
 
 struct RiscvRegister {
@@ -153,6 +172,9 @@ struct RiscvInstruction {
     std::optional<std::uint8_t> rounding_mode;
     bool writes_fflags = false;
     bool vector_masked = false;
+    // Number of interleaved vector fields for segmented RVV memory operations.
+    // One is the ordinary single-field form.
+    std::uint8_t vector_segment_fields = 1;
     bool reads_frm = false;
     bool reads_fflags = false;
 };
