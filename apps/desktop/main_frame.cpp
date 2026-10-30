@@ -57,6 +57,7 @@
 #include <wx/aboutdlg.h>
 #include <wx/display.h>
 #include <wx/choice.h>
+#include <wx/checkbox.h>
 #include <wx/choicdlg.h>
 #include <wx/clipbrd.h>
 #include <wx/log.h>
@@ -91,7 +92,9 @@
 #include <cstring>
 #include <functional>
 #include <fstream>
+#include <initializer_list>
 #include <mutex>
+#include <set>
 #include <span>
 #include <sstream>
 #include <stdexcept>
@@ -934,8 +937,16 @@ struct MainFrame::Impl {
     std::map<std::uint64_t, wxString> document_symbol_filters;
     std::vector<std::uint64_t> document_symbol_filter_order;
     wxTextCtrl *import_filter = nullptr, *export_filter = nullptr;
+    wxButton *import_pin_selected = nullptr, *export_pin_selected = nullptr;
+    wxCheckBox *imports_pinned_only = nullptr, *exports_pinned_only = nullptr;
     std::map<std::uint64_t, std::pair<wxString, wxString>> document_import_export_filters;
     std::vector<std::uint64_t> document_import_export_filter_order;
+    struct MetadataPins {
+        std::set<std::string> imports, exports;
+        bool imports_only = false, exports_only = false;
+    };
+    std::map<std::uint64_t, MetadataPins> document_metadata_pins;
+    std::vector<std::uint64_t> document_metadata_pin_order;
     wxStaticText *import_filter_status = nullptr, *export_filter_status = nullptr;
     wxTextCtrl *segment_filter = nullptr;
     wxStaticText *segment_filter_status = nullptr;
@@ -1524,15 +1535,19 @@ struct MainFrame::Impl {
     }
     void render_import_filter(const std::shared_ptr<const DocumentSnapshot> &doc) {
         visible_import_rows.clear();
+        ensure_metadata_pins(doc);
+        const auto pins_it = doc ? document_metadata_pins.find(doc->id.value) : document_metadata_pins.end();
+        const auto *pins = pins_it == document_metadata_pins.end() ? nullptr : &pins_it->second;
         const auto count = doc ? doc->metadata_view().imports.size() : 0;
         auto query_text = import_filter ? import_filter->GetValue() : wxString{};
         query_text.Trim(true).Trim(false);
         const auto query = parse_metadata_query(std::move(query_text));
-        const auto cell = [doc](std::size_t row, int column) {
+        const auto cell = [doc, pins](std::size_t row, int column) {
             if (!doc || row >= doc->metadata_view().imports.size()) return wxString{};
             const auto &item = doc->metadata_view().imports[row];
-            if (column == 0) return location_text(item.iat, doc->image.get());
-            if (column == 1) return text(item.library);
+            if (column == 0) return pins && pins->imports.contains(import_pin_key(item)) ? wxString("*") : wxString{};
+            if (column == 1) return location_text(item.iat, doc->image.get());
+            if (column == 2) return text(item.library);
             if (!item.name) return wxString::Format("ordinal %u", *item.ordinal);
             const auto rendered = hexlab::symbols::demangle_symbol_name(*item.name);
             return text(rendered.status == hexlab::symbols::DemangleStatus::demangled
@@ -1540,11 +1555,14 @@ struct MainFrame::Impl {
         };
         for (std::size_t row = 0; row < count; ++row) {
             const auto &item = doc->metadata_view().imports[row];
+            const auto key = import_pin_key(item);
+            const bool pinned = pins && pins->imports.contains(key);
+            if (pins && pins->imports_only && !pinned) continue;
             const auto ordinal = item.ordinal ? wxString::Format("%u", *item.ordinal) : wxString{};
             std::array<MetadataQueryValue, 5> values{{
-                {MetadataQueryField::address, cell(row, 0)},
-                {MetadataQueryField::library, cell(row, 1)},
-                {MetadataQueryField::name, cell(row, 2)},
+                {MetadataQueryField::address, cell(row, 1)},
+                {MetadataQueryField::library, cell(row, 2)},
+                {MetadataQueryField::name, cell(row, 3)},
                 {MetadataQueryField::name, item.name ? text(*item.name) : wxString{}},
                 {MetadataQueryField::ordinal, ordinal},
             }};
@@ -1566,27 +1584,35 @@ struct MainFrame::Impl {
         }
         index_context_tables(doc);
         select_context_rows(state().selection());
+        update_metadata_pin_controls(doc);
     }
     void render_export_filter(const std::shared_ptr<const DocumentSnapshot> &doc) {
         visible_export_rows.clear();
+        ensure_metadata_pins(doc);
+        const auto pins_it = doc ? document_metadata_pins.find(doc->id.value) : document_metadata_pins.end();
+        const auto *pins = pins_it == document_metadata_pins.end() ? nullptr : &pins_it->second;
         const auto count = doc ? doc->metadata_view().exports.size() : 0;
         auto query_text = export_filter ? export_filter->GetValue() : wxString{};
         query_text.Trim(true).Trim(false);
         const auto query = parse_metadata_query(std::move(query_text));
-        const auto cell = [doc](std::size_t row, int column) {
+        const auto cell = [doc, pins](std::size_t row, int column) {
             if (!doc || row >= doc->metadata_view().exports.size()) return wxString{};
             const auto &item = doc->metadata_view().exports[row];
-            if (column == 0) return item.address ? location_text(*item.address, doc->image.get()) : wxString("forwarded");
-            if (column == 1) return item.name ? text(*item.name) : wxString::Format("ordinal %u", item.ordinal);
+            if (column == 0) return pins && pins->exports.contains(export_pin_key(item)) ? wxString("*") : wxString{};
+            if (column == 1) return item.address ? location_text(*item.address, doc->image.get()) : wxString("forwarded");
+            if (column == 2) return item.name ? text(*item.name) : wxString::Format("ordinal %u", item.ordinal);
             return item.forwarder ? text(*item.forwarder) : wxString{};
         };
         for (std::size_t row = 0; row < count; ++row) {
             const auto &item = doc->metadata_view().exports[row];
+            const auto key = export_pin_key(item);
+            const bool pinned = pins && pins->exports.contains(key);
+            if (pins && pins->exports_only && !pinned) continue;
             std::array<MetadataQueryValue, 4> values{{
-                {MetadataQueryField::address, cell(row, 0)},
-                {MetadataQueryField::name, cell(row, 1)},
+                {MetadataQueryField::address, cell(row, 1)},
+                {MetadataQueryField::name, cell(row, 2)},
                 {MetadataQueryField::ordinal, wxString::Format("%u", item.ordinal)},
-                {MetadataQueryField::forwarder, cell(row, 2)},
+                {MetadataQueryField::forwarder, cell(row, 3)},
             }};
             const bool matches = metadata_query_matches(query, values);
             if (matches) visible_export_rows.push_back(row);
@@ -1608,6 +1634,7 @@ struct MainFrame::Impl {
         }
         index_context_tables(doc);
         select_context_rows(state().selection());
+        update_metadata_pin_controls(doc);
     }
     void render_segment_filter(const std::shared_ptr<const DocumentSnapshot> &doc) {
         visible_segment_rows.clear();
@@ -1810,6 +1837,7 @@ struct MainFrame::Impl {
         strings->synchronize_selection(selection, session_restore_activation_pending);
         if (!shown || !selection || !shown->image) {
             update_metadata_context(selection);
+            update_metadata_pin_controls(shown);
             return;
         }
 
@@ -1866,6 +1894,7 @@ struct MainFrame::Impl {
         select_indexed(bookmarks, bookmark_rows);
         select_indexed(symbols, symbol_rows);
         update_metadata_context(selection);
+        update_metadata_pin_controls(shown);
     }
     void poll_compare() {
         if (!compare_work.thread.joinable()) return;
@@ -2217,6 +2246,209 @@ struct MainFrame::Impl {
         for (const auto byte : document.project->state->uuid)
             identity += wxString::Format("%02x", static_cast<unsigned>(std::to_integer<unsigned char>(byte)));
         return wxString("/Desktop/ProjectImportExportFilters/") + identity;
+    }
+    static std::string metadata_pin_identity(const DocumentSnapshot &document) {
+        if (document.project && document.project->state) {
+            return "project:" + encode_recipe_hex(document.project->state->uuid);
+        }
+        if (const auto *file = dynamic_cast<const FileStorage *>(document.input_storage.get())) {
+            const auto path = file->backing_path().lexically_normal().u8string();
+            if (path.empty() || path.size() > maximum_persisted_path_characters) return {};
+            return "file:" + std::string(reinterpret_cast<const char *>(path.data()), path.size());
+        }
+        return {};
+    }
+    static wxString metadata_pin_config_path(const DocumentSnapshot &document) {
+        const auto identity = metadata_pin_identity(document);
+        if (identity.empty()) return {};
+        Sha256 hash;
+        const auto bytes = std::as_bytes(std::span(identity.data(), identity.size()));
+        if (!hash.update(bytes)) return {};
+        const auto digest = hexlab::digest_hex(hash.digest());
+        return wxString("/Desktop/DocumentMetadataPins/") +
+            wxString::FromUTF8(digest.data(), digest.size());
+    }
+    static bool valid_metadata_pin_key(std::string_view key) {
+        if (key.empty() || key.size() > 128 || key.find(':') == std::string_view::npos) return false;
+        return std::all_of(key.begin(), key.end(), [](unsigned char ch) {
+            return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || ch == ':' || ch == 'i';
+        });
+    }
+    static std::string metadata_pin_record_digest(std::initializer_list<std::string_view> fields) {
+        Sha256 hash;
+        for (const auto field : fields) {
+            const auto size = encode_session_integer(field.size());
+            std::string prefix = size;
+            prefix.push_back(':');
+            if (!hash.update(std::as_bytes(std::span(prefix.data(), prefix.size()))) ||
+                !hash.update(std::as_bytes(std::span(field.data(), field.size()))))
+                return {};
+        }
+        return hexlab::digest_hex(hash.digest());
+    }
+    static void read_metadata_pin_keys(wxString encoded, std::set<std::string> &keys) {
+        if (encoded.length() > 32768) return;
+        const auto bytes = wx_utf8_bytes(encoded);
+        std::size_t begin = 0;
+        while (begin < bytes.size() && keys.size() < 256) {
+            const auto end = bytes.find('\n', begin);
+            const auto stop = end == std::string::npos ? bytes.size() : end;
+            const std::string_view key(bytes.data() + begin, stop - begin);
+            if (valid_metadata_pin_key(key)) keys.emplace(key);
+            if (end == std::string::npos) break;
+            begin = end + 1;
+        }
+    }
+    static wxString write_metadata_pin_keys(const std::set<std::string> &keys) {
+        wxString encoded;
+        std::size_t count = 0;
+        for (const auto &key : keys) {
+            if (count >= 256 || !valid_metadata_pin_key(key)) break;
+            encoded += wxString::FromUTF8(key.data(), key.size()) + "\n";
+            ++count;
+        }
+        return encoded;
+    }
+    void ensure_metadata_pins(const std::shared_ptr<const DocumentSnapshot> &document) {
+        if (!document) return;
+        const auto id = document->id.value;
+        if (document_metadata_pins.contains(id)) return;
+        MetadataPins pins;
+        const auto identity = metadata_pin_identity(*document);
+        const auto path = metadata_pin_config_path(*document);
+        auto *config = wxConfigBase::Get(false);
+        if (!identity.empty() && !path.empty() && config) {
+            const auto previous_path = config->GetPath();
+            config->SetPath(path);
+            wxString stored_identity;
+            if (config->Read("Identity", &stored_identity) &&
+                stored_identity.length() <= maximum_persisted_path_characters + 16 &&
+                wx_utf8_bytes(stored_identity) == identity) {
+                wxString imports, exports;
+                if (config->Read("Imports", &imports)) read_metadata_pin_keys(imports, pins.imports);
+                if (config->Read("Exports", &exports)) read_metadata_pin_keys(exports, pins.exports);
+                config->Read("ImportsPinnedOnly", &pins.imports_only, false);
+                config->Read("ExportsPinnedOnly", &pins.exports_only, false);
+            }
+            config->SetPath(previous_path);
+        }
+        document_metadata_pins.emplace(id, std::move(pins));
+        std::erase(document_metadata_pin_order, id);
+        document_metadata_pin_order.push_back(id);
+        while (document_metadata_pin_order.size() > 32) {
+            document_metadata_pins.erase(document_metadata_pin_order.front());
+            document_metadata_pin_order.erase(document_metadata_pin_order.begin());
+        }
+    }
+    void save_metadata_pins(const std::shared_ptr<const DocumentSnapshot> &document) const {
+        if (!document) return;
+        const auto pins = document_metadata_pins.find(document->id.value);
+        if (pins == document_metadata_pins.end()) return;
+        const auto path = metadata_pin_config_path(*document);
+        const auto identity = metadata_pin_identity(*document);
+        auto *config = wxConfigBase::Get(false);
+        if (path.empty() || identity.empty() || !config) return;
+        const auto previous_path = config->GetPath();
+        config->SetPath(path);
+        config->Write("Identity", wxString::FromUTF8(identity.data(), identity.size()));
+        config->Write("Imports", write_metadata_pin_keys(pins->second.imports));
+        config->Write("Exports", write_metadata_pin_keys(pins->second.exports));
+        config->Write("ImportsPinnedOnly", pins->second.imports_only);
+        config->Write("ExportsPinnedOnly", pins->second.exports_only);
+        config->SetPath(previous_path);
+    }
+    static std::string import_pin_key(const ImportSymbol &item) {
+        const auto address = encode_session_integer(item.iat.space.value) + ":" + encode_session_integer(item.iat.offset);
+        const auto ordinal = item.ordinal ? encode_session_integer(*item.ordinal) : std::string{};
+        const auto name = item.name.value_or(std::string{});
+        const auto hash = metadata_pin_record_digest({item.library, name, ordinal, item.delay_load ? "delay" : "normal"});
+        return hash.empty() ? std::string{} : "i:" + address + ":" + hash;
+    }
+    static std::string export_pin_key(const ExportSymbol &item) {
+        const auto ordinal = encode_session_integer(item.ordinal);
+        const auto name = item.name.value_or(std::string{});
+        const auto forwarder = item.forwarder.value_or(std::string{});
+        const auto hash = metadata_pin_record_digest({name, forwarder});
+        if (hash.empty()) return {};
+        if (item.address)
+            return "e:" + encode_session_integer(item.address->space.value) + ":" +
+                encode_session_integer(item.address->offset) + ":" + ordinal + ":" + hash;
+        return "f:" + ordinal + ":" + hash;
+    }
+    void update_metadata_pin_controls(const std::shared_ptr<const DocumentSnapshot> &document) {
+        ensure_metadata_pins(document);
+        const auto found = document ? document_metadata_pins.find(document->id.value) : document_metadata_pins.end();
+        const auto *pins = found == document_metadata_pins.end() ? nullptr : &found->second;
+        const auto update_button = [&](wxButton *button, VirtualTable *table,
+                                       const std::vector<std::size_t> &visible_rows, bool imports) {
+            if (!button) return;
+            const auto selected = table ? table->selected_row() : std::nullopt;
+            if (!document || !pins || !selected || *selected >= visible_rows.size()) {
+                button->SetLabel(imports ? "Pin selected import" : "Pin selected export");
+                button->Enable(false);
+                return;
+            }
+            const auto source_row = visible_rows[*selected];
+            const auto &metadata = document->metadata_view();
+            std::string key;
+            bool pinned = false;
+            if (imports && source_row < metadata.imports.size()) {
+                key = import_pin_key(metadata.imports[source_row]);
+                pinned = pins->imports.contains(key);
+            } else if (!imports && source_row < metadata.exports.size()) {
+                key = export_pin_key(metadata.exports[source_row]);
+                pinned = pins->exports.contains(key);
+            }
+            if (key.empty()) {
+                button->SetLabel(imports ? "Pin selected import" : "Pin selected export");
+                button->Enable(false);
+                return;
+            }
+            button->SetLabel(pinned ? (imports ? "Unpin selected import" : "Unpin selected export")
+                                    : (imports ? "Pin selected import" : "Pin selected export"));
+            button->Enable(true);
+        };
+        update_button(import_pin_selected, imports, visible_import_rows, true);
+        update_button(export_pin_selected, exports, visible_export_rows, false);
+        if (imports_pinned_only) {
+            imports_pinned_only->Enable(document && pins);
+            imports_pinned_only->SetValue(document && pins ? pins->imports_only : false);
+        }
+        if (exports_pinned_only) {
+            exports_pinned_only->Enable(document && pins);
+            exports_pinned_only->SetValue(document && pins ? pins->exports_only : false);
+        }
+    }
+    void toggle_metadata_pin(bool imports_table) {
+        if (!shown) return;
+        ensure_metadata_pins(shown);
+        auto found = document_metadata_pins.find(shown->id.value);
+        if (found == document_metadata_pins.end()) return;
+        auto *table = imports_table ? imports : exports;
+        const auto &visible = imports_table ? visible_import_rows : visible_export_rows;
+        const auto selected = table ? table->selected_row() : std::nullopt;
+        if (!selected || *selected >= visible.size()) {
+            log("Select an import or export row before pinning it.");
+            return;
+        }
+        const auto source_row = visible[*selected];
+        const auto &metadata = shown->metadata_view();
+        if (imports_table && source_row >= metadata.imports.size()) return;
+        if (!imports_table && source_row >= metadata.exports.size()) return;
+        auto &keys = imports_table ? found->second.imports : found->second.exports;
+        const auto key = imports_table ? import_pin_key(metadata.imports[source_row])
+                                       : export_pin_key(metadata.exports[source_row]);
+        if (keys.contains(key)) {
+            keys.erase(key);
+        } else if (keys.size() >= 256) {
+            log("This document already has the maximum of 256 pinned rows for this table.");
+            return;
+        } else {
+            keys.insert(key);
+        }
+        save_metadata_pins(shown);
+        if (imports_table) render_import_filter(shown);
+        else render_export_filter(shown);
     }
     static wxString project_symbol_filter_config_path(const DocumentSnapshot &document) {
         if (!document.project || !document.project->state) return {};
@@ -3218,6 +3450,7 @@ struct MainFrame::Impl {
             show_macho_objc_placeholder();
             index_context_tables({});
             update_metadata_context({});
+            update_metadata_pin_controls({});
             if (pe_view) pe_view->set_document({});
             if (minidump_view) minidump_view->set_document({});
             return;
@@ -4575,7 +4808,16 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
     ui.import_filter->SetMaxLength(2048);
     ui.import_filter->SetHint("Filter imports: lib:value name:value ordinal:value address:value");
     ui.import_filter_status = new wxStaticText(imports_panel, wxID_ANY, "0 of 0 imports");
-    ui.imports = new VirtualTable(imports_panel, "imports", {"IAT", "Library", "Name / ordinal"});
+    ui.imports = new VirtualTable(imports_panel, "imports", {"Pin", "IAT", "Library", "Name / ordinal"});
+    auto *import_pin_actions = new wxBoxSizer(wxHORIZONTAL);
+    ui.import_pin_selected = new wxButton(imports_panel, wxID_ANY, "Pin selected import");
+    ui.import_pin_selected->SetName("import-pin-selected");
+    ui.import_pin_selected->SetToolTip("Pin or unpin the selected import for this project or open document. Each table is limited to 256 pins.");
+    ui.import_pin_selected->Enable(false);
+    ui.imports_pinned_only = new wxCheckBox(imports_panel, wxID_ANY, "Show pinned only");
+    ui.imports_pinned_only->SetName("imports-pinned-only");
+    import_pin_actions->Add(ui.import_pin_selected, 0, wxRIGHT, FromDIP(8));
+    import_pin_actions->Add(ui.imports_pinned_only, 0, wxALIGN_CENTER_VERTICAL);
     ui.import_context = new MetadataContextBar(imports_panel, "import-context", true);
     ui.import_context->navigate = metadata_context_navigate;
     ui.import_context->reveal = [this](std::shared_ptr<const DocumentSnapshot> document, Location cursor) {
@@ -4589,6 +4831,7 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
     imports_layout->Add(ui.import_context, 0, wxEXPAND);
     imports_layout->Add(ui.import_filter, 0, wxEXPAND | wxALL, FromDIP(4));
     imports_layout->Add(ui.import_filter_status, 0, wxLEFT | wxRIGHT | wxBOTTOM, FromDIP(4));
+    imports_layout->Add(import_pin_actions, 0, wxLEFT | wxRIGHT | wxBOTTOM, FromDIP(4));
     imports_layout->Add(ui.imports, 1, wxEXPAND);
     imports_panel->SetSizer(imports_layout);
     auto *exports_panel = new wxPanel(metadata);
@@ -4598,7 +4841,16 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
     ui.export_filter->SetMaxLength(2048);
     ui.export_filter->SetHint("Filter exports: name:value ordinal:value address:value forwarder:value");
     ui.export_filter_status = new wxStaticText(exports_panel, wxID_ANY, "0 of 0 exports");
-    ui.exports = new VirtualTable(exports_panel, "exports", {"Address", "Name", "Forwarder"});
+    ui.exports = new VirtualTable(exports_panel, "exports", {"Pin", "Address", "Name", "Forwarder"});
+    auto *export_pin_actions = new wxBoxSizer(wxHORIZONTAL);
+    ui.export_pin_selected = new wxButton(exports_panel, wxID_ANY, "Pin selected export");
+    ui.export_pin_selected->SetName("export-pin-selected");
+    ui.export_pin_selected->SetToolTip("Pin or unpin the selected export for this project or open document. Each table is limited to 256 pins.");
+    ui.export_pin_selected->Enable(false);
+    ui.exports_pinned_only = new wxCheckBox(exports_panel, wxID_ANY, "Show pinned only");
+    ui.exports_pinned_only->SetName("exports-pinned-only");
+    export_pin_actions->Add(ui.export_pin_selected, 0, wxRIGHT, FromDIP(8));
+    export_pin_actions->Add(ui.exports_pinned_only, 0, wxALIGN_CENTER_VERTICAL);
     ui.export_context = new MetadataContextBar(exports_panel, "export-context", true);
     ui.export_context->navigate = metadata_context_navigate;
     ui.export_context->reveal = [this](std::shared_ptr<const DocumentSnapshot> document, Location cursor) {
@@ -4612,6 +4864,7 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
     exports_layout->Add(ui.export_context, 0, wxEXPAND);
     exports_layout->Add(ui.export_filter, 0, wxEXPAND | wxALL, FromDIP(4));
     exports_layout->Add(ui.export_filter_status, 0, wxLEFT | wxRIGHT | wxBOTTOM, FromDIP(4));
+    exports_layout->Add(export_pin_actions, 0, wxLEFT | wxRIGHT | wxBOTTOM, FromDIP(4));
     exports_layout->Add(ui.exports, 1, wxEXPAND);
     exports_panel->SetSizer(exports_layout);
     ui.elf_programs = new VirtualTable(metadata, "elf-programs", {"Header / program", "File", "Address", "Details"});
@@ -5222,10 +5475,15 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
                                       .BestSize(FromDIP(wxSize(520, 360)))
                                       .MinSize(FromDIP(wxSize(300, 180)))
                                       .Hide());
-    for (auto *table : {ui.segments, ui.imports, ui.exports})
-        table->SetColumnWidth(0, FromDIP(140));
-    ui.imports->SetColumnWidth(1, FromDIP(110));
-    ui.imports->SetColumnWidth(2, FromDIP(140));
+    ui.segments->SetColumnWidth(0, FromDIP(140));
+    ui.imports->SetColumnWidth(0, FromDIP(48));
+    ui.imports->SetColumnWidth(1, FromDIP(140));
+    ui.imports->SetColumnWidth(2, FromDIP(160));
+    ui.imports->SetColumnWidth(3, FromDIP(220));
+    ui.exports->SetColumnWidth(0, FromDIP(48));
+    ui.exports->SetColumnWidth(1, FromDIP(140));
+    ui.exports->SetColumnWidth(2, FromDIP(220));
+    ui.exports->SetColumnWidth(3, FromDIP(220));
     ui.output = new wxTextCtrl(this, wxID_ANY, "HexLab workspace ready.\n", wxDefaultPosition, wxDefaultSize,
                                wxTE_MULTILINE | wxTE_READONLY | wxTE_DONTWRAP);
     ui.output->SetName("Output log pane");
@@ -5348,6 +5606,30 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
     });
     ui.export_filter->Bind(wxEVT_TEXT, [this](wxCommandEvent &) {
         impl_->save_project_import_export_filters(impl_->shown);
+        impl_->render_export_filter(impl_->shown);
+    });
+    ui.import_pin_selected->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) {
+        impl_->toggle_metadata_pin(true);
+    });
+    ui.export_pin_selected->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) {
+        impl_->toggle_metadata_pin(false);
+    });
+    ui.imports_pinned_only->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent &) {
+        if (!impl_->shown) return;
+        impl_->ensure_metadata_pins(impl_->shown);
+        auto found = impl_->document_metadata_pins.find(impl_->shown->id.value);
+        if (found == impl_->document_metadata_pins.end()) return;
+        found->second.imports_only = impl_->imports_pinned_only->GetValue();
+        impl_->save_metadata_pins(impl_->shown);
+        impl_->render_import_filter(impl_->shown);
+    });
+    ui.exports_pinned_only->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent &) {
+        if (!impl_->shown) return;
+        impl_->ensure_metadata_pins(impl_->shown);
+        auto found = impl_->document_metadata_pins.find(impl_->shown->id.value);
+        if (found == impl_->document_metadata_pins.end()) return;
+        found->second.exports_only = impl_->exports_pinned_only->GetValue();
+        impl_->save_metadata_pins(impl_->shown);
         impl_->render_export_filter(impl_->shown);
     });
     ui.segment_filter->Bind(wxEVT_TEXT, [this](wxCommandEvent &) {

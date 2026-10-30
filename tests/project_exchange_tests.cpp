@@ -37,7 +37,11 @@ void roundtrip() {
     check(encoded_again && encoded_again.value() == encoded.value(), "exchange encoding is deterministic");
     check(encoded.value().size() >= 60 && encoded.value()[0] == std::byte{'H'} && encoded.value()[3] == std::byte{'X'},
           "exchange has fixed magic and versioned header");
-    auto legacy_v3=encoded.value();legacy_v3[4]=std::byte{3};
+    auto legacy_v3=encoded.value();
+    // Versions 6-9 append three count fields after the v3 header's seven
+    // counts. Remove those header fields before changing the version marker.
+    legacy_v3.erase(legacy_v3.begin() + 76, legacy_v3.begin() + 88);
+    legacy_v3[4]=std::byte{3};
     auto legacy_import=import_project_exchange(source,legacy_v3,ExchangeConflictPolicy::replace);
     check(legacy_import&&legacy_import.value().commands.empty(),"v3 type-exchange payloads without provenance remain importable");
     auto empty_state = std::make_shared<database::ProjectState>(*source.state);
@@ -221,7 +225,8 @@ void portable_type_graph_roundtrip() {
           "round trip plans one atomic type graph command");
     if (!imported || imported.value().commands.size() != 1) return;
     auto graph = std::get_if<ImportPortableTypes>(&imported.value().commands[0]);
-    check(graph && graph->definitions.size() == 1 && graph->assignments.size() == 1 && graph->assignments[0].location == Address{{0}, 0x5004} &&
+    check(graph && graph->definitions.size() == 1 && graph->assignments.size() == 1 &&
+              graph->assignments[0].location == Location{Address{{0}, 0x5004}} &&
               graph->definitions[0].origin==source_user->types[0].origin,
           "portable type assignment rebases and preserves the named type DIE origin");
     auto delta = validate_command(target, imported.value().commands[0]);

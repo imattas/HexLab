@@ -1003,6 +1003,11 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
         bool true_edge_is_null;
         bool operator==(const NullBranchPredicate &) const = default;
     };
+    struct NullnessStackFact {
+        ReferenceNullness reference = ReferenceNullness::unknown;
+        std::optional<std::size_t> origin;
+        std::optional<bool> integer_nonzero;
+    };
     std::vector<std::optional<NullBranchPredicate>> branch_predicate_entries(starts.size());
     std::vector<bool> branch_predicate_seen(starts.size());
     const auto global_count = metadata ? metadata->globals.size() : 0;
@@ -1047,6 +1052,25 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
             // br_if/if without pretending that arbitrary stack expressions
             // have stable identity.
             std::optional<std::size_t> top_reference_origin;
+            // Keep a small abstract operand stack for the reference/nullness
+            // operations whose effects are modeled below. At block entry,
+            // stack values arrive through predecessor phis, so their facts
+            // are unknown until a local or constant establishes one.
+            std::vector<NullnessStackFact> stack_facts(entries[bi]->size());
+            bool stack_facts_valid = true;
+            const auto push_stack_fact = [&](NullnessStackFact fact) {
+                if (stack_facts_valid) stack_facts.push_back(std::move(fact));
+            };
+            const auto pop_stack_fact = [&]() -> std::optional<NullnessStackFact> {
+                if (!stack_facts_valid || stack_facts.empty()) return {};
+                auto fact = stack_facts.back();
+                stack_facts.pop_back();
+                return fact;
+            };
+            const auto invalidate_stack_facts = [&]() {
+                stack_facts_valid = false;
+                stack_facts.clear();
+            };
             const auto begin = starts[bi];
             const auto finish = bi + 1 < starts.size() ? starts[bi + 1] : code.size();
             for (std::size_t n = begin; n < finish; ++n) {
@@ -1061,9 +1085,11 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
                 if (op == 0xd0) {
                     top = ReferenceNullness::null_value;
                     top_reference_origin.reset();
+                    push_stack_fact({ReferenceNullness::null_value, {}, {}});
                 } else if (op == 0xd2) {
                     top = ReferenceNullness::non_null;
                     top_reference_origin.reset();
+                    push_stack_fact({ReferenceNullness::non_null, {}, {}});
                 } else if (op == 0x20 || op == 0x21 || op == 0x22) {
                     const auto index = immediate(instruction);
                     const auto type = index ? local_type(*index) : std::optional<ValueType>{};
@@ -1079,9 +1105,12 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
                             top_reference_origin = static_cast<std::size_t>(*index);
                         else
                             top_reference_origin.reset();
+                        push_stack_fact({top, top_reference_origin, {}});
                     } else {
+                        const auto assigned_fact = pop_stack_fact();
                         if (type->kind == TypeKind::pointer)
-                            locals[static_cast<std::size_t>(*index)] = top;
+                            locals[static_cast<std::size_t>(*index)] = assigned_fact
+                                ? assigned_fact->reference : top;
                         else
                             locals[static_cast<std::size_t>(*index)] = ReferenceNullness::unknown;
                         if (op == 0x21) {
@@ -1089,6 +1118,12 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
                             top_reference_origin.reset();
                         } else if (type->kind == TypeKind::pointer) {
                             top_reference_origin = static_cast<std::size_t>(*index);
+                            if (assigned_fact) {
+                                auto tee_fact = *assigned_fact;
+                                tee_fact.origin = top_reference_origin;
+                                tee_fact.reference = locals[static_cast<std::size_t>(*index)];
+                                push_stack_fact(std::move(tee_fact));
+                            }
                         }
                     }
                 } else if (op == 0x23 || op == 0x24) {
@@ -1103,35 +1138,84 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
                     if (global.value_type != 0x70 && global.value_type != 0x6f) {
                         top = ReferenceNullness::unknown;
                         top_reference_origin.reset();
+                        if (op == 0x23) push_stack_fact({});
+                        else if (!pop_stack_fact()) invalidate_stack_facts();
                     } else if (op == 0x23) {
                         const auto slot = local_types.size() + global_index;
                         top = locals[slot];
                         top_reference_origin = slot;
+                        push_stack_fact({top, top_reference_origin, {}});
                     } else {
+                        const auto assigned_fact = pop_stack_fact();
                         if (global.mutable_value)
-                            locals[local_types.size() + global_index] = top;
+                            locals[local_types.size() + global_index] = assigned_fact
+                                ? assigned_fact->reference : top;
                         top = ReferenceNullness::unknown;
                         top_reference_origin.reset();
                     }
                 } else if (op == 0xd1) {
-                    ref_is_null_input[n] = top;
-                    if (top_reference_origin)
-                        branch_predicate = NullBranchPredicate{*top_reference_origin, true};
+                    const auto tested_fact = pop_stack_fact();
+                    ref_is_null_input[n] = tested_fact ? tested_fact->reference : top;
+                    const auto origin = tested_fact ? tested_fact->origin : top_reference_origin;
+                    if (origin)
+                        branch_predicate = NullBranchPredicate{*origin, true};
                     else
                         branch_predicate.reset();
+                    const auto known = ref_is_null_input[n];
+                    push_stack_fact({ReferenceNullness::unknown, {},
+                        known == ReferenceNullness::null_value ? std::optional<bool>{true}
+                      : known == ReferenceNullness::non_null ? std::optional<bool>{false}
+                                                             : std::optional<bool>{}});
                     top = ReferenceNullness::unknown;
                     top_reference_origin.reset();
                 } else if (op == 0x45) {
+                    auto tested_fact = pop_stack_fact();
                     // i32.eqz reverses a directly produced ref.is_null result:
                     // the true edge now means the reference is non-null.
                     if (branch_predicate)
                         branch_predicate->true_edge_is_null = !branch_predicate->true_edge_is_null;
+                    if (tested_fact && tested_fact->integer_nonzero)
+                        tested_fact->integer_nonzero = !*tested_fact->integer_nonzero;
+                    push_stack_fact({ReferenceNullness::unknown, {},
+                        tested_fact ? tested_fact->integer_nonzero : std::optional<bool>{}});
+                    top = ReferenceNullness::unknown;
+                    top_reference_origin.reset();
+                } else if (op == 0x41) {
+                    const auto value = immediate(instruction);
+                    push_stack_fact({ReferenceNullness::unknown, {},
+                        value ? std::optional<bool>{*value != 0} : std::optional<bool>{}});
+                    top = ReferenceNullness::unknown;
+                    top_reference_origin.reset();
+                } else if (op == 0x1b || op == 0x1c) {
+                    const auto condition = pop_stack_fact();
+                    const auto when_true = pop_stack_fact();
+                    const auto when_false = pop_stack_fact();
+                    if (condition && when_true && when_false) {
+                        NullnessStackFact selected;
+                        if (condition->integer_nonzero)
+                            selected = *condition->integer_nonzero ? *when_true : *when_false;
+                        else if (when_true->reference == when_false->reference)
+                            selected.reference = when_true->reference;
+                        if (when_true->origin == when_false->origin)
+                            selected.origin = when_true->origin;
+                        push_stack_fact(selected);
+                        top = selected.reference;
+                        top_reference_origin = selected.origin;
+                    } else {
+                        invalidate_stack_facts();
+                        top = ReferenceNullness::unknown;
+                        top_reference_origin.reset();
+                    }
+                } else if (op == 0x1a) {
+                    if (!pop_stack_fact()) invalidate_stack_facts();
                     top = ReferenceNullness::unknown;
                     top_reference_origin.reset();
                 } else if (op == 0x0d || op == 0x04) {
                     // The condition is consumed here. Keep only the narrow
                     // ref.is_null provenance for the edge transfer below.
+                    if (!pop_stack_fact()) invalidate_stack_facts();
                 } else if (op != 0x01) {
+                    invalidate_stack_facts();
                     if (op == 0x10 || op == 0x11) {
                         // Calls can mutate any mutable global through direct,
                         // imported, or table-dispatched code.

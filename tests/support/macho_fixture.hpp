@@ -88,6 +88,10 @@ inline std::vector<std::byte> mapped(bool wide, bool big = false, bool object = 
     auto data = thin(wide, big);
     data.resize(1024);
     const auto header = wide ? 32u : 28u;
+    // thin() deliberately uses a nonzero reserved field for header-validation
+    // tests. Mapped-image fixtures represent valid inputs and clear it.
+    if (wide)
+        put(data, 28, 0, 4, big);
     const auto extent = (wide ? 72 : 56) + 3 * (wide ? 80 : 68);
     put(data, 12, object ? 1 : 2, 4, big);
     put(data, 16, 1, 4, big);
