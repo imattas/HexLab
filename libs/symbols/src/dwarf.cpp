@@ -860,7 +860,8 @@ hexlab::Result<ImportResult> import_dwarf(const DwarfSections&sections){
     for(const auto context_index:resolution_order){
         if(canceled())return hexlab::Error{hexlab::ErrorCode::canceled,"DWARF import canceled"};
         auto&context=contexts[context_index];
-        const auto unit_offset=context.offset,unit_end=static_cast<std::size_t>(context.end);
+        const auto unit_offset=context.offset;
+        const auto unit_end=static_cast<std::size_t>(context.end);
         const auto as_value=context.address_size;
         const auto version_value=context.version;const auto type_die_offset=context.type_die_offset;
         const auto type_signature=context.type_signature;
