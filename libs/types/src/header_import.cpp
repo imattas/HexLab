@@ -187,13 +187,14 @@ std::uint64_t integer_token_magnitude(std::string text, std::uint64_t limit) {
 class IntegerExpressionParser {
 public:
     using NameResolver = std::function<std::optional<std::int64_t>(std::string_view)>;
+    using TypeQuery = std::function<std::int64_t(const std::vector<Token> &, bool)>;
 
     IntegerExpressionParser(const std::vector<Token> &tokens,
                             const std::map<std::string, std::uint64_t, std::less<>> &bindings,
                             std::uint16_t max_nesting,
                             const std::map<std::string, std::vector<TemplateArgument>, std::less<>> &packs,
-                            NameResolver name_resolver = {})
-        : tokens_(tokens), max_nesting_(max_nesting), name_resolver_(std::move(name_resolver)) {
+                            NameResolver name_resolver = {}, TypeQuery type_query = {})
+        : tokens_(tokens), max_nesting_(max_nesting), name_resolver_(std::move(name_resolver)), type_query_(std::move(type_query)) {
         for (const auto &[name, value] : bindings) {
             if (value > static_cast<std::uint64_t>(INT64_MAX))
                 fail(ErrorCode::overflow, "bound integer exceeds the signed expression range");
@@ -207,9 +208,9 @@ public:
                             const std::map<std::string, std::int64_t, std::less<>> &bindings,
                             std::uint16_t max_nesting,
                             const std::map<std::string, std::vector<TemplateArgument>, std::less<>> &packs,
-                            NameResolver name_resolver = {})
+                            NameResolver name_resolver = {}, TypeQuery type_query = {})
         : tokens_(tokens), bindings_(bindings), max_nesting_(max_nesting),
-          name_resolver_(std::move(name_resolver)) {
+          name_resolver_(std::move(name_resolver)), type_query_(std::move(type_query)) {
         for (const auto &[name, arguments] : packs)
             pack_sizes_.emplace(name, static_cast<std::int64_t>(arguments.size()));
     }
@@ -295,9 +296,11 @@ private:
         }
         if (done()) fail(ErrorCode::malformed, "missing operand in integer constant expression");
         auto token = tokens_[position_++].text;
-        if (token == "sizeof") {
-            if (!take("(") || !take("..."))
-                fail(ErrorCode::unsupported, "only sizeof...(Pack) is supported in integer constant expressions");
+        if (token == "sizeof" || token == "alignof" || token == "_Alignof") {
+            const bool alignment = token != "sizeof";
+            if (!take("("))
+                fail(ErrorCode::unsupported, "sizeof and alignof require a parenthesized type-id in integer constant expressions");
+            if (token == "sizeof" && take("...")) {
             if (done() || !ident_start(tokens_[position_].text.front()) ||
                 !std::all_of(tokens_[position_].text.begin(), tokens_[position_].text.end(), ident_continue))
                 fail(ErrorCode::malformed, "sizeof... requires a template parameter pack name");
@@ -307,6 +310,25 @@ private:
             if (pack == pack_sizes_.end())
                 fail(ErrorCode::unsupported, "sizeof... refers to an unbound template parameter pack: '" + name + "'");
             return evaluate ? pack->second : 0;
+            }
+            std::vector<Token> type_tokens;
+            unsigned parens = 0, brackets = 0;
+            while (!done()) {
+                if (peek() == ")" && !parens && !brackets) break;
+                const auto text = peek();
+                if (text == "(") ++parens;
+                else if (text == ")") { if (!parens) fail(ErrorCode::malformed, "unbalanced type-id in sizeof/alignof"); --parens; }
+                else if (text == "[") ++brackets;
+                else if (text == "]") { if (!brackets) fail(ErrorCode::malformed, "unbalanced type-id in sizeof/alignof"); --brackets; }
+                type_tokens.push_back(tokens_[position_++]);
+                if (type_tokens.size() > max_tokens) fail(ErrorCode::resource_limit, "sizeof/alignof type-id exceeds its token limit");
+            }
+            if (!take(")")) fail(ErrorCode::malformed, "unclosed sizeof/alignof type-id");
+            if (type_tokens.empty()) fail(ErrorCode::malformed, "sizeof/alignof type-id is empty");
+            if (!type_query_) fail(ErrorCode::unsupported, "type-form sizeof/alignof is unavailable in this integer expression");
+            const auto result = type_query_(type_tokens, alignment);
+            if (result < 0) fail(ErrorCode::overflow, "sizeof/alignof result exceeds the signed expression range");
+            return evaluate ? result : 0;
         }
         if (token == "true") return evaluate ? 1 : 0;
         if (token == "false") return 0;
@@ -401,6 +423,7 @@ private:
     const std::vector<Token> &tokens_;
     std::map<std::string, std::int64_t, std::less<>> bindings_;
     NameResolver name_resolver_;
+    TypeQuery type_query_;
     std::map<std::string, std::int64_t, std::less<>> pack_sizes_;
     std::uint16_t max_nesting_;
     std::size_t position_ = 0;
@@ -2375,8 +2398,6 @@ private:
         if(!take("{")){
             if(packed||requested_alignment)fail(ErrorCode::unsupported,"layout attributes on forward aggregate references are unsupported");
             auto existing=names_.find(key);
-            if(!aggregate_scopes_.empty()&&existing==names_.end())
-                fail(ErrorCode::unsupported,"new nested aggregate declarations are unsupported");
             if(existing!=names_.end()&&existing->second->size())return existing->second;
             if(existing==names_.end()) {
                 auto incomplete=Type::incomplete_aggregate(is_union?Kind::union_type:Kind::structure,tag);
@@ -2789,17 +2810,48 @@ private:
             fail(ErrorCode::malformed, "empty bitfield width expression");
         return expression;
     }
+    std::int64_t query_type_extent(const std::vector<Token> &tokens, bool alignment) {
+        Parser nested(tokens_with_eof(tokens), o_, *this);
+        nested.template_type_bindings_ = template_type_bindings_;
+        nested.template_value_bindings_ = template_value_bindings_;
+        nested.template_template_bindings_ = template_template_bindings_;
+        nested.template_pack_bindings_ = template_pack_bindings_;
+        auto base = nested.parse_base();
+        if (base.is_typedef || base.is_static)
+            fail(ErrorCode::malformed, "storage specifier is invalid in sizeof/alignof type-id");
+        auto declaration = nested.parse_declarator(base.type, true);
+        if (!declaration.name.empty()) fail(ErrorCode::malformed, "sizeof/alignof requires an abstract type-id");
+        declaration.type = nested.apply_pending_function_convention(std::move(declaration.type));
+        if (!nested.at("<eof>")) fail(ErrorCode::malformed, "unexpected token after sizeof/alignof type-id");
+        auto type = declaration.type;
+        if (type->kind() == Kind::named_reference) {
+            auto resolved = lookup_type(type->name());
+            if (!resolved) fail(ErrorCode::unsupported, "sizeof/alignof refers to an unresolved named type: '" + type->name() + "'");
+            type = std::move(resolved);
+        }
+        const auto size = alignment ? std::optional<std::uint64_t>(type->alignment()) : type->size();
+        if (!size || !*size) fail(ErrorCode::unsupported, "sizeof/alignof requires a complete object type");
+        if (*size > static_cast<std::uint64_t>(INT64_MAX))
+            fail(ErrorCode::overflow, "sizeof/alignof result exceeds the signed expression range");
+        return static_cast<std::int64_t>(*size);
+    }
     std::int64_t evaluate_integer_expression(
         const std::vector<Token> &expression,
-        const std::map<std::string, std::uint64_t, std::less<>> &bindings) const {
-        return IntegerExpressionParser(expression, bindings, o_.max_nesting, template_pack_bindings_).parse();
+        const std::map<std::string, std::uint64_t, std::less<>> &bindings) {
+        const auto type_query = [this](const std::vector<Token> &tokens, bool alignment) {
+            return query_type_extent(tokens, alignment);
+        };
+        return IntegerExpressionParser(expression, bindings, o_.max_nesting, template_pack_bindings_, {}, type_query).parse();
     }
     std::int64_t evaluate_integer_expression(
         const std::vector<Token> &expression,
         const std::map<std::string, std::int64_t, std::less<>> &bindings,
-        IntegerExpressionParser::NameResolver name_resolver = {}) const {
+        IntegerExpressionParser::NameResolver name_resolver = {}) {
+        const auto type_query = [this](const std::vector<Token> &tokens, bool alignment) {
+            return query_type_extent(tokens, alignment);
+        };
         return IntegerExpressionParser(expression, bindings, o_.max_nesting, template_pack_bindings_,
-                                       std::move(name_resolver)).parse();
+                                       std::move(name_resolver), type_query).parse();
     }
     std::optional<std::int64_t> resolve_enum_expression_name(
         std::string_view spelling,
@@ -3011,7 +3063,24 @@ private:
         }
         for(auto it=pointer_qualifiers.rbegin();it!=pointer_qualifiers.rend();++it){Derived pointer{Derived::Kind::pointer};pointer.qualifiers=*it;derived.push_back(std::move(pointer));}
         for(auto it=derived.rbegin();it!=derived.rend();++it){
-            if(it->kind==Derived::Kind::pointer){auto p=Type::pointer(base,o_.pointer_bytes,o_.pointer_bytes);if(!p)fail(p.error().code,p.error().message);base=p.value();if(it->qualifiers){auto qualified=Type::qualified(base,it->qualifiers);if(!qualified)fail(qualified.error().code,qualified.error().message);base=qualified.value();}}
+            if(it->kind==Derived::Kind::pointer){
+                // Keep aggregate pointees symbolic even when their definition
+                // is already available. This gives both sides of a mutually
+                // recursive pointer graph the same representation and avoids
+                // embedding a full owning aggregate in one side of the graph.
+                auto pointee=base;
+                const auto *aggregate=unqualified(pointee.get());
+                if(aggregate&&(aggregate->kind()==Kind::structure||aggregate->kind()==Kind::union_type)){
+                    auto reference=Type::named_reference(std::string(aggregate->kind()==Kind::union_type?"union ":"struct ")+aggregate->name());
+                    if(!reference)fail(reference.error().code,reference.error().message);
+                    pointee=reference.value();
+                    if(base->kind()==Kind::qualified){
+                        auto qualified=Type::qualified(pointee,base->qualifiers());
+                        if(!qualified)fail(qualified.error().code,qualified.error().message);
+                        pointee=qualified.value();
+                    }
+                }
+                auto p=Type::pointer(std::move(pointee),o_.pointer_bytes,o_.pointer_bytes);if(!p)fail(p.error().code,p.error().message);base=p.value();if(it->qualifiers){auto qualified=Type::qualified(base,it->qualifiers);if(!qualified)fail(qualified.error().code,qualified.error().message);base=qualified.value();}}
             else if(it->kind==Derived::Kind::array){if(base->kind()==Kind::function)fail(ErrorCode::unsupported,"arrays of functions are invalid");auto p=Type::array(base,it->count);if(!p)fail(p.error().code,p.error().message);base=p.value();}
             else {if(base->kind()==Kind::array||base->kind()==Kind::function)fail(ErrorCode::unsupported,"functions cannot return arrays or functions");auto p=Type::function(base,it->parameters,it->variadic,it->convention);if(!p)fail(p.error().code,p.error().message);base=p.value();}
         }
@@ -3045,8 +3114,11 @@ private:
         const auto resolver = [&](std::string_view name) {
             return resolve_enum_expression_name(name, enum_value_bindings_);
         };
+        const auto type_query = [this](const std::vector<Token> &tokens, bool alignment) {
+            return query_type_extent(tokens, alignment);
+        };
         const auto value = IntegerExpressionParser(expression, template_value_bindings_,
-            o_.max_nesting, template_pack_bindings_, resolver).parse();
+            o_.max_nesting, template_pack_bindings_, resolver, type_query).parse();
         std::string message;
         if (take(",")) {
             bool found_literal = false;
