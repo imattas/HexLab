@@ -716,10 +716,10 @@ public:
                 const auto name_result = thread_info(thread, THREAD_EXTENDED_INFO,
                     reinterpret_cast<thread_info_t>(&extended), &extended_count);
                 if (name_result == KERN_SUCCESS) {
-                    const auto *name_end = std::find(extended.pth_name,
+                    const auto name_end = std::find(extended.pth_name,
                         extended.pth_name + sizeof(extended.pth_name), '\0');
                     if (name_end != extended.pth_name)
-                        name.assign(extended.pth_name, name_end);
+                        name.assign(extended.pth_name, static_cast<std::size_t>(name_end - extended.pth_name));
                 }
                 ThreadState state = ThreadState::unknown;
                 if (stopped_ && task_suspended_) {
@@ -1286,6 +1286,11 @@ private:
         mach_port_deallocate(mach_task_self(), port.value());
         return kr == KERN_SUCCESS ? Status{std::monostate{}} : Status{mach_error("thread_set_state x86_DEBUG_STATE64", kr)};
     }
+#else
+    Status update_watchpoint_state(const WatchpointRecord&, bool) {
+        return unsupported("Darwin hardware watchpoints are unavailable on this build");
+    }
+#endif
     Status set_watchpoint_enabled(WatchpointRecord& record, bool enabled) {
         if (record.enabled == enabled) return std::monostate{};
         auto changed = update_watchpoint_state(record, enabled);
@@ -1295,12 +1300,6 @@ private:
     Status restore_watchpoint(const WatchpointRecord& record) {
         return record.enabled ? update_watchpoint_state(record, false) : Status{std::monostate{}};
     }
-#else
-    Status set_watchpoint_enabled(WatchpointRecord&, bool) {
-        return unsupported("Darwin hardware watchpoints are unavailable on this build");
-    }
-    Status restore_watchpoint(const WatchpointRecord&) { return std::monostate{}; }
-#endif
     static auto module_key(const ModuleInfo& module) {
         return std::tuple{module.path, module.name, module.base};
     }

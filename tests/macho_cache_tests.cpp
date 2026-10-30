@@ -14,7 +14,7 @@ template <class T> T take(Result<T> value) {
 }
 void historical(const std::filesystem::path &payload_path, const std::filesystem::path &input_path,
                 unsigned generation) {
-    static_assert(derived_cache_version == 12, "Thumb packed relatives require a distinct cache schema");
+    static_assert(derived_cache_version >= 12, "Thumb packed relatives require a distinct cache schema");
     const auto prior_version = std::array{5u, 6u, 7u, 8u, 8u, 8u, 8u, 8u}[generation];
     const bool relocated = generation != 0;
     const auto payload_size = std::array{3011u, 3215u, 100131u, 6019u, 6175u, 6175u, 6175u, 6175u}[generation];

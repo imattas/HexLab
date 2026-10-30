@@ -2,6 +2,7 @@
 #include "hexlab/analysis/derived_cache.hpp"
 #include "functions_internal.hpp"
 #include "source_context_internal.hpp"
+#include <algorithm>
 namespace hexlab::derived_detail {
 using function_detail::Failure;
 using function_detail::take;
