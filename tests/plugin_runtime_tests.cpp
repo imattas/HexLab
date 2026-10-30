@@ -3,6 +3,7 @@
 #include "hexlab/database/project_state.hpp"
 #include "hexlab/image/byte_storage.hpp"
 
+#include <algorithm>
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
@@ -143,23 +144,30 @@ void project_semantic_roundtrip(PluginManager& manager) {
         RawOptions raw{Architecture::arm64, ExecutionMode::a64, {{0}, 0x1000}, true, false, true, {}};
         take(store->import_input(source, {Format::raw, raw}, {}, {}));
         auto options = manager.analysis_options();
+        // This test extension is intentionally pure over the callback bytes,
+        // so it can certify that it consults no external inputs.
+        options.semantic_decoder_read_set = [] {
+            return std::vector<AnalysisOptions::SemanticDecoderInput>{};
+        };
         auto session = take(ProjectSession::attach(store, options, {}));
         auto snapshot = session->snapshot();
         auto key = take(project_analysis_key(*snapshot, options));
         ProjectAnalysisRequest request; request.snapshot = snapshot; request.options = options;
-        request.key = key; request.force_full = true;
+        request.key = key; request.force_full = true; request.encode_cache = true;
         auto analysis = take(compute_project_analysis(request, {}));
+        bool has_call_reference = false;
+        if (analysis.derived.references) {
+            const auto outgoing = analysis.derived.references->outgoing_view(Address{{0}, 0x1000});
+            has_call_reference = std::any_of(outgoing.begin(), outgoing.end(), [](const auto& ref) {
+                const auto* location = std::get_if<Location>(&ref.target);
+                const auto* address = location ? std::get_if<Address>(location) : nullptr;
+                return address && *address == Address{{0}, 0x1010};
+            });
+        }
         check(analysis.derived.functions && analysis.derived.functions->functions.size() == 2 &&
                   analysis.derived.functions->calls.size() == 1 &&
                   analysis.derived.functions->calls[0].target == Address{{0}, 0x1010} &&
-                  analysis.derived.references &&
-                  std::any_of(analysis.derived.references->outgoing_view(Address{{0}, 0x1000}).begin(),
-                              analysis.derived.references->outgoing_view(Address{{0}, 0x1000}).end(),
-                              [](const auto& ref) {
-                                  const auto* location = std::get_if<Location>(&ref.target);
-                                  const auto* address = location ? std::get_if<Address>(location) : nullptr;
-                                  return address && *address == Address{{0}, 0x1010};
-                              }),
+                  has_call_reference,
               "plugin-decoded A64 call changes rooted project functions and references");
         check(bool(analysis.encoded_cache), "plugin-derived project analysis serializes to the persistent cache");
         if (analysis.encoded_cache) take(store->write_derived_cache(key, *analysis.encoded_cache, {}));
@@ -209,9 +217,15 @@ int main() {
           "validated processor flow and operand text reach the runtime dispatch result");
     for (std::uint8_t marker = 1; marker <= 4; ++marker) {
         const std::array<std::uint8_t, 1> malformed{marker};
-        const auto rejected = manager.decode_processor("test", "test", 0, malformed);
-        check(!rejected && rejected.error().code == ErrorCode::io,
-              "malformed processor callback output is rejected");
+        PluginManager malformed_manager(std::make_shared<Provider>());
+        const auto loaded_malformed = malformed_manager.load("fake");
+        if (!loaded_malformed) {
+            check(false, "malformed processor test extension loads");
+            continue;
+        }
+        const auto rejected = malformed_manager.decode_processor("test", "test", 0, malformed);
+        check(rejected && !rejected.value(),
+              "invalid processor callback output is quarantined without a decode result");
     }
     const std::array<std::byte, 1> semantic_bytes{std::byte{0xA0}};
     auto semantic = manager.decode_processor_semantic({Architecture::x86_64, ExecutionMode::x86_64},
@@ -244,16 +258,26 @@ int main() {
           "relative semantic effects use checked address arithmetic and become typed branch facts");
     for (std::uint8_t marker = 0xA1; marker <= 0xA4; ++marker) {
         const std::array<std::byte, 1> bad_semantic{static_cast<std::byte>(marker)};
-        auto rejected = manager.decode_processor_semantic({Architecture::x86_64, ExecutionMode::x86_64},
-                                                           {{0}, 0x2000}, bad_semantic);
-        check(!rejected && rejected.error().code == ErrorCode::io,
-              "malformed semantic plugin records and effects are rejected");
+        PluginManager malformed_manager(std::make_shared<Provider>());
+        const auto loaded_malformed = malformed_manager.load("fake");
+        if (!loaded_malformed) {
+            check(false, "malformed semantic test extension loads");
+            continue;
+        }
+        const auto rejected = malformed_manager.decode_processor_semantic(
+            {Architecture::x86_64, ExecutionMode::x86_64}, {{0}, 0x2000}, bad_semantic);
+        check(rejected && !rejected.value(),
+              "invalid semantic plugin record is quarantined without an instruction result");
     }
     const std::array<std::byte, 1> invalid_enum{std::byte{0xA6}};
-    const auto invalid_enum_result = manager.decode_processor_semantic(
-        {Architecture::x86_64, ExecutionMode::x86_64}, {{0}, 0x2000}, invalid_enum);
-    check(!invalid_enum_result && invalid_enum_result.error().code == ErrorCode::io,
-          "irrelevant unchecked operand enums are rejected rather than ignored");
+    PluginManager invalid_enum_manager(std::make_shared<Provider>());
+    const auto invalid_enum_loaded = invalid_enum_manager.load("fake");
+    const auto invalid_enum_result = invalid_enum_loaded
+        ? invalid_enum_manager.decode_processor_semantic(
+              {Architecture::x86_64, ExecutionMode::x86_64}, {{0}, 0x2000}, invalid_enum)
+        : Result<std::optional<Instruction>>{Error{ErrorCode::io, "malformed semantic test extension did not load"}};
+    check(invalid_enum_loaded && invalid_enum_result && !invalid_enum_result.value(),
+          "invalid operand enums quarantine the extension without an instruction result");
     Instruction display_only{};
     display_only.context = {Architecture::x86_64, ExecutionMode::x86_64};
     display_only.length = 2;

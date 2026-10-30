@@ -12,7 +12,7 @@ assert struct.unpack_from("<H", data, 16)[0] == (2 if is_executable else 1), "ou
 assert struct.unpack_from("<H", data, 18)[0] == 62, "output is not x86-64"
 shoff = struct.unpack_from("<Q", data, 40)[0]
 shentsize, shnum, shstrndx = struct.unpack_from("<HHH", data, 58)
-assert shentsize == 64 and shnum == 6 and shstrndx == 5, "unexpected linked section table"
+assert shentsize == 64 and shnum in (6, 7) and shstrndx == shnum - 1, "unexpected linked section table"
 
 
 def section(index):
@@ -28,7 +28,14 @@ def name(offset):
     return names[offset:end].decode("ascii")
 
 
-sections = {name(section(i)[0]): section(i) for i in range(shnum)}
+# Section header zero is the required unnamed null entry, not an output section.
+sections = {name(section(i)[0]): section(i) for i in range(1, shnum)}
+required_sections = {".text", ".data", ".strtab", ".symtab", ".shstrtab"}
+assert required_sections <= sections.keys() and set(sections) <= required_sections | {".bss"}, \
+    "linked output has missing or unexpected sections"
+if ".bss" in sections:
+    bss = sections[".bss"]
+    assert bss[1] == 8 and bss[2] & 3 == 3, "output .bss must be writable allocated NOBITS"
 text = sections[".text"]
 data_section = sections[".data"]
 base = 0x400000

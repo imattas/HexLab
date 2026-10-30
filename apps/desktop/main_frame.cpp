@@ -378,6 +378,7 @@ wxString string_encoding_name(StringEncoding encoding) {
     case StringEncoding::windows874: return "Windows-874";
     case StringEncoding::ebcdic_cp1047: return "EBCDIC CP1047";
     case StringEncoding::windows932: return "Windows-932";
+    case StringEncoding::windows936: return "Windows-936 (GBK)";
     }
     return "Unknown";
 }
@@ -5835,8 +5836,13 @@ void MainFrame::RestoreWorkspaceSession() {
     if (!config->Read("Count", &count) || count < 0) count = 0;
     std::uint64_t omitted_on_save = 0;
     wxString omitted_on_save_text;
-    if (config->Read("OmittedOnSave", &omitted_on_save_text))
-        (void)omitted_on_save_text.ToULongLong(&omitted_on_save);
+    if (config->Read("OmittedOnSave", &omitted_on_save_text)) {
+        // wxString::ToULongLong uses unsigned long long even where uint64_t
+        // aliases unsigned long (LP64 Unix), so parse into its exact API type.
+        unsigned long long parsed_omitted_on_save = 0;
+        if (omitted_on_save_text.ToULongLong(&parsed_omitted_on_save))
+            omitted_on_save = static_cast<std::uint64_t>(parsed_omitted_on_save);
+    }
     const long saved_document_count = count;
     const long omitted_document_count = count > maximum_restored_documents
         ? count - maximum_restored_documents : 0;

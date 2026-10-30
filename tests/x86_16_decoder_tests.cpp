@@ -298,12 +298,17 @@ void invalid_tests() {
     overlong.push_back(std::byte{0x90});
     check(decode_instruction(mode, overlong, {{7}, 0}).status == DecodeStatus::invalid,
           "16-bit architectural instruction length limit");
-    for (auto opaque : {bytes({0x8e, 0xd8}), bytes({0x1f}), bytes({0xc4, 0}), bytes({0x0f, 0xb2, 0}),
-                        bytes({0xcf}), bytes({0xc5, 0xf8, 0x77})}) {
+    const auto les = instruction({0xc4, 0x00});
+    check(les.opcode == Opcode::les && les.flow == FlowKind::fallthrough && les.memory_read && !les.memory_write,
+          "LES is decoded as a typed memory read rather than an opaque fallback");
+    const auto truncated_vex = decode_instruction(mode, bytes({0xc5, 0xf8, 0x77}), {{7}, 0});
+    check(truncated_vex.status == DecodeStatus::invalid && !truncated_vex.instruction,
+          "VEX-only encoding is invalid in the legacy 16-bit context");
+    for (auto opaque : {bytes({0x8e, 0xd8}), bytes({0x1f}), bytes({0x0f, 0xb2, 0}), bytes({0xcf})}) {
         const auto decoded = decode_instruction(mode, opaque, {{7}, 0});
         check(decoded.instruction && decoded.instruction->opcode == Opcode::x86_opaque &&
                   decoded.instruction->operands.empty(),
-              "Zydis fallback preserves unsupported legacy/system/vector encodings without scalar semantics");
+              "Zydis fallback preserves unsupported legacy/system encodings without scalar semantics");
     }
 }
 void far_tests() {

@@ -101,8 +101,12 @@ void large_linear_analysis_cache_test() {
     ImageLayout layout{{{0},64,1,ByteOrder::little},Architecture::x86_64,ExecutionMode::x86_64,
                        {{"large-linear",entry,storage->size(),{0},storage->size(),true,false,true}},{entry}};
     auto image = Image::create(storage,std::move(layout)).value();
+    AnalysisOptions analysis_options;
+    // This assertion measures instruction-fetch batching. String scanning is
+    // a separate analysis phase with many encoding passes over the same file.
+    analysis_options.string_scan_work_budget = 0;
     const auto begin = std::chrono::steady_clock::now();
-    const auto snapshot = analyze(*image,{},{}).value();
+    const auto snapshot = analyze(*image,analysis_options,{}).value();
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - begin).count();
     check(snapshot.code_complete && snapshot.instructions.size() == storage->size() &&
@@ -369,6 +373,15 @@ void string_tests() {
           "strict UTF-8 scan counts Unicode scalars and preserves UTF-8 preview");
     scan=find_strings(*raw_image(bytes({0xc0,0xaf,'A','B','C','D',0}),false),{},{}).value();
     check(!find(scan,StringEncoding::utf8,0),"overlong UTF-8 sequences cannot join printable candidates");
+    scan=find_strings(*raw_image(bytes({0xba,0xba,0xd7,0xd6,0xb2,0xe2,0xca,0xd4,0}),false),{},{}).value();
+    s=find(scan,StringEncoding::windows936,0);
+    check(s && s->preview=="汉字测试" && s->characters==4 && s->byte_length==8 && s->terminated,
+          "GBK multibyte legacy candidate decodes fixed mapping and retains source extent");
+    scan=find_strings(*raw_image(bytes({0xe6,0xb1,0x89,0xe5,0xad,0x97,0xe6,0xb5,0x8b,0xe8,0xaf,0x95,0}),false),{},{}).value();
+    check(find(scan,StringEncoding::utf8,0) && !find(scan,StringEncoding::windows936,0),
+          "strict UTF-8 text is not duplicated as a GBK reinterpretation");
+    scan=find_strings(*raw_image(bytes({'A','B','C','D',0}),false),{},{}).value();
+    check(!find(scan,StringEncoding::windows936,0),"GBK candidate scan does not duplicate ASCII-only text");
     scan=find_strings(*raw_image(bytes({0, 'A',0,'B',0,'C',0,'D',0,0}),false),{},{}).value();
     s=find(scan,StringEncoding::utf16be,0);
     check(s && s->preview=="ABCD" && s->characters==4 && s->byte_length==8 && s->terminated,
