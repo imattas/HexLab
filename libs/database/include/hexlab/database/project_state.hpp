@@ -340,7 +340,8 @@ public:
     // copy to destination. The recovery artifact is retained unchanged.
     HEXLAB_DATABASE_EXPORT static Result<SavedProject> recover_candidate(const ProjectRecoveryCandidate&,const std::filesystem::path& destination,ReplacePolicy,std::stop_token);
     // Restores a discovered interrupted-save or previous-version artifact
-    // over the same project identity. Candidate UUID/revisions are rechecked before publish.
+    // over the same project identity. Candidate UUID/revisions are rechecked
+    // before publish.
     HEXLAB_DATABASE_EXPORT static Result<SavedProject> recover_candidate_in_place(
         const ProjectRecoveryCandidate&,const std::filesystem::path& target,std::stop_token);
     HEXLAB_DATABASE_EXPORT ~ProjectStore();

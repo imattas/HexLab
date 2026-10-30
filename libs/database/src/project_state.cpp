@@ -208,7 +208,10 @@ Result<std::pair<std::uint64_t, Sha256Digest>> hash_recovery_artifact(
     std::ifstream input(path, std::ios::binary);
     if (!input) return Error{ErrorCode::io, "Cannot read recovery artifact bytes"};
     Sha256 hash;
-    std::array<std::byte, 1024 * 1024> buffer{};
+    // This function runs in recovery discovery on the CLI's small default
+    // Windows thread stack. Keep streaming state well below the 1 MiB stack
+    // limit while retaining chunked hashing.
+    std::array<std::byte, 64 * 1024> buffer{};
     std::uint64_t total = 0;
     while (input) {
         if (stop.stop_requested()) return Error{ErrorCode::canceled, "Recovery artifact hashing canceled"};
