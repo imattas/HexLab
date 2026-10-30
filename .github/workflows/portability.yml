@@ -23,7 +23,7 @@ jobs:
           - os: ubuntu-24.04
             preset: linux-gcc-headless-release
             toolchain: GCC Release
-          - os: macos-14
+          - os: macos-15
             preset: macos-headless
             toolchain: Apple Clang Debug
     runs-on: ${{ matrix.os }}
@@ -60,7 +60,7 @@ jobs:
         include:
           - os: ubuntu-24.04
             preset: linux-desktop
-          - os: macos-14
+          - os: macos-15
             preset: macos-desktop
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
