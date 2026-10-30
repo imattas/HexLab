@@ -1,6 +1,7 @@
 #pragma once
 #include "hexlab/processors/decoder.hpp"
 #include "hexlab/image/image.hpp"
+#include <algorithm>
 namespace hexlab::analysis_detail {
 inline bool is_arm_literal_pc_load(const Instruction &instruction) {
     if (instruction.context.architecture != Architecture::arm ||
