@@ -663,7 +663,9 @@ enum class Opcode {
     // Appended x86 I/O string instructions; preserve serialized opcode ordinals.
     x86_ins, x86_outs,
     // Hardware random/seed instructions; append for persisted opcode stability.
-    rdrand, rdseed
+    rdrand, rdseed,
+    // MIPS64 PREF prefetch hint; append to preserve serialized opcode IDs.
+    mips64_pref
 };
 enum class OperandAccess { read, write, read_write, address };
 // The encoded x86 group-one repeat prefix is retained separately from the

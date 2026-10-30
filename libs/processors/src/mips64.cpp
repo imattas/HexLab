@@ -592,6 +592,12 @@ DecodeResult decode_mips64(std::span<const std::byte> bytes, Address at, ByteOrd
         i.operands = {reg(rt), ImmediateOperand{word & 0xffffu, 16, 16, false, EncodedField{2, 2}}};
         i.access = {OperandAccess::write, OperandAccess::read};
         if (rt) i.register_writes = {reg(rt)};
+    } else if (op == 0x33) { // PREF: a nonbinding hint with an effective address.
+        i.opcode = Opcode::mips64_pref;
+        MemoryOperand address{0, 64, {}, reg(rs), {}, 1, signed16(word), false, {}, EncodedField{0, 2}};
+        i.operands = {ImmediateOperand{rt, 5, 5, false, {}}, address};
+        i.access = {OperandAccess::read, OperandAccess::address};
+        if (rs) i.register_reads = {reg(rs)};
     } else {
         Opcode opcode = Opcode::opaque; unsigned width = 0; bool load = false;
         bool unaligned_merge = false;

@@ -403,6 +403,7 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
     case Opcode::mips64_ldr: return "ldr";
     case Opcode::mips64_sdl: return "sdl";
     case Opcode::mips64_sdr: return "sdr";
+    case Opcode::mips64_pref: return "pref";
     default: break;
     }
     if (op >= Opcode::ppc_addi && op <= Opcode::ppc_nop) {
