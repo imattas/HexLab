@@ -33,6 +33,13 @@ std::vector<std::byte> fixture() {
     member(out, "#1/12", "bsd_object.oxyz");
     return out;
 }
+std::vector<std::byte> thin_fixture(std::string name, std::size_t declared_size) {
+    std::vector<std::byte> out; append(out, "!<thin>\n");
+    if (name.size() < 16) name += "/";
+    field(out, std::move(name), 16); field(out, "0", 12); field(out, "0", 6); field(out, "0", 6);
+    field(out, "100644", 8); field(out, std::to_string(declared_size), 10); append(out, "`\n");
+    return out;
+}
 std::vector<std::byte> sym64_fixture() {
     std::vector<std::byte> out; append(out, "!<arch>\n");
     // GNU /SYM64/ payload: 64-bit big-endian symbol count, member header
@@ -304,6 +311,42 @@ int main() { return run([] {
           "BSD ranlib scan cancellation");
     check(extract_ar_member(*storage, archive.members[2], stop.get_token()).error().code == ErrorCode::canceled,
           "member extraction cancellation");
+    FixtureFile thin_content(bytes({'t','h','i','n'}));
+    FixtureFile thin_container(thin_fixture("m.o", 4));
+    const auto thin_storage = FileStorage::open(thin_container.path).value();
+    const auto thin_archive = read_ar_archive(*thin_storage);
+    check(thin_archive && thin_archive.value().thin && thin_archive.value().members.size() == 1 &&
+          thin_archive.value().members[0].kind == ArMemberKind::thin_external &&
+          thin_archive.value().members[0].size == 4,
+          "GNU thin archive retains external member identity and declared extent");
+    if (thin_archive) {
+        const auto thin_contents = FileStorage::open(thin_content.path).value();
+        const ArThinMemberResolver thin_resolver = [&](std::string_view path) -> Result<std::shared_ptr<const ByteStorage>> {
+            if (path != "m.o") return Error{ErrorCode::invalid_argument, "unexpected member name"};
+            return std::shared_ptr<const ByteStorage>(thin_contents);
+        };
+        const auto extracted = extract_ar_member(thin_storage, thin_archive.value().members[0], thin_resolver);
+        check(extracted && extracted.value() == bytes({'t','h','i','n'}),
+              "thin member extraction reads the caller-resolved external snapshot");
+        FixtureFile wrong_size_content(bytes({'x'}));
+        const auto wrong_size_storage = FileStorage::open(wrong_size_content.path).value();
+        const ArThinMemberResolver wrong_size = [&](std::string_view) -> Result<std::shared_ptr<const ByteStorage>> {
+            return std::shared_ptr<const ByteStorage>(wrong_size_storage);
+        };
+        const auto rejected_wrong_size = extract_ar_member(thin_storage, thin_archive.value().members[0], wrong_size);
+        check(!rejected_wrong_size && rejected_wrong_size.error().code == ErrorCode::malformed,
+              "thin extraction rejects resolver storage with a different declared extent");
+        std::stop_source thin_stop; thin_stop.request_stop();
+        bool resolver_called = false;
+        const ArThinMemberResolver counting = [&](std::string_view) -> Result<std::shared_ptr<const ByteStorage>> {
+            resolver_called = true;
+            return Error{ErrorCode::io, "unexpected resolver call"};
+        };
+        const auto canceled_extraction = extract_ar_member(
+            thin_storage, thin_archive.value().members[0], counting, thin_stop.get_token());
+        check(!canceled_extraction && canceled_extraction.error().code == ErrorCode::canceled && !resolver_called,
+              "canceled thin extraction returns before invoking the resolver");
+    }
     ArLimits small; small.max_members = 1;
     check(read_ar_archive(*storage, {}, small).error().code == ErrorCode::resource_limit, "member count limit");
     small = {}; small.max_extracted_bytes = 2;
@@ -330,8 +373,9 @@ int main() { return run([] {
           "GNU long-name references must point to the start of a table entry");
     corrupt = std::vector<std::byte>{}; append(corrupt, "!<thin>\n");
     FixtureFile thin(corrupt);
-    check(read_ar_archive(*FileStorage::open(thin.path).value()).error().code == ErrorCode::unsupported,
-          "thin archive is explicitly unsupported");
+    const auto empty_thin = read_ar_archive(*FileStorage::open(thin.path).value());
+    check(empty_thin && empty_thin.value().thin && empty_thin.value().members.empty(),
+          "empty GNU thin archive is recognized without resolving external members");
     auto forged = archive.members[2]; forged.data_offset.value = UINT64_MAX; forged.size = 2;
     check(!extract_ar_member(*storage, forged), "forged extraction offset cannot wrap");
 }); }
