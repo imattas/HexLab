@@ -76,6 +76,8 @@ struct LibraryImportPlan {
     LibraryAssignmentSelection assignments;
     std::size_t validated_type_nodes = 0;
 };
+// Writes the legacy HXTL v1 definitions-only form. Entries with declaration
+// metadata or origins are rejected because v1 cannot round-trip those fields.
 HEXLAB_TYPES_EXPORT Result<std::vector<std::byte>> encode_library(std::span<const LibraryEntry>,
                                                                   std::size_t max_bytes = 16u * 1024u * 1024u);
 HEXLAB_TYPES_EXPORT Result<std::vector<LibraryEntry>> decode_library(std::span<const std::byte>,
