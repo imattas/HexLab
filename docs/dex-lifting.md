@@ -26,7 +26,12 @@ Integer signed divide/remainder operations (int and long, three-register,
 `/2addr`, and literal forms) produce typed arithmetic values and add a
 method-relative `may_trap` edge for `java.lang.ArithmeticException` when the
 divisor is zero. DEX integer division's minimum-value divided by negative one
-case remains a normal wrapped result. Floating constants are kept
+case remains a normal wrapped result. Separately, the caller-driven
+`evaluate_dex_integer_literal` helper evaluates a decoded literal operation
+from a raw 32-bit source-vreg value; it does not perform decompiler IR lifting
+or create CFG exception edges. It reports divide-by-zero explicitly, while
+`INT32_MIN / -1` returns the wrapped `INT32_MIN` value (and the matching
+remainder is zero). Floating constants are kept
 as exact bit patterns until a typed use provides floating context. It also
 lifts `iget`/`iput`, `sget`/`sput`, array loads/stores and `array-length`, the five
 invoke kinds and their `/range` forms, `move-result` variants, `new-instance`,

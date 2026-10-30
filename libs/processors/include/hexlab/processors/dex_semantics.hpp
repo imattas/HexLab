@@ -24,6 +24,12 @@ struct DexIntegerDivideResult {
     bool operator==(const DexIntegerDivideResult &) const = default;
 };
 
+struct DexIntegerLiteralResult {
+    std::optional<std::uint32_t> value;
+    bool divide_by_zero = false;
+    bool operator==(const DexIntegerLiteralResult &) const = default;
+};
+
 struct DexArrayLengthResult {
     std::uint32_t value = 0;
     bool null_pointer_trap = false;
@@ -279,6 +285,82 @@ inline std::optional<DexIntegerBinaryResult> evaluate_dex_integer_literal_shift(
             result |= UINT32_MAX & ~((UINT32_C(1) << (32 - count)) - 1);
     }
     return DexIntegerBinaryResult{result, 32};
+}
+
+// Evaluate Dalvik's int lit16/lit8 arithmetic family from the source vreg
+// and encoded signed literal. Division and remainder report their arithmetic
+// exception separately; all other operations wrap to 32 bits.
+inline std::optional<DexIntegerLiteralResult> evaluate_dex_integer_literal(
+    const Instruction &instruction, std::uint32_t source) noexcept {
+    if (instruction.context.architecture != Architecture::dex || instruction.context.mode != ExecutionMode::dex ||
+        instruction.opcode != Opcode::dex || instruction.length != 4 || instruction.memory_read ||
+        instruction.memory_write || instruction.flow != FlowKind::fallthrough || instruction.operands.size() != 3 ||
+        instruction.access.size() != 3 || instruction.access[0] != OperandAccess::write ||
+        instruction.access[1] != OperandAccess::read || instruction.access[2] != OperandAccess::read)
+        return std::nullopt;
+    const auto opcode = std::to_integer<std::uint8_t>(instruction.bytes[0]);
+    const auto *destination = std::get_if<RegisterOperand>(&instruction.operands[0]);
+    const auto *input = std::get_if<RegisterOperand>(&instruction.operands[1]);
+    const auto *literal = std::get_if<ImmediateOperand>(&instruction.operands[2]);
+    if (!destination || !input || !literal || destination->bank != RegisterBank::dex_vreg ||
+        input->bank != RegisterBank::dex_vreg || destination->width != 32 || input->width != 32 ||
+        destination->high_byte || input->high_byte || literal->effective_width != 32 || !literal->is_signed)
+        return std::nullopt;
+    const bool lit16 = opcode >= 0xd0 && opcode <= 0xd7;
+    const bool lit8 = opcode >= 0xd8 && opcode <= 0xe2;
+    const auto expected_width = static_cast<std::uint16_t>(lit16 ? 16 : 8);
+    const auto expected_mnemonic = [&]() -> std::string_view {
+        static constexpr std::string_view names16[]{"add-int/lit16", "rsub-int", "mul-int/lit16", "div-int/lit16",
+            "rem-int/lit16", "and-int/lit16", "or-int/lit16", "xor-int/lit16"};
+        static constexpr std::string_view names8[]{"add-int/lit8", "rsub-int/lit8", "mul-int/lit8", "div-int/lit8",
+            "rem-int/lit8", "and-int/lit8", "or-int/lit8", "xor-int/lit8", "shl-int/lit8", "shr-int/lit8", "ushr-int/lit8"};
+        return lit16 ? names16[opcode - 0xd0] : lit8 ? names8[opcode - 0xd8] : std::string_view{};
+    };
+    const auto separator = instruction.mnemonic_override.find(' ');
+    const std::string_view mnemonic(instruction.mnemonic_override.data(),
+        separator == std::string::npos ? instruction.mnemonic_override.size() : separator);
+    const auto immediate_value = std::bit_cast<std::int64_t>(literal->value);
+    if ((!lit16 && !lit8) || mnemonic != expected_mnemonic || literal->encoded_width != expected_width ||
+        immediate_value < (lit16 ? INT16_MIN : INT8_MIN) || immediate_value > (lit16 ? INT16_MAX : INT8_MAX))
+        return std::nullopt;
+    const RegisterOperand dst{RegisterBank::dex_vreg, destination->index, 32, false};
+    const RegisterOperand src{RegisterBank::dex_vreg, input->index, 32, false};
+    if (std::find(instruction.register_writes.begin(), instruction.register_writes.end(), dst) == instruction.register_writes.end() ||
+        std::find(instruction.register_reads.begin(), instruction.register_reads.end(), src) == instruction.register_reads.end())
+        return std::nullopt;
+
+    const auto rhs = static_cast<std::uint32_t>(immediate_value);
+    const auto signed_source = std::bit_cast<std::int32_t>(source);
+    const auto signed_rhs = static_cast<std::int32_t>(immediate_value);
+    std::uint32_t result = 0;
+    switch (opcode) {
+    case 0xd0: case 0xd8: result = source + rhs; break;
+    case 0xd1: case 0xd9: result = rhs - source; break;
+    case 0xd2: case 0xda: result = source * rhs; break;
+    case 0xd3: case 0xdb:
+        if (!signed_rhs) return DexIntegerLiteralResult{std::nullopt, true};
+        result = signed_source == INT32_MIN && signed_rhs == -1 ? UINT32_C(0x80000000)
+            : std::bit_cast<std::uint32_t>(signed_source / signed_rhs);
+        break;
+    case 0xd4: case 0xdc:
+        if (!signed_rhs) return DexIntegerLiteralResult{std::nullopt, true};
+        result = signed_source == INT32_MIN && signed_rhs == -1 ? 0
+            : std::bit_cast<std::uint32_t>(signed_source % signed_rhs);
+        break;
+    case 0xd5: case 0xdd: result = source & rhs; break;
+    case 0xd6: case 0xde: result = source | rhs; break;
+    case 0xd7: case 0xdf: result = source ^ rhs; break;
+    case 0xe0: result = source << (rhs & 31); break;
+    case 0xe1: {
+        const auto shift = rhs & 31;
+        result = shift ? source >> shift : source;
+        if (shift && (source & UINT32_C(0x80000000))) result |= UINT32_MAX << (32 - shift);
+        break;
+    }
+    case 0xe2: result = source >> (rhs & 31); break;
+    default: return std::nullopt;
+    }
+    return DexIntegerLiteralResult{result, false};
 }
 
 // Evaluate selected DEX int/long binary arithmetic and /2addr forms. Inputs
