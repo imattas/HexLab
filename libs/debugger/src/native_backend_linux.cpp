@@ -1005,6 +1005,23 @@ public:
                 const auto owner_action = std::find_if(actions.begin(), actions.end(), [&](const auto& action) {
                     return static_cast<pid_t>(action.thread) == owner;
                 });
+                if (owner_action != actions.end() && owner_action->kind == ThreadResumeKind::single_step &&
+                    std::none_of(runnable.begin(), runnable.end(), [&](const auto *action) {
+                        return static_cast<pid_t>(action->thread) != owner &&
+                               action->kind != ThreadResumeKind::continue_execution;
+                    })) {
+                    const int owner_signal = signal_for(*owner_action);
+                    if (owner_signal != 0 && owner_action->signal_disposition != ContinueStatus::handled)
+                        return Error{ErrorCode::unsupported,
+                            "cannot combine a Linux software-breakpoint step-over with delivery of the owner's pending signal"};
+                    // Keep peers stopped while the trap byte is displaced. The
+                    // owner's user-visible single-step event is delivered first;
+                    // the caller can then choose which peers to continue.
+                    auto stepped = begin_displaced_step(owner, false);
+                    if (!stepped) return stepped;
+                    apply_stopped_signal_dispositions();
+                    return std::monostate{};
+                }
                 if (owner_action == actions.end() || owner_action->kind != ThreadResumeKind::continue_execution ||
                     std::any_of(runnable.begin(), runnable.end(), [](const auto* action) {
                         return action->kind != ThreadResumeKind::continue_execution;

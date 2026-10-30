@@ -1013,6 +1013,31 @@ public:
                 const auto owner_action = std::find_if(actions.begin(), actions.end(), [&](const auto& action) {
                     return static_cast<pid_t>(action.thread) == owner;
                 });
+                if (owner_action != actions.end() && owner_action->kind == ThreadResumeKind::single_step &&
+                    std::none_of(runnable.begin(), runnable.end(), [&](const auto *action) {
+                        return static_cast<pid_t>(action->thread) != owner &&
+                               action->kind != ThreadResumeKind::continue_execution;
+                    })) {
+                    const int owner_signal = signal_for(*owner_action);
+                    if (owner_signal != 0 && owner_action->signal_disposition != ContinueStatus::handled)
+                        return Error{ErrorCode::unsupported,
+                            "cannot combine an AArch64 software-breakpoint step-over with delivery of the owner's pending signal"};
+                    // Execute the displaced instruction with peers held so the
+                    // exact step result is returned before any peer can run.
+                    // The next schedule can continue the caller-selected peers.
+                    auto stepped = begin_breakpoint_step(owner, *pending_breakpoint_);
+                    if (!stepped) return stepped;
+                    for (const auto& action : actions) {
+                        const auto stopped_tid = static_cast<pid_t>(action.thread);
+                        if (action.kind != ThreadResumeKind::stop) continue;
+                        const int signal = signal_for(action);
+                        if (action.signal_disposition == ContinueStatus::handled) deferred_signals_.erase(stopped_tid);
+                        else if (signal != 0) deferred_signals_[stopped_tid] = signal;
+                    }
+                    pending_.reset(); pending_thread_ = 0; pending_signal_ = 0; pending_thread_interrupt_ = false;
+                    pending_breakpoint_.reset(); pending_hardware_execute_ = false;
+                    return std::monostate{};
+                }
                 if (owner_action == actions.end() || owner_action->kind != ThreadResumeKind::continue_execution ||
                     std::any_of(runnable.begin(), runnable.end(), [](const auto* action) {
                         return action->kind != ThreadResumeKind::continue_execution;
