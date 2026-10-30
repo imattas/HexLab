@@ -34,6 +34,11 @@ struct FlowState {
     // Independently tracked NMOS 6502 copies of a TSX snapshot in A, X, or Y.
     // Each delta is relative to frame_depth, the stack depth sampled by TSX.
     std::array<FlowValue, 3> m6502_stack_alias_deltas{};
+    // Carry is only tracked when explicitly set by CLC/SEC. ADC/SBC can use
+    // it to preserve a stack-derived accumulator offset through immediate
+    // arithmetic, then invalidate it because their result carry is unknown.
+    bool m6502_carry_known = false;
+    bool m6502_carry_set = false;
     // For the NMOS 6502 TSX/$0100,X convention, track a small signed
     // displacement from the sampled S value. Values outside +/-127 are
     // intentionally discarded because 8-bit index wrap makes linear slot
@@ -144,6 +149,14 @@ bool merge(FlowState &current, const FlowState &incoming) {
     current.ambiguous = current.ambiguous || incoming.ambiguous;
     const bool stack_changed = merge_value(current.stack_depth, incoming.stack_depth);
     const bool frame_changed = merge_value(current.frame_depth, incoming.frame_depth);
+    bool m6502_carry_changed = false;
+    if (current.m6502_carry_known &&
+        (!incoming.m6502_carry_known || current.m6502_carry_set != incoming.m6502_carry_set)) {
+        current.m6502_carry_known = false;
+        m6502_carry_changed = true;
+    } else if (!current.m6502_carry_known && incoming.m6502_carry_known) {
+        current.ambiguous = true;
+    }
     bool frame_register_delta_changed = false;
     if (current.frame_register >= 0 && incoming.frame_register == current.frame_register) {
         if (current.frame_register_delta.known && incoming.frame_register_delta.known) {
@@ -205,7 +218,7 @@ bool merge(FlowState &current, const FlowState &incoming) {
     return stack_changed || frame_changed || previously_supported != current.supported ||
            previously_ambiguous != current.ambiguous || previous_frame_register != current.frame_register ||
            previous_arm64_frame_pointer != current.arm64_frame_pointer || frame_register_delta_changed ||
-           riscv_alias_changed || arm64_alias_changed || m6502_alias_changed;
+           riscv_alias_changed || arm64_alias_changed || m6502_alias_changed || m6502_carry_changed;
 }
 
 bool arm32_register(const std::optional<RegisterOperand> &value, std::uint8_t index) {
@@ -522,6 +535,38 @@ bool transfer(const Instruction &instruction, FlowState &state) {
             return std::find(registers.begin(), registers.end(),
                              RegisterOperand{RegisterBank::mos6502, index, 8, false}) != registers.end();
         };
+        if (instruction.opcode == Opcode::m6502_clc || instruction.opcode == Opcode::m6502_sec) {
+            state.m6502_carry_known = instruction.flow == FlowKind::fallthrough &&
+                                      has_register(instruction.register_writes, 3);
+            state.m6502_carry_set = instruction.opcode == Opcode::m6502_sec;
+            return true;
+        }
+        if (instruction.opcode == Opcode::m6502_adc || instruction.opcode == Opcode::m6502_sbc) {
+            const auto operand = immediate_value(instruction, 0);
+            const bool valid = instruction.flow == FlowKind::fallthrough && operand && *operand >= 0 && *operand <= 255 &&
+                has_register(instruction.register_reads, 0) && has_register(instruction.register_writes, 0) &&
+                has_register(instruction.register_writes, 3);
+            auto &accumulator = state.m6502_stack_alias_deltas[0];
+            if (valid && state.m6502_carry_known && accumulator.known) {
+                const auto delta = instruction.opcode == Opcode::m6502_adc
+                    ? *operand + static_cast<std::int64_t>(state.m6502_carry_set)
+                    : -*operand - static_cast<std::int64_t>(!state.m6502_carry_set);
+                std::int64_t updated = 0;
+                if (add_checked(accumulator.value, delta, updated) && m6502_slot_offset_unambiguous(updated))
+                    accumulator.value = updated;
+                else
+                    accumulator = {};
+            } else {
+                accumulator = {};
+            }
+            state.m6502_carry_known = false;
+            return true;
+        }
+        if (std::any_of(instruction.register_writes.begin(), instruction.register_writes.end(),
+                        [](const RegisterOperand &reg) {
+                            return reg.bank == RegisterBank::mos6502 && reg.index == 3;
+                        }))
+            state.m6502_carry_known = false;
         switch (instruction.opcode) {
         case Opcode::m6502_jsr:
             // A callee may overwrite any general register. Keep the caller's
@@ -532,6 +577,7 @@ bool transfer(const Instruction &instruction, FlowState &state) {
             state.frame_register = -1;
             state.frame_register_delta = {};
             state.m6502_stack_alias_deltas = {};
+            state.m6502_carry_known = false;
             return true;
         case Opcode::m6502_rts:
         case Opcode::m6502_rti:

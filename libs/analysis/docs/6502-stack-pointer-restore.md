@@ -18,6 +18,17 @@ Page-one indexed stack slots using `$0100,X` or `$0100,Y` can use either
 register's independently tracked copy. The source alias remains available
 after a transfer instruction copies it to another register.
 
+The accumulator copy can also pass through immediate `ADC` or `SBC` when the
+carry input is known from `CLC` or `SEC`. The analysis applies the exact
+8-bit offset change, including the carry/no-borrow input, and keeps the copy
+only while its signed displacement remains in the same -127 through 127
+window. This supports sequences such as `TSX; TXA; CLC; ADC #n; TAX; TXS`.
+Arithmetic result carry is not inferred, and any other instruction that
+writes the status register makes the carry input unknown. Non-immediate
+arithmetic and arithmetic with unknown carry discard the accumulator copy.
+These rules preserve the relative slot identity without claiming to know the
+incoming hardware S value.
+
 This recovers balanced save/restore sequences without guessing the incoming
 hardware S value. It does not model cycle timing, interrupt interleavings, or
 stack-page wrapping across an unknown entry S value.
