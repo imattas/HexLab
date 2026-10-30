@@ -437,7 +437,9 @@ inline void minidump_description(std::ostream &out, const ImageMetadata &metadat
         if (module.codeview_kind == "RSDS") {
             out << " pdb-binding=" << pdb_status_name(module.pdb_status)
                 << " symbols=" << module.pdb_symbol_count
-                << (module.pdb_symbols_complete ? "(complete)" : "(bounded/incomplete)");
+                << (module.pdb_symbols_complete ? "(complete)" : "(bounded/incomplete)")
+                << " source-lines=" << module.pdb_source_line_count
+                << (module.pdb_source_lines_complete ? "(complete)" : "(bounded/incomplete)");
             if (!module.bound_pdb_path.empty()) {
                 out << " bound-pdb=";
                 minidump_quoted_text(out, module.bound_pdb_path);
@@ -445,6 +447,10 @@ inline void minidump_description(std::ostream &out, const ImageMetadata &metadat
             if (!module.pdb_diagnostic.empty()) {
                 out << " pdb-note=";
                 minidump_quoted_text(out, module.pdb_diagnostic);
+            }
+            if (!module.pdb_source_line_diagnostic.empty()) {
+                out << " pdb-source-note=";
+                minidump_quoted_text(out, module.pdb_source_line_diagnostic);
             }
         }
         out << '\n';

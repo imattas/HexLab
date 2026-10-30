@@ -36,6 +36,19 @@ struct MinidumpPdbSymbol {
     bool procedure = false, public_symbol = false;
     bool operator==(const MinidumpPdbSymbol &) const = default;
 };
+// PDB C13 rows are retained in section-relative form for Minidump modules.
+// A dump module record does not include a PE section table, so callers must
+// not treat section/section_offset as a virtual address.
+struct MinidumpPdbSourceLine {
+    std::string source_path, module_name, object_name;
+    std::uint16_t section = 0, start_column = 0, end_column = 0, module_index = 0;
+    std::uint32_t section_offset = 0, contribution_size = 0, line = 0, end_line = 0;
+    std::uint32_t source_file_id = 0, subsection_offset = 0;
+    std::uint8_t checksum_kind = 0;
+    std::vector<std::byte> checksum;
+    bool has_columns = false, is_statement = false;
+    bool operator==(const MinidumpPdbSourceLine &) const = default;
+};
 struct MinidumpModule {
     std::uint64_t image_base = 0;
     std::uint32_t image_size = 0, checksum = 0, timestamp = 0;
@@ -56,6 +69,10 @@ struct MinidumpModule {
     std::uint32_t pdb_symbol_count = 0;
     bool pdb_symbols_complete = false;
     std::vector<MinidumpPdbSymbol> pdb_symbols;
+    std::uint32_t pdb_source_line_count = 0;
+    bool pdb_source_lines_complete = false;
+    std::vector<MinidumpPdbSourceLine> pdb_source_lines;
+    std::string pdb_source_line_diagnostic;
     bool operator==(const MinidumpModule &) const = default;
 };
 struct MinidumpUnloadedModule {

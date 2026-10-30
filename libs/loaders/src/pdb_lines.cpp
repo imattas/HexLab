@@ -467,6 +467,8 @@ Result<std::size_t> bind_local_minidump_pdbs(
     constexpr std::uint64_t max_total_pdb_bytes = 512ull * 1024 * 1024;
     constexpr std::size_t max_retained_symbols = 100'000;
     constexpr std::uint64_t max_retained_symbol_bytes = 48ull * 1024 * 1024;
+    constexpr std::size_t max_retained_source_lines = 250'000;
+    constexpr std::uint64_t max_retained_source_line_bytes = 64ull * 1024 * 1024;
     if (candidates.size() > max_candidate_rows)
         return Error{ErrorCode::resource_limit, "Minidump PDB candidate count exceeds 256"};
 
@@ -488,6 +490,8 @@ Result<std::size_t> bind_local_minidump_pdbs(
                 ? MinidumpPdbStatus::unavailable : MinidumpPdbStatus::unsupported_identity;
         module.bound_pdb_path.clear(); module.pdb_diagnostic.clear();
         module.pdb_symbol_count = 0; module.pdb_symbols_complete = false; module.pdb_symbols.clear();
+        module.pdb_source_line_count = 0; module.pdb_source_lines_complete = false;
+        module.pdb_source_lines.clear(); module.pdb_source_line_diagnostic.clear();
     }
     for (const auto &candidate : candidates) {
         if (stop.stop_requested()) return Error{ErrorCode::canceled, "Minidump PDB binding canceled"};
@@ -523,8 +527,8 @@ Result<std::size_t> bind_local_minidump_pdbs(
         std::byte{'P'}, std::byte{'D'}, std::byte{'B'}, std::byte{1}};
     auto fingerprint_result = fingerprint.update(domain);
     if (!fingerprint_result) return fingerprint_result.error();
-    std::uint64_t input_bytes = 0, retained_symbol_bytes = 0;
-    std::size_t retained_symbols = 0, bound_modules = 0;
+    std::uint64_t input_bytes = 0, retained_symbol_bytes = 0, retained_source_line_bytes = 0;
+    std::size_t retained_symbols = 0, retained_source_lines = 0, bound_modules = 0;
     for (const auto &candidate : unique) {
         if (stop.stop_requested()) return Error{ErrorCode::canceled, "Minidump PDB binding canceled"};
         auto mark_candidate_modules = [&](MinidumpPdbStatus status, const std::string &diagnostic) {
@@ -603,6 +607,8 @@ Result<std::size_t> bind_local_minidump_pdbs(
             }
             continue;
         }
+        auto source_lines = types::parse_pdb_source_lines(database.value(), stop);
+        if (!source_lines && source_lines.error().code == ErrorCode::canceled) return source_lines.error();
         for (const auto index : matches) {
             auto &module = dump.modules[index];
             if (module.pdb_status == MinidumpPdbStatus::matched) continue;
@@ -623,6 +629,33 @@ Result<std::size_t> bind_local_minidump_pdbs(
                     symbol.section, symbol.module_index, symbol.record_kind, symbol.section_offset,
                     symbol.size, symbol.record_offset, symbol.kind == types::PdbSymbolKind::procedure,
                     symbol.public_symbol});
+            }
+            if (!source_lines) {
+                module.pdb_source_line_diagnostic = "PDB identity matched, but C13 source lines are unavailable: " +
+                    source_lines.error().message;
+            } else {
+                module.pdb_source_line_count = static_cast<std::uint32_t>(
+                    std::min<std::size_t>(source_lines.value().lines.size(), UINT32_MAX));
+                module.pdb_source_lines_complete = true;
+                module.pdb_source_lines.reserve(std::min(source_lines.value().lines.size(), max_retained_source_lines));
+                for (const auto &line : source_lines.value().lines) {
+                    const auto cost = sizeof(MinidumpPdbSourceLine) + line.source_path.size() +
+                        line.module_name.size() + line.object_name.size() + line.checksum.size();
+                    if (retained_source_lines >= max_retained_source_lines ||
+                        cost > max_retained_source_line_bytes - retained_source_line_bytes) {
+                        module.pdb_source_lines_complete = false;
+                        continue;
+                    }
+                    retained_source_line_bytes += cost;
+                    ++retained_source_lines;
+                    module.pdb_source_lines.push_back({line.source_path, line.module_name, line.object_name,
+                        line.section, line.start_column, line.end_column, line.module_index,
+                        line.section_offset, line.contribution_size, line.line, line.end_line,
+                        line.source_file_id, line.subsection_offset, line.checksum_kind, line.checksum,
+                        line.has_columns, line.is_statement});
+                }
+                if (!module.pdb_source_lines_complete)
+                    module.pdb_source_line_diagnostic = "C13 source rows were bounded by the 250000-row / 64 MiB retention limit";
             }
             ++bound_modules;
         }
