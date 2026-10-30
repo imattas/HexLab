@@ -69,6 +69,20 @@ void n64_scalar_decode() {
               scd.instruction->access[0] == OperandAccess::read_write,
           "SCD decodes source and success-result register effects");
 
+    // PREF is an architecturally nonbinding prefetch hint. It consumes an
+    // effective address but does not itself read or write program memory.
+    const auto pref = decode((0x33u << 26) | (8u << 21) | (5u << 16) | 0xfff0u);
+    const auto *pref_memory = pref.instruction && pref.instruction->operands.size() > 1
+                                  ? std::get_if<MemoryOperand>(&pref.instruction->operands[1]) : nullptr;
+    check(pref.status == DecodeStatus::decoded && pref.instruction &&
+              pref.instruction->opcode == Opcode::mips64_pref &&
+              pref.instruction->operands.size() == 2 && pref_memory && pref_memory->base &&
+              pref_memory->base->index == 8 && pref_memory->displacement == -16 &&
+              pref.instruction->register_reads == std::vector<RegisterOperand>{{RegisterBank::mips_gpr, 8, 64, false}} &&
+              !pref.instruction->memory_read && !pref.instruction->memory_write &&
+              format_instruction(*pref.instruction) == "pref 0x5, -0x10(t0)",
+          "PREF retains hint/address while avoiding a false architectural memory access");
+
     const auto dmult = decode((8u << 21) | (9u << 16) | 0x1cu);
     const auto mfhi = decode((8u << 11) | 0x10u);
     const auto ddivu = decode((10u << 21) | (11u << 16) | 0x1fu);
@@ -199,8 +213,14 @@ void n64_cop1_decode() {
               branch.instruction->register_reads == std::vector<RegisterOperand>{{RegisterBank::mips_fcsr, 0, 32, false}},
           "N64 BC1T tests FCC0 and preserves its classic delay slot");
     const auto likely_branch = decode((0x11u << 26) | (8u << 21) | (3u << 16) | 1u);
-    check(likely_branch.status == DecodeStatus::unsupported,
-          "COP1 likely branches remain unsupported rather than losing annul semantics");
+    check(likely_branch.status == DecodeStatus::decoded && likely_branch.instruction &&
+              likely_branch.instruction->opcode == Opcode::mips64_bc1tl &&
+              likely_branch.instruction->flow == FlowKind::conditional_branch &&
+              likely_branch.instruction->delay_slots == 1 &&
+              likely_branch.instruction->direct_target == Address{{0}, 0x1'0000'1008ULL} &&
+              likely_branch.instruction->register_reads ==
+                  std::vector<RegisterOperand>{{RegisterBank::mips_fcsr, 0, 32, false}},
+          "COP1 likely branches decode with FCC state and retain their annulled delay slot");
     const auto unsupported_format = cop1(20, 0, 1, 2, 0);
     check(unsupported_format.status == DecodeStatus::unsupported,
           "N64 COP1 word arithmetic remains unsupported");

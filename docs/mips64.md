@@ -4,6 +4,8 @@ HexLab assigns `EM_MIPS` (`e_machine=8`) with ELF64 class to the MIPS64 context 
 
 Linux debugger process identification uses the ELF class and byte order when reading `e_machine`, so it recognizes both little- and big-endian ELF64 MIPS processes as MIPS64. The loader follows the ELF64 `EM_MIPS` N64-class convention; it does not claim to validate individual ABI flags or select N32/O32 calling conventions.
 
+The integer decoder recognizes `PREF` (opcode `0x33`) as a nonbinding prefetch hint. It preserves the five-bit hint and the sign-extended 16-bit base displacement, records the 64-bit base-register read, and formats the address without claiming an architectural memory read or write. The decoder does not model implementation-specific cache behavior or hint performance effects.
+
 The pre-Release 6 SPECIAL2 count-leading group covers CLZ/CLO on words and
 DCLZ/DCLO on doublewords. The decoder requires the legacy `rt == rd` encoding
 and a zero shift field; these instructions do not raise arithmetic exceptions.
