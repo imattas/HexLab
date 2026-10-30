@@ -17,6 +17,22 @@ int main() {
     _CrtSetReportFile(_CRT_ASSERT,_CRTDBG_FILE_STDERR);
     _set_abort_behavior(0,_WRITE_ABORT_MSG|_CALL_REPORTFAULT);
 #endif
+    auto type_size_expressions=import_c_header(R"(
+        struct HeaderRecord { char tag; int value; };
+        static_assert(sizeof(int) == 4, "int ABI width");
+        static_assert(sizeof(struct HeaderRecord) == 8, "aggregate extent");
+        static_assert(alignof(struct HeaderRecord) == 4, "aggregate alignment");
+        static_assert(sizeof(int *) == 8, "pointer width");
+        static_assert(sizeof(unsigned char[3]) == 3, "array extent");
+        enum HeaderSizes { header_record_bytes = sizeof(struct HeaderRecord) };
+    )");
+    if (!type_size_expressions ||
+        type_size_expressions.value().enum_constants.at("header_record_bytes") != 8) {
+        std::cerr << "RED: sizeof(type-id) and alignof(type-id) were not evaluated in header constants";
+        if (!type_size_expressions) std::cerr << ": " << type_size_expressions.error().message;
+        std::cerr << '\n';
+        return 1;
+    }
     const std::string header=R"(
         typedef unsigned long UWORD;
         struct Packet {
@@ -69,9 +85,17 @@ int main() {
     auto mutually_recursive=import_c_header(
         "struct Left { struct Right *right; }; struct Right { struct Left *left; };");
     if(!(mutually_recursive &&
+         mutually_recursive.value().symbols.at("struct Left").type->members()[0].type->kind()==Kind::pointer &&
+         mutually_recursive.value().symbols.at("struct Left").type->members()[0].type->element()->kind()==Kind::named_reference &&
          mutually_recursive.value().symbols.at("struct Left").type->members()[0].type->element()->name()=="struct Right" &&
+         mutually_recursive.value().symbols.at("struct Right").type->members()[0].type->kind()==Kind::pointer &&
+         mutually_recursive.value().symbols.at("struct Right").type->members()[0].type->element()->kind()==Kind::named_reference &&
          mutually_recursive.value().symbols.at("struct Right").type->members()[0].type->element()->name()=="struct Left")) {
-        std::cerr << "RED: mutually recursive pointer graph was not imported\n"; return 1;
+        std::cerr << "RED: mutually recursive pointer graph was not imported";
+        if(!mutually_recursive) std::cerr << ": " << mutually_recursive.error().message;
+        else std::cerr << ": Left edge=" << mutually_recursive.value().symbols.at("struct Left").type->members()[0].type->element()->name()
+                       << ", Right edge=" << mutually_recursive.value().symbols.at("struct Right").type->members()[0].type->element()->name();
+        std::cerr << '\n'; return 1;
     }
     auto recursive_by_value=import_c_header("struct InvalidLoop { struct InvalidLoop next; };");
     if(recursive_by_value || recursive_by_value.error().code!=hexlab::ErrorCode::unsupported) {
@@ -201,15 +225,17 @@ int main() {
     auto malformed_attribute=import_c_header("struct __attribute__((packed WireRecord { int value; };");
     assert(!malformed_attribute && malformed_attribute.error().code==hexlab::ErrorCode::malformed);
     auto unsupported_attribute=import_c_header("struct __attribute__((aligned(16))) AlignedRecord { int value; };");
-    assert(!unsupported_attribute && unsupported_attribute.error().code==hexlab::ErrorCode::unsupported);
-    auto unsupported_calling_convention=import_c_header("int __attribute__((stdcall)) callback(int value);");
-    assert(!unsupported_calling_convention && unsupported_calling_convention.error().code==hexlab::ErrorCode::unsupported &&
-           unsupported_calling_convention.error().message.find("calling-convention")!=std::string::npos);
-    auto unsupported_calling_convention_keyword=import_c_header("int __stdcall callback(int value);");
-    assert(!unsupported_calling_convention_keyword && unsupported_calling_convention_keyword.error().code==hexlab::ErrorCode::unsupported &&
-           unsupported_calling_convention_keyword.error().message.find("calling-convention")!=std::string::npos);
-    auto unsupported_declspec=import_c_header("struct __declspec(align(16)) AlignedRecord { int value; };");
-    assert(!unsupported_declspec && unsupported_declspec.error().code==hexlab::ErrorCode::unsupported);
+    if (!unsupported_attribute || unsupported_attribute.value().symbols.at("struct AlignedRecord").type->alignment()!=16) {
+        std::cerr << "RED: supported aligned aggregate attribute was not applied";
+        if (!unsupported_attribute) std::cerr << ": " << unsupported_attribute.error().message;
+        std::cerr << '\n'; return 1;
+    }
+    auto attributed_calling_convention=import_c_header("int __attribute__((stdcall)) callback(int value);");
+    assert(attributed_calling_convention && attributed_calling_convention.value().symbols.at("callback").type->function_convention()==FunctionConvention::stdcall);
+    auto keyword_calling_convention=import_c_header("int __stdcall callback(int value);");
+    assert(keyword_calling_convention && keyword_calling_convention.value().symbols.at("callback").type->function_convention()==FunctionConvention::stdcall);
+    auto declspec_aligned=import_c_header("struct __declspec(align(16)) AlignedRecord { int value; };");
+    assert(declspec_aligned && declspec_aligned.value().symbols.at("struct AlignedRecord").type->alignment()==16);
 
     auto pragma_packed=import_c_header(R"(
 #pragma pack(push, 2)
@@ -315,8 +341,7 @@ api_word exported;
     assert(!unresolved_include && unresolved_include.error().code == hexlab::ErrorCode::unsupported &&
            unresolved_include.error().message.find("unable to resolve include") != std::string::npos);
     auto function_macro = import_c_header("#define DECLARE(x) int x\nint value;", preprocessing);
-    assert(!function_macro && function_macro.error().code == hexlab::ErrorCode::unsupported &&
-           function_macro.error().message.find("function-like macros") != std::string::npos);
+    assert(function_macro && function_macro.value().symbols.contains("value"));
     auto conditional = import_c_header("#if 0\nint hidden;\n#elif defined(HEX_FEATURE)\nint selected;\n#else\nint other;\n#endif\n", preprocessing);
     if (!conditional) { std::cerr << "conditional preprocessing failed: " << conditional.error().message << '\n'; return 1; }
     if (conditional.value().symbols.contains("hidden") || !conditional.value().symbols.contains("selected") || conditional.value().symbols.contains("other")) {

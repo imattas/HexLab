@@ -115,7 +115,9 @@ linkage string literals are rejected explicitly.
 
 An integer constant-expression evaluator supports decimal, octal, and
 hexadecimal literals; previously bound integral template parameters;
-`true`/`false`; parentheses; unary `+`, `-`, `~`; arithmetic `+`, `-`, `*`,
+`true`/`false`; type-id `sizeof(T)`, `alignof(T)`, and `_Alignof(T)` using
+already imported ABI sizes and alignments; `sizeof...(Pack)` for a bound
+template parameter pack; parentheses; unary `+`, `-`, `~`; arithmetic `+`, `-`, `*`,
 `/`, `%`; shifts `<<`, `>>`; relational `<`, `>`, `<=`, `>=`; equality `==`,
 `!=`; logical `&&`, `||`; and bitwise `&`, `^`, `|`, with C++-style operator
 precedence. It is used for non-type template
@@ -399,11 +401,11 @@ These errors are returned explicitly; no partial symbol table is returned.
 
 File-scope and aggregate-scope `static_assert` and `_Static_assert`
 declarations are checked using the bounded integer-constant-expression parser.
-Assertions may use previously imported enum constants and expanded object-like
-macros, and may include an optional adjacent string-literal message. A false
-assertion returns a conflict with its source line and message. Expressions
-outside the supported constant-expression subset, including type-form `sizeof`,
-are rejected explicitly rather than ignored.
+Assertions may use previously imported enum constants, expanded object-like
+macros, type-id `sizeof`/`alignof` queries, and an optional adjacent
+string-literal message. A false assertion returns a conflict with its source
+line and message. Expression-form `sizeof`, conditional expressions, and
+general C++ constant evaluation remain outside the supported subset.
 
 Enum assignments accept bounded integer constant expressions using the
 supported evaluator above, including references to earlier
