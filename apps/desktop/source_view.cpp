@@ -1206,15 +1206,53 @@ void SourceView::set_document(std::shared_ptr<const DocumentSnapshot> document) 
                         "inlinee IPI " + std::to_string(site.inlinee_id) + ", module " + std::to_string(site.module_index) +
                         ", site " + std::to_string(site.record_offset)});
     }
+    std::vector<SourceRow> sequence;
+    std::vector<Address> sequence_addresses;
+    auto append_sequence = [&](std::optional<Address> end) {
+        auto boundaries = sequence_addresses;
+        std::sort(boundaries.begin(), boundaries.end(), [](Address left, Address right) {
+            return left.space.value < right.space.value ||
+                (left.space == right.space && left.offset < right.offset);
+        });
+        boundaries.erase(std::unique(boundaries.begin(), boundaries.end()), boundaries.end());
+        for (auto &row : sequence) {
+            const auto next = std::upper_bound(boundaries.begin(), boundaries.end(), row.address,
+                [](Address value, Address candidate) {
+                    return value.space.value < candidate.space.value ||
+                        (value.space == candidate.space && value.offset < candidate.offset);
+                });
+            if (next != boundaries.end() && next->space == row.address.space)
+                row.mapping_end = next->offset;
+            if (end && end->space == row.address.space && end->offset >= row.address.offset &&
+                (!row.mapping_end || end->offset < *row.mapping_end)) row.mapping_end = end->offset;
+            rows_.push_back(std::move(row));
+        }
+        sequence.clear();
+        sequence_addresses.clear();
+    };
     if (metadata->elf) {
-        for (const auto &row : metadata->elf->source_lines)
-            if (!row.end_sequence && row.line > 0 && !row.file.empty())
-                rows_.push_back({row.address, row.file, row.line, row.column});
+        for (const auto &row : metadata->elf->source_lines) {
+            if (row.end_sequence) {
+                append_sequence(row.address);
+            } else {
+                sequence_addresses.push_back(row.address);
+                if (row.line > 0 && !row.file.empty())
+                    sequence.push_back({row.address, row.file, row.line, row.column});
+            }
+        }
+        append_sequence({});
     }
     if (metadata->macho) {
-        for (const auto &row : metadata->macho->source_lines)
-            if (!row.end_sequence && row.address && row.line > 0 && !row.file.empty())
-                rows_.push_back({*row.address, row.file, row.line, row.column});
+        for (const auto &row : metadata->macho->source_lines) {
+            if (row.end_sequence) {
+                append_sequence(row.address);
+            } else if (row.address) {
+                sequence_addresses.push_back(*row.address);
+                if (row.line > 0 && !row.file.empty())
+                    sequence.push_back({*row.address, row.file, row.line, row.column});
+            }
+        }
+        append_sequence({});
     }
     if (metadata->dex) {
         constexpr std::size_t max_dex_source_rows = 250'000;
@@ -1323,6 +1361,7 @@ const SourceView::SourceRow *SourceView::source_row_for(Address address, bool &a
     for (auto iterator = begin; iterator != after; ++iterator) {
         const auto &row = rows_[*iterator];
         if (row.address.space != address.space || row.address.offset > address.offset) continue;
+        if (row.mapping_end && address.offset >= *row.mapping_end) continue;
         if (row.inline_size && address.offset - row.address.offset >= row.inline_size) continue;
         if (selected && row.inline_depth && row.inline_depth == selected->inline_depth &&
             (row.path != selected->path || row.line != selected->line || row.scope != selected->scope))

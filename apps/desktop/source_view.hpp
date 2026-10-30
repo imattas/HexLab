@@ -70,6 +70,7 @@ class SourceView final : public wxPanel {
         std::uint64_t column = 0;
         std::uint32_t inline_size = 0, inline_depth = 0;
         std::string scope;
+        std::optional<std::uint64_t> mapping_end;
     };
     struct SourceRevisionEvidence {
         std::uint8_t checksum_kind = 0;

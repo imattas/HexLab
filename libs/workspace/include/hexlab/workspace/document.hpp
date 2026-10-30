@@ -3,6 +3,7 @@
 #include "hexlab/loaders/pe.hpp"
 #include "hexlab/loaders/raw.hpp"
 #include "hexlab/loaders/macho.hpp"
+#include "hexlab/loaders/recipe.hpp"
 #include "hexlab/workspace/workspace_export.hpp"
 
 namespace hexlab {
@@ -32,6 +33,10 @@ struct OpenRequest {
     std::vector<std::filesystem::path> pdb_search_paths;
     // Explicit supplementary ELF DWP package; never inferred from DWARF paths.
     std::optional<std::filesystem::path> dwarf_supplementary_package_path;
+    // Exact previously resolved durable selection, used when reopening a
+    // session whose image came from a plugin provider. When present, the
+    // recipe is validated and used without probing for a replacement provider.
+    std::optional<LoadRecipe> resolved_recipe;
 };
 struct DocumentSnapshot {
     DocumentId id{0};

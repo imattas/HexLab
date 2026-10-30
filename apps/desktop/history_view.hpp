@@ -40,6 +40,7 @@ private:
     void begin_audit();
     void stop_audit();
     void record_audit_result(const wxString&);
+    void set_audit_status(const wxString&);
     void update_source_status();
     void copy_audit_json();
     void compare_with_previous();
@@ -57,6 +58,7 @@ private:
     VirtualTable* preview_items_ = nullptr;
     wxStaticText* status_ = nullptr;
     wxStaticText* source_status_ = nullptr;
+    wxStaticText* audit_status_ = nullptr;
     wxStaticText* preview_status_ = nullptr;
     wxTextCtrl* history_filter_ = nullptr;
     wxStaticText* history_filter_status_ = nullptr;
