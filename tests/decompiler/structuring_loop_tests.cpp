@@ -161,6 +161,44 @@ LiftedFunction loop_with_switch_dispatch() {
         selector_value, {{0, case_zero}, {1, case_one}}, default_case, true};
     return function;
 }
+
+LiftedFunction posttested_loop_with_switch_dispatch() {
+    const auto entry = address(0x9000), dispatch_at = address(0x9010);
+    const auto case_zero = address(0x9020), case_one = address(0x9030);
+    const auto default_case = address(0x9040), latch = address(0x9050), exit = address(0x9060);
+    const RegisterOperand selector{RegisterBank::gpr, 0, 64, false};
+    const auto selector_value = std::make_shared<Expression>(Expression{
+        {TypeKind::integer, 64, false}, RegisterValue{selector, std::nullopt}});
+    LiftedFunction function{FunctionId{900}, entry, {}, {}};
+    function.blocks = {
+        {BlockId{900}, entry, {{{entry, 900}, Branch{"true", dispatch_at, {}}}},
+         {{entry, dispatch_at, BlockId{901}, BlockEdgeKind::jump}}, {}},
+        {BlockId{901}, dispatch_at, {{{dispatch_at, 901}, Branch{"true", {}, {}}}},
+         {{dispatch_at, case_zero, BlockId{902}, BlockEdgeKind::jump},
+          {dispatch_at, case_one, BlockId{903}, BlockEdgeKind::jump},
+          {dispatch_at, default_case, BlockId{904}, BlockEdgeKind::jump}}, {}},
+        {BlockId{902}, case_zero,
+         {{{case_zero, 902}, Intrinsic{"case_zero_work", {}, {}}},
+          {{address(0x9024), 9024}, Branch{"true", latch, {}}}},
+         {{case_zero, latch, BlockId{905}, BlockEdgeKind::jump}}, {}},
+        {BlockId{903}, case_one,
+         {{{case_one, 903}, Intrinsic{"case_one_work", {}, {}}},
+          {{address(0x9034), 9034}, Branch{"true", latch, {}}}},
+         {{case_one, latch, BlockId{905}, BlockEdgeKind::jump}}, {}},
+        {BlockId{904}, default_case,
+         {{{default_case, 904}, Intrinsic{"default_work", {}, {}}},
+          {{address(0x9044), 9044}, Branch{"true", latch, {}}}},
+         {{default_case, latch, BlockId{905}, BlockEdgeKind::jump}}, {}},
+        {BlockId{905}, latch, {{{latch, 905}, Branch{"repeat", entry, exit}}},
+         {{latch, entry, BlockId{900}, BlockEdgeKind::conditional_true},
+          {latch, exit, BlockId{906}, BlockEdgeKind::conditional_false}}, {}},
+        {BlockId{906}, exit, {{{exit, 906}, Return{}}}, {}, {}}
+    };
+    function.blocks[1].switch_dispatch = LiftedBlock::SwitchDispatch{
+        selector_value, {{0, case_zero}, {1, case_one}}, default_case, true};
+    function.blocks[1].instructions.back().statement = Branch{"true", {}, {}};
+    return function;
+}
 }
 
 int main() {
@@ -182,14 +220,6 @@ int main() {
                 continue_output.text.find("goto") == std::string::npos,
             "conditional continue preserves initialization and every header-phi edge assignment");
 
-    const auto nested_output = format_structured_pseudocode(nested_while_loops());
-    require(!nested_output.used_fallback && nested_output.text.find("while (outer_more)") != std::string::npos &&
-                nested_output.text.find("while (inner_more)") != std::string::npos &&
-                nested_output.text.find("before_inner()") < nested_output.text.find("while (inner_more)") &&
-                nested_output.text.find("after_inner()") > nested_output.text.find("while (inner_more)") &&
-                nested_output.text.find("goto") == std::string::npos,
-            "a nested natural loop emits the inner region before resuming the outer body");
-
     const auto diamond_output = format_structured_pseudocode(loop_with_conditional_diamond());
     require(!diamond_output.used_fallback && diamond_output.text.find("while (keep_going)") != std::string::npos &&
                 diamond_output.text.find("if (choose_yes)") != std::string::npos &&
@@ -210,6 +240,34 @@ int main() {
                 switch_output.text.find("after_switch()") == switch_output.text.rfind("after_switch()") &&
                 switch_output.text.find("goto") == std::string::npos,
             "complete switch arms inside a natural loop converge on one emitted continuation");
+    auto switch_with_phi = posttested_loop_with_switch_dispatch();
+    const RegisterOperand switch_result{RegisterBank::gpr, 1, 64, false};
+    switch_with_phi.blocks[5].phis.push_back({switch_result, 1,
+        {{BlockId{902}, 2}, {BlockId{903}, 3}, {BlockId{904}, 4}}});
+    const auto switch_phi_output = format_structured_pseudocode(switch_with_phi);
+    require(!switch_phi_output.used_fallback &&
+                switch_phi_output.text.find("do {") != std::string::npos &&
+                switch_phi_output.text.find("switch (r0)") != std::string::npos &&
+                switch_phi_output.text.find("r1_1 = r1_2;") != std::string::npos &&
+                switch_phi_output.text.find("r1_1 = r1_3;") != std::string::npos &&
+                switch_phi_output.text.find("r1_1 = r1_4;") != std::string::npos &&
+                switch_phi_output.text.find("case_zero_work()") < switch_phi_output.text.find("r1_1 = r1_2;") &&
+                switch_phi_output.text.find("r1_1 = r1_2;") < switch_phi_output.text.find("break;") &&
+                switch_phi_output.text.find("} while (repeat);") != std::string::npos &&
+                switch_phi_output.text.find("goto") == std::string::npos,
+            "switch case tails lower exact register-phi inputs before one shared loop continuation");
+    auto malformed_switch_phi = switch_with_phi;
+    malformed_switch_phi.blocks[5].phis[0].inputs.pop_back();
+    const auto malformed_switch_phi_output = format_structured_pseudocode(malformed_switch_phi);
+    require(malformed_switch_phi_output.used_fallback && !malformed_switch_phi_output.fallback_reason.empty(),
+            "loop-switch continuation rejects missing case-tail phi inputs");
+    const auto nested_output = format_structured_pseudocode(nested_while_loops());
+    require(!nested_output.used_fallback && nested_output.text.find("while (outer_more)") != std::string::npos &&
+                nested_output.text.find("while (inner_more)") != std::string::npos &&
+                nested_output.text.find("before_inner()") < nested_output.text.find("while (inner_more)") &&
+                nested_output.text.find("after_inner()") > nested_output.text.find("while (inner_more)") &&
+                nested_output.text.find("goto") == std::string::npos,
+            "a nested natural loop emits the inner region before resuming the outer body");
     auto incomplete_switch = switch_function;
     incomplete_switch.blocks[2].switch_dispatch->complete = false;
     const auto incomplete_switch_output = format_structured_pseudocode(incomplete_switch);

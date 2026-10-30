@@ -48,10 +48,12 @@ diamonds described below, joined by straight-line chains. The parent continuatio
 preserving common cleanup and result code that precedes the return. The
 post-tested form supports the loop edge on either condition arm and inverts the
 displayed condition when needed. Its body may also contain a bounded switch whose
-phi-free, straight-line arms reconverge at one shared continuation. The formatter
-emits each arm as a `case`/`default` body and resumes the loop body at that
-continuation, including when it is the latch. Switch edges and arm predecessors
-must match the CFG exactly; side entries, side exits, and ambiguous joins retain
+phi-free, straight-line arms reconverge at one shared continuation. Register
+phis at that continuation are accepted when each input exactly matches one
+case-tail predecessor; simultaneous copies execute in the corresponding case
+before `break`. The formatter resumes the loop body at the continuation,
+including when it is the latch. Switch edges and arm predecessors must match the
+CFG exactly; side entries, side exits, memory phis, and ambiguous joins retain
 the conservative fallback.
 
 A post-tested loop's exit cleanup may end in one terminal conditional whose two

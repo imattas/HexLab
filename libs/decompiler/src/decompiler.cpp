@@ -11538,6 +11538,7 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
             const LiftedBlock *dispatch = nullptr;
             const LiftedBlock *join = nullptr;
             std::vector<DoLoopSwitchArm> arms;
+            std::map<std::uint64_t, std::vector<std::pair<std::string, std::string>>> join_phi_copies;
         };
         std::vector<DoLoopDiamond> diamonds;
         std::set<std::uint64_t> consumed_phi_joins;
@@ -11713,7 +11714,8 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                             return endpoint == endpoints.front();
                         })) join = endpoints.front();
                 }
-                if (!join || join == current || join->phis.size() || join->memory_phi) body_valid = false;
+                if (!join || join == current || join->memory_phi || !join->memory_partition_phis.empty())
+                    body_valid = false;
                 std::set<std::uint64_t> join_predecessors;
                 if (body_valid) {
                     for (std::size_t i = 0; i < traces.size(); ++i) {
@@ -11735,6 +11737,10 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                         region.arms.push_back(std::move(arm));
                     }
                     if (predecessors[join->id.value] != join_predecessors) body_valid = false;
+                    if (body_valid && !join->phis.empty() &&
+                        !validate_join_phis(*join, join_predecessors, region.join_phi_copies))
+                        body_valid = false;
+                    if (body_valid && !join->phis.empty()) consumed_phi_joins.insert(join->id.value);
                 }
                 if (!body_valid || !do_body_ids.insert(current->id.value).second) { body_valid = false; break; }
                 region.join = join;
@@ -11933,7 +11939,8 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
         }
         const auto *condition = latch ? terminal_conditional(*latch) : nullptr;
         if (body_valid && latch && latch != entry && !do_body_ids.empty() && condition &&
-            latch->phis.empty() && !latch->memory_phi && latch->successors.size() == 2 &&
+            (latch->phis.empty() || consumed_phi_joins.contains(latch->id.value)) &&
+            !latch->memory_phi && latch->memory_partition_phis.empty() && latch->successors.size() == 2 &&
             condition->true_target && condition->false_target &&
             ((edge_targets(latch->successors[0], *condition->true_target) &&
               edge_targets(latch->successors[1], *condition->false_target)) ||
@@ -12101,6 +12108,10 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                                 out << "        case 0x" << std::hex << value << std::dec << ":\n";
                             if (arm.is_default) out << "        default:\n";
                             for (const auto *arm_block : arm.body) emit_block(*arm_block, 12, true);
+                            const auto predecessor = arm.body.empty() ? region.dispatch->id.value : arm.body.back()->id.value;
+                            if (const auto copies = region.join_phi_copies.find(predecessor);
+                                copies != region.join_phi_copies.end())
+                                emit_parallel_copies(out, copies->second, 12);
                             out << "            break;\n";
                         }
                         out << "        }\n";
