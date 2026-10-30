@@ -25,6 +25,57 @@ else:
     raise AssertionError("closed debugger session remained usable")
 with tempfile.TemporaryDirectory(prefix="hexlab-python-") as temporary:
     root = pathlib.Path(temporary)
+    archive_payload = b"archive member bytes"
+    archive_header = ("object.o/".ljust(16) + "0".ljust(12) + "0".ljust(6) +
+                      "0".ljust(6) + "100644".ljust(8) + str(len(archive_payload)).ljust(10) + "`\n").encode("ascii")
+    archive_path = root / "objects.a"
+    archive_path.write_bytes(b"!<arch>\n" + archive_header + archive_payload +
+                             (b"\n" if len(archive_payload) % 2 else b""))
+    extracted_path = root / "object-copy.o"
+    with hexlab.Archive.open(archive_path) as archive:
+        extraction = archive.extract_member(0, extracted_path, chunk_size=3)
+        assert extraction == {"path": str(extracted_path), "bytes": len(archive_payload), "member_index": 0}
+        assert extracted_path.read_bytes() == archive_payload
+        try:
+            archive.extract_member(0, extracted_path)
+        except FileExistsError:
+            pass
+        else:
+            raise AssertionError("archive extraction replaced an existing destination")
+        too_small = root / "too-small.o"
+        try:
+            archive.extract_member(0, too_small, max_bytes=len(archive_payload) - 1)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("archive extraction exceeded its explicit byte budget")
+        assert not too_small.exists()
+        failed_path = root / "failed.o"
+        original_read_member = archive.read_member
+        def fail_archive_read(*args):
+            raise OSError("fixture read failure")
+        archive.read_member = fail_archive_read
+        try:
+            try:
+                archive.extract_member(0, failed_path)
+            except OSError as error:
+                assert str(error) == "fixture read failure"
+            else:
+                raise AssertionError("archive extraction swallowed a read failure")
+        finally:
+            archive.read_member = original_read_member
+        assert not failed_path.exists()
+        assert not list(root.glob(".hexlab-ar-extract-*"))
+        canceled_path = root / "canceled.o"
+        canceled_extraction = hexlab.CancellationToken()
+        canceled_extraction.cancel()
+        try:
+            archive.extract_member(0, canceled_path, cancel=canceled_extraction)
+        except hexlab.AnalysisCancelled:
+            pass
+        else:
+            raise AssertionError("archive extraction ignored a pre-canceled token")
+        assert not canceled_path.exists()
     source = root / "original.bin"
     source.write_bytes(b"\x90\xc3batch artifact string\0")
     path = root / "unicode-\u03bb.hxproj"
