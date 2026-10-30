@@ -610,6 +610,38 @@ ExpressionPtr simplify_consensus(const ExpressionPtr &expression) {
     return {};
 }
 
+// x | (~x & y) == x | y, with the dual x & (~x | y) == x & y.
+// Restrict this to total expressions so the rewrite cannot hide a trapping or
+// poison-producing operation in either operand.
+ExpressionPtr simplify_complemented_absorption(const ExpressionPtr &expression) {
+    const auto *root = expression ? std::get_if<BinaryValue>(&expression->value) : nullptr;
+    if (!root || (root->operation != "and" && root->operation != "or") ||
+        expression->type.kind != TypeKind::integer || !valid_bitvector(*expression) ||
+        !root->left || !root->right || expression_nodes(expression) > 256 ||
+        !total_select_value(root->left) || !total_select_value(root->right))
+        return {};
+
+    const auto inner_operation = root->operation == "or" ? "and" : "or";
+    const auto match = [&](const ExpressionPtr &candidate,
+                           const ExpressionPtr &nested_expression) -> ExpressionPtr {
+        const auto *nested = nested_expression
+            ? std::get_if<BinaryValue>(&nested_expression->value) : nullptr;
+        if (!nested || nested->operation != inner_operation || !nested->left || !nested->right ||
+            candidate->type != expression->type || nested_expression->type != expression->type ||
+            nested->left->type != expression->type || nested->right->type != expression->type)
+            return {};
+        for (const auto &value : {nested->left, nested->right}) {
+            const auto &other = value == nested->left ? nested->right : nested->left;
+            if (bitwise_complements(candidate, value) && total_select_value(other))
+                return std::make_shared<Expression>(Expression{expression->type,
+                    BinaryValue{root->operation, candidate, other}});
+        }
+        return {};
+    };
+    if (auto simplified = match(root->left, root->right)) return simplified;
+    return match(root->right, root->left);
+}
+
 // A sign-extended one-bit predicate is exactly an all-zero/all-one mask.
 // Therefore (yes & sext(c)) | (no & ~sext(c)) is c ? yes : no. Require the
 // exact same SSA predicate in both masks and total pure arms; do not infer the
@@ -1043,6 +1075,7 @@ ExpressionPtr simplify(const ExpressionPtr &input) {
     if (auto cleared = simplify_masked_clear(result)) return cleared;
     if (auto select = simplify_boolean_mask_select(result)) return select;
     if (auto consensus = simplify_consensus(result)) return consensus;
+    if (auto absorbed = simplify_complemented_absorption(result)) return absorbed;
     if (auto carry = simplify_add_xor_difference(result)) return carry;
     if (auto carry = simplify_carry_recombination(result)) return carry;
     if (auto low_bit = simplify_lowest_set_bit(result)) return low_bit;
