@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <array>
 #include <optional>
+#include <span>
 #include <vector>
 #include <stop_token>
 namespace hexlab {
@@ -61,4 +62,25 @@ struct MachOChainedTargetResolutionLimits {
 HEXLAB_LOADERS_EXPORT Result<std::vector<MachOChainedExternalTarget>> resolve_macho_chained_external_targets(
     const MachOMetadata &, const MachOChainedTargetBases &, std::stop_token = {},
     MachOChainedTargetResolutionLimits = {});
+
+enum class MachOChainedBindStatus : std::uint8_t { resolved, missing_import_address, invalid_encoding, overflow };
+struct MachOChainedBindTarget {
+    std::size_t pointer_index = 0;
+    std::uint32_t import_row = 0;
+    MachOChainedBindStatus status = MachOChainedBindStatus::missing_import_address;
+    std::optional<std::uint64_t> import_address, target_address;
+    std::optional<std::int64_t> combined_addend;
+    bool authentication_required = false;
+};
+struct MachOChainedBindResolutionLimits {
+    std::size_t max_pointer_rows = 1'000'000;
+};
+// Resolves chained bind pointers from explicit per-import-row addresses. The
+// address span must match metadata.chained_imports; null entries remain
+// unresolved. Results include the checked sum of import and pointer addends.
+// Authenticated binds return their pre-PAC address and still require runtime
+// signing; this function never writes pointer bytes or validates trust.
+HEXLAB_LOADERS_EXPORT Result<std::vector<MachOChainedBindTarget>> resolve_macho_chained_binds(
+    const MachOMetadata &, std::span<const std::optional<std::uint64_t>> import_addresses,
+    std::stop_token = {}, MachOChainedBindResolutionLimits = {});
 } // namespace hexlab

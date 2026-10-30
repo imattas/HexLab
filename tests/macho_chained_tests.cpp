@@ -2,6 +2,7 @@
 #include "support/macho_chained_fixture.hpp"
 #include "support/analysis_fixture.hpp"
 #include "support/checks.hpp"
+#include <algorithm>
 using namespace hexlab;
 using namespace hexlab_test;
 using namespace hexlab_test::macho_fixture;
@@ -61,10 +62,15 @@ void generic() {
 }
 void partial() {
     auto data = chained();
+    constexpr std::array<std::uint8_t, 13> compressed_name{120, 156, 139, 79, 173, 40, 97,
+                                                           0, 0, 5, 196, 1, 177};
+    for (std::size_t i = 0; i < compressed_name.size(); ++i)
+        data[chains_at + 80 + i] = std::byte{compressed_name[i]};
+    put(data, dyld_command(true) + 48 + 12, 93, 4, false);
     put(data, chains_at + 24, 1, 4, false);
-    const auto compressed = take(load(data));
-    check(!compressed.metadata.macho->dyld_complete && !compressed.metadata.macho->chained_imports[0].name,
-          "compressed symbol pool remains explicit raw partial metadata without guessed decompression");
+    const auto compressed = take(load(std::move(data)));
+    check(compressed.metadata.macho->dyld_complete && compressed.metadata.macho->chained_imports[0].name == "_ext",
+          "bounded zlib chained-import symbol pools decode their original symbol names");
     data = chained();
     put(data, chains_at + 42, 99, 2, false);
     const auto unknown = take(load(data));
@@ -160,6 +166,7 @@ void ordinal_boundaries() {
     constexpr std::uint32_t payload = 12288;
     auto original = chained();
     auto data = thin(true, false);
+    put(data, 28, 0, 4, false);
     data.resize(16384);
     put(data, 16, 1, 4, false);
     put(data, 20, 72, 4, false);
@@ -186,6 +193,71 @@ void ordinal_boundaries() {
                   (ordinal == 254 ? -2 : static_cast<int>(ordinal)),
               "8-bit import ordinals128..240 stay positive while only reserved top15 values are special");
     }
+}
+void bind_resolution() {
+    auto loaded = take(load(chained(true, 2, 2)));
+    std::vector<std::optional<std::uint64_t>> import_addresses{UINT64_C(0x2000)};
+    const auto resolved = take(resolve_macho_chained_binds(*loaded.metadata.macho, import_addresses));
+    check(resolved.size() == 1 && resolved[0].pointer_index == 1 && resolved[0].import_row == 0 &&
+              resolved[0].status == MachOChainedBindStatus::resolved &&
+              resolved[0].import_address == UINT64_C(0x2000) && resolved[0].combined_addend == 252 &&
+              resolved[0].target_address == UINT64_C(0x20fc) && !resolved[0].authentication_required,
+          "caller-supplied import addresses resolve chained binds with checked combined addends");
+
+    import_addresses[0].reset();
+    const auto missing = take(resolve_macho_chained_binds(*loaded.metadata.macho, import_addresses));
+    check(missing.size() == 1 && missing[0].status == MachOChainedBindStatus::missing_import_address &&
+              !missing[0].target_address,
+          "unprovided strong imports remain explicitly unresolved");
+    import_addresses[0] = 0;
+    const auto zero = take(resolve_macho_chained_binds(*loaded.metadata.macho, import_addresses));
+    check(zero[0].status == MachOChainedBindStatus::resolved && zero[0].target_address == 252,
+          "an explicit zero import address is distinct from a missing target");
+    check(!resolve_macho_chained_binds(*loaded.metadata.macho, {}),
+          "import-address namespace must match the parsed chained-import table");
+
+    import_addresses[0] = UINT64_MAX - 2;
+    const auto overflow = take(resolve_macho_chained_binds(*loaded.metadata.macho, import_addresses));
+    check(overflow[0].status == MachOChainedBindStatus::overflow && !overflow[0].target_address,
+          "positive chained addends cannot wrap an external import address");
+
+    auto sum_overflow_bytes = chained(true, 2, 3);
+    put(sum_overflow_bytes, chains_at + 72, INT64_MAX, 8, false);
+    const auto sum_overflow_image = take(load(std::move(sum_overflow_bytes)));
+    import_addresses[0] = UINT64_C(0x3000);
+    const auto sum_overflow = take(resolve_macho_chained_binds(*sum_overflow_image.metadata.macho, import_addresses));
+    check(sum_overflow[0].status == MachOChainedBindStatus::overflow && !sum_overflow[0].combined_addend &&
+              !sum_overflow[0].target_address,
+          "combined import and pointer addends cannot overflow signed64");
+
+    const auto auth_pointer = (UINT64_C(1) << 63) | (UINT64_C(1) << 62) | (UINT64_C(1) << 49) |
+                              (UINT64_C(1) << 48) | (UINT64_C(0xbeef) << 32);
+    auto auth_bytes = chained(true, 9, 2);
+    put(auth_bytes, 768, (UINT64_C(1) << 51) | 776, 8, false);
+    put(auth_bytes, 776, auth_pointer, 8, false);
+    loaded = take(load(std::move(auth_bytes)));
+    import_addresses[0] = UINT64_C(0x3000);
+    const auto authenticated = take(resolve_macho_chained_binds(*loaded.metadata.macho, import_addresses));
+    check(authenticated.size() == 1 && authenticated[0].status == MachOChainedBindStatus::resolved &&
+              authenticated[0].authentication_required && authenticated[0].combined_addend == -3 &&
+              authenticated[0].target_address == UINT64_C(0x2ffd),
+          "authenticated binds expose only the checked pre-PAC target and retain the signing requirement");
+    import_addresses[0] = 2;
+    const auto negative_overflow = take(resolve_macho_chained_binds(*loaded.metadata.macho, import_addresses));
+    check(negative_overflow[0].status == MachOChainedBindStatus::overflow &&
+              !negative_overflow[0].target_address,
+          "negative chained addends cannot underflow a supplied import address");
+
+    auto corrupt = *loaded.metadata.macho;
+    corrupt.chained_pointers[1].import_row = 99;
+    const auto invalid = take(resolve_macho_chained_binds(corrupt, import_addresses));
+    check(invalid[0].status == MachOChainedBindStatus::invalid_encoding && !invalid[0].target_address,
+          "invalid chained import row associations cannot resolve through caller input");
+    std::stop_source canceled;
+    canceled.request_stop();
+    const auto stopped = resolve_macho_chained_binds(*loaded.metadata.macho, import_addresses, canceled.get_token());
+    check(!stopped && stopped.error().code == ErrorCode::canceled,
+          "chained bind traversal observes cancellation");
 }
 class ControlledStorage final : public ByteStorage {
     MemoryStorage inner_;
@@ -259,5 +331,6 @@ int main() {
         malformed_and_scalar();
         ordinal_boundaries();
         source_bounds_and_cancellation();
+        bind_resolution();
     });
 }

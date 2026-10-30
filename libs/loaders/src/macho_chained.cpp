@@ -876,4 +876,89 @@ Result<std::vector<MachOChainedExternalTarget>> resolve_macho_chained_external_t
         return Error{ErrorCode::resource_limit, "Cannot allocate Mach-O chained target resolution rows"};
     }
 }
+
+Result<std::vector<MachOChainedBindTarget>> resolve_macho_chained_binds(
+    const MachOMetadata &metadata, std::span<const std::optional<std::uint64_t>> import_addresses,
+    std::stop_token stop, MachOChainedBindResolutionLimits limits) {
+    if (metadata.chained_pointers.size() > limits.max_pointer_rows || limits.max_pointer_rows > 1'000'000 ||
+        metadata.chained_imports.size() > 1'000'000)
+        return Error{ErrorCode::resource_limit, "Mach-O chained bind resolution exceeds its row limit"};
+    if (import_addresses.size() != metadata.chained_imports.size())
+        return Error{ErrorCode::invalid_argument, "Mach-O chained import addresses must match the import-row count"};
+    try {
+        std::vector<MachOChainedBindTarget> output;
+        for (std::size_t index = 0; index < metadata.chained_pointers.size(); ++index) {
+            if (stop.stop_requested())
+                return Error{ErrorCode::canceled, "Mach-O chained bind resolution canceled"};
+            const auto &pointer = metadata.chained_pointers[index];
+            if (!pointer.bind) continue;
+            MachOChainedBindTarget resolved;
+            resolved.pointer_index = index;
+            resolved.authentication_required = pointer.authenticated;
+            if (!pointer.source_interpretation_valid || !pointer.complete || !pointer.place || !pointer.field_size ||
+                !pointer.import_row || !pointer.import_index || pointer.header >= metadata.chained_headers.size()) {
+                resolved.status = MachOChainedBindStatus::invalid_encoding;
+                output.push_back(std::move(resolved));
+                continue;
+            }
+            if (*pointer.import_row >= metadata.chained_imports.size()) {
+                resolved.status = MachOChainedBindStatus::invalid_encoding;
+                output.push_back(std::move(resolved));
+                continue;
+            }
+            const auto import_row = static_cast<std::size_t>(*pointer.import_row);
+            const auto &import = metadata.chained_imports[import_row];
+            const auto &header = metadata.chained_headers[pointer.header];
+            resolved.import_row = static_cast<std::uint32_t>(import_row);
+            if (import.header != pointer.header || import.index != *pointer.import_index || !import.complete ||
+                !import.name || !header.imports_available || *pointer.import_index >= header.imports_count ||
+                header.first_import_row > UINT64_MAX - *pointer.import_index ||
+                header.first_import_row + *pointer.import_index != import_row) {
+                resolved.status = MachOChainedBindStatus::invalid_encoding;
+                output.push_back(std::move(resolved));
+                continue;
+            }
+            if (!import_addresses[import_row]) {
+                resolved.status = MachOChainedBindStatus::missing_import_address;
+                output.push_back(std::move(resolved));
+                continue;
+            }
+            const auto import_addend = import.addend;
+            const auto pointer_addend = pointer.addend;
+            if ((pointer_addend > 0 && import_addend > INT64_MAX - pointer_addend) ||
+                (pointer_addend < 0 && import_addend < INT64_MIN - pointer_addend)) {
+                resolved.status = MachOChainedBindStatus::overflow;
+                output.push_back(std::move(resolved));
+                continue;
+            }
+            const auto addend = import_addend + pointer_addend;
+            resolved.import_address = *import_addresses[import_row];
+            resolved.combined_addend = addend;
+            std::uint64_t target = *resolved.import_address;
+            if (addend >= 0) {
+                const auto positive = static_cast<std::uint64_t>(addend);
+                if (target > UINT64_MAX - positive) {
+                    resolved.status = MachOChainedBindStatus::overflow;
+                    output.push_back(std::move(resolved));
+                    continue;
+                }
+                target += positive;
+            } else {
+                const auto magnitude = static_cast<std::uint64_t>(-(addend + 1)) + 1;
+                if (target < magnitude) {
+                    resolved.status = MachOChainedBindStatus::overflow;
+                    output.push_back(std::move(resolved));
+                    continue;
+                }
+                target -= magnitude;
+            }
+            resolved.status = MachOChainedBindStatus::resolved;
+            resolved.target_address = target;
+            output.push_back(std::move(resolved));
+        }
+        return output;
+    } catch (const std::bad_alloc &) {
+        return Error{ErrorCode::resource_limit, "Cannot allocate Mach-O chained bind resolution rows"};
+    }
+}
 } // namespace hexlab
