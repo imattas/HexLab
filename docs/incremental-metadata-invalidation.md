@@ -194,6 +194,14 @@ The per-function block comparison polls cancellation for every owned block,
 and reusing a cached stack frame copies slots and each slot's access evidence
 with stop checks rather than performing one unchecked deep vector copy.
 
+The layout compatibility check used before derived-fact reuse is also
+cancellable. It compares segments, entries, domains, code exclusions,
+encrypted ranges, and execution-context profiles element by element, including
+nested ARM code-source records. A large hybrid or segmented image can therefore
+abort while comparing mapping metadata instead of waiting for a full generated
+`ImageLayout::operator==` traversal. Comparison results and reuse conditions are
+otherwise unchanged.
+
 Dependency-index construction now also checks its stop token inside the
 comparison steps used to sort per-fact prerequisite and decision lists and the
 global read-interval table. This closes a cancellation gap where the edge

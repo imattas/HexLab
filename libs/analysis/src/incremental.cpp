@@ -207,6 +207,79 @@ bool same_string_mapping(const Image &left, const Image &right, std::stop_token 
     }
     return true;
 }
+template <class Values, class Equal>
+bool equal_values_cancelable(const Values &left, const Values &right,
+                             std::stop_token stop, Equal equal) {
+    canceled(stop);
+    if (left.size() != right.size()) return false;
+    for (std::size_t index = 0; index < left.size(); ++index) {
+        canceled(stop);
+        if (!equal(left[index], right[index])) return false;
+    }
+    return true;
+}
+bool equal_arm_sources_cancelable(const std::vector<ArmContextSource> &left,
+                                  const std::vector<ArmContextSource> &right,
+                                  std::stop_token stop) {
+    return equal_values_cancelable(left, right, stop, [](const auto &a, const auto &b) {
+        return a == b;
+    });
+}
+bool equal_layout_cancelable(const ImageLayout &left, const ImageLayout &right,
+                             std::stop_token stop) {
+    canceled(stop);
+    if (left.space != right.space || left.architecture != right.architecture ||
+        left.mode != right.mode || left.stack_address_width != right.stack_address_width ||
+        left.segmented_memory != right.segmented_memory ||
+        !equal_values_cancelable(left.segments, right.segments, stop, [](const auto &a, const auto &b) {
+            return a == b;
+        }) ||
+        !equal_values_cancelable(left.entries, right.entries, stop, [](const auto &a, const auto &b) {
+            return a == b;
+        }) ||
+        !equal_values_cancelable(left.domains, right.domains, stop, [](const auto &a, const auto &b) {
+            return a == b;
+        }) ||
+        !equal_values_cancelable(left.code_exclusions, right.code_exclusions, stop,
+            [](const auto &a, const auto &b) { return a == b; }) ||
+        !equal_values_cancelable(left.encrypted_ranges, right.encrypted_ranges, stop,
+            [](const auto &a, const auto &b) { return a == b; }))
+        return false;
+    if (left.x86_profile.has_value() != right.x86_profile.has_value() ||
+        left.arm_profile.has_value() != right.arm_profile.has_value() ||
+        left.execution_profile.has_value() != right.execution_profile.has_value())
+        return false;
+    if (left.x86_profile) {
+        const auto &a = *left.x86_profile;
+        const auto &b = *right.x86_profile;
+        if (a.environment != b.environment || a.a20 != b.a20 ||
+            a.input_load_address != b.input_load_address || a.stack_selector != b.stack_selector ||
+            !equal_values_cancelable(a.bindings, b.bindings, stop, [](const auto &x, const auto &y) {
+                return x == y;
+            }))
+            return false;
+    }
+    if (left.arm_profile) {
+        const auto &a = *left.arm_profile;
+        const auto &b = *right.arm_profile;
+        if (!equal_values_cancelable(a.ranges, b.ranges, stop, [&](const auto &x, const auto &y) {
+                return x.begin == y.begin && x.size == y.size && x.kind == y.kind &&
+                       equal_arm_sources_cancelable(x.sources, y.sources, stop);
+            }) ||
+            !equal_values_cancelable(a.roots, b.roots, stop, [&](const auto &x, const auto &y) {
+                return x.at == y.at && x.mode == y.mode &&
+                       x.known_thumb_it_clear == y.known_thumb_it_clear &&
+                       equal_arm_sources_cancelable(x.sources, y.sources, stop);
+            }))
+            return false;
+    }
+    if (left.execution_profile &&
+        !equal_values_cancelable(left.execution_profile->ranges, right.execution_profile->ranges,
+            stop, [](const auto &a, const auto &b) { return a == b; }))
+        return false;
+    canceled(stop);
+    return true;
+}
 bool same_instruction_mapping(const Image &left, const Image &right, std::stop_token stop) {
     // Recovery rechecks current permission and context at every reused
     // instruction, then rebuilds all edges and ownership from those facts.
@@ -468,7 +541,7 @@ Result<DerivedProposal> reanalyze(const AnalysisBasis &old, std::shared_ptr<cons
         if (!analysis_detail::supports_automatic_flow(*image))
             return Error{ErrorCode::unsupported, "Derived instruction analysis requires a supported processor mode"};
         canceled(stop);
-        const bool same_layout = image->layout() == old.image->layout();
+        const bool same_layout = equal_layout_cancelable(image->layout(), old.image->layout(), stop);
         const bool same_metadata = *metadata == *old.metadata;
         if (key == old.key && !same_metadata)
             return Error{ErrorCode::conflict, "Loader metadata changed without advancing the analysis source key"};
