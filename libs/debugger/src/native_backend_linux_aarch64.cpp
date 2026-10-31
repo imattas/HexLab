@@ -1105,38 +1105,46 @@ public:
             }
             if (pending_hardware_execute_) {
                 // Keep every peer stopped while the event owner executes the
-                // instruction at the hardware breakpoint. Resume only the
-                // caller-selected continuations after the execute slot is
-                // restored at the owner's single-step stop.
-                if (std::any_of(runnable.begin(), runnable.end(), [](const auto* action) {
-                        return action->kind != ThreadResumeKind::continue_execution;
+                // instruction at the hardware breakpoint. An owner step
+                // returns its step event with peers held; owner continue
+                // resumes selected peers after debug state is restored.
+                if (std::any_of(runnable.begin(), runnable.end(), [&](const auto* action) {
+                        const auto tid = static_cast<pid_t>(action->thread);
+                        return tid != owner && action->kind != ThreadResumeKind::continue_execution;
                     }))
                     return Error{ErrorCode::unsupported,
-                        "an AArch64 hardware-breakpoint step-over schedule requires the event owner and selected peers to continue"};
+                        "an AArch64 hardware-breakpoint step-over schedule permits only an owner continue/step and peer continues"};
                 const auto owner_action = std::find_if(runnable.begin(), runnable.end(), [&](const auto* action) {
                     return static_cast<pid_t>(action->thread) == owner;
                 });
                 if (owner_action == runnable.end())
                     return Error{ErrorCode::unsupported,
-                        "an AArch64 hardware-breakpoint step-over schedule requires the event owner to continue"};
+                        "an AArch64 hardware-breakpoint step-over schedule requires the event owner to continue or single-step"};
+                if ((*owner_action)->kind != ThreadResumeKind::continue_execution &&
+                    (*owner_action)->kind != ThreadResumeKind::single_step)
+                    return Error{ErrorCode::unsupported,
+                        "an AArch64 hardware-breakpoint step-over schedule requires the event owner to continue or single-step"};
                 if (signal_for(**owner_action) != 0 &&
                     (*owner_action)->signal_disposition != ContinueStatus::handled)
                     return Error{ErrorCode::unsupported,
                         "cannot combine AArch64 hardware-breakpoint step-over with delivery of the owner's pending signal"};
                 std::vector<std::pair<pid_t, int>> deferred_resumes;
-                deferred_resumes.reserve(runnable.size() - 1);
-                for (const auto* action : runnable) {
-                    const auto tid = static_cast<pid_t>(action->thread);
-                    if (tid == owner) continue;
-                    const int queued = signal_for(*action);
-                    deferred_resumes.emplace_back(tid,
-                        action->signal_disposition == ContinueStatus::handled ? 0 : queued);
+                if ((*owner_action)->kind == ThreadResumeKind::continue_execution) {
+                    deferred_resumes.reserve(runnable.size() - 1);
+                    for (const auto* action : runnable) {
+                        const auto tid = static_cast<pid_t>(action->thread);
+                        if (tid == owner) continue;
+                        const int queued = signal_for(*action);
+                        deferred_resumes.emplace_back(tid,
+                            action->signal_disposition == ContinueStatus::handled ? 0 : queued);
+                    }
                 }
                 auto configured = ensure_hardware_breakpoints_configured();
                 if (!configured) return configured;
                 auto stepped = begin_hardware_execute_step(owner, pending_hardware_execute_address_);
                 if (!stepped) return stepped;
-                deferred_breakpoint_resumes_ = std::move(deferred_resumes);
+                if ((*owner_action)->kind == ThreadResumeKind::continue_execution)
+                    deferred_breakpoint_resumes_ = std::move(deferred_resumes);
                 for (const auto& action : actions) {
                     const auto tid = static_cast<pid_t>(action.thread);
                     if (action.kind != ThreadResumeKind::stop) continue;
