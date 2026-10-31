@@ -171,6 +171,10 @@ struct ManagedResource {
   std::vector<std::byte> implementation_key_or_token, implementation_hash;
   bool implementation_file_contains_metadata=false;
   ManagedResourceResolutionState resolution=ManagedResourceResolutionState::embedded;
+  // Zero-based position in the caller-supplied ManagedResourceInput span when
+  // an external provider was selected. This is provenance only; it is not a
+  // path and does not imply that the provider was loaded by this library.
+  std::optional<std::size_t> resolution_input_index;
   std::string resolution_diagnostic;
   // Metadata offset points at ManifestResource row. For embedded resources,
   // payload preserves the exact bytes after the length prefix.

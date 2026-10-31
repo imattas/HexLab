@@ -2666,7 +2666,8 @@ Result<std::vector<ManagedResource>> inspect_managed_resources(
     external_payload_bytes+=source.payload.size();
     destination.data_size=source.data_size;destination.payload=source.payload;
     destination.payload_format=source.payload_format;destination.payload_diagnostic=source.payload_diagnostic;
-    destination.records=source.records;destination.resolution=state;destination.resolution_diagnostic.clear();
+    destination.records=source.records;destination.resolution=state;
+    destination.resolution_input_index.reset();destination.resolution_diagnostic.clear();
     return true;
   };
 
@@ -2723,6 +2724,7 @@ Result<std::vector<ManagedResource>> inspect_managed_resources(
         if(!target){resource.resolution_diagnostic="Supplied File module has no same-name ManifestResource";continue;}
         auto copied=copy_payload(resource,*target,ManagedResourceResolutionState::resolved_file);
         if(!copied){if(copied.error().code==ErrorCode::resource_limit)return copied.error();resource.resolution_diagnostic=copied.error().message;}
+        else resource.resolution_input_index=matched.front();
       }else{
         constexpr std::uint64_t item_limit=16u*1024u*1024u;
         const auto size=candidate.storage->size();
@@ -2732,7 +2734,8 @@ Result<std::vector<ManagedResource>> inspect_managed_resources(
         if(size){auto bytes=candidate.storage->read_at({0},static_cast<std::size_t>(size));if(!bytes)return bytes.error();if(bytes.value().bytes.size()!=size)return Error{ErrorCode::io,"Short read from supplied CLR resource file"};resource.payload.assign(bytes.value().bytes.begin(),bytes.value().bytes.end());}
         resource.data_size=static_cast<std::uint32_t>(size);external_payload_bytes+=size;
         auto decoded=parse_dotnet_resources(resource);if(!decoded)return decoded.error();
-        resource.resolution=ManagedResourceResolutionState::resolved_file;resource.resolution_diagnostic.clear();
+        resource.resolution=ManagedResourceResolutionState::resolved_file;
+        resource.resolution_input_index=matched.front();resource.resolution_diagnostic.clear();
       }
       continue;
     }
@@ -2791,6 +2794,7 @@ Result<std::vector<ManagedResource>> inspect_managed_resources(
       auto copied=copy_payload(resource,*target,ManagedResourceResolutionState::resolved_assembly);
       if(!copied&&copied.error().code==ErrorCode::resource_limit)return copied.error();
       if(!copied)resource.resolution_diagnostic=copied.error().message;
+      else resource.resolution_input_index=matches.front();
     }
   }
   return resources;
