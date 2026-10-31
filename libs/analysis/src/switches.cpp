@@ -3558,6 +3558,7 @@ std::optional<SwitchSite> mips32_register_absolute_switch(
         return {};
     bool relative_table = false;
     bool relative_halfword_sign_extension = false;
+    bool relative_byte_sign_extension = false;
     std::optional<RegisterOperand> relative_base_register;
     std::size_t terminal_load_index = dispatch_index - 1;
     if (dispatch_index >= 2 && facts[dispatch_index - 1]) {
@@ -3574,15 +3575,13 @@ std::optional<SwitchSite> mips32_register_absolute_switch(
             if (relative_base_register) {
                 relative_table = true;
                 terminal_load_index = dispatch_index - 2;
-                // Some O32 compilers load an unsigned halfword and explicitly
-                // sign-extend it before adding the code base:
-                //   LHU target, table[index]; SLL target,target,16;
-                //   SRA target,target,16; ADDU target,codeBase,target; JR target.
+                // Some O32 compilers load unsigned narrow entries and explicitly
+                // sign-extend them before adding the code base.
                 if (dispatch_index >= 4 && facts[dispatch_index - 2] && facts[dispatch_index - 3]) {
                     const auto &arithmetic_shift = facts[dispatch_index - 2]->instruction;
                     const auto &left_shift = facts[dispatch_index - 3]->instruction;
                     const auto exact_shift = [&](const Instruction &instruction, Opcode opcode,
-                                                 const Instruction &next) {
+                                                 const Instruction &next, std::uint64_t expected_amount) {
                         const auto *destination = instruction.operands.size() == 3
                             ? register_operand(instruction, 0) : nullptr;
                         const auto *source = instruction.operands.size() == 3
@@ -3594,12 +3593,19 @@ std::optional<SwitchSite> mips32_register_absolute_switch(
                             instruction.flow == FlowKind::fallthrough && instruction.delay_slots == 0 &&
                             end && end.value() == next.address && same_register(destination, target_register) &&
                             same_register(source, target_register) && amount && amount->encoded_width == 5 &&
-                            amount->effective_width == 32 && !amount->is_signed && amount->value == 16;
+                            amount->effective_width == 32 && !amount->is_signed &&
+                            amount->value == expected_amount;
                     };
-                    if (exact_shift(arithmetic_shift, Opcode::mips_sra,
-                                    facts[dispatch_index - 1]->instruction) &&
-                        exact_shift(left_shift, Opcode::mips_sll, arithmetic_shift)) {
+                    const auto sign_extends = [&](std::uint64_t amount) {
+                        return exact_shift(arithmetic_shift, Opcode::mips_sra,
+                                           facts[dispatch_index - 1]->instruction, amount) &&
+                               exact_shift(left_shift, Opcode::mips_sll, arithmetic_shift, amount);
+                    };
+                    if (sign_extends(16)) {
                         relative_halfword_sign_extension = true;
+                        terminal_load_index = dispatch_index - 4;
+                    } else if (sign_extends(24)) {
+                        relative_byte_sign_extension = true;
                         terminal_load_index = dispatch_index - 4;
                     }
                 }
@@ -3611,14 +3617,17 @@ std::optional<SwitchSite> mips32_register_absolute_switch(
     const auto load_end = analysis_detail::continuation_address(terminal_load);
     const auto *loaded_register = terminal_load.operands.empty() ? nullptr : register_operand(terminal_load, 0);
     const auto expected_load_end = relative_table
-        ? std::optional<Address>{facts[relative_halfword_sign_extension
-            ? dispatch_index - 3 : dispatch_index - 1]->instruction.address}
+        ? std::optional<Address>{(relative_halfword_sign_extension || relative_byte_sign_extension)
+            ? facts[dispatch_index - 3]->instruction.address
+            : facts[dispatch_index - 1]->instruction.address}
         : std::optional<Address>{dispatch.address};
     if (!load_end || !expected_load_end || load_end.value() != expected_load_end.value() ||
         terminal_load.context != dispatch.context ||
         (terminal_load.opcode != Opcode::mips_lw &&
          !(relative_table && terminal_load.opcode == Opcode::mips_lh) &&
-         !(relative_halfword_sign_extension && terminal_load.opcode == Opcode::mips_lhu)) ||
+         !(relative_halfword_sign_extension && terminal_load.opcode == Opcode::mips_lhu) &&
+         !(relative_table && terminal_load.opcode == Opcode::mips_lb) &&
+         !(relative_byte_sign_extension && terminal_load.opcode == Opcode::mips_lbu)) ||
         terminal_load.flow != FlowKind::fallthrough ||
         !loaded_register || !same_register(loaded_register, target_register))
         return {};
@@ -3706,7 +3715,8 @@ std::optional<SwitchSite> mips32_register_absolute_switch(
         }
     }
     const auto setup_end = relative_table
-        ? dispatch_index - (relative_halfword_sign_extension ? 3 : 1) : dispatch_index;
+        ? dispatch_index - ((relative_halfword_sign_extension || relative_byte_sign_extension) ? 3 : 1)
+        : dispatch_index;
     for (std::size_t index = 0; index < setup_end; ++index) {
         if (stop.stop_requested() || !facts[index])
             return {};
@@ -3835,20 +3845,50 @@ std::optional<SwitchSite> mips32_register_absolute_switch(
                             value = std::move(combined);
                         }
                     }
+                    // Byte-relative tables need no shift before adding the
+                    // selector to the byte table base. Accept that direct
+                    // form only when the selector is an untouched block-entry
+                    // value; an unsupported transform is never a selector.
+                    if (!value && relative_table) {
+                        const auto unscaled = [&](const RegisterOperand &selector,
+                                                  const std::optional<Value> &selector_value,
+                                                  const std::optional<Value> &base_value) -> std::optional<Value> {
+                            if (selector_value || !base_value || !base_value->constant ||
+                                base_value->constant->space != dispatch.address.space || selector.index == 0)
+                                return {};
+                            for (std::size_t prior = 0; prior < index; ++prior) {
+                                if (!facts[prior] || facts[prior]->instruction.opcode == Opcode::opaque ||
+                                    writes_register(facts[prior]->instruction, selector))
+                                    return {};
+                            }
+                            Value result;
+                            result.table_base = base_value->constant;
+                            result.selector = selector;
+                            result.scale = 1;
+                            result.scale_instruction = instruction.address;
+                            result.has_scale_instruction = true;
+                            return result;
+                        };
+                        value = unscaled(*right, rhs, lhs);
+                        if (!value) value = unscaled(*left, lhs, rhs);
+                    }
                 }
             }
             erase_written();
             if (value) remember(destination->index, std::move(*value));
             continue;
         }
-        if ((instruction.opcode == Opcode::mips_lw ||
-             (relative_table && (instruction.opcode == Opcode::mips_lh ||
-                                 (relative_halfword_sign_extension && instruction.opcode == Opcode::mips_lhu)))) &&
-            instruction.operands.size() == 2 && destination) {
+        const bool table_entry_load = instruction.opcode == Opcode::mips_lw ||
+            (relative_table && (instruction.opcode == Opcode::mips_lh ||
+                                (relative_halfword_sign_extension && instruction.opcode == Opcode::mips_lhu) ||
+                                instruction.opcode == Opcode::mips_lb ||
+                                (relative_byte_sign_extension && instruction.opcode == Opcode::mips_lbu)));
+        if (table_entry_load && instruction.operands.size() == 2 && destination) {
             const auto *memory = std::get_if<MemoryOperand>(&instruction.operands[1]);
             std::optional<Value> value;
             const auto entry_width = instruction.opcode == Opcode::mips_lh || instruction.opcode == Opcode::mips_lhu
-                ? 16u : 32u;
+                ? 16u : instruction.opcode == Opcode::mips_lb || instruction.opcode == Opcode::mips_lbu
+                    ? 8u : 32u;
             if (destination->bank == RegisterBank::mips_gpr && destination->width == 32 && destination->index != 0 &&
                 memory && memory->data_width == entry_width && memory->address_width == 32 && memory->base &&
                 memory->base->bank == RegisterBank::mips_gpr && memory->base->width == 32 &&
@@ -3870,8 +3910,10 @@ std::optional<SwitchSite> mips32_register_absolute_switch(
     }
 
     const auto found = registers.find(target_register->index);
-    const auto entry_width = relative_table &&
-        (terminal_load.opcode == Opcode::mips_lh || relative_halfword_sign_extension) ? 2u : 4u;
+    const auto entry_width = !relative_table ? 4u
+        : terminal_load.opcode == Opcode::mips_lb || terminal_load.opcode == Opcode::mips_lbu ||
+          relative_byte_sign_extension ? 1u
+        : terminal_load.opcode == Opcode::mips_lh || relative_halfword_sign_extension ? 2u : 4u;
     if (found == registers.end() || !found->second.table_base || !found->second.selector ||
         same_register(&*found->second.selector, target_register) ||
         found->second.scale != entry_width ||
