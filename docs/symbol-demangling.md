@@ -41,8 +41,9 @@ ABI conversion expressions `cv <type> <expression>` render as
 `static_cast<type>(expression)` and reuse the bounded type and expression
 parsers. This is a presentation of the encoded conversion; the demangler does
 not evaluate it or infer the resulting template value. Other expression
-operands are integer literals; calls, template-parameter references inside
-expressions, and other expression productions remain unsupported. Vendor-qualified types
+operands are integer literals; bounded `T_` and `T<n>_` expressions resolve to
+the corresponding enclosing template argument. Calls and other expression
+productions remain unsupported. Vendor-qualified types
 using `U <source-name> <type>` are presented as a GNU-style
 `__attribute__((name))` suffix. Vendor qualifiers may also carry the bounded
 template argument list `I...E`; these render with their arguments, for example
@@ -186,8 +187,7 @@ parameters are recognized; vector support covers the bounded GNU/Clang
 default-argument local-name
 forms, expression-valued template arguments beyond the bounded integer
 expression grammar, and broader operator/type
-encodings remain incomplete, including expression calls/casts,
-template parameter references inside expressions, and unrecognized vendor
+encodings remain incomplete, including expression calls/casts and unrecognized vendor
 qualifiers. Other Itanium builtin extensions and newer instantiation-dependent
 builtin encodings remain unsupported. Microsoft far/virtual adjustment thunks and other special names,
 non-integral template values (including pointers, member pointers, symbol
