@@ -1035,6 +1035,8 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
     if (op == Opcode::m6502_lax) return "lax";
     if (op == Opcode::m6502_sax) return "sax";
     if (op == Opcode::m6502_kil) return "kil";
+    if (op == Opcode::m65c02_bra) return "bra";
+    if (op == Opcode::m65c02_stz) return "stz";
     if (op == Opcode::palignr) return "palignr";
     if (op == Opcode::vpalignr) return "vpalignr";
     const auto index = static_cast<std::size_t>(op);
@@ -1080,6 +1082,7 @@ std::string format_instruction(const Instruction &i) {
             const auto encoded = i.bytes[0];
             const auto address = hex(static_cast<std::uint64_t>(mem->displacement));
             if (encoded == std::byte{0x6c}) out += "(" + address + ")";
+            else if (i.context.mode == ExecutionMode::m65c02 && (std::to_integer<unsigned>(encoded) & 0x1f) == 0x12) out += "(" + address + ")";
             else if ((std::to_integer<unsigned>(encoded) & 0x1f) == 0x01) out += "(" + address + ", x)";
             else if ((std::to_integer<unsigned>(encoded) & 0x1f) == 0x11) out += "(" + address + "), y";
             else {

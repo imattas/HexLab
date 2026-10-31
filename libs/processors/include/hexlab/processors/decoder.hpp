@@ -42,6 +42,7 @@ HEXLAB_PROCESSORS_EXPORT DecodeResult decode_mips64(std::span<const std::byte>, 
                                                     ByteOrder = ByteOrder::little);
 HEXLAB_PROCESSORS_EXPORT DecodeResult decode_powerpc(DecodeContext, std::span<const std::byte>, Address);
 HEXLAB_PROCESSORS_EXPORT DecodeResult decode_m6502(std::span<const std::byte>, Address);
+HEXLAB_PROCESSORS_EXPORT DecodeResult decode_m65c02(std::span<const std::byte>, Address);
 HEXLAB_PROCESSORS_EXPORT DecodeResult decode_wasm(std::span<const std::byte>, Address);
 HEXLAB_PROCESSORS_EXPORT DecodeResult decode_dex(std::span<const std::byte>, Address);
 HEXLAB_PROCESSORS_EXPORT DecodeResult decode_jvm(std::span<const std::byte>, Address);
