@@ -7,7 +7,7 @@ namespace hexlab {
 namespace {
 using R = RegisterOperand;
 constexpr RegisterBank bank = RegisterBank::mos6502;
-enum class Mode : std::uint8_t { immediate, zero_page, zero_page_x, zero_page_y, absolute, absolute_x,
+enum class Mode : std::uint8_t { immediate, zero_page, zero_page_x, zero_page_y, zero_page_indirect, absolute, absolute_x,
                                 absolute_y, indexed_indirect, indirect_indexed, indirect, accumulator, implied, relative };
 R reg(unsigned n) { return {bank, static_cast<std::uint8_t>(n), 8, false}; }
 constexpr R a{bank, 0, 8, false}, x{bank, 1, 8, false}, y{bank, 2, 8, false}, p{bank, 3, 8, false}, s{bank, 4, 8, false};
@@ -47,14 +47,14 @@ constexpr std::array<std::uint8_t, 256> documented_cycles{
     2,5,0,0,0,4,6,0,2,4,2,0,0,4,7,0};
 }
 
-DecodeResult decode_m6502(std::span<const std::byte> bytes, Address at) {
+static DecodeResult decode_m6502_impl(std::span<const std::byte> bytes, Address at, bool cmos) {
     if (at.offset > UINT16_MAX)
         return bad(DecodeStatus::invalid, "6502 address exceeds its 16-bit address space");
     if (bytes.empty())
         return bad(DecodeStatus::truncated, "6502 instruction needs an opcode byte");
     const auto op = std::to_integer<unsigned>(bytes[0]);
     Instruction i;
-    i.context = {Architecture::mos6502, ExecutionMode::m6502, ByteOrder::little};
+    i.context = {Architecture::mos6502, cmos ? ExecutionMode::m65c02 : ExecutionMode::m6502, ByteOrder::little};
     i.address = at;
     auto finish = [&](unsigned length) -> DecodeResult {
         i.length = static_cast<std::uint8_t>(length);
@@ -83,7 +83,7 @@ DecodeResult decode_m6502(std::span<const std::byte> bytes, Address at) {
     auto absolute = [&] { return static_cast<std::uint16_t>(byte(1) | (unsigned(byte(2)) << 8)); };
     auto sized_mode = [](Mode mode) {
         switch (mode) {
-        case Mode::immediate: case Mode::zero_page: case Mode::zero_page_x: case Mode::zero_page_y:
+        case Mode::immediate: case Mode::zero_page: case Mode::zero_page_x: case Mode::zero_page_y: case Mode::zero_page_indirect:
         case Mode::indexed_indirect: case Mode::indirect_indexed: case Mode::relative: return 2u;
         case Mode::absolute: case Mode::absolute_x: case Mode::absolute_y: case Mode::indirect: return 3u;
         case Mode::accumulator: case Mode::implied: return 1u;
@@ -104,10 +104,11 @@ DecodeResult decode_m6502(std::span<const std::byte> bytes, Address at) {
             m.index = x;
         else if (mode == Mode::zero_page_y || mode == Mode::absolute_y || mode == Mode::indirect_indexed)
             m.index = y;
-        if (!m.index && mode != Mode::indirect)
+        if (!m.index && mode != Mode::indirect && mode != Mode::zero_page_indirect)
             m.resolved_address = Address{at.space, address};
         return m;
     };
+
     auto data_op = [&](Opcode opcode, Mode mode, R value, bool store, bool rmw = false,
                        bool writes_flags = true, bool reads_carry = false) -> DecodeResult {
         const auto length = sized_mode(mode);
@@ -125,7 +126,7 @@ DecodeResult decode_m6502(std::span<const std::byte> bytes, Address at) {
             i.operands.emplace_back(m);
             i.access = {rmw ? OperandAccess::read_write : store ? OperandAccess::write : OperandAccess::read};
             if (m.index) i.register_reads.push_back(*m.index);
-            if (mode == Mode::indexed_indirect || mode == Mode::indirect_indexed) i.memory_read = true; // pointer fetch
+            if (mode == Mode::indexed_indirect || mode == Mode::indirect_indexed || mode == Mode::zero_page_indirect) i.memory_read = true; // pointer fetch
             if (store) {
                 i.memory_write = true;
                 i.register_reads.push_back(value);
@@ -152,6 +153,37 @@ DecodeResult decode_m6502(std::span<const std::byte> bytes, Address at) {
             i.register_reads.push_back(p);
         return finish(length);
     };
+    // CMOS-only zero-page-indirect forms are distinct from NMOS KIL aliases.
+    if (cmos && (op == 0x12 || op == 0x32 || op == 0x52 || op == 0x72 ||
+                 op == 0x92 || op == 0xb2 || op == 0xd2 || op == 0xf2)) {
+        static constexpr Opcode operations[]{Opcode::m6502_ora, Opcode::m6502_and, Opcode::m6502_eor,
+            Opcode::m6502_adc, Opcode::m6502_sta, Opcode::m6502_lda, Opcode::m6502_cmp, Opcode::m6502_sbc};
+        const unsigned operation = op >> 5;
+        return data_op(operations[operation], Mode::zero_page_indirect, a, operation == 4, false, operation != 4,
+                       operation == 3 || operation == 7);
+    }
+    if (cmos && (op == 0x80 || op == 0x64 || op == 0x74 || op == 0x9c || op == 0x9e)) {
+        if (op == 0x80) {
+            if (!begin(Opcode::m65c02_bra, 2)) return bad(DecodeStatus::truncated, "65C02 BRA displacement is truncated");
+            const auto displacement = static_cast<std::int8_t>(byte(1));
+            i.operands.emplace_back(RelativeOperand{displacement, 8, 16, EncodedField{1, 1}});
+            i.access = {OperandAccess::address}; i.flow = FlowKind::jump;
+            i.direct_target = Address{at.space, static_cast<std::uint16_t>(at.offset + 2 + displacement)};
+            return finish(2);
+        }
+        const Mode mode = op == 0x64 ? Mode::zero_page : op == 0x74 ? Mode::zero_page_x : op == 0x9c ? Mode::absolute : Mode::absolute_x;
+        const auto length = sized_mode(mode);
+        if (!begin(Opcode::m65c02_stz, length)) return bad(DecodeStatus::truncated, "65C02 STZ operand is truncated");
+        auto operand = memory(mode); i.operands.emplace_back(operand); i.access = {OperandAccess::write};
+        if (operand.index) i.register_reads.push_back(*operand.index);
+        i.memory_write = true;
+        return finish(length);
+    }
+    // Do not let the NMOS unofficial-opcode table reinterpret bytes in the
+    // CMOS profile. The supported CMOS additions above have explicit cases;
+    // remaining CMOS-only assignments and reserved bytes stay unsupported.
+    if (cmos && documented_cycles[op] == 0)
+        return bad(DecodeStatus::unsupported, "65C02 opcode is outside the implemented CMOS subset");
     auto implied = [&](Opcode opcode, unsigned length = 1) -> bool {
         if (!begin(opcode, length)) return false;
         return true;
@@ -537,8 +569,14 @@ DecodeResult decode_m6502(std::span<const std::byte> bytes, Address at) {
     // 65C02-defined encodings are called out separately; other unassigned
     // encodings are undocumented NMOS instructions (including stable illegal
     // operations) and are deliberately not assigned fabricated semantics.
-    if (op == 0x9c || op == 0x9e)
+    if (!cmos && (op == 0x9c || op == 0x9e))
         return bad(DecodeStatus::unsupported, "65C02-only opcode is not enabled in the NMOS 6502 mode");
     return bad(DecodeStatus::unsupported, "Undocumented NMOS 6502 opcode has no defined decoder semantics");
+}
+DecodeResult decode_m6502(std::span<const std::byte> bytes, Address at) {
+    return decode_m6502_impl(bytes, at, false);
+}
+DecodeResult decode_m65c02(std::span<const std::byte> bytes, Address at) {
+    return decode_m6502_impl(bytes, at, true);
 }
 } // namespace hexlab

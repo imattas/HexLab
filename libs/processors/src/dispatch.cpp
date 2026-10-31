@@ -331,6 +331,11 @@ ProcessorCapabilities processor_capabilities(DecodeContext context) noexcept {
             return {false, 0, {}, "6502 does not use x86 segmentation or stack-address overrides"};
         return {true, 3, "MOS 6502 scalar subset", {}};
     }
+    if (context.architecture == Architecture::mos6502 && context.mode == ExecutionMode::m65c02) {
+        if (context.segmented_memory || context.stack_address_width)
+            return {false, 0, {}, "65C02 does not use x86 segmentation or stack-address overrides"};
+        return {true, 3, "WDC 65C02 scalar subset"};
+    }
     if (context.architecture == Architecture::x86_64 && context.mode == ExecutionMode::x86_64) {
         if (context.segmented_memory)
             return {false, 0, {}, "This segmented address model requires legacy x86 mode"};
@@ -372,6 +377,7 @@ std::span<const ProcessorVariantInfo> processor_variant_inventory() noexcept {
     static constexpr std::string_view ppc_families[]{"integer", "loads-and-stores", "control-flow",
         "condition-register", "selected-vmx-integer-and-scalar-floating"};
     static constexpr std::string_view m6502_families[]{"documented-nmos-151-opcodes", "selected-undocumented-nmos"};
+    static constexpr std::string_view m65c02_families[]{"shared-documented-6502-core", "zero-page-indirect-alu", "bra", "stz"};
     static constexpr std::string_view wasm_families[]{"wasm-1-structured-control", "calls-and-locals", "memory",
         "scalar-numeric"};
     static constexpr std::string_view dex_families[]{"core-dalvik-scalar", "branches-and-switch-payloads",
@@ -396,6 +402,7 @@ std::span<const ProcessorVariantInfo> processor_variant_inventory() noexcept {
     static constexpr ProcessorVariantCoverage mips64_coverage{mips64_families, native_analysis, native_decompiler, remote_debugger};
     static constexpr ProcessorVariantCoverage ppc_coverage_partial{ppc_families, ppc_analysis, native_decompiler, remote_debugger};
     static constexpr ProcessorVariantCoverage m6502_coverage{m6502_families, native_analysis, native_decompiler, no_coverage};
+    static constexpr ProcessorVariantCoverage m65c02_coverage{m65c02_families, no_coverage, no_coverage, no_coverage};
     static constexpr ProcessorVariantCoverage wasm_coverage{wasm_families, no_coverage, managed_decompiler, no_coverage};
     static constexpr ProcessorVariantCoverage dex_coverage{dex_families, no_coverage, managed_decompiler, no_coverage};
     static constexpr ProcessorVariantCoverage jvm_coverage{jvm_families, no_coverage, managed_decompiler, no_coverage};
@@ -418,6 +425,7 @@ std::span<const ProcessorVariantInfo> processor_variant_inventory() noexcept {
         ProcessorVariantInfo{"ppc64le", {Architecture::powerpc, ExecutionMode::ppc64, ByteOrder::little}, {}, true, ppc_coverage_partial},
         ProcessorVariantInfo{"ppc64be", {Architecture::powerpc, ExecutionMode::ppc64, ByteOrder::big}, {}, true, ppc_coverage_partial},
         ProcessorVariantInfo{"6502", {Architecture::mos6502, ExecutionMode::m6502, ByteOrder::little}, {}, true, m6502_coverage},
+        ProcessorVariantInfo{"65c02", {Architecture::mos6502, ExecutionMode::m65c02, ByteOrder::little}, {}, true, m65c02_coverage},
         ProcessorVariantInfo{"wasm32", {Architecture::wasm, ExecutionMode::wasm32, ByteOrder::little}, {}, false, wasm_coverage},
         ProcessorVariantInfo{"dex", {Architecture::dex, ExecutionMode::dex, ByteOrder::little}, {}, true, dex_coverage},
         ProcessorVariantInfo{"jvm", {Architecture::jvm, ExecutionMode::jvm, ByteOrder::big}, {}, true, jvm_coverage}
@@ -461,6 +469,8 @@ DecodeResult decode_instruction(DecodeContext context, std::span<const std::byte
         result = decode_powerpc(context, bytes, at);
     else if (context.architecture == Architecture::mos6502 && context.mode == ExecutionMode::m6502)
         result = decode_m6502(bytes, at);
+    else if (context.architecture == Architecture::mos6502 && context.mode == ExecutionMode::m65c02)
+        result = decode_m65c02(bytes, at);
     else {
         result = x64_detail::decode_scalar(bytes, at, context);
         if (result.status == DecodeStatus::unsupported)

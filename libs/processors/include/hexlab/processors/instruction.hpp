@@ -648,6 +648,8 @@ enum class Opcode {
     a64_adc, a64_adcs, a64_sbc, a64_sbcs,
     // NMOS 6502 jam/lockup opcode family; append for persisted ID stability.
     m6502_kil,
+    // Documented W65C02 extensions, appended to preserve persisted opcode IDs.
+    m65c02_bra, m65c02_stz,
     // SSSE3/AVX2 128-bit-lane byte alignment; preserve stored opcode IDs.
     palignr, vpalignr,
     // RVV mask prefix/index and scalar mask reduction instructions.

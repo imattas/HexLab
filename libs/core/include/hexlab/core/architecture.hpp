@@ -3,7 +3,7 @@
 namespace hexlab {
 // Preserve numeric values: canonical load recipes already store these enums.
 enum class Architecture { unknown, x86, x86_64, arm, arm64, riscv64, mips32, mos6502, riscv32, mips64, powerpc, wasm, dex, jvm };
-enum class ExecutionMode { unknown, x86_16, x86_32, x86_64, a32, thumb, a64, rv64, rv64c, mips32, m6502, rv32, mips64, ppc32, ppc64, wasm32, dex, jvm };
+enum class ExecutionMode { unknown, x86_16, x86_32, x86_64, a32, thumb, a64, rv64, rv64c, mips32, m6502, rv32, mips64, ppc32, ppc64, wasm32, dex, jvm, m65c02 };
 struct DecodeContext {
     Architecture architecture = Architecture::unknown;
     ExecutionMode mode = ExecutionMode::unknown;
