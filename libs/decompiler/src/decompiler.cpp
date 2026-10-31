@@ -2517,6 +2517,45 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
                 return effect;
             }
         }
+        if (instruction.opcode == Opcode::m6502_bit && instruction.operands.size() == 1 && operands.size() == 1 &&
+            operands.front() && operands.front()->type == integer_type(8) &&
+            instruction.access == std::vector<OperandAccess>{OperandAccess::read} &&
+            !instruction.memory_write && instruction.flow == FlowKind::fallthrough &&
+            instruction.register_reads == std::vector<RegisterOperand>{accumulator, status} &&
+            instruction.register_writes == std::vector<RegisterOperand>{status}) {
+            const auto *immediate = std::get_if<ImmediateOperand>(&instruction.operands.front());
+            const auto *memory = std::get_if<MemoryOperand>(&instruction.operands.front());
+            const bool immediate_form = immediate && !instruction.memory_read && immediate->effective_width == 8 &&
+                immediate->encoded_width == 8 && !immediate->is_signed && immediate->value <= 0xff;
+            const bool indexed_form = memory && instruction.memory_read && memory->data_width == 8 &&
+                memory->address_width == 16 && !memory->base && !memory->ip_relative &&
+                memory->index == RegisterOperand{RegisterBank::mos6502, 1, 8, false};
+            if (immediate_form || indexed_form) {
+                const auto value = operands.front();
+                const auto tested = binary("and", reg_expr(accumulator), value);
+                auto zero_flag = std::make_shared<Expression>(Expression{integer_type(8), UnaryValue{"zext",
+                    boolean_binary("eq", tested, zero)}});
+                ExpressionPtr updated_status = binary("or", binary("and", reg_expr(status),
+                    constant_expr(immediate_form ? 0xfd : 0x3d, 8)),
+                    binary("shl", std::move(zero_flag), constant_expr(1, 8)));
+                if (indexed_form) {
+                    auto negative_flag = std::make_shared<Expression>(Expression{integer_type(8), UnaryValue{"zext",
+                        boolean_binary("bit_extract", value, constant_expr(7, 8))}});
+                    auto overflow_flag = std::make_shared<Expression>(Expression{integer_type(8), UnaryValue{"zext",
+                        boolean_binary("bit_extract", value, constant_expr(6, 8))}});
+                    updated_status = binary("or", std::move(updated_status),
+                        binary("shl", std::move(negative_flag), constant_expr(7, 8)));
+                    updated_status = binary("or", std::move(updated_status),
+                        binary("shl", std::move(overflow_flag), constant_expr(6, 8)));
+                }
+                Intrinsic effect{immediate_form ? "m65c02_bit_immediate" : "m65c02_bit_indexed",
+                    {value, reg_expr(accumulator), reg_expr(status)},
+                    indexed_form ? IntrinsicMemoryEffect::read : IntrinsicMemoryEffect::none};
+                effect.register_writes = {status};
+                effect.register_output_values = {std::move(updated_status)};
+                return effect;
+            }
+        }
         if ((instruction.opcode == Opcode::m65c02_rmb || instruction.opcode == Opcode::m65c02_smb) &&
             instruction.condition < 8 && instruction.operands.size() == 1 && operands.size() == 1 &&
             is_memory(instruction.operands.front()) &&
