@@ -2,6 +2,7 @@
 #include "hexlab/workspace/project_actor.hpp"
 #include "hexlab/workspace/project_exchange.hpp"
 #include "hexlab/database/wal_inspection.hpp"
+#include "hexlab/database/journal_inspection.hpp"
 #include "hexlab/workspace/search.hpp"
 #include "hexlab/analysis/graph.hpp"
 #include "hexlab/analysis/signatures.hpp"
@@ -89,6 +90,7 @@ struct Arguments {
     bool schema_json = false;
     std::size_t integrity_max_issues = 64;
     database::WalInspectionLimits wal_inspection_limits;
+    database::JournalInspectionLimits journal_inspection_limits;
     std::optional<database::RecoveryArtifactKind> recovery_kind_filter;
     bool backup_json = false;
     std::size_t backup_retention = 0;

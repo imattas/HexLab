@@ -41,6 +41,27 @@ They do not provide a SQLite transaction snapshot or prove stability against
 an active writer; use an offline copy for diagnosis. Base-database association,
 WAL replay, page salvage, and repaired-project publication remain unsupported.
 
+Inspect an orphan or suspect SQLite rollback journal without opening its
+database:
+
+```powershell
+hexlab_cli project recovery inspect-journal .\projects\sample.hxproj-journal --json
+```
+
+The read-only inspector validates the rollback-journal magic, bounded page and
+sector sizes, and each complete page record's nonce-based checksum in the
+first journal segment. It reports the initial database page count, declared
+or inferred record count, checksum-valid prefix, partial trailing bytes, and
+why inspection stopped. `--max-records` accepts 1..65536 and `--max-bytes`
+accepts 64..67108864; defaults are 4096 records and 64 MiB. Journal headers
+use sector padding, which is respected when locating the first page record.
+SQLite may place later segment headers after a declared record group; bytes
+beyond the first segment are reported as uninspected rather than treated as
+validated. The command never opens the database through SQLite, associates
+the journal with a base file, or replays pages. A valid prefix is diagnostic
+evidence only, not a repaired or recoverable project. See the
+[SQLite rollback journal format](https://sqlite.org/fileformat.html#rollback_journal).
+
 List recovery artifacts in a directory without changing any files:
 
 ```powershell

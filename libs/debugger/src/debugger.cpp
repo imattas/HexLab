@@ -941,6 +941,25 @@ Result<std::vector<std::byte>> DebugSession::run_remote_monitor_command(
         return Error{ErrorCode::resource_limit, "remote monitor output exceeds the 1 MiB limit"};
     return result;
 }
+Status DebugSession::set_remote_pass_signals(std::span<const unsigned> signals,
+                                             std::stop_token cancellation) {
+    if (!impl_->backend || !impl_->process || impl_->state != SessionState::stopped)
+        return invalid_state("remote signal pass-through configuration");
+    if (signals.empty() || signals.size() > 256)
+        return Error{ErrorCode::invalid_argument, "remote pass-signal list must contain 1 to 256 signal numbers"};
+    unsigned previous = 0;
+    bool first = true;
+    for (const auto signal : signals) {
+        if (signal > 255 || (!first && signal <= previous))
+            return Error{ErrorCode::invalid_argument,
+                         "remote pass-signal numbers must be strictly increasing 8-bit values"};
+        previous = signal;
+        first = false;
+    }
+    if (cancellation.stop_requested())
+        return Error{ErrorCode::canceled, "remote pass-signal configuration canceled before it started"};
+    return impl_->backend->set_remote_pass_signals(signals, cancellation);
+}
 Result<std::vector<RegisterValue>> DebugSession::read_registers(ThreadId thread) {
     if (!impl_->backend || !impl_->process || (impl_->state != SessionState::running && impl_->state != SessionState::stopped)) return invalid_state("read_registers");
     return impl_->backend->read_registers(thread);

@@ -109,6 +109,29 @@ HEXLAB_LOADERS_EXPORT Result<PeAuthenticodeSignerInventory> inspect_pe_authentic
     const Image &, const ImageMetadata &, std::size_t certificate_record,
     std::stop_token = {});
 
+struct PeAuthenticodeEmbeddedCertificate {
+    std::uint64_t certificate_file_offset = 0;
+    std::uint64_t certificate_size = 0;
+    std::string serial_number_hex;
+    std::uint64_t issuer_file_offset = 0;
+    std::uint64_t issuer_der_size = 0;
+    std::uint64_t subject_file_offset = 0;
+    std::uint64_t subject_der_size = 0;
+    std::string not_before;
+    std::string not_after;
+    std::string signature_algorithm_oid;
+    bool operator==(const PeAuthenticodeEmbeddedCertificate &) const = default;
+};
+struct PeAuthenticodeCertificateInventory {
+    std::size_t certificate_record = 0;
+    std::vector<PeAuthenticodeEmbeddedCertificate> certificates;
+};
+// Inventories bounded X.509 certificates embedded in one PKCS#7 SignedData
+// record. Names remain raw DER spans; this does not validate trust or time.
+HEXLAB_LOADERS_EXPORT Result<PeAuthenticodeCertificateInventory> inspect_pe_authenticode_certificates(
+    const Image &, const ImageMetadata &, std::size_t certificate_record,
+    std::stop_token = {});
+
 struct PeAuthenticodeSignerVerification {
     bool signature_valid = false;
     std::uint32_t provider_error = 0;

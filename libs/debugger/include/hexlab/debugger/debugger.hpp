@@ -308,6 +308,9 @@ public:
     virtual Result<std::vector<std::byte>> run_remote_monitor_command(std::string_view, std::stop_token = {}) {
         return Error{ErrorCode::unsupported, "remote monitor commands are not supported by this backend"};
     }
+    virtual Status set_remote_pass_signals(std::span<const unsigned>, std::stop_token = {}) {
+        return Error{ErrorCode::unsupported, "remote signal pass-through is not supported by this backend"};
+    }
     virtual Result<std::vector<RegisterValue>> read_registers(ThreadId) = 0;
     virtual Status write_registers(ThreadId, std::span<const RegisterValue>) = 0;
     virtual Result<Breakpoint> add_breakpoint(std::uint64_t address, BreakpointKind) = 0;
@@ -426,6 +429,9 @@ public:
     // target-console output bytes. Native backends report unsupported.
     Result<std::vector<std::byte>> run_remote_monitor_command(std::string_view command,
         std::stop_token cancellation = {});
+    // Replaces the remote stub's pass-through signal list via QPassSignals.
+    // Signal numbers must be sorted, unique, and in the 8-bit RSP range.
+    Status set_remote_pass_signals(std::span<const unsigned> signals, std::stop_token cancellation = {});
     Result<std::vector<RegisterValue>> read_registers(ThreadId thread);
     // Evaluates a bounded register/memory expression against one stopped thread.
     Result<std::uint64_t> evaluate_expression(ThreadId thread, std::string_view expression);

@@ -366,6 +366,155 @@ Result<PeAuthenticodeSignerInventory> parse_signers(
     }
     return inventory;
 }
+
+Result<PeAuthenticodeCertificateInventory> parse_embedded_certificates(
+    const Image &image, const ImageMetadata &metadata, std::size_t record_index, std::stop_token stop) {
+    if (!metadata.pe || !metadata.pe->certificate_table)
+        return Error{ErrorCode::invalid_argument, "PE certificate table is unavailable"};
+    const auto &records = metadata.pe->certificate_table->records;
+    if (record_index >= records.size())
+        return Error{ErrorCode::out_of_bounds, "PE certificate record index is out of range"};
+    const auto &record = records[record_index];
+    if (record.type != 0x0002)
+        return Error{ErrorCode::unsupported, "WIN_CERTIFICATE is not PKCS#7 signed data"};
+    if (record.payload.size() != 1 || record.payload.front().size > 64ull * 1024 * 1024 ||
+        record.payload.front().size > std::numeric_limits<std::size_t>::max())
+        return Error{ErrorCode::resource_limit, "PKCS#7 payload is fragmented or exceeds 64 MiB"};
+    if (stop.stop_requested()) return Error{ErrorCode::canceled, "Authenticode certificate inspection canceled"};
+    const auto &range = record.payload.front();
+    auto view = image.storage()->read_at(range.offset, static_cast<std::size_t>(range.size));
+    if (!view) return view.error();
+    const auto payload = std::span<const std::byte>(view.value().bytes);
+    if (payload.size() != range.size)
+        return Error{ErrorCode::malformed, "PKCS#7 payload read returned a short range"};
+    std::size_t cursor = 0;
+    auto content = der_node(payload, cursor);
+    if (!content || content.value().tag != 0x30 || cursor != payload.size())
+        return Error{ErrorCode::malformed, "PKCS#7 ContentInfo is not one complete DER sequence"};
+    cursor = 0;
+    auto content_type = der_node(content.value().content, cursor);
+    auto explicit_data = der_node(content.value().content, cursor);
+    if (!content_type || !is_oid(content_type.value(), {0x2a,0x86,0x48,0x86,0xf7,0x0d,0x01,0x07,0x02}) ||
+        !explicit_data || explicit_data.value().tag != 0xa0 || cursor != content.value().content.size())
+        return Error{ErrorCode::unsupported, "PKCS#7 ContentInfo is not SignedData"};
+    auto signed_data = only_child(explicit_data.value(), 0x30, "SignedData");
+    if (!signed_data) return signed_data.error();
+    cursor = 0;
+    auto version = der_node(signed_data.value().content, cursor);
+    auto digest_set = der_node(signed_data.value().content, cursor);
+    auto encapsulated = der_node(signed_data.value().content, cursor);
+    if (!version || !digest_set || digest_set.value().tag != 0x31 || !encapsulated || encapsulated.value().tag != 0x30)
+        return Error{ErrorCode::malformed, "Invalid PKCS#7 SignedData prefix"};
+    if (cursor >= signed_data.value().content.size() || signed_data.value().content[cursor] != std::byte{0xa0})
+        return Error{ErrorCode::unsupported, "PKCS#7 SignedData has no embedded certificate set"};
+    auto cert_set = der_node(signed_data.value().content, cursor);
+    if (!cert_set || cert_set.value().tag != 0xa0)
+        return Error{ErrorCode::malformed, "PKCS#7 certificate set is malformed"};
+
+    PeAuthenticodeCertificateInventory inventory;
+    inventory.certificate_record = record_index;
+    std::size_t cert_cursor = 0;
+    while (cert_cursor < cert_set.value().content.size()) {
+        if (inventory.certificates.size() == 1024)
+            return Error{ErrorCode::resource_limit, "PKCS#7 certificate count exceeds 1024"};
+        if (stop.stop_requested())
+            return Error{ErrorCode::canceled, "Authenticode certificate inspection canceled"};
+        auto certificate = der_node(cert_set.value().content, cert_cursor);
+        if (!certificate) return certificate.error();
+        if (certificate.value().tag != 0x30)
+            return Error{ErrorCode::unsupported, "PKCS#7 certificate set contains a non-X.509 certificate choice"};
+        std::size_t cert_field = 0;
+        auto tbs = der_node(certificate.value().content, cert_field);
+        auto outer_algorithm = der_node(certificate.value().content, cert_field);
+        auto signature = der_node(certificate.value().content, cert_field);
+        if (!tbs || tbs.value().tag != 0x30 || !outer_algorithm || !signature ||
+            signature.value().tag != 0x03 || signature.value().content.empty() ||
+            std::to_integer<unsigned>(signature.value().content.front()) > 7 ||
+            cert_field != certificate.value().content.size())
+            return Error{ErrorCode::malformed, "Embedded X.509 certificate envelope is malformed"};
+        const auto unused_signature_bits = std::to_integer<unsigned>(signature.value().content.front());
+        if (unused_signature_bits && (signature.value().content.size() < 2 ||
+            (std::to_integer<unsigned>(signature.value().content.back()) & ((1u << unused_signature_bits) - 1u))))
+            return Error{ErrorCode::malformed, "Embedded X.509 signature BIT STRING has invalid padding bits"};
+        auto signature_oid = algorithm_oid(outer_algorithm.value());
+        if (!signature_oid) return signature_oid.error();
+
+        std::size_t tbs_field = 0;
+        if (tbs.value().content.size() && tbs.value().content[tbs_field] == std::byte{0xa0}) {
+            auto explicit_version = der_node(tbs.value().content, tbs_field);
+            if (!explicit_version) return explicit_version.error();
+            auto version_value = only_child(explicit_version.value(), 0x02, "X.509 version");
+            if (!version_value) return version_value.error();
+            auto parsed_version = integer_u32(version_value.value(), "X.509 version");
+            if (!parsed_version || parsed_version.value() > 2)
+                return Error{ErrorCode::malformed, "Embedded X.509 certificate version is invalid"};
+        }
+        auto serial = der_node(tbs.value().content, tbs_field);
+        auto inner_algorithm = der_node(tbs.value().content, tbs_field);
+        auto issuer = der_node(tbs.value().content, tbs_field);
+        auto validity = der_node(tbs.value().content, tbs_field);
+        auto subject = der_node(tbs.value().content, tbs_field);
+        auto public_key = der_node(tbs.value().content, tbs_field);
+        if (!serial || serial.value().tag != 0x02 || serial.value().content.empty() ||
+            serial.value().content.size() > 64 ||
+            (std::to_integer<unsigned>(serial.value().content.front()) & 0x80u) ||
+            !inner_algorithm || inner_algorithm.value().tag != 0x30 || !issuer || issuer.value().tag != 0x30 ||
+            !validity || validity.value().tag != 0x30 || !subject || subject.value().tag != 0x30 ||
+            !public_key || public_key.value().tag != 0x30)
+            return Error{ErrorCode::malformed, "Embedded X.509 TBS certificate fields are malformed"};
+        auto inner_signature_oid = algorithm_oid(inner_algorithm.value());
+        if (!inner_signature_oid || inner_signature_oid.value() != signature_oid.value())
+            return Error{ErrorCode::malformed, "Embedded X.509 signature algorithms disagree"};
+        std::size_t validity_cursor = 0;
+        auto not_before = der_node(validity.value().content, validity_cursor);
+        auto not_after = der_node(validity.value().content, validity_cursor);
+        const auto time_text = [](const DerNode &time) -> Result<std::string> {
+            if ((time.tag != 0x17 && time.tag != 0x18) || time.content.empty() || time.content.size() > 32)
+                return Error{ErrorCode::malformed, "Embedded X.509 validity time is malformed"};
+            std::string text;
+            text.reserve(time.content.size());
+            for (const auto byte : time.content) {
+                const auto value = std::to_integer<unsigned char>(byte);
+                if (value < 0x20 || value > 0x7e)
+                    return Error{ErrorCode::malformed, "Embedded X.509 validity time is not printable ASCII"};
+                text.push_back(static_cast<char>(value));
+            }
+            return text;
+        };
+        if (!not_before || !not_after || validity_cursor != validity.value().content.size())
+            return Error{ErrorCode::malformed, "Embedded X.509 validity must contain exactly two times"};
+        auto before_text = time_text(not_before.value());
+        auto after_text = time_text(not_after.value());
+        if (!before_text || !after_text) return !before_text ? before_text.error() : after_text.error();
+        // Consume remaining TBS fields so malformed trailing DER cannot be hidden.
+        while (tbs_field < tbs.value().content.size()) {
+            auto extension = der_node(tbs.value().content, tbs_field);
+            if (!extension) return extension.error();
+        }
+        const auto payload_offset = [&](std::span<const std::byte> bytes) {
+            return static_cast<std::uint64_t>(bytes.data() - payload.data());
+        };
+        PeAuthenticodeEmbeddedCertificate item;
+        const auto cert_relative = payload_offset(certificate.value().encoded);
+        const auto issuer_relative = payload_offset(issuer.value().encoded);
+        const auto subject_relative = payload_offset(subject.value().encoded);
+        if (range.offset.value > UINT64_MAX - cert_relative || range.offset.value > UINT64_MAX - issuer_relative ||
+            range.offset.value > UINT64_MAX - subject_relative)
+            return Error{ErrorCode::overflow, "Embedded certificate source offset overflows"};
+        item.certificate_file_offset = range.offset.value + cert_relative;
+        item.certificate_size = certificate.value().encoded.size();
+        item.serial_number_hex = hex_bytes(serial.value().content);
+        item.issuer_file_offset = range.offset.value + issuer_relative;
+        item.issuer_der_size = issuer.value().encoded.size();
+        item.subject_file_offset = range.offset.value + subject_relative;
+        item.subject_der_size = subject.value().encoded.size();
+        item.not_before = std::move(before_text.value());
+        item.not_after = std::move(after_text.value());
+        item.signature_algorithm_oid = std::move(signature_oid.value());
+        inventory.certificates.push_back(std::move(item));
+    }
+    return inventory;
+}
 } // namespace
 
 Result<PeAuthenticodeDigestMatch> inspect_pe_authenticode_digest(
@@ -383,5 +532,10 @@ Result<PeAuthenticodeSignerInventory> inspect_pe_authenticode_signers(
     const Image &image, const ImageMetadata &metadata, std::size_t certificate_record,
     std::stop_token stop) {
     return parse_signers(image, metadata, certificate_record, stop);
+}
+Result<PeAuthenticodeCertificateInventory> inspect_pe_authenticode_certificates(
+    const Image &image, const ImageMetadata &metadata, std::size_t certificate_record,
+    std::stop_token stop) {
+    return parse_embedded_certificates(image, metadata, certificate_record, stop);
 }
 } // namespace hexlab
