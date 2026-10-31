@@ -6,8 +6,11 @@ MIPS32 decoder's integer instructions: `ADDU`, `SUBU`, `AND`, `OR`, `XOR`,
 `SLTIU`, `ANDI`, `ORI`, `XORI`, and `LUI`. Writes to architectural `$zero`
 are discarded and reads from it become the 32-bit constant zero.
 
-`BEQ`, `BNE`, `BLEZ`, `BGTZ`, `BLTZ`, and `BGEZ` carry typed predicates into
-the IR. `LB`, `LBU`, `LH`, `LHU`, and `LW` lift as typed memory reads; signed
+`BEQ`, `BNE`, `BLEZ`, `BGTZ`, `BLTZ`, `BGEZ`, and their conditional-link
+`BLTZAL`/`BGEZAL` and likely-link `BLTZALL`/`BGEZALL` forms carry typed
+predicates into the IR. The link forms assign `$ra = PC + 8`; likely-link
+branches annul the delay-slot edge when their predicate is false. `LB`, `LBU`,
+`LH`, `LHU`, and `LW` lift as typed memory reads; signed
 byte/halfword reads explicitly sign-extend to the 32-bit destination, and
 unsigned reads zero-extend. `SB`, `SH`, and `SW` lift as typed memory writes.
 `$zero` destinations are discarded. The existing memory SSA pass tracks these
@@ -17,7 +20,10 @@ Analysis retains MIPS branch delay slots as a distinct CFG edge and block. The
 decompiler preserves that CFG while ordering the statements so the slot's
 effects run before the branch, call, or return. `JAL` and `JALR` write their
 decoded link register with the instruction address plus eight before the slot;
-the call itself follows the slot. `JR $ra` becomes a return after its slot.
+the call itself follows the slot. Conditional-link `BLTZAL`/`BGEZAL` and
+`BLTZALL`/`BGEZALL` also write `$ra = PC + 8` before their conditional branch;
+the likely-link forms execute their delay slot only on the taken path. `JR $ra`
+becomes a return after its slot.
 Branch destinations are taken from the post-slot CFG successors. This relies on
 the analysis delay-slot edge; incomplete or hand-authored CFGs without that edge
 do not receive guessed slot semantics. MIPS `ERET` remains an intrinsic even
@@ -152,3 +158,5 @@ malformed or contradictory effect record remains an explicit intrinsic.
 
 The encoding and condition rule follow the MIPS32 Volume II-A instruction
 reference linked above.
+
+Conditional-link branches currently lift with their predicate, unconditional PC+8 `$ra` effect, and correct likely-slot annulment. Their CFG edges remain branch edges, so automatic call-graph discovery does not yet classify the taken target as a call. The ISA marks `rs = 31` encodings UNPREDICTABLE; HexLab currently decodes them conservatively without rejecting them.

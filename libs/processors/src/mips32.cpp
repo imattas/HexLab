@@ -224,10 +224,17 @@ DecodeResult decode_mips32(ByteOrder order, std::span<const std::byte> bytes, Ad
         i.operands = {reg(rs)}; i.access = {OperandAccess::read}; i.register_reads = {reg(rs)};
         i.flow = FlowKind::conditional_branch; add_target(i, signed16(w), order); i.access.push_back(OperandAccess::address); i.delay_slots = 1;
     } else if (op == 1) {
-        if (rt != 0 && rt != 1 && rt != 2 && rt != 3)
-            return {DecodeStatus::unsupported, {}, "MIPS32 REGIMM branch-likely/link form is not implemented"};
-        i.opcode = rt == 0 ? Opcode::mips_bltz : rt == 1 ? Opcode::mips_bgez : rt == 2 ? Opcode::mips_bltzl : Opcode::mips_bgezl;
+        if (rt > 3 && rt != 16 && rt != 17 && rt != 18 && rt != 19)
+            return {DecodeStatus::unsupported, {}, "MIPS32 REGIMM suboperation is unsupported"};
+        const bool link = rt >= 16;
+        const bool ge_zero = (rt & 1) != 0;
+        const bool likely = (rt & 2) != 0;
+        i.opcode = link ? (ge_zero ? (likely ? Opcode::mips_bgezall : Opcode::mips_bgezal)
+                                    : (likely ? Opcode::mips_bltzall : Opcode::mips_bltzal)) :
+                   ge_zero ? (likely ? Opcode::mips_bgezl : Opcode::mips_bgez)
+                           : (likely ? Opcode::mips_bltzl : Opcode::mips_bltz);
         i.operands = {reg(rs)}; i.access = {OperandAccess::read}; i.register_reads = {reg(rs)};
+        if (link) i.register_writes = {reg(31)};
         i.flow = FlowKind::conditional_branch; add_target(i, signed16(w), order); i.access.push_back(OperandAccess::address); i.delay_slots = 1;
     } else if (op == 8 || op == 9 || op == 10 || op == 11 || (op >= 12 && op <= 14)) {
         immediate(op == 8 ? Opcode::mips_addi : op == 9 ? Opcode::mips_addiu : op == 10 ? Opcode::mips_slti :

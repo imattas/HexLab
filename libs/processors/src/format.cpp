@@ -340,6 +340,10 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
     case Opcode::mips_bgtzl: return "bgtzl";
     case Opcode::mips_bltzl: return "bltzl";
     case Opcode::mips_bgezl: return "bgezl";
+    case Opcode::mips_bltzal: return "bltzal";
+    case Opcode::mips_bgezal: return "bgezal";
+    case Opcode::mips_bltzall: return "bltzall";
+    case Opcode::mips_bgezall: return "bgezall";
     case Opcode::mips64_multu: return "multu";
     case Opcode::mips64_div: return "div";
     case Opcode::mips64_divu: return "divu";
