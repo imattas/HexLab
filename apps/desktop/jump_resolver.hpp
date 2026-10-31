@@ -119,17 +119,23 @@ inline std::vector<std::pair<wxString, Location>> image_symbol_locations(
             }
     }
     if (metadata.macho) {
-        for (const auto &symbol : metadata.macho->symbols)
+        for (const auto &symbol : metadata.macho->symbols) {
+            if (cancelled && cancelled->load(std::memory_order_relaxed)) return entries;
             if (symbol.state == MachOSymbolState::defined && symbol.address)
                 append(symbol.name, *symbol.address);
-        for (const auto &symbol : metadata.macho->dyld_exports)
+        }
+        for (const auto &symbol : metadata.macho->dyld_exports) {
+            if (cancelled && cancelled->load(std::memory_order_relaxed)) return entries;
             if (symbol.is_definition())
                 append(symbol.name, *symbol.address);
+        }
     }
     if (metadata.pe)
-        for (const auto &symbol : metadata.pe->pdb_symbols)
+        for (const auto &symbol : metadata.pe->pdb_symbols) {
+            if (cancelled && cancelled->load(std::memory_order_relaxed)) return entries;
             if (symbol.address)
                 append(symbol.name, *symbol.address);
+        }
     return entries;
 }
 
