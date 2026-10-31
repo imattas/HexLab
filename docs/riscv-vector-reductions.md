@@ -37,4 +37,4 @@ The opcode assignments follow the RVV OPFVV encoding table: funct6 `110001`
 for `vfwredusum` and `110011` for `vfwredosum`. Reduction instructions require
 `vstart=0`; automatic analysis records the `vstart` dependency, while runtime
 validation remains with the caller. See the [RISC-V Vector specification,
-Sections 14.3–14.4 and the OP-V instruction table](https://github.com/riscvarchive/riscv-v-spec/blob/master/v-spec.adoc).
+Sections 14.3–14.4 and the OP-V instruction table](https://docs.riscv.org/reference/isa/extensions/vector/_attachments/riscv-v-spec.pdf).
