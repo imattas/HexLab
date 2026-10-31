@@ -93,6 +93,10 @@ struct Aarch64BreakpointStepRollback {
     Aarch64Regs registers{};
     bool trap_may_be_displaced{};
 };
+struct Aarch64DeferredBreakpointResumes {
+    std::vector<std::pair<pid_t, int>> threads;
+    bool report_owner_step = false;
+};
 struct Aarch64GprName {
     std::size_t index{};
     bool low_word{};
@@ -770,6 +774,7 @@ public:
             if (tid > 0) {
                 DebugEvent e{}; e.sequence = ++seq_; e.process = static_cast<ProcessId>(pid_); e.thread = static_cast<ThreadId>(tid);
                 bool hardware_trap = false;
+                bool trace_trap = false;
                 bool hardware_step_restore_failed = false;
                 if (WIFEXITED(status) || WIFSIGNALED(status)) {
                     pending_signal_ = 0;
@@ -809,7 +814,9 @@ public:
                         else if (ptrace_event == PTRACE_EVENT_STOP) e.message = "group stop";
                         if (last_signal_ == SIGTRAP && ptrace_event == 0) {
                             siginfo_t info{};
-                            if (ptrace(PTRACE_GETSIGINFO, tid, nullptr, &info) == 0 && info.si_code == TRAP_HWBKPT) {
+                            const bool have_siginfo = ptrace(PTRACE_GETSIGINFO, tid, nullptr, &info) == 0;
+                            trace_trap = have_siginfo && info.si_code == TRAP_TRACE;
+                            if (have_siginfo && info.si_code == TRAP_HWBKPT) {
                                 hardware_trap = true;
                                 const auto access = reinterpret_cast<std::uintptr_t>(info.si_addr);
                                 bool matched_execute = false;
@@ -851,11 +858,11 @@ public:
                             constexpr std::array<std::byte, 4> brk{std::byte{0x00}, std::byte{0x00}, std::byte{0x20}, std::byte{0xd4}};
                             if (enabled_.contains(*step_breakpoint_) && !write_raw(*step_breakpoint_, brk)) return sys_error("reinsert BRK after displaced instruction");
                             step_breakpoint_.reset(); step_thread_ = 0; step_pending_ = false;
-                            if (last_signal_ == SIGTRAP && !hardware_trap) {
+                            if (trace_trap) {
                                 e.kind = EventKind::single_step;
                                 if (deferred_breakpoint_resumes_) {
                                     std::vector<pid_t> resumed;
-                                    for (const auto& [resume_tid, signal] : *deferred_breakpoint_resumes_) {
+                                    for (const auto& [resume_tid, signal] : deferred_breakpoint_resumes_->threads) {
                                         if (ptrace(PTRACE_CONT, resume_tid, nullptr,
                                                    reinterpret_cast<void*>(static_cast<std::intptr_t>(signal))) == 0) {
                                             stopped_.erase(resume_tid);
@@ -873,11 +880,10 @@ public:
                                         e.message += "; deferred schedule failed: " + error.message;
                                         break;
                                     }
-                                    if (resumed.size() == deferred_breakpoint_resumes_->size()) {
-                                        deferred_breakpoint_resumes_.reset();
-                                        continue;
-                                    }
+                                    const bool keep_waiting = resumed.size() == deferred_breakpoint_resumes_->threads.size() &&
+                                        !deferred_breakpoint_resumes_->report_owner_step;
                                     deferred_breakpoint_resumes_.reset();
+                                    if (keep_waiting) continue;
                                 }
                             }
                             deferred_breakpoint_resumes_.reset();
@@ -887,7 +893,7 @@ public:
                                 e.kind = EventKind::single_step;
                                 if (deferred_breakpoint_resumes_) {
                                     std::vector<pid_t> resumed;
-                                    for (const auto& [resume_tid, signal] : *deferred_breakpoint_resumes_) {
+                                    for (const auto& [resume_tid, signal] : deferred_breakpoint_resumes_->threads) {
                                         if (ptrace(PTRACE_CONT, resume_tid, nullptr,
                                                    reinterpret_cast<void*>(static_cast<std::intptr_t>(signal))) == 0) {
                                             stopped_.erase(resume_tid);
@@ -906,7 +912,7 @@ public:
                                         e.message += "; deferred schedule failed: " + error.message;
                                         break;
                                     }
-                                    const bool all_resumed = resumed.size() == deferred_breakpoint_resumes_->size();
+                                    const bool all_resumed = resumed.size() == deferred_breakpoint_resumes_->threads.size();
                                     deferred_breakpoint_resumes_.reset();
                                     if (all_resumed) continue;
                                 }
@@ -1056,10 +1062,19 @@ public:
                     if (owner_signal != 0 && owner_action->signal_disposition != ContinueStatus::handled)
                         return Error{ErrorCode::unsupported,
                             "cannot combine an AArch64 software-breakpoint step-over with delivery of the owner's pending signal"};
-                    // Execute the displaced instruction with peers held so the
-                    // exact step result is returned before any peer can run.
-                    // The next schedule can continue the caller-selected peers.
-                    auto stepped = begin_breakpoint_step(owner, *pending_breakpoint_);
+                    // Hold peers while BRK is displaced. After the owner's
+                    // trace trap rearms BRK, run selected peers and collect
+                    // their racing stops before returning the owner step.
+                    std::vector<std::pair<pid_t, int>> deferred_resumes;
+                    deferred_resumes.reserve(runnable.size() - 1);
+                    for (const auto* action : runnable) {
+                        const auto tid = static_cast<pid_t>(action->thread);
+                        if (tid == owner) continue;
+                        const int queued = signal_for(*action);
+                        deferred_resumes.emplace_back(tid,
+                            action->signal_disposition == ContinueStatus::handled ? 0 : queued);
+                    }
+                    auto stepped = begin_breakpoint_step(owner, *pending_breakpoint_, std::move(deferred_resumes), true);
                     if (!stepped) return stepped;
                     for (const auto& action : actions) {
                         const auto stopped_tid = static_cast<pid_t>(action.thread);
@@ -1143,7 +1158,7 @@ public:
                 auto stepped = begin_hardware_execute_step(owner, pending_hardware_execute_address_);
                 if (!stepped) return stepped;
                 if ((*owner_action)->kind == ThreadResumeKind::continue_execution)
-                    deferred_breakpoint_resumes_ = std::move(deferred_resumes);
+                    deferred_breakpoint_resumes_ = Aarch64DeferredBreakpointResumes{std::move(deferred_resumes), false};
                 for (const auto& action : actions) {
                     const auto tid = static_cast<pid_t>(action.thread);
                     if (action.kind != ThreadResumeKind::stop) continue;
@@ -2285,7 +2300,8 @@ private:
         return std::monostate{};
     }
     Status begin_breakpoint_step(pid_t tid, std::uint64_t address,
-                                 std::vector<std::pair<pid_t, int>> deferred_resumes = {}) {
+                                 std::vector<std::pair<pid_t, int>> deferred_resumes = {},
+                                 bool report_owner_step = false) {
         auto safe = require_all_threads_stopped(); if (!safe) return safe;
         auto configured = ensure_hardware_breakpoints_configured(); if (!configured) return configured;
         auto regs = get_regs(tid); if (!regs) return regs.error();
@@ -2323,7 +2339,8 @@ private:
             return rollback_setup(sys_error("PTRACE_SINGLESTEP over breakpoint"), true);
         breakpoint_step_rollback_.reset();
         step_breakpoint_ = address; step_thread_ = tid; step_pending_ = true; stopped_.erase(tid);
-        if (!deferred_resumes.empty()) deferred_breakpoint_resumes_ = std::move(deferred_resumes);
+        if (!deferred_resumes.empty())
+            deferred_breakpoint_resumes_ = Aarch64DeferredBreakpointResumes{std::move(deferred_resumes), report_owner_step};
         return std::monostate{};
     }
     Status stop_all_threads() {
@@ -2559,7 +2576,7 @@ private:
     }
     void clear() { initial_children_.clear(); startup_cleanup_ = false; startup_kill_ = false; detaching_ = false; detach_hardware_cleared_ = false; pid_ = 0; tracked_.clear(); stopped_.clear(); seized_.clear(); deferred_.clear(); deferred_signals_.clear(); interrupting_.clear(); requested_thread_interrupt_.reset(); rollback_threads_.clear(); resume_blocked_ = false; breakpoint_step_rollback_.reset(); hardware_unconfigured_threads_.clear(); hardware_configuration_error_.clear(); hardware_step_state_.reset(); pending_.reset(); pending_thread_ = 0; pending_signal_ = 0; pending_thread_interrupt_ = false; pending_breakpoint_.reset(); pending_hardware_execute_ = false; pending_hardware_execute_address_ = 0; initial_ = false; exited_ = false; step_breakpoint_.reset(); deferred_breakpoint_resumes_.reset(); step_thread_ = 0; step_pending_ = false; breakpoints_.clear(); originals_.clear(); extra_originals_.clear(); ids_.clear(); enabled_.clear(); hardware_breakpoints_.clear(); }
     pid_t pid_ = 0, pending_thread_ = 0, step_thread_ = 0; int pending_signal_ = 0; bool initial_ = false, exited_ = false, step_pending_ = false, pending_thread_interrupt_ = false; std::uint64_t seq_ = 0; BreakpointId next_id_ = 1; int last_signal_ = SIGTRAP;
-    std::mutex wait_gate_mutex_; std::set<pid_t> tracked_, stopped_, seized_, interrupting_; std::optional<pid_t> requested_thread_interrupt_; std::map<pid_t, int> deferred_, deferred_signals_; std::vector<pid_t> rollback_threads_; bool resume_blocked_ = false; std::optional<Aarch64BreakpointStepRollback> breakpoint_step_rollback_; std::optional<std::uint64_t> pending_, pending_breakpoint_, step_breakpoint_; std::optional<std::vector<std::pair<pid_t, int>>> deferred_breakpoint_resumes_;
+    std::mutex wait_gate_mutex_; std::set<pid_t> tracked_, stopped_, seized_, interrupting_; std::optional<pid_t> requested_thread_interrupt_; std::map<pid_t, int> deferred_, deferred_signals_; std::vector<pid_t> rollback_threads_; bool resume_blocked_ = false; std::optional<Aarch64BreakpointStepRollback> breakpoint_step_rollback_; std::optional<std::uint64_t> pending_, pending_breakpoint_, step_breakpoint_; std::optional<Aarch64DeferredBreakpointResumes> deferred_breakpoint_resumes_;
     std::map<std::uint64_t, std::byte> breakpoints_, originals_; std::map<std::uint64_t, std::array<std::byte, 3>> extra_originals_; std::map<BreakpointId, std::uint64_t> ids_; std::set<std::uint64_t> enabled_;
     std::vector<Aarch64HardwareBreakpoint> hardware_breakpoints_;
     std::set<pid_t> hardware_unconfigured_threads_;

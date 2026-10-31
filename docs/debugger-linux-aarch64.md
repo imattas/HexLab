@@ -28,8 +28,17 @@ peer `PTRACE_CONT` fails, the backend returns the completed owner step as a
 `single_step` event with the peer-resume error attached. It stops peers already
 resumed and blocks later resumes only if rollback cannot restore the stopped
 state. Signal, clone, exit, and other racing peer statuses remain deferred.
-Owner-only step-over returns the step event while selected peers remain
-stopped. These ptrace operations use stop-and-rollback and are not atomic.
+An owner single-step at an owned software breakpoint may also select peer
+continuations. Those peers remain stopped while the instruction is displaced,
+then resume with their requested signals only after a confirmed `TRAP_TRACE`
+stop and successful BRK rearm. Before returning the owner's `single_step`
+event, the backend stops the resumed peers and queues their racing signal,
+clone, or exit events for later delivery. A peer-resume failure is appended to
+the completed owner step; incomplete rollback blocks later resumes until
+recovery succeeds. A non-trace signal or interrupt stop cancels deferred
+continuations and remains visible with the selected peers held. Hardware execute-breakpoint owner steps
+still leave selected peers stopped through the returned step event. These
+ptrace operations use stop-and-rollback and are not atomic.
 Memory reads and writes, breakpoint changes, detach, and register writes
 require the entire process thread group to be owned and stopped. If the task
 list and ptrace ownership do not match, these operations fail closed.
@@ -96,7 +105,8 @@ kernel implementation: [`user_sve_header` and `NT_ARM_SVE` layout](https://githu
 [`encode_ctrl_reg`](https://github.com/torvalds/linux/blob/master/arch/arm64/include/asm/hw_breakpoint.h),
 and [watchpoint hit attribution](https://github.com/torvalds/linux/blob/master/arch/arm64/kernel/hw_breakpoint.c).
 
-The updated source passed a syntax-only compile with the AArch64 backend guard
-enabled under x86_64 WSL, using the host Linux headers. The available host is
-not AArch64, so this does not validate native AArch64 ptrace UAPI behavior or
-runtime breakpoint handling. No tests or target runtime checks have been run.
+The updated source passed syntax-only and object compilation with the AArch64
+backend guard enabled under x86_64 WSL, using the host Linux headers. This
+checks the guarded C++ source but emits host code; it does not validate native
+AArch64 code generation, ptrace UAPI behavior, or runtime breakpoint handling.
+No tests or target runtime checks have been run.
