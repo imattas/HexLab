@@ -2633,7 +2633,7 @@ struct ManagedResourceBindingTraversal {
   std::size_t provider_visits=0;
   std::size_t public_key_work_bytes=0, assembly_identity_comparisons=0;
   std::vector<std::size_t> active_provider_inputs;
-  std::uint64_t copied_payload_bytes=0;
+  std::uint64_t copied_payload_bytes=0, cached_catalog_payload_bytes=0;
 };
 Result<std::vector<ManagedResource>> inspect_managed_resources_recursive(
     const LoadedImage&,std::span<const ManagedResourceInput>,const ManagedResourceResolutionLimits&,
@@ -2677,7 +2677,6 @@ Result<std::vector<ManagedResource>> inspect_managed_resources_recursive(
     input_bytes+=storage->size();
     candidates.push_back({&input,std::move(storage)});
   }
-  std::uint64_t cached_payload_bytes=0;
   const auto candidate_identity=[&](Candidate& candidate)->std::optional<ManagedAssemblyIdentity>{
     if(candidate.identity_checked)return candidate.identity;
     candidate.identity_checked=true;
@@ -2704,9 +2703,9 @@ Result<std::vector<ManagedResource>> inspect_managed_resources_recursive(
       traversal.active_provider_inputs.pop_back();
       if(!parsed)return parsed.error();
       std::uint64_t bytes=0;for(const auto& item:parsed.value())bytes+=item.payload.size();
-      if(bytes>limits.max_payload_bytes-cached_payload_bytes)
+      if(bytes>limits.max_payload_bytes-traversal.cached_catalog_payload_bytes)
         return Error{ErrorCode::resource_limit,"Supplied managed resource catalogs exceed the binding cache budget"};
-      cached_payload_bytes+=bytes;
+      traversal.cached_catalog_payload_bytes+=bytes;
       candidate.resources=std::move(parsed.value());
     }
     return &*candidate.resources;
