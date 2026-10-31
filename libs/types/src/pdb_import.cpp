@@ -600,7 +600,7 @@ Result<PdbTypeImportResult> import_pdb_type_graph(const PdbTypeGraph &graph) {
                                       record.pointer_kind == 0x0c;
             if (record.pointer_mode != 0 || !flat_pointer || !record.size ||
                 (record.size & (record.size - 1)) != 0 ||
-                (record.pointer_options & ~std::uint32_t{0x1700}) != 0)
+                record.pointer_options != 0)
                 return fail(Error{ErrorCode::unsupported, "PDB pointer uses an unsupported kind, mode, or size"});
             auto pointee = convert(target_namespace, record.referenced_type);
             if (!pointee) return fail(pointee.error());
