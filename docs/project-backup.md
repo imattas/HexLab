@@ -338,7 +338,8 @@ cumulatively per operation. A requested per-file budget must be 1 byte through
 timestamp advances past previously validated generations if the wall clock
 ties or moves backward.
 
-The CLI and database API do not provide desktop controls for source archives.
+The desktop File menu supports asynchronous source-archive create, rotate, list,
+prune, verify, and restore operations.
 Project-database rotation and source-archive rotation remain independent.
 OS-level scheduling while HexLab is closed remains unsupported.
 

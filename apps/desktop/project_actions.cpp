@@ -693,6 +693,7 @@ void ProjectActions::add_menus(wxMenu &file, wxMenu &edit) {
     file.Insert(position++, list_source_archives_id, "List Rotated Source Archives");
     file.Insert(position++, prune_source_archives_id, "Prune Rotated Source Archives...");
     file.Insert(position++, verify_source_archive_id, "Verify Source Archive...");
+    file.Insert(position++, restore_source_archive_id, "Restore Source Archive...");
     file.Insert(position++, cancel_source_archive_id, "Cancel Source Archive Work");
     file.Insert(position, export_id, "Export Patched &Binary...");
     file.InsertSeparator(position++);
@@ -759,7 +760,7 @@ void ProjectActions::update(wxUpdateUIEvent &event) {
     }
     if (event.GetId() == archive_source_id || event.GetId() == rotate_source_archives_id ||
         event.GetId() == list_source_archives_id || event.GetId() == prune_source_archives_id ||
-        event.GetId() == verify_source_archive_id) {
+        event.GetId() == verify_source_archive_id || event.GetId() == restore_source_archive_id) {
         bool saved = false;
         if (id)
             for (const auto &document : controller_.documents().documents())
@@ -1069,7 +1070,7 @@ void ProjectActions::command(wxCommandEvent &event) {
     }
     if (event.GetId() == archive_source_id || event.GetId() == rotate_source_archives_id ||
         event.GetId() == list_source_archives_id || event.GetId() == prune_source_archives_id ||
-        event.GetId() == verify_source_archive_id) {
+        event.GetId() == verify_source_archive_id || event.GetId() == restore_source_archive_id) {
         std::optional<std::filesystem::path> project_path;
         for (const auto &document : controller_.documents().documents())
             if (document.id == *id) project_path = document.path;
@@ -1077,8 +1078,10 @@ void ProjectActions::command(wxCommandEvent &event) {
         auto action = event.GetId() == archive_source_id ? SourceArchiveAction::create :
             event.GetId() == rotate_source_archives_id ? SourceArchiveAction::rotate :
             event.GetId() == list_source_archives_id ? SourceArchiveAction::list :
-            event.GetId() == prune_source_archives_id ? SourceArchiveAction::prune : SourceArchiveAction::verify;
+            event.GetId() == prune_source_archives_id ? SourceArchiveAction::prune :
+            event.GetId() == verify_source_archive_id ? SourceArchiveAction::verify : SourceArchiveAction::restore;
         std::filesystem::path selected;
+        std::filesystem::path output;
         std::size_t retain = 5;
         if (action == SourceArchiveAction::create) {
             const auto filename = project_path->stem().wstring() + L"-source.bin";
@@ -1097,6 +1100,22 @@ void ProjectActions::command(wxCommandEvent &event) {
                                 wxFD_OPEN | wxFD_FILE_MUST_EXIST);
             if (dialog.ShowModal() != wxID_OK) return;
             selected = std::filesystem::path(dialog.GetPath().ToStdWstring());
+        } else if (action == SourceArchiveAction::restore) {
+            wxFileDialog archive_dialog(&frame_, "Choose source archive to restore", {}, {},
+                                        "All files (*.*)|*.*", wxFD_OPEN | wxFD_FILE_MUST_EXIST);
+            if (archive_dialog.ShowModal() != wxID_OK) return;
+            selected = std::filesystem::path(archive_dialog.GetPath().ToStdWstring());
+            const auto filename = project_path->stem().wstring() + L"-source-restored.bin";
+            wxFileDialog output_dialog(&frame_, "Restore matching source bytes", {}, wxString(filename),
+                                       "All files (*.*)|*.*", wxFD_SAVE);
+            if (output_dialog.ShowModal() != wxID_OK) return;
+            output = std::filesystem::path(output_dialog.GetPath().ToStdWstring());
+            std::error_code error;
+            if (std::filesystem::exists(output, error) || error) {
+                controller_.documents().report_error(*id, {ErrorCode::conflict,
+                    error ? "Cannot inspect the selected destination" : "Source restore never replaces existing files"});
+                return;
+            }
         } else if (action == SourceArchiveAction::rotate || action == SourceArchiveAction::prune) {
             wxNumberEntryDialog dialog(&frame_, "Source archive generations are validated against the embedded input.",
                 "Generations to retain:", action == SourceArchiveAction::rotate ? "Rotate Source Archives" : "Prune Source Archives", 5, 1, 32);
@@ -1107,13 +1126,14 @@ void ProjectActions::command(wxCommandEvent &event) {
                     "Confirm Source Archive Pruning", wxYES_NO | wxICON_WARNING, &frame_) != wxYES)
                 return;
         }
-        auto started = controller_.manage_source_archive(*id, action, std::move(selected), retain);
+        auto started = controller_.manage_source_archive(*id, action, std::move(selected), retain, std::move(output));
         if (!started) controller_.documents().report_error(*id, started.error());
         else if (controller_.message) {
             const wxString label = action == SourceArchiveAction::create ? "Archiving the matching external source..." :
                 action == SourceArchiveAction::rotate ? "Creating and rotating source archives..." :
                 action == SourceArchiveAction::list ? "Validating rotated source archives..." :
-                action == SourceArchiveAction::prune ? "Pruning validated source archives..." : "Verifying source archive...";
+                action == SourceArchiveAction::prune ? "Pruning validated source archives..." :
+                action == SourceArchiveAction::verify ? "Verifying source archive..." : "Restoring source archive...";
             controller_.message(*id, label + " This runs in the background; use File > Cancel Source Archive Work to request cancellation.");
         }
         return;

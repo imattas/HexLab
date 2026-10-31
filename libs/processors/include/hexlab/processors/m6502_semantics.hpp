@@ -144,6 +144,31 @@ struct M6502ReturnResult {
     bool operator==(const M6502ReturnResult &) const = default;
 };
 
+enum class M6502HardwareInterrupt : std::uint8_t { irq, nmi };
+
+struct M6502InterruptEntryResult {
+    std::uint16_t program_counter = 0;
+    std::uint8_t stack_pointer = 0;
+    std::uint8_t status = 0;
+    std::uint8_t pushed_program_counter_high = 0;
+    std::uint8_t pushed_program_counter_low = 0;
+    std::uint8_t pushed_status = 0;
+    std::uint16_t vector_address = 0;
+    bool operator==(const M6502InterruptEntryResult &) const = default;
+};
+
+// Evaluate an already accepted NMOS IRQ/NMI entry. The caller supplies the
+// interrupted PC/P/S and bytes read from the selected vector. This models the
+// architectural frame and post-entry registers, not interrupt recognition,
+// bus cycles, or memory writes.
+HEXLAB_PROCESSORS_EXPORT std::optional<M6502InterruptEntryResult>
+evaluate_m6502_hardware_interrupt(M6502HardwareInterrupt interrupt,
+                                  std::uint16_t program_counter,
+                                  std::uint8_t stack_pointer,
+                                  std::uint8_t status,
+                                  std::uint8_t vector_low,
+                                  std::uint8_t vector_high) noexcept;
+
 // Evaluate RTS/RTI using caller-fetched stack bytes in pop order.
 HEXLAB_PROCESSORS_EXPORT std::optional<M6502ReturnResult>
 evaluate_m6502_return(Opcode opcode, std::uint8_t stack_pointer,

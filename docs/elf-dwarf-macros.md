@@ -34,9 +34,16 @@ validate. Standard units may coexist in one section.
 Legacy macinfo define/undef, file-stack entries, and vendor-extension
 constant/string operands are decoded. Legacy streams carry no lengths, so each
 contribution must terminate with opcode zero; truncation and unknown opcodes
-fail the ELF metadata parse. Only standard DWARF v5 macro opcodes are
-interpreted. Vendor-defined v5 opcodes with table descriptions are recognized
-structurally but reported unsupported if encountered. Resolving
+fail the ELF metadata parse. Standard DWARF v5 macro opcodes retain their
+decoded fields. Vendor-defined v5 opcodes with opcode-table descriptions are
+retained with their opcode, operand form, section-relative source offset, and
+decoded operand. Supported forms include fixed-width data and flags,
+ULEB/SLEB, inline strings, blocks, `strp`/`strp_sup`/`line_strp`/`sec_offset`,
+`strx` and `strx1..4`, and `data16`. Inline block operands are capped at 64 KiB
+each and all operand storage shares the existing 64 MiB metadata budget. The
+CLI previews at most 256 vendor records and 512 operands, and displays at most
+32 bytes of each block. This is structural retention only; vendor-specific
+macro semantics are not inferred. Resolving
 `strp`/`strx`/supplementary text, supplementary import linking, ordinary import
 expansion (though ordinary import targets are checked against unit boundaries
 within their source section), and applying macro

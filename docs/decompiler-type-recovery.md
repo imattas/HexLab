@@ -538,7 +538,16 @@ unsupported. Multi-register HFA returns and ambiguous mixed-class argument
 evidence without a prototype are left unresolved. Without a prototype,
 argument inference is emitted only when evidence occupies a contiguous prefix
 of one register class; seeing both integer and SIMD classes leaves source
-parameter ordering ambiguous.
+parameter ordering ambiguous. Multiple observed scalar FP values in consecutive
+SIMD registers are also left unresolved because they may be separate scalar
+parameters or members of one HFA. A single observed SIMD scalar remains a
+candidate scalar parameter, though a one-member HFA has the same register
+placement. Stack reads without a prototype are retained as unresolved
+entry-relative offset/width/type evidence, including exact 32-bit reads at the
+upper four-byte half of a configured eight-byte stack slot, and are not appended
+to a candidate signature; if no register prefix is observed, no inferred
+signature is emitted. At most 256 distinct stack offsets are retained per
+function; additional offsets are omitted with a diagnostic.
 
 Within AArch64 FP recovery, `sN`, `dN`, and `qN` accesses share one physical
 SIMD register and SSA identity. A typed scalar `Assign`, call result, or

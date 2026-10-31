@@ -3517,6 +3517,7 @@ static Result<TypeRecoveryResult> recover_types_impl(
             return offset;
         };
         std::map<std::int64_t, const Fact *> stack_arguments;
+        bool aapcs64_stack_evidence_budget_exhausted = false;
         if (abi.stack_argument_base) for (const auto &b : fn.blocks) for (const auto &i : b.instructions) {
             const auto *assign=std::get_if<Assign>(&i.statement);
             if (!assign || !assign->value) continue;
@@ -3525,9 +3526,22 @@ static Result<TypeRecoveryResult> recover_types_impl(
             const auto normalized_offset = stack_offset_from_entry(*mem);
             if (!normalized_offset || *normalized_offset < 0) continue;
             auto slot=std::find(abi.stack_argument_offsets.begin(),abi.stack_argument_offsets.end(),*normalized_offset);
+            if (slot == abi.stack_argument_offsets.end() && abi.name == "AArch64 AAPCS64" &&
+                mem->type.bits == 32 && *normalized_offset % 8 == 4) {
+                const auto containing_slot = *normalized_offset - 4;
+                slot = std::find(abi.stack_argument_offsets.begin(), abi.stack_argument_offsets.end(), containing_slot);
+            }
             if(slot==abi.stack_argument_offsets.end()) continue;
             auto fact=facts.find(key(assign->destination,assign->destination_version));
-            if(fact!=facts.end() && fact->second.bits) stack_arguments[*normalized_offset]=&fact->second;
+            if (fact == facts.end() || !fact->second.bits) continue;
+            constexpr std::size_t max_aapcs64_stack_evidence = 256;
+            if (abi.name == "AArch64 AAPCS64" &&
+                !stack_arguments.contains(*normalized_offset) &&
+                stack_arguments.size() >= max_aapcs64_stack_evidence) {
+                aapcs64_stack_evidence_budget_exhausted = true;
+                continue;
+            }
+            stack_arguments[*normalized_offset] = &fact->second;
         }
 
         auto incoming_register_fact = [&](RegisterOperand reg) -> const Fact * {
@@ -3698,15 +3712,43 @@ static Result<TypeRecoveryResult> recover_types_impl(
                 if (const auto *fact = incoming_register_fact(reg)) integer_facts.emplace_back(reg, *fact);
             for (const auto reg : abi.floating_argument_registers)
                 if (const auto *fact = incoming_register_fact(reg)) floating_facts.emplace_back(reg, *fact);
+            if (!stack_arguments.empty()) {
+                for (const auto &[offset, fact] : stack_arguments) {
+                    auto candidate = make_type(*fact, abi.pointer_bits, nested_layout_work);
+                    result.unresolved_stack_arguments.push_back({offset, fact->bits, std::move(candidate)});
+                }
+                result.diagnostics.push_back(
+                    "AAPCS64 stack input evidence is retained by entry-relative slot, but source parameter order is unresolved without a prototype");
+                if (integer_facts.empty() && floating_facts.empty()) unresolved_argument_order = true;
+            }
+            if (aapcs64_stack_evidence_budget_exhausted)
+                result.diagnostics.push_back("AAPCS64 unresolved stack input evidence reached its 256-slot limit");
             if (!integer_facts.empty() && !floating_facts.empty()) {
                 unresolved_argument_order = true;
+                inferred_parameters.clear();
                 result.diagnostics.push_back("AAPCS64 argument classes are both observed without a prototype; source parameter ordering is ambiguous");
             } else {
                 const auto &observed = integer_facts.empty() ? floating_facts : integer_facts;
                 const auto &registers = integer_facts.empty() ? abi.floating_argument_registers
                                                               : abi.integer_argument_registers;
+                if (integer_facts.empty()) {
+                    std::size_t scalar_float_count = 0;
+                    for (const auto &[reg, observed_fact] : floating_facts) {
+                        (void)reg;
+                        auto classified = observed_fact;
+                        classified.floating = true;
+                        const auto type = make_type(classified, abi.pointer_bits, nested_layout_work);
+                        if (type && type->kind() == types::Kind::floating) ++scalar_float_count;
+                    }
+                    if (scalar_float_count > 1) {
+                        unresolved_argument_order = true;
+                        inferred_parameters.clear();
+                        result.diagnostics.push_back(
+                            "AAPCS64 consecutive scalar FP-register evidence may be separate arguments or one HFA; parameter grouping is unresolved without a prototype");
+                    }
+                }
                 bool contiguous = true;
-                for (std::size_t index = 0; index < observed.size(); ++index) {
+                for (std::size_t index = 0; index < observed.size() && !unresolved_argument_order; ++index) {
                     if (index >= registers.size() || observed[index].first != registers[index]) {
                         contiguous = false; break;
                     }

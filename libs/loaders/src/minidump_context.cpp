@@ -185,6 +185,7 @@ MinidumpContext decode_context(std::uint16_t architecture, std::span<const std::
                 add("xcomp_bv", xsave_header_in_context + 8, 8);
             }
             std::uint64_t retained = 0;
+            bool compacted_avx_decoded = false;
             if (xsave_header_valid) {
                 for (std::size_t index = 3; index < 64; ++index) {
                     if ((in_use & (std::uint64_t{1} << index)) &&
@@ -214,8 +215,44 @@ MinidumpContext decode_context(std::uint16_t architecture, std::span<const std::
             };
             const auto tile_config = amx_component(17, 64);
             const auto tile_palette = amx_palette(tile_config);
+            if (compacted_format && xsave_header_valid && (in_use & (std::uint64_t{1} << 2))) {
+                constexpr std::uint64_t avx_bit = std::uint64_t{1} << 2;
+                constexpr std::uint64_t avx_compacted_offset = 576;
+                constexpr std::uint64_t ymm_upper_size = 16u * 16u;
+                const auto feature = std::find_if(xstate_features.begin(), xstate_features.end(),
+                    [](const auto &row) { return row.index == 2; });
+                if (!(compacted & avx_bit)) {
+                    omitted = true;
+                    result.diagnostics.emplace_back("AMD64 compacted XSTATE in-use AVX feature is absent from XCOMP_BV");
+                } else if (feature == xstate_features.end() || feature->offset != avx_compacted_offset ||
+                           feature->size < ymm_upper_size || feature->size > 64u * 1024u ||
+                           feature->size > xstate_context_size - std::min<std::uint64_t>(xstate_context_size, avx_compacted_offset) ||
+                           xsave_area_in_context + avx_compacted_offset > bytes.size() ||
+                           feature->size > bytes.size() - (xsave_area_in_context + avx_compacted_offset) ||
+                           xsave_area_in_context + avx_compacted_offset + feature->size > source_size) {
+                    omitted = true;
+                    result.diagnostics.emplace_back("AMD64 compacted AVX component lacks a validated first-component extent");
+                } else {
+                    const auto begin = static_cast<std::size_t>(xsave_area_in_context + avx_compacted_offset);
+                    for (std::size_t reg = 0; reg < 16; ++reg)
+                        add("ymm" + std::to_string(reg) + "_hi", begin + reg * 16, 16);
+                    for (std::uint64_t part = 0, at = begin + ymm_upper_size;
+                         at < begin + feature->size; ++part) {
+                        const auto chunk = static_cast<std::size_t>(std::min<std::uint64_t>(
+                            xstate_chunk_bytes, begin + feature->size - at));
+                        add("xstate_feature_2_tail_" + std::to_string(part), static_cast<std::size_t>(at), chunk);
+                        at += chunk;
+                    }
+                    retained = feature->size;
+                    compacted_avx_decoded = true;
+                }
+            }
             for (const auto &feature : xstate_features) {
-                if (compacted_format) { omitted = true; continue; }
+                if (compacted_format) {
+                    if (!(in_use & (std::uint64_t{1} << feature.index))) continue;
+                    if (feature.index != 2 || !compacted_avx_decoded) omitted = true;
+                    continue;
+                }
                 // Features 0 and 1 (legacy FP and SSE) are represented by the
                 // fixed AMD64 CONTEXT fields. Feature 2 stores the upper halves
                 // of YMM0-YMM15 and is decoded separately below.
@@ -396,8 +433,8 @@ MinidumpContext decode_context(std::uint16_t architecture, std::span<const std::
             } else if (!xsave_header_valid) {
                 result.diagnostics.emplace_back("AMD64 XSTATE header is truncated from the captured context");
             } else if (compacted_format) {
-                omitted = true;
-                result.diagnostics.emplace_back("AMD64 XSTATE header declares compacted XSAVE format; component payloads are not decoded");
+                if (omitted)
+                    result.diagnostics.emplace_back("AMD64 compacted XSAVE components other than the validated first AVX component remain opaque");
                 if (compacted_component_mismatch) {
                     truncated = true;
                     result.diagnostics.emplace_back("AMD64 compacted XSTATE bitmap marks an in-use non-legacy component absent from XCOMP_BV");
@@ -407,6 +444,7 @@ MinidumpContext decode_context(std::uint16_t architecture, std::span<const std::
             }
             if (omitted && !compacted_format)
                 result.diagnostics.emplace_back("Some AMD64 XSTATE feature bytes exceed the validated source extent or 64 KiB capture bound");
+            if (compacted_format && omitted) truncated = true;
         }
     } else if (architecture == 5) {
         if (group(2,56,"ARM integer")) {
