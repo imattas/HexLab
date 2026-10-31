@@ -4578,6 +4578,66 @@ RegisterReferenceFacts mips_reference_facts(const Image *image, const Relocation
                         result.immediate_targets[{fact->id, 2}] = *target;
                 }
                 propagated = true;
+            } else if (mips64 && (instruction.opcode == Opcode::mips64_slt ||
+                                  instruction.opcode == Opcode::mips64_sltu ||
+                                  instruction.opcode == Opcode::mips64_slti ||
+                                  instruction.opcode == Opcode::mips64_sltiu) &&
+                       instruction.operands.size() == 3) {
+                const auto *dst = architecture_register(instruction, 0, RegisterBank::mips_gpr, 64);
+                const bool immediate_compare = instruction.opcode == Opcode::mips64_slti ||
+                                               instruction.opcode == Opcode::mips64_sltiu;
+                const bool signed_compare = instruction.opcode == Opcode::mips64_slt ||
+                                            instruction.opcode == Opcode::mips64_slti;
+                const auto *left = architecture_register(instruction, 1, RegisterBank::mips_gpr, 64);
+                std::optional<std::uint64_t> lhs, rhs;
+                const auto has_register = [](const auto &registers, const RegisterOperand &reg) {
+                    return std::find(registers.begin(), registers.end(), reg) != registers.end();
+                };
+                const auto *right = immediate_compare ? nullptr :
+                    architecture_register(instruction, 2, RegisterBank::mips_gpr, 64);
+                const bool valid_form = dst && left && instruction.length == 4 &&
+                    instruction.flow == FlowKind::fallthrough && instruction.delay_slots == 0 &&
+                    instruction.access.size() == 3 && instruction.access[0] == OperandAccess::write &&
+                    instruction.access[1] == OperandAccess::read && instruction.access[2] == OperandAccess::read &&
+                    !instruction.memory_read && !instruction.memory_write &&
+                    (dst->index == 0 || has_register(instruction.register_writes, *dst)) &&
+                    (left->index == 0 || has_register(instruction.register_reads, *left)) &&
+                    (immediate_compare || (right && (right->index == 0 ||
+                                                     has_register(instruction.register_reads, *right))));
+                const auto read = [&](const RegisterOperand *reg) -> std::optional<std::uint64_t> {
+                    if (!reg) return {};
+                    if (reg->index == 0) return UINT64_C(0);
+                    const auto value = registers.find(reg->index);
+                    if (value == registers.end() || value->second.space != instruction.address.space) return {};
+                    return value->second.offset;
+                };
+                if (valid_form) lhs = read(left);
+                if (valid_form && immediate_compare) {
+                    const auto *immediate = std::get_if<ImmediateOperand>(&instruction.operands[2]);
+                    if (immediate && immediate->encoded_width == 16 && immediate->effective_width == 64 &&
+                        immediate->is_signed) {
+                        const auto signed_value = std::bit_cast<std::int64_t>(immediate->value);
+                        if (signed_value >= INT16_MIN && signed_value <= INT16_MAX)
+                            rhs = static_cast<std::uint64_t>(signed_value);
+                    }
+                } else if (valid_form) {
+                    rhs = read(right);
+                }
+                std::optional<std::uint64_t> comparison;
+                if (dst && dst->index != 0 && lhs && rhs) {
+                    const bool less = signed_compare
+                        ? std::bit_cast<std::int64_t>(*lhs) < std::bit_cast<std::int64_t>(*rhs)
+                        : *lhs < *rhs;
+                    comparison = less ? UINT64_C(1) : UINT64_C(0);
+                }
+                erase_written();
+                if (dst && dst->index != 0 && comparison) {
+                    const Address target{instruction.address.space, *comparison};
+                    registers[dst->index] = target;
+                    if (riscv_target_segment(*image, target, OperandAccess::address))
+                        result.immediate_targets[{fact->id, 2}] = target;
+                }
+                propagated = true;
             } else if (mips32 && (instruction.opcode == Opcode::mips_clz || instruction.opcode == Opcode::mips_clo) &&
                 instruction.operands.size() == 2) {
                 const auto *dst = architecture_register(instruction, 0, RegisterBank::mips_gpr, 32);
