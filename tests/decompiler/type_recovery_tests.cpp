@@ -3,6 +3,11 @@
 #include <algorithm>
 #include <cassert>
 #include <iostream>
+#if defined(__APPLE__)
+#include <execinfo.h>
+#include <signal.h>
+#include <unistd.h>
+#endif
 #if defined(_MSC_VER)
 #include <crtdbg.h>
 #endif
@@ -10,7 +15,27 @@
 using namespace hexlab;
 using namespace hexlab::decompiler;
 
+#if defined(__APPLE__)
+namespace {
+void print_segv_backtrace(int signal_number) {
+    void *frames[64];
+    const int frame_count = ::backtrace(frames, static_cast<int>(sizeof(frames) / sizeof(frames[0])));
+    constexpr char message[] = "decompiler_type_recovery: SIGSEGV backtrace follows\n";
+    (void)::write(STDERR_FILENO, message, sizeof(message) - 1);
+    if (frame_count > 0) ::backtrace_symbols_fd(frames, frame_count, STDERR_FILENO);
+    ::_exit(128 + signal_number);
+}
+}
+#endif
+
 int main() {
+#if defined(__APPLE__)
+    struct sigaction action{};
+    action.sa_handler = print_segv_backtrace;
+    sigemptyset(&action.sa_mask);
+    action.sa_flags = 0;
+    (void)sigaction(SIGSEGV, &action, nullptr);
+#endif
 #if defined(_MSC_VER)
     _CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
     _CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);

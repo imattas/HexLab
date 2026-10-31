@@ -7,6 +7,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <random>
+#include "sqlite3.h"
 
 namespace hexlab::database::detail {
 OwnedFile::~OwnedFile() {
@@ -89,6 +90,17 @@ void publish_file(OwnedFile& source,const std::filesystem::path& destination,Rep
             struct stat identity{};
             if(::lstat(companion.c_str(),&identity)==0){
                 if(replacing && std::string(suffix)=="-wal" && S_ISREG(identity.st_mode) && identity.st_size==0)continue;
+                // SQLite may retain the WAL-index file after the last
+                // read-only connection closes. It can be cleaned only by
+                // SQLite itself, and only when the associated WAL is empty.
+                if(replacing && std::string(suffix)=="-shm" && S_ISREG(identity.st_mode)){
+                    auto wal=destination;wal += "-wal";
+                    struct stat wal_identity{};
+                    if(::lstat(wal.c_str(),&wal_identity)==0){
+                        if(S_ISREG(wal_identity.st_mode) && wal_identity.st_size==0)continue;
+                    }else if(errno==ENOENT)continue;
+                    else throw Failure{native_error("Cannot inspect destination WAL")};
+                }
                 throw Failure{{ErrorCode::busy,"Destination has live or unrecovered journal companions"}};
             }
             if(errno!=ENOENT)throw Failure{native_error("Cannot inspect destination journal companions")};
@@ -107,6 +119,59 @@ void publish_file(OwnedFile& source,const std::filesystem::path& destination,Rep
         if(fd<0)throw Failure{native_error("Cannot reserve destination for publication")};
         NativeHandle guard{fd};
         if(::flock(fd,LOCK_EX|LOCK_NB)!=0)throw Failure{{ErrorCode::busy,"Destination is still open in another reader or writer"}};
+        struct stat guarded_identity{};
+        if(::fstat(fd,&guarded_identity)!=0)throw Failure{native_error("Cannot inspect reserved publication destination")};
+        if(!S_ISREG(guarded_identity.st_mode) || guarded_identity.st_dev!=destination_identity.st_dev ||
+           guarded_identity.st_ino!=destination_identity.st_ino)
+            throw Failure{{ErrorCode::conflict,"Destination changed while being reserved for publication"}};
+        auto shm=destination;shm += "-shm";
+        auto wal=destination;wal += "-wal";
+        struct stat shm_identity{},wal_identity{};
+        const bool has_shm=::lstat(shm.c_str(),&shm_identity)==0;
+        if(!has_shm && errno!=ENOENT)throw Failure{native_error("Cannot inspect destination shared-memory companion")};
+        const bool has_wal=::lstat(wal.c_str(),&wal_identity)==0;
+        if(!has_wal && errno!=ENOENT)throw Failure{native_error("Cannot inspect destination WAL")};
+        if(has_shm || has_wal){
+            if((has_shm && !S_ISREG(shm_identity.st_mode)) ||
+               (has_wal && (!S_ISREG(wal_identity.st_mode) || wal_identity.st_size!=0)))
+                throw Failure{{ErrorCode::busy,"Destination has live or unrecovered journal companions"}};
+            // A checkpoint through SQLite's own locking protocol distinguishes
+            // reconstructible sidecars from a WAL still used by another client.
+            sqlite3* database=nullptr;
+            const auto path=destination.string();
+            struct stat before_sqlite{};
+            if(::lstat(destination.c_str(),&before_sqlite)!=0 || !S_ISREG(before_sqlite.st_mode) ||
+               before_sqlite.st_dev!=guarded_identity.st_dev || before_sqlite.st_ino!=guarded_identity.st_ino)
+                throw Failure{{ErrorCode::conflict,"Destination path changed before SQLite journal recovery"}};
+            const auto opened=sqlite3_open_v2(path.c_str(),&database,
+                SQLITE_OPEN_READWRITE|SQLITE_OPEN_FULLMUTEX|SQLITE_OPEN_NOFOLLOW,nullptr);
+            if(opened!=SQLITE_OK){if(database)sqlite3_close(database);throw Failure{{ErrorCode::busy,"Cannot safely recover destination SQLite journal companions"}};}
+            struct stat opened_path{};
+            if(::lstat(destination.c_str(),&opened_path)!=0 || !S_ISREG(opened_path.st_mode) ||
+               opened_path.st_dev!=guarded_identity.st_dev || opened_path.st_ino!=guarded_identity.st_ino){
+                sqlite3_close(database);
+                throw Failure{{ErrorCode::conflict,"Destination path changed while SQLite opened it"}};
+            }
+            int log_frames=-1,checkpointed_frames=-1;
+            const auto checkpoint=sqlite3_wal_checkpoint_v2(database,"main",SQLITE_CHECKPOINT_TRUNCATE,
+                                                              &log_frames,&checkpointed_frames);
+            const auto closed=sqlite3_close(database);
+            if(checkpoint!=SQLITE_OK || closed!=SQLITE_OK || log_frames!=checkpointed_frames)
+                throw Failure{{ErrorCode::busy,"Destination SQLite journal companions are still in use"}};
+            struct stat recovered_path{},still_guarded{};
+            if(::lstat(destination.c_str(),&recovered_path)!=0 || ::fstat(fd,&still_guarded)!=0 ||
+               !S_ISREG(recovered_path.st_mode) || recovered_path.st_dev!=guarded_identity.st_dev ||
+               recovered_path.st_ino!=guarded_identity.st_ino || still_guarded.st_dev!=guarded_identity.st_dev ||
+               still_guarded.st_ino!=guarded_identity.st_ino)
+                throw Failure{{ErrorCode::conflict,"Destination path changed during SQLite journal recovery"}};
+            if(::lstat(shm.c_str(),&shm_identity)==0)
+                throw Failure{{ErrorCode::busy,"Destination SQLite shared-memory companion is still in use"}};
+            if(errno!=ENOENT)throw Failure{native_error("Cannot recheck destination shared-memory companion")};
+            if(::lstat(wal.c_str(),&wal_identity)==0){
+                if(!S_ISREG(wal_identity.st_mode) || wal_identity.st_size!=0 || ::unlink(wal.c_str())!=0)
+                    throw Failure{{ErrorCode::busy,"Destination WAL remains after SQLite checkpoint"}};
+            }else if(errno!=ENOENT)throw Failure{native_error("Cannot recheck destination WAL")};
+        }
         auto parent=destination.parent_path();if(parent.empty())parent=".";
         int directory_fd=::open(parent.c_str(),O_RDONLY|O_CLOEXEC
 #ifdef O_DIRECTORY

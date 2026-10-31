@@ -13,6 +13,7 @@
 #include <cerrno>
 #include <csignal>
 #include <cstddef>
+#include <cstdio>
 #include <cstring>
 #include <map>
 #include <new>
@@ -1064,6 +1065,16 @@ void run_native_hardware_breakpoint_hit_test(const std::string& executable) {
 #endif
 
 #if defined(__linux__)
+template <class T> void linux_debug_error(const char *operation, const T &result) {
+    if (!result) std::fprintf(stderr, "Linux debugger diagnostic: %s: %s\n", operation,
+                              result.error().message.c_str());
+}
+
+void linux_debug_wait_error(const char *operation, const Result<DebugEvent> &result) {
+    if (!result) std::fprintf(stderr, "Linux debugger diagnostic: %s: %s\n", operation,
+                              result.error().message.c_str());
+}
+
 void run_linux_native_lifecycle_test(const std::string& executable) {
     DebugSession session(make_native_backend());
     auto processes = session.processes();
@@ -1072,11 +1083,16 @@ void run_linux_native_lifecycle_test(const std::string& executable) {
     hexlab_test::check(self, "Linux native process enumeration includes the current process");
     Target target{executable, {"--linux-debuggee"}, {}};
     auto launched = session.launch(target);
+    linux_debug_error("launch lifecycle fixture", launched);
     hexlab_test::check(static_cast<bool>(launched), "Linux ptrace backend launches a traced process");
     if (!launched) return;
     auto event = session.wait_event(std::chrono::seconds(5));
     hexlab_test::check(event && event.value().kind == EventKind::breakpoint,
                        "Linux launched child reports the exec SIGTRAP stop");
+    linux_debug_wait_error("wait for lifecycle exec stop", event);
+    if (event && event.value().kind != EventKind::breakpoint)
+        std::fprintf(stderr, "Linux debugger diagnostic: lifecycle initial event kind=%u message=%s\n",
+                     static_cast<unsigned>(event.value().kind), event.value().message.c_str());
     bool registers_ok = false;
     bool extended_registers_ok = false;
     bool ymm_registers_ok = false;
@@ -1089,9 +1105,10 @@ void run_linux_native_lifecycle_test(const std::string& executable) {
                            "Linux ptrace exposes validated process memory regions while stopped");
         auto modules = session.modules();
         hexlab_test::check(modules && std::any_of(modules.value().begin(), modules.value().end(),
-                               [](const ModuleInfo& module) { return module.name == "debugger_tests" && module.size != 0; }),
+                               [](const ModuleInfo& module) { return module.name == "hexlab_debugger_tests" && module.size != 0; }),
                            "Linux ptrace derives file-backed module ranges from process mappings");
         auto registers = session.read_registers(event.value().thread);
+        linux_debug_error("read lifecycle registers", registers);
         registers_ok = registers && std::any_of(registers.value().begin(), registers.value().end(),
             [](const RegisterValue& reg) { return reg.name == "rip" && reg.bytes.size() == sizeof(std::uint64_t); });
         if (registers) {
@@ -1133,8 +1150,10 @@ void run_linux_native_lifecycle_test(const std::string& executable) {
             const auto changed = xmm != registers.value().end()
                 ? session.write_registers(event.value().thread, std::span<const RegisterValue>(&changed_xmm, 1))
                 : Status{Error{ErrorCode::unsupported, "xmm0 missing"}};
+            linux_debug_error("write changed xmm0", changed);
             const auto after_change = changed ? session.read_registers(event.value().thread)
                                               : Result<std::vector<RegisterValue>>{changed.error()};
+            linux_debug_error("read back changed xmm0", after_change);
             const auto changed_value = after_change ? std::find_if(after_change.value().begin(), after_change.value().end(),
                 [](const RegisterValue& reg) { return reg.name == "xmm0"; }) : std::vector<RegisterValue>::const_iterator{};
             const bool mutation_visible = after_change && changed_value != after_change.value().end() &&
@@ -1142,37 +1161,65 @@ void run_linux_native_lifecycle_test(const std::string& executable) {
             const auto restored = xmm != registers.value().end()
                 ? session.write_registers(event.value().thread, std::span<const RegisterValue>(&*xmm, 1))
                 : Status{Error{ErrorCode::unsupported, "xmm0 missing"}};
+            linux_debug_error("restore xmm0", restored);
             const auto after_restore = restored ? session.read_registers(event.value().thread)
                                                 : Result<std::vector<RegisterValue>>{restored.error()};
+            linux_debug_error("read back restored xmm0", after_restore);
             const auto restored_value = after_restore ? std::find_if(after_restore.value().begin(), after_restore.value().end(),
                 [](const RegisterValue& reg) { return reg.name == "xmm0"; }) : std::vector<RegisterValue>::const_iterator{};
             extended_registers_ok = xmm != registers.value().end() && st0 != registers.value().end() && changed &&
                 mutation_visible && restored && after_restore && restored_value != after_restore.value().end() &&
                 restored_value->bytes == xmm->bytes;
+            if (!extended_registers_ok)
+                std::fprintf(stderr, "Linux debugger diagnostic: x87/XMM round-trip xmm=%d st0=%d changed=%d visible=%d restored=%d reread=%d value_matches=%d\n",
+                    xmm != registers.value().end(), st0 != registers.value().end(), static_cast<bool>(changed),
+                    mutation_visible, static_cast<bool>(restored), static_cast<bool>(after_restore),
+                    after_restore && xmm != registers.value().end() &&
+                        restored_value != after_restore.value().end() && restored_value->bytes == xmm->bytes);
             const auto ip = std::find_if(registers.value().begin(), registers.value().end(),
                 [](const RegisterValue& reg) { return reg.name == "rip" && reg.bytes.size() == sizeof(std::uint64_t); });
             if (ip != registers.value().end()) {
                 std::uint64_t address = 0;
                 std::memcpy(&address, ip->bytes.data(), sizeof(address));
                 auto breakpoint = session.add_breakpoint(address, BreakpointKind::software);
+                linux_debug_error("add software breakpoint", breakpoint);
                 const std::byte replacement{0x90}, trap{0xcc};
                 auto original = session.read_memory(address, 1);
+                linux_debug_error("read original breakpoint byte", original);
                 auto disabled = breakpoint ? session.set_breakpoint_enabled(breakpoint.value().id, false)
                                            : Status{breakpoint.error()};
+                linux_debug_error("disable software breakpoint", disabled);
                 auto disabled_byte = session.read_memory(address, 1);
+                linux_debug_error("read disabled breakpoint byte", disabled_byte);
                 auto enabled = breakpoint ? session.set_breakpoint_enabled(breakpoint.value().id, true)
                                           : Status{breakpoint.error()};
+                linux_debug_error("enable software breakpoint", enabled);
                 auto enabled_byte = session.read_memory(address, 1);
+                linux_debug_error("read enabled breakpoint byte", enabled_byte);
                 auto write = breakpoint ? session.write_memory(address, std::span<const std::byte>(&replacement, 1))
                                         : Status{breakpoint.error()};
+                linux_debug_error("write through software breakpoint", write);
                 auto visible = session.read_memory(address, 1);
+                linux_debug_error("read visible breakpoint byte", visible);
                 auto removed = breakpoint ? session.remove_breakpoint(breakpoint.value().id)
                                           : Status{breakpoint.error()};
+                linux_debug_error("remove software breakpoint", removed);
                 auto restored = session.read_memory(address, 1);
+                linux_debug_error("read restored breakpoint byte", restored);
                 breakpoint_write_ok = breakpoint && original && disabled && disabled_byte &&
                     disabled_byte.value()[0] == original.value()[0] && enabled && enabled_byte &&
                     enabled_byte.value()[0] == trap && write && visible && visible.value()[0] == trap && removed &&
                     restored && restored.value()[0] == replacement;
+                if (!breakpoint_write_ok)
+                    std::fprintf(stderr, "Linux debugger diagnostic: software breakpoint transaction add=%d original=%d disable=%d disabled_byte=%d enable=%d enabled_byte=%d write=%d visible=%d remove=%d restored=%d byte_values=%d/%d/%d/%d/%d\n",
+                        static_cast<bool>(breakpoint), static_cast<bool>(original), static_cast<bool>(disabled),
+                        static_cast<bool>(disabled_byte), static_cast<bool>(enabled), static_cast<bool>(enabled_byte),
+                        static_cast<bool>(write), static_cast<bool>(visible), static_cast<bool>(removed), static_cast<bool>(restored),
+                        original && !original.value().empty() ? std::to_integer<int>(original.value()[0]) : -1,
+                        disabled_byte && !disabled_byte.value().empty() ? std::to_integer<int>(disabled_byte.value()[0]) : -1,
+                        enabled_byte && !enabled_byte.value().empty() ? std::to_integer<int>(enabled_byte.value()[0]) : -1,
+                        visible && !visible.value().empty() ? std::to_integer<int>(visible.value()[0]) : -1,
+                        restored && !restored.value().empty() ? std::to_integer<int>(restored.value()[0]) : -1);
             }
         }
         (void)session.continue_execution(event.value().sequence, ContinueStatus::handled);
@@ -1187,10 +1234,12 @@ void run_linux_native_lifecycle_test(const std::string& executable) {
     bool exited = false;
     for (int i = 0; i < 250 && !exited; ++i) {
         event = session.wait_event(std::chrono::milliseconds(50));
-        if (!event) { if (event.error().code == ErrorCode::busy) continue; break; }
+        if (!event) { if (event.error().code == ErrorCode::busy) continue; linux_debug_wait_error("wait for child exit", event); break; }
         exited = event.value().kind == EventKind::process_exited;
         (void)session.continue_execution(event.value().sequence, ContinueStatus::handled);
     }
+    if (!exited) std::fprintf(stderr, "Linux debugger diagnostic: child exit not observed; session state=%u\n",
+                              static_cast<unsigned>(session.state()));
     hexlab_test::check(exited, "Linux traced child exit is delivered through the event queue");
     if (session.state() == SessionState::exited) (void)session.detach();
 }
@@ -1198,38 +1247,64 @@ void run_linux_native_lifecycle_test(const std::string& executable) {
 void run_linux_launched_interrupt_test(const std::string& executable) {
     DebugSession session(make_native_backend());
     auto failed = session.launch(Target{executable + ".missing", {"--linux-interrupt-debuggee"}, {}});
+    if (failed) std::fprintf(stderr, "Linux debugger diagnostic: missing executable unexpectedly launched pid=%llu\n",
+                             static_cast<unsigned long long>(failed.value().id));
     hexlab_test::check(!failed, "Linux failed exec is reported instead of publishing a launch");
     int failed_status = 0;
     errno = 0;
     const auto unreaped_child = waitpid(-1, &failed_status, WNOHANG);
+    const auto reap_errno = errno;
+    if (unreaped_child != -1 || reap_errno != ECHILD)
+        std::fprintf(stderr, "Linux debugger diagnostic: failed-exec child reap probe returned pid=%ld errno=%d status=0x%x\n",
+                     static_cast<long>(unreaped_child), reap_errno, failed_status);
+    if ((unreaped_child != -1 || reap_errno != ECHILD) && !failed)
+        std::fprintf(stderr, "Linux debugger diagnostic: failed exec launch error: %s\n", failed.error().message.c_str());
+    errno = reap_errno;
     hexlab_test::check(unreaped_child == -1 && errno == ECHILD,
                        "Linux failed exec is reaped before launch returns");
 
     auto launched = session.launch(Target{executable, {"--linux-interrupt-debuggee", "argument-forwarded"}, {}});
+    linux_debug_error("launch interrupt fixture", launched);
     hexlab_test::check(static_cast<bool>(launched), "Linux launches a target that can be asynchronously interrupted");
     if (!launched) return;
     const auto process = launched.value().id;
     auto initial = session.wait_event(std::chrono::seconds(5));
+    linux_debug_wait_error("wait for interrupt fixture exec stop", initial);
     const bool initial_stop = initial && initial.value().kind == EventKind::breakpoint;
+    if (initial && !initial_stop)
+        std::fprintf(stderr, "Linux debugger diagnostic: interrupt fixture initial event kind=%u message=%s\n",
+                     static_cast<unsigned>(initial.value().kind), initial.value().message.c_str());
     hexlab_test::check(initial_stop, "Linux seized launch reports the initial exec stop");
     if (!initial) { (void)session.detach(); return; }
     auto resumed = session.continue_execution(initial.value().sequence, ContinueStatus::handled);
+    linux_debug_error("resume interrupt fixture", resumed);
     hexlab_test::check(static_cast<bool>(resumed), "Linux resumes the launched target after exec stop");
     auto requested = resumed ? session.request_interrupt() : Status{resumed.error()};
+    linux_debug_error("request async interrupt", requested);
     hexlab_test::check(static_cast<bool>(requested), "Linux asynchronous interrupt accepts a launched seized target");
     auto interrupted = requested ? session.wait_event(std::chrono::seconds(5))
                                  : Result<DebugEvent>{Error{ErrorCode::busy, "interrupt was not accepted"}};
+    linux_debug_wait_error("wait for async interrupt stop", interrupted);
+    if (interrupted && (interrupted.value().kind != EventKind::exception || interrupted.value().message != "interrupt stop"))
+        std::fprintf(stderr, "Linux debugger diagnostic: interrupt event kind=%u message=%s\n",
+                     static_cast<unsigned>(interrupted.value().kind), interrupted.value().message.c_str());
     const bool stopped = interrupted && interrupted.value().kind == EventKind::exception &&
                          interrupted.value().message == "interrupt stop";
+    if (!stopped)
+        std::fprintf(stderr, "Linux debugger diagnostic: interrupt outcome requested=%d got_event=%d state=%u\n",
+                     static_cast<bool>(requested), static_cast<bool>(interrupted), static_cast<unsigned>(session.state()));
     hexlab_test::check(stopped, "Linux interrupt produces an explicit ptrace stop event");
     if (interrupted && session.state() == SessionState::stopped)
         (void)session.continue_execution(interrupted.value().sequence, ContinueStatus::handled);
     auto detached = session.detach();
+    linux_debug_error("detach interrupt fixture", detached);
     hexlab_test::check(static_cast<bool>(detached), "Linux detaches cleanly after interrupting a launched target");
     if (detached) {
         int status = 0;
         const auto waited = waitpid(static_cast<pid_t>(process), &status, WNOHANG);
         const bool survived = waited == 0 && kill(static_cast<pid_t>(process), 0) == 0;
+        if (!survived) std::fprintf(stderr, "Linux debugger diagnostic: detached process probe waitpid=%ld errno=%d status=0x%x\n",
+                                    static_cast<long>(waited), errno, status);
         hexlab_test::check(survived, "Linux launched target remains alive immediately after debugger detach");
         if (survived) {
             (void)kill(static_cast<pid_t>(process), SIGTERM);
@@ -1408,6 +1483,7 @@ void run_linux_write_watchpoint_test() {
     DebugSession session(make_native_backend());
     auto attached = shared->ready != 0 ? session.attach(static_cast<ProcessId>(child))
                                        : Result<ProcessInfo>{Error{ErrorCode::busy, "watchpoint child did not start"}};
+    linux_debug_error("attach watchpoint child", attached);
     hexlab_test::check(static_cast<bool>(attached), "Linux attaches to the child before its watched write");
     bool installed = false;
     bool observed_owned_hit = false;
@@ -1415,24 +1491,31 @@ void run_linux_write_watchpoint_test() {
     bool exited = false;
     if (attached) {
         auto initial = session.wait_event(std::chrono::milliseconds(50));
+        linux_debug_wait_error("wait for watchpoint child initial stop", initial);
+        if (initial && initial.value().kind != EventKind::exception)
+            std::fprintf(stderr, "Linux debugger diagnostic: watchpoint initial event kind=%u message=%s\n",
+                         static_cast<unsigned>(initial.value().kind), initial.value().message.c_str());
         auto breakpoint = initial ? session.add_breakpoint(
             reinterpret_cast<std::uintptr_t>(&shared->watched_value), BreakpointKind::write, sizeof(std::uint64_t))
                                   : Result<Breakpoint>{initial.error()};
+        linux_debug_error("install write watchpoint", breakpoint);
         installed = static_cast<bool>(breakpoint);
         hexlab_test::check(installed, "Linux installs an aligned eight-byte write watchpoint on a stopped child");
         if (breakpoint) {
             shared->trigger = 1;
             auto resumed = session.continue_execution(initial.value().sequence, ContinueStatus::handled);
+            linux_debug_error("resume watchpoint child", resumed);
             hexlab_test::check(static_cast<bool>(resumed), "Linux resumes the child after installing its watchpoint");
             for (int i = 0; i < 100 && !exited; ++i) {
                 auto event = session.wait_event(std::chrono::milliseconds(100));
-                if (!event) { if (event.error().code == ErrorCode::busy) continue; break; }
+                if (!event) { if (event.error().code == ErrorCode::busy) continue; linux_debug_wait_error("wait for watchpoint event", event); break; }
                 if (event.value().kind == EventKind::breakpoint &&
                     std::find(event.value().breakpoint_ids.begin(), event.value().breakpoint_ids.end(), breakpoint.value().id) !=
                         event.value().breakpoint_ids.end()) {
                     observed_owned_hit = true;
                     observed_write = shared->watched_value == 0x8877665544332211ULL;
                     auto removed = session.remove_breakpoint(breakpoint.value().id);
+                    linux_debug_error("remove hit write watchpoint", removed);
                     hexlab_test::check(static_cast<bool>(removed), "Linux removes the hit write watchpoint while stopped");
                 }
                 exited = event.value().kind == EventKind::process_exited;
@@ -1445,18 +1528,32 @@ void run_linux_write_watchpoint_test() {
     } else {
         shared->trigger = 1;
     }
+    if (!observed_owned_hit || !exited)
+        std::fprintf(stderr, "Linux debugger diagnostic: write-watchpoint outcome hit=%d committed=%d exited=%d state=%u\n",
+                     observed_owned_hit, observed_write, exited, static_cast<unsigned>(session.state()));
     hexlab_test::check(observed_owned_hit, "Linux DR6 maps a data-write stop to its owned breakpoint ID");
     hexlab_test::check(observed_write, "Linux reports the watchpoint after the target store has committed");
     hexlab_test::check(exited, "Linux write-watchpoint target exits after its stop is acknowledged");
     if (session.state() == SessionState::exited) (void)session.detach();
     int status{};
     bool reaped = false;
+    pid_t last_waited = -1;
+    int last_wait_errno = 0;
     for (int i = 0; i < 100 && !reaped; ++i) {
+        errno = 0;
         const auto waited = waitpid(child, &status, WNOHANG);
+        last_waited = waited;
+        last_wait_errno = errno;
         reaped = waited == child;
         if (!reaped) std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
     if (!reaped) { (void)kill(child, SIGKILL); (void)waitpid(child, &status, 0); }
+    if (!reaped) {
+        std::fprintf(stderr, "Linux debugger diagnostic: watchpoint child was not reaped before forced cleanup; pid=%ld status=0x%x\n",
+                     static_cast<long>(child), status);
+        std::fprintf(stderr, "Linux debugger diagnostic: last watchpoint waitpid=%ld errno=%d\n",
+                     static_cast<long>(last_waited), last_wait_errno);
+    }
     hexlab_test::check(reaped && WIFEXITED(status) && WEXITSTATUS(status) == 0,
                        "Linux watchpoint child is reaped cleanly");
     (void)munmap(storage, sizeof(SharedTarget));
@@ -1472,16 +1569,30 @@ void run_linux_multithread_attach_test(const std::string& executable) {
     }
     DebugSession session(make_native_backend());
     auto attached = session.attach(static_cast<ProcessId>(child));
+    linux_debug_error("attach multithread child", attached);
     hexlab_test::check(static_cast<bool>(attached), "Linux ptrace attach stops an existing child process");
     if (attached) {
         auto threads = session.threads();
+        linux_debug_error("enumerate attached threads", threads);
         const bool all_stopped = threads && threads.value().size() >= 3 &&
             std::all_of(threads.value().begin(), threads.value().end(), [](const ThreadInfo& thread) {
                 return thread.state == ThreadState::stopped;
             });
         hexlab_test::check(all_stopped,
             "Linux attach converges on every target thread and reports each stopped before returning");
+        if (!all_stopped) {
+            if (threads) {
+                for (const auto &thread : threads.value())
+                    std::fprintf(stderr, "Linux debugger diagnostic: attached thread id=%llu state=%u native=%s\n",
+                                 static_cast<unsigned long long>(thread.id), static_cast<unsigned>(thread.state),
+                                 thread.native_state.c_str());
+            }
+        }
         auto event = session.wait_event(std::chrono::milliseconds(50));
+        linux_debug_wait_error("wait for multithread attach event", event);
+        if (event && event.value().kind != EventKind::exception)
+            std::fprintf(stderr, "Linux debugger diagnostic: attach event kind=%u message=%s\n",
+                         static_cast<unsigned>(event.value().kind), event.value().message.c_str());
         hexlab_test::check(event && event.value().kind == EventKind::exception,
                            "Linux attach exposes its synthetic initial stop as an explicit event");
         if (event) {
@@ -1492,6 +1603,7 @@ void run_linux_multithread_attach_test(const std::string& executable) {
                 std::uint64_t address = 0;
                 std::memcpy(&address, ip->bytes.data(), sizeof(address));
                 auto breakpoint = session.add_breakpoint(address, BreakpointKind::execute, 1);
+                linux_debug_error("install attach-group execute breakpoint", breakpoint);
                 hexlab_test::check(static_cast<bool>(breakpoint),
                     "Linux installs a hardware execute breakpoint across the stopped thread group");
                 if (breakpoint) {
@@ -1519,6 +1631,7 @@ void run_linux_multithread_attach_test(const std::string& executable) {
             }
         }
         auto detached = session.detach();
+        linux_debug_error("detach multithread child", detached);
         hexlab_test::check(static_cast<bool>(detached), "Linux detach releases every seized target thread");
     }
     int status{};
@@ -1529,6 +1642,8 @@ void run_linux_multithread_attach_test(const std::string& executable) {
         if (!exited) std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
     if (!exited) { (void)kill(child, SIGKILL); (void)waitpid(child, &status, 0); }
+    if (!exited) std::fprintf(stderr, "Linux debugger diagnostic: attached child not reaped after detach; pid=%ld status=0x%x\n",
+                              static_cast<long>(child), status);
     hexlab_test::check(exited && WIFEXITED(status) && WEXITSTATUS(status) == 0,
                        "Linux attached child resumes cleanly after detach and exits normally");
 }
@@ -1645,6 +1760,8 @@ int main(int argc, char **argv) {
         run_native_exception_delivery_test(executable);
         run_native_hardware_breakpoint_hit_test(executable);
     });
+#elif defined(__APPLE__) || defined(__linux__)
+    return hexlab_test::run([&] { run_tests(); });
 #else
     return hexlab_test::run([&] {
         run_tests();

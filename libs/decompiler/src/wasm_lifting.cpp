@@ -309,6 +309,15 @@ std::optional<std::string_view> simd_integer_shift(std::uint32_t subopcode) {
     }
     return {};
 }
+bool simd_integer_extend_or_pairwise_add(std::uint32_t subopcode) {
+    return (subopcode >= 0x7c && subopcode <= 0x7f) ||
+           (subopcode >= 0x87 && subopcode <= 0x8a) ||
+           (subopcode >= 0xa7 && subopcode <= 0xaa) ||
+           (subopcode >= 0xc7 && subopcode <= 0xca);
+}
+bool simd_integer_narrow(std::uint32_t subopcode) {
+    return subopcode == 0x65 || subopcode == 0x66 || subopcode == 0x85 || subopcode == 0x86;
+}
 std::optional<SimdMemoryOpInfo> simd_memory_op(std::uint32_t subopcode) {
     const auto opaque = vector(128);
     switch (subopcode) {
@@ -851,6 +860,20 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
                     if (!shift) return shift.error();
                     auto value = shape_pop(stack, vector(128));
                     if (!value) return value.error();
+                    stack.push_back(vector(128));
+                    continue;
+                }
+                if (subopcode && simd_integer_extend_or_pairwise_add(*subopcode)) {
+                    auto value = shape_pop(stack, vector(128));
+                    if (!value) return value.error();
+                    stack.push_back(vector(128));
+                    continue;
+                }
+                if (subopcode && simd_integer_narrow(*subopcode)) {
+                    auto high = shape_pop(stack, vector(128));
+                    auto low = shape_pop(stack, vector(128));
+                    if (!high) return high.error();
+                    if (!low) return low.error();
                     stack.push_back(vector(128));
                     continue;
                 }
@@ -1669,6 +1692,24 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
                         if (!shift) return shift.error();
                         if (!value) return value.error();
                         stack.push_back(binary(std::string(*operation), value.value(), shift.value(), vector(128)));
+                        continue;
+                    }
+                    if (simd_integer_extend_or_pairwise_add(*subopcode)) {
+                        if (i.mnemonic_override.empty())
+                            return unsupported("SIMD extension mnemonic is unavailable");
+                        auto value = pop(vector(128));
+                        if (!value) return value.error();
+                        stack.push_back(unary(i.mnemonic_override, value.value(), vector(128)));
+                        continue;
+                    }
+                    if (simd_integer_narrow(*subopcode)) {
+                        if (i.mnemonic_override.empty())
+                            return unsupported("SIMD narrowing mnemonic is unavailable");
+                        auto high = pop(vector(128));
+                        auto low = pop(vector(128));
+                        if (!high) return high.error();
+                        if (!low) return low.error();
+                        stack.push_back(binary(i.mnemonic_override, low.value(), high.value(), vector(128)));
                         continue;
                     }
                 }

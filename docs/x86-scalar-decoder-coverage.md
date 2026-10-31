@@ -130,6 +130,18 @@ Legacy LES (`C4 /r`) and LDS (`C5 /r`) now decode only memory far pointers in 16
 
 ## POPCNT decoded evaluation
 
+## Conditional data moves
+
+The scalar decoder recognizes all `CMOVcc` forms (`0F 40`–`0F 4F`) and
+`SETcc` forms (`0F 90`–`0F 9F`) in 16-, 32-, and 64-bit modes. Both retain
+the exact four-bit x86 condition code and a FLAGS read dependency. CMOVcc
+uses the mode-selected operand width, a read/write destination register (it
+is preserved when the condition is false), and a register or memory source.
+SETcc writes an 8-bit register or memory destination. This change records
+decoder semantics only; conditional value selection remains unsupported by
+the scalar lifter. Prefix validation continues to reject repeat prefixes
+outside explicitly supported opcode forms.
+
 The decoded POPCNT evaluator accepts 16-, 32-, or 64-bit register/memory source widths and a caller-supplied source value after any memory read. It returns the count in the destination width and updates CF, PF, AF, ZF, SF, and OF: the five non-ZF bits are cleared and ZF is set exactly when the masked source is zero. Other FLAGS bits are preserved from the caller's incoming value. Decoder effects now mark FLAGS as both read and written to represent that preservation. The helper does not perform memory access, apply the destination/FLAGS outputs to runtime state, or gate on CPUID feature bits.
 BSF/BSR and F3 TZCNT/LZCNT scans now have width-specific typed result
 intrinsics for 16-, 32-, and 64-bit forms. Their FLAGS outputs explicitly
