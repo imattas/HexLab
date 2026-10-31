@@ -2,6 +2,7 @@
 
 #include <bit>
 #include <algorithm>
+#include <limits>
 
 namespace hexlab {
 namespace {
@@ -1456,36 +1457,162 @@ evaluate_x87_square_root(const X87SquareRootRequest &request) noexcept {
 std::optional<X87ScaleResult> evaluate_x87_scale(const X87ScaleRequest &request) noexcept {
     const auto value = decode(request.value);
     const auto scale = decode(request.scale);
-    const auto value_raw_exponent = static_cast<std::uint16_t>(request.value.sign_exponent & exponent_mask);
-    const auto scale_raw_exponent = static_cast<std::uint16_t>(request.scale.sign_exponent & exponent_mask);
-    if ((value.kind != Class::zero && value.kind != Class::finite) ||
-        (scale.kind != Class::zero && scale.kind != Class::finite) ||
-        (value.kind == Class::finite && value_raw_exponent == 0) ||
-        (scale.kind == Class::finite && scale_raw_exponent == 0))
-        return {};
+    auto result = X87ScaleResult{};
+    result.status_word = static_cast<std::uint16_t>(request.status_word & ~fsw_c1);
 
-    if (value.kind == Class::zero)
-        return X87ScaleResult{request.value, static_cast<std::uint16_t>(request.status_word & ~fsw_c1)};
+    const auto from_arithmetic = [](const X87ArithmeticResult &arithmetic) {
+        X87ScaleResult scaled;
+        scaled.status_word = arithmetic.status_word;
+        scaled.completed = arithmetic.completed;
+        scaled.invalid_operation = arithmetic.invalid_operation;
+        scaled.overflow = arithmetic.overflow;
+        scaled.underflow = arithmetic.underflow;
+        scaled.precision = arithmetic.precision;
+        scaled.value_valid = arithmetic.value.has_value();
+        if (arithmetic.value) scaled.value = *arithmetic.value;
+        return scaled;
+    };
 
+    // Invalid encodings and signaling NaNs take priority over ordinary
+    // denormal processing. The shared special-operand rule preserves x87 NaN
+    // payload selection and raises IE for SNaNs/unsupported encodings.
+    if (value.kind == Class::unsupported || scale.kind == Class::unsupported ||
+        is_nan(value.kind) || is_nan(scale.kind)) {
+        X87ArithmeticResult arithmetic;
+        (void)handle_special_operands(request.value, request.scale, value, scale,
+                                      request.control_word, result.status_word, arithmetic);
+        arithmetic.invalid_operation = value.kind == Class::unsupported || scale.kind == Class::unsupported ||
+            value.kind == Class::signaling_nan || scale.kind == Class::signaling_nan;
+        return from_arithmetic(arithmetic);
+    }
+
+    const auto raw_value_exponent = static_cast<std::uint16_t>(request.value.sign_exponent & exponent_mask);
+    const auto raw_scale_exponent = static_cast<std::uint16_t>(request.scale.sign_exponent & exponent_mask);
+    const bool value_denormal = value.kind == Class::finite && raw_value_exponent == 0 &&
+                                (request.value.significand & integer_bit) == 0;
+    const bool scale_denormal = scale.kind == Class::finite && raw_scale_exponent == 0 &&
+                                (request.scale.significand & integer_bit) == 0;
+    result.denormal_operand = value_denormal || scale_denormal;
+    if (result.denormal_operand) {
+        if ((request.control_word & fcw_denormal_mask) == 0) {
+            result.status_word = signal_exception(result.status_word, fsw_denormal);
+            result.completed = false;
+            result.value_valid = false;
+            return result;
+        }
+        result.status_word |= fsw_denormal;
+    }
+
+    if (scale.kind == Class::infinity) {
+        // Intel's FSCALE class table defines 0*2^infinity and
+        // infinity*2^infinity as invalid; finite nonzero values scale to
+        // signed zero or infinity according to the exponent sign.
+        if (value.kind == Class::zero || value.kind == Class::infinity)
+            return from_arithmetic(invalid_arithmetic(result.status_word, request.control_word, x87_indefinite()));
+        result.value = scale.negative
+            ? X87Binary80{0, static_cast<std::uint16_t>(value.negative ? sign_mask : 0)}
+            : X87Binary80{integer_bit, static_cast<std::uint16_t>(exponent_mask | (value.negative ? sign_mask : 0))};
+        return result;
+    }
+
+    if (value.kind == Class::infinity || value.kind == Class::zero) {
+        result.value = request.value;
+        return result;
+    }
+
+    // ST(1) is truncated toward zero. Up through unbiased exponent 15 its
+    // integral magnitude fits in uint16_t. Above that, its magnitude is at
+    // least 65536, enough to overflow the smallest binary80 input or
+    // underflow the largest one regardless of the exact significand.
     std::int64_t integral_scale = 0;
+    bool enormous_scale = false;
     if (scale.kind == Class::finite) {
-        const auto unbiased_scale_exponent = static_cast<int>(scale.exponent) - 16383;
-        // Larger magnitudes cannot keep a finite binary80 ST(0) normal.
-        if (unbiased_scale_exponent > 14) return {};
-        if (unbiased_scale_exponent >= 0) {
-            const auto magnitude = scale.significand >> (63 - unbiased_scale_exponent);
+        const auto scale_unbiased_exponent = static_cast<int>(scale.exponent) - 16383;
+        if (scale_unbiased_exponent > 15) {
+            enormous_scale = true;
+        } else if (scale_unbiased_exponent >= 0) {
+            const auto magnitude = scale.significand >> (63 - scale_unbiased_exponent);
             integral_scale = static_cast<std::int64_t>(magnitude);
         }
         if (scale.negative) integral_scale = -integral_scale;
     }
 
-    auto result_value = request.value;
-    const auto unbiased_value_exponent = static_cast<int>(value.exponent) - 16383;
-    const auto result_exponent = unbiased_value_exponent + integral_scale;
-    if (result_exponent < -16382 || result_exponent > 16383) return {};
-    result_value.sign_exponent = static_cast<std::uint16_t>(
-        (request.value.sign_exponent & sign_mask) | static_cast<std::uint16_t>(result_exponent + 16383));
-    return X87ScaleResult{result_value, static_cast<std::uint16_t>(request.status_word & ~fsw_c1)};
+    const auto normalized = normalize_finite(value);
+    const auto result_exponent = enormous_scale
+        ? (scale.negative ? std::numeric_limits<int>::min() / 2 : std::numeric_limits<int>::max() / 2)
+        : normalized.exponent + static_cast<int>(integral_scale);
+
+    if (result_exponent >= 0x7fff) {
+        result.overflow = true;
+        result.precision = true;
+        result.status_word |= static_cast<std::uint16_t>(fsw_overflow | fsw_precision);
+        if ((request.control_word & fcw_overflow_mask) == 0) {
+            result.status_word = signal_exception(result.status_word, fsw_overflow);
+            result.completed = false;
+            result.value_valid = false;
+            return result;
+        }
+        const auto rc = static_cast<std::uint8_t>((request.control_word & fcw_rounding_mask) >> 10);
+        const bool to_infinity = rc == 0 || (rc == 1 && value.negative) || (rc == 2 && !value.negative);
+        result.value = to_infinity
+            ? X87Binary80{integer_bit, static_cast<std::uint16_t>(exponent_mask | (value.negative ? sign_mask : 0))}
+            : X87Binary80{UINT64_MAX, static_cast<std::uint16_t>(0x7ffe | (value.negative ? sign_mask : 0))};
+        const bool magnitude_incremented = to_infinity;
+        if (value.negative != magnitude_incremented) result.status_word |= fsw_c1;
+        if ((request.control_word & fcw_precision_mask) == 0) {
+            result.status_word = signal_exception(result.status_word, fsw_precision);
+            result.completed = false;
+        }
+        return result;
+    }
+
+    if (result_exponent < -63) {
+        // `normalized.exponent` is biased and `normalized.significand` has its
+        // leading bit set. At exponent -64 the largest possible magnitude is
+        // strictly below half the least binary80 subnormal, so round-to-nearest
+        // and round-toward-zero produce zero; directed rounding may produce
+        // the least subnormal.
+        result.underflow = true;
+        result.precision = true;
+        result.status_word |= static_cast<std::uint16_t>(fsw_underflow | fsw_precision);
+        if ((request.control_word & fcw_underflow_mask) == 0) {
+            result.status_word = signal_exception(result.status_word, fsw_underflow);
+            result.completed = false;
+            result.value_valid = false;
+            return result;
+        }
+        const auto rc = static_cast<std::uint8_t>((request.control_word & fcw_rounding_mask) >> 10);
+        const bool increment = (rc == 1 && value.negative) || (rc == 2 && !value.negative);
+        result.value = increment
+            ? X87Binary80{1, static_cast<std::uint16_t>(value.negative ? sign_mask : 0)}
+            : X87Binary80{0, static_cast<std::uint16_t>(value.negative ? sign_mask : 0)};
+        if (value.negative != increment) result.status_word |= fsw_c1;
+        if ((request.control_word & fcw_precision_mask) == 0) {
+            result.status_word = signal_exception(result.status_word, fsw_precision);
+            result.completed = false;
+        }
+        return result;
+    }
+
+    if (result_exponent >= 1 && result_exponent <= 0x7ffe) {
+        result.value = X87Binary80{normalized.significand,
+            static_cast<std::uint16_t>(result_exponent | (value.negative ? sign_mask : 0))};
+        return result;
+    }
+
+    // FSCALE is not one of the five x87 arithmetic operations controlled by
+    // FCW.PC. Preserve all 64 significand bits and use the caller's RC only
+    // when exponent adjustment denormalizes or overflows the result.
+    X87AddSubtractRequest rounding_request;
+    rounding_request.control_word = static_cast<std::uint16_t>(
+        (request.control_word & ~std::uint16_t{3u << 8}) | std::uint16_t{3u << 8});
+    rounding_request.status_word = result.status_word;
+    auto rounded = round_add_sub_result(extended_significand(normalized.significand), result_exponent,
+                                        value.negative, rounding_request);
+    if (!rounded) return {};
+    auto scaled = from_arithmetic(*rounded);
+    scaled.denormal_operand = result.denormal_operand;
+    return scaled;
 }
 
 X87UnaryResult evaluate_x87_unary(X87Binary80 value, std::uint16_t status_word,

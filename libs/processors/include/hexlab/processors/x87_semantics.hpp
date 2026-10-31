@@ -322,17 +322,30 @@ struct X87ScaleRequest {
     X87Binary80 value;
     X87Binary80 scale;
     std::uint16_t status_word = 0;
+    std::uint16_t control_word = 0x037f;
 };
 struct X87ScaleResult {
     X87Binary80 value;
     std::uint16_t status_word = 0;
     // C0/C2/C3 are undefined for FSCALE; C1 is zero on the normal path.
     std::uint16_t status_word_defined_mask = 0xbaff;
+    // False means normal completion was interrupted by an unmasked exception.
+    // `value` is meaningful only when value_valid is true; an unmasked
+    // precision exception can retain a valid rounded result.
+    bool value_valid = true;
+    bool completed = true;
+    bool invalid_operation = false;
+    bool denormal_operand = false;
+    bool overflow = false;
+    bool underflow = false;
+    bool precision = false;
     bool operator==(const X87ScaleResult &) const = default;
 };
-// Evaluate the exact normal-result FSCALE subset. ST(1) must be a finite
-// normal value or zero; its value is truncated toward zero. ST(0) must be
-// zero or normal and the adjusted exponent must remain normal.
+// Evaluate FSCALE from raw binary80 operands, including denormal operands,
+// special values, and masked/unmasked numeric exceptions. ST(1) is truncated
+// toward zero. Caller-owned stack tags/TOP and exception delivery remain
+// separate; consult `value_valid` to determine whether ST(0) has a value to
+// commit after an exception.
 HEXLAB_PROCESSORS_EXPORT std::optional<X87ScaleResult>
 evaluate_x87_scale(const X87ScaleRequest &request) noexcept;
 

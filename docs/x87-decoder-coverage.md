@@ -49,7 +49,11 @@ dependencies only; it does not calculate the stored integer or exception
 retirement. Numeric conversion remains available through the caller-driven
 `evaluate_x87_to_integer` helper described in [integer conversion semantics](x87-integer-conversions.md).
 
-The caller-driven `evaluate_x87_scale` helper handles exact normal-result
-FSCALE cases by truncating finite ST(1) toward zero and adjusting ST(0)'s
-exponent. Special values, subnormals, exponent overflow/underflow, and stack
-fault retirement remain outside this helper; see [FSCALE semantics](x87-fscale-semantics.md).
+The caller-driven `evaluate_x87_scale` helper truncates ST(1) toward zero,
+preserves the significand for in-range normal results, and handles binary80
+zero/infinity/NaN classes, pseudo-denormals, denormal exception masks,
+gradual underflow, overflow, FCW.RC rounding, and precision-exception
+retirement. It reports whether an output value exists and whether the
+instruction completed. Stack tags/TOP, stack-fault generation, pending
+exception delivery, and committing the value remain caller-owned; see
+[FSCALE semantics](x87-fscale-semantics.md).

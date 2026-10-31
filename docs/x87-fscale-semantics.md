@@ -1,20 +1,35 @@
 # x87 FSCALE Semantics
 
-`evaluate_x87_scale` models exact normal-result cases of FSCALE from raw
-binary80 operands. It truncates finite ST(1) toward zero, adds that integer to
-ST(0)'s unbiased exponent, and leaves ST(0)'s significand and sign unchanged.
-Signed zero in ST(0) is preserved. The helper clears FSW.C1 on the normal
-nonempty-stack path and identifies C0/C2/C3 as undefined; other supplied FSW
-bits are preserved.
+`evaluate_x87_scale` evaluates the caller-supplied binary80 values for
+`ST(0)` and `ST(1)`. It truncates `ST(1)` toward zero and adds that integer to
+the `ST(0)` exponent. An in-range normal result preserves all 64 significand
+bits, independent of FCW precision control. When scaling crosses the binary80
+normal range, the helper normalizes subnormal inputs and rounds only as needed
+for gradual underflow or overflow, using FCW rounding control.
 
-The helper accepts zero or normal finite ST(1), and zero or normal finite
-ST(0). A finite ST(1) whose truncated magnitude exceeds 32767 is unsupported.
-For a nonzero ST(0), exponent underflow or overflow is unsupported, as are
-subnormal and pseudo-denormal inputs, infinities, NaNs, unnormal encodings, and
-stack faults. Those cases return no result rather than guessing exception,
-rounding, or exponent-wrap behavior. The caller owns stack tags/TOP, exception
-delivery, and retirement. This exact path does not depend on FCW precision or
-rounding control because it changes only a normal result's exponent.
+The result records the updated FSW, normal completion, and whether a valid
+`ST(0)` output exists. Unmasked invalid, denormal, overflow, or underflow
+exceptions suppress the output. A masked overflow produces infinity or the
+largest finite value according to FCW.RC; a masked massive underflow produces
+signed zero or the least subnormal for directed rounding. Inexact scaling sets
+PE, and unmasked PE reports `completed=false` while retaining the rounded
+result, matching x87 precision exception retirement. OE/UE also imply PE. The
+C1 output is computed for rounding; C0/C2/C3 are marked undefined by
+`status_word_defined_mask`.
 
-The truncation rule and condition-code behavior follow Intel's
-[FSCALE instruction reference](https://cdrdv2-public.intel.com/812383/253666-sdm-vol-2a.pdf).
+Normal zero/infinity cases and NaN propagation follow Intel's FSCALE class
+table. A signaling NaN or unsupported binary80 encoding raises IE; quiet NaNs
+propagate. A denormal operand sets DE when masked and prevents completion when
+DE is unmasked. Pseudo-denormals use their equivalent exponent-one value and
+do not set DE. Stack tags/TOP, stack-fault generation, pending exception
+delivery, and committing the returned value remain caller-owned.
+
+The exponent in `ST(1)` is truncated without converting out-of-range values to
+a host integer. Finite scales whose integral magnitude necessarily exceeds
+the binary80 exponent range use the exact overflow/underflow path. Unsupported
+unnormal encodings are treated as invalid operands, consistent with the
+instruction's #IA definition.
+
+These rules follow Intel's [64 and IA-32 Architectures Software Developer's
+Manual, Volume 2, FSCALE](https://cdrdv2-public.intel.com/774492/325383-sdm-vol-2abcd.pdf)
+and its [instruction reference](https://intel.github.io/SDM/instruction/FSCALE.html).
