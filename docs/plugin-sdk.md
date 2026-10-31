@@ -403,6 +403,7 @@ Supported architecture/mode pairs and address widths are:
 | `mips32` / `mips64` | `mips32` / `mips64` respectively | 32 / 64 | 4 |
 | `powerpc` | `ppc32` / `ppc64` | 32 / 64 | 4 |
 | `mos6502` | `m6502` | 16 | 1 |
+| `mos6502` | `m65c02` | 16 | 1 |
 
 Byte order is little (0), or big (1) for MIPS and PowerPC only. The provider
 must decline formats needing transformed or decrypted storage, applied

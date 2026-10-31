@@ -25,7 +25,7 @@ bool native_scalar_context(DecodeContext context){
     case Architecture::mips32:return context.mode==ExecutionMode::mips32;
     case Architecture::mips64:return context.mode==ExecutionMode::mips64;
     case Architecture::powerpc:return context.mode==ExecutionMode::ppc32||context.mode==ExecutionMode::ppc64;
-    case Architecture::mos6502:return context.mode==ExecutionMode::m6502;
+    case Architecture::mos6502:return context.mode==ExecutionMode::m6502||context.mode==ExecutionMode::m65c02;
     default:return false;
     }
 }

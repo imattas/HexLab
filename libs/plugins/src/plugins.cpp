@@ -525,7 +525,7 @@ std::optional<RegisterOperand> semantic_register_v2(DecodeContext context,
         case ExecutionMode::mips32: case ExecutionMode::ppc32: return 32u;
         case ExecutionMode::x86_64: case ExecutionMode::a64: case ExecutionMode::rv64:
         case ExecutionMode::rv64c: case ExecutionMode::mips64: case ExecutionMode::ppc64: return 64u;
-        case ExecutionMode::m6502: return 8u;
+        case ExecutionMode::m6502: case ExecutionMode::m65c02: return 8u;
         default: return 0u;
         }
     }();
@@ -686,7 +686,7 @@ std::optional<Instruction> convert_semantic_v2(const HexLabSemanticInstructionV2
             MemoryOperand memory{};
             memory.data_width = static_cast<std::uint16_t>(source.width);
             if (source.kind == HEXLAB_SEMANTIC_ABSOLUTE_MEMORY_V2) {
-                const auto address_width = context.mode == ExecutionMode::x86_16 || context.mode == ExecutionMode::m6502 ? 16u :
+                const auto address_width = context.mode == ExecutionMode::x86_16 || context.mode == ExecutionMode::m6502 || context.mode == ExecutionMode::m65c02 ? 16u :
                     context.mode == ExecutionMode::x86_32 || context.mode == ExecutionMode::a32 ||
                     context.mode == ExecutionMode::rv32 || context.mode == ExecutionMode::mips32 ||
                     context.mode == ExecutionMode::ppc32 ? 32u : 64u;
@@ -699,7 +699,7 @@ std::optional<Instruction> convert_semantic_v2(const HexLabSemanticInstructionV2
             } else {
                 if (access == OperandAccess::address || source.bank || source.index || source.value ||
                     (source.address_width != 16 && source.address_width != 32 && source.address_width != 64)) return {};
-                const auto mode_address_width = context.mode == ExecutionMode::x86_16 || context.mode == ExecutionMode::m6502 ? 16u :
+                const auto mode_address_width = context.mode == ExecutionMode::x86_16 || context.mode == ExecutionMode::m6502 || context.mode == ExecutionMode::m65c02 ? 16u :
                     context.mode == ExecutionMode::x86_32 || context.mode == ExecutionMode::a32 ||
                     context.mode == ExecutionMode::rv32 || context.mode == ExecutionMode::mips32 ||
                     context.mode == ExecutionMode::ppc32 ? 32u : 64u;
@@ -3673,7 +3673,8 @@ constexpr FlatImageMode flat_image_modes[] = {
     {"mips64", "mips64", Architecture::mips64, ExecutionMode::mips64, 64, 4, true},
     {"powerpc", "ppc32", Architecture::powerpc, ExecutionMode::ppc32, 32, 4, true},
     {"powerpc", "ppc64", Architecture::powerpc, ExecutionMode::ppc64, 64, 4, true},
-    {"mos6502", "m6502", Architecture::mos6502, ExecutionMode::m6502, 16, 1, false}
+    {"mos6502", "m6502", Architecture::mos6502, ExecutionMode::m6502, 16, 1, false},
+    {"mos6502", "m65c02", Architecture::mos6502, ExecutionMode::m65c02, 16, 1, false}
 };
 }
 
@@ -3840,6 +3841,7 @@ Result<std::optional<Instruction>> PluginManager::decode_processor_semantic(
         case ExecutionMode::rv64c: return std::string("rv64c"); case ExecutionMode::mips32: return std::string("mips32");
         case ExecutionMode::mips64: return std::string("mips64"); case ExecutionMode::ppc32: return std::string("ppc32");
         case ExecutionMode::ppc64: return std::string("ppc64"); case ExecutionMode::m6502: return std::string("m6502");
+        case ExecutionMode::m65c02: return std::string("m65c02");
         case ExecutionMode::wasm32: return std::string("wasm32"); case ExecutionMode::dex: return std::string("dex"); case ExecutionMode::jvm: return std::string("jvm");
         default: return std::string{};
         }
@@ -4014,7 +4016,7 @@ Result<std::optional<Instruction>> PluginManager::decode_processor_semantic(
                        source.width <= 128 && source.width % 8 == 0 && source.bank == 0 && source.index == 0) {
                 std::uint16_t address_width = 64;
                 switch (decode_context.mode) {
-                case ExecutionMode::x86_16: case ExecutionMode::m6502: address_width = 16; break;
+                case ExecutionMode::x86_16: case ExecutionMode::m6502: case ExecutionMode::m65c02: address_width = 16; break;
                 case ExecutionMode::x86_32: case ExecutionMode::a32: case ExecutionMode::rv32:
                 case ExecutionMode::mips32: case ExecutionMode::ppc32: address_width = 32; break;
                 default: break;
@@ -4061,7 +4063,9 @@ Result<std::optional<decompiler::Intrinsic>> PluginManager::instruction_ir(
         case Architecture::mips32:return architecture=="mips32"&&mode=="mips32"&&context.mode==ExecutionMode::mips32;
         case Architecture::mips64:return architecture=="mips64"&&mode=="mips64"&&context.mode==ExecutionMode::mips64;
         case Architecture::powerpc:return architecture=="powerpc"&&(context.mode==ExecutionMode::ppc32?mode=="ppc32":context.mode==ExecutionMode::ppc64&&mode=="ppc64");
-        case Architecture::mos6502:return architecture=="mos6502"&&mode=="m6502"&&context.mode==ExecutionMode::m6502;
+        case Architecture::mos6502:return architecture=="mos6502"&&
+            ((mode=="m6502"&&context.mode==ExecutionMode::m6502)||
+             (mode=="m65c02"&&context.mode==ExecutionMode::m65c02));
         default:return false;
         }
     };

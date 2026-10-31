@@ -44,6 +44,7 @@ std::string_view mode_id(ExecutionMode value) {
     case ExecutionMode::dex: return "dex";
     case ExecutionMode::jvm: return "jvm";
     case ExecutionMode::m6502: return "m6502";
+    case ExecutionMode::m65c02: return "m65c02";
     default: return {};
     }
 }
