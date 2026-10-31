@@ -1466,6 +1466,9 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage,std::stop_t
                     if(!r.u2(entry.method_handle_index)||!r.u2(argument_count))return malformed("truncated BootstrapMethods entry");
                     if(!entry.method_handle_index||entry.method_handle_index>=md.constant_pool.size()||md.constant_pool[entry.method_handle_index].tag!=15)
                         return malformed("BootstrapMethods entry does not reference a CONSTANT_MethodHandle");
+                    const auto bootstrap_kind=md.constant_pool[entry.method_handle_index].first;
+                    if(bootstrap_kind!=6&&bootstrap_kind!=8)
+                        return malformed("BootstrapMethods method handle must use REF_invokeStatic or REF_newInvokeSpecial");
                     if(argument_count>8192-retained_arguments)return Error{ErrorCode::resource_limit,"BootstrapMethods argument count exceeds the 8192-entry limit"};
                     retained_arguments+=argument_count;entry.argument_indices.reserve(argument_count);
                     for(unsigned j=0;j<argument_count;++j){std::uint16_t index=0;if(!r.u2(index)||!index||index>=md.constant_pool.size())return malformed("invalid BootstrapMethods argument index");
