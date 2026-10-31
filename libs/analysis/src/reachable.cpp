@@ -614,10 +614,12 @@ Result<AnalysisSnapshot> analyze(const Image &image, const ImageMetadata &metada
                                         : ThumbITState{true, 0};
                     }
                 }
+                const bool conditional_call = analysis_detail::is_mips_conditional_link_branch(instruction);
                 output.edges.push_back(
-                    {mips_slot.value_or(address), target, instruction.flow == FlowKind::call ? EdgeKind::call : EdgeKind::branch});
+                    {mips_slot.value_or(address), target, conditional_call ? EdgeKind::conditional_call :
+                        instruction.flow == FlowKind::call ? EdgeKind::call : EdgeKind::branch});
                 pending.push_back({target, target_it});
-                if (instruction.flow == FlowKind::call && code_allowed(target))
+                if ((instruction.flow == FlowKind::call || conditional_call) && code_allowed(target))
                     output.candidates.push_back(target);
             } else {
                 output.edges.push_back(

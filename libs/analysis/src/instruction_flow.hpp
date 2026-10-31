@@ -30,6 +30,17 @@ inline bool is_mips_branch_likely(const Instruction &instruction) {
         return false;
     }
 }
+inline bool is_mips_conditional_link_branch(const Instruction &instruction) {
+    if (instruction.context.architecture != Architecture::mips32 || instruction.context.mode != ExecutionMode::mips32)
+        return false;
+    switch (instruction.opcode) {
+    case Opcode::mips_bltzal: case Opcode::mips_bgezal:
+    case Opcode::mips_bltzall: case Opcode::mips_bgezall:
+        return true;
+    default:
+        return false;
+    }
+}
 inline bool supports_automatic_flow(DecodeContext context) {
     if (context.architecture == Architecture::arm)
         return context.mode == ExecutionMode::a32 || context.mode == ExecutionMode::thumb ||

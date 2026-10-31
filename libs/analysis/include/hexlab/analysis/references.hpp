@@ -25,7 +25,8 @@ enum class ReferenceKind {
     user_code,
     user_data,
     relocation,
-    dyld_fixup
+    dyld_fixup,
+    conditional_call
 };
 enum class UnresolvedReason {
     register_value,

@@ -6,7 +6,7 @@ struct GraphNodeId {std::uint64_t value=0;auto operator<=>(const GraphNodeId&)co
 struct GraphEdgeId {std::uint64_t value=0;auto operator<=>(const GraphEdgeId&)const=default;};
 enum class GraphKind {function_cfg,image_calls,function_calls};
 enum class GraphNodeKind {block,function,external,unresolved,boundary};
-enum class GraphEdgeKind {fallthrough,conditional_true,conditional_false,jump,call,tail_candidate,call_continuation,unresolved,delay_slot};
+enum class GraphEdgeKind {fallthrough,conditional_true,conditional_false,jump,call,tail_candidate,call_continuation,unresolved,delay_slot,conditional_call};
 struct GraphOptions {
     std::size_t node_budget=1000,edge_budget=10000,preview_lines=16;
     // Function call neighborhoods expand callers and callees by this many

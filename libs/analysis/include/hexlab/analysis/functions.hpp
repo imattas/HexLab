@@ -26,7 +26,7 @@ struct FunctionSeed {FunctionSeedKind kind;Address entry;std::optional<Address> 
 enum class FunctionStopReason {ret,trap,unsupported,invalid,truncated,unmapped,uninitialized,non_executable,manual_data,overlap,indirect,budget,target_overflow,chunk_boundary,tail_candidate,elf_relocation,macho_relocation,macho_dyld,image_exclusion};
 struct FunctionStop {Address address;FunctionStopReason reason;std::string detail;bool operator==(const FunctionStop&)const=default;};
 struct InstructionFact {std::uint64_t id;Instruction instruction;ReadSet reads;bool semantic_decoder_used=false;};
-enum class BlockEdgeKind {fallthrough,conditional_true,conditional_false,jump,call_continuation,unresolved,delay_slot,exception};
+enum class BlockEdgeKind {fallthrough,conditional_true,conditional_false,jump,call_continuation,unresolved,delay_slot,exception,conditional_call};
 struct BlockSuccessor {Address source;std::optional<Address> target;std::optional<BlockId> block;BlockEdgeKind kind;bool operator==(const BlockSuccessor&)const=default;};
 struct BasicBlock {
     BlockId id;Address begin;std::vector<std::shared_ptr<const InstructionFact>> instructions;

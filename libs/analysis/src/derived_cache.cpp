@@ -500,7 +500,7 @@ Decoded read_payload(std::span<const std::byte> bytes, const Image &image, const
             if (in.flag())
                 edge.block = BlockId{in.number()};
             auto kind = in.number(1);
-            require(kind <= static_cast<unsigned>(BlockEdgeKind::exception), "Unknown cached block edge kind");
+            require(kind <= static_cast<unsigned>(BlockEdgeKind::conditional_call), "Unknown cached block edge kind");
             edge.kind = static_cast<BlockEdgeKind>(kind);
             block->successors.push_back(edge);
         }
