@@ -38,6 +38,18 @@ std::optional<VmxOperation> vmx_operation(Opcode opcode) {
     case Opcode::ppc_vor: return VmxOperation{"vor", 0};
     case Opcode::ppc_vxor: return VmxOperation{"vxor", 0};
     case Opcode::ppc_vnor: return VmxOperation{"vnor", 0};
+    case Opcode::ppc_vmaxub: return VmxOperation{"vmaxub", 8};
+    case Opcode::ppc_vmaxuh: return VmxOperation{"vmaxuh", 16};
+    case Opcode::ppc_vmaxuw: return VmxOperation{"vmaxuw", 32};
+    case Opcode::ppc_vmaxsb: return VmxOperation{"vmaxsb", 8};
+    case Opcode::ppc_vmaxsh: return VmxOperation{"vmaxsh", 16};
+    case Opcode::ppc_vmaxsw: return VmxOperation{"vmaxsw", 32};
+    case Opcode::ppc_vminub: return VmxOperation{"vminub", 8};
+    case Opcode::ppc_vminuh: return VmxOperation{"vminuh", 16};
+    case Opcode::ppc_vminuw: return VmxOperation{"vminuw", 32};
+    case Opcode::ppc_vminsb: return VmxOperation{"vminsb", 8};
+    case Opcode::ppc_vminsh: return VmxOperation{"vminsh", 16};
+    case Opcode::ppc_vminsw: return VmxOperation{"vminsw", 32};
     default: return std::nullopt;
     }
 }
