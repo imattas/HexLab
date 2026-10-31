@@ -887,6 +887,7 @@ std::string operation_name(Opcode opcode) {
     case Opcode::vshufps: return "vshufps";
     case Opcode::vshufpd: return "vshufpd";
     case Opcode::vpshufd: return "vpshufd";
+    case Opcode::vpblendd: return "vpblendd";
     case Opcode::vpsadbw: return "vpsadbw";
     case Opcode::vpermd: return "vpermd";
     case Opcode::vpermb: return "vpermb";
@@ -5592,6 +5593,7 @@ a64_unhandled:
     const bool avx_move = instruction.opcode == Opcode::vmovups;
     const bool avx_shuffle = instruction.opcode == Opcode::vshufps || instruction.opcode == Opcode::vshufpd;
     const bool avx_immediate_shuffle = instruction.opcode == Opcode::vpshufd;
+    const bool avx_immediate_blend = instruction.opcode == Opcode::vpblendd;
     const bool avx_float_arithmetic = instruction.opcode == Opcode::vaddps || instruction.opcode == Opcode::vaddpd ||
         instruction.opcode == Opcode::vsubps || instruction.opcode == Opcode::vsubpd ||
         instruction.opcode == Opcode::vmulps || instruction.opcode == Opcode::vmulpd ||
@@ -5621,7 +5623,7 @@ a64_unhandled:
     const bool avx_integer_lanes = (!instruction.x86_evex || avx_integer_shift) &&
         (avx_integer_arithmetic || avx_integer_subtraction || avx_integer_multiply ||
          avx_integer_minmax || avx_integer_compare || avx_integer_shift || avx_integer_sign ||
-         instruction.opcode == Opcode::vpermd);
+         instruction.opcode == Opcode::vpermd || avx_immediate_blend);
     const auto avx_integer_lane_bits = instruction.opcode == Opcode::vpcmpeqb || instruction.opcode == Opcode::vpcmpgtb ||
         instruction.opcode == Opcode::vpaddb || instruction.opcode == Opcode::vpsubb ||
         instruction.opcode == Opcode::vpaddsb || instruction.opcode == Opcode::vpaddusb ||
@@ -5638,14 +5640,14 @@ a64_unhandled:
           instruction.opcode == Opcode::vpaddq || instruction.opcode == Opcode::vpsubq ? 64u
         : instruction.opcode == Opcode::vpsllvw || instruction.opcode == Opcode::vpsrlvw || instruction.opcode == Opcode::vpsravw ? 16u
         : instruction.opcode == Opcode::vpsllvq || instruction.opcode == Opcode::vpsrlvq || instruction.opcode == Opcode::vpsravq ? 64u
-        : instruction.opcode == Opcode::vpermd ? 32u
+        : instruction.opcode == Opcode::vpermd || avx_immediate_blend ? 32u
         : avx_integer_multiply ? 16u : 0u;
     const bool avx_integer_bitwise = instruction.opcode == Opcode::vpand || instruction.opcode == Opcode::vpor ||
         instruction.opcode == Opcode::vpxor || instruction.opcode == Opcode::vpandd ||
         instruction.opcode == Opcode::vpandq || instruction.opcode == Opcode::vpord ||
         instruction.opcode == Opcode::vporq || instruction.opcode == Opcode::vpxord ||
         instruction.opcode == Opcode::vpxorq;
-    if (x86 && (avx_move || avx_shuffle || avx_immediate_shuffle || avx_float_arithmetic ||
+    if (x86 && (avx_move || avx_shuffle || avx_immediate_shuffle || avx_immediate_blend || avx_float_arithmetic ||
                 avx_bitwise || avx_integer_lanes || avx_integer_bitwise)) {
         const auto destination = instruction.operands.empty() ? std::optional<RegisterOperand>{} : as_register(instruction.operands[0]);
         const auto move_source = avx_move && instruction.operands.size() == 2 ? as_register(instruction.operands[1]) : std::optional<RegisterOperand>{};
@@ -5737,6 +5739,28 @@ a64_unhandled:
                     (instruction.x86_opmask ? (instruction.x86_opmask_zeroing ? "_mask_zero" : "_mask_merge") : ""),
                     std::move(shuffle_inputs),
                     std::holds_alternative<MemoryOperand>(instruction.operands[1])
+                        ? IntrinsicMemoryEffect::read : IntrinsicMemoryEffect::none};
+                effect.register_writes = instruction.register_writes;
+                effect.result_type = result_type;
+                return effect;
+            }
+        } else if (supported_width && avx_immediate_blend && instruction.operands.size() == 4) {
+            const auto first = as_register(instruction.operands[1]);
+            const auto *selector = std::get_if<ImmediateOperand>(&instruction.operands[3]);
+            const bool source2_valid = valid_vector_operand(instruction.operands[2], true);
+            if (!instruction.x86_evex && first && first->bank == vector_bank && first->width == vector_width &&
+                source2_valid && selector && selector->encoded_width == 8 && selector->effective_width == 8 &&
+                !selector->is_signed && instruction.vector_bits == vector_width &&
+                instruction.vector_element_bits == 32) {
+                const auto input_type = vector_type(vector_width, TypeKind::integer, 32,
+                    static_cast<std::uint8_t>(vector_width / 32));
+                const auto result_type = vector_type(result_width, TypeKind::integer, 32,
+                    static_cast<std::uint8_t>(result_width / 32));
+                Intrinsic effect{"x86_vpblendd_i32x" + std::to_string(vector_width / 32) + "_imm8" +
+                    (zero_upper ? "_zero_upper" : ""),
+                    {retag_expr(operands[1], input_type), retag_expr(operands[2], input_type),
+                     constant_expr(selector->value, 8)},
+                    std::holds_alternative<MemoryOperand>(instruction.operands[2])
                         ? IntrinsicMemoryEffect::read : IntrinsicMemoryEffect::none};
                 effect.register_writes = instruction.register_writes;
                 effect.result_type = result_type;

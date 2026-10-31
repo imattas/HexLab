@@ -410,6 +410,37 @@ bool simd_0f3a(State &state, std::uint8_t opcode) {
 }
 
 bool vex_simd(State &state, std::uint8_t opcode, unsigned map, unsigned pp, unsigned vvvv, bool l, bool w) {
+    if (map == 3 && opcode == 0x02) {
+        if (pp != 1)
+            invalid("VPBLENDD requires VEX.pp=66");
+        if (w)
+            invalid("VPBLENDD requires VEX.W=0");
+        const auto vector_width = static_cast<std::uint16_t>(l ? 256 : 128);
+        const auto bank = l ? RegisterBank::ymm : RegisterBank::xmm;
+        auto decoded = modrm(state, vector_width, vector_width);
+        auto destination = decoded.reg;
+        destination.bank = bank;
+        destination.width = vector_width;
+        Operand source2 = std::move(decoded.rm);
+        if (auto *reg = std::get_if<RegisterOperand>(&source2)) {
+            reg->bank = bank;
+            reg->width = vector_width;
+            reg->high_byte = false;
+        } else if (auto *memory = std::get_if<MemoryOperand>(&source2)) {
+            memory->data_width = vector_width;
+        }
+        state.i.opcode = Opcode::vpblendd;
+        state.i.vector_bits = vector_width;
+        state.i.vector_element_bits = 32;
+        if (!l)
+            state.i.register_writes.push_back({RegisterBank::ymm, destination.index, 256, false});
+        state.operand(destination, OperandAccess::write);
+        state.operand(RegisterOperand{bank, static_cast<std::uint8_t>(vvvv), vector_width, false},
+                      OperandAccess::read);
+        state.operand(std::move(source2), OperandAccess::read);
+        state.operand(state.immediate(8, 8, false), OperandAccess::read);
+        return true;
+    }
     if (map == 1 && opcode >= 0x90 && opcode <= 0x93) {
         if (l || vvvv != 0)
             invalid("VEX KMOV requires L=0 and the reserved vvvv encoding");
