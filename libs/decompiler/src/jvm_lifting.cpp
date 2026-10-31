@@ -1240,7 +1240,15 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
                 auto signature=parse_method_descriptor(member.value().descriptor);if(!signature)return signature.error();
                 std::vector<ExpressionPtr> arguments(signature.value().parameters.size()+(is_static?0u:1u));
                 for(std::size_t n=signature.value().parameters.size();n>0;--n){auto value=pop(signature.value().parameters[n-1]);if(!value)return value.error();arguments[n-1+(is_static?0u:1u)]=value.value();}
-                if(!is_static){auto receiver=pop(ref32());if(!receiver)return receiver.error();arguments[0]=receiver.value();}
+                if(!is_static){auto receiver=pop(ref32());if(!receiver)return receiver.error();arguments[0]=receiver.value();
+                    // Instance invocation can throw before entering the callee
+                    // when its receiver is null. Constructor receivers are
+                    // verifier-uninitialized values and are known non-null.
+                    if(member.value().name!="<init>")
+                        dst.trap_edges.push_back({i.address,TrapEdgeKind::may_trap,
+                            "java.lang.NullPointerException from "+i.mnemonic_override,
+                            bin("eq",arguments[0],con(0,ref32()),int32())});
+                }
                 if (references && op == 0xb7 && member.value().name == "<init>") {
                     const auto receiver = identity(arguments[0]);
                     const auto initialized = reference_class(member.value().owner);
