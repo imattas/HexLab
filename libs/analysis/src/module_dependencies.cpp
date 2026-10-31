@@ -267,6 +267,7 @@ std::vector<std::string> standard_default_dirs(const ElfHeader &header) {
     else if (header.machine == 40 && !header.is_64)
         add("/lib", (header.flags & 0x400) ? "arm-linux-gnueabihf" : "arm-linux-gnueabi");
     else if (header.machine == 243 && header.is_64) add("/lib", "riscv64-linux-gnu");
+    else if (header.machine == 258 && header.is_64) add("/lib", "loongarch64-linux-gnu");
     else if (header.machine == 22 && header.is_64) add("/lib", "s390x-linux-gnu");
     else if (header.machine == 22 && !header.is_64) add("/lib", "s390-linux-gnu");
     else if (header.machine == 21 && header.is_64)
