@@ -17,6 +17,8 @@ and phi-only values remain read-only.
 
 Use **Ctrl+F** while the pseudocode pane is focused to search the currently rendered function. Search is a literal, case-sensitive match by default, wraps at either end, and selects/reveals each result; Enter and the Previous/Next buttons move between matches, while Shift+Enter moves backward. Enable **Whole word** to require identifier boundaries around the match; letters, digits, underscore, and non-ASCII characters count as identifier characters. **Escape** returns focus to the pseudocode. The query is limited to 256 characters and the scan to the first 1 MiB of rendered text. Selecting a result with a mapped instruction origin follows the normal document/project revision guard, so a stale render cannot navigate the active workspace. Search only reads the rendered pseudocode and does not change project state.
 
+With the pseudocode pane focused, **F3** finds the next occurrence of the current query and **Shift+F3** finds the previous one. **F2** renames the uniquely selected editable variable using the same project command as the Rename button; ambiguous, shared-origin, function-entry, and read-only selections are not renamed.
+
 The SSA variable **Previous occurrence** and **Next occurrence** controls also
 select and reveal the instruction line for each mapped use. They use the same
 document and project revision guard as source selection; occurrences without a
