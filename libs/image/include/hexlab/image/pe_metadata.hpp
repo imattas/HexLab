@@ -228,6 +228,32 @@ struct PeLoadConfigCodeIntegrity {
     PeRecordSource source;
     bool operator==(const PeLoadConfigCodeIntegrity &) const = default;
 };
+enum class PeEnclaveConfigurationStatus : std::uint8_t { decoded, unsupported, malformed, resource_limit };
+struct PeEnclaveImport {
+    std::uint32_t match_type = 0, minimum_security_version = 0;
+    std::array<std::byte, 32> unique_or_author_id{};
+    std::array<std::byte, 16> family_id{}, image_id{};
+    std::uint32_t name_rva = 0, reserved = 0;
+    std::string name;
+    PeRecordSource source, name_source;
+    bool operator==(const PeEnclaveImport &) const = default;
+};
+// Enclave identities and policy flags are inspection metadata, not an
+// attestation, import authorization, or enforcement decision.
+struct PeEnclaveConfiguration {
+    std::uint32_t rva = 0, declared_size = 0, minimum_required_size = 0;
+    std::uint32_t policy_flags = 0, import_count = 0, import_list_rva = 0, import_entry_size = 0;
+    std::array<std::byte, 16> family_id{}, image_id{};
+    std::uint32_t image_version = 0, security_version = 0;
+    std::uint64_t enclave_size = 0;
+    std::uint32_t thread_count = 0, enclave_flags = 0;
+    PeEnclaveConfigurationStatus status = PeEnclaveConfigurationStatus::malformed;
+    std::string diagnostic;
+    std::optional<PeRecordSource> source, import_table_source;
+    // Published only when every import record and name has been validated.
+    std::vector<PeEnclaveImport> imports;
+    bool operator==(const PeEnclaveConfiguration &) const = default;
+};
 // Supported load-config pointer fields are normalized to RVAs; fields with
 // per-record or table payloads retain their source spans and decoded rows.
 // Unknown versioned tail fields remain opaque.
@@ -273,6 +299,7 @@ struct PeLoadConfiguration {
     std::optional<std::uint64_t> guard_rf_verify_stack_pointer_rva;
     std::optional<std::uint32_t> hot_patch_table_offset;
     std::optional<std::uint64_t> enclave_configuration_rva;
+    std::optional<PeEnclaveConfiguration> enclave_configuration;
     std::optional<std::uint64_t> volatile_metadata_rva;
     std::optional<PeRecordSource> guard_rf_failure_routine_source;
     std::optional<PeRecordSource> guard_rf_failure_routine_pointer_source;

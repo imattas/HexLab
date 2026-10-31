@@ -738,6 +738,66 @@ inline void pe_description(std::ostream &out, const ImageMetadata &metadata, con
         pointer("Guard RF failure routine function pointer", config.guard_rf_failure_routine_pointer_rva);
         pointer("Guard RF verify stack function pointer", config.guard_rf_verify_stack_pointer_rva);
         pointer("Enclave configuration", config.enclave_configuration_rva);
+        if (config.enclave_configuration) {
+            const auto &enclave = *config.enclave_configuration;
+            const auto status = enclave.status == PeEnclaveConfigurationStatus::decoded ? "decoded" :
+                enclave.status == PeEnclaveConfigurationStatus::unsupported ? "unsupported" :
+                enclave.status == PeEnclaveConfigurationStatus::resource_limit ? "resource-limit" : "malformed";
+            out << "  Enclave: status=" << status << " size=" << enclave.declared_size
+                << " minimum-required-size=" << enclave.minimum_required_size;
+            if (const auto offset = source_offset(config.enclave_configuration_source))
+                out << " pointer-file=0x" << std::hex << *offset << std::dec;
+            if (const auto offset = source_offset(enclave.source))
+                out << " file=0x" << std::hex << *offset << std::dec;
+            out << '\n';
+            if (!enclave.diagnostic.empty())
+                out << "    " << escape_pe_version_text(enclave.diagnostic) << '\n';
+            if (enclave.status == PeEnclaveConfigurationStatus::decoded) {
+                const auto identity = [&](const auto &bytes) {
+                    constexpr char digits[] = "0123456789abcdef";
+                    for (const auto byte : bytes) {
+                        const auto value = std::to_integer<unsigned>(byte);
+                        out << digits[value >> 4] << digits[value & 15];
+                    }
+                };
+                out << "    policy-flags=0x" << std::hex << enclave.policy_flags
+                    << " enclave-flags=0x" << enclave.enclave_flags << std::dec
+                    << " image-version=" << enclave.image_version << " security-version=" << enclave.security_version
+                    << " private-bytes=" << enclave.enclave_size << " threads=" << enclave.thread_count;
+                if (enclave.policy_flags & 1u) out << " debuggable";
+                if (enclave.policy_flags & 2u) out << " strict-memory";
+                if (enclave.enclave_flags & 1u) out << " primary-image";
+                out << "\n    family-id=";
+                identity(enclave.family_id);
+                out << " image-id=";
+                identity(enclave.image_id);
+                out << "\n    imports=" << enclave.import_count << " table-RVA=0x" << std::hex
+                    << enclave.import_list_rva << std::dec << " stride=" << enclave.import_entry_size << '\n';
+                constexpr std::size_t enclave_output_limit = 256;
+                const auto count = std::min(enclave.imports.size(), enclave_output_limit);
+                for (std::size_t i = 0; i < count; ++i) {
+                    const auto &entry = enclave.imports[i];
+                    const auto match = entry.match_type == 0 ? "none" : entry.match_type == 1 ? "unique-id" :
+                        entry.match_type == 2 ? "author-id" : entry.match_type == 3 ? "family-id" :
+                        entry.match_type == 4 ? "image-id" : "unknown";
+                    out << "      \"" << escape_pe_version_text(entry.name) << "\" match=" << match
+                        << "(" << entry.match_type << ") minimum-security-version=" << entry.minimum_security_version
+                        << " name-RVA=0x" << std::hex << entry.name_rva << " reserved=0x" << entry.reserved;
+                    if (!entry.source.spans.empty()) out << " file=0x" << entry.source.spans.front().offset.value;
+                    if (!entry.name_source.spans.empty())
+                        out << " name-file=0x" << entry.name_source.spans.front().offset.value;
+                    out << std::dec << "\n        unique-or-author-id=";
+                    identity(entry.unique_or_author_id);
+                    out << " family-id=";
+                    identity(entry.family_id);
+                    out << " image-id=";
+                    identity(entry.image_id);
+                    out << '\n';
+                }
+                if (count != enclave.imports.size())
+                    out << "      ... enclave import output limited to " << enclave_output_limit << " rows\n";
+            }
+        }
         pointer("Volatile metadata", config.volatile_metadata_rva);
         if (config.hot_patch_table_offset)
             out << "  Hot-patch table offset=0x" << std::hex << *config.hot_patch_table_offset << std::dec << '\n';

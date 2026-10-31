@@ -372,6 +372,13 @@ Result<LoadedImage> load_pe_impl(std::shared_ptr<const ByteStorage> storage,
             }
         }
         if (loaded.metadata.pe && loaded.metadata.pe->load_configuration &&
+            loaded.metadata.pe->load_configuration->enclave_configuration &&
+            loaded.metadata.pe->load_configuration->enclave_configuration->status != PeEnclaveConfigurationStatus::decoded) {
+            loaded.metadata_complete = false;
+            loaded.diagnostics.push_back({DiagnosticSeverity::warning,
+                "PE enclave configuration: " + loaded.metadata.pe->load_configuration->enclave_configuration->diagnostic, {}});
+        }
+        if (loaded.metadata.pe && loaded.metadata.pe->load_configuration &&
             loaded.metadata.pe->load_configuration->chpe_metadata &&
             !loaded.metadata.pe->load_configuration->chpe_metadata->code_ranges.empty()) {
             auto layout = loaded.image->layout();

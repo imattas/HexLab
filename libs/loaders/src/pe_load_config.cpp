@@ -358,8 +358,23 @@ Result<std::size_t> read_load_configuration(const Image& image, const Directory&
             result.hot_patch_table_offset_source = PeRecordSource{
                 0, reader.sources(directory.location + hot_patch_table_offset_at, 4)};
         }
-        result.enclave_configuration_rva = read_optional_pointer_with_source(
-            enclave_configuration_at, "enclave configuration", result.enclave_configuration_source);
+        if (declared >= enclave_configuration_at + width && pointer(enclave_configuration_at)) {
+            // Unlike ordinary load-config pointers, optional enclave metadata
+            // has its own diagnostic boundary, including VA normalization.
+            result.enclave_configuration_source = PeRecordSource{
+                0, reader.sources(directory.location + enclave_configuration_at, width)};
+            try {
+                result.enclave_configuration_rva = normalize(pointer(enclave_configuration_at), "enclave configuration");
+                result.enclave_configuration = read_enclave_configuration(
+                    image, metadata, *result.enclave_configuration_rva, pe64, stop);
+            } catch (const Failure &failure) {
+                if (failure.error.code == ErrorCode::canceled) throw;
+                PeEnclaveConfiguration enclave;
+                enclave.diagnostic = failure.error.message + " (preferred-base VA " +
+                    std::to_string(pointer(enclave_configuration_at)) + ")";
+                result.enclave_configuration = std::move(enclave);
+            }
+        }
         result.volatile_metadata_rva = read_optional_pointer_with_source(
             volatile_metadata_at, "volatile metadata", result.volatile_metadata_source);
         if (declared >= dynamic_reloc_table_at + width) {

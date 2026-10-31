@@ -5,6 +5,7 @@ hexlab_add_library(loaders SOURCES src/detect.cpp src/recipe.cpp src/raw.cpp src
   src/elf_dynamic.cpp src/elf_dynamic_symbols.cpp src/elf_dynamic_relocations.cpp src/elf_virtual.cpp src/elf_unwind.cpp src/elf_cfi.cpp src/elf_rtti.cpp
   src/macho_segments.cpp src/macho_image.cpp src/macho_symbols.cpp src/macho_lines.cpp src/macho_commands.cpp src/macho_relocations.cpp src/macho_dyld.cpp src/macho_exports.cpp src/macho_chained.cpp src/macho_shared_cache.cpp src/macho_protections.cpp src/macho_codesign_hashes.cpp src/macho_unwind.cpp src/managed.cpp src/cil.cpp src/firmware.cpp src/wasm.cpp src/wasm_link.cpp src/dex.cpp src/dex_container.cpp src/dex_archive.cpp src/apk_signing_block.cpp src/vdex.cpp src/jvm.cpp src/jvm_module_path.cpp src/jar.cpp src/jmod.cpp src/elf_lines.cpp src/elf_dwarf.cpp src/elf_debug_macro.cpp src/elf_debug_compression.cpp src/pdb_lines.cpp DEPENDS hexlab::image hexlab::firmware hexlab::symbols hexlab::types)
 target_sources(hexlab_loaders PRIVATE src/pe_debug.cpp)
+target_sources(hexlab_loaders PRIVATE src/pe_enclave.cpp)
 target_sources(hexlab_loaders PRIVATE src/elf_debug_frame.cpp)
 target_sources(hexlab_loaders PRIVATE src/minidump_context.cpp)
 target_sources(hexlab_loaders PRIVATE src/jvm_signature.cpp)
