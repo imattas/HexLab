@@ -870,7 +870,6 @@ public:
                                             resume_blocked_ = true;
                                             e.message += "; deferred-schedule rollback failed: " + rollback.error().message;
                                         } else rollback_threads_.clear();
-                                        e.kind = EventKind::exception;
                                         e.message += "; deferred schedule failed: " + error.message;
                                         break;
                                     }

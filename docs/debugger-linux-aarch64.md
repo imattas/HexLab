@@ -18,12 +18,18 @@ session blocks further resume operations until it has retried stopping those
 peers; signal, clone, exit, and other racing statuses are retained as deferred
 events and are not attributed to the schedule's pending event. A schedule must
 include the exact pending event owner, and every listed thread must be uniquely
-owned and stopped by this session. The schedule API has no signal-delivery
-field, so schedules fail closed when the pending event is a real signal stop;
-use the signal-aware continue operation instead. Multi-thread schedules accept
-continue actions only and cannot step over a pending software or hardware
-breakpoint; single-step schedules remain limited to one runnable thread.
-These ptrace operations use stop-and-rollback and are not atomic.
+owned and stopped by this session. Each scheduled action can preserve or
+redeliver its queued signal by default or `not_handled`, or suppress it with
+`handled`. A schedule may contain at most one single-step action; unsupported
+combinations are rejected before resume mutation. Continuing the owner past an
+owned software breakpoint with selected peers first executes the displaced
+instruction alone and rearms BRK. If that step and rearm complete but a later
+peer `PTRACE_CONT` fails, the backend returns the completed owner step as a
+`single_step` event with the peer-resume error attached. It stops peers already
+resumed and blocks later resumes only if rollback cannot restore the stopped
+state. Signal, clone, exit, and other racing peer statuses remain deferred.
+Owner-only step-over returns the step event while selected peers remain
+stopped. These ptrace operations use stop-and-rollback and are not atomic.
 Memory reads and writes, breakpoint changes, detach, and register writes
 require the entire process thread group to be owned and stopped. If the task
 list and ptrace ownership do not match, these operations fail closed.

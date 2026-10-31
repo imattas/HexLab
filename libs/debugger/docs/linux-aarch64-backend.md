@@ -55,6 +55,14 @@ separate debugger daemon. The x86-64 host build continues to select
   resume. The owner may instead request a user-visible step; selected peers stay
   stopped through that returned step event. Non-owner steps remain unsupported,
   and the owner's pending signal must be suppressed for the displaced instruction.
+- At an owned software-breakpoint stop, an owner-only step returns its
+  `single_step` event with peers held. A schedule that also selects peers resumes
+  them only after the original BRK instruction has been restored. If a peer
+  continuation then fails, the completed owner step remains a `single_step`
+  event with the peer-resume error attached. Already resumed peers are stopped
+  again; `resume_blocked_` is set only if that rollback is incomplete. Peer stop
+  events observed during rollback remain queued, and signal state is consumed
+  only for peer continuations accepted by ptrace.
 - File-backed module inspection from `/proc/<pid>/maps`, grouped by exact path.
   Reported spans cover the min/max mapped range and can include gaps.
 

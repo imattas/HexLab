@@ -1990,12 +1990,72 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
                             const bool object = opcode == 0x46 || opcode == 0x4d;
                             if (!expect_type(array, RegType::reference) || !expect_type(index, RegType::int32))
                                 return Error{ErrorCode::malformed, "DEX array access has an incompatible array or index type"};
+                            // Only a tracked, valid reference descriptor can
+                            // constrain the element type. Null and unresolved
+                            // reference values retain the legacy conservative
+                            // category-only checks below.
+                            std::string_view component;
+                            const bool known_array = before[array] == RegType::reference &&
+                                before.references[array] < types.size();
+                            const auto array_descriptor = known_array
+                                ? std::string_view(types[before.references[array]]) : std::string_view{};
+                            if (known_array) {
+                                if (array_descriptor.empty() || array_descriptor.front() != '[') {
+                                    std::ostringstream provenance;
+                                    provenance << "DEX array opcode uses a known non-array reference"
+                                        << " (method_idx=" << method_idx
+                                        << ", code_item_file_offset=0x" << std::hex << code_off
+                                        << ", instruction_code_unit_offset=0x" << (offset / 2)
+                                        << ", opcode=0x" << static_cast<unsigned>(opcode) << ')';
+                                    return Error{ErrorCode::malformed, provenance.str()};
+                                }
+                                component = array_descriptor.substr(1);
+                                const bool reference_component = !component.empty() &&
+                                    (component.front() == 'L' || component.front() == '[');
+                                bool component_matches = false;
+                                if (object) component_matches = reference_component;
+                                else if (wide) component_matches = component == "J" || component == "D";
+                                else if (opcode == 0x44 || opcode == 0x4b)
+                                    component_matches = component == "I" || component == "F";
+                                else if (opcode == 0x47 || opcode == 0x4e) component_matches = component == "Z";
+                                else if (opcode == 0x48 || opcode == 0x4f) component_matches = component == "B";
+                                else if (opcode == 0x49 || opcode == 0x50) component_matches = component == "C";
+                                else if (opcode == 0x4a || opcode == 0x51) component_matches = component == "S";
+                                if (!component_matches) {
+                                    std::ostringstream provenance;
+                                    provenance << "DEX array opcode disagrees with the known component descriptor"
+                                        << " (method_idx=" << method_idx
+                                        << ", code_item_file_offset=0x" << std::hex << code_off
+                                        << ", instruction_code_unit_offset=0x" << (offset / 2)
+                                        << ", opcode=0x" << static_cast<unsigned>(opcode)
+                                        << ", array_descriptor=" << array_descriptor << ')';
+                                    return Error{ErrorCode::malformed, provenance.str()};
+                                }
+                            }
                             if (get) {
-                                if (wide) set_type(value, RegType::wide_low), set_type(value + 1, RegType::wide_high);
+                                if (known_array) set_descriptor(value, component);
+                                else if (wide) set_type(value, RegType::wide_low), set_type(value + 1, RegType::wide_high);
                                 else set_type(value, object ? RegType::reference : RegType::int32);
-                            } else if (wide ? !expect_any_wide(value) :
-                                       !expect_type(value, object ? RegType::reference : RegType::int32)) {
+                            } else if (known_array && !object && !expect_descriptor(value, component)) {
+                                std::ostringstream provenance;
+                                provenance << "DEX array store value disagrees with the known component descriptor"
+                                    << " (method_idx=" << method_idx
+                                    << ", code_item_file_offset=0x" << std::hex << code_off
+                                    << ", instruction_code_unit_offset=0x" << (offset / 2)
+                                    << ", opcode=0x" << static_cast<unsigned>(opcode)
+                                    << ", array_descriptor=" << array_descriptor << ')';
+                                return Error{ErrorCode::malformed, provenance.str()};
+                            } else if (!known_array && (wide ? !expect_any_wide(value) :
+                                       !expect_type(value, object ? RegType::reference : RegType::int32))) {
                                 return Error{ErrorCode::malformed, "DEX array store value has an incompatible type"};
+                            } else if (known_array && object && !expect_type(value, RegType::reference)) {
+                                std::ostringstream provenance;
+                                provenance << "DEX aput-object value is not a reference"
+                                    << " (method_idx=" << method_idx
+                                    << ", code_item_file_offset=0x" << std::hex << code_off
+                                    << ", instruction_code_unit_offset=0x" << (offset / 2)
+                                    << ", array_descriptor=" << array_descriptor << ')';
+                                return Error{ErrorCode::malformed, provenance.str()};
                             }
                         } else if (opcode >= 0x52 && opcode <= 0x6d) {
                             const auto instance = opcode < 0x60;

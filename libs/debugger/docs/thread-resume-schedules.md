@@ -110,6 +110,14 @@ AArch64 keeps selected peers stopped through the owner step event. AArch64
 hardware execute-breakpoint schedules require the owner and only peer
 continuations; non-owner steps remain unsupported.
 
+For Linux AArch64 software-breakpoint continue schedules, the displaced owner
+instruction is an internal step. If it completes and BRK is rearmed but a later
+peer `PTRACE_CONT` fails, the backend returns that completed owner step as a
+`single_step` event with the resume error attached. It stops peers already
+resumed and blocks future resumes only if rollback cannot restore the stopped
+state. Signal delivery consumed by a successful peer continuation is not
+redelivered on retry; queued peer stop events remain available.
+
 If a Linux x86/x64 peer continuation fails after the displaced owner instruction
 has completed and the trap has been rearmed, the backend still returns the
 owner's `single_step` event and appends the peer-resume failure. Successfully
