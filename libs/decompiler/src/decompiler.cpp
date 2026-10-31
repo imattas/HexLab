@@ -12233,11 +12233,35 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                     for (const auto &node : tree)
                         for (const auto *block : node.path)
                             if (!covered.insert(block->id.value).second) valid_tree = false;
-                    const auto *exit = find_block(exit_address);
-                    valid_tree = valid_tree && exit && has_only_terminal_return(*exit) &&
-                        exit->phis.empty() && !exit->memory_phi && exit->memory_partition_phis.empty() &&
-                        predecessors[entry->id.value] == latch_ids && predecessors[exit->id.value] == latch_ids &&
-                        covered.insert(exit->id.value).second && covered.size() == function.blocks.size() &&
+                    std::vector<const LiftedBlock *> exit_path;
+                    std::set<std::uint64_t> exit_path_ids;
+                    auto *exit_cursor = find_block(exit_address);
+                    auto expected_exit_predecessors = latch_ids;
+                    while (valid_tree && exit_cursor && exit_path.size() < 64 &&
+                           exit_path_ids.insert(exit_cursor->id.value).second &&
+                           predecessors[exit_cursor->id.value] == expected_exit_predecessors &&
+                           exit_cursor->phis.empty() && !exit_cursor->memory_phi &&
+                           exit_cursor->memory_partition_phis.empty() && !exit_cursor->switch_dispatch &&
+                           (has_only_terminal_return(*exit_cursor) ||
+                            (!contains_return(*exit_cursor) && has_only_simple_statements(*exit_cursor)))) {
+                        exit_path.push_back(exit_cursor);
+                        if (has_only_terminal_return(*exit_cursor)) break;
+                        if (exit_cursor->successors.size() != 1 || !exit_cursor->successors.front().target ||
+                            (exit_cursor->successors.front().kind != BlockEdgeKind::jump &&
+                             exit_cursor->successors.front().kind != BlockEdgeKind::fallthrough) ||
+                            !has_unconditional_edge(*exit_cursor, *exit_cursor->successors.front().target)) {
+                            valid_tree = false;
+                            break;
+                        }
+                        expected_exit_predecessors = {exit_cursor->id.value};
+                        exit_cursor = find_block(*exit_cursor->successors.front().target);
+                    }
+                    valid_tree = valid_tree && !exit_path.empty() &&
+                        has_only_terminal_return(*exit_path.back()) && exit_path.size() <= 64 &&
+                        predecessors[entry->id.value] == latch_ids;
+                    for (const auto *block : exit_path)
+                        if (!covered.insert(block->id.value).second) valid_tree = false;
+                    valid_tree = valid_tree && covered.size() == function.blocks.size() &&
                         std::all_of(function.blocks.begin(), function.blocks.end(), [&](const auto &block) {
                             return covered.contains(block.id.value);
                         });
@@ -12267,7 +12291,8 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                         out << "        } else {\n";
                         emit_tree(*false_root, 12);
                         out << "        }\n    } while (true);\n";
-                        emit_block(*exit, 4);
+                        for (std::size_t i = 0; i < exit_path.size(); ++i)
+                            emit_block(*exit_path[i], 4, i + 1 != exit_path.size());
                         out << "}\n";
                         return {out.str(), false, {}};
                     }
