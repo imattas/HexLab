@@ -669,7 +669,9 @@ enum class Opcode {
     // AVX-512 opmask Boolean instructions; append to preserve serialized IDs.
     kandb, kandw, kandd, kandq, kandnb, kandnw, kandnd, kandnq,
     korb, korw, kord, korq, kxorb, kxorw, kxord, kxorq,
-    kxnorb, kxnorw, kxnord, kxnorq, knotb, knotw, knotd, knotq
+    kxnorb, kxnorw, kxnord, kxnorq, knotb, knotw, knotd, knotq,
+    // AVX-512 opmask transfers; append to preserve persisted opcode IDs.
+    kmovb, kmovw, kmovd, kmovq
 };
 enum class OperandAccess { read, write, read_write, address };
 // The encoded x86 group-one repeat prefix is retained separately from the

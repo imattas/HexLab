@@ -125,6 +125,12 @@ void read_protections(const ByteStorage &storage, const Image &image, MachOMetad
                                 blob.hash_type = std::to_integer<std::uint8_t>(payload.bytes[base + 37]);
                                 blob.platform = std::to_integer<std::uint8_t>(payload.bytes[base + 38]);
                                 blob.page_size_exponent = std::to_integer<std::uint8_t>(payload.bytes[base + 39]);
+                                if (blob.code_directory_version.value() >= 0x20300) {
+                                    require(blob.size >= 64, "Truncated Mach-O CodeDirectory codeLimit64 field");
+                                    const auto high = std::uint64_t(be32(base + 56));
+                                    const auto low = std::uint64_t(be32(base + 60));
+                                    blob.code_limit64 = (high << 32) | low;
+                                }
                             } else {
                                 metadata.protections_complete = false;
                             }

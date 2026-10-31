@@ -82,6 +82,20 @@ full K-register reads and write; the opcode variant carries the active low
 destination. No pure runtime mask evaluator or typed decompiler lift is added
 here; CPU feature checks and exception delivery remain caller-owned.
 
+VEX `KMOVB/W/D/Q` now covers K-register copies, K-to-memory stores,
+memory-to-K loads, and transfers between K registers and GPRs. The byte/word
+forms use `pp=66/W=0` and `pp=none/W=0`, respectively; K/m dword/qword forms
+use `pp=66/W=1` and `pp=none/W=1`, while GPR dword/qword forms use
+`pp=F2/W=0` and `pp=F2/W=1`. GPR forms use 32-bit GPRs for byte/word/dword
+and require 64-bit mode for qword. K
+destinations record full 64-bit writes because the instruction zero-extends
+the selected low-width source; memory accesses retain their exact 8/16/32/64-
+bit widths. Reserved `vvvv`, invalid prefix combinations, non-register forms
+for the GPR transfers, and K indices outside K0-K7 are rejected. Direct
+GPR-to-memory and memory-to-GPR copies are not KMOV encodings and remain
+unsupported. The forms and zero-extension behavior follow Intel's
+[KMOV instruction reference](https://cdrdv2-public.intel.com/835757/325383-sdm-vol-2abcd.pdf).
+
 EVEX immediate packed shifts support word, dword, and qword logical left and
 right forms plus arithmetic right word and dword forms. They use map 1
 opcodes `71`/`72`/`73`, `pp=66`, and the documented ModRM group selectors;

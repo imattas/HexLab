@@ -55,6 +55,12 @@ an incomplete `ObjC2.Meta.<name>` aggregate only when the scanner validated a
 metaclass address. The parsed method signature retains its receiver and
 selector parameters.
 
+Validated class property declarations also synthesize instance getter and,
+unless readonly, setter signatures on the class aggregate. Explicit method
+encodings take precedence when they declare the same selector. These
+signatures retain typed `self`, `_cmd`, and setter value parameters; property
+metadata does not add or rename instance storage.
+
 The action accepts only a scan of the currently displayed document snapshot.
 Names above the project's 512-byte limit and method lists above the persistent
 type codec's 100,000-method limit are skipped with diagnostics. Layouts above
