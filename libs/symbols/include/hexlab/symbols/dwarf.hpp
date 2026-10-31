@@ -266,6 +266,8 @@ struct DwarfLineFile {
 };
 struct DwarfLineUnit {
     std::uint16_t version = 0;
+    std::string source_id;
+    std::uint64_t section_offset = 0;
     std::vector<std::string> directories;
     std::vector<DwarfLineFile> files;
     std::vector<DwarfLineRow> rows;
@@ -280,6 +282,9 @@ struct DwarfLineSections {
     std::stop_token stop;
     // Optional shared string sections used by DWARF v5 line-table forms.
     std::span<const std::uint8_t> strings, line_strings;
+    // Absolute offset of this byte span in its source section. Contribution
+    // importers use this to retain package-level provenance on each unit.
+    std::uint64_t section_offset = 0;
 };
 HEXLAB_SYMBOLS_EXPORT hexlab::Result<std::vector<DwarfLineUnit>> import_dwarf_line_v2_v5(const DwarfLineSections &sections);
 // Compatibility name retained for callers that explicitly request v2-v4.
