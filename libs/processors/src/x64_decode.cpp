@@ -390,6 +390,10 @@ DecodeResult decode_scalar(std::span<const std::byte> input, Address address, De
                     state.operand(decoded.rm, OperandAccess::read);
                     state.flags_read = true;
                     state.flags_write = true;
+                    const std::uint64_t chain_flag = state.i.opcode == Opcode::adcx
+                        ? UINT64_C(1) : UINT64_C(1) << 11;
+                    state.flags_read_mask = chain_flag;
+                    state.flags_write_mask = chain_flag;
                 } else if ((map_opcode == 0xf0 || map_opcode == 0xf1) && state.group1 == 0xf2) {
                     const std::uint16_t destination_width = state.rules.long_mode() && (state.rex & 8) ? 64 : 32;
                     const std::uint16_t source_width = map_opcode == 0xf0 ? 8 : state.width();
