@@ -887,10 +887,6 @@ struct Instruction {
     std::vector<Operand> operands;
     std::vector<OperandAccess> access;
     std::vector<RegisterOperand> register_reads, register_writes;
-    // Optional x86 RFLAGS bit dependencies for instructions whose effects are
-    // narrower than the architectural FLAGS register. Unset means legacy
-    // whole-register facts remain the only available description.
-    std::optional<std::uint64_t> x86_flags_read_mask, x86_flags_write_mask;
     FlowKind flow = FlowKind::fallthrough;
     std::optional<Address> direct_target;
     std::optional<DexSwitchTable> dex_switch;
@@ -945,6 +941,10 @@ struct Instruction {
     bool reads_frm = false;
     // Accrued exception flags are sticky, so vector FP operations read old fflags.
     bool reads_fflags = false;
+    // Optional x86 RFLAGS bit dependencies for instructions whose effects are
+    // narrower than the architectural FLAGS register. Appended to preserve
+    // positional aggregate initializers; unset means only whole-register facts.
+    std::optional<std::uint64_t> x86_flags_read_mask, x86_flags_write_mask;
     std::size_t byte_length() const noexcept { return length; }
     std::span<const std::byte> encoded_bytes() const noexcept {
         if (!extended_bytes.empty()) return extended_bytes;
