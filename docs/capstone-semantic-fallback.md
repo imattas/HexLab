@@ -10,6 +10,10 @@ A64 and A32/Thumb use Capstone's per-operand access bits for register, immediate
 
 For MOS6502, Capstone detail exposes typed 8-bit register/immediate operands and 16-bit-address, 8-bit-data memory operands when the register roles are available. Indexed zero-page/absolute forms retain their X/Y index register; unindexed zero-page, absolute, relative-branch and zero-page-relative operands receive resolved addresses from Capstone detail. HexLab assigns data-memory access from the decoded instruction ID: loads/ALU/compare/BIT and BBR/BBS read, STA/STX/STY/STZ write, ASL/LSR/ROL/ROR/INC/DEC/RMB/SMB/TRB/TSB read-write, and indirect JMP reads its pointer. Indirect addressing modes also set the instruction-level memory-read summary for pointer fetches, including indirect stores; a pointer operand's resolved address identifies its encoded pointer location and does not claim to resolve the final effective address. PHA/PHP/JSR/BRK report implicit stack writes; PLA/PLP/RTS/RTI report implicit stack reads, and these instructions report S read/write effects. These stack facts are instruction-level booleans and do not encode the exact page-$01 byte offsets or access widths. Relative branch target operands remain address-only, including the second operand of BBR/BBS. Other memory roles remain address-only when not covered by this table. Absolute JMP/JSR targets are retained; indirect JMP is not converted to a direct target. Relative branch destinations are taken only from Capstone's decoded target operand, never parsed from display text. BCC/BCS/BEQ/BMI/BNE/BPL/BVC/BVS and BBR/BBS are classified conditional, while BRA/BRL are unconditional jumps.
 
+BRK, COP, and STP are classified as traps even when Capstone omits the
+interrupt group. WAI remains fallthrough because an interrupt can resume
+execution after the wait; no wake source or interrupt state is inferred.
+
 The MOS6502 fallback also supplements Capstone's implicit-register read/write
 sets for common base instructions. Instruction IDs identify A/X/Y/SP dataflow,
 status-register updates and branch-condition reads for arithmetic, logic,
