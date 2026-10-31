@@ -56,6 +56,29 @@ bool stack_flow(State &s, std::uint8_t opcode, bool extended) {
                 if (s.rules.long_mode()) s.i.register_writes.push_back(gpr(index, 64));
                 s.i.register_writes.push_back(result);
             }
+        } else if (opcode == 0x31 || opcode == 0x33) {
+            // These instructions return a 64-bit counter in EDX:EAX. RDPMC
+            // selects its counter through ECX; RDTSC reads the timestamp
+            // counter directly. 32-bit writes clear the upper halves in long
+            // mode regardless of the operand-size prefix.
+            const bool performance = opcode == 0x33;
+            s.i.opcode = performance ? Opcode::rdpmc : Opcode::rdtsc;
+            if (performance) s.i.register_reads.push_back(gpr(1, 32));
+            for (const std::uint8_t index : {std::uint8_t{0}, std::uint8_t{2}}) {
+                if (s.rules.long_mode()) s.i.register_writes.push_back(gpr(index, 64));
+                s.i.register_writes.push_back(gpr(index, 32));
+            }
+        } else if (opcode == 0x01 && s.peek() == 0xf9) {
+            // RDTSCP is the fixed 0F 01 F9 form. It returns TSC_AUX in ECX
+            // alongside the timestamp in EDX:EAX.
+            if (s.group1 || s.operand_override || s.address_override || s.rex)
+                invalid("RDTSCP does not accept legacy or REX prefixes in this subset");
+            (void)s.take(1);
+            s.i.opcode = Opcode::rdtscp;
+            for (const std::uint8_t index : {std::uint8_t{0}, std::uint8_t{2}, std::uint8_t{1}}) {
+                if (s.rules.long_mode()) s.i.register_writes.push_back(gpr(index, 64));
+                s.i.register_writes.push_back(gpr(index, 32));
+            }
         } else if (opcode == 0x1f) {
             auto m = modrm(s, s.width());
             if (m.group != 0)
