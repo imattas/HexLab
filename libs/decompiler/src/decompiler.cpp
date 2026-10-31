@@ -2422,12 +2422,58 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
     if (m65c02) {
         const RegisterOperand accumulator{RegisterBank::mos6502, 0, 8, false};
         const RegisterOperand status{RegisterBank::mos6502, 3, 8, false};
+        const RegisterOperand stack_pointer{RegisterBank::mos6502, 4, 8, false};
         const auto binary = [](std::string operation, ExpressionPtr left, ExpressionPtr right,
                                std::uint16_t width = 8) -> ExpressionPtr {
             return std::make_shared<Expression>(Expression{
                 integer_type(width), BinaryValue{std::move(operation), std::move(left), std::move(right)}});
         };
         const auto zero = constant_expr(0, 8);
+        const bool push_index = instruction.opcode == Opcode::m65c02_phx ||
+                                instruction.opcode == Opcode::m65c02_phy;
+        const bool pull_index = instruction.opcode == Opcode::m65c02_plx ||
+                                instruction.opcode == Opcode::m65c02_ply;
+        if ((push_index || pull_index) && instruction.operands.empty() && operands.empty() &&
+            instruction.flow == FlowKind::fallthrough && instruction.access.empty()) {
+            const RegisterOperand value_register{RegisterBank::mos6502,
+                static_cast<std::uint8_t>(instruction.opcode == Opcode::m65c02_phy ||
+                                          instruction.opcode == Opcode::m65c02_ply ? 2 : 1), 8, false};
+            if (push_index && !instruction.memory_read && instruction.memory_write &&
+                instruction.register_reads == std::vector<RegisterOperand>{value_register, stack_pointer} &&
+                instruction.register_writes == std::vector<RegisterOperand>{stack_pointer}) {
+                Intrinsic effect{instruction.opcode == Opcode::m65c02_phx
+                        ? "m65c02_phx_stack_write_page_0100_wrap" : "m65c02_phy_stack_write_page_0100_wrap",
+                    {reg_expr(value_register), reg_expr(stack_pointer), constant_expr(0x0100, 16)},
+                    IntrinsicMemoryEffect::write};
+                effect.register_writes = {stack_pointer};
+                effect.register_output_values = {binary("and",
+                    binary("sub", reg_expr(stack_pointer), constant_expr(1, 8)), constant_expr(0xff, 8))};
+                return effect;
+            }
+            if (pull_index && instruction.memory_read && !instruction.memory_write &&
+                instruction.register_reads == std::vector<RegisterOperand>{stack_pointer, status} &&
+                instruction.register_writes == std::vector<RegisterOperand>{value_register, stack_pointer, status}) {
+                auto pulled = std::make_shared<Expression>(Expression{integer_type(8),
+                    UnknownValue{instruction.opcode == Opcode::m65c02_plx
+                        ? "PLX byte pulled from $0100 | ((S+1)&$ff)" :
+                          "PLY byte pulled from $0100 | ((S+1)&$ff)"}});
+                const auto new_sp = binary("and", binary("add", reg_expr(stack_pointer), constant_expr(1, 8)),
+                    constant_expr(0xff, 8));
+                auto zero_flag = std::make_shared<Expression>(Expression{integer_type(8), UnaryValue{"zext",
+                    boolean_binary("eq", pulled, zero)}});
+                auto negative_flag = std::make_shared<Expression>(Expression{integer_type(8), UnaryValue{"zext",
+                    boolean_binary("bit_extract", pulled, constant_expr(7, 8))}});
+                auto new_status = binary("or", binary("or", binary("and", reg_expr(status), constant_expr(0x7d, 8)),
+                    binary("shl", std::move(zero_flag), constant_expr(1, 8))),
+                    binary("shl", std::move(negative_flag), constant_expr(7, 8)));
+                Intrinsic effect{instruction.opcode == Opcode::m65c02_plx
+                        ? "m65c02_plx_stack_read_page_0100_wrap" : "m65c02_ply_stack_read_page_0100_wrap",
+                    {reg_expr(stack_pointer)}, IntrinsicMemoryEffect::read};
+                effect.register_writes = {value_register, stack_pointer, status};
+                effect.register_output_values = {pulled, new_sp, new_status};
+                return effect;
+            }
+        }
         if (instruction.opcode == Opcode::m65c02_stz && instruction.operands.size() == 1 &&
             operands.size() == 1 && is_memory(instruction.operands.front()) &&
             instruction.access == std::vector<OperandAccess>{OperandAccess::write} &&
