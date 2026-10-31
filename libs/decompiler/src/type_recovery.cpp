@@ -3403,15 +3403,17 @@ static Result<TypeRecoveryResult> recover_types_impl(
     // unrelated writes to the ABI return register for a returned value.
     if (!prototype && has_bare_return && !has_value_return)
         result.return_type = types::Type::void_type();
-    if(!result.return_type && abi.integer_return_register) {
+    if (!result.return_type && has_value_return) {
         std::optional<std::uint32_t> latest_version;
         const Fact *return_fact = nullptr;
-        for (const auto &[fact_key, fact] : facts) {
-            (void)fact_key;
-            if (fact.reg != *abi.integer_return_register) continue;
-            if (!return_fact || (fact.version && (!latest_version || *fact.version > *latest_version))) {
-                return_fact = &fact;
-                latest_version = fact.version;
+        if (abi.integer_return_register) {
+            for (const auto &[fact_key, fact] : facts) {
+                (void)fact_key;
+                if (fact.reg != *abi.integer_return_register) continue;
+                if (!return_fact || (fact.version && (!latest_version || *fact.version > *latest_version))) {
+                    return_fact = &fact;
+                    latest_version = fact.version;
+                }
             }
         }
         types::TypePtr observed_return_type;
