@@ -253,7 +253,7 @@ partition phis per block, 65,536 combined register/memory phi inputs, and 64
 cleanup blocks. It requires unique block IDs and addresses, exact resolved
 edge kinds and target block
 identities, complete function coverage, and a terminal return. Nested or overlapping
-body branches, switches, nonterminal side entries or ambiguous exits, multiple latches,
+body branches, switches, nonterminal side entries or ambiguous exits, other multi-latch shapes,
 extra or duplicated edges,
 and malformed phis proceed to the existing region/state-machine/goto paths.
 
@@ -275,6 +275,17 @@ edge still follows the validated exit path. The chain is limited to 64 blocks,
 requires exact single-predecessor links through to the body entry, and cannot
 contain memory/register phis, branches, switches, returns, or side entries.
 Unsupported or ambiguous loop shapes retain lossless explicit gotos.
+
+A separate narrow function-entry form accepts exactly two disjoint post-tested
+body arms, each ending in its own conditional latch. Both latches must branch
+directly to the function-entry loop header or to the same phi-free terminal
+return, and the header and return predecessor sets must consist exactly of
+those two latch blocks. Each arm is limited to 64 blocks including its latch;
+the whole function is limited to 128 blocks and 4,096 edges. The formatter emits
+the arm choice inside `do { ... } while (true)` and lowers each latch condition
+to `continue` or `break`. Register and memory phis, side entries, additional
+exits, non-return exits, overlapping arms, malformed edges, and larger graphs
+retain the existing fallback.
 
 The acyclic structurer also handles nested regions with multiple explicit
 terminal returns. An analysis-only virtual exit supplies post-dominators for
