@@ -775,11 +775,26 @@ Result<std::vector<ModuleInfo>> parse_libraries_xml(std::string_view xml) {
         }
         for (const char c : xml.substr(pos, open - pos)) if (!std::isspace(static_cast<unsigned char>(c)))
             return Error{ErrorCode::malformed, "unexpected text in libraries XML"};
+        if (xml.substr(open).starts_with("<!--")) {
+            const auto end = xml.find("-->", open + 4);
+            if (end == std::string_view::npos || end - open > 4096 ||
+                xml.substr(open + 4, end - open - 4).find("--") != std::string_view::npos)
+                return Error{ErrorCode::malformed, "invalid or oversized libraries XML comment"};
+            pos = end + 3;
+            continue;
+        }
+        if (xml.substr(open).starts_with("<?")) {
+            const auto end = xml.find("?>", open + 2);
+            if (end == std::string_view::npos || end - open > 4096)
+                return Error{ErrorCode::malformed, "unterminated or oversized libraries XML processing instruction"};
+            pos = end + 2;
+            continue;
+        }
+        if (xml.substr(open).starts_with("<!"))
+            return Error{ErrorCode::unsupported, "libraries XML DTD and entity declarations are unsupported"};
         auto close = xml.find('>', open + 1);
         if (close == std::string_view::npos) return Error{ErrorCode::malformed, "unterminated libraries XML tag"};
         auto tag = xml.substr(open + 1, close - open - 1); pos = close + 1;
-        if (tag.starts_with("?")) continue;
-        if (tag.starts_with("!")) return Error{ErrorCode::unsupported, "libraries XML declarations are unsupported"};
         const bool closing = tag.starts_with("/"); if (closing) tag.remove_prefix(1);
         const bool self_closing = !tag.empty() && tag.back() == '/'; if (self_closing) tag.remove_suffix(1);
         while (!tag.empty() && std::isspace(static_cast<unsigned char>(tag.front()))) tag.remove_prefix(1);
@@ -871,7 +886,7 @@ Result<std::vector<ModuleInfo>> parse_libraries_xml(std::string_view xml) {
                 auto& diagnostic = modules.back().diagnostic;
                 if (!diagnostic.empty()) diagnostic += "; ";
                 diagnostic += "library segment has an invalid address";
-            } else if (modules.back().base == 0) {
+            } else if (!library_has_base_evidence) {
                 modules.back().base = segment_base;
                 library_has_base_evidence = true;
             }
