@@ -108,6 +108,12 @@ from the PE image digest match and raw CMS signature result. See Microsoft's
 and [`CertVerifyCertificateChainPolicy`](https://learn.microsoft.com/en-us/windows/win32/api/wincrypt/nf-wincrypt-certverifycertificatechainpolicy)
 documentation.
 
+The desktop PE metadata pane exposes the same check on its Authenticode page.
+Select a PKCS#7 row in Certificates and start verification; the UI displays
+per-signer signature, chain, chain-status, policy, and provider results. The
+check runs outside the UI thread, is bound to the immutable document snapshot,
+and discards its result if the document changes before completion.
+
 Invalid alignment, truncated records, unsupported
 revisions, zero types, or out-of-file extents make PE metadata partial while
 leaving the mapped image available.

@@ -1,9 +1,12 @@
 #include "pe_view.hpp"
+#include "hexlab/loaders/pe.hpp"
 #include "hexlab/workspace/project.hpp"
 #include <wx/sizer.h>
 #include <algorithm>
+#include <mutex>
 #include <optional>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -46,7 +49,19 @@ const char *certificate_type_name(std::uint16_t type) {
 }
 } // namespace
 
-PeView::PeView(wxWindow *parent) : wxPanel(parent) {
+struct PeView::TrustWork {
+    struct Completion {
+        std::uint64_t generation = 0;
+        std::shared_ptr<const DocumentSnapshot> document;
+        Result<PeAuthenticodeTrustVerification> result;
+    };
+    std::mutex mutex;
+    std::optional<Completion> completion;
+    std::jthread worker;
+};
+
+PeView::PeView(wxWindow *parent)
+    : wxPanel(parent), trust_work_(std::make_shared<TrustWork>()), trust_timer_(this) {
     auto *tabs = new wxNotebook(this, wxID_ANY);
     directories_ = new VirtualTable(tabs, "pe-directories", {"#", "Kind", "RVA / file", "Size"});
     auto *coff_symbol_page = new wxPanel(tabs);
@@ -75,6 +90,27 @@ PeView::PeView(wxWindow *parent) : wxPanel(parent) {
     certificate_layout->Add(certificate_status_, 0, wxEXPAND | wxALL, 4);
     certificate_layout->Add(certificates_, 1, wxEXPAND);
     certificate_page->SetSizer(certificate_layout);
+    auto *authenticode_page = new wxPanel(tabs);
+    verify_authenticode_ = new wxButton(authenticode_page, wxID_ANY, "Verify selected PKCS#7 record");
+    verify_authenticode_->SetName("pe-authenticode-verify");
+    verify_authenticode_->Enable(false);
+    authenticode_status_ = new wxStaticText(authenticode_page, wxID_ANY,
+        "Select a PKCS#7 record on the Certificates page to check its signer chain.");
+    authenticode_signers_ = new VirtualTable(authenticode_page, "pe-authenticode-signers",
+        {"Signer", "CMS signature", "Signature error", "Chain", "Chain errors", "Policy error", "Provider error"});
+    auto *authenticode_layout = new wxBoxSizer(wxVERTICAL);
+    authenticode_layout->Add(verify_authenticode_, 0, wxALL, 6);
+    authenticode_layout->Add(authenticode_status_, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 6);
+    authenticode_layout->Add(authenticode_signers_, 1, wxEXPAND);
+    authenticode_page->SetSizer(authenticode_layout);
+    certificates_->Bind(wxEVT_LIST_ITEM_SELECTED, [this](wxListEvent &event) {
+        update_authenticode_controls();
+        event.Skip();
+    });
+    verify_authenticode_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) {
+        begin_authenticode_verification();
+    });
+    Bind(wxEVT_TIMER, [this](wxTimerEvent &) { poll_authenticode_verification(); }, trust_timer_.GetId());
     auto *load_config_page = new wxPanel(tabs);
     load_config_status_ = new wxStaticText(load_config_page, wxID_ANY, "SafeSEH: unavailable");
     safe_seh_ = new VirtualTable(load_config_page, "pe-safe-seh", {"Handler RVA", "Source", "Record"});
@@ -113,6 +149,7 @@ PeView::PeView(wxWindow *parent) : wxPanel(parent) {
     tabs->AddPage(resource_page, "Resources");
     tabs->AddPage(bound_imports_, "Bound imports");
     tabs->AddPage(certificate_page, "Certificates");
+    tabs->AddPage(authenticode_page, "Authenticode");
     tabs->AddPage(load_config_page, "Load config");
     tabs->AddPage(runtime_view_page, "Runtime views");
     tabs->AddPage(exceptions_, "Exceptions / unwind");
@@ -127,7 +164,22 @@ PeView::PeView(wxWindow *parent) : wxPanel(parent) {
     set_document({});
 }
 
+PeView::~PeView() {
+    trust_timer_.Stop();
+    if (trust_work_ && trust_work_->worker.joinable())
+        trust_work_->worker.request_stop();
+}
+
 void PeView::set_document(std::shared_ptr<const DocumentSnapshot> document) {
+    const bool source_changed = !document_ || !document || document_->id != document->id ||
+        document_->revision != document->revision || document_->image != document->image;
+    if (source_changed) {
+        ++trust_generation_;
+        authenticode_signers_->populate(0, {});
+        authenticode_status_->SetLabel(trust_running_
+            ? "A check for the previous document is finishing; its result will be discarded."
+            : "Select a PKCS#7 record on the Certificates page to check its signer chain.");
+    }
     document_ = std::move(document);
     const auto source_document = document_;
     const auto *metadata = source_document ? &source_document->metadata_view() : nullptr;
@@ -140,7 +192,8 @@ void PeView::set_document(std::shared_ptr<const DocumentSnapshot> document) {
         resources_->populate(0, {});
         bound_imports_->populate(0, {});
         certificates_->populate(0, {});
-        certificate_status_->SetLabel("Certificate table: unavailable; signatures are not verified");
+        certificate_status_->SetLabel("Certificate table: unavailable");
+        update_authenticode_controls();
         safe_seh_->populate(0, {});
         load_config_status_->SetLabel("SafeSEH: unavailable");
         runtime_view_status_->SetLabel("ARM64X runtime views are unavailable for this image");
@@ -320,7 +373,8 @@ void PeView::set_document(std::shared_ptr<const DocumentSnapshot> document) {
     };
     const auto &certificate_table = metadata->pe->certificate_table;
     if (!certificate_table) {
-        certificate_status_->SetLabel("Certificate table: not present; signatures are not verified");
+        certificate_status_->SetLabel("Certificate table: not present");
+        authenticode_status_->SetLabel("No PE certificate record is available for checking.");
         certificates_->populate(0, {});
         certificates_->activate = {};
     } else {
@@ -328,7 +382,7 @@ void PeView::set_document(std::shared_ptr<const DocumentSnapshot> document) {
         const auto &records = certificate_table->records;
         const auto shown = std::min(certificate_display_limit, records.size());
         certificate_status_->SetLabel(wxString::Format(
-            "Certificate table: %u records at file offset 0x%llX, size 0x%X; payloads are opaque and signatures are not verified%s",
+            "Certificate table: %u records at file offset 0x%llX, size 0x%X; payloads are opaque%s",
             static_cast<unsigned>(records.size()),
             static_cast<unsigned long long>(certificate_table->file_offset.value),
             certificate_table->size, shown < records.size() ? " (display limited to 4096 rows)" : ""));
@@ -357,6 +411,7 @@ void PeView::set_document(std::shared_ptr<const DocumentSnapshot> document) {
             else if (!record.source.spans.empty()) navigate(source_document, record.source.spans.front().offset);
         };
     }
+    update_authenticode_controls();
     const auto &load_config = metadata->pe->load_configuration;
     const auto loaded = document_->project ? document_->project->loaded : nullptr;
     const bool has_alternative = loaded && static_cast<bool>(loaded->pe_arm64x_image);
@@ -580,4 +635,106 @@ void PeView::set_document(std::shared_ptr<const DocumentSnapshot> document) {
     exceptions_->fit_columns({0, 1, 2, 3});
     pdb_symbols_->fit_columns({0, 1, 2, 3, 4}); pdb_types_->fit_columns({0, 1, 2, 3}); pdb_lines_->fit_columns({0, 1, 2, 3});
 }
+
+void PeView::update_authenticode_controls() {
+    if (!verify_authenticode_) return;
+    bool enabled = !trust_running_ && document_ && document_->image;
+    if (enabled) {
+        const auto *metadata = &document_->metadata_view();
+        const auto row = certificates_->selected_row();
+        enabled = metadata->pe && metadata->pe->certificate_table && row &&
+            *row < metadata->pe->certificate_table->records.size() &&
+            metadata->pe->certificate_table->records[*row].type == 0x0002;
+    }
+    verify_authenticode_->Enable(enabled);
+}
+
+void PeView::begin_authenticode_verification() {
+    if (trust_running_ || !document_ || !document_->image) return;
+    const auto *metadata = &document_->metadata_view();
+    const auto row = certificates_->selected_row();
+    if (!metadata->pe || !metadata->pe->certificate_table || !row ||
+        *row >= metadata->pe->certificate_table->records.size() ||
+        metadata->pe->certificate_table->records[*row].type != 0x0002) {
+        authenticode_status_->SetLabel("Select a PKCS#7 signed-data record on the Certificates page first.");
+        update_authenticode_controls();
+        return;
+    }
+
+    const auto source_document = document_;
+    const auto certificate_record = *row;
+    const auto generation = ++trust_generation_;
+    trust_running_ = true;
+    authenticode_signers_->populate(0, {});
+    authenticode_status_->SetLabel("Checking CMS signature and Authenticode code-signing chain...");
+    update_authenticode_controls();
+    {
+        std::lock_guard lock(trust_work_->mutex);
+        trust_work_->completion.reset();
+    }
+    // PeView owns this work state, and its jthread joins before the state mutex is destroyed.
+    auto *work = trust_work_.get();
+    work->worker = std::jthread([work, source_document, certificate_record, generation](std::stop_token stop) {
+        auto result = verify_pe_authenticode_trust(*source_document->image,
+            source_document->metadata_view(), certificate_record, stop);
+        std::lock_guard lock(work->mutex);
+        work->completion.emplace(TrustWork::Completion{
+            generation, source_document, std::move(result)});
+    });
+    trust_timer_.Start(50);
+}
+
+void PeView::poll_authenticode_verification() {
+    if (!trust_work_) return;
+    std::optional<TrustWork::Completion> completed;
+    {
+        std::lock_guard lock(trust_work_->mutex);
+        if (trust_work_->completion) {
+            completed.emplace(std::move(*trust_work_->completion));
+            trust_work_->completion.reset();
+        }
+    }
+    if (!completed) return;
+    trust_timer_.Stop();
+    trust_running_ = false;
+    update_authenticode_controls();
+    if (completed->generation != trust_generation_) {
+        authenticode_status_->SetLabel("The previous document's Authenticode result was discarded.");
+        return;
+    }
+    if (!completed->result) {
+        authenticode_signers_->populate(0, {});
+        authenticode_status_->SetLabel("Authenticode chain check unavailable: " +
+            text(completed->result.error().message).Left(240));
+        return;
+    }
+
+    const auto signers = completed->result.value().signers;
+    std::size_t valid_signatures = 0, trusted_chains = 0;
+    for (const auto &signer : signers) {
+        valid_signatures += static_cast<std::size_t>(signer.signature_valid);
+        trusted_chains += static_cast<std::size_t>(signer.chain_trusted);
+    }
+    authenticode_status_->SetLabel(wxString::Format(
+        "%u signer(s); %u CMS signature(s) valid; %u code-signing chain(s) trusted. Revocation and timestamps were not checked.",
+        static_cast<unsigned>(signers.size()), static_cast<unsigned>(valid_signatures),
+        static_cast<unsigned>(trusted_chains)));
+    authenticode_signers_->populate(signers.size(), [signers](std::size_t row, int column) {
+        const auto &signer = signers[row];
+        const auto error = [](std::uint32_t value) {
+            return value ? wxString::Format("0x%08X", value) : wxString("none");
+        };
+        switch (column) {
+        case 0: return wxString::Format("%u", static_cast<unsigned>(row));
+        case 1: return signer.signature_valid ? wxString("verified") : wxString("failed");
+        case 2: return error(signer.signature_error);
+        case 3: return signer.chain_built ? wxString("built") : wxString("unavailable");
+        case 4: return error(signer.chain_error_status);
+        case 5: return error(signer.policy_error);
+        default: return error(signer.provider_error);
+        }
+    });
+    authenticode_signers_->fit_columns({0, 1, 2, 3, 4, 5, 6});
+}
+
 } // namespace hexlab::desktop
