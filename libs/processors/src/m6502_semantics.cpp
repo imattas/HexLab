@@ -184,6 +184,64 @@ evaluate_m6502_compare(Opcode opcode, std::uint8_t left, std::uint8_t operand,
     return M6502CompareResult{updated};
 }
 
+std::optional<M6502CompareResult>
+evaluate_m65c02_compare(Opcode opcode, std::uint8_t left, std::uint8_t operand,
+                        std::uint8_t status, bool immediate_bit) noexcept {
+    if (opcode == Opcode::m6502_bit) {
+        const auto updated = immediate_bit
+            ? static_cast<std::uint8_t>((status & 0xfdu) | ((left & operand) == 0 ? 0x02u : 0u))
+            : static_cast<std::uint8_t>((status & 0x3du) | ((left & operand) == 0 ? 0x02u : 0u) |
+                                        (operand & 0xc0u));
+        return M6502CompareResult{updated};
+    }
+    if (immediate_bit || (opcode != Opcode::m6502_cmp && opcode != Opcode::m6502_cpx &&
+                          opcode != Opcode::m6502_cpy))
+        return {};
+    const auto difference = static_cast<std::uint8_t>(left - operand);
+    const auto updated = static_cast<std::uint8_t>((status & 0x7cu) |
+        (left >= operand ? 0x01u : 0u) | (difference == 0 ? 0x02u : 0u) | (difference & 0x80u));
+    return M6502CompareResult{updated};
+}
+
+std::optional<M6502CompareResult>
+evaluate_m65c02_compare_instruction(const Instruction &instruction,
+                                    std::uint8_t left, std::uint8_t operand,
+                                    std::uint8_t status) noexcept {
+    if (instruction.context.architecture != Architecture::mos6502 ||
+        instruction.context.mode != ExecutionMode::m65c02 || instruction.operands.size() != 1 ||
+        instruction.access.size() != 1 || instruction.access[0] != OperandAccess::read ||
+        instruction.memory_write)
+        return {};
+    RegisterOperand selected{RegisterBank::mos6502,
+        static_cast<std::uint16_t>(instruction.opcode == Opcode::m6502_cpx ? 1 :
+                                   instruction.opcode == Opcode::m6502_cpy ? 2 : 0), 8, false};
+    if (instruction.opcode != Opcode::m6502_cmp && instruction.opcode != Opcode::m6502_cpx &&
+        instruction.opcode != Opcode::m6502_cpy && instruction.opcode != Opcode::m6502_bit)
+        return {};
+    if (std::find(instruction.register_reads.begin(), instruction.register_reads.end(), selected) ==
+        instruction.register_reads.end())
+        return {};
+    const RegisterOperand processor_status{RegisterBank::mos6502, 3, 8, false};
+    if (std::find(instruction.register_reads.begin(), instruction.register_reads.end(), processor_status) ==
+            instruction.register_reads.end() ||
+        std::find(instruction.register_writes.begin(), instruction.register_writes.end(), processor_status) ==
+            instruction.register_writes.end())
+        return {};
+    bool immediate_bit = false;
+    if (const auto *immediate = std::get_if<ImmediateOperand>(&instruction.operands[0])) {
+        if (instruction.opcode != Opcode::m6502_bit || immediate->effective_width != 8 ||
+            immediate->value > UINT8_MAX || instruction.memory_read)
+            return {};
+        immediate_bit = true;
+    } else if (const auto *memory = std::get_if<MemoryOperand>(&instruction.operands[0])) {
+        if (memory->data_width != 8 || !instruction.memory_read || instruction.memory_write)
+            return {};
+    } else {
+        return {};
+    }
+    return evaluate_m65c02_compare(instruction.opcode, left, operand, status, immediate_bit);
+}
+
 std::optional<M6502AlrResult>
 evaluate_m6502_alr_instruction(const Instruction &instruction,
                                std::uint8_t accumulator, std::uint8_t status) noexcept {

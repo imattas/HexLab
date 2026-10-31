@@ -62,6 +62,15 @@ struct M6502CompareResult {
 HEXLAB_PROCESSORS_EXPORT std::optional<M6502CompareResult>
 evaluate_m6502_compare(Opcode opcode, std::uint8_t left, std::uint8_t operand,
                        std::uint8_t status) noexcept;
+// Evaluate W65C02 CMP/CPX/CPY or BIT. For BIT, pass true only for the
+// immediate form, which updates Z while preserving N/V.
+HEXLAB_PROCESSORS_EXPORT std::optional<M6502CompareResult>
+evaluate_m65c02_compare(Opcode opcode, std::uint8_t left, std::uint8_t operand,
+                        std::uint8_t status, bool immediate_bit = false) noexcept;
+HEXLAB_PROCESSORS_EXPORT std::optional<M6502CompareResult>
+evaluate_m65c02_compare_instruction(const Instruction &instruction,
+                                    std::uint8_t left, std::uint8_t operand,
+                                    std::uint8_t status) noexcept;
 
 struct M6502AlrResult {
     std::uint8_t accumulator = 0;
