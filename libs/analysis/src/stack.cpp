@@ -352,6 +352,42 @@ bool ppc_register(const std::optional<RegisterOperand> &value, std::uint8_t inde
     return value && value->bank == RegisterBank::ppc_gpr && value->index == index;
 }
 
+// MOV Xd,Xn is encoded as ORR Xd,XZR,Xn. Only the unshifted, full-width
+// identity preserves an entry-SP relation; W-register copies truncate it.
+std::optional<RegisterOperand> arm64_stack_copy_source(const Instruction &instruction) {
+    if (instruction.context.architecture != Architecture::arm64 ||
+        instruction.context.mode != ExecutionMode::a64 || instruction.opcode != Opcode::a64_orr ||
+        instruction.operands.size() != 3 ||
+        instruction.access != std::vector<OperandAccess>{OperandAccess::write, OperandAccess::read,
+                                                        OperandAccess::read} ||
+        instruction.flow != FlowKind::fallthrough || instruction.delay_slots ||
+        instruction.memory_read || instruction.memory_write)
+        return {};
+    const auto full_gpr = [](const std::optional<RegisterOperand> &reg) {
+        return reg && reg->bank == RegisterBank::arm64_gpr && reg->index < 31 &&
+               reg->width == 64 && !reg->high_byte;
+    };
+    const auto zero = [](const std::optional<RegisterOperand> &reg) {
+        return reg && reg->bank == RegisterBank::arm64_zero && reg->index == 31 &&
+               reg->width == 64 && !reg->high_byte;
+    };
+    const auto destination = register_at(instruction, 0);
+    const auto left = register_at(instruction, 1);
+    const auto right = register_at(instruction, 2);
+    const auto source = zero(left) ? right : zero(right) ? left : std::optional<RegisterOperand>{};
+    if (!full_gpr(destination) || !full_gpr(source) ||
+        instruction.register_reads != std::vector<RegisterOperand>{*source} ||
+        instruction.register_writes != std::vector<RegisterOperand>{*destination})
+        return {};
+    return source;
+}
+
+FlowValue arm64_stack_copy_depth(const FlowState &state, RegisterOperand source) {
+    if (source.index == 29)
+        return state.arm64_frame_pointer ? state.frame_depth : FlowValue{};
+    return state.arm64_stack_alias_depths[source.index];
+}
+
 bool record_slot_access(StackSlot &slot, bool read, bool written, bool address_taken, Address site,
                         std::size_t &detail_count) {
     if (std::find(slot.accesses.begin(), slot.accesses.end(), site) == slot.accesses.end())
@@ -1417,6 +1453,17 @@ bool transfer(const Instruction &instruction, FlowState &state) {
     const auto arm64_sp = [](const std::optional<RegisterOperand> &reg) {
         return reg && reg->bank == RegisterBank::arm64_sp;
     };
+    if (const auto source = arm64_stack_copy_source(instruction)) {
+        const auto relation = arm64_stack_copy_depth(state, *source);
+        if (first->index == 29) {
+            state.frame_depth = relation;
+            state.arm64_frame_pointer = relation.known;
+            state.supported = state.supported && relation.known;
+        } else {
+            state.arm64_stack_alias_depths[first->index] = relation;
+        }
+        return true;
+    }
     if (instruction.context.architecture == Architecture::arm64 &&
         (instruction.opcode == Opcode::a64_add || instruction.opcode == Opcode::a64_sub) &&
         instruction.operands.size() >= 3) {
@@ -2378,6 +2425,10 @@ Result<StackFrameAnalysis> analyze_stack_frame(const FunctionRecord &function, c
                         address_displacement = *immediate;
                     }
                 }
+            } else if (const auto arm64_copy_source = arm64_stack_copy_source(instruction);
+                       arm64_copy_source && address_destination->index != 29) {
+                address_base = arm64_stack_copy_depth(state, *arm64_copy_source);
+                forms_stack_address = address_base.known;
             } else if (instruction.context.architecture == Architecture::arm &&
                        (instruction.opcode == Opcode::a32_add || instruction.opcode == Opcode::a32_sub) &&
                        instruction.operands.size() >= 3 && address_destination && address_source &&

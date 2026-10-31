@@ -27,7 +27,27 @@ SP or x29 produce two adjacent typed slots, each with the instruction's read or
 write provenance. Scalar and pair load/store writeback through SP updates the
 entry-relative depth, covering common `STP`/`LDP` prologue and epilogue forms.
 Post-indexed accesses use the pre-writeback address; pre-indexed accesses use
-the adjusted address. On A32 and Thumb it tracks immediate SP adjustments,
+the adjusted address.
+
+AArch64 full-width `MOV Xd,Xn` copies (decoded as unshifted
+`ORR Xd,XZR,Xn`) preserve a tracked x29 or temporary stack relation. The
+equivalent unshifted `ORR Xd,Xn,XZR` identity is also recognized. Copies can
+establish x29 from a tracked temporary, feed later `ADD/SUB SP,Xn,#imm`
+restoration, and resolve direct scalar/pair loads and stores through the
+destination. Copies into temporaries record address-taking provenance at the
+copy instruction, coalescing with typed accesses at the same entry-SP offset.
+For example, `SUB SP,SP,#32; ADD X9,SP,#16; MOV X10,X9; STR X0,[X10]`
+recovers the 64-bit slot at entry-SP-16 with both copy and store provenance;
+`MOV X29,X10; ADD SP,X29,#16` then restores entry SP. Recognition requires
+exact A64 mode, three full-width typed operands, an explicit XZR source, and
+matching read/write effects. Shifted forms and W-register copies discard the
+destination relation through the existing unknown-write path. Unknown source
+relations never establish a frame, and calls/clobbers and conflicting CFG
+joins retain the existing conservative behavior. Tracking remains bounded to
+the fixed 31-register alias map; the function semantic fingerprint invalidates
+cached facts produced before this transfer was supported.
+
+On A32 and Thumb it tracks immediate SP adjustments,
 `MOV r7/r11,sp`, and constant `ADD`/`SUB` relations that establish r7/r11
 from SP or adjust an already tracked frame register. SP restoration from those
 frame registers, immediate SP-based load/store operands, and writeback address
