@@ -38,6 +38,7 @@ const char *seed_kind_name(FunctionSeedKind kind) {
     case FunctionSeedKind::m6502_reset_vector: return "6502 reset vector";
     case FunctionSeedKind::m6502_irq_vector: return "6502 IRQ/BRK vector";
     case FunctionSeedKind::dwarf_entry_point: return "DWARF alternate entry point";
+    case FunctionSeedKind::jvm_method: return "JVM method with Code attribute";
     }
     return "unknown function evidence";
 }
@@ -71,6 +72,9 @@ std::string seed_provenance_text(const FunctionSeed &seed) {
         text += " (unit @ " + std::to_string(seed.dwarf_evidence->unit_offset) +
                 ", DIE @ " + std::to_string(seed.dwarf_evidence->die_offset) +
                 ", size " + std::to_string(seed.dwarf_evidence->record_size) + ")";
+    if (seed.jvm_method_evidence)
+        text += " (method " + std::to_string(seed.jvm_method_evidence->method_index) +
+                ", Code @ file offset " + std::to_string(seed.jvm_method_evidence->code_file_offset) + ")";
     if (seed.initializer_evidence) {
         const auto &evidence = *seed.initializer_evidence;
         const char *source_name = "initializer";
@@ -524,6 +528,30 @@ void Recovery::seed_roots() {
             root({FunctionSeedKind::dex_method,
                   Address{AddressSpaceId{method.method_index + 1}, 0}, {}, {}}, false);
         }
+    if (metadata.jvm) {
+        for (std::size_t method_index = 0; method_index < metadata.jvm->methods.size(); ++method_index) {
+            canceled();
+            const auto &method = metadata.jvm->methods[method_index];
+            if (!method.code) continue; // Abstract and native methods have no local bytecode body.
+            const auto &code = *method.code;
+            const auto *segment = image.segment_at(code.begin);
+            const auto context = image.context_at(code.begin);
+            const auto storage_size = image.storage()->size();
+            if (method_index > UINT32_MAX || code.code_size == 0 || !segment || !segment->executable ||
+                !context || context.value().architecture != Architecture::jvm ||
+                image.code_window(code.begin, code.code_size) != code.code_size ||
+                code.file_begin.value > storage_size || code.code_size > storage_size - code.file_begin.value) {
+                output->complete = false;
+                output->candidates.push_back({code.begin, {}, FunctionStopReason::unsupported,
+                    "JVM method Code attribute has no complete executable bytecode mapping"});
+                continue;
+            }
+            FunctionSeed seed{FunctionSeedKind::jvm_method, code.begin, {}, {}};
+            seed.jvm_method_evidence = FunctionSeedJvmMethodEvidence{
+                static_cast<std::uint32_t>(method_index), code.file_begin.value};
+            root(std::move(seed), false);
+        }
+    }
     if (metadata.wasm) {
         const auto &wasm = *metadata.wasm;
         const auto total_functions = static_cast<std::uint64_t>(wasm.imported_functions) + wasm.defined_functions;
@@ -3104,7 +3132,7 @@ bool semantic_decoder_image_reads_intersect(const AnalysisOptions &options,
 Sha256Digest function_engine_fingerprint(const AnalysisOptions &options) {
     Sha256 hash;
     constexpr std::string_view version =
-        "hexlab-functions-v96-mips32-regimm-conditional-call-edges-v1/semantic-decoder-manifest-single-capture-v2/x64-rip-indirect-call-slot-target-v1/riscv64-lw-signed-pointer-load-v1/mips64-bitfield-relocation-guard-v1/m6502-vector-roots-v1/wasm-direct-call-edges-v1/wasm-constant-call-indirect-function-edges-v1/a64-add-sub-carry-v1/riscv-masked-integer-reductions-v1/dex-register-index-16-v1/x64-loop-counter-alias-v1/elf-et-exec-section-init-fini-array-roots-v1/elf-legacy-ctors-dtors-roots-v1/windows-x64-shadow-store-call-provenance-v1/mips32-gpr-conditional-moves-v1/ppc-popcntb-v1/ppc-addze-addme-lift-v1/x86-implicit-multiply-lift-v1/x86-bit-scan-lift-v1/x86-bit-test-lift-v1/x86-movemask-lift-v2/x86-palignr-fallthrough-v1/x86-ssse3-pabs-lift-v1/ppc64-rldic-reference-v1/ppc64-rldcl-rldcr-reference-v1/a64-extr-reference-v1/a64-madd-msub-reference-v1/a64-conditional-select-nzcv-v1/mips32-cop1-conditional-moves-v1/riscv-bitwise-stack-copies-v1/mips32-cop1-branch-likely-v1/mips64-eh-frame-roots-v1/pe-x86-fpo-roots-and-extents-v1/riscv-bitwise-immediate-addresses-v1/dex-method-roots-call-edges-v2/dex-relative-control-operands-v1/dex-payload-data-v1/riscv-vfrsqrt7-vfrec7-v1/a64-preserving-bitfield-v1/a64-ubfm-sbfm-address-reference-v1/a64-nzcv-constant-flow-v1/nonx86-reference-producer-graph-v1/dataflow-reference-producer-graph-v4/reference-immediate-origin-v1/x86-vdivps-vdivpd-vex-evex-mxcsr-effects-v1/mips64-arithmetic-reference-v1/mips64-shift-rotate-reference-v1/mips64-special-conditional-traps-v1/evex-packed-fp-broadcast-v1/wasm-br-table-12-case-v1/dex-switch-flow-v1/dex-exception-flow-v1/jvm-switch-flow-v2/jvm-exception-flow-v1/pe-guard-cf-function-roots-v1/pe-chpe-execution-ranges-v1/pe-amd64-chained-function-chunks-v1/runtime-initializer-roots-v1/runtime-initializer-array-roots-v2/initializer-source-relocation-provenance-v1/string-scan-work-budget-v1/mips64-delay-slot-ownership-v1/explicit-root-budget-priority-v1/arm-predicate-nzcv-reachability-v1/thumb-it-condition-edges-v1/arm-a32-predicate-thumb-it-flow-v4/zydis-opaque-stop-v1/multiarc-flow-v1/switch-cfg-targets-v4/guard-multiblock-v1/unicode-strings-v3/windows1253-1255-strings-v1/iso8859-10-13-14-16-strings-v1/x86-scalar-context-v5/elf-symbol-roots-v1/elf-symbol-extents-v1/operand-encoding-v1/elf-relocation-flow-v2/pe-pogo-function-roots-v1/elf-powerpc-eh-frame-roots-v1/macho-compact-unwind-extents-v1/ppc64-elfv1-opd-symbol-roots-v1/wasm-export-function-roots-v1/wasm-start-function-root-v1/wasm-element-function-roots-v1/wasm-all-defined-function-roots-v1/m6502-reference-producer-graph-v1/riscv64-lwu-pointer-load-v1/riscv-zbb-count-reference-v1/mips64-dclz-dclo-reference-v1/elf-dwarf-entrypoint-roots-v1"
+        "hexlab-functions-v97-jvm-local-code-method-roots-v1/mips32-regimm-conditional-call-edges-v1/semantic-decoder-manifest-single-capture-v2/x64-rip-indirect-call-slot-target-v1/riscv64-lw-signed-pointer-load-v1/mips64-bitfield-relocation-guard-v1/m6502-vector-roots-v1/wasm-direct-call-edges-v1/wasm-constant-call-indirect-function-edges-v1/a64-add-sub-carry-v1/riscv-masked-integer-reductions-v1/dex-register-index-16-v1/x64-loop-counter-alias-v1/elf-et-exec-section-init-fini-array-roots-v1/elf-legacy-ctors-dtors-roots-v1/windows-x64-shadow-store-call-provenance-v1/mips32-gpr-conditional-moves-v1/ppc-popcntb-v1/ppc-addze-addme-lift-v1/x86-implicit-multiply-lift-v1/x86-bit-scan-lift-v1/x86-bit-test-lift-v1/x86-movemask-lift-v2/x86-palignr-fallthrough-v1/x86-ssse3-pabs-lift-v1/ppc64-rldic-reference-v1/ppc64-rldcl-rldcr-reference-v1/a64-extr-reference-v1/a64-madd-msub-reference-v1/a64-conditional-select-nzcv-v1/mips32-cop1-conditional-moves-v1/riscv-bitwise-stack-copies-v1/mips32-cop1-branch-likely-v1/mips64-eh-frame-roots-v1/pe-x86-fpo-roots-and-extents-v1/riscv-bitwise-immediate-addresses-v1/dex-method-roots-call-edges-v2/dex-relative-control-operands-v1/dex-payload-data-v1/riscv-vfrsqrt7-vfrec7-v1/a64-preserving-bitfield-v1/a64-ubfm-sbfm-address-reference-v1/a64-nzcv-constant-flow-v1/nonx86-reference-producer-graph-v1/dataflow-reference-producer-graph-v4/reference-immediate-origin-v1/x86-vdivps-vdivpd-vex-evex-mxcsr-effects-v1/mips64-arithmetic-reference-v1/mips64-shift-rotate-reference-v1/mips64-special-conditional-traps-v1/evex-packed-fp-broadcast-v1/wasm-br-table-12-case-v1/dex-switch-flow-v1/dex-exception-flow-v1/jvm-switch-flow-v2/jvm-exception-flow-v1/pe-guard-cf-function-roots-v1/pe-chpe-execution-ranges-v1/pe-amd64-chained-function-chunks-v1/runtime-initializer-roots-v1/runtime-initializer-array-roots-v2/initializer-source-relocation-provenance-v1/string-scan-work-budget-v1/mips64-delay-slot-ownership-v1/explicit-root-budget-priority-v1/arm-predicate-nzcv-reachability-v1/thumb-it-condition-edges-v1/arm-a32-predicate-thumb-it-flow-v4/zydis-opaque-stop-v1/multiarc-flow-v1/switch-cfg-targets-v4/guard-multiblock-v1/unicode-strings-v3/windows1253-1255-strings-v1/iso8859-10-13-14-16-strings-v1/x86-scalar-context-v5/elf-symbol-roots-v1/elf-symbol-extents-v1/operand-encoding-v1/elf-relocation-flow-v2/pe-pogo-function-roots-v1/elf-powerpc-eh-frame-roots-v1/macho-compact-unwind-extents-v1/ppc64-elfv1-opd-symbol-roots-v1/wasm-export-function-roots-v1/wasm-start-function-root-v1/wasm-element-function-roots-v1/wasm-all-defined-function-roots-v1/m6502-reference-producer-graph-v1/riscv64-lwu-pointer-load-v1/riscv-zbb-count-reference-v1/mips64-dclz-dclo-reference-v1/elf-dwarf-entrypoint-roots-v1"
         "mips64-word-shift-reference-v1/wasm-import-call-identities-v1/wasm-constant-call-indirect-reference-v1/"
         "elf-reference-provenance-v1/elf-arithmetic-v2/macho-symbol-roots-v1/macho-relocation-flow-v1/"
         "macho-reference-provenance-v1/macho-dyld-data-provenance-v1/macho-dyld-flow-v1/macho-export-roots-v1/macho-code-policy-v1/elf-unwind-personality-roots-v1/elf-unwind-roots-v1/macho-eh-frame-roots-v1/pe-tls-callback-roots-v1/pe-arm64-pdata-provenance-v1/mips64-cop1-condition-predicates-v1/riscv-v-vector-comparisons-v1/riscv-vfclass-vfsqrt-v1/x86-vex128-zero-upper-v1/powerpc-xform-logical-clz-signext-v1/x87-status-control-tag-effects-v1/pe-safe-seh-function-roots-v1/macho-mod-term-function-roots-v1/elf-dwarf-subprogram-roots-v1/thumb2-movw-movt-reference-v1/riscv-addiw-address-reference-v1/aapcs32-stack-argument-slots-v1/mips-o32-stack-argument-slots-v1/mips-n64-stack-argument-slots-v1/a64-32bit-pointer-load-references-v1/ebcdic-cp037-string-candidates-v1/mips64-special2-mul-address-reference-v1/ppc32-rlwinm-address-reference-v1/ppc64-rldimi-address-reference-v1/riscv-outgoing-stack-store-provenance-v1/thumb-tbb-aligned-pc-target-v1/mips64-word-rotr-address-reference-v1/native-import-slot-call-identities-v1/windows932-string-candidates-v1/m6502-decimal-stack-alias-guard-v1";

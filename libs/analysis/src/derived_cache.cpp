@@ -226,6 +226,11 @@ std::vector<std::byte> payload(const DerivedProposal &proposal, std::stop_token 
                 out.number(seed.dwarf_evidence->die_offset);
                 out.number(seed.dwarf_evidence->record_size);
             }
+            out.flag(seed.jvm_method_evidence.has_value());
+            if (seed.jvm_method_evidence) {
+                out.number(seed.jvm_method_evidence->method_index, 4);
+                out.number(seed.jvm_method_evidence->code_file_offset);
+            }
         }
         out.count(function->stops.size());
         for (auto &record : function->stops)
@@ -405,7 +410,7 @@ Decoded read_payload(std::span<const std::byte> bytes, const Image &image, const
     require(std::equal(marker.begin(), marker.end(), magic.begin()), "Unknown derived cache magic");
     const auto version = in.number(2);
     require(version == 53 || version == 54 || version == 55 || version == 56 || version == 57 || version == 58 || version == 59 || version == 60 || version == 63 || version == 64 || version == 65 || version == 66 || version == 67 || version == 68 || version == 69 || version == 70 || version == 71 || version == 72 || version == 73 ||
-                version == 87 || version == 88 || version == 89 || version == 90 || version == 91 || version == derived_cache_version,
+                version == 87 || version == 88 || version == 89 || version == 90 || version == 91 || version == 96 || version == derived_cache_version,
             "Unknown derived cache version", ErrorCode::unsupported);
     require(in.key(version >= 54) == key, "Derived cache source key differs from the requested revision");
     auto context = in.context();
@@ -532,7 +537,8 @@ Decoded read_payload(std::span<const std::byte> bytes, const Image &image, const
         auto seeds = in.count(16);
         for (size_t j = 0; j < seeds; ++j) {
             auto kind = in.number(1);
-            require(kind <= static_cast<unsigned>(version >= derived_cache_version ? FunctionSeedKind::dwarf_entry_point
+            require(kind <= static_cast<unsigned>(version >= derived_cache_version ? FunctionSeedKind::jvm_method
+                                            : version >= 96 ? FunctionSeedKind::dwarf_entry_point
                                             : version >= 87 ? FunctionSeedKind::m6502_irq_vector
                                             : version >= 59 ? FunctionSeedKind::dwarf_subprogram
                                                             : FunctionSeedKind::wasm_defined),
@@ -587,6 +593,9 @@ Decoded read_payload(std::span<const std::byte> bytes, const Image &image, const
                     static_cast<std::uint32_t>(in.number(4)), static_cast<std::uint32_t>(in.number(4)), in.number()};
             if (version >= 59 && in.flag())
                 seed.dwarf_evidence = FunctionSeedDwarfEvidence{in.number(), in.number(), in.number()};
+            if (version >= 97 && in.flag())
+                seed.jvm_method_evidence = FunctionSeedJvmMethodEvidence{
+                    static_cast<std::uint32_t>(in.number(4)), in.number()};
             require((seed.kind == FunctionSeedKind::unwind) == seed.unwind_evidence.has_value() &&
                         (!seed.unwind_evidence || seed.unwind_evidence->record_size > 0) &&
                         ((seed.kind == FunctionSeedKind::initializer) == seed.initializer_evidence.has_value()) &&
@@ -610,6 +619,11 @@ Decoded read_payload(std::span<const std::byte> bytes, const Image &image, const
                         ((seed.kind == FunctionSeedKind::dwarf_subprogram ||
                           seed.kind == FunctionSeedKind::dwarf_entry_point) == seed.dwarf_evidence.has_value()) &&
                         (!seed.dwarf_evidence || seed.dwarf_evidence->record_size > 0) &&
+                        ((seed.kind == FunctionSeedKind::jvm_method) == seed.jvm_method_evidence.has_value()) &&
+                        (!seed.jvm_method_evidence ||
+                         (seed.jvm_method_evidence->code_file_offset < image.storage()->size() &&
+                          image.context_at(seed.entry) &&
+                          image.context_at(seed.entry).value().architecture == Architecture::jvm)) &&
                         (!(seed.kind == FunctionSeedKind::m6502_nmi_vector ||
                            seed.kind == FunctionSeedKind::m6502_reset_vector ||
                            seed.kind == FunctionSeedKind::m6502_irq_vector) || seed.source.has_value()),
@@ -885,7 +899,7 @@ Result<AnalysisKey> inspect_derived_key(std::span<const std::byte> bytes, std::s
         require(std::equal(marker.begin(), marker.end(), magic.begin()), "Unknown derived cache envelope magic");
         const auto version = in.number(2);
         require(version == 53 || version == 54 || version == 55 || version == 56 || version == 57 || version == 58 || version == 59 || version == 60 || version == 63 || version == 64 || version == 65 || version == 66 || version == 67 || version == 68 || version == 69 || version == 70 || version == 71 || version == 72 || version == 73 ||
-                    version == 87 || version == 88 || version == 89 || version == 90 || version == 91 || version == derived_cache_version,
+                    version == 87 || version == 88 || version == 89 || version == 90 || version == 91 || version == 96 || version == derived_cache_version,
                 "Unknown derived cache envelope version",
                 ErrorCode::unsupported);
         auto key = in.key(version >= 54);
