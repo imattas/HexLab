@@ -65,7 +65,7 @@ enum class StringEncoding : std::uint8_t {
     iso8859_13 = 31, iso8859_14 = 32, iso8859_16 = 33, iso8859_8 = 34,
     iso8859_11 = 35, windows874 = 36, koi8_u = 37, mac_cyrillic = 38,
     ebcdic_cp037 = 39, ebcdic_cp500 = 40, ebcdic_cp1047 = 41, ebcdic_cp1140 = 42,
-    windows932 = 43, windows936 = 44
+    windows932 = 43, windows936 = 44, windows949 = 45
 };
 // Coarse script-family hint derived from the retained UTF-8 preview. This is
 // not a locale, language, or source-encoding determination.

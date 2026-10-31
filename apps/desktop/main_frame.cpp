@@ -382,6 +382,7 @@ wxString string_encoding_name(StringEncoding encoding) {
     case StringEncoding::ebcdic_cp1047: return "EBCDIC CP1047";
     case StringEncoding::windows932: return "Windows-932";
     case StringEncoding::windows936: return "Windows-936 (GBK)";
+    case StringEncoding::windows949: return "Windows-949 (UHC)";
     }
     return "Unknown";
 }
