@@ -2471,6 +2471,28 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
                 return effect;
             }
         }
+        if ((instruction.opcode == Opcode::m65c02_rmb || instruction.opcode == Opcode::m65c02_smb) &&
+            instruction.condition < 8 && instruction.operands.size() == 1 && operands.size() == 1 &&
+            is_memory(instruction.operands.front()) &&
+            instruction.access == std::vector<OperandAccess>{OperandAccess::read_write} &&
+            instruction.memory_read && instruction.memory_write &&
+            instruction.flow == FlowKind::fallthrough && instruction.register_reads.empty() &&
+            instruction.register_writes.empty() && operands.front() && operands.front()->type == integer_type(8) &&
+            std::holds_alternative<MemoryValue>(operands.front()->value)) {
+            const auto *memory = std::get_if<MemoryOperand>(&instruction.operands.front());
+            if (memory && memory->data_width == 8 && memory->address_width == 16 &&
+                !memory->base && !memory->index && !memory->ip_relative) {
+                const auto old_byte = operands.front();
+                const auto mask = std::uint64_t{1} << instruction.condition;
+                const auto written = instruction.opcode == Opcode::m65c02_smb
+                    ? binary("or", old_byte, constant_expr(mask, 8))
+                    : binary("and", old_byte, constant_expr(0xffu ^ mask, 8));
+                Intrinsic effect{instruction.opcode == Opcode::m65c02_smb ? "m65c02_smb" : "m65c02_rmb",
+                    {old_byte, written}, IntrinsicMemoryEffect::read_write};
+                effect.memory_output = IntrinsicMemoryOutput{0, 1};
+                return effect;
+            }
+        }
     }
     const bool m6502 = instruction.context.architecture == Architecture::mos6502 &&
                        instruction.context.mode == ExecutionMode::m6502;
