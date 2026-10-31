@@ -226,7 +226,7 @@ struct ElfLibraryManifestEntry {
     std::optional<std::string> path;
 };
 enum class ElfLibraryResolutionState { resolved, missing, ambiguous };
-enum class ElfLibrarySearchSource { manifest_name, rpath, runpath };
+enum class ElfLibrarySearchSource { manifest_name, rpath, runpath, environment };
 struct ElfLibraryResolution {
     std::string needed_name;
     ElfLibraryResolutionState state = ElfLibraryResolutionState::missing;
@@ -255,11 +255,15 @@ struct ElfLibrarySearchContext {
     std::string importer_path;
     std::size_t max_search_entries = 1024;
     std::size_t max_path_bytes = 4096;
+    // Caller-supplied absolute paths representing LD_LIBRARY_PATH in the
+    // target environment. The resolver never reads the host environment.
+    std::vector<std::string> environment_search_paths;
 };
-// Applies DT_RUNPATH, or DT_RPATH only when DT_RUNPATH is absent, to the
-// caller-owned manifest's optional candidate paths. Directory order is
-// preserved; the first directory with candidates wins, and duplicates there
-// remain ambiguous. This remains a metadata-only operation with no file I/O.
+// Applies caller-supplied environment directories and DT_RUNPATH/DT_RPATH to
+// the caller-owned manifest's optional candidate paths in direct-dependency
+// search order. Directory order is preserved; the first directory with
+// candidates wins, and duplicates there remain ambiguous. This is metadata
+// only and performs no file I/O or host environment lookup.
 HEXLAB_LOADERS_EXPORT Result<std::vector<ElfLibraryResolution>> resolve_elf_needed_libraries(
     const LoadedImage &, std::span<const ElfLibraryManifestEntry>, const ElfLibrarySearchContext &,
     std::stop_token = {}, ElfLibraryResolutionLimits = {});
