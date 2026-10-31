@@ -344,10 +344,15 @@ void add_arm64ec_candidate_overlay(MinidumpContext &context,
             alias.value |= std::uint64_t{std::to_integer<unsigned>(alias.bytes[byte])} << (byte * 8);
         aliases.push_back(std::move(alias));
     };
-    // ARM64EC_NT_CONTEXT in Windows SDK 10.0.26100.0 um/winnt.h stores
-    // each composite register as four noncontiguous 16-bit x87 slot fields.
-    add_composite("x16", {0x128, 0x138, 0x148, 0x158});
-    add_composite("x17", {0x168, 0x178, 0x188, 0x198});
+    // These overlays occupy the AMD64 floating-save area. Captured bytes alone
+    // are insufficient: require the context's floating group to be declared
+    // and decoded before interpreting its x87 slots as ARM64EC composites.
+    if (context.floating_valid) {
+        // ARM64EC_NT_CONTEXT in Windows SDK 10.0.26100.0 um/winnt.h stores
+        // each composite register as four noncontiguous 16-bit x87 slot fields.
+        add_composite("x16", {0x128, 0x138, 0x148, 0x158});
+        add_composite("x17", {0x168, 0x178, 0x188, 0x198});
+    }
     // X18 is fixed to the thread's TEB in user-mode ARM64EC. The AMD64
     // CONTEXT has no GS.base value, but MINIDUMP_THREAD carries the TEB VA.
     // Keep the row conditional because the same AMD64 context can be x64 code.

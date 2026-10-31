@@ -345,7 +345,9 @@ within the AMD64 x87 ST0-ST3 slots; X17 uses `0x168`, `0x178`, `0x188`, and
 `0x198` within ST4-ST7. These are discontiguous and must not be reconstructed
 from neighboring bytes. The loader exposes X16/X17 candidate composites by
 concatenating those fragments in little-endian byte order, with exact per-byte
-file offsets; their contiguous source-navigation action is disabled. `ARM64EC_NT_CONTEXT`
+file offsets, only when the AMD64 context declared and decoded its floating-save
+group; captured bytes without that group flag are not interpreted. Their
+contiguous source-navigation action is disabled. `ARM64EC_NT_CONTEXT`
 does not contain a GS.base field, so the X18 candidate comes from the thread
 record's TEB address rather than a guessed context offset. Microsoft documents that ARM64EC uses an x64
 `CONTEXT` representation and maps its supported ARM64 registers into that
