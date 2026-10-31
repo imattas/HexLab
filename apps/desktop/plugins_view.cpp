@@ -223,9 +223,9 @@ PluginsView::PluginsView(wxWindow *parent, std::shared_ptr<plugins::ModuleProvid
     plan_button_->SetName("plugin-candidate-plan");
     load_dependencies_button_ = new wxButton(this, wxID_ANY, "Load With Dependencies");
     load_dependencies_button_->SetName("plugin-candidate-load-dependencies");
-    install_candidate_button_ = new wxButton(this, wxID_ANY, "Install Copy...");
+    install_candidate_button_ = new wxButton(this, wxID_ANY, "Install / Update Copy...");
     install_candidate_button_->SetName("plugin-candidate-install");
-    install_candidate_button_->SetToolTip("Copy a reviewed module and its sidecar to the per-user plugin folder without activating it.");
+    install_candidate_button_->SetToolTip("Install or update a verified per-user copy without activating it.");
     install_candidate_button_->Enable(false);
     candidate_controls->Add(plan_button_, 0, wxRIGHT, FromDIP(4));
     candidate_controls->Add(load_dependencies_button_, 0, wxRIGHT, FromDIP(4));
@@ -811,7 +811,8 @@ void PluginsView::install_candidate() {
     const auto install_directory = install_root / id;
     const auto question = "Copy " + string(candidate.manifest->name) + " (" + string(id) +
         ") and its sidecar into:\n" + string(path_utf8(install_directory)) +
-        "\n\nThe module will not be loaded or executed. Its pinned SHA-256 will be checked. Publisher signatures are not verified.";
+        "\n\nAn existing managed install for this plugin ID will be replaced after the staged copy passes verification. "
+        "The module will not be loaded or executed. Its pinned SHA-256 will be checked. Publisher signatures are not verified.";
     if (wxMessageBox(question, "Install Plugin Candidate", wxYES_NO | wxNO_DEFAULT | wxICON_WARNING, this) != wxYES)
         return;
 
@@ -836,8 +837,20 @@ void PluginsView::install_candidate() {
             if (ec || std::filesystem::is_symlink(root_status) || !std::filesystem::is_directory(root_status))
                 return OperationResult{"The per-user plugin directory is not a regular directory.", false};
             const auto destination_status = std::filesystem::symlink_status(install_directory, ec);
-            if (!ec && std::filesystem::exists(destination_status))
-                return OperationResult{"A plugin install directory with this ID already exists. Updates and replacement are not available yet.", false};
+            const bool replacing = !ec && std::filesystem::exists(destination_status);
+            if (replacing) {
+                if (std::filesystem::is_symlink(destination_status) ||
+                    !std::filesystem::is_directory(destination_status))
+                    return OperationResult{"The existing plugin install path is not a regular directory; it was left untouched.", false};
+                auto existing = manager->scan_directory(path_utf8(install_directory));
+                if (!existing)
+                    return OperationResult{"The existing plugin install could not be verified; it was left untouched: " +
+                                           existing.error().message, false};
+                const auto managed = std::find_if(existing.value().begin(), existing.value().end(),
+                    [&](const auto &item) { return item.manifest && item.manifest->id == candidate.manifest->id; });
+                if (existing.value().size() != 1 || managed == existing.value().end())
+                    return OperationResult{"The existing plugin directory must contain exactly one matching managed candidate; it was left untouched.", false};
+            }
             if (ec != std::errc::no_such_file_or_directory && ec)
                 return OperationResult{"Cannot inspect the plugin install destination: " + ec.message(), false};
 
@@ -888,15 +901,40 @@ void PluginsView::install_candidate() {
                 cleanup();
                 return OperationResult{"Copied candidate metadata or integrity does not match the reviewed scan; it was not installed.", false};
             }
+            const auto backup = install_root / (".previous-" + candidate.manifest->id + "-" + std::to_string(nonce));
+            if (replacing) {
+                std::filesystem::rename(install_directory, backup, ec);
+                if (ec) { cleanup(); return OperationResult{"Cannot move the existing install aside: " + ec.message(), false}; }
+            }
             std::filesystem::rename(staging, install_directory, ec);
-            if (ec) { cleanup(); return OperationResult{"Cannot publish the plugin install directory: " + ec.message(), false}; }
+            if (ec) {
+                const auto publish_error = ec.message();
+                if (replacing) {
+                    std::error_code restore_error;
+                    std::filesystem::rename(backup, install_directory, restore_error);
+                    cleanup();
+                    if (restore_error)
+                        return OperationResult{"Cannot publish the update (" + publish_error + "); the previous install remains at " +
+                                               path_utf8(backup) + " because restoration failed: " + restore_error.message(), false};
+                } else {
+                    cleanup();
+                }
+                return OperationResult{"Cannot publish the plugin install directory: " + publish_error, false};
+            }
+            std::string cleanup_warning;
+            if (replacing) {
+                std::filesystem::remove_all(backup, ec);
+                if (ec) cleanup_warning = " The previous version remains at " + path_utf8(backup) +
+                                          " because cleanup failed: " + ec.message();
+            }
             auto installed = manager->scan_directory(path_utf8(install_directory));
             if (!installed)
                 return OperationResult{"Plugin files were copied, but the installed directory could not be scanned: " + installed.error().message,
                                        false};
             auto refreshed = manager->refresh_requirement_preflight(installed.value());
-            std::string message = "Installed " + candidate.manifest->name + " (" + candidate.manifest->id +
-                ") at " + path_utf8(install_directory) + ". It was not activated.";
+            std::string message = std::string(replacing ? "Updated " : "Installed ") + candidate.manifest->name +
+                " (" + candidate.manifest->id + ") at " + path_utf8(install_directory) + ". It was not activated." +
+                cleanup_warning;
             if (!refreshed) message += " Provider availability could not be refreshed: " + refreshed.error().message;
             return OperationResult{std::move(message), false, true, std::move(installed.value())};
         } catch (const std::exception &error) {

@@ -118,15 +118,21 @@ key in the existing desktop preferences. Blocking does not unload a matching
 module that is already running; it is a convenience policy, not a trust or
 security boundary. It does not automatically load plugins at startup.
 
-**Install Copy...** is available for a selected, enabled candidate with a
+**Install / Update Copy...** is available for a selected, enabled candidate with a
 valid sidecar and a matching SHA-256 pin. It copies the module and sidecar into
 the per-user `plugins/<plugin-id>` directory adjacent to the plugin-state
 directory. Files are staged in a temporary sibling directory, re-scanned, and
 published only when the copied identity, capability declarations, and module
-hash match the reviewed candidate. An existing ID directory is left untouched;
-replacement and update are not supported yet. Installation does not load or
-execute the module. The panel switches to the installed candidate so the user
-can inspect it and explicitly choose **Load Selected Candidate**. The sidecar
+hash match the reviewed candidate. If an ID directory already exists, it must
+be a regular directory containing a candidate with the same plugin ID;
+unrecognized directories and symlinks are left untouched. The existing
+directory is moved aside only after the staged copy is verified. If publishing
+fails, the previous directory is restored; if restoration also fails, the
+previous copy remains at the reported backup path. After a successful update,
+the backup is removed when possible. The plugin must be unloaded before an
+update, and the new module is never loaded or executed by installation. The
+panel switches to the installed candidate so the user can inspect it and
+explicitly choose **Load Selected Candidate**. The sidecar
 hash is an integrity pin, not a publisher signature, and is required here to
 bind the copied bytes to the reviewed scan. Candidates with malformed or
 missing sidecars, missing hash pins, hash mismatches, or blocked source paths
