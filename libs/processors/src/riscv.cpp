@@ -129,7 +129,17 @@ bool decode_vector_reduction(std::uint32_t w, RiscvInstruction &i) {
     const unsigned funct3 = (w >> 12) & 7, vd = (w >> 7) & 31;
     // Integer reductions are OPMVV-only. vs1 is the vector-register seed
     // (its element zero), while vd is a vector result.
-    if (funct3 != 2 || funct6 > 7) return false;
+    if (funct3 != 2 || (funct6 > 7 && funct6 != 0x30 && funct6 != 0x31)) return false;
+    if (funct6 == 0x30 || funct6 == 0x31) {
+        i.opcode = funct6 == 0x30 ? RiscvOpcode::vwredsumu : RiscvOpcode::vwredsum;
+        operand(i, RiscvRegister{static_cast<std::uint8_t>(vd), false, true}, RiscvOperandAccess::write);
+        read_vector_destination(i, vd);
+        operand(i, RiscvRegister{static_cast<std::uint8_t>(vs2), false, true}, RiscvOperandAccess::read);
+        operand(i, RiscvRegister{static_cast<std::uint8_t>(vs1), false, true}, RiscvOperandAccess::read);
+        if (!vm) i.register_reads.push_back(RiscvRegister{0, false, true});
+        i.vector_masked = !vm;
+        return true;
+    }
     static constexpr RiscvOpcode ops[]{RiscvOpcode::vredsum, RiscvOpcode::vredand,
         RiscvOpcode::vredor, RiscvOpcode::vredxor, RiscvOpcode::vredminu,
         RiscvOpcode::vredmin, RiscvOpcode::vredmaxu, RiscvOpcode::vredmax};

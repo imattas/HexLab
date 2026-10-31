@@ -845,6 +845,8 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
             "vredminu.vs", "vredmin.vs", "vredmaxu.vs", "vredmax.vs"};
         return names[static_cast<std::size_t>(op) - static_cast<std::size_t>(Opcode::rv_vredsum)];
     }
+    if (op == Opcode::rv_vwredsum) return "vwredsum.vs";
+    if (op == Opcode::rv_vwredsumu) return "vwredsumu.vs";
     if (op >= Opcode::rv_vcpop_m && op <= Opcode::rv_vid_v) {
         static constexpr const char *names[]{"vcpop.m", "vfirst.m", "vmsbf.m", "vmsof.m",
             "vmsif.m", "viota.m", "vid.v"};

@@ -121,7 +121,9 @@ enum class RiscvOpcode {
     // RVV mask prefix, index, and reduction-to-GPR forms; preserve IDs above.
     vcpop_m, vfirst_m, vmsbf_m, vmsof_m, vmsif_m, viota_m, vid_v,
     // RVV widening floating-point reductions; appended to preserve decoder IDs.
-    vfwredusum, vfwredosum
+    vfwredusum, vfwredosum,
+    // RVV widening integer reductions, appended to preserve decoder IDs.
+    vwredsum, vwredsumu
 };
 
 struct RiscvRegister {

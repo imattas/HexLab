@@ -1319,11 +1319,15 @@ evaluate_riscv_vector_integer_operation(RiscvOpcode opcode, const RiscvVectorInt
         operands.old_destination.size() != vlmax || (config.masked && operands.predicate_mask.size() != vlmax))
         return {};
 
+    const bool widening_reduction = opcode == RiscvOpcode::vwredsum || opcode == RiscvOpcode::vwredsumu;
+    if (widening_reduction && (sew == 64 || config.lmul_log2 > 2))
+        return {}; // 128-bit results or an LMUL>8 destination group are unsupported.
     bool reduction = true;
     switch (opcode) {
     case RiscvOpcode::vredsum: case RiscvOpcode::vredand: case RiscvOpcode::vredor:
     case RiscvOpcode::vredxor: case RiscvOpcode::vredminu: case RiscvOpcode::vredmin:
-    case RiscvOpcode::vredmaxu: case RiscvOpcode::vredmax: break;
+    case RiscvOpcode::vredmaxu: case RiscvOpcode::vredmax:
+    case RiscvOpcode::vwredsum: case RiscvOpcode::vwredsumu: break;
     default: reduction = false; break;
     }
     if (reduction) {
@@ -1331,7 +1335,9 @@ evaluate_riscv_vector_integer_operation(RiscvOpcode opcode, const RiscvVectorInt
             (config.masked && std::any_of(operands.predicate_mask.begin(), operands.predicate_mask.end(),
                                           [](std::uint8_t bit) { return bit > 1; }))) return {};
         const auto element_mask = width_mask(sew);
-        auto accumulator = operands.vs1[0] & element_mask;
+        const auto result_bits = widening_reduction ? sew * 2 : sew;
+        const auto result_mask = width_mask(result_bits);
+        auto accumulator = operands.vs1[0] & result_mask;
         const auto signed_less = [sew](std::uint64_t lhs, std::uint64_t rhs) {
             const bool lhs_negative = negative(lhs, sew), rhs_negative = negative(rhs, sew);
             return lhs_negative != rhs_negative ? lhs_negative : lhs < rhs;
@@ -1340,6 +1346,14 @@ evaluate_riscv_vector_integer_operation(RiscvOpcode opcode, const RiscvVectorInt
             if (config.masked && operands.predicate_mask[static_cast<std::size_t>(lane)] == 0) continue;
             const auto value = operands.vs2[static_cast<std::size_t>(lane)] & element_mask;
             switch (opcode) {
+            case RiscvOpcode::vwredsumu:
+                accumulator = (accumulator + value) & result_mask;
+                break;
+            case RiscvOpcode::vwredsum: {
+                const auto extended = negative(value, sew) ? (value | ~element_mask) : value;
+                accumulator = (accumulator + extended) & result_mask;
+                break;
+            }
             case RiscvOpcode::vredsum: accumulator = (accumulator + value) & element_mask; break;
             case RiscvOpcode::vredand: accumulator &= value; break;
             case RiscvOpcode::vredor: accumulator |= value; break;
@@ -1353,7 +1367,7 @@ evaluate_riscv_vector_integer_operation(RiscvOpcode opcode, const RiscvVectorInt
         }
         RiscvVectorIntegerResult result;
         result.vlmax = vlmax;
-        result.element_bits = static_cast<std::uint8_t>(sew);
+        result.element_bits = static_cast<std::uint8_t>(result_bits);
         result.lanes.assign(operands.old_destination.begin(), operands.old_destination.end());
         result.lanes[0] = accumulator;
         return result;
