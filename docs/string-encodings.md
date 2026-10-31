@@ -59,12 +59,24 @@ ID 46 is appended and derived-cache version 98 recomputes older scans. Windows-
 950 is a mapping candidate; it does not infer locale or language, and arbitrary
 binary can still produce overlapping candidates.
 
-Windows-1251 is scanned as a second single-byte heuristic, with an explicit
-fixed mapping for Cyrillic letters and punctuation. Its undefined byte 0x98
+Windows-1251 is scanned as a single-byte heuristic after the UTF-8, UTF-16,
+and UTF-32 passes, using the Unicode Consortium's
+[Microsoft CP1251 mapping](https://www.unicode.org/Public/MAPPINGS/VENDORS/MICSFT/WINDOWS/CP1251.TXT)
+for Cyrillic letters and punctuation. Its undefined byte 0x98
 ends a candidate. As with Windows-1252, emitted candidates must contain a
 non-ASCII scalar, previews are UTF-8, and candidates may overlap other encoding
 interpretations. These code-page labels identify plausible byte mappings;
 they do not prove the source file's declared encoding or locale.
+
+This ordering gives Unicode candidates priority over Windows-1251
+reinterpretations within each scan domain when the record or byte-inspection
+budget is tight. A completed scan can still return both interpretations:
+decodability alone does not determine the source encoding. The Windows-1251
+pass retains its non-ASCII requirement, NUL termination, printable-scalar
+splitting, cancellation checks, and shared scan budgets. Its UTF-8 preview
+does not change the recorded original file offset, byte length, or mapped
+address. Encoding ID 7 remains stable; the analysis engine fingerprint changes
+so cached results use the new scan ordering.
 
 Windows-1250 is also scanned for Central European text, using a fixed mapping
 and breaking runs at undefined bytes. Windows-1254 adds the Turkish Windows

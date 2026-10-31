@@ -222,6 +222,7 @@ std::optional<std::uint32_t> decode_windows1252(unsigned byte) {
 std::optional<std::uint32_t> decode_windows1251(unsigned byte) {
     // Windows-1251 bytes 0x80..0xff, in code-page order. Zero entries are
     // undefined and therefore break a candidate rather than becoming text.
+    // https://www.unicode.org/Public/MAPPINGS/VENDORS/MICSFT/WINDOWS/CP1251.TXT
     static constexpr std::uint16_t high[128]={
         0x0402,0x0403,0x201a,0x0453,0x201e,0x2026,0x2020,0x2021,0x20ac,0x2030,0x0409,0x2039,0x040a,0x040c,0x040b,0x040f,
         0x0452,0x2018,0x2019,0x201c,0x201d,0x2022,0x2013,0x2014,0,0x2122,0x0459,0x203a,0x045a,0x045c,0x045b,0x045f,
@@ -999,16 +1000,6 @@ Result<StringScan> scan_selected(const Image& image,const AnalysisOptions& optio
                 else emit(run,false,StringEncoding::windows1252,range,options,output,true);
             }
             emit(run,false,StringEncoding::windows1252,range,options,output,true);
-            run={};
-            for(auto at=range.begin;at<range.end;++at) {
-                if(((at-range.begin)&4095)==0)check_stop(stop);
-                const auto value=input.byte(at);
-                if(value==0) {emit(run,true,StringEncoding::windows1251,range,options,output,true);continue;}
-                const auto scalar=decode_windows1251(value);
-                if(scalar && printable(*scalar))run.add(at,*scalar,1);
-                else emit(run,false,StringEncoding::windows1251,range,options,output,true);
-            }
-            emit(run,false,StringEncoding::windows1251,range,options,output,true);
             }
             for(unsigned endian=0;endian<2;++endian)for(unsigned alignment=0;alignment<2;++alignment) {
                 const bool big_endian=endian!=0;
@@ -1050,11 +1041,22 @@ Result<StringScan> scan_selected(const Image& image,const AnalysisOptions& optio
                 }
                 emit(run,false,encoding,range,options,output);
             }
-            // Keep single-byte locale fallbacks after Unicode encodings so a
-            // tight result budget cannot displace UTF-16/32 candidates. Every
-            // such decoder requires a high-bit byte to produce a non-ASCII
-            // candidate, so ASCII-only ranges have nothing to gain from them.
+            // Keep the remaining code-page fallbacks after Unicode encodings.
+            // In particular, a Windows-1251 reinterpretation must not consume
+            // the result/work budget before UTF-16/32 get a chance to decode
+            // the same bytes. Overlapping candidates remain heuristic labels.
+            // These decoders need high-bit bytes to emit non-ASCII candidates.
             if(has_high_bit_bytes) {
+            run={};
+            for(auto at=range.begin;at<range.end;++at) {
+                if(((at-range.begin)&4095)==0)check_stop(stop);
+                const auto value=input.byte(at);
+                if(value==0) {emit(run,true,StringEncoding::windows1251,range,options,output,true);continue;}
+                const auto scalar=decode_windows1251(value);
+                if(scalar && printable(*scalar))run.add(at,*scalar,1);
+                else emit(run,false,StringEncoding::windows1251,range,options,output,true);
+            }
+            emit(run,false,StringEncoding::windows1251,range,options,output,true);
             run={};
             for(auto at=range.begin;at<range.end;) {
                 if(((at-range.begin)&4095)==0)check_stop(stop);
