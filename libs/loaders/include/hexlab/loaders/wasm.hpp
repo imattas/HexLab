@@ -34,8 +34,10 @@ struct WasmImportHostFacts {
 };
 using WasmTableMemoryImportResolver = std::function<std::optional<WasmImportHostFacts>(const WasmImport &)>;
 
-// Offline module inventory linking. This compares only caller-supplied parsed
-// metadata; it never opens files, loads modules, or executes host code.
+// Offline module inventory linking. Each identity is the exact module-name
+// string expected by an importing module's WasmImport::module field. This
+// compares only caller-supplied parsed metadata; it never opens files, loads
+// modules, or executes host code.
 struct WasmLinkModule {
     std::string identity;
     const WasmMetadata *metadata = nullptr;
