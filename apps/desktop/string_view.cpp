@@ -53,7 +53,8 @@ constexpr std::array string_encodings{
     StringEncoding::iso8859_13, StringEncoding::iso8859_14, StringEncoding::iso8859_16,
     StringEncoding::iso8859_8, StringEncoding::iso8859_11, StringEncoding::windows874,
     StringEncoding::mac_cyrillic, StringEncoding::ebcdic_cp037, StringEncoding::ebcdic_cp500,
-    StringEncoding::ebcdic_cp1047, StringEncoding::windows932, StringEncoding::windows936};
+    StringEncoding::ebcdic_cp1047, StringEncoding::windows932, StringEncoding::windows936,
+    StringEncoding::windows949};
 
 wxString encoding_text(StringEncoding encoding) {
     switch (encoding) {
@@ -101,6 +102,7 @@ wxString encoding_text(StringEncoding encoding) {
     case StringEncoding::ebcdic_cp1047: return "EBCDIC CP1047";
     case StringEncoding::windows932: return "Windows-932";
     case StringEncoding::windows936: return "Windows-936 (GBK)";
+    case StringEncoding::windows949: return "Windows-949 (UHC)";
     }
     return "unknown";
 }

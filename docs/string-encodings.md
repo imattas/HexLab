@@ -32,6 +32,15 @@ scans. The mapping is provenance for the byte-to-Unicode interpretation; this
 is still a heuristic candidate and does not infer locale or language. Arbitrary
 binary may still produce overlapping legacy-codepage candidates.
 
+Windows-949 adds a bounded Unified Hangul Code candidate using the Unicode
+Consortium's [CP949 mapping table](https://www.unicode.org/Public/MAPPINGS/VENDORS/MICSFT/WINDOWS/CP949.TXT).
+The scanner accepts the defined UHC lead and trail ranges, retains original
+byte/address extents, and emits UTF-8 previews. Invalid pairs split runs;
+candidate extents matching strict UTF-8 are suppressed, and candidates need at
+least one non-ASCII scalar. Persisted encoding ID 45 is appended and derived
+cache version 96 recomputes older scans. The result remains a heuristic code
+page interpretation and does not infer locale or language.
+
 Windows-1251 is scanned as a second single-byte heuristic, with an explicit
 fixed mapping for Cyrillic letters and punctuation. Its undefined byte 0x98
 ends a candidate. As with Windows-1252, emitted candidates must contain a
@@ -153,6 +162,8 @@ candidate remains heuristic and does not classify file language or locale.
 CLI, desktop Strings, and Python API encoding labels expose DOS-866, DOS-852,
 and KOI8-R. The supported legacy set remains incomplete and does not perform
 locale or language classification.
+
+Windows-949 is exposed by the same CLI, desktop Strings, and Python labels.
 
 Mac Roman adds the fixed Apple Macintosh Roman mapping for legacy Macintosh
 resources and executables. The table follows the Unicode Consortium's
