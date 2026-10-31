@@ -611,6 +611,72 @@ bool vex_simd(State &state, std::uint8_t opcode, unsigned map, unsigned pp, unsi
         }
         return true;
     }
+    if (map == 1 && opcode == 0x4a) {
+        if (!l || pp != (w ? 0u : 1u) || (state.rex & 7))
+            invalid("KADD has an invalid VEX prefix or extended opmask register");
+        if (vvvv > 7)
+            invalid("KADD VEX.vvvv source must encode K0-K7");
+        const std::uint16_t width = w ? (pp ? 32 : 64) : (pp ? 8 : 16);
+        auto decoded = modrm(state, 64, 64);
+        if (decoded.mod != 3 || decoded.reg.index > 7 || std::get<RegisterOperand>(decoded.rm).index > 7)
+            invalid("KADD requires direct K0-K7 operands");
+        state.i.opcode = width == 8 ? Opcode::kaddb : width == 16 ? Opcode::kaddw :
+                         width == 32 ? Opcode::kaddd : Opcode::kaddq;
+        auto destination = decoded.reg;
+        destination.bank = RegisterBank::opmask; destination.width = 64; destination.high_byte = false;
+        auto source1 = RegisterOperand{RegisterBank::opmask, static_cast<std::uint8_t>(vvvv), 64, false};
+        auto source2 = std::get<RegisterOperand>(decoded.rm);
+        source2.bank = RegisterBank::opmask; source2.width = 64; source2.high_byte = false;
+        state.i.register_writes.push_back(destination);
+        state.operand(destination, OperandAccess::write);
+        state.operand(source1, OperandAccess::read);
+        state.operand(source2, OperandAccess::read);
+        return true;
+    }
+    if (map == 1 && opcode == 0x4b) {
+        if (!l || w && pp || (state.rex & 7))
+            invalid("KUNPCK has an invalid VEX prefix or extended opmask register");
+        if (vvvv > 7)
+            invalid("KUNPCK VEX.vvvv source must encode K0-K7");
+        if (pp > 1)
+            invalid("KUNPCK uses an unsupported mandatory prefix");
+        auto decoded = modrm(state, 64, 64);
+        if (decoded.mod != 3 || decoded.reg.index > 7 || std::get<RegisterOperand>(decoded.rm).index > 7)
+            invalid("KUNPCK requires direct K0-K7 operands");
+        state.i.opcode = w ? Opcode::kunpckdq : (pp ? Opcode::kunpckbw : Opcode::kunpckwd);
+        auto destination = decoded.reg;
+        destination.bank = RegisterBank::opmask; destination.width = 64; destination.high_byte = false;
+        auto source1 = RegisterOperand{RegisterBank::opmask, static_cast<std::uint8_t>(vvvv), 64, false};
+        auto source2 = std::get<RegisterOperand>(decoded.rm);
+        source2.bank = RegisterBank::opmask; source2.width = 64; source2.high_byte = false;
+        state.i.register_writes.push_back(destination);
+        state.operand(destination, OperandAccess::write);
+        state.operand(source1, OperandAccess::read);
+        state.operand(source2, OperandAccess::read);
+        return true;
+    }
+    if (map == 3 && opcode >= 0x30 && opcode <= 0x33) {
+        if (l || pp != 1 || vvvv != 0 || (state.rex & 7))
+            invalid("KSHIFT requires VEX.L=0, 66, reserved vvvv, and K0-K7 registers");
+        const auto width = opcode == 0x30 ? (w ? 16 : 8) : opcode == 0x31 ? (w ? 64 : 32) :
+                           opcode == 0x32 ? (w ? 16 : 8) : (w ? 64 : 32);
+        const bool left = opcode == 0x32 || opcode == 0x33;
+        auto decoded = modrm(state, 64, 64);
+        if (decoded.reg.index > 7 || decoded.mod != 3 || std::get<RegisterOperand>(decoded.rm).index > 7)
+            invalid("KSHIFT requires direct K0-K7 operands");
+        state.i.opcode = left
+            ? (width == 8 ? Opcode::kshiftlb : width == 16 ? Opcode::kshiftlw : width == 32 ? Opcode::kshiftld : Opcode::kshiftlq)
+            : (width == 8 ? Opcode::kshiftrb : width == 16 ? Opcode::kshiftrw : width == 32 ? Opcode::kshiftrd : Opcode::kshiftrq);
+        auto destination = decoded.reg;
+        destination.bank = RegisterBank::opmask; destination.width = 64; destination.high_byte = false;
+        auto source = std::get<RegisterOperand>(decoded.rm);
+        source.bank = RegisterBank::opmask; source.width = 64; source.high_byte = false;
+        state.i.register_writes.push_back(destination);
+        state.operand(destination, OperandAccess::write);
+        state.operand(source, OperandAccess::read);
+        state.operand(state.immediate(8, 8, false), OperandAccess::read);
+        return true;
+    }
     if (map == 2 && opcode == 0x17) {
         if (pp != 1)
             invalid("VPTEST requires VEX.pp=66");

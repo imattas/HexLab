@@ -699,7 +699,10 @@ enum class Opcode {
     rdtsc, rdtscp, rdpmc,
     // PowerPC VMX signed/unsigned lane-wise min/max; appended for cache stability.
     ppc_vmaxub, ppc_vmaxuh, ppc_vmaxuw, ppc_vmaxsb, ppc_vmaxsh, ppc_vmaxsw,
-    ppc_vminub, ppc_vminuh, ppc_vminuw, ppc_vminsb, ppc_vminsh, ppc_vminsw
+    ppc_vminub, ppc_vminuh, ppc_vminuw, ppc_vminsb, ppc_vminsh, ppc_vminsw,
+    // AVX-512 opmask arithmetic, shifts, and unpack; appended for stable IDs.
+    kaddb, kaddw, kaddd, kaddq, kshiftlb, kshiftlw, kshiftld, kshiftlq,
+    kshiftrb, kshiftrw, kshiftrd, kshiftrq, kunpckbw, kunpckwd, kunpckdq
 };
 enum class OperandAccess { read, write, read_write, address };
 // The encoded x86 group-one repeat prefix is retained separately from the
