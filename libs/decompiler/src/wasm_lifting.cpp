@@ -426,6 +426,21 @@ std::optional<std::string_view> simd_float_binary(std::uint32_t subopcode) {
     default: return {};
     }
 }
+std::optional<std::string_view> simd_conversion(std::uint32_t subopcode) {
+    switch (subopcode) {
+    case 0x5e: return "f32x4.demote_f64x2_zero";
+    case 0x5f: return "f64x2.promote_low_f32x4";
+    case 0xf8: return "i32x4.trunc_sat_f32x4_s";
+    case 0xf9: return "i32x4.trunc_sat_f32x4_u";
+    case 0xfa: return "f32x4.convert_i32x4_s";
+    case 0xfb: return "f32x4.convert_i32x4_u";
+    case 0xfc: return "i32x4.trunc_sat_f64x2_s_zero";
+    case 0xfd: return "i32x4.trunc_sat_f64x2_u_zero";
+    case 0xfe: return "f64x2.convert_low_i32x4_s";
+    case 0xff: return "f64x2.convert_low_i32x4_u";
+    default: return {};
+    }
+}
 std::optional<std::string_view> simd_integer_extmul(std::uint32_t subopcode) {
     switch (subopcode) {
     case 0x9c: return "i16x8.extmul_low_i8x16_s";
@@ -974,6 +989,16 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
                     auto left = shape_pop(stack, vector(128));
                     if (!right) return right.error();
                     if (!left) return left.error();
+                    stack.push_back(vector(128));
+                    continue;
+                }
+                const auto conversion = subopcode ? simd_conversion(*subopcode) : std::optional<std::string_view>{};
+                if (conversion) {
+                    const auto &instruction = code[n]->instruction;
+                    if (!instruction.operands.empty() || instruction.mnemonic_override != *conversion)
+                        return unsupported("SIMD conversion opcode metadata is inconsistent");
+                    auto value = shape_pop(stack, vector(128));
+                    if (!value) return value.error();
                     stack.push_back(vector(128));
                     continue;
                 }
@@ -1897,6 +1922,15 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
                     if (!right) return right.error();
                     if (!left) return left.error();
                     stack.push_back(binary(std::string(*float_binary), left.value(), right.value(), vector(128)));
+                    continue;
+                }
+                const auto conversion = subopcode ? simd_conversion(*subopcode) : std::optional<std::string_view>{};
+                if (conversion) {
+                    if (!i.operands.empty() || i.mnemonic_override != *conversion)
+                        return unsupported("SIMD conversion opcode metadata is inconsistent");
+                    auto value = pop(vector(128));
+                    if (!value) return value.error();
+                    stack.push_back(unary(std::string(*conversion), value.value(), vector(128)));
                     continue;
                 }
                 const auto splat = subopcode ? simd_splat_op(*subopcode) : std::optional<SimdSplatOpInfo>{};
