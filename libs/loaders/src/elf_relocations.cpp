@@ -163,6 +163,12 @@ Field field(const ElfHeader &header, std::uint32_t type) {
         case 260: return {K::pc_relative, 8}; // PREL64
         case 261: return {K::pc_relative, 4}; // PREL32
         case 262: return {K::pc_relative, 2}; // PREL16
+        case 273: return {K::pc_relative, 4}; // LD_PREL_LO19
+        case 274: return {K::pc_relative, 4}; // ADR_PREL_LO21
+        case 275: case 276: return {K::pc_relative, 4}; // ADR_PREL_PG_HI21[_NC]
+        case 277: return {K::absolute, 4}; // ADD_ABS_LO12_NC
+        case 278: case 284: case 285: case 286: return {K::absolute, 4}; // LDST{8,16,32,64}_ABS_LO12_NC
+        case 279: case 280: return {K::pc_relative, 4}; // TSTBR14 / CONDBR19
         case 1024: return {K::copy, {}};
         case 1025: return {K::global_data, 8};
         case 1026: return {K::jump_slot, 8};
