@@ -261,3 +261,11 @@ expression budget; and both masks must use the exact same predicate SSA value.
 The reversed arm/mask ordering is handled as well. Arbitrary integer masks,
 zero-extended booleans, memory values, effectful values, and mismatched types
 remain unchanged because they do not prove a 0-or-all-ones condition mask.
+
+The equivalent XOR-mask form `base ^ ((base ^ other) & mask)` is also rewritten
+to `select_if`. The mask must be the exact sign extension of a pure one-bit
+predicate whose register leaves carry SSA versions, optionally complemented
+with bitwise not; complementing the mask swaps the true and false arms. Both
+value arms must be exact-width pure, total bitvectors within the same 256-node
+bound. Arbitrary masks, unversioned values, effects, and mismatched types remain
+explicit.

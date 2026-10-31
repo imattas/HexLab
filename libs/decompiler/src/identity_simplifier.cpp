@@ -715,6 +715,72 @@ ExpressionPtr simplify_boolean_mask_select(const ExpressionPtr &expression) {
         BinaryValue{"select_if", yes_term->predicate, std::move(alternatives)}});
 }
 
+// base ^ ((base ^ other) & sext(predicate)) is predicate ? other : base.
+// A complemented sign-extension swaps the selected arms. As with the OR-mask
+// form above, require versioned bitvectors and total values so the rewrite
+// cannot hide effects or target traps.
+ExpressionPtr simplify_xor_mask_select(const ExpressionPtr &expression) {
+    const auto *root = expression ? std::get_if<BinaryValue>(&expression->value) : nullptr;
+    if (!root || root->operation != "xor" || expression->type.kind != TypeKind::integer ||
+        !valid_bitvector(*expression) || !root->left || !root->right ||
+        expression_nodes(expression) > 256 || !pure_bitvector(expression))
+        return {};
+
+    const auto try_order = [&](const ExpressionPtr &masked_expression,
+                               const ExpressionPtr &base) -> ExpressionPtr {
+        const auto *masked = masked_expression
+            ? std::get_if<BinaryValue>(&masked_expression->value) : nullptr;
+        if (!masked || masked->operation != "and" || masked_expression->type != expression->type ||
+            !masked->left || !masked->right || masked->left->type != expression->type ||
+            masked->right->type != expression->type || base->type != expression->type)
+            return {};
+
+        const auto try_delta = [&](const ExpressionPtr &delta_expression,
+                                   const ExpressionPtr &mask_expression) -> ExpressionPtr {
+            const auto *delta = delta_expression
+                ? std::get_if<BinaryValue>(&delta_expression->value) : nullptr;
+            if (!delta || delta->operation != "xor" || delta_expression->type != expression->type ||
+                !delta->left || !delta->right || delta->left->type != expression->type ||
+                delta->right->type != expression->type)
+                return {};
+
+            ExpressionPtr predicate_mask = mask_expression;
+            bool inverted = false;
+            const auto *extension = predicate_mask
+                ? std::get_if<UnaryValue>(&predicate_mask->value) : nullptr;
+            if (extension && extension->operation == "bitnot" && extension->operand) {
+                inverted = true;
+                predicate_mask = extension->operand;
+                extension = std::get_if<UnaryValue>(&predicate_mask->value);
+            }
+            if (!extension || extension->operation != "sext" || !extension->operand ||
+                predicate_mask->type != expression->type ||
+                extension->operand->type.kind != TypeKind::boolean ||
+                extension->operand->type.bits != 1 || !pure_bitvector(extension->operand))
+                return {};
+
+            ExpressionPtr other;
+            if (structurally_equal(base, delta->left)) other = delta->right;
+            else if (structurally_equal(base, delta->right)) other = delta->left;
+            else return {};
+            if (!total_select_value(base) || !other || other->type != expression->type ||
+                !total_select_value(other))
+                return {};
+
+            auto yes = inverted ? base : other;
+            auto no = inverted ? other : base;
+            auto alternatives = std::make_shared<Expression>(Expression{expression->type,
+                BinaryValue{"pair", std::move(yes), std::move(no)}});
+            return std::make_shared<Expression>(Expression{expression->type,
+                BinaryValue{"select_if", extension->operand, std::move(alternatives)}});
+        };
+        if (auto direct = try_delta(masked->left, masked->right)) return direct;
+        return try_delta(masked->right, masked->left);
+    };
+    if (auto direct = try_order(root->left, root->right)) return direct;
+    return try_order(root->right, root->left);
+}
+
 // Flatten a nested select controlled by the same exact SSA predicate:
 // c ? (c ? a : b) : d == c ? a : d, and its false-arm dual. Total pure
 // bitvectors and exact predicate identity avoid path, alias, and effect guesses.
@@ -1074,6 +1140,7 @@ ExpressionPtr simplify(const ExpressionPtr &input) {
     if (auto partition = simplify_mask_partition(result)) return partition;
     if (auto cleared = simplify_masked_clear(result)) return cleared;
     if (auto select = simplify_boolean_mask_select(result)) return select;
+    if (auto select = simplify_xor_mask_select(result)) return select;
     if (auto consensus = simplify_consensus(result)) return consensus;
     if (auto absorbed = simplify_complemented_absorption(result)) return absorbed;
     if (auto carry = simplify_add_xor_difference(result)) return carry;
