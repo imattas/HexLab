@@ -178,7 +178,8 @@ FunctionCallNeighborhood function_call_neighborhood(const ProjectSnapshot &proje
     };
     const auto *containing = function_for(address);
     if (!containing) return result;
-    std::map<CallAddressKey, FunctionCallRelation> callees, callers;
+    using CallEdgeKey = std::pair<CallAddressKey, CallAddressKey>;
+    std::map<CallEdgeKey, FunctionCallRelation> callees, callers;
     const auto chunk_count = std::min(max_chunks, containing->chunks.size());
     if (containing->chunks.size() > chunk_count) result.omitted = true;
     for (std::size_t i = 0; i < chunk_count; ++i) {
@@ -194,7 +195,8 @@ FunctionCallNeighborhood function_call_neighborhood(const ProjectSnapshot &proje
                 const auto *target = target_location ? std::get_if<Address>(target_location) : nullptr;
                 if (!source || !target || !executable(*target)) continue;
                 if (const auto *callee = function_for(*target))
-                    callees.try_emplace(call_address_key(callee->entry), FunctionCallRelation{callee->entry, *source});
+                    callees.try_emplace(CallEdgeKey{call_address_key(callee->entry), call_address_key(*source)},
+                                        FunctionCallRelation{callee->entry, *source});
             }
             if (outgoing.value().next_offset) result.omitted = true;
         }
@@ -209,7 +211,8 @@ FunctionCallNeighborhood function_call_neighborhood(const ProjectSnapshot &proje
                 const auto *source = std::get_if<Address>(&reference.source);
                 if (source && executable(*source))
                     if (const auto *caller = function_for(*source))
-                        callers.try_emplace(call_address_key(caller->entry), FunctionCallRelation{caller->entry, *source});
+                        callers.try_emplace(CallEdgeKey{call_address_key(caller->entry), call_address_key(*source)},
+                                            FunctionCallRelation{caller->entry, *source});
             }
             if (incoming.value().next_offset) result.omitted = true;
         }
@@ -268,12 +271,20 @@ wxString endpoint_context(const ProjectSnapshot &project, Location location, con
         const auto append_relations = [&](const char *prefix, const std::vector<FunctionCallRelation> &relations) {
             if (relations.empty()) return;
             wxString value = wxString::Format("%s ", prefix);
-            const auto shown = std::min<std::size_t>(6, relations.size());
-            for (std::size_t i = 0; i < shown; ++i) {
-                if (i) value += ", ";
-                value += preview_text(presentation_name(project, Location{relations[i].entry}), 96);
+            std::map<CallAddressKey, std::pair<Address, std::size_t>> functions;
+            for (const auto &relation : relations) {
+                auto it = functions.try_emplace(call_address_key(relation.entry), relation.entry, 0).first;
+                ++it->second.second;
             }
-            if (relations.size() > shown) value += wxString::Format(" (+%zu)", relations.size() - shown);
+            const auto shown = std::min<std::size_t>(6, functions.size());
+            std::size_t index = 0;
+            for (const auto &entry : functions) {
+                if (index == shown) break;
+                if (index++) value += ", ";
+                value += preview_text(presentation_name(project, Location{entry.second.first}), 96);
+                if (entry.second.second > 1) value += wxString::Format(" (%zu call sites)", entry.second.second);
+            }
+            if (functions.size() > shown) value += wxString::Format(" (+%zu)", functions.size() - shown);
             append(value);
         };
         append_relations("calls", relationships.callees);

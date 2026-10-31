@@ -8,10 +8,12 @@ from the current, key-matched reference index; indirect calls without a proven
 address are omitted. A relationship is shown only when its address maps to an
 executable image segment and resolves to a recovered function. The inspection
 is bounded to eight function chunks, 128 indexed references per direction and
-chunk, and six displayed functions per direction. Repeated edges to the same
-function are collapsed. Consequently, large functions or incomplete reference
-pages can have omitted relationships; this is a compact context hint, not a
-complete call graph.
+chunk, and six displayed functions per direction. Context summaries group
+callers and callees by function and report multiple call sites. The caller and
+callee chooser retains each distinct function/call-site pair, so separate
+calls to the same function remain individually navigable. Consequently, large
+functions or incomplete reference pages can have omitted relationships; this
+is a compact context hint, not a complete call graph.
 
 Use **Navigate → Incoming References** (`Ctrl+Shift+X`) or **Outgoing References** (`Ctrl+Alt+X`) to open references for the current selection. The listing context menu offers the same operations for the row under the pointer, or the selected row when opened with the keyboard. Opening this menu or a reference set leaves the workspace address and history unchanged. When an interior-byte selection falls inside a decoded instruction in the current listing page, the query uses that instruction's start without changing the selected byte. Other address and file-offset queries keep their original domain.
 
