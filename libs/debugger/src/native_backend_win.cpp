@@ -3127,7 +3127,10 @@ private:
             Status trap_restored = std::monostate{};
             if (displaced_breakpoint) trap_restored = patch_bytes(*displaced_breakpoint, software_breakpoint_instruction());
             Status hw_restored = std::monostate{};
-            if (hardware_step_state) hw_restored = restore_arm64_hardware_step_state(*hardware_step_state);
+            if (hardware_step_state) {
+                hw_restored = restore_arm64_hardware_step_state(*hardware_step_state);
+                if (!hw_restored) arm64_hardware_step_ = *hardware_step_state;
+            }
             CloseHandle(thread);
             if (!trap_restored || !hw_restored)
                 return Error{ErrorCode::io, error.message +
@@ -3166,7 +3169,10 @@ private:
             Status trap_restored = std::monostate{};
             if (displaced_breakpoint) trap_restored = patch_bytes(*displaced_breakpoint, software_breakpoint_instruction());
             Status hw_restored = std::monostate{};
-            if (hardware_step_state) hw_restored = restore_arm64_hardware_step_state(*hardware_step_state);
+            if (hardware_step_state) {
+                hw_restored = restore_arm64_hardware_step_state(*hardware_step_state);
+                if (!hw_restored) arm64_hardware_step_ = *hardware_step_state;
+            }
             if (!restored || !trap_restored || !hw_restored)
                 return Error{ErrorCode::io, "ARM64 step thread is absent from its resume set and rollback failed"};
             return Error{ErrorCode::invalid_argument, "ARM64 step thread must remain in the selected resume set"};
@@ -3183,7 +3189,10 @@ private:
             Status trap_restored = std::monostate{};
             if (displaced_breakpoint) trap_restored = patch_bytes(*displaced_breakpoint, software_breakpoint_instruction());
             Status hw_restored = std::monostate{};
-            if (hardware_step_state) { hw_restored = restore_arm64_hardware_step(); }
+            if (hardware_step_state) {
+                hw_restored = restore_arm64_hardware_step_state(*hardware_step_state);
+                if (!hw_restored) arm64_hardware_step_ = *hardware_step_state;
+            }
             if (!restored || !trap_restored || !hw_restored)
                 return Error{ErrorCode::io, suspended.error().message +
                     std::string(!restored ? "; restoring ARM64 thread state failed: " + restored.error().message : "") +
@@ -3199,7 +3208,10 @@ private:
             Status trap_restored = std::monostate{};
             if (displaced_breakpoint) trap_restored = patch_bytes(*displaced_breakpoint, software_breakpoint_instruction());
             Status hw_restored = std::monostate{};
-            if (hardware_step_state) hw_restored = restore_arm64_hardware_step();
+            if (hardware_step_state) {
+                hw_restored = restore_arm64_hardware_step_state(*hardware_step_state);
+                if (!hw_restored) arm64_hardware_step_ = *hardware_step_state;
+            }
             auto released = resume_step_suspensions();
             if (!restored || !trap_restored || !hw_restored)
                 return Error{ErrorCode::io, continue_error.message +

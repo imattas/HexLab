@@ -2006,6 +2006,22 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
                             if (instance && !expect_type(receiver, RegType::reference))
                                 return Error{ErrorCode::malformed, "DEX instance field receiver is not a reference"};
                             if (field_index < fields.size()) {
+                                if (instance && before[receiver] == RegType::reference &&
+                                    before.references[receiver] != UINT32_MAX) {
+                                    const auto relation = reference_assignability(
+                                        before.references[receiver], fields[field_index].owner);
+                                    if (relation == Assignability::no) {
+                                        std::ostringstream provenance;
+                                        provenance << "DEX instance field receiver is not assignable to field owner"
+                                            << " (method_idx=" << method_idx
+                                            << ", code_item_file_offset=0x" << std::hex << code_off
+                                            << ", instruction_code_unit_offset=0x" << (offset / 2)
+                                            << ", field_idx=" << std::dec << field_index << ')';
+                                        return Error{ErrorCode::malformed, provenance.str()};
+                                    }
+                                    if (relation == Assignability::unresolved)
+                                        state.references[receiver] = UINT32_MAX;
+                                }
                                 const auto &field_type = types[fields[field_index].type];
                                 if (get) set_descriptor(value, field_type);
                                 else if (!expect_descriptor(value, field_type))

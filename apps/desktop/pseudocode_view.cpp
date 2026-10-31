@@ -751,7 +751,6 @@ std::string render_user_variables(const decompiler::LiftedFunction &function, st
                                   const std::map<std::string, std::string> &local_comments) {
     std::map<std::string, Address> definitions;
     std::map<std::string, std::string> stable_identities;
-    std::set<std::string> read_only;
     std::map<std::string, std::vector<Address>> uses;
     std::set<std::string> ambiguous;
     const auto define = [&](RegisterOperand reg, std::optional<std::uint32_t> version, Address at) {
@@ -765,7 +764,6 @@ std::string render_user_variables(const decompiler::LiftedFunction &function, st
             const auto token = register_token(phi.destination, phi.version);
             if (!definitions.emplace(token, block.begin).second) ambiguous.insert(token);
             stable_identities.emplace(token, phi_identity(phi, block.begin));
-            read_only.insert(token);
         }
         for (const auto &instruction : block.instructions) {
             std::visit([&](const auto &statement) {
@@ -814,18 +812,21 @@ std::string render_user_variables(const decompiler::LiftedFunction &function, st
         // Keep larger identities visible, but disable edits rather than applying
         // a partial rename/type assignment.
         const bool safely_editable = access_sites.size() <= 4096;
-        const bool is_phi = read_only.contains(token);
         const auto identity = stable_identities.contains(token) ? stable_identities.at(token) : token;
-        const auto *annotation = project && !is_phi ? annotation_at(*project, address) : nullptr;
-        const auto *assignment = project && !is_phi ? type_assignment(*project, address) : nullptr;
+        // Phi values have a stable merge identity and use the block-entry
+        // instruction as their defining origin. The later shared-origin and
+        // function-entry checks decide whether address-keyed persistence can
+        // safely represent this value without colliding with another value.
+        const auto *annotation = project ? annotation_at(*project, address) : nullptr;
+        const auto *assignment = project ? type_assignment(*project, address) : nullptr;
         const auto *definition = assignment ? type_definition(*project, assignment->type_id) : nullptr;
         std::string display = annotation && !annotation->name.empty() ? annotation->name : identity;
         if (definition) display += " /* " + (definition->type->name().empty()
                                                    ? types::format(*definition->type) : definition->type->name()) + " */";
         replacements.emplace(token, display);
         variables.push_back({identity, address, annotation && !annotation->name.empty() ? annotation->name : identity,
-                             !is_phi && safely_editable, false,
-                             !is_phi && safely_editable ? std::move(access_sites) : std::vector<Address>{}});
+                             safely_editable, false,
+                             safely_editable ? std::move(access_sites) : std::vector<Address>{}});
     }
     for (const auto &[token, display] : replacements) {
         std::size_t position = 0;

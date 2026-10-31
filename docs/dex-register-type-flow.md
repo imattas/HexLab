@@ -35,10 +35,19 @@ halves admit the same long/double interpretation.
 This remains partial category validation. Unknown facts are permissive and do
 not prove definite assignment. Unsupported writes erase their own category
 facts. Handlers start with unknown registers because instruction-level
-exceptional type propagation is not implemented. Reference class identity,
-array element descriptors, constructor initialization, class-hierarchy
-assignability, and path-dependent null refinement are not modeled. A successful
-load is not a complete Dalvik verification certificate.
+exceptional type propagation is not implemented. Known reference identities are
+checked for assignability at ordinary invoke receivers and instance field
+receivers using the class definitions and array rules present in this DEX.
+External or incomplete hierarchy paths remain unresolved and are accepted
+conservatively; they do not establish assignability. Array element descriptors,
+constructor initialization, and path-dependent null refinement are not
+modeled. A successful load is not a complete Dalvik verification certificate.
+
+An instance-field receiver rejected by a known hierarchy contradiction reports
+the method identifier-table index, code-item file offset, method-relative
+instruction code-unit offset, and field identifier-table index. This provenance
+identifies the exact checked use while keeping the public loader error model
+unchanged.
 
 The existing bounds remain: at most one million instruction/register cells per
 method and eight million per load, cancellation checks in the worklist, and a

@@ -15,7 +15,7 @@ threads receive debugger-owned suspend counts. On the next debug event, those
 counts are released while Windows has frozen the process; the resulting event
 is then surfaced normally. If setup or event continuation fails, the owner
 context, breakpoint slot and acquired suspension counts are restored or retained
-for cleanup retry before the event is returned.
+for cleanup retry before the event is returned. If a failed `ContinueDebugEvent` leaves the owner hardware registers unrestored, the backend retains the slot recovery record and blocks later resume attempts until restoration succeeds.
 
 The mixed form applies only to a handled ARM64 hardware execute-breakpoint
 event, with exactly one step action on its event owner. Other mixed step and
