@@ -1,4 +1,5 @@
 #include "hexlab/processors/riscv_semantics.hpp"
+#include "riscv_estimate_tables.hpp"
 #include <algorithm>
 #include <bit>
 #include <limits>
@@ -1576,12 +1577,15 @@ evaluate_riscv_vector_floating_operation(RiscvOpcode opcode, const RiscvVectorIn
         (config.masked && operands.predicate_mask.size() != vlmax))
         return {};
 
-    enum class Operation { classification, sign_copy, sign_invert, sign_xor, min, max, reduce_min, reduce_max,
+    enum class Operation { classification, reciprocal_estimate, reciprocal_sqrt_estimate,
+                           sign_copy, sign_invert, sign_xor, min, max, reduce_min, reduce_max,
                            equal, not_equal, less, less_equal, greater, greater_equal };
     Operation operation;
     bool vector_rhs = false, mask_result = false;
     switch (opcode) {
     case RiscvOpcode::vfclass_v: operation = Operation::classification; break;
+    case RiscvOpcode::vfrec7_v: operation = Operation::reciprocal_estimate; break;
+    case RiscvOpcode::vfrsqrt7_v: operation = Operation::reciprocal_sqrt_estimate; break;
 #define RV_FLOAT_PAIR(vv, vf, name) \
     case RiscvOpcode::vv: operation = Operation::name; vector_rhs = true; break; \
     case RiscvOpcode::vf: operation = Operation::name; break
@@ -1630,6 +1634,70 @@ evaluate_riscv_vector_floating_operation(RiscvOpcode opcode, const RiscvVectorIn
             return (value & sign_mask) ? (~value & element_mask) : (value ^ sign_mask);
         };
         return order_key(lhs) < order_key(rhs);
+    };
+
+    const bool estimate = operation == Operation::reciprocal_estimate ||
+                          operation == Operation::reciprocal_sqrt_estimate;
+    if (estimate && (vector_rhs || !operands.vs1.empty())) return {};
+    if (operation == Operation::reciprocal_estimate &&
+        (!operands.frm || *operands.frm > 4)) return {};
+    const unsigned frac_bits = sew == 32 ? 23 : 52;
+    const unsigned exp_bits = sew == 32 ? 8 : 11;
+    const int bias = (1 << (exp_bits - 1)) - 1;
+    const auto estimate_value = [&](std::uint64_t input, std::uint8_t &fflags) {
+        const auto sign = input & sign_mask;
+        const auto mag = input & ~sign_mask & element_mask;
+        const auto exp_field = static_cast<unsigned>((mag & exponent_mask) >> frac_bits);
+        const auto frac = mag & fraction_mask;
+        const auto max_exp_field = (1u << exp_bits) - 1;
+        if (exp_field == max_exp_field) {
+            if (frac) {
+                if ((frac & quiet_mask) == 0) fflags |= 0x10;
+                return canonical_nan;
+            }
+            if (operation == Operation::reciprocal_estimate) return sign;
+            if (sign) fflags |= 0x10;
+            return sign ? canonical_nan : UINT64_C(0);
+        }
+        if (operation == Operation::reciprocal_sqrt_estimate && sign && mag != 0) {
+            fflags |= 0x10;
+            return canonical_nan;
+        }
+        if (mag == 0) {
+            fflags |= 0x08;
+            return sign | exponent_mask;
+        }
+        const bool normal = exp_field != 0;
+        const int e = normal ? static_cast<int>(exp_field)
+                             : -static_cast<int>(frac_bits - std::bit_width(frac));
+        const std::uint64_t normalized_frac = normal ? frac :
+            ((frac << static_cast<unsigned>(1 - e)) & fraction_mask);
+        if (operation == Operation::reciprocal_sqrt_estimate) {
+            int out_e = 3 * bias - 1 - e;
+            out_e = out_e >= 0 ? out_e / 2 : -((-out_e + 1) / 2);
+            const auto index = ((e & 1) << 6) | static_cast<unsigned>(normalized_frac >> (frac_bits - 6));
+            const auto out_frac = static_cast<std::uint64_t>(detail::vfrsqrt7_table[index]) << (frac_bits - 7);
+            const auto out_exp = static_cast<std::uint64_t>(out_e);
+            return sign | (out_exp << frac_bits) | out_frac;
+        }
+        const int out_e = 2 * bias - 1 - e;
+        if (out_e > 2 * bias) {
+            fflags |= 0x05; // NX | OF
+            const auto mode = *operands.frm;
+            const bool infinity = sign ? (mode == 2 || mode == 0 || mode == 4)
+                                       : (mode == 3 || mode == 0 || mode == 4);
+            if (infinity) return sign | exponent_mask;
+            return sign | ((static_cast<std::uint64_t>(max_exp_field - 1) << frac_bits) | fraction_mask);
+        }
+        const unsigned idx = static_cast<unsigned>(normalized_frac >> (frac_bits - 7));
+        const auto out_frac = static_cast<std::uint64_t>(detail::vfrec7_table[idx]) << (frac_bits - 7);
+        if (out_e == 0 || out_e == -1) {
+            const auto sig = (UINT64_C(1) << frac_bits) | out_frac;
+            const unsigned shift = static_cast<unsigned>(1 - out_e);
+            return sign | (shift >= 64 ? 0 : sig >> shift);
+        }
+        const auto out_exp = static_cast<std::uint64_t>(out_e);
+        return sign | (out_exp << frac_bits) | out_frac;
     };
 
     const auto minmax = [&](std::uint64_t lhs, std::uint64_t rhs, bool maximum,
@@ -1690,6 +1758,10 @@ evaluate_riscv_vector_floating_operation(RiscvOpcode opcode, const RiscvVectorIn
             }
             break;
         }
+        case Operation::reciprocal_estimate:
+        case Operation::reciprocal_sqrt_estimate:
+            value = estimate_value(lhs, result.fflags_set);
+            break;
         case Operation::sign_copy:
             value = (lhs & ~sign_mask) | (rhs & sign_mask);
             break;
