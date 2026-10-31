@@ -333,7 +333,13 @@ V0-V15 use XMM0-XMM15. The prefix is deliberate: these rows describe the
 documented ARM64EC overlay as a possible view, not a finding that the thread
 was executing ARM64EC code. Composite X16/X17 and GS.base-backed X18 are not
 emitted because this fixed register list cannot represent their source extents
-as a single exact register row. Microsoft documents that ARM64EC uses an x64
+as a single exact register row. The installed Windows SDK `um/winnt.h`
+(`ARM64EC_NT_CONTEXT`, Windows Kits 10.0.26100.0) lays out X16 as four
+16-bit pieces at context offsets `0x128`, `0x138`, `0x148`, and `0x158`,
+within the AMD64 x87 ST0-ST3 slots; X17 uses `0x168`, `0x178`, `0x188`, and
+`0x198` within ST4-ST7. These are discontiguous and must not be reconstructed
+from neighboring bytes. That SDK declaration does not identify a GS.base field
+or establish the X18 source mapping, so no X18 alias is inferred. Microsoft documents that ARM64EC uses an x64
 `CONTEXT` representation and maps its supported ARM64 registers into that
 layout; x64 emulation remains possible for the same dump context. See
 [ARM64EC register mapping](https://learn.microsoft.com/en-us/windows/arm/arm64ec-abi)
