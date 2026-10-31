@@ -12,6 +12,30 @@ void read(Instruction &i, RegisterOperand r) {
 }
 } // namespace
 bool data(Instruction &i, std::uint32_t word) {
+    // ARMv6 byte-reversal and bit-reversal operations. The fixed fields
+    // distinguish all four encodings; PC operands are rejected as UNPREDICTABLE.
+    const auto reverse_key = word & 0x0fff0ff0u;
+    Opcode reverse_opcode{};
+    bool reverse = true;
+    switch (reverse_key) {
+    case 0x06bf0f30u: reverse_opcode = Opcode::a32_rev; break;
+    case 0x06bf0fb0u: reverse_opcode = Opcode::a32_rev16; break;
+    case 0x06ff0fb0u: reverse_opcode = Opcode::a32_revsh; break;
+    case 0x06ff0f30u: reverse_opcode = Opcode::a32_rbit; break;
+    default: reverse = false; break;
+    }
+    if (reverse) {
+        const auto rd = (word >> 12) & 15, rm = word & 15;
+        if (rd == 15 || rm == 15)
+            return false;
+        const auto destination = gpr(rd), source = gpr(rm);
+        i.opcode = reverse_opcode;
+        i.operands = {destination, source};
+        i.access = {OperandAccess::write, OperandAccess::read};
+        read(i, source);
+        i.register_writes.push_back(destination);
+        return true;
+    }
     // A32 multiply encodings occupy the otherwise-unallocated register-shift
     // space. Decode them before the ordinary data-processing class.
     const auto mul_rn = (word >> 16) & 15, mul_rd = (word >> 12) & 15;

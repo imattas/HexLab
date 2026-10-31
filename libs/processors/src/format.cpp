@@ -1031,6 +1031,7 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
         (op >= Opcode::a32_sxtb && op <= Opcode::a32_uxtah) ||
         (op >= Opcode::t32_sxtb16 && op <= Opcode::t32_uxtab16) ||
         (op >= Opcode::a32_sxtb16 && op <= Opcode::a32_uxtab16) ||
+        (op >= Opcode::a32_rev && op <= Opcode::a32_rbit) ||
         op == Opcode::t32_addw || op == Opcode::t32_subw ||
         op == Opcode::arm_tbb || op == Opcode::arm_tbh)
         return arm32_detail::mnemonic(op, condition);
