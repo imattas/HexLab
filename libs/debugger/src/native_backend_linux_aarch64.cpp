@@ -87,6 +87,12 @@ constexpr std::array<const char*, aarch64_reg_count> names = {
     "x21", "x22", "x23", "x24", "x25", "x26", "x27", "x28", "x29", "x30",
     "sp", "pc", "pstate"};
 struct Aarch64Regs { std::uint64_t value[aarch64_reg_count]{}; };
+struct Aarch64BreakpointStepRollback {
+    pid_t thread{};
+    std::uint64_t address{};
+    Aarch64Regs registers{};
+    bool trap_may_be_displaced{};
+};
 struct Aarch64GprName {
     std::size_t index{};
     bool low_word{};
@@ -634,6 +640,7 @@ public:
         WaitScope scope(*this);
         if (startup_cleanup_) return cleanup_startup();
         if (!pid_) return Error{ErrorCode::invalid_argument, "no debug target is attached"};
+        auto rollback = recover_resume_rollback(); if (!rollback) return rollback;
         if (!detaching_) {
             auto stopped = stop_all_threads(); if (!stopped) return stopped;
             auto ownership = require_all_threads_stopped(); if (!ownership) return ownership;
@@ -1107,7 +1114,7 @@ public:
                     return Error{ErrorCode::unsupported,
                         "an AArch64 hardware-breakpoint step-over schedule requires the event owner and selected peers to continue"};
                 const auto owner_action = std::find_if(runnable.begin(), runnable.end(), [&](const auto* action) {
-                    return static_cast<pid_t>((*action)->thread) == owner;
+                    return static_cast<pid_t>(action->thread) == owner;
                 });
                 if (owner_action == runnable.end())
                     return Error{ErrorCode::unsupported,
@@ -2275,16 +2282,39 @@ private:
         auto safe = require_all_threads_stopped(); if (!safe) return safe;
         auto configured = ensure_hardware_breakpoints_configured(); if (!configured) return configured;
         auto regs = get_regs(tid); if (!regs) return regs.error();
-        regs.value().value[32] = address;
-        auto moved = set_regs(tid, regs.value()); if (!moved) return moved;
-        auto restored = write_raw(address, original_instruction(address)); if (!restored) return restored;
-        if (ptrace(PTRACE_SINGLESTEP, tid, nullptr, nullptr) != 0) {
-            const auto error = sys_error("PTRACE_SINGLESTEP over breakpoint");
-            constexpr std::array<std::byte, 4> brk{std::byte{0x00}, std::byte{0x00}, std::byte{0x20}, std::byte{0xd4}};
-            auto rearmed = write_raw(address, brk);
-            if (!rearmed) return Error{error.code, error.message + "; breakpoint rearm failed: " + rearmed.error().message};
+        breakpoint_step_rollback_ = Aarch64BreakpointStepRollback{tid, address, regs.value(), false};
+        auto rollback_setup = [&](Error error, bool trap_may_be_displaced) -> Status {
+            breakpoint_step_rollback_->trap_may_be_displaced = trap_may_be_displaced;
+            auto& rollback = *breakpoint_step_rollback_;
+            if (rollback.trap_may_be_displaced) {
+                constexpr std::array<std::byte, 4> brk{
+                    std::byte{0x00}, std::byte{0x00}, std::byte{0x20}, std::byte{0xd4}};
+                auto rearmed = write_raw(rollback.address, brk);
+                if (!rearmed) {
+                    resume_blocked_ = true;
+                    return Error{error.code, error.message + "; breakpoint-step rollback incomplete: " +
+                        rearmed.error().message};
+                }
+                rollback.trap_may_be_displaced = false;
+            }
+            auto restored = set_regs(rollback.thread, rollback.registers);
+            if (!restored) {
+                resume_blocked_ = true;
+                return Error{error.code, error.message + "; breakpoint-step rollback incomplete: " +
+                    restored.error().message};
+            }
+            breakpoint_step_rollback_.reset();
             return error;
-        }
+        };
+        auto moved_regs = regs.value();
+        moved_regs.value[32] = address;
+        auto moved = set_regs(tid, moved_regs);
+        if (!moved) return rollback_setup(moved.error(), false);
+        auto restored = write_raw(address, original_instruction(address));
+        if (!restored) return rollback_setup(restored.error(), true);
+        if (ptrace(PTRACE_SINGLESTEP, tid, nullptr, nullptr) != 0)
+            return rollback_setup(sys_error("PTRACE_SINGLESTEP over breakpoint"), true);
+        breakpoint_step_rollback_.reset();
         step_breakpoint_ = address; step_thread_ = tid; step_pending_ = true; stopped_.erase(tid);
         if (!deferred_resumes.empty()) deferred_breakpoint_resumes_ = std::move(deferred_resumes);
         return std::monostate{};
@@ -2416,6 +2446,25 @@ private:
     }
     Status recover_resume_rollback() {
         if (!resume_blocked_) return std::monostate{};
+        if (breakpoint_step_rollback_) {
+            auto& rollback = *breakpoint_step_rollback_;
+            if (rollback.trap_may_be_displaced) {
+                constexpr std::array<std::byte, 4> brk{
+                    std::byte{0x00}, std::byte{0x00}, std::byte{0x20}, std::byte{0xd4}};
+                auto rearmed = write_raw(rollback.address, brk);
+                if (!rearmed)
+                    return Error{rearmed.error().code,
+                        "breakpoint-step rollback is still incomplete; BRK rearm failed: " +
+                        rearmed.error().message};
+                rollback.trap_may_be_displaced = false;
+            }
+            auto restored = set_regs(rollback.thread, rollback.registers);
+            if (!restored)
+                return Error{restored.error().code,
+                    "breakpoint-step rollback is still incomplete; register restore failed: " +
+                    restored.error().message};
+            breakpoint_step_rollback_.reset();
+        }
         auto stopped = stop_threads_for_rollback(rollback_threads_);
         if (!stopped) return Error{stopped.error().code,
             "resume rollback is still incomplete: " + stopped.error().message};
@@ -2463,6 +2512,8 @@ private:
     }
     Status require_all_threads_stopped() const {
         if (!pid_) return Error{ErrorCode::invalid_argument, "no debug target is attached"};
+        if (resume_blocked_ || breakpoint_step_rollback_)
+            return Error{ErrorCode::busy, "resolve the pending Linux resume rollback before accessing stopped target state"};
         std::set<pid_t> observed; std::error_code ec;
         const auto path = "/proc/" + std::to_string(pid_) + "/task";
         for (std::filesystem::directory_iterator it(path, ec), end; !ec && it != end; it.increment(ec)) {
@@ -2499,9 +2550,9 @@ private:
         }
         return std::monostate{};
     }
-    void clear() { initial_children_.clear(); startup_cleanup_ = false; startup_kill_ = false; detaching_ = false; detach_hardware_cleared_ = false; pid_ = 0; tracked_.clear(); stopped_.clear(); seized_.clear(); deferred_.clear(); deferred_signals_.clear(); interrupting_.clear(); requested_thread_interrupt_.reset(); rollback_threads_.clear(); resume_blocked_ = false; hardware_unconfigured_threads_.clear(); hardware_configuration_error_.clear(); hardware_step_state_.reset(); pending_.reset(); pending_thread_ = 0; pending_signal_ = 0; pending_thread_interrupt_ = false; pending_breakpoint_.reset(); pending_hardware_execute_ = false; pending_hardware_execute_address_ = 0; initial_ = false; exited_ = false; step_breakpoint_.reset(); deferred_breakpoint_resumes_.reset(); step_thread_ = 0; step_pending_ = false; breakpoints_.clear(); originals_.clear(); extra_originals_.clear(); ids_.clear(); enabled_.clear(); hardware_breakpoints_.clear(); }
+    void clear() { initial_children_.clear(); startup_cleanup_ = false; startup_kill_ = false; detaching_ = false; detach_hardware_cleared_ = false; pid_ = 0; tracked_.clear(); stopped_.clear(); seized_.clear(); deferred_.clear(); deferred_signals_.clear(); interrupting_.clear(); requested_thread_interrupt_.reset(); rollback_threads_.clear(); resume_blocked_ = false; breakpoint_step_rollback_.reset(); hardware_unconfigured_threads_.clear(); hardware_configuration_error_.clear(); hardware_step_state_.reset(); pending_.reset(); pending_thread_ = 0; pending_signal_ = 0; pending_thread_interrupt_ = false; pending_breakpoint_.reset(); pending_hardware_execute_ = false; pending_hardware_execute_address_ = 0; initial_ = false; exited_ = false; step_breakpoint_.reset(); deferred_breakpoint_resumes_.reset(); step_thread_ = 0; step_pending_ = false; breakpoints_.clear(); originals_.clear(); extra_originals_.clear(); ids_.clear(); enabled_.clear(); hardware_breakpoints_.clear(); }
     pid_t pid_ = 0, pending_thread_ = 0, step_thread_ = 0; int pending_signal_ = 0; bool initial_ = false, exited_ = false, step_pending_ = false, pending_thread_interrupt_ = false; std::uint64_t seq_ = 0; BreakpointId next_id_ = 1; int last_signal_ = SIGTRAP;
-    std::mutex wait_gate_mutex_; std::set<pid_t> tracked_, stopped_, seized_, interrupting_; std::optional<pid_t> requested_thread_interrupt_; std::map<pid_t, int> deferred_, deferred_signals_; std::vector<pid_t> rollback_threads_; bool resume_blocked_ = false; std::optional<std::uint64_t> pending_, pending_breakpoint_, step_breakpoint_; std::optional<std::vector<std::pair<pid_t, int>>> deferred_breakpoint_resumes_;
+    std::mutex wait_gate_mutex_; std::set<pid_t> tracked_, stopped_, seized_, interrupting_; std::optional<pid_t> requested_thread_interrupt_; std::map<pid_t, int> deferred_, deferred_signals_; std::vector<pid_t> rollback_threads_; bool resume_blocked_ = false; std::optional<Aarch64BreakpointStepRollback> breakpoint_step_rollback_; std::optional<std::uint64_t> pending_, pending_breakpoint_, step_breakpoint_; std::optional<std::vector<std::pair<pid_t, int>>> deferred_breakpoint_resumes_;
     std::map<std::uint64_t, std::byte> breakpoints_, originals_; std::map<std::uint64_t, std::array<std::byte, 3>> extra_originals_; std::map<BreakpointId, std::uint64_t> ids_; std::set<std::uint64_t> enabled_;
     std::vector<Aarch64HardwareBreakpoint> hardware_breakpoints_;
     std::set<pid_t> hardware_unconfigured_threads_;
