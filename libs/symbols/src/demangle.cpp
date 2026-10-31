@@ -884,6 +884,16 @@ class Msvc {
         if (ctor) function = scopes.front();
         if (dtor) function = "~" + scopes.front();
         const char fc = s_[at_++];
+        if (fc == '$') {
+            if (scopes.empty()) throw Failure{DemangleStatus::malformed};
+            std::string qualified;
+            for (auto it = scopes.rbegin(); it != scopes.rend(); ++it) {
+                append_bounded(qualified, *it);
+                append_bounded(qualified, "::");
+            }
+            append_bounded(qualified, function);
+            return virtual_adjustor_thunk(qualified, ctor || dtor);
+        }
         // Far static-adjustment thunk classes are known MSVC productions but
         // are outside this bounded family. Do not reinterpret them as an
         // ordinary member function merely because their class byte overlaps
@@ -960,6 +970,88 @@ class Msvc {
         return out;
     }
   private:
+    void append_bounded(std::string &out, std::string_view value) const {
+        if (out.size() > limits_.max_output_bytes ||
+            value.size() > limits_.max_output_bytes - out.size())
+            throw Failure{DemangleStatus::resource_limit};
+        out.append(value);
+    }
+    std::string virtual_adjustor_thunk(std::string_view qualified, bool structor) {
+        // The '$' function-class prefix has already been consumed. Near
+        // $0/$2/$4 records contain vtordisp and static offsets; $R0/$R2/$R4
+        // prepend vbptr and vbtable-entry offsets. All fields are signed.
+        const bool extended = take('R');
+        if (at_ >= s_.size()) throw Failure{DemangleStatus::malformed};
+        const char access_code = s_[at_++];
+        const char *access = access_code == '0' ? "private:" :
+                             access_code == '2' ? "protected:" :
+                             access_code == '4' ? "public:" : nullptr;
+        if (!access) throw Failure{DemangleStatus::unsupported}; // Far forms stay raw.
+        if (limits_.max_components < (extended ? 4u : 2u))
+            throw Failure{DemangleStatus::resource_limit};
+        std::string out = access;
+        append_bounded(out, " virtual adjustor thunk [");
+        if (extended) {
+            append_bounded(out, "vbptr offset=");
+            append_bounded(out, descriptor_number(true));
+            append_bounded(out, ", vbtable entry offset=");
+            append_bounded(out, descriptor_number(true));
+            append_bounded(out, ", ");
+        }
+        append_bounded(out, "vtordisp offset=");
+        append_bounded(out, descriptor_number(true));
+        append_bounded(out, ", this adjustment=");
+        append_bounded(out, descriptor_number(true));
+        append_bounded(out, "] to ");
+
+        if (peek() == 'E') ++at_; // ptr64
+        std::string ref;
+        if (take('G')) ref = " &";
+        else if (take('H')) ref = " &&";
+        if (at_ >= s_.size()) throw Failure{DemangleStatus::malformed};
+        const char cv = s_[at_++];
+        const char *this_cv = cv == 'A' ? "" : cv == 'B' ? " const" :
+                              cv == 'C' ? " volatile" : cv == 'D' ? " const volatile" : nullptr;
+        if (!this_cv) throw Failure{DemangleStatus::unsupported};
+        if (at_ >= s_.size()) throw Failure{DemangleStatus::malformed};
+        const char *call = calling_convention(s_[at_++]);
+        if (!call) throw Failure{DemangleStatus::unsupported};
+        if (structor) {
+            if (!take('@')) throw Failure{DemangleStatus::malformed};
+            append_bounded(out, "void");
+        } else append_bounded(out, type(0));
+        append_bounded(out, " ");
+        append_bounded(out, call);
+        append_bounded(out, " ");
+        append_bounded(out, qualified);
+        append_bounded(out, "(");
+
+        // Unlike ordinary names' legacy parameter loop, require the ABI's
+        // explicit empty-list marker or a terminated nonempty parameter list.
+        if (!take('X')) {
+            std::size_t count = 0;
+            while (at_ < s_.size() && peek() != '@' && peek() != 'Z') {
+                if (count >= limits_.max_components) throw Failure{DemangleStatus::resource_limit};
+                const auto argument = type(0);
+                if (argument == "void") throw Failure{DemangleStatus::malformed};
+                if (count++) append_bounded(out, ", ");
+                append_bounded(out, argument);
+            }
+            if (take('Z')) {
+                if (count) append_bounded(out, ", ");
+                append_bounded(out, "...");
+            } else if (!count || !take('@')) throw Failure{DemangleStatus::malformed};
+        }
+        append_bounded(out, ")");
+        append_bounded(out, this_cv);
+        append_bounded(out, ref);
+        if (take('_')) {
+            if (!take('E')) throw Failure{DemangleStatus::malformed};
+            append_bounded(out, " noexcept");
+        } else if (!take('Z')) throw Failure{DemangleStatus::malformed};
+        if (at_ != s_.size()) throw Failure{DemangleStatus::malformed};
+        return out;
+    }
     std::string variable_symbol(const std::string &name, const std::vector<std::string> &scopes,
                                 unsigned storage_class) {
         // <storage-class> ::= 0 private static member; 1 protected static
@@ -1214,6 +1306,12 @@ class Msvc {
     }
     std::string deleting_destructor(std::string_view function_name) {
         const auto owner = qualified_type_name(1);
+        if (take('$')) {
+            std::string qualified = owner;
+            append_bounded(qualified, "::");
+            append_bounded(qualified, function_name);
+            return virtual_adjustor_thunk(qualified, false);
+        }
         if (at_ >= s_.size()) throw Failure{DemangleStatus::malformed};
         const auto klass = function_class(s_[at_++]);
         if (!klass.valid || !klass.member || klass.is_static) throw Failure{DemangleStatus::malformed};
@@ -1366,7 +1464,7 @@ class Msvc {
             }
             if (!terminated) throw Failure{DemangleStatus::malformed};
         }
-        if (negative && value > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()))
+        if (is_signed && value > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()))
             throw Failure{DemangleStatus::resource_limit};
         return (negative ? "-" : "") + std::to_string(value);
     }

@@ -129,9 +129,38 @@ without resolving the target or inferring dispatch behavior. Near static
 ordinary member-function type encoding. They render the decoded adjustment as
 encoded metadata, for example `public: adjustor thunk [this adjustment=-4] to
 void __thiscall Derived::run()`. The parser does not infer which base/derived
-object conversion the offset implements. Far static forms `H`, `P`, and `X`,
-virtual forms `$0` through `$5`, and extended virtual-adjustment records remain
-unsupported and preserve the raw symbol.
+object conversion the offset implements.
+
+Near virtual adjustor thunks recognize function classes `$0` (private), `$2`
+(protected), and `$4` (public). They decode two signed MSVC numbers in ABI
+order: the vtordisp offset, then the static `this` adjustment. The extended
+near forms `$R0`, `$R2`, and `$R4` prepend the signed vbptr offset and vbtable
+entry offset. For example, `?run@Derived@@$4?3A@AEXXZ` renders as
+`public: virtual adjustor thunk [vtordisp offset=-4, this adjustment=0] to void
+__thiscall Derived::run()`. The extended form
+`?run@Derived@@$R4A@7?3A@AEXXZ` reports `vbptr offset=0, vbtable entry offset=8,
+vtordisp offset=-4, this adjustment=0` in the same label. These values identify
+encoded fields only; HexLab does not calculate a runtime target or object
+layout. Scalar/vector deleting-destructor names can carry these same near
+virtual adjustor classes.
+
+Each signed field accepts the ordinary digit-biased or `A` through `P`
+hexadecimal number syntax, with an optional `?` negative marker and magnitude
+at most `9223372036854775807`. The member signature accepts an optional `E`
+ptr64 marker, optional `G`/`H` ref qualifier, `A` through `D` this-cv marker,
+and a supported calling convention. It requires `X` for an empty parameter
+list, `@` after a nonempty fixed list, or `Z` after a variadic list, followed
+by the `Z` throw terminator or `_E` noexcept marker. Existing bounded name,
+template, type, nesting, component, input, and output limits apply, including
+a component check for the two or four offset fields. Parsing must consume
+the entire symbol. Malformed numbers, missing fields or terminators, trailing
+bytes, unsupported signature types/backreferences, and exhausted bounds retain
+the raw spelling. Far static forms `H`, `P`, and `X`, far virtual classes
+`$1/$3/$5` and `$R1/$R3/$R5`, and other adjustment records remain unsupported.
+The field order and near/far class mapping follow LLVM's
+[Microsoft function-class and function-encoding parser](https://github.com/llvm/llvm-project/blob/main/llvm/lib/Demangle/MicrosoftDemangle.cpp).
+No tests were added or run for this slice. The standalone `hexlab_symbols`
+Debug target built with MSVC 19.44 and `BUILD_TESTING=OFF`.
 For `??_R1`, the bounded presentation grammar is
 `??_R1<number><signed-number><number><number><qualified-name>8`; the numeric
 fields follow the MSVC number syntax below, and only the second field accepts
