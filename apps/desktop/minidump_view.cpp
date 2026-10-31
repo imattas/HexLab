@@ -428,7 +428,9 @@ void MinidumpView::select_context(std::size_t row) {
         case 1: return decimal(reg.width);
         case 2: return register_value(reg);
         case 3: return hex_bytes(std::span(reg.bytes).first(std::min<std::size_t>(reg.bytes.size(), 16)));
-        case 4: return number(reg.file_offset.value);
+        case 4: return reg.byte_file_offsets.size() == reg.bytes.size() && !reg.byte_file_offsets.empty() &&
+                       reg.byte_file_offsets[0].value != reg.file_offset.value
+                   ? wxString{} : number(reg.file_offset.value);
         case 5: return address_register(*context, reg) && mapped_location(*document_, reg.value) ? number(reg.value) : wxString{};
         default: return {};
         }
@@ -442,7 +444,16 @@ void MinidumpView::select_register(std::size_t row) {
     if (c && row < std::min(c->registers.size(), register_limit)) {
         const auto &reg = c->registers[row];
         if (address_register(*c, reg)) register_target_ = mapped_location(*document_, reg.value);
-        register_source_ = source_location(*document_, reg.file_offset, reg.bytes.size());
+        bool contiguous = reg.byte_file_offsets.empty();
+        if (!reg.byte_file_offsets.empty() && reg.byte_file_offsets.size() == reg.bytes.size()) {
+            contiguous = true;
+            for (std::size_t byte = 1; byte < reg.byte_file_offsets.size(); ++byte)
+                if (reg.byte_file_offsets[byte].value != reg.byte_file_offsets[0].value + byte) {
+                    contiguous = false;
+                    break;
+                }
+        }
+        if (contiguous) register_source_ = source_location(*document_, reg.file_offset, reg.bytes.size());
     }
     register_go_->Enable(register_target_.has_value()); register_bytes_->Enable(register_source_.has_value());
 }

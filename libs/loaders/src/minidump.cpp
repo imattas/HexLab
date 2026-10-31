@@ -326,6 +326,27 @@ void add_arm64ec_candidate_overlay(MinidumpContext &context) {
         }
         aliases.push_back(std::move(alias));
     }
+    const auto add_composite = [&](std::string name, std::array<std::size_t, 4> fragments) {
+        MinidumpRegister alias;
+        alias.name = "arm64ec_candidate_" + std::move(name);
+        alias.width = 64;
+        alias.bytes.reserve(8);
+        alias.byte_file_offsets.reserve(8);
+        for (const auto offset : fragments) {
+            if (offset > context.captured_prefix.size() || context.captured_prefix.size() - offset < 2) return;
+            for (std::size_t byte = 0; byte < 2; ++byte) {
+                alias.bytes.push_back(context.captured_prefix[offset + byte]);
+                alias.byte_file_offsets.push_back({std::uint64_t{context.source_rva} + offset + byte});
+            }
+        }
+        for (std::size_t byte = 0; byte < alias.bytes.size(); ++byte)
+            alias.value |= std::uint64_t{std::to_integer<unsigned>(alias.bytes[byte])} << (byte * 8);
+        aliases.push_back(std::move(alias));
+    };
+    // ARM64EC_NT_CONTEXT in Windows SDK 10.0.26100.0 um/winnt.h stores
+    // each composite register as four noncontiguous 16-bit x87 slot fields.
+    add_composite("x16", {0x128, 0x138, 0x148, 0x158});
+    add_composite("x17", {0x168, 0x178, 0x188, 0x198});
     if (aliases.empty()) return;
     context.registers.insert(context.registers.begin() + static_cast<std::ptrdiff_t>(insert_at),
                              aliases.begin(), aliases.end());
