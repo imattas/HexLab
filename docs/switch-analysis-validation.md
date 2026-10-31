@@ -413,6 +413,17 @@ cross-block setup, and alternative load/sign-extension sequences remain
 unsupported. This is an API-only recovery extension; existing CLI site output
 reports the entry encoding and code target base.
 
+The same N64 recognizer accepts signed halfword offsets when the table uses
+`DSLL scaledIndex, selector, 1; LH target, tableBase, scaledIndex; DADDU
+target, codeBase, target; JR target`. Each two-byte slot is sign-extended by
+`LH` and added to the independently resolved code base. The table must be
+file-backed, and any slot covered by relocation metadata is rejected rather
+than interpreted as a raw displacement. Resolved targets must decode as
+executable MIPS64 instructions. Guarded counts still use the exact
+`SLTIU`/`BEQ` range proof; otherwise the analyzer retains only the verified
+prefix, up to 4096 entries. Other load/sign-extension sequences and
+cross-block dynamic values remain unsupported.
+
 MIPS32 O32 also recognizes a bounded signed-relative form:
 `LW target, tableBase, scaledIndex; ADDU target, codeBase, target; JR target`
 (the ADDU sources may be reversed). The scale is four, and the code base must
