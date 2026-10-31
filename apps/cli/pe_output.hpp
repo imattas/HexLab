@@ -108,6 +108,32 @@ inline void pe_description(std::ostream &out, const ImageMetadata &metadata, con
                             << escape_pe_version_text(verification.error().message) << ")\n";
                     }
                 };
+                const auto report_chain_trust = [&] {
+                    const auto verification = verify_pe_authenticode_trust(*image, metadata, index);
+                    if (!verification) {
+                        out << "PE Authenticode chain trust: unavailable ("
+                            << escape_pe_version_text(verification.error().message) << ")\n";
+                        return;
+                    }
+                    out << "PE Authenticode chain trust (Crypt32; local trust stores; revocation and timestamps unchecked):\n";
+                    constexpr std::size_t trust_output_limit = 32;
+                    const auto rows = (std::min)(verification.value().signers.size(), trust_output_limit);
+                    for (std::size_t signer_index = 0; signer_index < rows; ++signer_index) {
+                        const auto &status = verification.value().signers[signer_index];
+                        out << "  signer=" << signer_index
+                            << " signature=" << (status.signature_valid ? "verified" : "failed")
+                            << " chain=" << (status.chain_built ? "built" : "unavailable")
+                            << " chain-trusted=" << (status.chain_trusted ? "true" : "false")
+                            << " chain-errors=0x" << std::hex << status.chain_error_status
+                            << " policy-error=0x" << status.policy_error << std::dec;
+                        if (status.signature_error) out << " signature-error=0x" << std::hex << status.signature_error << std::dec;
+                        if (status.provider_error) out << " provider-error=0x" << std::hex << status.provider_error << std::dec;
+                        out << '\n';
+                    }
+                    if (rows < verification.value().signers.size())
+                        out << "  trust rows omitted=" << verification.value().signers.size() - rows
+                            << " (limit " << trust_output_limit << ")\n";
+                };
                 const auto match = inspect_pe_authenticode_digest(*image, metadata, index);
                 if (match) {
                     auto digest_text = [&](const Sha256Digest &digest) {
@@ -161,6 +187,7 @@ inline void pe_description(std::ostream &out, const ImageMetadata &metadata, con
                         << index << " (" << escape_pe_version_text(match.error().message) << ")\n";
                 }
                 report_signature_verification();
+                report_chain_trust();
             }
         }
         if (!digest_reported) {
