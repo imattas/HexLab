@@ -255,6 +255,26 @@ inline bool is_xmm_or_ymm(const Operand &operand, unsigned bits) noexcept {
         reg->bank == (bits == 128 ? RegisterBank::xmm : RegisterBank::ymm);
 }
 
+inline bool is_vex_context(const Instruction &instruction) noexcept {
+    return (instruction.context.architecture == Architecture::x86 &&
+            instruction.context.mode == ExecutionMode::x86_32) ||
+           (instruction.context.architecture == Architecture::x86_64 &&
+            instruction.context.mode == ExecutionMode::x86_64);
+}
+
+inline bool vex_registers_valid(const Instruction &instruction) noexcept {
+    if (instruction.context.mode != ExecutionMode::x86_32)
+        return true;
+    const auto valid = [](RegisterOperand reg) {
+        return (reg.bank != RegisterBank::xmm && reg.bank != RegisterBank::ymm) || reg.index < 8;
+    };
+    for (const auto &operand : instruction.operands)
+        if (const auto *reg = std::get_if<RegisterOperand>(&operand); reg && !valid(*reg))
+            return false;
+    return std::all_of(instruction.register_reads.begin(), instruction.register_reads.end(), valid) &&
+           std::all_of(instruction.register_writes.begin(), instruction.register_writes.end(), valid);
+}
+
 template <std::size_t Size>
 inline std::uint64_t load_lane(const std::array<std::byte, Size> &value,
                                unsigned offset, unsigned width) noexcept {
@@ -579,8 +599,7 @@ inline std::optional<X86AvxPackedResult> evaluate_x86_avx_packed(
     const Instruction &instruction, const std::array<std::byte, 32> &source1,
     const std::array<std::byte, 32> &source2) noexcept {
     using namespace x86_avx_detail;
-    if (instruction.context.architecture != Architecture::x86_64 ||
-        instruction.context.mode != ExecutionMode::x86_64 || instruction.operands.size() < 2 ||
+    if (!is_vex_context(instruction) || !vex_registers_valid(instruction) || instruction.operands.size() < 2 ||
         instruction.x86_evex ||
         instruction.x86_opmask || instruction.x86_opmask_zeroing)
         return std::nullopt;
@@ -1252,8 +1271,7 @@ inline std::optional<X86AvxFloatCompareResult> evaluate_x86_avx_float_compare(
     const Instruction &instruction, const std::array<std::byte, 32> &source1,
     const std::array<std::byte, 32> &source2, std::uint32_t mxcsr = 0x1f80) noexcept {
     using namespace x86_avx_detail;
-    if (instruction.context.architecture != Architecture::x86_64 ||
-        instruction.context.mode != ExecutionMode::x86_64 || instruction.x86_evex ||
+    if (!is_vex_context(instruction) || !vex_registers_valid(instruction) || instruction.x86_evex ||
         instruction.x86_opmask || instruction.x86_opmask_zeroing ||
         instruction.x86_evex_broadcast || instruction.x86_evex_sae ||
         (instruction.opcode != Opcode::vcmpps && instruction.opcode != Opcode::vcmppd) ||

@@ -4902,6 +4902,9 @@ a64_unhandled:
 
     const bool x86 = instruction.context.architecture == Architecture::x86 ||
                      instruction.context.architecture == Architecture::x86_64;
+    const bool x86_vex_context =
+        (instruction.context.architecture == Architecture::x86 && instruction.context.mode == ExecutionMode::x86_32) ||
+        (instruction.context.architecture == Architecture::x86_64 && instruction.context.mode == ExecutionMode::x86_64);
     if (x86 && (instruction.opcode == Opcode::xchg || instruction.opcode == Opcode::xadd ||
                 instruction.opcode == Opcode::cmpxchg) &&
         instruction.operands.size() == 2) {
@@ -4993,7 +4996,7 @@ a64_unhandled:
             return effect;
         }
     }
-    if (x86 && instruction.context.mode == ExecutionMode::x86_64 && !instruction.x86_evex &&
+    if (x86_vex_context && !instruction.x86_evex &&
         (instruction.opcode == Opcode::vcmpps || instruction.opcode == Opcode::vcmppd) &&
         (instruction.vector_bits == 128 || instruction.vector_bits == 256) &&
         instruction.operands.size() == 4 && !instruction.x86_opmask && !instruction.x86_opmask_zeroing) {
@@ -5439,8 +5442,7 @@ a64_unhandled:
             ((instruction.context.architecture == Architecture::x86_64) == (mode == ExecutionMode::x86_64)) &&
             destination->index < max_gprs && source->index < max_gprs &&
             instruction.vector_element_bits == lane_bits && operands[1]->type.bits == vector_bits &&
-            (!vex || (instruction.context.architecture == Architecture::x86_64 &&
-                      instruction.context.mode == ExecutionMode::x86_64)) &&
+            (!vex || x86_vex_context) &&
             source_reads && destination_writes &&
             instruction.register_reads == std::vector<RegisterOperand>{*source} &&
             instruction.register_writes == std::vector<RegisterOperand>{*destination} &&
@@ -5465,7 +5467,7 @@ a64_unhandled:
         }
     }
     if (const auto shape = x86_avx_detail::integer_dataflow_shape(instruction.opcode);
-        x86 && instruction.context.mode == ExecutionMode::x86_64 && shape &&
+        x86_vex_context && shape &&
         instruction.operands.size() == 3 && !instruction.x86_evex && !instruction.x86_opmask &&
         !instruction.x86_opmask_zeroing) {
         const auto destination = as_register(instruction.operands[0]);
@@ -5505,7 +5507,7 @@ a64_unhandled:
     }
 
     if (const auto lane = x86_avx_detail::absolute_lane_width(instruction.opcode);
-        x86 && instruction.context.mode == ExecutionMode::x86_64 && lane &&
+        x86_vex_context && lane &&
         instruction.operands.size() == 2 && !instruction.x86_evex && !instruction.x86_opmask &&
         !instruction.x86_opmask_zeroing) {
         const auto destination = as_register(instruction.operands[0]);
@@ -5540,7 +5542,7 @@ a64_unhandled:
     }
 
     if (const auto shape = x86_avx_detail::immediate_shift_shape(instruction.opcode);
-        x86 && instruction.context.mode == ExecutionMode::x86_64 && shape &&
+        x86_vex_context && shape &&
         instruction.operands.size() == 3 && !instruction.x86_evex && !instruction.x86_opmask &&
         !instruction.x86_opmask_zeroing) {
         const auto destination = as_register(instruction.operands[0]);

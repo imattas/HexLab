@@ -11,6 +11,14 @@ registers 8-15 are rejected, and BMI1/BMI2 forms with 64-bit operands remain
 opcodes, including VZEROUPPER, remain outside the typed subset, and x86-16
 VEX recognition is not enabled.
 
+The bounded packed-integer and floating-compare evaluators accept these x86-32
+instructions and validate that vector operands name registers 0-7. Matching
+typed decompiler paths now retain x86-32 VEX integer dataflow, lane operations,
+shifts, move masks, and floating comparisons. BMI1/BMI2 32-bit evaluator
+adapters accept the legacy register set while continuing to reject 64-bit
+operands outside long mode. Memory reads, CPU feature dispatch, and fault
+delivery remain caller-owned.
+
 Legacy `PSADBW` (`66 0F F6 /r`) is decoded as a destructive XMM operation with
 an XMM or 128-bit memory source. It sums eight unsigned byte absolute
 differences independently in each 8-byte half and writes the two sums into
