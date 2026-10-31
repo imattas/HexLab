@@ -793,6 +793,14 @@ int print_derived(std::ostream &out, const Arguments &args, const ProjectSnapsho
                    <<",\"payload_bytes\":"<<resource.payload.size()
                    <<",\"records\":"<<resource.records.size();
                 if(resource.resolution_input_index)out<<",\"resolved_input_index\":"<<*resource.resolution_input_index;
+                if(!resource.resolution_input_chain.empty()){
+                    out<<",\"resolved_input_chain\":[";
+                    for(std::size_t chain_index=0;chain_index<resource.resolution_input_chain.size();++chain_index){
+                        if(chain_index)out<<',';
+                        out<<resource.resolution_input_chain[chain_index];
+                    }
+                    out<<']';
+                }
                 if(!resource.implementation_hash.empty()){
                     constexpr std::size_t hash_prefix_bytes=32;
                     const auto hash_prefix=std::min(resource.implementation_hash.size(),hash_prefix_bytes);
@@ -856,6 +864,13 @@ int print_derived(std::ostream &out, const Arguments &args, const ProjectSnapsho
             }
             out << " resolution=" << resolution_name(resource.resolution);
             if(resource.resolution_input_index)out<<" resolved-input-index="<<*resource.resolution_input_index;
+            if(resource.resolution_input_chain.size()>1){
+                out<<" resolved-input-chain=";
+                for(std::size_t chain_index=0;chain_index<resource.resolution_input_chain.size();++chain_index){
+                    if(chain_index)out<<'>';
+                    out<<resource.resolution_input_chain[chain_index];
+                }
+            }
             if (resource.payload.size()||resource.data_size)
                 out << " payload-bytes=" << resource.payload.size() << " records=" << resource.records.size();
             out << '\n';

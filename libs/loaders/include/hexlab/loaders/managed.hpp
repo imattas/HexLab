@@ -175,6 +175,9 @@ struct ManagedResource {
   // an external provider was selected. This is provenance only; it is not a
   // path and does not imply that the provider was loaded by this library.
   std::optional<std::size_t> resolution_input_index;
+  // Ordered caller-input indexes followed through nested File/AssemblyRef
+  // resource providers. The first item is the direct provider.
+  std::vector<std::size_t> resolution_input_chain;
   std::string resolution_diagnostic;
   // Metadata offset points at ManifestResource row. For embedded resources,
   // payload preserves the exact bytes after the length prefix.
@@ -201,12 +204,16 @@ struct ManagedResourceResolutionLimits {
   std::size_t max_inputs=256;
   std::uint64_t max_input_bytes=512u*1024u*1024u;
   std::uint64_t max_payload_bytes=64u*1024u*1024u;
+  std::size_t max_provider_depth=16;
+  std::size_t max_provider_visits=4096;
 };
 // Resolves external resource entries only against explicitly supplied inputs.
 // File candidates require an exact name and supported, matching Assembly
 // HashAlgId/File.HashValue. AssemblyRef candidates require an exact identity,
 // matching AssemblyRef.HashValue when present, and a unique resource-name
-// match. No host paths are searched.
+// match. Nested File/AssemblyRef resource providers are followed within the
+// caller's input set and bounded provider depth/visit budgets. No host paths
+// are searched.
 HEXLAB_LOADERS_EXPORT Result<std::vector<ManagedResource>> inspect_managed_resources(
     const LoadedImage& loaded, std::span<const ManagedResourceInput> supplied,
     const ManagedResourceResolutionLimits& limits={}, std::stop_token stop={});
