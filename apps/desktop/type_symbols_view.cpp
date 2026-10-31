@@ -1292,6 +1292,62 @@ void TypeSymbolsView::import_header() {
         options.long_double_bytes = 8;
         options.long_double_alignment = 8;
     }
+    // Resolve only files inside the selected header's directory tree. The
+    // importer owns the include-count/depth/expanded-byte budgets; this
+    // callback supplies bounded bytes and stable canonical identities.
+    std::error_code root_error;
+    const auto include_root = std::filesystem::weakly_canonical(path.parent_path(), root_error);
+    if (!root_error) {
+        std::map<std::string, std::filesystem::path, std::less<>> include_paths;
+        include_paths.emplace("<input>", path);
+        std::uint64_t include_input_bytes = 0;
+        options.include_resolver = [include_root, &include_paths, &include_input_bytes,
+            byte_limit = options.max_input_bytes, total_limit = options.max_expanded_bytes](
+            std::string_view include_name, std::string_view including_id, bool angled)
+            -> std::optional<types::HeaderInclude> {
+            const auto including = include_paths.find(including_id);
+            if (including == include_paths.end() || include_name.empty() ||
+                include_name.find('\0') != std::string_view::npos) return {};
+            try {
+                const auto *begin = reinterpret_cast<const char8_t *>(include_name.data());
+                const std::filesystem::path requested(std::u8string(begin, begin + include_name.size()));
+                if (requested.empty() || requested.is_absolute() || requested.has_root_name() ||
+                    requested.has_root_directory()) return {};
+                std::vector<std::filesystem::path> candidates;
+                if (!angled) candidates.push_back(including->second.parent_path() / requested);
+                candidates.push_back(include_root / requested);
+                for (const auto &candidate : candidates) {
+                    std::error_code error;
+                    const auto resolved = std::filesystem::weakly_canonical(candidate, error);
+                    if (error) continue;
+                    const auto within_root = resolved.lexically_relative(include_root);
+                    if (within_root.empty() || within_root.is_absolute() || *within_root.begin() == "..") continue;
+                    const auto status = std::filesystem::symlink_status(resolved, error);
+                    if (error || !std::filesystem::is_regular_file(status)) continue;
+                    const auto size = std::filesystem::file_size(resolved, error);
+                    if (error || size > byte_limit || size > total_limit - include_input_bytes) continue;
+                    std::ifstream file(resolved, std::ios::binary);
+                    if (!file) continue;
+                    std::string contents(static_cast<std::size_t>(size), '\0');
+                    if (!contents.empty()) {
+                        file.read(contents.data(), static_cast<std::streamsize>(contents.size()));
+                        if (file.gcount() != static_cast<std::streamsize>(contents.size())) continue;
+                    }
+                    char extra = 0;
+                    file.read(&extra, 1);
+                    if (file.gcount() != 0) continue;
+                    include_input_bytes += size;
+                    const auto encoded = resolved.generic_u8string();
+                    const std::string id(reinterpret_cast<const char *>(encoded.data()), encoded.size());
+                    include_paths.insert_or_assign(id, resolved);
+                    return types::HeaderInclude{id, std::move(contents)};
+                }
+            } catch (const std::filesystem::filesystem_error &) {
+                return {};
+            }
+            return {};
+        };
+    }
     auto parsed = types::import_c_header(source, options);
     if (!parsed) {
         if (diagnostics_changed) diagnostics_changed({{"Header import", DiagnosticSeverity::error, parsed.error().message, {}, {}}});
