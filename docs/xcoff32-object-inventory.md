@@ -4,8 +4,8 @@
 AIX relocatable objects with magic `0x01df`. Callers can inspect an archive
 member without copying its payload by passing the storage returned by
 `open_ar_member`. The public API complements the existing XCOFF32 archive
-symbol summary and [XCOFF64 inventory](xcoff64-object-inventory.md); it is not
-wired into the CLI relocation audit.
+symbol summary and [XCOFF64 inventory](xcoff64-object-inventory.md). Ordinary
+relocation records are retained as metadata by the CLI inspect command.
 
 The result retains file flags, timestamp, symbol-slot count and table offset,
 string-table byte size, and the 40-byte section headers' names, flags, addresses,
@@ -23,19 +23,29 @@ The reader checks cancellation before and after storage reads and during section
 and symbol traversal, checks complete reads and table extents, and maps allocation
 failures to resource-limit errors. The string table may be absent when names are
 inline; when present, empty tables (size at most four bytes) are accepted. It
-checks ordinary 10-byte relocation and 6-byte line-number table extents without
-reading or decoding the rows. Section
+checks ordinary 10-byte relocation and 6-byte line-number table extents. Ordinary
+10-byte relocation rows are decoded into virtual address, zero-based symbol
+slot, raw `r_rsize`/`r_rtype` bytes and record file offset. A one-million-row
+aggregate limit bounds retained relocations, in addition to the shared 256 MiB
+metadata budget. The decoder checks cancellation, complete table extents,
+symbol-slot range and primary-slot membership (auxiliary slots are rejected),
+that each address is within the section relative to `s_paddr`, and ascending
+address order. The CLI displays each validated row with its section byte offset,
+symbol name when available, raw type and known name, bit width, signed flag and
+instruction-modified flag. This is metadata display only; no relocation is
+applied. Line-number rows remain extent-checked only. Section
 type flags determine whether raw data is BSS/TBSS; names are only metadata.
 A zero raw-data pointer denotes absent raw data, including in a nonempty section.
 
 The subset rejects executable (`F_EXEC`) objects, optional headers, deleted
 section headers and overflow sections/count sentinels. Loader-section payloads
-and their embedded loader relocation tables remain uninterpreted; ordinary
-section relocation and line-number rows are extent-checked only. It does not
+and their embedded loader relocation tables remain uninterpreted. Line-number
+rows are extent-checked only. It does not
 validate overlap between payload tables, decode auxiliary csect records,
-validate relocation symbol targets or arithmetic, decode line records, resolve
-symbols, apply relocations, or produce linked output. No runtime tests were
-added or run for this slice; the production loader target was compiled. This is
+interpret csect relocation semantics or relocation arithmetic, decode line
+records, resolve symbols beyond displaying names for validated slots, apply
+relocations, or produce linked output. No runtime tests were
+added or run for this slice. This is
 partial structural inspection, not full XCOFF support or verification of
 archive linking capability.
 

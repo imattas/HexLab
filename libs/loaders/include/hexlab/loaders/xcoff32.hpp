@@ -7,9 +7,16 @@
 #include <cstdint>
 #include <stop_token>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace hexlab {
+
+struct Xcoff32Relocation {
+    std::uint32_t virtual_address = 0, symbol_index = 0;
+    std::uint8_t size_info = 0, type = 0;
+    std::uint64_t file_offset = 0;
+};
 
 struct Xcoff32Section {
     std::uint32_t index = 0, flags = 0;
@@ -17,6 +24,7 @@ struct Xcoff32Section {
     std::uint32_t physical_address = 0, virtual_address = 0, size = 0;
     std::uint32_t data_file_offset = 0, relocation_file_offset = 0, line_number_file_offset = 0;
     std::uint16_t relocation_count = 0, line_number_count = 0;
+    std::vector<Xcoff32Relocation> relocations;
 };
 
 struct Xcoff32Object {
@@ -39,14 +47,16 @@ struct Xcoff32Object {
 struct Xcoff32ObjectLimits {
     std::size_t max_sections = 4096;
     std::uint32_t max_symbols = 1'000'000;
+    std::uint64_t max_relocations = 1'000'000;
     std::uint64_t max_metadata_bytes = 256ULL * 1024 * 1024;
     std::size_t max_name_bytes = 4096;
 };
 
 // Structural inventory of big-endian relocatable XCOFF32 without an optional
-// header. Checks ordinary relocation/line table extents but does not decode
-// or apply those rows. Overflow sections and loader relocation rows are
+// header. Decodes ordinary relocation rows as metadata but does not apply
+// them. Overflow sections and loader relocation rows are
 // explicitly unsupported. No csect interpretation or linking is performed.
+HEXLAB_LOADERS_EXPORT std::string_view xcoff32_relocation_type_name(std::uint8_t);
 HEXLAB_LOADERS_EXPORT Result<Xcoff32Object> inspect_xcoff32_object(
     const ByteStorage &, std::stop_token = {}, Xcoff32ObjectLimits = {});
 

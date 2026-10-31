@@ -1,4 +1,5 @@
 #include "hexlab/loaders/xcoff32.hpp"
+#include <algorithm>
 #include <limits>
 #include <new>
 #include <stdexcept>
@@ -45,7 +46,7 @@ std::vector<std::byte> read(const ByteStorage &storage, std::uint64_t offset,
 
 Result<Xcoff32Object> inspect_xcoff32_object(const ByteStorage &storage,
     std::stop_token stop, Xcoff32ObjectLimits limits) try {
-    require(limits.max_sections && limits.max_symbols && limits.max_metadata_bytes && limits.max_name_bytes,
+    require(limits.max_sections && limits.max_symbols && limits.max_relocations && limits.max_metadata_bytes && limits.max_name_bytes,
             "XCOFF32 object limits must be positive", ErrorCode::invalid_argument);
     std::uint64_t budget = 0;
     const auto header = read(storage, 0, 20, budget, limits, stop);
@@ -69,6 +70,7 @@ Result<Xcoff32Object> inspect_xcoff32_object(const ByteStorage &storage,
     const auto sections = read(storage, 20, section_bytes, budget, limits, stop);
     charge(std::uint64_t{section_count} * sizeof(Xcoff32Section), budget, limits);
     result.sections.reserve(section_count);
+    std::uint64_t relocation_total = 0;
     for (std::uint32_t index = 0; index < section_count; ++index) {
         canceled(stop);
         const auto row = std::span<const std::byte>(sections).subspan(std::size_t{index} * 40, 40);
@@ -100,6 +102,10 @@ Result<Xcoff32Object> inspect_xcoff32_object(const ByteStorage &storage,
                     "XCOFF32 section data exceeds file extent or overlaps headers");
         if (section.relocation_count) {
             require(type != 0x1000, "XCOFF32 loader relocation rows are unsupported", ErrorCode::unsupported);
+            require(section.relocation_file_offset != 0, "XCOFF32 relocation count has no file offset");
+            require(section.relocation_count <= limits.max_relocations - relocation_total,
+                    "XCOFF32 relocation count exceeds configured limit", ErrorCode::resource_limit);
+            relocation_total += section.relocation_count;
             require(section.relocation_file_offset >= header_end &&
                         contains(storage.size(), section.relocation_file_offset,
                                  std::uint64_t{section.relocation_count} * 10),
@@ -174,6 +180,42 @@ Result<Xcoff32Object> inspect_xcoff32_object(const ByteStorage &storage,
             i += 1 + result.symbols.back().auxiliary_count;
         }
     }
+
+    for (auto &section : result.sections) {
+        if (!section.relocation_count) continue;
+        canceled(stop);
+        const auto bytes_count = std::uint64_t{section.relocation_count} * 10;
+        const auto rows = read(storage, section.relocation_file_offset, bytes_count, budget, limits, stop);
+        charge(std::uint64_t{section.relocation_count} * sizeof(Xcoff32Relocation), budget, limits);
+        section.relocations.reserve(section.relocation_count);
+        std::uint32_t previous_address = 0;
+        bool have_previous = false;
+        for (std::uint32_t i = 0; i < section.relocation_count; ++i) {
+            canceled(stop);
+            const auto at = std::size_t{i} * 10;
+            const auto row = std::span<const std::byte>(rows).subspan(at, 10);
+            Xcoff32Relocation relocation;
+            relocation.virtual_address = be(row, 0, 4);
+            relocation.symbol_index = be(row, 4, 4);
+            relocation.size_info = static_cast<std::uint8_t>(be(row, 8, 1));
+            relocation.type = static_cast<std::uint8_t>(be(row, 9, 1));
+            relocation.file_offset = std::uint64_t{section.relocation_file_offset} + at;
+            require(relocation.symbol_index < result.symbol_count,
+                    "XCOFF32 relocation symbol index exceeds symbol table");
+            const auto symbol = std::lower_bound(result.symbols.begin(), result.symbols.end(), relocation.symbol_index,
+                [](const auto &candidate, auto slot) { return candidate.index < slot; });
+            require(symbol != result.symbols.end() && symbol->index == relocation.symbol_index,
+                    "XCOFF32 relocation refers to an auxiliary symbol slot");
+            require(relocation.virtual_address >= section.physical_address &&
+                        std::uint64_t{relocation.virtual_address} - section.physical_address < section.size,
+                    "XCOFF32 relocation address is outside its section");
+            require(!have_previous || relocation.virtual_address >= previous_address,
+                    "XCOFF32 section relocations are not in ascending address order");
+            previous_address = relocation.virtual_address;
+            have_previous = true;
+            section.relocations.push_back(relocation);
+        }
+    }
     canceled(stop);
     return result;
 } catch (const Failure &failure) {
@@ -182,6 +224,20 @@ Result<Xcoff32Object> inspect_xcoff32_object(const ByteStorage &storage,
     return Error{ErrorCode::resource_limit, "Cannot allocate bounded XCOFF32 object metadata"};
 } catch (const std::length_error &) {
     return Error{ErrorCode::resource_limit, "XCOFF32 object metadata exceeds host container limits"};
+}
+
+std::string_view xcoff32_relocation_type_name(std::uint8_t type) {
+    switch (type) {
+    case 0x00: return "R_POS"; case 0x01: return "R_NEG"; case 0x02: return "R_REL";
+    case 0x03: return "R_TOC"; case 0x05: return "R_GL"; case 0x06: return "R_TCL";
+    case 0x08: return "R_BA"; case 0x0a: return "R_BR"; case 0x0c: return "R_RL";
+    case 0x0d: return "R_RLA"; case 0x0f: return "R_REF"; case 0x12: return "R_TRL";
+    case 0x13: return "R_TRLA"; case 0x18: return "R_RBA"; case 0x1a: return "R_RBR";
+    case 0x20: return "R_TLS"; case 0x21: return "R_TLS_IE"; case 0x22: return "R_TLS_LD";
+    case 0x23: return "R_TLS_LE"; case 0x24: return "R_TLSM"; case 0x25: return "R_TLSML";
+    case 0x30: return "R_TOCU"; case 0x31: return "R_TOCL";
+    default: return "unknown";
+    }
 }
 
 } // namespace hexlab

@@ -2984,7 +2984,7 @@ int xcoff32_command(std::span<const std::wstring_view> args, std::ostream &out, 
     if (args.size() == 2 && args[1] == L"--help") {
         out << "Usage: hexlab_cli xcoff32 inspect <object>\n"
                "Show the bounded structural inventory of a big-endian XCOFF32 relocatable object.\n"
-               "Relocation and line-number rows are reported by extent only; they are not decoded or applied.\n";
+               "Ordinary relocation rows are decoded as metadata and never applied; line-number rows are extent-checked only.\n";
         return 0;
     }
     if (args.size() != 2 || args[0] != L"inspect") {
@@ -3011,6 +3011,22 @@ int xcoff32_command(std::span<const std::wstring_view> args, std::ostream &out, 
                 << std::dec << " relocations=" << section.relocation_count
                 << " line-rows=" << section.line_number_count
                 << " flags=0x" << std::hex << section.flags << std::dec << '\n';
+            for (const auto &relocation : section.relocations) {
+                const auto symbol = std::lower_bound(object.symbols.begin(), object.symbols.end(), relocation.symbol_index,
+                    [](const auto &candidate, auto slot) { return candidate.index < slot; });
+                const auto type_name = xcoff32_relocation_type_name(relocation.type);
+                out << "Relocation metadata: section=" << section.index
+                    << " address=0x" << std::hex << relocation.virtual_address
+                    << " section-byte-offset=0x" << (relocation.virtual_address - section.physical_address)
+                    << " record-offset=0x" << relocation.file_offset
+                    << " type=0x" << static_cast<unsigned>(relocation.type) << std::dec
+                    << " name=" << type_name
+                    << " bits=" << ((relocation.size_info & 0x3fu) + 1)
+                    << " signed=" << ((relocation.size_info & 0x80u) ? "true" : "false")
+                    << " instruction-modified=" << ((relocation.size_info & 0x40u) ? "true" : "false")
+                    << " symbol-slot=" << relocation.symbol_index
+                    << " symbol=" << (symbol != object.symbols.end() ? safe_text(symbol->name) : "<invalid>") << '\n';
+            }
         }
         for (const auto &symbol : object.symbols) {
             out << "Symbol slot=" << symbol.index << " name=" << safe_text(symbol.name)
@@ -3020,7 +3036,8 @@ int xcoff32_command(std::span<const std::wstring_view> args, std::ostream &out, 
                 << " storage-class=" << static_cast<unsigned>(symbol.storage_class)
                 << " auxiliary-slots=" << static_cast<unsigned>(symbol.auxiliary_count) << '\n';
         }
-        out << "Note: relocation and line-number rows are structurally bounded but uninterpreted; linking is unsupported.\n";
+        out << "Note: ordinary relocation fields are decoded as raw metadata and are not applied; "
+               "line-number rows remain uninterpreted and linking is unsupported.\n";
         return 0;
     } catch (const Failure &failure) {
         err << "XCOFF32: " << failure.error.message << '\n';
