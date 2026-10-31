@@ -535,6 +535,10 @@ struct ImportResult {
     std::vector<DwarfMacroUnit> macro_units;
     bool split_unit = false;
     std::optional<std::uint64_t> split_dwo_id;
+    // DWO IDs declared by skeleton units in this import. IDs only are retained
+    // so bounded sidecar discovery can match a DWP CU index without following
+    // DW_AT_dwo_name or DW_AT_comp_dir paths.
+    std::vector<std::uint64_t> split_dwo_ids;
     std::vector<std::string> diagnostics;
     // Exact DW_AT_str_offsets_base of the imported split compile unit, when
     // present. DWP macro strx operands use this same contribution identity.
