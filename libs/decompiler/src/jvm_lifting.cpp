@@ -1037,6 +1037,12 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
                 dst.trap_edges.push_back({i.address,TrapEdgeKind::may_trap,
                     "java.lang.NegativeArraySizeException from "+i.mnemonic_override,
                     bin("slt",length.value(),con(0,int32()),int32())});
+                // Heap availability is runtime-dependent. Preserve the
+                // allocation-failure edge without guessing a size threshold
+                // or treating the allocator as infallible.
+                dst.trap_edges.push_back({i.address,TrapEdgeKind::may_trap,
+                    "java.lang.OutOfMemoryError from "+i.mnemonic_override,
+                    unknown("jvm_array_allocation_out_of_memory",int32())});
                 if(op==0xbc){
                     static constexpr const char *types[]={"","","","","boolean","char","float","double","byte","short","int","long"};
                     const auto atype=imm(i);if(!atype||*atype<4||*atype>11)return no("newarray primitive type is invalid");element=types[*atype];
@@ -1144,6 +1150,9 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
                 }
                 dst.trap_edges.push_back({i.address,TrapEdgeKind::may_trap,
                     "java.lang.NegativeArraySizeException from multianewarray",negative_dimension});
+                dst.trap_edges.push_back({i.address,TrapEdgeKind::may_trap,
+                    "java.lang.OutOfMemoryError from multianewarray",
+                    unknown("jvm_multianewarray_out_of_memory",int32())});
                 Intrinsic allocation;allocation.name="jvm_multianewarray "+descriptor.value()+" dims="+std::to_string(*dimensions);
                 allocation.operands=std::move(sizes);allocation.memory_effect=IntrinsicMemoryEffect::unknown;allocation.result_type=ref32();
                 const auto description=allocation.name;emit(*fact,std::move(allocation));stack.push_back(evidence(unknown(description,ref32()),reference_descriptor(descriptor.value())));continue;
@@ -1320,6 +1329,9 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
                 if(!metadata)return no("object allocation requires JVM constant-pool metadata");
                 auto index=imm(i);if(!index)return no("class constant-pool index unavailable");
                 auto name=cp_class_name(*metadata,*index);if(!name)return name.error();
+                dst.trap_edges.push_back({i.address,TrapEdgeKind::may_trap,
+                    "java.lang.OutOfMemoryError from new",
+                    unknown("jvm_object_allocation_out_of_memory",int32())});
                 Intrinsic allocation;allocation.name="jvm_new "+name.value();allocation.memory_effect=IntrinsicMemoryEffect::unknown;allocation.result_type=ref32();
                 Reference allocated;
                 if (code) {
