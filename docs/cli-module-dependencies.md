@@ -97,6 +97,10 @@ Examples:
 `hexlab_cli modules --sysroot <root-directory> --discover --graph <ELF-root>`
 loads dependency metadata from exact filenames inside an explicit filesystem
 root. Repeat `--search-dir <directory>` to add directories inside that sysroot.
+Repeat `--ld-library-path-dir <directory>` to supply target
+`LD_LIBRARY_PATH` entries for the graph walk. These are explicit host paths
+inside the sysroot; HexLab never reads the host process environment. Both
+directory kinds share the 128-entry bound.
 The command never executes the binaries. It opens no ambient host library
 paths and does not enumerate directory trees. Extra supplied files retain
 input-order node IDs; discovered files follow in deterministic dependency and
@@ -129,9 +133,18 @@ to descendant basename dependencies. A module's own `DT_RUNPATH` suppresses
 its own `DT_RPATH` for both direct lookup and inheritance; it does not erase
 RPATH entries inherited from its ancestors.
 
+Caller-supplied `LD_LIBRARY_PATH` directories are considered after applicable
+own/inherited `DT_RPATH` entries and before the current object's `DT_RUNPATH`.
+Every compatible candidate is retained with `LD_LIBRARY_PATH` provenance,
+including duplicates across directories; the inventory does not claim a
+selected runtime provider. The user must provide each directory as a separate
+`--ld-library-path-dir` argument. Entries are canonicalized, must be
+directories beneath the sysroot, and cannot escape through symlinks.
+
 ```text
 hexlab_cli modules --sysroot ./sdk --discover --target-cwd ./sdk/app \
-  --lib-token lib64 --platform-token x86_64 --graph ./sdk/app/bin/tool
+  --ld-library-path-dir ./sdk/lib --lib-token lib64 --platform-token x86_64 \
+  --graph ./sdk/app/bin/tool
 ```
 
 The target working directory must be an existing directory inside the

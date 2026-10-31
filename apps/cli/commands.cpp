@@ -585,7 +585,7 @@ int modules_command(std::span<const std::wstring_view> arguments, std::ostream &
     std::optional<std::filesystem::path> sysroot;
     std::optional<std::filesystem::path> target_working_directory;
     std::string lib_token, platform_token;
-    std::vector<std::filesystem::path> discovery_directories;
+    std::vector<std::filesystem::path> discovery_directories, ld_library_path_directories;
     bool graph_mode = false, discover = false, glibc_system_search = false;
     std::size_t option_count = 0;
     while (option_count < arguments.size()) {
@@ -594,7 +594,7 @@ int modules_command(std::span<const std::wstring_view> arguments, std::ostream &
         if (option == L"--graph") graph_mode = true;
         else if (option == L"--discover") discover = true;
         else if (option == L"--glibc-system-search") glibc_system_search = true;
-        else if (option == L"--sysroot" || option == L"--search-dir" || option == L"--target-cwd" ||
+        else if (option == L"--sysroot" || option == L"--search-dir" || option == L"--ld-library-path-dir" || option == L"--target-cwd" ||
                  option == L"--lib-token" || option == L"--platform-token") {
             if (++option_count == arguments.size()) {
                 err << "Missing module discovery option value.\n"; return 2;
@@ -611,24 +611,26 @@ int modules_command(std::span<const std::wstring_view> arguments, std::ostream &
                 }
                 (option == L"--lib-token" ? lib_token : platform_token) = std::move(value);
             } else {
-                if (discovery_directories.size() >= 128) {
-                    err << "Module discovery accepts at most 128 explicit search directories.\n"; return 2;
+                auto &directories = option == L"--ld-library-path-dir"
+                    ? ld_library_path_directories : discovery_directories;
+                if (discovery_directories.size() + ld_library_path_directories.size() >= 128) {
+                    err << "Module discovery accepts at most 128 explicit and LD_LIBRARY_PATH directories combined.\n"; return 2;
                 }
-                discovery_directories.emplace_back(arguments[option_count]);
+                directories.emplace_back(arguments[option_count]);
             }
         } else break;
         ++option_count;
     }
     const auto inputs = arguments.subspan(option_count);
     if ((graph_mode && inputs.empty()) || (!graph_mode && inputs.size() < 2)) {
-        err << "Usage: hexlab_cli modules [--sysroot <directory>] [--discover] [--glibc-system-search] [--search-dir <directory>] [--target-cwd <directory>] [--lib-token <value>] [--platform-token <value>] [--graph] <binary>...\n"
+        err << "Usage: hexlab_cli modules [--sysroot <directory>] [--discover] [--glibc-system-search] [--search-dir <directory>] [--ld-library-path-dir <directory>] [--target-cwd <directory>] [--lib-token <value>] [--platform-token <value>] [--graph] <binary>...\n"
                "       Graph mode starts at the first binary. Discovery requires --graph and --sysroot.\n";
         return 2;
     }
     if ((sysroot && !graph_mode) || (discover && (!graph_mode || !sysroot)) ||
-        (!discovery_directories.empty() && !discover) ||
+        (!discovery_directories.empty() && !discover) || (!ld_library_path_directories.empty() && !discover) ||
         ((target_working_directory || !lib_token.empty() || !platform_token.empty() || glibc_system_search) && !discover)) {
-        err << "--discover requires --graph and --sysroot; --search-dir, target path substitutions and --glibc-system-search require --discover.\n";
+        err << "--discover requires --graph and --sysroot; --search-dir, --ld-library-path-dir, target path substitutions and --glibc-system-search require --discover.\n";
         return 2;
     }
     constexpr std::size_t max_graph_modules = 4096;
@@ -707,6 +709,7 @@ int modules_command(std::span<const std::wstring_view> arguments, std::ostream &
     path_context.target_working_directory = target_working_directory;
     path_context.lib_token = lib_token;
     path_context.platform_token = platform_token;
+    path_context.environment_directories = ld_library_path_directories;
     path_context.use_glibc_ld_so_cache = glibc_system_search;
     path_context.use_standard_default_directories = glibc_system_search;
     if (glibc_system_search && canonical_sysroot) {
@@ -741,6 +744,10 @@ int modules_command(std::span<const std::wstring_view> arguments, std::ostream &
     const auto supplied_count = modules.size();
     if (discover && !modules.front().document->metadata.elf && !modules.front().document->metadata.macho) {
         err << "Filesystem dependency discovery currently requires an ELF or Mach-O root.\n";
+        return 2;
+    }
+    if (discover && !ld_library_path_directories.empty() && !modules.front().document->metadata.elf) {
+        err << "--ld-library-path-dir is supported only for ELF dependency discovery.\n";
         return 2;
     }
     if (discover && modules.front().document->metadata.elf) {
@@ -860,6 +867,7 @@ int modules_command(std::span<const std::wstring_view> arguments, std::ostream &
                         candidate.source == ElfDependencyPathSource::runpath ? "DT_RUNPATH" :
                         candidate.source == ElfDependencyPathSource::rpath ? "DT_RPATH" :
                         candidate.source == ElfDependencyPathSource::inherited_rpath ? "inherited DT_RPATH" :
+                        candidate.source == ElfDependencyPathSource::environment_directory ? "LD_LIBRARY_PATH" :
                         candidate.source == ElfDependencyPathSource::glibc_cache ? "glibc ld.so.cache" :
                         candidate.source == ElfDependencyPathSource::default_directory ? "glibc default directory" :
                         "--search-dir";
