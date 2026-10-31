@@ -463,6 +463,41 @@ std::optional<Statement> lift_ppc_instruction(const Instruction &i, std::vector<
             return Assign{*dst, std::move(address)};
         return Store{std::move(address), reg(*dst)};
     }
+    if (i.opcode == Opcode::ppc_mffs && ops.size() == 1 && dst &&
+        dst->bank == RegisterBank::ppc_fpr && dst->width == 64) {
+        const R status{RegisterBank::ppc_fpscr, 0, 32, false};
+        const R record{RegisterBank::ppc_cr, 1, 4, false};
+        const bool writes_record = std::find(i.register_writes.begin(), i.register_writes.end(), record) !=
+                                   i.register_writes.end();
+        if (i.register_reads != std::vector<R>{status} ||
+            i.register_writes != (writes_record ? std::vector<R>{*dst, record} : std::vector<R>{*dst}))
+            return effect(i, "ppc_malformed_mffs_effects");
+        std::vector<ExpressionPtr> outputs{
+            std::make_shared<Expression>(Expression{floating(64), UnknownValue{"ppc_mffs_fpr_encoding"}})};
+        if (writes_record) outputs.push_back(ppc_fpscr_record_cr1(reg(status)));
+        return effect_with_outputs(i, "ppc_mffs", std::move(outputs));
+    }
+    if ((i.opcode == Opcode::ppc_mtfsb0 || i.opcode == Opcode::ppc_mtfsb1 ||
+         i.opcode == Opcode::ppc_mtfsfi || i.opcode == Opcode::ppc_mtfsf) && !ops.empty()) {
+        const R status{RegisterBank::ppc_fpscr, 0, 32, false};
+        const R record{RegisterBank::ppc_cr, 1, 4, false};
+        const bool writes_record = std::find(i.register_writes.begin(), i.register_writes.end(), record) !=
+                                   i.register_writes.end();
+        auto expected_writes = std::vector<R>{status};
+        if (writes_record) expected_writes.push_back(record);
+        const auto status_read = std::find(i.register_reads.begin(), i.register_reads.end(), status) !=
+                                 i.register_reads.end();
+        if (i.register_writes != expected_writes || !status_read)
+            return effect(i, "ppc_malformed_mtfs_effects");
+        const char *name = i.opcode == Opcode::ppc_mtfsb0 ? "ppc_mtfsb0" :
+                           i.opcode == Opcode::ppc_mtfsb1 ? "ppc_mtfsb1" :
+                           i.opcode == Opcode::ppc_mtfsfi ? "ppc_mtfsfi" : "ppc_mtfsf";
+        auto next_status = std::make_shared<Expression>(Expression{
+            integer(32), UnknownValue{std::string(name) + "_fpscr_after_update"}});
+        std::vector<ExpressionPtr> outputs{next_status};
+        if (writes_record) outputs.push_back(ppc_fpscr_record_cr1(next_status));
+        return effect_with_outputs(i, name, std::move(outputs));
+    }
     if ((i.opcode == Opcode::ppc_fcmpu || i.opcode == Opcode::ppc_fcmpo) && ops.size() == 3) {
         const auto *field = std::get_if<R>(&ops[0]);
         const auto *left = std::get_if<R>(&ops[1]);

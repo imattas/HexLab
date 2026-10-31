@@ -685,7 +685,9 @@ enum class Opcode {
     m65c02_tsb, m65c02_trb, m65c02_rmb, m65c02_smb,
     m65c02_bbr, m65c02_bbs, m65c02_wai, m65c02_stp,
     // RVV widening floating-point reductions; append for stable IDs.
-    rv_vfwredusum, rv_vfwredosum
+    rv_vfwredusum, rv_vfwredosum,
+    // PowerPC FPSCR transfer/control forms; append to preserve serialized IDs.
+    ppc_mffs, ppc_mtfsb0, ppc_mtfsb1, ppc_mtfsfi, ppc_mtfsf
 };
 enum class OperandAccess { read, write, read_write, address };
 // The encoded x86 group-one repeat prefix is retained separately from the

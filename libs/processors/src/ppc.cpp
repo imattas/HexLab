@@ -692,6 +692,59 @@ DecodeResult decode_powerpc(DecodeContext context, std::span<const std::byte> by
         } else {
             return fail(DecodeStatus::unsupported, "PowerPC opcode-31 X-form is outside the enabled integer subset");
         }
+    } else if (op == 63 && (((w >> 1) & 0x3ff) == 583 ||
+                            ((w >> 1) & 0x3ff) == 70 ||
+                            ((w >> 1) & 0x3ff) == 38 ||
+                            ((w >> 1) & 0x3ff) == 134)) {
+        const auto xo = (w >> 1) & 0x3ff;
+        const bool record = rc != 0;
+        if (xo == 583) { // mffs FRT
+            if (ra != 0 || rb != 0)
+                return fail(DecodeStatus::invalid, "PowerPC MFFS has nonzero reserved fields");
+            const auto destination = fpr(rt, 64);
+            i.opcode = Opcode::ppc_mffs;
+            i.operands = {destination};
+            i.access = {OperandAccess::write};
+            i.register_reads = {fpscr()};
+            i.register_writes = {destination};
+        } else if (xo == 70 || xo == 38) { // mtfsb0/mtfsb1 BT
+            if (ra != 0 || rb != 0)
+                return fail(DecodeStatus::invalid, "PowerPC MTFSB instruction has nonzero reserved fields");
+            i.opcode = xo == 70 ? Opcode::ppc_mtfsb0 : Opcode::ppc_mtfsb1;
+            i.operands = {ImmediateOperand{rt, 5, 5, false, {}}};
+            i.access = {OperandAccess::read};
+            i.register_reads = {fpscr()};
+            i.register_writes = {fpscr()};
+        } else { // mtfsfi BF,U; low RT and RB bits are reserved.
+            if ((rt & 3) != 0 || ra != 0 || (rb & 1) != 0)
+                return fail(DecodeStatus::invalid, "PowerPC MTFSFI has nonzero reserved fields");
+            const auto field = (rt >> 2) & 7;
+            const auto immediate = (rb >> 1) & 15;
+            i.opcode = Opcode::ppc_mtfsfi;
+            i.operands = {ImmediateOperand{field, 3, 3, false, {}},
+                          ImmediateOperand{immediate, 4, 4, false, {}}};
+            i.access = {OperandAccess::read, OperandAccess::read};
+            i.register_reads = {fpscr()};
+            i.register_writes = {fpscr()};
+        }
+        if (record) {
+            if (i.register_reads.empty() || i.register_reads.back() != fpscr())
+                i.register_reads.push_back(fpscr());
+            i.register_writes.push_back(cr1());
+        }
+    } else if (op == 63 && ((w >> 1) & 0x3ff) == 711) { // mtfsf FLM,FRB,L,W
+        const auto field_mask = (w >> 17) & 0xff;
+        const auto load_all = (w >> 25) & 1;
+        const auto word_select = (w >> 16) & 1;
+        const auto source = fpr(rb, 64);
+        i.opcode = Opcode::ppc_mtfsf;
+        i.operands = {ImmediateOperand{field_mask, 8, 8, false, {}}, source,
+                      ImmediateOperand{load_all, 1, 1, false, {}},
+                      ImmediateOperand{word_select, 1, 1, false, {}}};
+        i.access = {OperandAccess::read, OperandAccess::read, OperandAccess::read, OperandAccess::read};
+        i.register_reads = {source, fpscr()};
+        i.register_writes = {fpscr()};
+        if (rc) i.register_writes.push_back(cr1());
     } else if (op == 63 && ((w >> 1) & 0x3ff) == 0) {
         // Floating compare unordered. BF occupies the high three bits of the
         // nominal FRT field; the remaining two bits are reserved.
