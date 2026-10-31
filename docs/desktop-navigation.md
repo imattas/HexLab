@@ -143,6 +143,10 @@ Current-document literal name results are loaded in pages of at most 256.
 case-insensitively sorted, deduplicated result set; each page is searched on
 the existing background worker. A literal search examines at most 200,000
 source records per request and labels partial results if that bound is reached.
+Literal-match collection checks cancellation during source scans and uses a
+cancellable stable ordering pass before publishing a page. Each accepted result
+batch is capped at 256 rows; selection is retained by name and destination as
+additional pages arrive.
 Changing the query, scope, or mode cancels pending work and discards stale
 pages. Source vectors are collected lazily by the chooser's cancellable
 background worker after the dialog opens, so a large document does not block
@@ -328,3 +332,9 @@ The chooser scans at most 100,000 source entries and displays at most 4,096
 unique locations. Its prompt reports either bound when reached. The entries come
 from the immutable image snapshot; if the active document changes while the
 chooser is open, the selection is rejected and the chooser must be reopened.
+
+## Default analysis workspace
+
+HexLab keeps **Functions** and **Symbols** in dockable navigation panes on the left, the active binary views in the central notebook, and **Binary Metadata** and **Decompiler** in separate right-side panes. The decompiler stays visible beside the listing so address-synchronized pseudocode and assembly can be compared together. **Output** remains a bottom pane. Use View > Move Pane to Display or drag pane captions to resize, reorder, float, or dock these work areas.
+
+The center notebook contains Disassembly, Bytes, Graph, and Source. Saved view IDs remain stable across this layout: Disassembly 0, Bytes 1, Graph 2, Decompiler 3, and Source 4. Older desktop sessions and navigation history therefore retain their original view meaning.

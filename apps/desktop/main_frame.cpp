@@ -92,6 +92,7 @@
 #include <cstring>
 #include <functional>
 #include <fstream>
+#include <cstdlib>
 #include <initializer_list>
 #include <mutex>
 #include <set>
@@ -178,15 +179,15 @@ std::optional<std::vector<std::byte>> decode_recipe_hex(std::string_view encoded
     return bytes;
 }
 #ifdef HEXLAB_DESKTOP_PYTHON_CONSOLE
-constexpr std::array<const char *, 7> movable_pane_names{
-    "workspace", "functions", "symbols", "metadata", "debugger", "output", "python-console"};
-constexpr std::array<const char *, 7> movable_pane_labels{
-    "Disassembly / Graph / Pseudocode", "Functions", "Symbols", "Binary Metadata", "Debugger", "Output", "Python Console"};
+constexpr std::array<const char *, 8> movable_pane_names{
+    "workspace", "functions", "symbols", "metadata", "pseudocode", "debugger", "output", "python-console"};
+constexpr std::array<const char *, 8> movable_pane_labels{
+    "Listing / Bytes / Graph / Source", "Functions", "Symbols", "Binary Metadata", "Decompiler", "Debugger", "Output", "Python Console"};
 #else
-constexpr std::array<const char *, 6> movable_pane_names{
-    "workspace", "functions", "symbols", "metadata", "debugger", "output"};
-constexpr std::array<const char *, 6> movable_pane_labels{
-    "Disassembly / Graph / Pseudocode", "Functions", "Symbols", "Binary Metadata", "Debugger", "Output"};
+constexpr std::array<const char *, 7> movable_pane_names{
+    "workspace", "functions", "symbols", "metadata", "pseudocode", "debugger", "output"};
+constexpr std::array<const char *, 7> movable_pane_labels{
+    "Listing / Bytes / Graph / Source", "Functions", "Symbols", "Binary Metadata", "Decompiler", "Debugger", "Output"};
 #endif
 constexpr int dock_floating_panes_id = move_pane_id_base + static_cast<int>(movable_pane_names.size());
 constexpr int focus_pane_id_base = dock_floating_panes_id + 1;
@@ -1012,6 +1013,29 @@ struct MainFrame::Impl {
         int binary_view = -1;
         bool persistable = false;
     };
+    // Persisted navigation IDs remain stable: disassembly=0, bytes=1,
+    // graph=2, pseudocode=3, and source=4. Pseudocode now lives in its own
+    // dock pane, so the center notebook has no corresponding page.
+    static int page_index_for_view_id(int view_id) {
+        if (view_id >= 0 && view_id <= 2) return view_id;
+        if (view_id == 4) return 3;
+        return wxNOT_FOUND;
+    }
+    static int view_id_for_page_index(int page_index) {
+        if (page_index >= 0 && page_index <= 2) return page_index;
+        if (page_index == 3) return 4;
+        return wxNOT_FOUND;
+    }
+    static wxString view_name_for_id(int view_id) {
+        switch (view_id) {
+        case 0: return "Disassembly";
+        case 1: return "Bytes";
+        case 2: return "Graph";
+        case 3: return "Pseudocode";
+        case 4: return "Source";
+        default: return {};
+        }
+    }
     std::vector<NavigationEntry> navigation_history;
     std::size_t navigation_position = 0;
     bool restoring_navigation = false;
@@ -2527,10 +2551,17 @@ struct MainFrame::Impl {
         if (const auto active = manager.active_document()) {
             if (page_view_owner != active) {
                 const auto view = document_page_views.find(active->value);
-                const int selection = view != document_page_views.end() && pages && view->second >= 0 &&
-                    view->second < static_cast<int>(pages->GetPageCount()) ? view->second : 0;
+                const int restored = view != document_page_views.end()
+                    ? page_index_for_view_id(view->second) : wxNOT_FOUND;
+                const int selection = pages && restored >= 0 && restored < static_cast<int>(pages->GetPageCount())
+                    ? restored : 0;
                 if (pages && pages->GetSelection() != selection)
                     pages->ChangeSelection(static_cast<std::size_t>(selection));
+                if (view != document_page_views.end() && view->second == 3 && pseudocode) {
+                    frame.docking_.GetPane("pseudocode").Show();
+                    frame.docking_.Update();
+                    pseudocode->SetFocus();
+                }
                 page_view_owner = active;
             }
         } else {
@@ -2781,7 +2812,10 @@ struct MainFrame::Impl {
         entry.document = *id;
         entry.document_revision = document->revision;
         entry.location = std::move(location);
-        entry.binary_view = pages ? pages->GetSelection() : wxNOT_FOUND;
+        const auto active_id = controller->documents().active_document();
+        const auto saved_view = active_id ? document_page_views.find(active_id->value) : document_page_views.end();
+        entry.binary_view = saved_view != document_page_views.end()
+            ? saved_view->second : (pages ? view_id_for_page_index(pages->GetSelection()) : wxNOT_FOUND);
         if (document->project && document->project->state) {
             entry.project_uuid = document->project->state->uuid;
             entry.project_input = document->project->state->input;
@@ -2975,9 +3009,16 @@ struct MainFrame::Impl {
         entry.document_revision = document->revision;
         navigation_history[position] = std::move(entry);
         navigation_position = position;
-        if (restored_binary_view >= 0 && pages && restored_binary_view < static_cast<int>(pages->GetPageCount())) {
+        const int restored_page = page_index_for_view_id(restored_binary_view);
+        if (view_name_for_id(restored_binary_view) != wxString{} && pages) {
             center->SetSelection(1);
-            pages->SetSelection(restored_binary_view);
+            if (restored_page >= 0 && restored_page < static_cast<int>(pages->GetPageCount())) {
+                pages->SetSelection(restored_page);
+            } else if (restored_binary_view == 3 && pseudocode) {
+                frame.docking_.GetPane("pseudocode").Show();
+                frame.docking_.Update();
+                pseudocode->SetFocus();
+            }
         }
         changed();
         return true;
@@ -3018,9 +3059,10 @@ struct MainFrame::Impl {
             }
             auto label = i == navigation_position ? wxString("* ") : wxString("  ");
             label += document_label + "  " + location_text(entry.location);
-            if (entry.binary_view >= 0 && pages && entry.binary_view < static_cast<int>(pages->GetPageCount())) {
+            const auto view_name = view_name_for_id(entry.binary_view);
+            if (!view_name.empty()) {
                 label += "  [";
-                label += pages->GetPageText(static_cast<std::size_t>(entry.binary_view));
+                label += view_name;
                 label += "]";
             }
             choices.Add(label);
@@ -3104,8 +3146,7 @@ struct MainFrame::Impl {
                 path.assign(reinterpret_cast<const char *>(encoded.data()), encoded.size());
             }
             std::string view;
-            if (entry.binary_view >= 0 && pages && entry.binary_view < static_cast<int>(pages->GetPageCount()))
-                view = utf8(pages->GetPageText(static_cast<std::size_t>(entry.binary_view)));
+            view = utf8(view_name_for_id(entry.binary_view));
             const auto uuid = entry.project_uuid ? encode_recipe_hex(*entry.project_uuid) : std::string{};
             const auto digest = entry.project_input ? encode_recipe_hex(entry.project_input->sha256) : std::string{};
             if (json) {
@@ -3984,15 +4025,28 @@ struct MainFrame::Impl {
                         // Preserve Jump's exact-name fast path without scanning on the UI thread.
                         // Exact resolution includes checked named displacements and section bounds.
                         if (query.CmpNoCase(requested) == 0) {
-                            const auto exact = resolve_named_location_expression(
-                                sources->all, sources->sections, requested);
+                            auto exact = resolve_named_location_expression(
+                                sources->all, sources->sections, requested, &cancelled);
+                            if (cancelled.load(std::memory_order_relaxed))
+                                return NamedLocationSearch{{}, true, "source collection canceled"};
                             if (exact.location || exact.ambiguous) {
                                 NamedLocationSearch result;
-                                result.candidates = exact.candidates;
-                                result.truncated = sources->truncated;
-                                result.unique_exact_match = exact.location.has_value() && !sources->truncated;
+                                if (exact.location && !sources->truncated) {
+                                    result.candidates = std::move(exact.candidates);
+                                    result.unique_exact_match = true;
+                                    return result;
+                                }
+                                if (!cancellable_sort_named_candidates(exact.candidates, &cancelled))
+                                    return NamedLocationSearch{{}, true, "source collection canceled"};
+                                const auto begin = std::min(offset, exact.candidates.size());
+                                const auto end = std::min(exact.candidates.size(), begin + std::min<std::size_t>(page_size, 256));
+                                result.candidates.assign(exact.candidates.begin() + static_cast<std::ptrdiff_t>(begin),
+                                                         exact.candidates.begin() + static_cast<std::ptrdiff_t>(end));
+                                result.truncated = sources->truncated || end < exact.candidates.size();
                                 if (sources->truncated)
                                     result.limitation = "source snapshot capped at 200000 records";
+                                else if (end < exact.candidates.size())
+                                    result.limitation = "more exact-name destinations are available";
                                 return result;
                             }
                         }
@@ -4442,7 +4496,7 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
     view->Append(analysis_options_id, "Analysis Options...");
     view->Append(reanalyze_id, "Reanalyze Project\tCtrl+F5");
     view->Append(type_symbols_id, "Types & Symbols");
-    view->Append(pseudocode_id, "Pseudocode at Selection\tCtrl+D");
+    view->Append(pseudocode_id, "Show Decompiler at Selection\tCtrl+D");
     view->Append(plugins_panel_id, "Plugins");
 #ifdef HEXLAB_DESKTOP_PYTHON_CONSOLE
     view->Append(python_console_id, "Python Console");
@@ -4489,14 +4543,16 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
     pages->AddPage(ui.bytes, "Bytes");
     ui.graph = new GraphView(pages);
     pages->AddPage(ui.graph, "Graph");
-    ui.pseudocode = new PseudocodeView(pages);
-    pages->AddPage(ui.pseudocode, "Pseudocode");
     ui.source = new SourceView(pages);
     pages->AddPage(ui.source, "Source");
+    ui.pseudocode = new PseudocodeView(this);
+    ui.pseudocode->SetName("Decompiler view");
     pages->Bind(wxEVT_NOTEBOOK_PAGE_CHANGED, [this](wxBookCtrlEvent &event) {
         if (event.GetSelection() >= 0) {
-            if (const auto active = impl_->controller->documents().active_document())
-                impl_->document_page_views.insert_or_assign(active->value, event.GetSelection());
+            if (const auto active = impl_->controller->documents().active_document()) {
+                const auto view_id = Impl::view_id_for_page_index(event.GetSelection());
+                if (view_id >= 0) impl_->document_page_views.insert_or_assign(active->value, view_id);
+            }
         }
         event.Skip();
     });
@@ -4671,37 +4727,6 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
     };
     ui.center->AddPage(pages, "Binary");
     ui.listing->navigate = [this](Location location) { Navigate(location); };
-    ui.strings->comment = [this, strings = ui.strings](Location location) {
-        const auto id = projects().active_document();
-        if (!id) return;
-        const auto project = projects().project(*id);
-        const auto actor = projects().actor(*id);
-        if (actor && actor->view().untitled) {
-            const auto existing = strings->standalone_comment(location).value_or(wxString{});
-            wxTextEntryDialog dialog(this,
-                "This note is saved immediately in local workspace preferences for this exact input.",
-                "Standalone string comment", existing, wxOK | wxCANCEL | wxTE_MULTILINE);
-            if (dialog.ShowModal() != wxID_OK) return;
-            if (!strings->set_standalone_comment(location, dialog.GetValue()))
-                impl_->log_to(*id, "Standalone string comment was not saved; it may exceed the local comment limits or the selected string changed.");
-            return;
-        }
-        if (!project || !project->state || project->mode == database::ProjectMode::read_only) {
-            impl_->log_to(*id, "String comments require a writable project.");
-            return;
-        }
-        const auto *existing = annotation_at(*project, location);
-        auto dialog = edit_dialog(this, "Comment string", "Project comment:",
-                                  existing ? text(existing->comment) : wxString{}, true,
-                                  [location](const wxString &value) -> Result<ProjectCommand> {
-                                      const auto encoded = value.utf8_str();
-                                      return ProjectCommand{Comment{
-                                          location, std::string(encoded.data(), encoded.length())}};
-                                  });
-        if (!dialog) return;
-        auto result = impl_->controller->execute(*id, std::move(*dialog));
-        if (!result) impl_->controller->documents().report_error(*id, result.error());
-    };
     ui.bytes->navigate = ui.listing->navigate;
     ui.bytes->submit = [this](ProjectCommand command) {
         const auto id = projects().active_document();
@@ -4767,15 +4792,17 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
                                         .Caption("Functions")
                                         .Left()
                                         .Position(0)
-                                        .BestSize(FromDIP(wxSize(260, 250)))
-                                        .MinSize(FromDIP(wxSize(160, 100))));
+                                        .Row(0)
+                                        .BestSize(FromDIP(wxSize(300, 320)))
+                                        .MinSize(FromDIP(wxSize(190, 140))));
     docking_.AddPane(symbol_panel, wxAuiPaneInfo()
                                      .Name("symbols")
                                      .Caption("Symbols")
                                      .Left()
                                      .Position(1)
-                                     .BestSize(FromDIP(wxSize(260, 200)))
-                                     .MinSize(FromDIP(wxSize(160, 100))));
+                                     .Row(0)
+                                     .BestSize(FromDIP(wxSize(300, 250)))
+                                     .MinSize(FromDIP(wxSize(190, 120))));
     auto *metadata = new wxNotebook(this, wxID_ANY);
     ui.metadata_pages = metadata;
     metadata->SetName("Binary metadata pane");
@@ -4833,6 +4860,37 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
     segments_panel->SetSizer(segments_layout);
     ui.strings = new StringBrowserView(metadata);
     ui.strings->navigate = [this](Location location) { Navigate(location); };
+    ui.strings->comment = [this, strings = ui.strings](Location location) {
+        const auto id = projects().active_document();
+        if (!id) return;
+        const auto project = projects().project(*id);
+        const auto actor = projects().actor(*id);
+        if (actor && actor->view().untitled) {
+            const auto existing = strings->standalone_comment(location).value_or(wxString{});
+            wxTextEntryDialog dialog(this,
+                "This note is saved immediately in local workspace preferences for this exact input.",
+                "Standalone string comment", existing, wxOK | wxCANCEL | wxTE_MULTILINE);
+            if (dialog.ShowModal() != wxID_OK) return;
+            if (!strings->set_standalone_comment(location, dialog.GetValue()))
+                impl_->log_to(*id, "Standalone string comment was not saved; it may exceed the local comment limits or the selected string changed.");
+            return;
+        }
+        if (!project || !project->state || project->mode == database::ProjectMode::read_only) {
+            impl_->log_to(*id, "String comments require a writable project.");
+            return;
+        }
+        const auto *existing = annotation_at(*project, location);
+        auto dialog = edit_dialog(this, "Comment string", "Project comment:",
+                                  existing ? text(existing->comment) : wxString{}, true,
+                                  [location](const wxString &value) -> Result<ProjectCommand> {
+                                      const auto encoded = value.utf8_str();
+                                      return ProjectCommand{Comment{
+                                          location, std::string(encoded.data(), encoded.length())}};
+                                  });
+        if (!dialog) return;
+        auto result = impl_->controller->execute(*id, std::move(*dialog));
+        if (!result) impl_->controller->documents().report_error(*id, result.error());
+    };
     auto *imports_panel = new wxPanel(metadata);
     auto *imports_layout = new wxBoxSizer(wxVERTICAL);
     ui.import_filter = new wxTextCtrl(imports_panel, wxID_ANY, {}, wxDefaultPosition, wxDefaultSize, wxTE_PROCESS_ENTER);
@@ -4929,7 +4987,8 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
     macho_box->Add(ui.macho_details, 0, wxEXPAND | wxTOP, FromDIP(4));
     macho_box->Add(ui.macho_open_slice, 0, wxALL, FromDIP(4));
     macho_panel->SetSizer(macho_box);
-    ui.macho_objc = new VirtualTable(metadata, "macho-objc",
+    auto *macho_objc_panel = new wxPanel(metadata);
+    ui.macho_objc = new VirtualTable(macho_objc_panel, "macho-objc",
                                      {"Kind", "Owner", "Name", "Address", "Status", "Provenance", "Details"});
     ui.macho_objc->SetToolTip("Objective-C runtime records from the bounded scan of the displayed Mach-O snapshot. Activate an addressable row to navigate.");
     ui.macho_objc->Bind(wxEVT_LIST_COL_CLICK, [this](wxListEvent &event) {
@@ -4950,16 +5009,16 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
         }
         impl_->display_macho_objc_rows(impl_->macho_objc_source, impl_->macho_objc_rows);
     });
-    ui.macho_objc_filter = new wxTextCtrl(metadata, wxID_ANY);
+    ui.macho_objc_filter = new wxTextCtrl(macho_objc_panel, wxID_ANY);
     ui.macho_objc_filter->SetName("macho-objc-filter");
     ui.macho_objc_filter->SetHint("Filter kind, class, selector, status, provenance, or details");
     ui.macho_objc_filter->SetToolTip("Case-insensitive filter over the loaded Objective-C runtime rows. Activating a filtered row still navigates to its original address.");
-    ui.macho_objc_filter_status = new wxStaticText(metadata, wxID_ANY, "No runtime records loaded");
-    ui.macho_objc_import_types = new wxButton(metadata, wxID_ANY, "Import Objective-C types");
+    ui.macho_objc_filter_status = new wxStaticText(macho_objc_panel, wxID_ANY, "No runtime records loaded");
+    ui.macho_objc_import_types = new wxButton(macho_objc_panel, wxID_ANY, "Import Objective-C types");
     ui.macho_objc_import_types->SetName("macho-objc-import-types");
     ui.macho_objc_import_types->Enable(false);
     ui.macho_objc_import_types->SetToolTip("Persist class instance layouts and parsed method signatures from validated Objective-C runtime records.");
-    ui.macho_objc_pseudocode = new wxButton(metadata, wxID_ANY, "Pseudocode at implementation");
+    ui.macho_objc_pseudocode = new wxButton(macho_objc_panel, wxID_ANY, "Pseudocode at implementation");
     ui.macho_objc_pseudocode->SetName("macho-objc-pseudocode");
     ui.macho_objc_pseudocode->Enable(false);
     ui.macho_objc_pseudocode->SetToolTip("Open the selected method implementation in the pseudocode view when the runtime record has an exact implementation address.");
@@ -4968,11 +5027,15 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
         const auto implementation = impl_->selected_macho_objc_implementation();
         if (!doc || !implementation || !impl_->navigate_from_document(doc, *implementation)) return;
         if (impl_->pages && impl_->pseudocode) {
-            impl_->pages->SetSelection(impl_->pages->FindPage(impl_->pseudocode));
+            docking_.GetPane("pseudocode").Show();
+            docking_.Update();
+            if (const auto active = impl_->controller->documents().active_document())
+                impl_->document_page_views.insert_or_assign(active->value, 3);
+            impl_->pseudocode->SetFocus();
             impl_->sync();
         }
     });
-    ui.macho_objc_copy_row = new wxButton(metadata, wxID_ANY, "Copy selected row");
+    ui.macho_objc_copy_row = new wxButton(macho_objc_panel, wxID_ANY, "Copy selected row");
     ui.macho_objc_copy_row->SetName("macho-objc-copy-row");
     ui.macho_objc_copy_row->Enable(false);
     ui.macho_objc_copy_row->SetToolTip("Copy all visible fields for the selected Objective-C runtime record.");
@@ -5051,7 +5114,7 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
     });
     auto *macho_objc_layout = new wxBoxSizer(wxVERTICAL);
     auto *macho_objc_filter_row = new wxBoxSizer(wxHORIZONTAL);
-    macho_objc_filter_row->Add(new wxStaticText(metadata, wxID_ANY, "Filter"), 0,
+    macho_objc_filter_row->Add(new wxStaticText(macho_objc_panel, wxID_ANY, "Filter"), 0,
                                wxALL | wxALIGN_CENTER_VERTICAL, FromDIP(3));
     macho_objc_filter_row->Add(ui.macho_objc_filter, 1, wxALL | wxEXPAND, FromDIP(3));
     macho_objc_filter_row->Add(ui.macho_objc_filter_status, 0,
@@ -5061,12 +5124,7 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
     macho_objc_layout->Add(ui.macho_objc_pseudocode, 0, wxALL, FromDIP(3));
     macho_objc_layout->Add(ui.macho_objc_copy_row, 0, wxALL, FromDIP(3));
     macho_objc_layout->Add(ui.macho_objc, 1, wxEXPAND);
-    auto *macho_objc_panel = new wxPanel(metadata);
     macho_objc_panel->SetSizer(macho_objc_layout);
-    ui.macho_objc->Reparent(macho_objc_panel);
-    ui.macho_objc_filter->Reparent(macho_objc_panel);
-    ui.macho_objc_filter_status->Reparent(macho_objc_panel);
-    ui.macho_objc_copy_row->Reparent(macho_objc_panel);
     const auto update_objc_pseudocode_action = [this, button = ui.macho_objc_pseudocode](wxListEvent &) {
         if (button) button->Enable(impl_->selected_macho_objc_implementation().has_value());
     };
@@ -5462,8 +5520,18 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
                                    .Name("metadata")
                                    .Caption("Binary Metadata")
                                    .Right()
-                                   .BestSize(FromDIP(wxSize(380, 400)))
-                                   .MinSize(FromDIP(wxSize(180, 120))));
+                                   .Row(0)
+                                   .Position(0)
+                                   .BestSize(FromDIP(wxSize(340, 400)))
+                                   .MinSize(FromDIP(wxSize(220, 160))));
+    docking_.AddPane(ui.pseudocode, wxAuiPaneInfo()
+                                        .Name("pseudocode")
+                                        .Caption("Decompiler")
+                                        .Right()
+                                        .Row(0)
+                                        .Position(1)
+                                        .BestSize(FromDIP(wxSize(500, 600)))
+                                        .MinSize(FromDIP(wxSize(280, 220))));
     ui.debugger = new DebuggerView(this, {}, [this] {
         return impl_->controller ? impl_->controller->state().current() : std::shared_ptr<const DocumentSnapshot>{};
     }, [this](DocumentId id, Location location) {
@@ -5523,8 +5591,8 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
                                     .Name("output")
                                     .Caption("Output")
                                     .Bottom()
-                                    .BestSize(FromDIP(wxSize(800, 140)))
-                                    .MinSize(FromDIP(wxSize(200, 80))));
+                                    .BestSize(FromDIP(wxSize(900, 170)))
+                                    .MinSize(FromDIP(wxSize(300, 90))));
     ui.search = new SearchView(this);
     docking_.AddPane(ui.search, wxAuiPaneInfo()
                                     .Name("search")
@@ -5934,7 +6002,11 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
     }, plugins_panel_id);
     Bind(wxEVT_MENU, [this](wxCommandEvent &) {
         if (impl_->pages && impl_->pseudocode) {
-            impl_->pages->SetSelection(impl_->pages->FindPage(impl_->pseudocode));
+            docking_.GetPane("pseudocode").Show();
+            docking_.Update();
+            if (const auto active = impl_->controller->documents().active_document())
+                impl_->document_page_views.insert_or_assign(active->value, 3);
+            impl_->pseudocode->SetFocus();
             impl_->sync();
         }
     }, pseudocode_id);
@@ -6377,11 +6449,11 @@ void MainFrame::SaveWorkspaceSession() {
         }
         if (active_id && document.id == *active_id) active = static_cast<long>(entries.size());
         if (const auto selected = projects().selection(document.id)) entry.location = *selected;
-        if (active_id && document.id == *active_id && impl_->pages)
-            entry.view = static_cast<int>(impl_->pages->GetSelection());
-        else if (const auto view = impl_->document_page_views.find(document.id.value);
+        if (const auto view = impl_->document_page_views.find(document.id.value);
                  view != impl_->document_page_views.end())
             entry.view = view->second;
+        else if (active_id && document.id == *active_id && impl_->pages)
+            entry.view = Impl::view_id_for_page_index(impl_->pages->GetSelection());
         entries.push_back(std::move(entry));
     }
     const auto previous_path = config->GetPath();

@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.1.1 — 2026-10-31
+
+### Improved
+
+- Dockable Ghidra-inspired workspace with a dedicated decompiler pane beside
+  the listing, separate Functions and Symbols navigation, and independent
+  metadata and output panes. Existing saved view IDs remain compatible.
+- Graph canvas pans by dragging empty space with the left mouse button;
+  middle-button panning and node movement remain available.
+- CLI help is grouped and easier to scan. The new `hexdump` command prints
+  address, hexadecimal, and ASCII columns with bounded `--offset`, `--length`,
+  and `--width` options.
+- Name search checks and sorting can be canceled during large searches, and
+  ambiguous exact-name matches are returned in bounded pages.
+- Fixed desktop startup initialization order so the String browser callback is
+  installed only after the view exists, and corrected Objective-C metadata
+  control parenting.
+
 ## 0.1.0 — 2026-10-31
 
 First public HexLab release. This version packages the current C++20 analysis

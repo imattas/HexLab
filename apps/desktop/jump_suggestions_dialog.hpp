@@ -319,7 +319,8 @@ private:
         for (std::size_t i = 0; i < candidates_.size(); ++i) {
             rows.Add(describe_(candidates_[i]));
             if (selected && candidates_[i].location == selected->location &&
-                candidates_[i].document == selected->document) preserved = static_cast<int>(i);
+                candidates_[i].document == selected->document && candidates_[i].name == selected->name)
+                preserved = static_cast<int>(i);
         }
         list_->Set(rows);
         if (!candidates_.empty()) list_->SetSelection(preserved);

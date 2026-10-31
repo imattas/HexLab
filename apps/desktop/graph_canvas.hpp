@@ -77,6 +77,7 @@ class GraphCanvas final : public wxPanel {
     double scale_ = 1;
     GraphPoint origin_{24, 24};
     bool dragging_ = false;
+    bool left_pan_dragging_ = false;
     bool node_dragging_ = false, node_drag_moved_ = false;
     std::optional<GraphNodeId> drag_node_;
     wxPoint node_drag_start_;
