@@ -210,10 +210,15 @@ A body conditional may also leave through a return-only decision tree of at
 most 64 blocks while its other edge continues toward the latch. Multiple such
 regions may occur in sequence and may mix with the body diamonds.
 The tree may contain straight-line blocks and nested two-way conditionals;
-every leaf ends in a terminal return. Each nonterminal tree block has exactly
-its parent edge as its sole CFG predecessor, and every nested branch has two
-resolved, distinct successors matching the true and false edges. Terminal
-returns may be shared by multiple guarded side arms or by a side arm and the
+every leaf ends in a terminal return. A nonterminal block may be reached by
+multiple branches inside the same tree when all of its actual CFG predecessors
+are represented in that tree. The formatter expands that shared block at each
+guarded path and lowers its register phis using the path's exact incoming edge;
+each expansion counts toward the 64-block budget. Edges back to an ancestor,
+external predecessors, and blocks already claimed by another region remain
+unsupported. Every nested branch has two resolved, distinct successors
+matching the true and false edges. Terminal returns may be shared by multiple
+guarded side arms or by a side arm and the
 ordinary loop-exit cleanup. Every actual predecessor of a shared terminal
 return must be one of those recognized edges, with an exact SSA phi input.
 The formatter emits
@@ -221,8 +226,8 @@ the tree only under the original side-return predicate, preserves each nested
 branch polarity, and lowers register phi copies on each actual incoming edge.
 It lowers the continuing edge before the remaining loop body. Each shared
 terminal return is emitted on its selected path after that edge's phi copies;
-only one such path executes. Shared nonterminal cleanup, other joins, cycles,
-and unrecognized side entries retain explicit flow.
+only one such path executes. Shared blocks across separate side-return trees,
+other joins, cycles, and unrecognized side entries retain explicit flow.
 
 Each accepted conditional region records its branch and unique continuing
 block on the body spine. All arms and nonterminal return-tree blocks must be

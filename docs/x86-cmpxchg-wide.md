@@ -8,8 +8,16 @@ The instruction accepts `LOCK`; other `/r` group extensions remain outside
 this implementation.
 
 The decompiler preserves the memory operation and implicit input/output
-register effects as `x86_cmpxchg8b` or `x86_cmpxchg16b` intrinsics. Compare,
-conditional memory replacement, and ZF behavior remain opaque because the
-current IR does not model a conditional atomic memory update. The decoder does
-not perform CPUID feature gating, and detailed flag definedness is not
-represented by the current flags effect metadata.
+register effects as `x86_cmpxchg8b` or `x86_cmpxchg16b` intrinsics. It does not
+model a conditional atomic memory update.
+
+The pure `evaluate_x86_cmpxchg_wide` helper and decoded adapter
+`evaluate_x86_cmpxchg_wide_instruction` model the comparison, conditional
+memory replacement, accumulator-pair reload on mismatch, and exact ZF update.
+The input and result represent the remaining tracked FLAGS bits unchanged.
+They accept caller-supplied memory/register values and do not perform memory
+access, report memory faults, or provide atomicity for LOCK-prefixed forms.
+See [wide compare-exchange semantics](x86-cmpxchg-wide-semantics.md).
+
+The decoder does not perform CPUID feature gating. It records a FLAGS read as
+well as a write so consumers preserve the non-ZF bits.

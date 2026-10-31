@@ -230,6 +230,12 @@ PluginsView::PluginsView(wxWindow *parent, std::shared_ptr<plugins::ModuleProvid
     candidate_controls->Add(plan_button_, 0, wxRIGHT, FromDIP(4));
     candidate_controls->Add(load_dependencies_button_, 0, wxRIGHT, FromDIP(4));
     candidate_controls->Add(install_candidate_button_, 0, wxRIGHT, FromDIP(4));
+    verify_candidate_signature_button_ = new wxButton(this, wxID_ANY, "Check Authenticode Trust");
+    verify_candidate_signature_button_->SetName("plugin-candidate-authenticode");
+    verify_candidate_signature_button_->SetToolTip(
+        "Check the current Windows Authenticode trust policy without loading the module.");
+    verify_candidate_signature_button_->Enable(false);
+    candidate_controls->Add(verify_candidate_signature_button_, 0, wxRIGHT, FromDIP(4));
     toggle_candidate_button_ = new wxButton(this, wxID_ANY, "Block Future Activation");
     toggle_candidate_button_->SetName("plugin-candidate-toggle-enabled");
     candidate_controls->Add(toggle_candidate_button_, 0, wxRIGHT, FromDIP(4));
@@ -328,6 +334,8 @@ PluginsView::PluginsView(wxWindow *parent, std::shared_ptr<plugins::ModuleProvid
     export_candidates_button_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { export_candidate_report(); });
     load_candidate_button_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { load_candidate(); });
     install_candidate_button_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { install_candidate(); });
+    verify_candidate_signature_button_->Bind(wxEVT_BUTTON,
+        [this](wxCommandEvent &) { verify_candidate_signature(); });
     toggle_candidate_button_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { toggle_candidate_enabled(); });
     plan_button_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { plan_candidate(); });
     load_dependencies_button_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { load_candidate_dependencies(); });
@@ -730,6 +738,37 @@ void PluginsView::load_candidate() {
     }, true, "Loading selected plugin candidate...");
 }
 
+void PluginsView::verify_candidate_signature() {
+    if (operation_pending_) return;
+    const auto selected = selected_candidate_index();
+    if (!selected) {
+        report("Select a discovered candidate before checking its Authenticode signature.");
+        return;
+    }
+    const auto path = candidate_rows_[*selected].path;
+    start_operation([path] {
+        const auto checked = plugins::verify_plugin_authenticode_trust(std::filesystem::u8path(path));
+        if (!checked)
+            return OperationResult{"Authenticode check failed: " + checked.error().message, false};
+        OperationResult result;
+        result.signature_path = path;
+        result.signature_trust = checked.value();
+        switch (checked.value().status) {
+        case plugins::PluginAuthenticodeTrustStatus::trusted:
+            result.message = "Windows Authenticode policy trusts the selected module. This does not sandbox it.";
+            break;
+        case plugins::PluginAuthenticodeTrustStatus::not_trusted:
+            result.message = "Windows Authenticode policy did not trust the selected module (provider status " +
+                std::to_string(checked.value().provider_status) + ").";
+            break;
+        case plugins::PluginAuthenticodeTrustStatus::unsupported:
+            result.message = "No Authenticode trust provider is available on this platform.";
+            break;
+        }
+        return result;
+    }, false, "Checking platform Authenticode trust without loading the module...");
+}
+
 void PluginsView::install_candidate() {
     if (operation_pending_) return;
     const auto selected = selected_candidate_index();
@@ -1053,6 +1092,7 @@ void PluginsView::start_operation(std::function<OperationResult()> operation, bo
     load_button_->Disable(); unload_button_->Disable(); invoke_button_->Disable(); provider_button_->Disable();
     scan_button_->Disable(); export_candidates_button_->Disable(); load_candidate_button_->Disable(); candidates_->Disable();
     install_candidate_button_->Disable();
+    verify_candidate_signature_button_->Disable();
     candidate_filter_->Disable();
     plan_button_->Disable(); load_dependencies_button_->Disable(); unload_dependents_button_->Disable();
     unload_all_button_->Disable();
@@ -1068,6 +1108,9 @@ void PluginsView::start_operation(std::function<OperationResult()> operation, bo
 
 void PluginsView::finish_operation(OperationResult result, bool lifecycle) {
     operation_pending_ = false;
+    if (result.replace_candidates) candidate_signature_results_.clear();
+    if (result.signature_trust)
+        candidate_signature_results_.insert_or_assign(result.signature_path, *result.signature_trust);
     load_button_->Enable(); unload_button_->Enable(); scan_button_->Enable(); candidates_->Enable(); candidate_filter_->Enable();
     if (result.replace_candidates) {
         const auto selected = selected_candidate_index();
@@ -1188,6 +1231,7 @@ void PluginsView::update_candidate_controls() {
     load_candidate_button_->Enable(selected && !blocked && !operation_pending_);
     install_candidate_button_->Enable(selected && !blocked && candidate_rows_[*index].manifest.has_value() &&
                                       !candidate_rows_[*index].manifest->sha256.empty() && !operation_pending_);
+    verify_candidate_signature_button_->Enable(selected && !operation_pending_);
     load_dependencies_button_->Enable(selected && !blocked && !operation_pending_);
     plan_button_->Enable(selected && !blocked && !operation_pending_);
 }
@@ -1261,6 +1305,21 @@ void PluginsView::show_candidate_details() {
     const auto &candidate = candidate_rows_[*selected];
     std::ostringstream details;
     details << "Module path: " << candidate.path << "\n";
+    if (const auto checked = candidate_signature_results_.find(candidate.path);
+        checked != candidate_signature_results_.end()) {
+        const auto &trust = checked->second;
+        details << "Platform signature check: ";
+        switch (trust.status) {
+        case plugins::PluginAuthenticodeTrustStatus::trusted:
+            details << "trusted by Windows Authenticode policy"; break;
+        case plugins::PluginAuthenticodeTrustStatus::not_trusted:
+            details << "not trusted by Windows Authenticode policy (status " << trust.provider_status << ")"; break;
+        case plugins::PluginAuthenticodeTrustStatus::unsupported: details << "unsupported"; break;
+        }
+        details << "\nProvider: " << trust.provider << "\n";
+    } else {
+        details << "Platform signature check: not checked\n";
+    }
     const bool blocked = disabled_candidate_paths_.contains(normalize_plugin_path(candidate.path));
     details << "Future activation: " << (blocked ? "blocked by saved user preference" : "enabled for explicit user activation")
             << "\n";
@@ -1310,7 +1369,7 @@ void PluginsView::show_candidate_details() {
     } else {
         details << "Sidecar: none\n";
     }
-    details << "A sidecar is unsigned metadata, not publisher verification. Native modules run in-process. "
+    details << "A sidecar is unsigned metadata, not publisher verification. The explicit platform check is informational. Native modules run in-process. "
             << "A declared hash pin is rechecked for candidate activation. Blocking a path affects future activation only.\n";
     candidate_details_->ChangeValue(string(details.str()));
     update_candidate_controls();

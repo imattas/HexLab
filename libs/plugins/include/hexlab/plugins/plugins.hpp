@@ -278,4 +278,15 @@ HEXLAB_PLUGINS_EXPORT std::shared_ptr<ModuleProvider> make_native_module_provide
 HEXLAB_PLUGINS_EXPORT Result<PluginCandidate::Manifest> read_manifest(const std::string& path);
 // Compares advisory sidecar fields to the module identity returned by query.
 HEXLAB_PLUGINS_EXPORT bool manifest_matches(const PluginCandidate::Manifest&, const PluginInfo&);
+
+enum class PluginAuthenticodeTrustStatus : std::uint8_t { trusted, not_trusted, unsupported };
+struct HEXLAB_PLUGINS_EXPORT PluginAuthenticodeTrust {
+    PluginAuthenticodeTrustStatus status = PluginAuthenticodeTrustStatus::unsupported;
+    std::int32_t provider_status = 0;
+    std::string provider;
+};
+// Uses the host platform's Authenticode trust policy when available. This is
+// informational and does not prevent activation or provide process isolation.
+HEXLAB_PLUGINS_EXPORT Result<PluginAuthenticodeTrust> verify_plugin_authenticode_trust(
+    const std::filesystem::path& module_path);
 } // namespace hexlab::plugins

@@ -1,6 +1,7 @@
 #include "references_internal.hpp"
 #include "control_target.hpp"
 #include "mips64_reference_helpers.hpp"
+#include "a64_fields.hpp"
 #include "hexlab/analysis/relocations.hpp"
 #include "hexlab/processors/arm32_semantics.hpp"
 #include "hexlab/processors/mips32_semantics.hpp"
@@ -2928,15 +2929,65 @@ RegisterReferenceFacts a64_reference_facts(const Image *image, const RelocationC
                     else nzcv.reset();
                 } else nzcv.reset();
                 nzcv_updated = true;
-            } else if (instruction.opcode == Opcode::a64_ands && instruction.operands.size() == 3) {
+            } else if ((instruction.opcode == Opcode::a64_ands || instruction.opcode == Opcode::a64_bics) &&
+                       (instruction.operands.size() == 3 || instruction.operands.size() == 4)) {
                 const auto *left = std::get_if<RegisterOperand>(&instruction.operands[1]);
                 const auto *right_reg = std::get_if<RegisterOperand>(&instruction.operands[2]);
                 const auto width = left ? left->width : 0;
                 const auto lhs = read_flag_operand(left, width);
                 auto rhs = immediate_value(instruction, 2);
                 if (!rhs) rhs = read_flag_operand(right_reg, width);
-                if (lhs && rhs && (width == 32 || width == 64)) {
-                    const auto value = (*lhs & *rhs) & (width == 32 ? UINT64_C(0xffffffff) : UINT64_MAX);
+                bool valid_bics = instruction.opcode != Opcode::a64_bics;
+                if (instruction.opcode == Opcode::a64_bics &&
+                    (instruction.operands.size() == 3 || instruction.operands.size() == 4) &&
+                    analysis_detail::a64_packed_operand(instruction, 2)) {
+                    const auto *destination = std::get_if<RegisterOperand>(&instruction.operands[0]);
+                    const auto valid_reg = [&](const RegisterOperand *reg) {
+                        return reg && reg->width == width &&
+                            ((reg->bank == RegisterBank::arm64_gpr && reg->index < 31) ||
+                             (reg->bank == RegisterBank::arm64_zero && reg->index == 31));
+                    };
+                    std::vector<OperandAccess> expected_access{OperandAccess::write, OperandAccess::read,
+                        OperandAccess::read};
+                    if (instruction.operands.size() == 4) expected_access.push_back(OperandAccess::read);
+                    std::vector<RegisterOperand> expected_reads;
+                    for (const auto *reg : {left, right_reg})
+                        if (reg && reg->bank == RegisterBank::arm64_gpr) expected_reads.push_back(*reg);
+                    std::vector<RegisterOperand> expected_writes;
+                    if (destination && destination->bank == RegisterBank::arm64_gpr) expected_writes.push_back(*destination);
+                    expected_writes.push_back(RegisterOperand{RegisterBank::arm_flags, 0, 4, false});
+                    valid_bics = destination && valid_reg(destination) && valid_reg(left) && valid_reg(right_reg) &&
+                        (width == 32 || width == 64) && instruction.access == expected_access &&
+                        instruction.register_reads == expected_reads && instruction.register_writes == expected_writes;
+                    if (instruction.operands.size() == 4) {
+                        const auto *amount = std::get_if<ImmediateOperand>(&instruction.operands[3]);
+                        valid_bics = valid_bics && amount && amount->encoded_width == 6 &&
+                            amount->effective_width == width && !amount->is_signed && amount->value < width;
+                    }
+                }
+                if (rhs && right_reg && instruction.operands.size() == 4 && (width == 32 || width == 64)) {
+                    const auto amount = immediate_value(instruction, 3);
+                    if (!amount || *amount >= width || instruction.bytes.size() != 4) rhs.reset();
+                    else {
+                        std::uint32_t word = 0;
+                        for (unsigned byte = 0; byte < 4; ++byte)
+                            word |= std::uint32_t(std::to_integer<unsigned>(instruction.bytes[byte])) << (byte * 8);
+                        const auto shift = static_cast<unsigned>(*amount);
+                        const auto kind = (word >> 22) & 3u;
+                        const auto mask = width == 32 ? UINT64_C(0xffffffff) : UINT64_MAX;
+                        *rhs &= mask;
+                        if (kind == 0) *rhs = (*rhs << shift) & mask;
+                        else if (kind == 1) *rhs >>= shift;
+                        else if (kind == 2) *rhs = width == 32
+                            ? static_cast<std::uint32_t>(std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(*rhs)) >> shift)
+                            : static_cast<std::uint64_t>(std::bit_cast<std::int64_t>(*rhs) >> shift);
+                        else *rhs = shift ? ((*rhs >> shift) | (*rhs << (width - shift))) & mask : *rhs;
+                    }
+                }
+                if (valid_bics && lhs && rhs && (width == 32 || width == 64)) {
+                    const auto mask = width == 32 ? UINT64_C(0xffffffff) : UINT64_MAX;
+                    const auto value = instruction.opcode == Opcode::a64_bics
+                        ? (*lhs & ~*rhs) & mask : (*lhs & *rhs) & mask;
                     nzcv = static_cast<std::uint8_t>(((value >> (width - 1)) ? 8u : 0u) |
                                                      (value == 0 ? 4u : 0u));
                 } else nzcv.reset();
@@ -3275,7 +3326,9 @@ RegisterReferenceFacts a64_reference_facts(const Image *image, const RelocationC
                 }
                 propagated = true;
             } else if ((instruction.opcode == Opcode::a64_and || instruction.opcode == Opcode::a64_orr ||
-                        instruction.opcode == Opcode::a64_eor || instruction.opcode == Opcode::a64_ands) &&
+                        instruction.opcode == Opcode::a64_eor || instruction.opcode == Opcode::a64_ands ||
+                        instruction.opcode == Opcode::a64_bic || instruction.opcode == Opcode::a64_orn ||
+                        instruction.opcode == Opcode::a64_eon || instruction.opcode == Opcode::a64_bics) &&
                        (instruction.operands.size() == 3 || instruction.operands.size() == 4)) {
                 // Logical immediate and shifted-register forms can preserve or
                 // transform a proven address constant. Keep this separate
@@ -3287,7 +3340,7 @@ RegisterReferenceFacts a64_reference_facts(const Image *image, const RelocationC
                 const auto *third_immediate = std::get_if<ImmediateOperand>(&instruction.operands[2]);
                 const auto *shift_immediate = instruction.operands.size() == 4
                     ? std::get_if<ImmediateOperand>(&instruction.operands[3]) : nullptr;
-                const bool logical_flags = instruction.opcode == Opcode::a64_ands;
+                const bool logical_flags = instruction.opcode == Opcode::a64_ands || instruction.opcode == Opcode::a64_bics;
                 const bool destination_valid = destination &&
                     (destination->width == 32 || destination->width == 64) &&
                     ((destination->bank == RegisterBank::arm64_gpr && destination->index < 31) ||
@@ -3309,8 +3362,11 @@ RegisterReferenceFacts a64_reference_facts(const Image *image, const RelocationC
                     const bool register_form = (word & 0x1f000000u) == 0x0a000000u;
                     if (unsigned((word >> 31) ? 64 : 32) != destination->width) return false;
                     const auto operation = (word >> 29) & 3u;
-                    const auto expected_opcode = operation == 0 ? Opcode::a64_and :
-                        operation == 1 ? Opcode::a64_orr : operation == 2 ? Opcode::a64_eor : Opcode::a64_ands;
+                    const bool invert = register_form && (word & (1u << 21)) != 0;
+                    const auto expected_opcode = operation == 0 ? (invert ? Opcode::a64_bic : Opcode::a64_and) :
+                        operation == 1 ? (invert ? Opcode::a64_orn : Opcode::a64_orr) :
+                        operation == 2 ? (invert ? Opcode::a64_eon : Opcode::a64_eor) :
+                        (invert ? Opcode::a64_bics : Opcode::a64_ands);
                     if (instruction.opcode != expected_opcode ||
                         (word & 31u) != destination->index || ((word >> 5) & 31u) != source->index)
                         return false;
@@ -3343,7 +3399,7 @@ RegisterReferenceFacts a64_reference_facts(const Image *image, const RelocationC
                             expected_mask |= element << bit;
                         return third_immediate->value == expected_mask;
                     }
-                    if (!register_form || ((word >> 21) & 1u) || !logical_register_valid(third_register, destination->width))
+                    if (!register_form || !logical_register_valid(third_register, destination->width))
                         return false;
                     const unsigned shift_kind = (word >> 22) & 3u;
                     const unsigned amount = (word >> 10) & 63u;
@@ -3398,19 +3454,29 @@ RegisterReferenceFacts a64_reference_facts(const Image *image, const RelocationC
                             ? std::rotr(static_cast<std::uint32_t>(*rhs), static_cast<int>(amount))
                             : std::rotr(*rhs, static_cast<int>(amount));
                     }
-                    if (lhs && !rhs && (instruction.opcode == Opcode::a64_and || instruction.opcode == Opcode::a64_ands) && !*lhs)
+                    const bool and_operation = instruction.opcode == Opcode::a64_and || instruction.opcode == Opcode::a64_ands ||
+                        instruction.opcode == Opcode::a64_bic || instruction.opcode == Opcode::a64_bics;
+                    if (lhs && !rhs && and_operation && !*lhs)
                         rhs = UINT64_C(0);
-                    if (rhs && !lhs && (instruction.opcode == Opcode::a64_and || instruction.opcode == Opcode::a64_ands) && !*rhs)
+                    const bool plain_and = instruction.opcode == Opcode::a64_and || instruction.opcode == Opcode::a64_ands;
+                    if (rhs && !lhs && plain_and && !*rhs)
                         lhs = UINT64_C(0);
                 }
                 std::optional<Address> target;
                 if (valid_effects && destination && destination->bank == RegisterBank::arm64_gpr &&
                     destination->index < 31 && lhs && rhs) {
+                    const auto mask = destination->width == 32 ? UINT64_C(0xffffffff) : UINT64_MAX;
+                    const auto right_value = (instruction.opcode == Opcode::a64_bic ||
+                        instruction.opcode == Opcode::a64_orn || instruction.opcode == Opcode::a64_eon ||
+                        instruction.opcode == Opcode::a64_bics) ? (~*rhs & mask) : *rhs;
                     std::uint64_t value = 0;
-                    if (instruction.opcode == Opcode::a64_and || instruction.opcode == Opcode::a64_ands) value = *lhs & *rhs;
-                    else if (instruction.opcode == Opcode::a64_orr) value = *lhs | *rhs;
-                    else value = *lhs ^ *rhs;
-                    if (destination->width == 32) value &= UINT64_C(0xffffffff);
+                    if (instruction.opcode == Opcode::a64_and || instruction.opcode == Opcode::a64_ands ||
+                        instruction.opcode == Opcode::a64_bic || instruction.opcode == Opcode::a64_bics)
+                        value = *lhs & right_value;
+                    else if (instruction.opcode == Opcode::a64_orr || instruction.opcode == Opcode::a64_orn)
+                        value = *lhs | right_value;
+                    else value = *lhs ^ right_value;
+                    value &= mask;
                     target = Address{instruction.address.space, value};
                 }
                 erase_written();

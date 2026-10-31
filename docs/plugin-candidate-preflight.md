@@ -24,6 +24,10 @@ sidecar or the providers changed after the scan.
 Sidecars are bounded to 64 KiB and at most 256 provided or required capability
 records. A directory scan examines at most 4096 entries in the desktop flow.
 Malformed or missing sidecars remain visible as candidates with an unverified
-identity and no capability preflight. The feature does not authenticate
-publishers, verify signatures, sandbox modules, or establish that a native
-module is safe to execute.
+identity and no capability preflight. The **Check Authenticode Trust** action
+checks the selected file using Windows' generic Authenticode trust policy,
+without opening the module as code. It uses cached trust data only and does not
+check revocation. A positive result reflects the current Windows trust store;
+it is informational and does not gate activation. Other platforms report that
+the provider is unsupported. Neither a sidecar hash nor this check provides
+process isolation: native modules still run in-process.

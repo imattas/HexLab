@@ -213,8 +213,7 @@ bool integer(Instruction &i, std::uint32_t word) {
         return false;
     if (add_sub && shift == 3)
         return false;
-    if (logical && ((word >> 21) & 1))
-        return false; // BIC/ORN/EON/BICS have separate opcode contracts.
+    const bool invert_right = logical && ((word >> 21) & 1);
 
     const bool set_flags = add_sub && ((word >> 29) & 1);
     if (add_sub) {
@@ -223,10 +222,10 @@ bool integer(Instruction &i, std::uint32_t word) {
                             : (set_flags ? Opcode::a64_adds : Opcode::a64_add);
     } else {
         switch ((word >> 29) & 3) {
-        case 0: i.opcode = Opcode::a64_and; break;
-        case 1: i.opcode = Opcode::a64_orr; break;
-        case 2: i.opcode = Opcode::a64_eor; break;
-        default: i.opcode = Opcode::a64_ands; break;
+        case 0: i.opcode = invert_right ? Opcode::a64_bic : Opcode::a64_and; break;
+        case 1: i.opcode = invert_right ? Opcode::a64_orn : Opcode::a64_orr; break;
+        case 2: i.opcode = invert_right ? Opcode::a64_eon : Opcode::a64_eor; break;
+        default: i.opcode = invert_right ? Opcode::a64_bics : Opcode::a64_ands; break;
         }
     }
     operand(i, reg(word & 31, width), OperandAccess::write);
@@ -234,7 +233,7 @@ bool integer(Instruction &i, std::uint32_t word) {
     operand(i, reg((word >> 16) & 31, width), OperandAccess::read);
     if (amount || shift)
         operand(i, ImmediateOperand{amount, 6, static_cast<std::uint16_t>(width), false, {}}, OperandAccess::read);
-    if (set_flags || i.opcode == Opcode::a64_ands)
+    if (set_flags || i.opcode == Opcode::a64_ands || i.opcode == Opcode::a64_bics)
         i.register_writes.push_back(nzcv);
     return true;
 }

@@ -9446,24 +9446,27 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                         BlockId predecessor;
                         std::optional<std::size_t> parent;
                         unsigned child; // 0: root, 1: linear, 2: true, 3: false
+                        std::set<std::uint64_t> ancestors;
                     };
                     std::vector<ReturnNode> result;
-                    std::set<std::uint64_t> seen;
-                    std::vector<Pending> pending{{find_block(target), current->id, std::nullopt, 0}};
+                    std::map<std::uint64_t, std::set<std::uint64_t>> nonterminal_sources;
+                    std::vector<Pending> pending{{find_block(target), current->id, std::nullopt, 0, {}}};
                     while (!pending.empty()) {
                         const auto item = pending.back();
                         pending.pop_back();
                         const auto *cursor = item.block;
                         if (!cursor || result.size() >= 64) return {};
+                        if (item.ancestors.contains(cursor->id.value)) return {};
                         const bool terminal_return = has_only_terminal_return(*cursor);
                         if (terminal_return) {
                             if (!predecessors[cursor->id.value].contains(item.predecessor.value) ||
                                 (covered.contains(cursor->id.value) &&
                                  !terminal_return_sources.contains(cursor->id.value))) return {};
-                        } else if (!seen.insert(cursor->id.value).second ||
-                                   covered.contains(cursor->id.value) ||
-                                   predecessors[cursor->id.value] !=
-                                       std::set<std::uint64_t>{item.predecessor.value}) return {};
+                        } else {
+                            if (covered.contains(cursor->id.value) ||
+                                !predecessors[cursor->id.value].contains(item.predecessor.value)) return {};
+                            nonterminal_sources[cursor->id.value].insert(item.predecessor.value);
+                        }
                         const auto index = result.size();
                         result.push_back(ReturnNode{cursor, item.predecessor});
                         if (item.parent) {
@@ -9474,17 +9477,21 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                         }
                         if (terminal_return) continue;
                         if (contains_return(*cursor)) return {};
+                        auto ancestors = item.ancestors;
+                        ancestors.insert(cursor->id.value);
                         if (const auto *branch = terminal_conditional(*cursor)) {
                             if (branch->indirect_target) return {};
                             result[index].condition = branch;
-                            pending.push_back({find_block(*branch->false_target), cursor->id, index, 3});
-                            pending.push_back({find_block(*branch->true_target), cursor->id, index, 2});
+                            pending.push_back({find_block(*branch->false_target), cursor->id, index, 3, ancestors});
+                            pending.push_back({find_block(*branch->true_target), cursor->id, index, 2, ancestors});
                         } else {
                             const auto *next = linear_successor(*cursor);
                             if (!next) return {};
-                            pending.push_back({next, cursor->id, index, 1});
+                            pending.push_back({next, cursor->id, index, 1, std::move(ancestors)});
                         }
                     }
+                    for (const auto &[id, sources] : nonterminal_sources)
+                        if (sources != predecessors[id]) return {};
                     return result;
                 };
                 const auto yes_return = trace_return(*condition->true_target);
