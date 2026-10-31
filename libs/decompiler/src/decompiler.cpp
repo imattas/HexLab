@@ -306,6 +306,7 @@ bool mips_branch_likely(Opcode opcode) {
     switch (opcode) {
     case Opcode::mips_beql: case Opcode::mips_bnel: case Opcode::mips_blezl:
     case Opcode::mips_bgtzl: case Opcode::mips_bltzl: case Opcode::mips_bgezl:
+    case Opcode::mips_bltzall: case Opcode::mips_bgezall:
     case Opcode::mips64_bltzall: case Opcode::mips64_bgezall:
     case Opcode::mips_bc1tl: case Opcode::mips_bc1fl:
     case Opcode::mips64_bc1tl: case Opcode::mips64_bc1fl:
@@ -3720,6 +3721,10 @@ a64_unhandled:
                 case Opcode::mips_bgtzl: compare("sgt", operands[0], zero); break;
                 case Opcode::mips_bltzl: compare("slt", operands[0], zero); break;
                 case Opcode::mips_bgezl: compare("sge", operands[0], zero); break;
+                case Opcode::mips_bltzal: case Opcode::mips_bltzall:
+                    compare("slt", operands[0], zero); break;
+                case Opcode::mips_bgezal: case Opcode::mips_bgezall:
+                    compare("sge", operands[0], zero); break;
                 default: break;
                 }
             }
@@ -7924,6 +7929,13 @@ Result<LiftedFunction> lift_function(const FunctionRecord &function, const Funct
                 const RegisterOperand link{RegisterBank::mips_gpr, 31, 64, false};
                 block.instructions.push_back({{decoded.address, fact->id},
                     Assign{link, constant_expr(decoded.address.offset + 8, 64)}});
+            }
+            if (decoded.context.architecture == Architecture::mips32 &&
+                (decoded.opcode == Opcode::mips_bltzal || decoded.opcode == Opcode::mips_bgezal ||
+                 decoded.opcode == Opcode::mips_bltzall || decoded.opcode == Opcode::mips_bgezall)) {
+                const RegisterOperand link{RegisterBank::mips_gpr, 31, 32, false};
+                block.instructions.push_back({{decoded.address, fact->id},
+                    Assign{link, constant_expr(decoded.address.offset + 8, 32)}});
             }
             // W-form arithmetic defines both the 32-bit W view and the
             // architecturally zero-extended 64-bit X view. The shared SSA key

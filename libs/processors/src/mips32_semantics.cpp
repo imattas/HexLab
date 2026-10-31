@@ -539,7 +539,9 @@ evaluate_mips32_integer_branch_instruction(const Instruction &instruction,
         op == Opcode::mips_beql || op == Opcode::mips_bnel;
     const bool unary = op == Opcode::mips_blez || op == Opcode::mips_bgtz ||
         op == Opcode::mips_blezl || op == Opcode::mips_bgtzl || op == Opcode::mips_bltz ||
-        op == Opcode::mips_bgez || op == Opcode::mips_bltzl || op == Opcode::mips_bgezl;
+        op == Opcode::mips_bgez || op == Opcode::mips_bltzl || op == Opcode::mips_bgezl ||
+        op == Opcode::mips_bltzal || op == Opcode::mips_bgezal ||
+        op == Opcode::mips_bltzall || op == Opcode::mips_bgezall;
     if (!pair && !unary) return {};
     const auto register_count = pair ? 2u : 1u;
     if (instruction.operands.size() != register_count + 1 || instruction.access.size() != register_count + 1 ||
@@ -559,6 +561,12 @@ evaluate_mips32_integer_branch_instruction(const Instruction &instruction,
                                      instruction.register_reads.end();
     };
     if (!has_read(*left) || (pair && !has_read(*right))) return {};
+    const bool link = op == Opcode::mips_bltzal || op == Opcode::mips_bgezal ||
+        op == Opcode::mips_bltzall || op == Opcode::mips_bgezall;
+    const RegisterOperand return_address{RegisterBank::mips_gpr, 31, 32, false};
+    if (link && std::find(instruction.register_writes.begin(), instruction.register_writes.end(), return_address) ==
+                    instruction.register_writes.end())
+        return {};
     if (left->index == 0) lhs = 0;
     if (pair && right->index == 0) rhs = 0;
     const auto signed_lhs = std::bit_cast<std::int32_t>(lhs);
@@ -568,8 +576,10 @@ evaluate_mips32_integer_branch_instruction(const Instruction &instruction,
     case Opcode::mips_bne: case Opcode::mips_bnel: return lhs != rhs;
     case Opcode::mips_blez: case Opcode::mips_blezl: return signed_lhs <= 0;
     case Opcode::mips_bgtz: case Opcode::mips_bgtzl: return signed_lhs > 0;
-    case Opcode::mips_bltz: case Opcode::mips_bltzl: return signed_lhs < 0;
-    case Opcode::mips_bgez: case Opcode::mips_bgezl: return signed_lhs >= 0;
+    case Opcode::mips_bltz: case Opcode::mips_bltzl: case Opcode::mips_bltzal:
+    case Opcode::mips_bltzall: return signed_lhs < 0;
+    case Opcode::mips_bgez: case Opcode::mips_bgezl: case Opcode::mips_bgezal:
+    case Opcode::mips_bgezall: return signed_lhs >= 0;
     default: return {};
     }
 }

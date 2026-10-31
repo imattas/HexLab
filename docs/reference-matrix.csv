@@ -70,7 +70,7 @@ processor.rx,processor,RX,absent,open,,P01,8
 processor.powerpc,processor,PowerPC/POWER,partial,partial,libs/processors/src/ppc.cpp; tests/ppc_tests.cpp; docs/powerpc.md; PPC32/PPC64 endian-aware integer slice,P01,8
 processor.tricore,processor,TriCore,absent,open,,P01,8
 processor.ia64,processor,IA-64,absent,open,,P01,8
-processor.mips,processor,MIPS32,partial,open,libs/processors/src/mips32.cpp; libs/decompiler/src/decompiler.cpp; tests/processor_tests.cpp; tests/elf_image_tests.cpp; docs/mips32.md; ELF32 little/big-endian selected decode including Release 2 SPECIAL3 EXT/INS range checks and bit-precise lifting; delay-slot-aware reachability and function recovery; remaining variants partial,P01,8
+processor.mips,processor,MIPS32,partial,open,libs/processors/src/mips32.cpp; libs/decompiler/src/decompiler.cpp; tests/processor_tests.cpp; tests/elf_image_tests.cpp; docs/mips32.md; ELF32 little/big-endian selected decode including Release 2 SPECIAL3 EXT/INS range checks, REGIMM conditional-link and likely-link branches with PC+8 link effects, typed predicates, annulled delay-slot flow and bit-precise lifting; taken targets are not yet call-graph candidates; remaining variants partial,P01,8
 processor.mips64,processor,MIPS64,partial,open,libs/processors/src/mips64.cpp; libs/decompiler/src/mips64_lifting.cpp; tests/mips64_tests.cpp; tests/decompiler/mips64_lifting_tests.cpp; docs/mips64.md; ELF64 little/big-endian selected integer including trapping DADDI and HILO decode plus shared-SSA lifting,P01,8
 processor.m32r,processor,M32R,absent,open,,P01,8
 processor.m7700,processor,M7700,absent,open,,P01,8
