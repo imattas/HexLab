@@ -36,8 +36,13 @@ AssemblyRef row has a nonempty `HashValue`, its supplied candidate must also
 match that hash under the owning Assembly's `HashAlgId`; an absent hash
 preserves identity-only matching. SHA-1 and SHA-256 are supported for this
 check. The candidate must then contain a unique same-name embedded resource
-with the exact ManifestResource offset. Nested external providers are not
-followed.
+with the exact ManifestResource offset. File- or AssemblyRef-backed resources
+in a selected provider are followed recursively using the same caller-supplied
+input set; each edge repeats the exact identity/name/hash checks. A resource
+that reaches a provider already on the active chain remains unresolved with a
+cycle diagnostic. Provider traversal is capped at 16 nested levels and 4,096
+provider visits by default, with configurable hard caps of 64 levels and
+65,536 visits. Copied external payloads remain bounded by `max_payload_bytes`.
 Missing, ambiguous, unsupported-hash, and mismatched-hash cases retain an
 explicit resolution state and diagnostic without discarding metadata.
 
@@ -49,8 +54,10 @@ Relative entries are resolved only against the list file's directory. No
 search paths are inferred. Resolved external resources retain the zero-based
 index of the exact caller-supplied input selected by the resolver; the index
 refers to input order after blank and comment lines are discarded. Text output
-prints `resolved-input-index`, and JSON emits `resolved_input_index`. This is
-an input index, not a path. `--json` emits each resource's resolution state,
+prints `resolved-input-index`, and JSON emits `resolved_input_index`. Nested
+resources also expose `resolved-input-chain` / `resolved_input_chain`, ordered
+from the direct provider through each nested input index. These are input
+indexes, not paths. `--json` emits each resource's resolution state,
 diagnostic, and (when present) implementation hash algorithm, full hash byte
 count, and at most the first 32 hash bytes in hexadecimal. Text output uses
 the same bounded hash prefix. For decoded `.resources` payloads, both text and JSON output

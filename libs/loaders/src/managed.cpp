@@ -2601,11 +2601,26 @@ Result<std::vector<ManagedResource>> inspect_managed_resources(const LoadedImage
 } catch(const std::bad_alloc&) {return Error{ErrorCode::resource_limit,"Cannot allocate embedded CLR resource catalog"};}
   catch(const std::length_error&) {return Error{ErrorCode::resource_limit,"Embedded CLR resource catalog exceeds container limits"};}
 
-Result<std::vector<ManagedResource>> inspect_managed_resources(
+namespace {
+struct ManagedResourceBindingTraversal {
+  std::size_t provider_visits=0;
+  std::vector<std::size_t> active_provider_inputs;
+  std::uint64_t copied_payload_bytes=0;
+};
+Result<std::vector<ManagedResource>> inspect_managed_resources_recursive(
+    const LoadedImage&,std::span<const ManagedResourceInput>,const ManagedResourceResolutionLimits&,
+    std::stop_token,ManagedResourceBindingTraversal&);
+}
+
+namespace {
+Result<std::vector<ManagedResource>> inspect_managed_resources_recursive(
     const LoadedImage& loaded,std::span<const ManagedResourceInput> supplied,
-    const ManagedResourceResolutionLimits& limits,std::stop_token stop) try {
+    const ManagedResourceResolutionLimits& limits,std::stop_token stop,
+    ManagedResourceBindingTraversal& traversal) try {
   if(supplied.size()>limits.max_inputs||limits.max_inputs>256||
-     limits.max_input_bytes>512u*1024u*1024u||limits.max_payload_bytes>512u*1024u*1024u)
+     limits.max_input_bytes>512u*1024u*1024u||limits.max_payload_bytes>512u*1024u*1024u||
+     limits.max_provider_depth==0||limits.max_provider_depth>64||
+     limits.max_provider_visits==0||limits.max_provider_visits>65536)
     return Error{ErrorCode::resource_limit,"CLR resource input or payload budget is invalid or exceeded"};
   auto resources=inspect_managed_resources(loaded);if(!resources)return resources.error();
   struct Candidate {
@@ -2614,7 +2629,6 @@ Result<std::vector<ManagedResource>> inspect_managed_resources(
     std::optional<ManagedAssemblyIdentity> identity;
     bool identity_checked=false;
     std::optional<std::vector<ManagedResource>> resources;
-    std::uint64_t cached_payload_bytes=0;
     std::map<std::uint32_t,std::vector<std::byte>> hashes;
     std::map<std::uint32_t,std::string> hash_errors;
   };
@@ -2635,7 +2649,7 @@ Result<std::vector<ManagedResource>> inspect_managed_resources(
     input_bytes+=storage->size();
     candidates.push_back({&input,std::move(storage)});
   }
-  std::uint64_t external_payload_bytes=0,cached_payload_bytes=0;
+  std::uint64_t cached_payload_bytes=0;
   const auto candidate_identity=[&](Candidate& candidate)->std::optional<ManagedAssemblyIdentity>{
     if(candidate.identity_checked)return candidate.identity;
     candidate.identity_checked=true;
@@ -2648,26 +2662,45 @@ Result<std::vector<ManagedResource>> inspect_managed_resources(
   const auto candidate_resources=[&](Candidate& candidate)->Result<const std::vector<ManagedResource>*>{
     if(!candidate.input->loaded_image)return Error{ErrorCode::unsupported,"Supplied resource provider is not a managed PE image"};
     if(!candidate.resources){
-      auto parsed=inspect_managed_resources(*candidate.input->loaded_image);if(!parsed)return parsed.error();
+      const auto candidate_index=static_cast<std::size_t>(&candidate-candidates.data());
+      if(std::find(traversal.active_provider_inputs.begin(),traversal.active_provider_inputs.end(),candidate_index)!=
+         traversal.active_provider_inputs.end())
+        return Error{ErrorCode::unsupported,"CLR resource provider cycle reaches caller input index "+std::to_string(candidate_index)};
+      if(traversal.active_provider_inputs.size()>=limits.max_provider_depth)
+        return Error{ErrorCode::unsupported,"CLR nested resource provider depth limit reached"};
+      if(traversal.provider_visits>=limits.max_provider_visits)
+        return Error{ErrorCode::unsupported,"CLR nested resource provider visit budget exhausted"};
+      ++traversal.provider_visits;
+      traversal.active_provider_inputs.push_back(candidate_index);
+      auto parsed=inspect_managed_resources_recursive(*candidate.input->loaded_image,supplied,limits,stop,traversal);
+      traversal.active_provider_inputs.pop_back();
+      if(!parsed)return parsed.error();
       std::uint64_t bytes=0;for(const auto& item:parsed.value())bytes+=item.payload.size();
       if(bytes>limits.max_payload_bytes-cached_payload_bytes)
         return Error{ErrorCode::resource_limit,"Supplied managed resource catalogs exceed the binding cache budget"};
-      cached_payload_bytes+=bytes;candidate.cached_payload_bytes=bytes;
+      cached_payload_bytes+=bytes;
       candidate.resources=std::move(parsed.value());
     }
     return &*candidate.resources;
   };
   const auto copy_payload=[&](ManagedResource& destination,const ManagedResource& source,
-                              ManagedResourceResolutionState state)->Result<bool>{
-    if(source.implementation!=ManagedResourceImplementationKind::embedded)
-      return Error{ErrorCode::unsupported,"Nested external CLR resource providers are not followed"};
-    if(source.payload.size()>limits.max_payload_bytes-external_payload_bytes)
+                              ManagedResourceResolutionState state,std::size_t provider_index)->Result<bool>{
+    if(source.implementation!=ManagedResourceImplementationKind::embedded&&
+       source.resolution!=ManagedResourceResolutionState::resolved_file&&
+       source.resolution!=ManagedResourceResolutionState::resolved_assembly)
+      return Error{ErrorCode::unsupported,source.resolution_diagnostic.empty()?
+          "Nested external CLR resource provider is unresolved":source.resolution_diagnostic};
+    if(source.payload.size()>limits.max_payload_bytes-traversal.copied_payload_bytes)
       return Error{ErrorCode::resource_limit,"Resolved CLR resource payloads exceed the cumulative byte budget"};
-    external_payload_bytes+=source.payload.size();
+    traversal.copied_payload_bytes+=source.payload.size();
     destination.data_size=source.data_size;destination.payload=source.payload;
     destination.payload_format=source.payload_format;destination.payload_diagnostic=source.payload_diagnostic;
     destination.records=source.records;destination.resolution=state;
-    destination.resolution_input_index.reset();destination.resolution_diagnostic.clear();
+    destination.resolution_input_index=provider_index;
+    destination.resolution_input_chain.clear();destination.resolution_input_chain.push_back(provider_index);
+    destination.resolution_input_chain.insert(destination.resolution_input_chain.end(),
+        source.resolution_input_chain.begin(),source.resolution_input_chain.end());
+    destination.resolution_diagnostic.clear();
     return true;
   };
 
@@ -2722,20 +2755,19 @@ Result<std::vector<ManagedResource>> inspect_managed_resources(
         for(const auto& item:*parsed.value())if(item.name==resource.name){if(target){target=nullptr;resource.resolution=ManagedResourceResolutionState::ambiguous;resource.resolution_diagnostic="Multiple same-name ManifestResource rows exist in supplied File module";break;}target=&item;}
         if(resource.resolution==ManagedResourceResolutionState::ambiguous)continue;
         if(!target){resource.resolution_diagnostic="Supplied File module has no same-name ManifestResource";continue;}
-        auto copied=copy_payload(resource,*target,ManagedResourceResolutionState::resolved_file);
+        auto copied=copy_payload(resource,*target,ManagedResourceResolutionState::resolved_file,matched.front());
         if(!copied){if(copied.error().code==ErrorCode::resource_limit)return copied.error();resource.resolution_diagnostic=copied.error().message;}
-        else resource.resolution_input_index=matched.front();
       }else{
         constexpr std::uint64_t item_limit=16u*1024u*1024u;
         const auto size=candidate.storage->size();
-        if(size>item_limit||size>limits.max_payload_bytes-external_payload_bytes)
+        if(size>item_limit||size>limits.max_payload_bytes-traversal.copied_payload_bytes)
           return Error{ErrorCode::resource_limit,"Supplied raw CLR resource file exceeds its payload budget"};
         if(stop.stop_requested())return Error{ErrorCode::canceled,"CLR resource file read canceled"};
         if(size){auto bytes=candidate.storage->read_at({0},static_cast<std::size_t>(size));if(!bytes)return bytes.error();if(bytes.value().bytes.size()!=size)return Error{ErrorCode::io,"Short read from supplied CLR resource file"};resource.payload.assign(bytes.value().bytes.begin(),bytes.value().bytes.end());}
-        resource.data_size=static_cast<std::uint32_t>(size);external_payload_bytes+=size;
+        resource.data_size=static_cast<std::uint32_t>(size);traversal.copied_payload_bytes+=size;
         auto decoded=parse_dotnet_resources(resource);if(!decoded)return decoded.error();
         resource.resolution=ManagedResourceResolutionState::resolved_file;
-        resource.resolution_input_index=matched.front();resource.resolution_diagnostic.clear();
+        resource.resolution_input_index=matched.front();resource.resolution_input_chain={matched.front()};resource.resolution_diagnostic.clear();
       }
       continue;
     }
@@ -2791,15 +2823,22 @@ Result<std::vector<ManagedResource>> inspect_managed_resources(
         resource.resolution_diagnostic="Supplied AssemblyRef resource offset differs from the referenced ManifestResource";
         continue;
       }
-      auto copied=copy_payload(resource,*target,ManagedResourceResolutionState::resolved_assembly);
+      auto copied=copy_payload(resource,*target,ManagedResourceResolutionState::resolved_assembly,matches.front());
       if(!copied&&copied.error().code==ErrorCode::resource_limit)return copied.error();
       if(!copied)resource.resolution_diagnostic=copied.error().message;
-      else resource.resolution_input_index=matches.front();
     }
   }
   return resources;
 } catch(const std::bad_alloc&) {return Error{ErrorCode::resource_limit,"Cannot allocate supplied CLR resource binding state"};}
   catch(const std::length_error&) {return Error{ErrorCode::resource_limit,"Supplied CLR resource binding exceeds container limits"};}
+}
+
+Result<std::vector<ManagedResource>> inspect_managed_resources(
+    const LoadedImage& loaded,std::span<const ManagedResourceInput> supplied,
+    const ManagedResourceResolutionLimits& limits,std::stop_token stop) {
+  ManagedResourceBindingTraversal traversal;
+  return inspect_managed_resources_recursive(loaded,supplied,limits,stop,traversal);
+}
 
 Result<std::vector<ManagedMethod>> parse_managed_methods(std::span<const std::byte> root){
   auto parsed=parse_cli_metadata(root);if(!parsed)return parsed.error();
