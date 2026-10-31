@@ -727,6 +727,16 @@ struct PeFpoRecord {
     PeRecordSource source;
     bool operator==(const PeFpoRecord &) const = default;
 };
+// IMAGE_DEBUG_TYPE_MISC IMAGE_DEBUG_MISC_EXENAME records identify the
+// original executable name. The path is retained as decoded UTF-8 when the
+// payload's Unicode flag is set, or as the original single-byte text otherwise.
+struct PeMiscDebugInfo {
+    std::uint32_t data_type = 0, declared_length = 0;
+    bool unicode = false;
+    std::string executable_name;
+    PeRecordSource source, name_source;
+    bool operator==(const PeMiscDebugInfo &) const = default;
+};
 struct PePogoEntry {
     std::uint32_t rva = 0, size = 0;
     std::string name;
@@ -874,6 +884,7 @@ struct PeMetadata {
     std::optional<bool> pdb_checksum_verified;
     std::vector<PeDebugDirectoryEntry> debug_directories;
     std::vector<PeFpoRecord> fpo_records;
+    std::vector<PeMiscDebugInfo> misc_debug_info;
     std::vector<PePogoData> pogo_data;
     std::vector<PeSourceLine> source_lines;
     PePdbStatus pdb_status = PePdbStatus::unavailable;

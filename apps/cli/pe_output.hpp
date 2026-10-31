@@ -960,6 +960,26 @@ inline void pe_description(std::ostream &out, const ImageMetadata &metadata, con
             out << "  ... debug directory output limited to " << debug_directory_limit << " rows; omitted="
                 << directories.size() - count << '\n';
     }
+    if (metadata.pe && !metadata.pe->misc_debug_info.empty()) {
+        const auto &records = metadata.pe->misc_debug_info;
+        out << "PE MISC debug records: " << records.size() << '\n';
+        const auto count = (std::min<std::size_t>)(records.size(), 256);
+        for (std::size_t i = 0; i < count; ++i) {
+            const auto &record = records[i];
+            out << "  [" << i << "] data-type=" << record.data_type
+                << " length=" << record.declared_length
+                << " encoding=" << (record.unicode ? "UTF-16LE" : "single-byte");
+            if (record.data_type == 1)
+                out << " executable-name=\"" << escape_pe_version_text(record.executable_name) << '\"';
+            if (!record.source.spans.empty())
+                out << " file=0x" << std::hex << record.source.spans.front().offset.value << std::dec;
+            if (!record.name_source.spans.empty())
+                out << " name-file=0x" << std::hex << record.name_source.spans.front().offset.value << std::dec;
+            out << '\n';
+        }
+        if (count != records.size())
+            out << "  ... MISC debug output limited to 256 rows; omitted=" << records.size() - count << '\n';
+    }
     if (metadata.pe && !metadata.pe->codeview.empty()) {
         out << "PE CodeView identities: " << metadata.pe->codeview.size() << '\n';
         const auto count = std::min<std::size_t>(metadata.pe->codeview.size(), 256);

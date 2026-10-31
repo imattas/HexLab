@@ -92,6 +92,14 @@ before parsing or binding; any mismatch rejects that candidate. Other
 algorithm names are preserved for inspection but are not verified. The CLI
 shows the algorithm, digest, source offset, and local verification result.
 
+`IMAGE_DEBUG_TYPE_MISC` payloads are bounded and decoded as `IMAGE_DEBUG_MISC`
+records. The parser validates their declared size and encoding flag. For
+`IMAGE_DEBUG_MISC_EXENAME`, it exposes the original executable name, decodes
+UTF-16LE names to UTF-8 with surrogate validation, and retains source spans for
+the record and name. Other MISC data types remain present as generic debug
+directory payloads; no external DBG file is opened or bound. CLI output is
+limited to 256 decoded rows. See [PE MISC debug records](pe-misc-debug.md).
+
 Recognized POGO (`IMAGE_DEBUG_TYPE_POGO`) payloads additionally expose their
 LTCG/PGU signature and bounded code/data block names, RVAs, sizes, and source
 provenance; see [PE POGO debug records](pe-pogo.md).

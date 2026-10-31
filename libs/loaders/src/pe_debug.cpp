@@ -17,6 +17,7 @@ Result<std::size_t> read_debug_directory(const Image &image, const Directory &di
         std::vector<PePdbChecksum> pdb_checksums;
         std::vector<PeDebugDirectoryEntry> entries;
         std::vector<PeFpoRecord> fpo_records;
+        std::vector<PeMiscDebugInfo> misc_debug_info;
         std::vector<PePogoData> pogo_data;
         std::size_t pogo_entry_count = 0;
         std::size_t pogo_name_bytes = 0;
@@ -156,6 +157,103 @@ Result<std::size_t> read_debug_directory(const Image &image, const Directory &di
                     fpo_records.push_back(std::move(record));
                     previous_end = end_rva;
                 }
+            }
+            if (type == 4) { // IMAGE_DEBUG_TYPE_MISC.
+                constexpr std::uint32_t misc_payload_limit = 1024u * 1024u;
+                constexpr std::uint32_t misc_header_size = 12;
+                require(entry.data_size >= misc_header_size && entry.data_size <= misc_payload_limit,
+                        "PE MISC debug payload has an invalid bounded size", ErrorCode::resource_limit);
+                std::vector<std::byte> payload;
+                if (entry.raw_offset) {
+                    FileReader file_reader(*image.storage());
+                    const auto view = file_reader.bytes(entry.raw_offset, entry.data_size, "MISC debug payload");
+                    payload.assign(view.bytes.begin(), view.bytes.end());
+                } else {
+                    payload = r.bytes(entry.data_rva, entry.data_size);
+                }
+                const auto u32 = [&](std::size_t offset) {
+                    return std::to_integer<std::uint32_t>(payload[offset]) |
+                        (std::to_integer<std::uint32_t>(payload[offset + 1]) << 8) |
+                        (std::to_integer<std::uint32_t>(payload[offset + 2]) << 16) |
+                        (std::to_integer<std::uint32_t>(payload[offset + 3]) << 24);
+                };
+                PeMiscDebugInfo misc;
+                misc.data_type = u32(0);
+                misc.declared_length = u32(4);
+                require(misc.declared_length >= misc_header_size && misc.declared_length <= entry.data_size,
+                        "PE MISC declared length exceeds its debug payload");
+                const auto unicode_flag = std::to_integer<unsigned>(payload[8]);
+                require(unicode_flag <= 1, "PE MISC Unicode flag is not boolean");
+                misc.unicode = unicode_flag != 0;
+                require(payload[9] == std::byte{0} && payload[10] == std::byte{0} && payload[11] == std::byte{0},
+                        "PE MISC reserved bytes are nonzero");
+                misc.source = PeRecordSource{index, entry.raw_offset
+                    ? std::vector<PeSourceSpan>{{FileOffset{entry.raw_offset}, misc.declared_length}}
+                    : r.sources(entry.data_rva, misc.declared_length)};
+                if (misc.data_type == 1) { // IMAGE_DEBUG_MISC_EXENAME.
+                    const auto name_begin = std::size_t{misc_header_size};
+                    const auto name_end = static_cast<std::size_t>(misc.declared_length);
+                    if (misc.unicode) {
+                        require((name_end - name_begin) % 2 == 0,
+                                "PE MISC Unicode executable name has an odd byte length");
+                        std::size_t terminator = name_begin;
+                        while (terminator + 1 < name_end &&
+                               (payload[terminator] != std::byte{0} || payload[terminator + 1] != std::byte{0}))
+                            terminator += 2;
+                        require(terminator + 1 < name_end,
+                                "PE MISC Unicode executable name is unterminated");
+                        for (std::size_t offset = name_begin; offset < terminator; offset += 2) {
+                            auto code_unit = static_cast<std::uint16_t>(
+                                std::to_integer<unsigned>(payload[offset]) |
+                                (std::to_integer<unsigned>(payload[offset + 1]) << 8));
+                            std::uint32_t codepoint = code_unit;
+                            if (code_unit >= 0xd800 && code_unit <= 0xdbff) {
+                                require(offset + 3 < terminator,
+                                        "PE MISC executable name has an unpaired UTF-16 high surrogate");
+                                const auto low = static_cast<std::uint16_t>(
+                                    std::to_integer<unsigned>(payload[offset + 2]) |
+                                    (std::to_integer<unsigned>(payload[offset + 3]) << 8));
+                                require(low >= 0xdc00 && low <= 0xdfff,
+                                        "PE MISC executable name has an invalid UTF-16 surrogate pair");
+                                codepoint = 0x10000u + ((code_unit - 0xd800u) << 10) + (low - 0xdc00u);
+                                offset += 2;
+                            } else {
+                                require(code_unit < 0xdc00 || code_unit > 0xdfff,
+                                        "PE MISC executable name has an unpaired UTF-16 low surrogate");
+                            }
+                            if (codepoint <= 0x7f) misc.executable_name.push_back(static_cast<char>(codepoint));
+                            else if (codepoint <= 0x7ff) {
+                                misc.executable_name.push_back(static_cast<char>(0xc0 | (codepoint >> 6)));
+                                misc.executable_name.push_back(static_cast<char>(0x80 | (codepoint & 0x3f)));
+                            } else if (codepoint <= 0xffff) {
+                                misc.executable_name.push_back(static_cast<char>(0xe0 | (codepoint >> 12)));
+                                misc.executable_name.push_back(static_cast<char>(0x80 | ((codepoint >> 6) & 0x3f)));
+                                misc.executable_name.push_back(static_cast<char>(0x80 | (codepoint & 0x3f)));
+                            } else {
+                                misc.executable_name.push_back(static_cast<char>(0xf0 | (codepoint >> 18)));
+                                misc.executable_name.push_back(static_cast<char>(0x80 | ((codepoint >> 12) & 0x3f)));
+                                misc.executable_name.push_back(static_cast<char>(0x80 | ((codepoint >> 6) & 0x3f)));
+                                misc.executable_name.push_back(static_cast<char>(0x80 | (codepoint & 0x3f)));
+                            }
+                        }
+                        const auto name_size = terminator + 2 - name_begin;
+                        misc.name_source = PeRecordSource{index, entry.raw_offset
+                            ? std::vector<PeSourceSpan>{{FileOffset{std::uint64_t{entry.raw_offset} + name_begin}, name_size}}
+                            : r.sources(std::uint64_t{entry.data_rva} + name_begin, name_size)};
+                    } else {
+                        const auto begin = payload.begin() + static_cast<std::ptrdiff_t>(name_begin);
+                        const auto end = payload.begin() + static_cast<std::ptrdiff_t>(name_end);
+                        const auto terminator = std::find(begin, end, std::byte{0});
+                        require(terminator != end, "PE MISC executable name is unterminated");
+                        for (auto it = begin; it != terminator; ++it)
+                            misc.executable_name.push_back(static_cast<char>(std::to_integer<unsigned char>(*it)));
+                        const auto name_size = static_cast<std::size_t>(terminator - begin) + 1;
+                        misc.name_source = PeRecordSource{index, entry.raw_offset
+                            ? std::vector<PeSourceSpan>{{FileOffset{std::uint64_t{entry.raw_offset} + name_begin}, name_size}}
+                            : r.sources(std::uint64_t{entry.data_rva} + name_begin, name_size)};
+                    }
+                }
+                misc_debug_info.push_back(std::move(misc));
             }
             if (type == 13) { // IMAGE_DEBUG_TYPE_POGO.
                 constexpr std::uint32_t signature_ltcg = 0x4c544347u; // "LTCG"
@@ -332,7 +430,8 @@ Result<std::size_t> read_debug_directory(const Image &image, const Directory &di
             identity.record = {{{raw_offset}, data_size}};
             codeview.push_back(std::move(identity));
         }
-        const auto count_read = entries.size() + codeview.size() + pdb_checksums.size() + fpo_records.size() + pogo_entry_count;
+        const auto count_read = entries.size() + codeview.size() + pdb_checksums.size() + fpo_records.size() +
+            misc_debug_info.size() + pogo_entry_count;
         if (metadata.pe) {
             metadata.pe->debug_directories.insert(metadata.pe->debug_directories.end(),
                                                    std::make_move_iterator(entries.begin()),
@@ -346,6 +445,9 @@ Result<std::size_t> read_debug_directory(const Image &image, const Directory &di
             metadata.pe->fpo_records.insert(metadata.pe->fpo_records.end(),
                                             std::make_move_iterator(fpo_records.begin()),
                                             std::make_move_iterator(fpo_records.end()));
+            metadata.pe->misc_debug_info.insert(metadata.pe->misc_debug_info.end(),
+                                                std::make_move_iterator(misc_debug_info.begin()),
+                                                std::make_move_iterator(misc_debug_info.end()));
             metadata.pe->pogo_data.insert(metadata.pe->pogo_data.end(),
                                           std::make_move_iterator(pogo_data.begin()),
                                           std::make_move_iterator(pogo_data.end()));
