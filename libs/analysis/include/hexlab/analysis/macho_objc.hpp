@@ -100,6 +100,13 @@ struct MachOObjCList {
     std::vector<MachOObjCProtocolReference> protocol_references;
 };
 
+struct MachOObjCIvarLayout {
+    std::optional<Address> address;
+    std::vector<std::uint8_t> encoded_bytes;
+    std::string pointer_status = "not-read";
+    std::string status = "not-read";
+};
+
 struct MachOObjCClass {
     std::uint32_t classlist_section = 0;
     std::uint64_t classlist_index = 0;
@@ -112,6 +119,7 @@ struct MachOObjCClass {
     std::optional<Address> metaclass_ro_address;
     std::string metaclass_ro_pointer_status = "not-read";
     std::optional<std::uint32_t> metaclass_flags;
+    MachOObjCIvarLayout metaclass_ivar_layout, metaclass_weak_ivar_layout;
     std::optional<std::string> metaclass_name;
     std::string metaclass_name_status = "not-read";
     MachOObjCList class_methods;
@@ -127,6 +135,7 @@ struct MachOObjCClass {
     // the on-disk hierarchy is contradictory even if all pointers resolved.
     std::string superclass_link_status = "unlinked";
     std::optional<std::uint32_t> flags;
+    MachOObjCIvarLayout ivar_layout, weak_ivar_layout;
     std::optional<std::uint32_t> instance_start;
     std::optional<std::uint32_t> instance_size;
     MachOObjCList methods, protocols, ivars, properties;
@@ -174,6 +183,7 @@ struct MachOObjCLimits {
     std::size_t max_protocols = 100000;
     std::uint64_t max_metadata_bytes = 64ull * 1024 * 1024;
     std::size_t max_name_bytes = 4096;
+    std::size_t max_ivar_layout_bytes = 4096;
     std::uint32_t max_list_entries = 1000000;
     std::size_t max_protocol_inheritance_depth = 32;
     std::size_t max_protocol_requirement_work = 200000;

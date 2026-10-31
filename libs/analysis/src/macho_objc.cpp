@@ -139,6 +139,8 @@ Pointer pointer_at(const Image &image, const RelocationResolver &resolver, Addre
     return {target, "raw"};
 }
 
+void mark_incomplete(MachOObjCScan &scan, bool &owner_complete, std::string reason);
+
 std::optional<std::string> read_name(const Image &image, Address address, Budget &budget, std::string &status) {
     const auto *segment = image.segment_at(address);
     if (!segment || !segment->readable || address.offset < segment->begin.offset) {
@@ -171,6 +173,55 @@ std::optional<std::string> read_name(const Image &image, Address address, Budget
     return std::string(reinterpret_cast<const char *>(bytes.value().data()), length);
 }
 
+MachOObjCIvarLayout read_ivar_layout(const Image &image, const RelocationResolver &resolver,
+                                      Address pointer_slot, Budget &budget, MachOObjCScan &scan,
+                                      bool &owner_complete) {
+    MachOObjCIvarLayout result;
+    const auto pointer = pointer_at(image, resolver, pointer_slot, budget);
+    result.pointer_status = pointer.status;
+    if (!pointer.address) {
+        result.status = pointer.status;
+        if (pointer.status != "null")
+            mark_incomplete(scan, owner_complete, "Objective-C ivar-layout pointer is unresolved");
+        return result;
+    }
+    result.address = pointer.address;
+    const auto *segment = image.segment_at(*pointer.address);
+    if (!segment || !segment->readable || pointer.address->offset < segment->begin.offset) {
+        result.status = "layout-unmapped";
+        mark_incomplete(scan, owner_complete, "Objective-C ivar-layout bytes are unmapped");
+        return result;
+    }
+    const auto relative = pointer.address->offset - segment->begin.offset;
+    if (relative >= segment->file_size) {
+        result.status = "layout-uninitialized";
+        mark_incomplete(scan, owner_complete, "Objective-C ivar-layout bytes are uninitialized");
+        return result;
+    }
+    const auto available = segment->file_size - relative;
+    const auto request = static_cast<std::size_t>(std::min<std::uint64_t>(available,
+        budget.limits.max_ivar_layout_bytes));
+    auto bytes = read_exact(image, *pointer.address, request, budget);
+    if (!bytes) {
+        result.status = bytes.error().code == ErrorCode::canceled ? "canceled" :
+                        bytes.error().code == ErrorCode::resource_limit ? "budget" : "layout-read-failed";
+        mark_incomplete(scan, owner_complete, "Objective-C ivar-layout bytes could not be read");
+        return result;
+    }
+    const auto end = std::find(bytes.value().begin(), bytes.value().end(), std::byte{0});
+    const auto count = static_cast<std::size_t>(end - bytes.value().begin());
+    result.encoded_bytes.reserve(count);
+    for (std::size_t i = 0; i < count; ++i)
+        result.encoded_bytes.push_back(std::to_integer<std::uint8_t>(bytes.value()[i]));
+    if (end == bytes.value().end()) {
+        result.status = available > request ? "layout-limit" : "unterminated-layout";
+        mark_incomplete(scan, owner_complete, "Objective-C ivar-layout string has no bounded terminator");
+    } else {
+        result.status = "resolved-raw-encoding";
+    }
+    return result;
+}
+
 bool add_incomplete(MachOObjCScan &scan, MachOObjCClass &row, std::string reason) {
     row.complete = false;
     scan.complete = false;
@@ -191,8 +242,6 @@ bool add_incomplete(MachOObjCScan &scan, MachOObjCProtocol &row, std::string rea
     if (scan.reason.empty()) scan.reason = std::move(reason);
     return false;
 }
-
-void mark_incomplete(MachOObjCScan &scan, bool &owner_complete, std::string reason);
 
 MachOObjCList parse_list(const Image &image, const RelocationResolver &resolver, Address pointer_slot,
                          unsigned kind, Budget &budget, MachOObjCScan &scan, bool &owner_complete) {
@@ -698,7 +747,7 @@ bool decode_metaclass(const Image &image, const RelocationResolver &resolver, Ma
     const auto pointer_bytes = static_cast<std::uint64_t>(budget.pointer_bytes);
     const auto class_size = 5 * pointer_bytes;
     // Through baseMethods on LP64; the full stable ILP32 prefix is also 40 bytes.
-    const auto class_ro_size = UINT64_C(40);
+    const auto class_ro_size = budget.pointer_bytes == 8 ? UINT64_C(72) : UINT64_C(40);
     const auto class_ro_name_offset = budget.pointer_bytes == 8 ? UINT64_C(24) : UINT64_C(16);
     const auto class_ro_methods_offset = budget.pointer_bytes == 8 ? UINT64_C(32) : UINT64_C(20);
     const auto isa_slot = *row.class_address;
@@ -750,10 +799,14 @@ bool decode_metaclass(const Image &image, const RelocationResolver &resolver, Ma
     row.metaclass_flags = static_cast<std::uint32_t>(read_integer(ro_bytes.value(), 0, 4));
     const auto name_slot = add(ro, class_ro_name_offset);
     const auto methods_slot = add(ro, class_ro_methods_offset);
-    if (!name_slot || !methods_slot) {
+    const auto ivar_layout_slot = add(ro, budget.pointer_bytes == 8 ? UINT64_C(16) : UINT64_C(12));
+    const auto weak_ivar_layout_slot = add(ro, budget.pointer_bytes == 8 ? UINT64_C(56) : UINT64_C(32));
+    if (!name_slot || !methods_slot || !ivar_layout_slot || !weak_ivar_layout_slot) {
         add_incomplete(scan, row, "Objective-C metaclass class_ro_t field address overflow");
         return false;
     }
+    row.metaclass_ivar_layout = read_ivar_layout(image, resolver, *ivar_layout_slot, budget, scan, row.complete);
+    row.metaclass_weak_ivar_layout = read_ivar_layout(image, resolver, *weak_ivar_layout_slot, budget, scan, row.complete);
     const auto name = pointer_at(image, resolver, *name_slot, budget);
     row.metaclass_name_status = name.status;
     if (name.address)
@@ -812,7 +865,7 @@ Result<MachOObjCScan> scan_macho_objc_classes(const Image &image, const ImageMet
     if (!address_domain_matches || image.layout().space.order != ByteOrder::little)
         return Error{ErrorCode::conflict, "Objective-C selected slice and mapped-image pointer width or byte order disagree"};
     if (!limits.max_classes || !limits.max_categories || !limits.max_protocols || !limits.max_metadata_bytes ||
-        !limits.max_name_bytes || !limits.max_list_entries || !limits.max_protocol_inheritance_depth ||
+        !limits.max_name_bytes || !limits.max_ivar_layout_bytes || !limits.max_list_entries || !limits.max_protocol_inheritance_depth ||
         !limits.max_protocol_requirement_work)
         return Error{ErrorCode::invalid_argument, "Objective-C scan limits must be nonzero"};
     auto resolver = RelocationResolver::create(image, metadata, stop);
@@ -943,16 +996,20 @@ Result<MachOObjCScan> scan_macho_objc_classes(const Image &image, const ImageMet
             row.instance_size = static_cast<std::uint32_t>(read_integer(ro.value(), 8, 4));
             if (*row.instance_start > *row.instance_size)
                 add_incomplete(scan, row, "Objective-C class instance range is inconsistent");
+            const auto ivar_layout_slot = add(ro_address, pointer_bytes == 8 ? 16 : 12);
+            const auto weak_ivar_layout_slot = add(ro_address, pointer_bytes == 8 ? 56 : 32);
             const auto name_slot = add(ro_address, pointer_bytes == 8 ? 24 : 16);
             const auto methods_slot = add(ro_address, pointer_bytes == 8 ? 32 : 20);
             const auto protocols_slot = add(ro_address, pointer_bytes == 8 ? 40 : 24);
             const auto ivars_slot = add(ro_address, pointer_bytes == 8 ? 48 : 28);
             const auto properties_slot = add(ro_address, pointer_bytes == 8 ? 64 : 36);
-            if (!name_slot || !methods_slot || !protocols_slot || !ivars_slot || !properties_slot) {
+            if (!ivar_layout_slot || !weak_ivar_layout_slot || !name_slot || !methods_slot || !protocols_slot || !ivars_slot || !properties_slot) {
                 add_incomplete(scan, row, "Objective-C class_ro_t field address overflow");
                 scan.classes.push_back(std::move(row));
                 continue;
             }
+            row.ivar_layout = read_ivar_layout(image, resolver.value(), *ivar_layout_slot, budget, scan, row.complete);
+            row.weak_ivar_layout = read_ivar_layout(image, resolver.value(), *weak_ivar_layout_slot, budget, scan, row.complete);
             const auto name_pointer = pointer_at(image, resolver.value(), *name_slot, budget);
             if (name_pointer.address) {
                 row.name = read_name(image, *name_pointer.address, budget, row.name_status);

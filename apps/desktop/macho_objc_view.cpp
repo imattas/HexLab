@@ -4,6 +4,7 @@
 #include "hexlab/analysis/macho_objc_types.hpp"
 #include "hexlab/database/codec.hpp"
 #include <algorithm>
+#include <array>
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
@@ -19,6 +20,17 @@ std::string number(std::uint64_t value) { return "0x" + [](std::uint64_t v) {
 
 std::string opt_number(const std::optional<std::uint32_t> &value) {
     return value ? std::to_string(*value) : "unavailable";
+}
+
+std::string layout_hex(const MachOObjCIvarLayout &layout) {
+    constexpr char digits[] = "0123456789abcdef";
+    std::string result;
+    result.reserve(layout.encoded_bytes.size() * 2);
+    for (const auto byte : layout.encoded_bytes) {
+        result.push_back(digits[byte >> 4]);
+        result.push_back(digits[byte & 15]);
+    }
+    return result;
 }
 
 std::string class_ro_flag_names(std::uint32_t flags) {
@@ -185,6 +197,14 @@ std::vector<MachOObjCViewRow> macho_objc_view_rows(const MachOObjCScan &scan) {
             origin, "metaclass=" + (c.metaclass_address ? number(c.metaclass_address->offset) : "unavailable") +
             "; metaclass-ro=" + (c.metaclass_ro_address ? number(c.metaclass_ro_address->offset) : "unavailable"),
             c.metaclass_address ? c.metaclass_address : std::optional<Address>{c.classlist_slot});
+        for (const auto &[kind, layout] : std::array<std::pair<const char *, const MachOObjCIvarLayout *>, 4>{{
+                 {"Strong ivar layout", &c.ivar_layout}, {"Weak ivar layout", &c.weak_ivar_layout},
+                 {"Metaclass strong ivar layout", &c.metaclass_ivar_layout},
+                 {"Metaclass weak ivar layout", &c.metaclass_weak_ivar_layout}}}) {
+            add(rows, kind, owner, layout_hex(*layout), layout->status + "; pointer=" + layout->pointer_status,
+                layout->address ? "layout " + number(layout->address->offset) : "class_ro_t layout field",
+                "pointer=" + layout->pointer_status + "; raw compressed layout bytes=" + layout_hex(*layout), layout->address);
+        }
         add_list(rows, c.methods, owner, "Instance");
         add_list(rows, c.class_methods, owner, "Class");
         add_list(rows, c.ivars, owner, "Instance");

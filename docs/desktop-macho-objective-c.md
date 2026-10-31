@@ -9,6 +9,9 @@ snapshot is selected. The page shows classes, metaclasses, categories,
 protocols, methods, properties, ivars, class/category protocol references, and
 protocol adoption references. It reports scanner completeness and field
 statuses directly, alongside section/index or record-entry provenance.
+Class and metaclass rows include separate strong and weak ivar-layout rows.
+These display bounded raw layout bytes as hex with their addresses and read
+statuses; they are not decoded into object-slot ranges.
 
 Activate an addressable row to navigate through the desktop's existing address
 navigation callback. Method rows prefer a validated implementation address and

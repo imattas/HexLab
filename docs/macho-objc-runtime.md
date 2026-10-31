@@ -20,6 +20,12 @@ the data pointers, then reads the fixed 40-byte (32-bit) or 72-byte (64-bit)
 `class_ro_t` prefix. It reports
 the bounded class name, flags, instance start and size, and superclass index
 and name only when the superclass address maps to a scanned class-list entry.
+The strong and weak `class_ro_t` ivar-layout pointers are also resolved with
+the same fixup policy. Their NUL-terminated encoded bytes are retained up to a
+separate 4,096-byte limit for classes and directly referenced metaclasses;
+the bytes are shown as hex and are not interpreted as instance-layout runs.
+Null pointers remain absent, while unresolved pointers and unterminated or
+over-limit byte strings mark the row and scan partial.
 The directly referenced metaclass is decoded as a class object; its `class_ro_t`
 name and class-method list are reported with separate pointer statuses. Names
 must terminate within initialized mapped bytes and the configured name limit.
@@ -122,7 +128,7 @@ pointers. A partial field marks its owning class/category/protocol and scan inco
 decoded records remain available. The scanner bounds every list extent, string,
 pointer slot, and scalar read. Protocol definitions use the same validated direct and relative method-list formats described above. The scanner does not infer category targets from runtime registration or decode optional protocol tail fields.
 
-Default work limits are 100,000 classes, categories, and protocols, 64 MiB of metadata reads and validated list extents, 4,096 bytes per name, and 1,000,000 entries per list. A limit or unresolved class field
+Default work limits are 100,000 classes, categories, and protocols, 64 MiB of metadata reads and validated list extents, 4,096 bytes per name and ivar-layout encoding, and 1,000,000 entries per list. A limit or unresolved class field
 marks the scan partial while preserving the rows already decoded. Cancellation
 is honored during scanning. Little-endian arm64_32 uses four-byte Objective-C
 metadata pointers in a validated 64-bit address space. Big-endian images,
@@ -130,8 +136,6 @@ other ABI64_32 variants, ObjC1 `__OBJC`
 records and runtime class data remain unsupported.
 See the [32-bit layout and validation contract](../libs/analysis/docs/macho-objc-32bit.md)
 for exact supported offsets, pointer checks and remaining runtime forms.
-This hardening slice has source-review evidence only; no builds or tests were run.
-
 The Objective-C type import plan also persists complete categories whose name
 and target link resolve to a scanned class. Parsed instance and class method
 signatures are stored together in a separate incomplete aggregate named
