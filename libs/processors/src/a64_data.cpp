@@ -88,17 +88,19 @@ bool data(Instruction &i, std::uint32_t word) {
     } else if ((word & 0x3b200c00u) == 0x38200800u) {
         const auto size = word >> 30, op = (word >> 22) & 3;
         const auto option = (word >> 13) & 7;
+        const bool signed_narrow = size < 2 && op >= 2;
         const bool signed_word = size == 2 && op == 2;
-        if ((!signed_word && (op > 1 || size == 2)) ||
+        if ((!signed_narrow && !signed_word && (op > 1 || size == 2)) ||
             (option != 2 && option != 3 && option != 6 && option != 7))
             return false;
-        const bool load = op == 1;
-        i.opcode = signed_word ? Opcode::a64_ldrsw
+        const bool load = op != 0;
+        i.opcode = signed_narrow ? (size == 0 ? Opcode::a64_ldrsb : Opcode::a64_ldrsh)
+                   : signed_word ? Opcode::a64_ldrsw
                    : size == 0   ? (load ? Opcode::a64_ldrb : Opcode::a64_strb)
                    : size == 1 ? (load ? Opcode::a64_ldrh : Opcode::a64_strh)
                                : (load ? Opcode::a64_ldr : Opcode::a64_str);
-        operand(i, reg(word & 31, signed_word || size == 3 ? 64 : 32),
-                signed_word || load ? OperandAccess::write : OperandAccess::read);
+        const auto destination_width = signed_word || size == 3 || (signed_narrow && op == 2) ? 64u : 32u;
+        operand(i, reg(word & 31, destination_width), load ? OperandAccess::write : OperandAccess::read);
         MemoryOperand memory;
         memory.data_width = signed_word ? 32 : static_cast<std::uint16_t>(8u << size);
         memory.address_width = 64;
@@ -109,25 +111,30 @@ bool data(Instruction &i, std::uint32_t word) {
         memory.index_shift_amount = (word & 0x1000u) ? static_cast<std::uint8_t>(size) : 0;
         i.register_reads.push_back(*memory.base);
         i.register_reads.push_back(*memory.index);
-        operand(i, memory, signed_word || load ? OperandAccess::read : OperandAccess::write);
-        i.memory_read = signed_word || load;
-        i.memory_write = !signed_word && !load;
+        operand(i, memory, load ? OperandAccess::read : OperandAccess::write);
+        i.memory_read = load;
+        i.memory_write = !load;
     } else if ((word & 0x3b200000u) == 0x38000000u) {
         const auto size = word >> 30, op = (word >> 22) & 3;
         const auto mode = (word >> 10) & 3;
-        if (op > 1 || mode == 2)
-            return false; // Signed loads and unprivileged forms have separate contracts.
-        const bool load = op == 1, writeback = mode != 0, post_index = mode == 1;
+        const bool signed_narrow = size < 2 && op >= 2;
+        const bool signed_word = size == 2 && op == 2;
+        if ((!signed_narrow && !signed_word && op > 1) || mode == 2)
+            return false; // Unprivileged and prefetch forms remain outside this slice.
+        const bool load = op != 0, writeback = mode != 0, post_index = mode == 1;
         const auto data_register = word & 31, base_register = (word >> 5) & 31;
         if (writeback && base_register != 31 && base_register == data_register)
             return false; // Writeback overlap has constrained-unpredictable semantics.
         const auto offset = signed_value((word >> 12) & 0x1ff, 9);
-        i.opcode = size == 0   ? (load ? Opcode::a64_ldrb : Opcode::a64_strb)
+        i.opcode = signed_narrow ? (size == 0 ? Opcode::a64_ldrsb : Opcode::a64_ldrsh)
+                   : signed_word ? Opcode::a64_ldrsw
+                   : size == 0   ? (load ? Opcode::a64_ldrb : Opcode::a64_strb)
                    : size == 1 ? (load ? Opcode::a64_ldrh : Opcode::a64_strh)
                                : (load ? Opcode::a64_ldr : Opcode::a64_str);
-        operand(i, reg(data_register, size == 3 ? 64 : 32), load ? OperandAccess::write : OperandAccess::read);
+        const auto destination_width = signed_word || size == 3 || (signed_narrow && op == 2) ? 64u : 32u;
+        operand(i, reg(data_register, destination_width), load ? OperandAccess::write : OperandAccess::read);
         MemoryOperand memory;
-        memory.data_width = static_cast<std::uint16_t>(8u << size);
+        memory.data_width = signed_word ? 32 : static_cast<std::uint16_t>(8u << size);
         memory.address_width = 64;
         memory.base = reg(base_register, 64, true);
         memory.displacement = post_index ? 0 : offset;
@@ -141,15 +148,20 @@ bool data(Instruction &i, std::uint32_t word) {
         i.memory_write = !load;
     } else if ((word & 0x3f000000u) == 0x39000000u) {
         const auto size = word >> 30, op = (word >> 22) & 3;
-        if (op > 1)
-            return false; // Signed/PRFM forms have separate contracts.
-        const bool load = op == 1;
-        i.opcode = size == 0   ? (load ? Opcode::a64_ldrb : Opcode::a64_strb)
+        const bool signed_narrow = size < 2 && op >= 2;
+        const bool signed_word = size == 2 && op == 2;
+        if ((!signed_narrow && !signed_word && op > 1))
+            return false; // Prefetch and reserved forms remain outside this slice.
+        const bool load = op != 0;
+        i.opcode = signed_narrow ? (size == 0 ? Opcode::a64_ldrsb : Opcode::a64_ldrsh)
+                   : signed_word ? Opcode::a64_ldrsw
+                   : size == 0   ? (load ? Opcode::a64_ldrb : Opcode::a64_strb)
                    : size == 1 ? (load ? Opcode::a64_ldrh : Opcode::a64_strh)
                                : (load ? Opcode::a64_ldr : Opcode::a64_str);
-        operand(i, reg(word & 31, size == 3 ? 64 : 32), load ? OperandAccess::write : OperandAccess::read);
+        const auto destination_width = signed_word || size == 3 || (signed_narrow && op == 2) ? 64u : 32u;
+        operand(i, reg(word & 31, destination_width), load ? OperandAccess::write : OperandAccess::read);
         MemoryOperand memory;
-        memory.data_width = static_cast<std::uint16_t>(8u << size);
+        memory.data_width = signed_word ? 32 : static_cast<std::uint16_t>(8u << size);
         memory.address_width = 64;
         memory.base = reg((word >> 5) & 31, 64, true);
         memory.displacement = static_cast<std::int64_t>(((word >> 10) & 0xfff) << size);

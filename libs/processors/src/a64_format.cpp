@@ -24,6 +24,8 @@ std::string mnemonic(Opcode opcode, std::uint8_t condition) {
     if (opcode == Opcode::a64_clz) return "clz";
     if (opcode == Opcode::a64_cls) return "cls";
     if (opcode == Opcode::a64_extr) return "extr";
+    if (opcode == Opcode::a64_ldrsb) return "ldrsb";
+    if (opcode == Opcode::a64_ldrsh) return "ldrsh";
     if (opcode == Opcode::a64_ldrsw) return "ldrsw";
     if (opcode == Opcode::a64_madd) return "madd";
     if (opcode == Opcode::a64_msub) return "msub";
@@ -207,19 +209,28 @@ std::string format(const Instruction &i) {
         for (unsigned byte = 0; byte < 4; ++byte)
             encoded_word |= std::uint32_t(std::to_integer<unsigned>(i.bytes[byte])) << (byte * 8);
     std::string result = mnemonic(i.opcode, i.condition);
+    const auto unscaled_size = encoded_word >> 30;
+    const auto unscaled_op = (encoded_word >> 22) & 3u;
+    const bool signed_narrow_unscaled = unscaled_size < 2 && unscaled_op >= 2;
+    const bool signed_word_unscaled = unscaled_size == 2 && unscaled_op == 2;
+    const bool valid_unscaled_op = unscaled_op <= 1 || signed_narrow_unscaled || signed_word_unscaled;
     const bool unscaled_encoding = i.bytes.size() == 4 &&
         (encoded_word & 0x3b200000u) == 0x38000000u &&
-        ((encoded_word >> 10) & 3u) == 0 && ((encoded_word >> 22) & 3u) <= 1;
-    const unsigned unscaled_size = encoded_word >> 30;
-    const bool unscaled_load = ((encoded_word >> 22) & 3u) == 1;
-    const auto unscaled_opcode = unscaled_size == 0
+        ((encoded_word >> 10) & 3u) == 0 && valid_unscaled_op;
+    const bool unscaled_load = unscaled_op != 0;
+    const auto unscaled_opcode = signed_narrow_unscaled
+        ? (unscaled_size == 0 ? Opcode::a64_ldrsb : Opcode::a64_ldrsh)
+        : signed_word_unscaled ? Opcode::a64_ldrsw
+        : unscaled_size == 0
         ? (unscaled_load ? Opcode::a64_ldrb : Opcode::a64_strb)
         : unscaled_size == 1
             ? (unscaled_load ? Opcode::a64_ldrh : Opcode::a64_strh)
             : unscaled_load ? Opcode::a64_ldr : Opcode::a64_str;
     const bool unscaled_transfer = unscaled_encoding && i.opcode == unscaled_opcode;
     if (unscaled_transfer) {
-        if (unscaled_size == 0) result = unscaled_load ? "ldurb" : "sturb";
+        if (signed_narrow_unscaled) result = unscaled_size == 0 ? "ldursb" : "ldursh";
+        else if (signed_word_unscaled) result = "ldursw";
+        else if (unscaled_size == 0) result = unscaled_load ? "ldurb" : "sturb";
         else if (unscaled_size == 1) result = unscaled_load ? "ldurh" : "sturh";
         else result = unscaled_load ? "ldur" : "stur";
     }

@@ -623,6 +623,44 @@ std::optional<Address> static_narrow_pointer_load(const Image &image, const Relo
     const Address target{source.space, value};
     return riscv_target_segment(image, target, OperandAccess::address) ? std::optional<Address>{target} : std::nullopt;
 }
+std::optional<Address> static_signed_narrow_pointer_load(const Image &image,
+                                                         const RelocationCoverage &relocations,
+                                                         Address source, std::uint8_t bit_width,
+                                                         std::uint16_t destination_width) {
+    if ((bit_width != 8 && bit_width != 16) ||
+        (destination_width != 32 && destination_width != 64)) return {};
+    const auto *space = image.space(source.space);
+    const auto *segment = image.segment_at(source);
+    if (!space || space->width_bits < destination_width || !segment || !segment->readable ||
+        source.offset < segment->begin.offset) return {};
+    const auto byte_width = static_cast<std::uint64_t>(bit_width / 8);
+    const auto relative = source.offset - segment->begin.offset;
+    if (relative > segment->file_size || byte_width > segment->file_size - relative ||
+        relocations.overlaps(source, byte_width)) return {};
+    const auto bytes = image.read(source, static_cast<std::size_t>(byte_width));
+    if (!bytes || bytes.value().size() != byte_width) return {};
+    std::uint32_t raw = 0;
+    if (space->order == ByteOrder::little) {
+        for (std::size_t index = 0; index < bytes.value().size(); ++index)
+            raw |= std::uint32_t(std::to_integer<std::uint8_t>(bytes.value()[index])) << (index * 8);
+    } else {
+        for (const auto byte : bytes.value())
+            raw = (raw << 8) | std::to_integer<std::uint8_t>(byte);
+    }
+    const auto signed_value = bit_width == 8
+        ? static_cast<std::int64_t>(std::bit_cast<std::int8_t>(static_cast<std::uint8_t>(raw)))
+        : static_cast<std::int64_t>(std::bit_cast<std::int16_t>(static_cast<std::uint16_t>(raw)));
+    const auto extended = destination_width == 32
+        ? static_cast<std::uint64_t>(static_cast<std::uint32_t>(signed_value))
+        : static_cast<std::uint64_t>(signed_value);
+    const Address target{source.space, extended};
+    return riscv_target_segment(image, target, OperandAccess::address)
+        ? std::optional<Address>{target} : std::nullopt;
+}
+bool a64_signed_narrow_load(Opcode opcode, std::uint16_t memory_width) {
+    return (opcode == Opcode::a64_ldrsb && memory_width == 8) ||
+           (opcode == Opcode::a64_ldrsh && memory_width == 16);
+}
 std::optional<Address> static_m6502_indirect_target(const Image &image, const RelocationCoverage &relocations,
                                                     Address pointer) {
     const auto *space = image.space(pointer.space);
@@ -4066,7 +4104,8 @@ RegisterReferenceFacts a64_reference_facts(const Image *image, const RelocationC
                     // value assigned to the base after the transfer.
                     const bool writeback_load = instruction.opcode == Opcode::a64_ldr ||
                         instruction.opcode == Opcode::a64_ldrb || instruction.opcode == Opcode::a64_ldrh ||
-                        instruction.opcode == Opcode::a64_ldp;
+                        instruction.opcode == Opcode::a64_ldrsb || instruction.opcode == Opcode::a64_ldrsh ||
+                        instruction.opcode == Opcode::a64_ldrsw || instruction.opcode == Opcode::a64_ldp;
                     const bool writeback_store = instruction.opcode == Opcode::a64_str ||
                         instruction.opcode == Opcode::a64_strb || instruction.opcode == Opcode::a64_strh ||
                         instruction.opcode == Opcode::a64_stp;
@@ -4081,11 +4120,17 @@ RegisterReferenceFacts a64_reference_facts(const Image *image, const RelocationC
                         const auto expected_memory_access = writeback_load ? OperandAccess::read : OperandAccess::write;
                         const auto expected_register_access = writeback_load ? OperandAccess::write : OperandAccess::read;
                         const auto expected_memory_width = instruction.opcode == Opcode::a64_ldrb ||
-                            instruction.opcode == Opcode::a64_strb ? std::uint16_t{8} :
-                            instruction.opcode == Opcode::a64_ldrh || instruction.opcode == Opcode::a64_strh
-                                ? std::uint16_t{16} : memory->data_width;
-                        const auto expected_register_width = !pair && expected_memory_width < 32
-                            ? std::uint16_t{32} : expected_memory_width;
+                            instruction.opcode == Opcode::a64_strb || instruction.opcode == Opcode::a64_ldrsb
+                                ? std::uint16_t{8} :
+                            instruction.opcode == Opcode::a64_ldrh || instruction.opcode == Opcode::a64_strh ||
+                            instruction.opcode == Opcode::a64_ldrsh ? std::uint16_t{16} :
+                            instruction.opcode == Opcode::a64_ldrsw ? std::uint16_t{32} : memory->data_width;
+                        const auto *writeback_destination = !pair && !instruction.operands.empty()
+                            ? std::get_if<RegisterOperand>(&instruction.operands[0]) : nullptr;
+                        const auto expected_register_width = !pair &&
+                            (expected_memory_width < 32 || instruction.opcode == Opcode::a64_ldrsw)
+                                ? (writeback_destination ? writeback_destination->width : std::uint16_t{0})
+                                : expected_memory_width;
                         std::vector<RegisterOperand> expected_reads, expected_writes;
                         bool transfers_valid = instruction.operands.size() == transfer_count + 1 &&
                             instruction.access.size() == transfer_count + 1 &&
@@ -4174,10 +4219,14 @@ RegisterReferenceFacts a64_reference_facts(const Image *image, const RelocationC
                         const bool supported_pointer_width = memory->data_width == 32 || memory->data_width == 64;
                         const bool signed_word_load = instruction.opcode == Opcode::a64_ldrsw &&
                             memory->data_width == 32 && loaded_destination && loaded_destination->width == 64;
+                        const bool signed_narrow_load = a64_signed_narrow_load(instruction.opcode,
+                                                                               memory->data_width);
                         const bool destination_written = loaded_destination &&
                             loaded_destination->bank == RegisterBank::arm64_gpr && loaded_destination->index != 31 &&
                             (loaded_destination->width == memory->data_width || signed_word_load ||
-                             (narrow_load && loaded_destination->width == 32)) &&
+                             (narrow_load && loaded_destination->width == 32) ||
+                             (signed_narrow_load && (loaded_destination->width == 32 ||
+                                                     loaded_destination->width == 64))) &&
                             std::any_of(instruction.register_writes.begin(), instruction.register_writes.end(),
                                 [&](const RegisterOperand &written) {
                                     return written.bank == loaded_destination->bank &&
@@ -4202,6 +4251,11 @@ RegisterReferenceFacts a64_reference_facts(const Image *image, const RelocationC
                                    destination_written) {
                             if (const auto value = static_narrow_pointer_load(*image, relocations, literal,
                                                                              memory->data_width))
+                                loaded_pointers.emplace_back(loaded_destination->index, *value);
+                        } else if (signed_narrow_load && instruction.access[i] == OperandAccess::read &&
+                                   destination_written) {
+                            if (const auto value = static_signed_narrow_pointer_load(*image, relocations, literal,
+                                    memory->data_width, loaded_destination->width))
                                 loaded_pointers.emplace_back(loaded_destination->index, *value);
                         }
                         continue;
@@ -4243,6 +4297,15 @@ RegisterReferenceFacts a64_reference_facts(const Image *image, const RelocationC
                                         [&](const RegisterOperand &written) {
                                             return written.bank == destination->bank && written.index == destination->index;
                                         });
+                                const bool signed_narrow_destination_written = destination &&
+                                    destination->bank == RegisterBank::arm64_gpr && destination->index != 31 &&
+                                    (destination->width == 32 || destination->width == 64) &&
+                                    a64_signed_narrow_load(instruction.opcode, memory->data_width) &&
+                                    instruction.access[i] == OperandAccess::read &&
+                                    std::any_of(instruction.register_writes.begin(), instruction.register_writes.end(),
+                                        [&](const RegisterOperand &written) {
+                                            return written.bank == destination->bank && written.index == destination->index;
+                                        });
                                 if (destination_written && riscv_target_segment(*image, address, OperandAccess::read, 8)) {
                                     const auto slot = reference_detail::take(resolver.data_at(*image, address, 8, stop));
                                     if (slot.relocated()) {
@@ -4252,6 +4315,10 @@ RegisterReferenceFacts a64_reference_facts(const Image *image, const RelocationC
                                         loaded_pointers.emplace_back(destination->index, *value);
                                     }
                                 }
+                                if (signed_narrow_destination_written)
+                                    if (const auto value = static_signed_narrow_pointer_load(*image, relocations, address,
+                                            memory->data_width, destination->width))
+                                        loaded_pointers.emplace_back(destination->index, *value);
                             }
                             continue;
                         }
@@ -4339,10 +4406,13 @@ RegisterReferenceFacts a64_reference_facts(const Image *image, const RelocationC
                             memory->data_width == 32 && destination && destination->width == 64;
                         const bool narrow_load = (instruction.opcode == Opcode::a64_ldrb && memory->data_width == 8) ||
                             (instruction.opcode == Opcode::a64_ldrh && memory->data_width == 16);
+                        const bool signed_narrow_load = a64_signed_narrow_load(instruction.opcode,
+                                                                               memory->data_width);
                         const bool destination_written = destination && destination->bank == RegisterBank::arm64_gpr &&
                             destination->index != 31 &&
                             (destination->width == memory->data_width || signed_word_load ||
-                             (narrow_load && destination->width == 32)) &&
+                             (narrow_load && destination->width == 32) ||
+                             (signed_narrow_load && (destination->width == 32 || destination->width == 64))) &&
                             std::any_of(instruction.register_writes.begin(), instruction.register_writes.end(),
                                 [&](const RegisterOperand &written) {
                                     return written.bank == destination->bank && written.index == destination->index;
@@ -4378,6 +4448,11 @@ RegisterReferenceFacts a64_reference_facts(const Image *image, const RelocationC
                                    destination_written) {
                             if (const auto value = static_narrow_pointer_load(*image, relocations, address,
                                                                              memory->data_width))
+                                loaded_pointers.emplace_back(destination->index, *value);
+                        } else if (instruction.access[i] == OperandAccess::read && signed_narrow_load &&
+                                   destination_written) {
+                            if (const auto value = static_signed_narrow_pointer_load(*image, relocations, address,
+                                    memory->data_width, destination->width))
                                 loaded_pointers.emplace_back(destination->index, *value);
                         } else if (instruction.access[i] == OperandAccess::read &&
                                    instruction.opcode == Opcode::a64_ldp && instruction.operands.size() >= 2) {
