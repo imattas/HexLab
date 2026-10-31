@@ -1543,6 +1543,106 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
             return effect;
         }
     }
+    const bool x86_opmask_logic = instruction.opcode >= Opcode::kandb &&
+                                  instruction.opcode <= Opcode::knotq;
+    if (x86_context && instruction.context.architecture == Architecture::x86_64 &&
+        instruction.context.mode == ExecutionMode::x86_64 && instruction.flow == FlowKind::fallthrough &&
+        x86_opmask_logic && !instruction.x86_evex && !instruction.x86_opmask &&
+        !instruction.x86_opmask_zeroing && !instruction.x86_evex_broadcast && !instruction.x86_evex_sae &&
+        !instruction.memory_read && !instruction.memory_write) {
+        enum class Operation : std::uint8_t { and_, and_not, or_, xor_, xnor, not_ };
+        Operation operation{};
+        unsigned width = 0;
+        switch (instruction.opcode) {
+#define HEXLAB_KLOGIC_WIDTHS(prefix, op) \
+        case Opcode::prefix##b: width = 8; operation = Operation::op; break; \
+        case Opcode::prefix##w: width = 16; operation = Operation::op; break; \
+        case Opcode::prefix##d: width = 32; operation = Operation::op; break; \
+        case Opcode::prefix##q: width = 64; operation = Operation::op; break
+        HEXLAB_KLOGIC_WIDTHS(kand, and_);
+        HEXLAB_KLOGIC_WIDTHS(kandn, and_not);
+        HEXLAB_KLOGIC_WIDTHS(kor, or_);
+        HEXLAB_KLOGIC_WIDTHS(kxor, xor_);
+        HEXLAB_KLOGIC_WIDTHS(kxnor, xnor);
+        HEXLAB_KLOGIC_WIDTHS(knot, not_);
+#undef HEXLAB_KLOGIC_WIDTHS
+        default: break;
+        }
+        const bool unary = operation == Operation::not_;
+        const std::size_t operand_count = unary ? 2u : 3u;
+        if (width != 0 && instruction.operands.size() == operand_count && operands.size() == operand_count &&
+            instruction.access.size() == operand_count && instruction.access[0] == OperandAccess::write &&
+            instruction.access[1] == OperandAccess::read &&
+            (unary || instruction.access[2] == OperandAccess::read)) {
+            const auto *destination = std::get_if<RegisterOperand>(&instruction.operands[0]);
+            const auto *source1_register = std::get_if<RegisterOperand>(&instruction.operands[1]);
+            const auto *source2_register = unary ? nullptr : std::get_if<RegisterOperand>(&instruction.operands[2]);
+            const auto valid_k = [](const RegisterOperand *reg) {
+                return reg && reg->bank == RegisterBank::opmask && reg->index < 8 &&
+                    reg->width == 64 && !reg->high_byte;
+            };
+            const auto has_read = [&](RegisterOperand reg) {
+                return std::find(instruction.register_reads.begin(), instruction.register_reads.end(), reg) !=
+                    instruction.register_reads.end();
+            };
+            const bool reads_valid = valid_k(source1_register) && has_read(*source1_register) &&
+                (unary || (valid_k(source2_register) && has_read(*source2_register)));
+            const bool no_extra_reads = std::all_of(instruction.register_reads.begin(), instruction.register_reads.end(),
+                [&](RegisterOperand reg) {
+                    return (valid_k(source1_register) && reg == *source1_register) ||
+                        (!unary && valid_k(source2_register) && reg == *source2_register);
+                });
+            const bool write_valid = valid_k(destination) && instruction.register_writes.size() == 1 &&
+                instruction.register_writes.front() == *destination;
+            if (write_valid && reads_valid && no_extra_reads && operands[0]->type.bits == 64 &&
+                operands[1]->type.bits == 64 && (unary || operands[2]->type.bits == 64)) {
+                const auto binary64 = [](std::string name, ExpressionPtr left, ExpressionPtr right) {
+                    return std::make_shared<Expression>(Expression{integer_type(64),
+                        BinaryValue{std::move(name), std::move(left), std::move(right)}});
+                };
+                const std::uint64_t mask = width == 64 ? UINT64_MAX : (UINT64_C(1) << width) - 1;
+                const auto source1 = retag_expr(operands[1], integer_type(64));
+                ExpressionPtr value;
+                std::string name;
+                switch (operation) {
+                case Operation::and_:
+                    value = binary64("and", source1, retag_expr(operands[2], integer_type(64)));
+                    name = "x86_kand_i";
+                    break;
+                case Operation::and_not:
+                    value = binary64("and", binary64("xor", source1, constant_expr(UINT64_MAX, 64)),
+                        retag_expr(operands[2], integer_type(64)));
+                    name = "x86_kandn_i";
+                    break;
+                case Operation::or_:
+                    value = binary64("or", source1, retag_expr(operands[2], integer_type(64)));
+                    name = "x86_kor_i";
+                    break;
+                case Operation::xor_:
+                    value = binary64("xor", source1, retag_expr(operands[2], integer_type(64)));
+                    name = "x86_kxor_i";
+                    break;
+                case Operation::xnor:
+                    value = binary64("xor", binary64("xor", source1, retag_expr(operands[2], integer_type(64))),
+                        constant_expr(UINT64_MAX, 64));
+                    name = "x86_kxnor_i";
+                    break;
+                case Operation::not_:
+                    value = binary64("xor", source1, constant_expr(UINT64_MAX, 64));
+                    name = "x86_knot_i";
+                    break;
+                }
+                value = binary64("and", std::move(value), constant_expr(mask, 64));
+                name += std::to_string(width);
+                Intrinsic effect{std::move(name), {source1}, IntrinsicMemoryEffect::none};
+                if (!unary) effect.operands.push_back(retag_expr(operands[2], integer_type(64)));
+                effect.register_writes = instruction.register_writes;
+                effect.register_output_values = {std::move(value)};
+                effect.result_type = integer_type(64);
+                return effect;
+            }
+        }
+    }
     const bool x86_opmask_arithmetic = instruction.opcode >= Opcode::kaddb &&
                                        instruction.opcode <= Opcode::kunpckdq;
     if (x86_context && instruction.context.architecture == Architecture::x86_64 &&
