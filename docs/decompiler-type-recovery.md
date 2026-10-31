@@ -696,9 +696,13 @@ GPR and FPR allocation is independent and unused incoming arguments are
 possible; observed argument-register or stack use therefore leaves the
 candidate parameter list unresolved. Integer-only 8-byte structures use R3,
 and supported 16-byte structures are projected across R3/R4. Larger supported
-structures use the classifier's hidden R3 result pointer. Variadic placement,
-vector arguments, and aggregate layouts outside that bounded classifier subset
-remain unsupported by this decompiler path.
+structures use the classifier's hidden R3 result pointer. Complete 128-bit
+vector parameters use V2-V13 by vector-class order, and vector results use V2;
+typed vector metadata must identify a complete vector. More than twelve vector
+parameters, variadic placement, vector aggregates, and aggregate layouts outside
+that bounded classifier subset remain unsupported. Unprototyped vector register
+observations do not establish parameter order and are not promoted to candidate
+parameters on their own.
 The profile follows the [OpenPOWER 64-bit ELF ABI specification](https://openpower.foundation/specifications/64bitelfabi/).
 
 MIPS N32 explicit prototypes now use the shared scalar classifier to constrain incoming `A0`–`A7` integer/pointer or `F12`–`F19` floating arguments and exact entry-relative 8-byte stack slots after the eight argument positions. The N32 data model retains 32-bit pointers with 64-bit GPR containers. Interprocedural argument propagation carries these classified scalar locations only when caller and callee ABI descriptions match, and uses the declared parameter index rather than treating the separate register classes as independently ordered. Scalar integer/pointer results use V0 and floating results use F0 through the existing MIPS N32 profile. Variadic, aggregate, array, vector and unprototyped mixed-class argument recovery remain unsupported; register observations alone do not establish parameter order.

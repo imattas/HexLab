@@ -1636,7 +1636,7 @@ AbiSignatureClassification classify_ppc64le_elfv2(const types::Type &function_ty
         return fail_signature("function declaration requests a different calling convention");
 
     struct Shape {
-        enum class Class { invalid, integer, floating, aggregate, void_result } cls = Class::invalid;
+        enum class Class { invalid, integer, floating, vector, aggregate, void_result } cls = Class::invalid;
         std::uint64_t size = 0;
         std::string reason;
     };
@@ -1671,6 +1671,14 @@ AbiSignatureClassification classify_ppc64le_elfv2(const types::Type &function_ty
                 (s.size == 8 && type.name() == "double"))
                 s.cls = Shape::Class::floating;
             else s.reason = "only binary float and double are modeled for PowerPC64 ELFv2";
+            break;
+        case types::Kind::vector:
+            // ELFv2 passes a complete VMX vector in one vector register. The
+            // type graph must retain its exact 128-bit width; opaque or partial
+            // vectors do not establish this ABI class.
+            if (s.size == 16 && type.element() && type.count() > 0)
+                s.cls = Shape::Class::vector;
+            else s.reason = "PowerPC64 ELFv2 requires a complete 128-bit vector type";
             break;
         case types::Kind::structure: {
             // Whole doubleword memory images avoid endian-dependent partial
@@ -1708,7 +1716,7 @@ AbiSignatureClassification classify_ppc64le_elfv2(const types::Type &function_ty
             break;
         }
         default:
-            s.reason = "PowerPC64 ELFv2 vector, complex, array, union, or unresolved value is unsupported";
+            s.reason = "PowerPC64 ELFv2 complex, array, union, or unresolved value is unsupported";
             break;
         }
         return s;
@@ -1721,6 +1729,8 @@ AbiSignatureClassification classify_ppc64le_elfv2(const types::Type &function_ty
         out.result.locations.push_back(reg_location("R3", result.size, 0, 8));
     else if (result.cls == Shape::Class::floating)
         out.result.locations.push_back(reg_location("F1", result.size, 0, 8));
+    else if (result.cls == Shape::Class::vector)
+        out.result.locations.push_back(reg_location("V2", 16, 0, 16));
     else if (result.cls == Shape::Class::aggregate) {
         if (result.size <= 16) {
             for (std::uint64_t part = 0; part < result.size / 8; ++part)
@@ -1737,6 +1747,7 @@ AbiSignatureClassification classify_ppc64le_elfv2(const types::Type &function_ty
     // The home doubleword index selects R3-R10 and then SP+32 onward.
     std::uint64_t slot = out.result.indirect ? 1 : 0;
     std::uint64_t next_fpr = 1;
+    std::uint64_t next_vector = 2;
     bool spilled = false;
     bool placement_known = true;
     for (const auto &parameter : function_type.parameters()) {
@@ -1763,7 +1774,13 @@ AbiSignatureClassification classify_ppc64le_elfv2(const types::Type &function_ty
             continue;
         }
         AbiValueLocation argument;
-        if (value.cls == Shape::Class::floating && next_fpr <= 13) {
+        if (value.cls == Shape::Class::vector && next_vector <= 13) {
+            argument.locations.push_back(reg_location("V" + std::to_string(next_vector++), 16, 0, 16));
+        } else if (value.cls == Shape::Class::vector) {
+            out.arguments.push_back(unsupported("PowerPC64 ELFv2 vector arguments beyond V13 are outside the bounded classifier"));
+            out.complete = false;
+            continue;
+        } else if (value.cls == Shape::Class::floating && next_fpr <= 13) {
             argument.locations.push_back(reg_location("F" + std::to_string(next_fpr++),
                                                      value.size, 0, 8));
         } else if (value.cls != Shape::Class::floating && slot < 8 && words == 1) {
