@@ -325,6 +325,19 @@ CONTEXT with the AMD64 ContextFlags family at the documented AMD64 offset is
 decoded using AMD64 register offsets. This context representation can be used
 for either ARM64EC execution or x64 emulation; the minidump context alone does
 not distinguish those modes, so the loader labels it only AMD64-compatible.
+For this fixed layout, the register list also exposes conditional
+`arm64ec_candidate_*` aliases for the mapped GPRs, PC/SP/FP/LR, and V0-V15.
+Aliases backed by one AMD64 field preserve that field's exact file offset and
+bytes; LR and X6-X12/X15 use the low 64 bits of their mapped x87 slots, while
+V0-V15 use XMM0-XMM15. The prefix is deliberate: these rows describe the
+documented ARM64EC overlay as a possible view, not a finding that the thread
+was executing ARM64EC code. Composite X16/X17 and GS.base-backed X18 are not
+emitted because this fixed register list cannot represent their source extents
+as a single exact register row. Microsoft documents that ARM64EC uses an x64
+`CONTEXT` representation and maps its supported ARM64 registers into that
+layout; x64 emulation remains possible for the same dump context. See
+[ARM64EC register mapping](https://learn.microsoft.com/en-us/windows/arm/arm64ec-abi)
+and [ARM64EC ABI register tables](https://learn.microsoft.com/en-us/cpp/build/arm64ec-windows-abi-conventions).
 For variable-sized AMD64 contexts on ARM64 (including extended-state layouts),
 the loader retains the prefix and reports an architecture ambiguity rather
 than guessing a layout. These checks use bounded context prefixes and leave

@@ -286,6 +286,52 @@ ContextArchitectureSelection select_compatible_context_architecture(
     if (amd64_context) return {amd64, false};
     return {system_architecture, false};
 }
+void add_arm64ec_candidate_overlay(MinidumpContext &context) {
+    // ARM64EC_NT_CONTEXT overlays selected ARM64 core registers on the same
+    // storage used by an AMD64 CONTEXT. These are candidate aliases only:
+    // ARM64 SystemInfo plus an AMD64-shaped context cannot distinguish
+    // ARM64EC execution from x64 emulation.
+    struct Mapping { std::string_view arm64_name, amd64_name; };
+    static constexpr Mapping mappings[]{
+        {"x0", "rcx"}, {"x1", "rdx"}, {"x2", "r8"}, {"x3", "r9"},
+        {"x4", "r10"}, {"x5", "r11"}, {"x6", "st1"}, {"x7", "st2"},
+        {"x8", "rax"}, {"x9", "st3"}, {"x10", "st4"}, {"x11", "st5"},
+        {"x12", "st6"}, {"x15", "st7"}, {"x19", "r12"}, {"x20", "r13"},
+        {"x21", "r14"}, {"x22", "r15"}, {"x25", "rsi"}, {"x26", "rdi"},
+        {"x27", "rbx"}, {"fp", "rbp"}, {"lr", "st0"}, {"sp", "rsp"},
+        {"pc", "rip"},
+        {"v0", "xmm0"}, {"v1", "xmm1"}, {"v2", "xmm2"}, {"v3", "xmm3"},
+        {"v4", "xmm4"}, {"v5", "xmm5"}, {"v6", "xmm6"}, {"v7", "xmm7"},
+        {"v8", "xmm8"}, {"v9", "xmm9"}, {"v10", "xmm10"}, {"v11", "xmm11"},
+        {"v12", "xmm12"}, {"v13", "xmm13"}, {"v14", "xmm14"}, {"v15", "xmm15"}
+    };
+    std::vector<MinidumpRegister> aliases;
+    aliases.reserve(std::size(mappings));
+    std::size_t insert_at = 0;
+    for (const auto &mapping : mappings) {
+        const auto found = std::find_if(context.registers.begin(), context.registers.end(), [&](const auto &reg) {
+            return reg.name == mapping.amd64_name;
+        });
+        if (found == context.registers.end()) continue;
+        insert_at = std::max(insert_at, static_cast<std::size_t>(found - context.registers.begin()) + 1);
+        auto alias = *found;
+        alias.name = "arm64ec_candidate_" + std::string(mapping.arm64_name);
+        if (found->name.starts_with("st")) {
+            if (alias.bytes.size() < 8) continue;
+            alias.width = 64;
+            alias.bytes.resize(8);
+            alias.value = 0;
+            for (std::size_t byte = 0; byte < alias.bytes.size(); ++byte)
+                alias.value |= std::uint64_t{std::to_integer<unsigned>(alias.bytes[byte])} << (byte * 8);
+        }
+        aliases.push_back(std::move(alias));
+    }
+    if (aliases.empty()) return;
+    context.registers.insert(context.registers.begin() + static_cast<std::ptrdiff_t>(insert_at),
+                             aliases.begin(), aliases.end());
+    context.diagnostics.emplace_back(
+        "Conditional ARM64EC register aliases use the arm64ec_candidate_ prefix; x64 emulation remains possible and is not distinguished from these bytes");
+}
 struct Region { std::uint64_t begin, size, file; };
 struct Protection {
     std::uint64_t begin, end, allocation_base;
@@ -992,6 +1038,8 @@ Result<LoadedImage> load_minidump(std::shared_ptr<const ByteStorage> storage, st
                         ? "WOW64-compatible x86 context selected from its exact 716-byte layout and x86 ContextFlags; SystemInfo architecture differs"
                         : "AMD64-compatible 1232-byte context selected from its AMD64 ContextFlags; ARM64EC versus x64 emulation is not distinguishable from this context alone");
                 }
+                if (metadata.processor_architecture == 12 && selection.architecture == 9 && size == 1232)
+                    add_arm64ec_candidate_overlay(decoded);
             }
             auto context = std::move(decoded);
             if (context.status != MinidumpContextStatus::decoded) ++context_issue_count;
