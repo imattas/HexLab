@@ -144,11 +144,14 @@ case-insensitively sorted, deduplicated result set; each page is searched on
 the existing background worker. A literal search examines at most 200,000
 source records per request and labels partial results if that bound is reached.
 Changing the query, scope, or mode cancels pending work and discards stale
-pages. Source vectors are still collected synchronously when Jump opens, so a
-very large document can pause during collection. Paging covers captured
-current-document names only; it does not add a persistent index, background
-source collection, or searches of unopened projects. Fuzzy ranking remains
-bounded to its first 4,096 destinations and does not expose additional pages.
+pages. Source vectors are collected lazily by the chooser's cancellable
+background worker after the dialog opens, so a large document does not block
+the UI during collection. The worker reads the captured immutable document and
+project snapshots; navigation revalidates the active document and revision
+before following a result. Paging covers captured current-document names only;
+it does not add a persistent index or searches of unopened projects. Fuzzy
+ranking remains bounded to its first 4,096 destinations and does not expose
+additional pages.
 
 ## Find result filtering
 
