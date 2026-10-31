@@ -11,6 +11,14 @@ server description. The local packet ceiling is limited to 128 bytes through
 environment values are intentionally not persisted because they can contain
 credentials.
 
+The TCP connector applies one deadline to both name resolution and socket
+connection, and checks the caller's stop token while waiting for DNS. The
+operating-system resolver itself cannot be interrupted on every supported host,
+so it runs in a detached worker from a process-wide pool capped at four active
+lookups. A timed-out or canceled lookup may continue in the background and
+occupy one slot until the OS resolver returns; further connects wait within
+their own deadline rather than starting unbounded resolver threads.
+
 `rsp::Client::read_feature_annex()` reads `qXfer:features:read` annexes in
 multiple packets. Its `chunk` argument is a maximum and is reduced to fit both
 the local and peer `PacketSize` ceilings, leaving room for worst-case escaping
