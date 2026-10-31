@@ -839,13 +839,31 @@ class Msvc {
         if (ctor) function = scopes.front();
         if (dtor) function = "~" + scopes.front();
         const char fc = s_[at_++];
+        // Far static-adjustment thunk classes are known MSVC productions but
+        // are outside this bounded family. Do not reinterpret them as an
+        // ordinary member function merely because their class byte overlaps
+        // a legacy function-class case below.
+        if (fc == 'H' || fc == 'P' || fc == 'X')
+            throw Failure{DemangleStatus::unsupported};
         // MSVC data symbols use a storage-class digit followed directly by
         // the encoded variable type. Keep this parser separate from function
         // qualifiers/calling-convention handling: treating a data storage
         // class as a function class would misread the type as a return type.
         if (fc >= '0' && fc <= '4')
             return variable_symbol(function, scopes, static_cast<unsigned>(fc - '0'));
-        const auto klass = function_class(fc);
+        auto klass = function_class(fc);
+        bool static_adjustor_thunk = false;
+        std::string adjustment;
+        if (fc == 'G' || fc == 'O' || fc == 'W') {
+            // Near static-this-adjustment thunk classes: private, protected,
+            // and public respectively. The signed offset follows the class
+            // byte before the ordinary member-function type encoding.
+            static_adjustor_thunk = true;
+            const char *access = fc == 'G' ? "private:" : fc == 'O' ? "protected:" : "public:";
+            klass = {true, true, false, false, access};
+            if (scopes.empty()) throw Failure{DemangleStatus::malformed};
+            adjustment = descriptor_number(true);
+        }
         if (!klass.valid) throw Failure{DemangleStatus::unsupported};
         std::string this_cv, ref;
         if (klass.member && !klass.is_static) {
@@ -880,17 +898,20 @@ class Msvc {
         if (!take('Z') || at_ != s_.size()) throw Failure{DemangleStatus::malformed};
         if (args.size() == 1 && args.front() == "void") args.clear();
         std::string out;
-        if (klass.member) {
+        if (klass.member && !static_adjustor_thunk) {
             out = klass.access;
             if (klass.is_virtual) out += " virtual";
             if (klass.is_static) out += " static";
             out += " ";
+        } else if (static_adjustor_thunk) {
+            out = std::string(klass.access) + " adjustor thunk [this adjustment=" + adjustment + "] to ";
         }
         out += ret + " ";
         for (auto it=scopes.rbegin(); it!=scopes.rend(); ++it) out += *it + "::";
         out += function + "(";
         for (std::size_t i=0;i<args.size();++i) { if(i) out += ", "; out += args[i]; }
         out += ")" + this_cv + ref;
+        if (out.size() > limits_.max_output_bytes) throw Failure{DemangleStatus::resource_limit};
         return out;
     }
   private:

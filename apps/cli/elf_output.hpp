@@ -415,6 +415,45 @@ inline void elf_description(std::ostream &out, const ImageMetadata &metadata, co
             out << "  AArch64 control notes omitted="
                 << (elf.core->arm64_control_notes.size() - arm64_note_limit) << '\n';
     }
+    if (!elf.dwarf_macro_units.empty()) {
+        out << "ELF DWARF macro units: " << elf.dwarf_macro_units.size() << '\n';
+        constexpr std::size_t macro_record_limit = 256, macro_operand_limit = 512;
+        std::size_t shown_records = 0, omitted_records = 0, shown_operands = 0, omitted_operands = 0;
+        for (const auto &unit : elf.dwarf_macro_units) {
+            for (const auto &record : unit.records) {
+                if (!record.vendor_defined) continue;
+                if (shown_records >= macro_record_limit) { ++omitted_records; continue; }
+                ++shown_records;
+                out << "  vendor macro opcode=0x" << std::hex << unsigned(record.opcode) << std::dec
+                    << " section=\"" << elf_text(unit.section_name) << "\" section-offset="
+                    << elf_hex(record.section_offset) << " file=" << elf_hex(record.file_offset)
+                    << " operands=" << record.vendor_operands.size() << '\n';
+                for (const auto &operand : record.vendor_operands) {
+                    if (shown_operands >= macro_operand_limit) { ++omitted_operands; continue; }
+                    ++shown_operands;
+                    out << "    form=0x" << std::hex << unsigned(operand.form) << std::dec
+                        << " section-offset=" << elf_hex(operand.section_offset);
+                    if (operand.unsigned_value) out << " value=" << elf_hex(*operand.unsigned_value);
+                    if (operand.signed_value) out << " signed=" << *operand.signed_value;
+                    if (!operand.text.empty()) out << " text=\"" << elf_text(operand.text.substr(0, 256)) << '"';
+                    if (!operand.bytes.empty()) {
+                        out << " bytes=";
+                        const auto byte_count = std::min<std::size_t>(operand.bytes.size(), 32);
+                        const auto previous_fill = out.fill();
+                        for (std::size_t i = 0; i < byte_count; ++i)
+                            out << std::hex << std::setw(2) << std::setfill('0')
+                                << std::to_integer<unsigned>(operand.bytes[i]);
+                        out << std::dec;
+                        out.fill(previous_fill);
+                        if (operand.bytes.size() > byte_count) out << "...";
+                    }
+                    out << '\n';
+                }
+            }
+        }
+        if (omitted_records) out << "  vendor macro records omitted=" << omitted_records << '\n';
+        if (omitted_operands) out << "  vendor macro operands omitted=" << omitted_operands << '\n';
+    }
     out << "ELF relocations: " << elf.relocations.size() << ' ' << (elf.relocations_complete ? "complete" : "partial")
         << '\n';
     for (const auto &row : elf.relocations) {

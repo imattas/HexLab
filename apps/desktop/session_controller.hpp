@@ -19,7 +19,7 @@ struct AutomaticBackupOptions {
     int interval_minutes = 15;
     std::size_t retain = 5;
 };
-enum class SourceArchiveAction : std::uint8_t { create, rotate, list, prune, verify };
+enum class SourceArchiveAction : std::uint8_t { create, rotate, list, prune, verify, restore };
 class SessionController final : public wxEvtHandler {
   public:
     explicit SessionController(std::function<void()> changed);
@@ -46,7 +46,7 @@ class SessionController final : public wxEvtHandler {
     Result<bool> list_backups(DocumentId);
     Result<bool> prune_backups(DocumentId, std::size_t retain);
     Result<bool> manage_source_archive(DocumentId, SourceArchiveAction, std::filesystem::path = {},
-                                       std::size_t retain = 5);
+                                       std::size_t retain = 5, std::filesystem::path output = {});
     bool source_archive_pending() const { return source_archive_job_.has_value(); }
     void cancel_source_archive();
     bool backup_pending(DocumentId) const;
@@ -128,7 +128,8 @@ class SessionController final : public wxEvtHandler {
     };
     std::vector<BackupManagement> backup_management_;
     using SourceArchiveResult = std::variant<database::SourceArchiveResult, database::SourceArchiveRotationResult,
-        database::SourceArchiveListing, database::SourceArchivePruneResult, database::SourceArchiveVerification>;
+        database::SourceArchiveListing, database::SourceArchivePruneResult, database::SourceArchiveVerification,
+        database::SourceArchiveRestore>;
     struct SourceArchiveJob {
         DocumentId document;
         std::filesystem::path project_path;

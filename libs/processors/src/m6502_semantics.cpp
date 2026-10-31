@@ -358,6 +358,31 @@ evaluate_m6502_return_instruction(const Instruction &instruction,
     return evaluate_m6502_return(instruction.opcode, stack_pointer, first, second, third);
 }
 
+std::optional<M6502InterruptEntryResult>
+evaluate_m6502_hardware_interrupt(M6502HardwareInterrupt interrupt,
+                                  std::uint16_t program_counter,
+                                  std::uint8_t stack_pointer,
+                                  std::uint8_t status,
+                                  std::uint8_t vector_low,
+                                  std::uint8_t vector_high) noexcept {
+    std::uint16_t vector_address = 0;
+    switch (interrupt) {
+    case M6502HardwareInterrupt::irq: vector_address = 0xfffe; break;
+    case M6502HardwareInterrupt::nmi: vector_address = 0xfffa; break;
+    default: return {};
+    }
+
+    const auto pushed_status = static_cast<std::uint8_t>((status & 0xefu) | 0x20u);
+    const auto next_status = static_cast<std::uint8_t>((status & 0xcfu) | 0x24u);
+    const auto next_stack = static_cast<std::uint8_t>(stack_pointer - 3u);
+    const auto target = static_cast<std::uint16_t>(vector_low |
+        (static_cast<std::uint16_t>(vector_high) << 8));
+    return M6502InterruptEntryResult{target, next_stack, next_status,
+                                     static_cast<std::uint8_t>(program_counter >> 8),
+                                     static_cast<std::uint8_t>(program_counter),
+                                     pushed_status, vector_address};
+}
+
 std::optional<M6502FlagControlResult>
 evaluate_m6502_flag_control(Opcode opcode, std::uint8_t status) noexcept {
     std::uint8_t bit = 0;

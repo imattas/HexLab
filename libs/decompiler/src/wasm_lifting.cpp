@@ -347,6 +347,63 @@ std::optional<std::string_view> simd_integer_shift(std::uint32_t subopcode) {
     }
     return {};
 }
+std::optional<std::string_view> simd_float_unary(std::uint32_t subopcode) {
+    switch (subopcode) {
+    case 0x67: return "f32x4.ceil";
+    case 0x68: return "f32x4.floor";
+    case 0x69: return "f32x4.trunc";
+    case 0x6a: return "f32x4.nearest";
+    case 0x74: return "f64x2.ceil";
+    case 0x75: return "f64x2.floor";
+    case 0x7a: return "f64x2.trunc";
+    case 0x94: return "f64x2.nearest";
+    case 0xe0: return "f32x4.abs";
+    case 0xe1: return "f32x4.neg";
+    case 0xe3: return "f32x4.sqrt";
+    case 0xec: return "f64x2.abs";
+    case 0xed: return "f64x2.neg";
+    case 0xef: return "f64x2.sqrt";
+    default: return {};
+    }
+}
+std::optional<std::string_view> simd_float_binary(std::uint32_t subopcode) {
+    switch (subopcode) {
+    case 0xe4: return "f32x4.add";
+    case 0xe5: return "f32x4.sub";
+    case 0xe6: return "f32x4.mul";
+    case 0xe7: return "f32x4.div";
+    case 0xe8: return "f32x4.min";
+    case 0xe9: return "f32x4.max";
+    case 0xea: return "f32x4.pmin";
+    case 0xeb: return "f32x4.pmax";
+    case 0xf0: return "f64x2.add";
+    case 0xf1: return "f64x2.sub";
+    case 0xf2: return "f64x2.mul";
+    case 0xf3: return "f64x2.div";
+    case 0xf4: return "f64x2.min";
+    case 0xf5: return "f64x2.max";
+    case 0xf6: return "f64x2.pmin";
+    case 0xf7: return "f64x2.pmax";
+    default: return {};
+    }
+}
+std::optional<std::string_view> simd_integer_extmul(std::uint32_t subopcode) {
+    switch (subopcode) {
+    case 0x9c: return "i16x8.extmul_low_i8x16_s";
+    case 0x9d: return "i16x8.extmul_high_i8x16_s";
+    case 0x9e: return "i16x8.extmul_low_i8x16_u";
+    case 0x9f: return "i16x8.extmul_high_i8x16_u";
+    case 0xbc: return "i32x4.extmul_low_i16x8_s";
+    case 0xbd: return "i32x4.extmul_high_i16x8_s";
+    case 0xbe: return "i32x4.extmul_low_i16x8_u";
+    case 0xbf: return "i32x4.extmul_high_i16x8_u";
+    case 0xdc: return "i64x2.extmul_low_i32x4_s";
+    case 0xdd: return "i64x2.extmul_high_i32x4_s";
+    case 0xde: return "i64x2.extmul_low_i32x4_u";
+    case 0xdf: return "i64x2.extmul_high_i32x4_u";
+    default: return {};
+    }
+}
 bool simd_integer_extend_or_pairwise_add(std::uint32_t subopcode) {
     return (subopcode >= 0x7c && subopcode <= 0x7f) ||
            (subopcode >= 0x87 && subopcode <= 0x8a) ||
@@ -847,6 +904,28 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
             }
             if (op == 0xfd) {
                 const auto subopcode = simd_subopcode(code[n]->instruction);
+                const auto float_unary = subopcode ? simd_float_unary(*subopcode) : std::optional<std::string_view>{};
+                if (float_unary) {
+                    const auto &instruction = code[n]->instruction;
+                    if (!instruction.operands.empty() || instruction.mnemonic_override != *float_unary)
+                        return unsupported("SIMD floating unary opcode metadata is inconsistent");
+                    auto value = shape_pop(stack, vector(128));
+                    if (!value) return value.error();
+                    stack.push_back(vector(128));
+                    continue;
+                }
+                const auto float_binary = subopcode ? simd_float_binary(*subopcode) : std::optional<std::string_view>{};
+                if (float_binary) {
+                    const auto &instruction = code[n]->instruction;
+                    if (!instruction.operands.empty() || instruction.mnemonic_override != *float_binary)
+                        return unsupported("SIMD floating binary opcode metadata is inconsistent");
+                    auto right = shape_pop(stack, vector(128));
+                    auto left = shape_pop(stack, vector(128));
+                    if (!right) return right.error();
+                    if (!left) return left.error();
+                    stack.push_back(vector(128));
+                    continue;
+                }
                 if (subopcode && *subopcode == 13) {
                     // wasm.cpp decodes each of the sixteen shuffle bytes as
                     // an 8-bit unsigned immediate and rejects values >= 32.
@@ -920,6 +999,18 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
                 }
                 if (subopcode && ((*subopcode >= 0x23 && *subopcode <= 0x4c) ||
                                   (*subopcode >= 0xd6 && *subopcode <= 0xdb))) {
+                    auto right = shape_pop(stack, vector(128));
+                    auto left = shape_pop(stack, vector(128));
+                    if (!right) return right.error();
+                    if (!left) return left.error();
+                    stack.push_back(vector(128));
+                    continue;
+                }
+                const auto extmul = subopcode ? simd_integer_extmul(*subopcode) : std::optional<std::string_view>{};
+                if (extmul) {
+                    const auto &instruction = code[n]->instruction;
+                    if (!instruction.operands.empty() || instruction.mnemonic_override != *extmul)
+                        return unsupported("SIMD extended-multiply opcode metadata is inconsistent");
                     auto right = shape_pop(stack, vector(128));
                     auto left = shape_pop(stack, vector(128));
                     if (!right) return right.error();
@@ -1714,6 +1805,26 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
                     stack.push_back(binary("wasm_i8x16_swizzle", source.value(), indices.value(), vector(128)));
                     continue;
                 }
+                const auto float_unary = subopcode ? simd_float_unary(*subopcode) : std::optional<std::string_view>{};
+                if (float_unary) {
+                    if (!i.operands.empty() || i.mnemonic_override != *float_unary)
+                        return unsupported("SIMD floating unary opcode metadata is inconsistent");
+                    auto value = pop(vector(128));
+                    if (!value) return value.error();
+                    stack.push_back(unary(std::string(*float_unary), value.value(), vector(128)));
+                    continue;
+                }
+                const auto float_binary = subopcode ? simd_float_binary(*subopcode) : std::optional<std::string_view>{};
+                if (float_binary) {
+                    if (!i.operands.empty() || i.mnemonic_override != *float_binary)
+                        return unsupported("SIMD floating binary opcode metadata is inconsistent");
+                    auto right = pop(vector(128));
+                    auto left = pop(vector(128));
+                    if (!right) return right.error();
+                    if (!left) return left.error();
+                    stack.push_back(binary(std::string(*float_binary), left.value(), right.value(), vector(128)));
+                    continue;
+                }
                 const auto splat = subopcode ? simd_splat_op(*subopcode) : std::optional<SimdSplatOpInfo>{};
                 if (splat) {
                     auto scalar = pop(splat->scalar_type);
@@ -1802,6 +1913,16 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
                     continue;
                 }
                 if (subopcode) {
+                    if (const auto operation = simd_integer_extmul(*subopcode)) {
+                        if (!i.operands.empty() || i.mnemonic_override != *operation)
+                            return unsupported("SIMD extended-multiply opcode metadata is inconsistent");
+                        auto right = pop(vector(128));
+                        auto left = pop(vector(128));
+                        if (!right) return right.error();
+                        if (!left) return left.error();
+                        stack.push_back(binary(std::string(*operation), left.value(), right.value(), vector(128)));
+                        continue;
+                    }
                     if (const auto operation = wasm_simd_integer_binary_op(*subopcode)) {
                         auto right = pop(vector(128));
                         auto left = pop(vector(128));

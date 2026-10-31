@@ -354,7 +354,7 @@ void SessionController::cancel_source_archive() {
 }
 Result<bool> SessionController::manage_source_archive(DocumentId id, SourceArchiveAction action,
                                                        std::filesystem::path selected_path,
-                                                       std::size_t retain) {
+                                                       std::size_t retain, std::filesystem::path output_path) {
     if (source_archive_job_)
         return Error{ErrorCode::busy, "Wait for the current source archive operation to finish"};
     std::optional<std::filesystem::path> project_path;
@@ -365,8 +365,11 @@ Result<bool> SessionController::manage_source_archive(DocumentId id, SourceArchi
     const auto project = manager_->project(id);
     if (!project || !project->state)
         return Error{ErrorCode::busy, "Wait for the project to finish opening"};
-    if ((action == SourceArchiveAction::create || action == SourceArchiveAction::verify) && selected_path.empty())
+    if ((action == SourceArchiveAction::create || action == SourceArchiveAction::verify ||
+         action == SourceArchiveAction::restore) && selected_path.empty())
         return Error{ErrorCode::invalid_argument, "Choose a source archive path"};
+    if (action == SourceArchiveAction::restore && output_path.empty())
+        return Error{ErrorCode::invalid_argument, "Choose a destination for the restored source"};
     if ((action == SourceArchiveAction::rotate || action == SourceArchiveAction::prune) &&
         (retain == 0 || retain > 32))
         return Error{ErrorCode::invalid_argument, "Source archive retention must be from 1 through 32"};
@@ -382,6 +385,7 @@ Result<bool> SessionController::manage_source_archive(DocumentId id, SourceArchi
         const auto expected_uuid = project->state->uuid;
         auto result = std::async(std::launch::async,
             [path = *project_path, base = std::move(base_path), selected = std::move(selected_path),
+             output = std::move(output_path),
              action, retain, token, expected_uuid]() -> Result<SourceArchiveResult> {
                 auto opened = database::ProjectStore::open(path, database::ProjectMode::read_only, token);
                 if (!opened) return opened.error();
@@ -413,6 +417,11 @@ Result<bool> SessionController::manage_source_archive(DocumentId id, SourceArchi
                 }
                 case SourceArchiveAction::verify: {
                     auto value = opened.value()->verify_source_archive(selected, options.max_bytes, token);
+                    if (!value) return value.error();
+                    return SourceArchiveResult{std::move(value.value())};
+                }
+                case SourceArchiveAction::restore: {
+                    auto value = opened.value()->restore_source_archive(selected, output, options.max_bytes, token);
                     if (!value) return value.error();
                     return SourceArchiveResult{std::move(value.value())};
                 }
@@ -789,6 +798,10 @@ void SessionController::poll() {
                 } else if constexpr (std::is_same_v<T, database::SourceArchivePruneResult>) {
                     message(document, wxString::Format("Pruned %zu source archives; %zu remain%s.", value.removed,
                         value.remaining, value.retention_satisfied ? "" : " (retention incomplete; files preserved)"));
+                } else if constexpr (std::is_same_v<T, database::SourceArchiveRestore>) {
+                    message(document, "Restored matching source archive to " + wxString(value.restored_path.wstring()) +
+                        wxString::Format(" (%llu bytes; project provenance unchanged).",
+                            static_cast<unsigned long long>(value.input.size)));
                 } else {
                     message(document, "Verified source archive " + wxString(value.path.wstring()) +
                         wxString::Format(" (%llu bytes; SHA-256 matches embedded input).",

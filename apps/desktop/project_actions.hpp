@@ -37,6 +37,7 @@ enum ProjectActionId {
     list_source_archives_id,
     prune_source_archives_id,
     verify_source_archive_id,
+    restore_source_archive_id,
     cancel_source_archive_id,
     annotation_review_id
 };

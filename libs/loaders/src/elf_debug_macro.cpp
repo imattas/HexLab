@@ -1,7 +1,9 @@
 #include "elf_internal.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <iterator>
+#include <map>
 #include <set>
 
 namespace hexlab::elf_detail {
@@ -35,6 +37,27 @@ std::uint64_t uleb(std::span<const std::uint8_t> bytes, std::size_t &at) {
         shift += 7;
     }
     require(false, "DWARF macro ULEB128 operand exceeds ten bytes");
+    return 0;
+}
+std::int64_t sleb(std::span<const std::uint8_t> bytes, std::size_t &at) {
+    std::uint64_t result = 0;
+    unsigned shift = 0;
+    std::uint8_t byte = 0;
+    for (unsigned i = 0; i < 10; ++i) {
+        require(at < bytes.size(), "Truncated DWARF macro SLEB128 operand");
+        byte = bytes[at++];
+        const auto payload = static_cast<std::uint8_t>(byte & 0x7f);
+        if (i == 9)
+            require((byte & 0x80) == 0 && (payload == 0 || payload == 0x7f),
+                    "DWARF macro SLEB128 operand overflows");
+        result |= std::uint64_t(payload) << shift;
+        shift += 7;
+        if (!(byte & 0x80)) {
+            if (shift < 64 && (byte & 0x40)) result |= (~std::uint64_t{0}) << shift;
+            return std::bit_cast<std::int64_t>(result);
+        }
+    }
+    require(false, "DWARF macro SLEB128 operand exceeds ten bytes");
     return 0;
 }
 std::string cstring(std::span<const std::uint8_t> bytes, std::size_t &at, Budget &budget) {
@@ -76,7 +99,7 @@ void parse_section(const ByteStorage &storage, ElfMetadata &metadata, const ElfS
         require((flags & 0xf8u) == 0, "DWARF macro unit has reserved flag bits");
         const auto unit_offset_size = (flags & 1u) ? 8u : 4u;
         require(unit_offset_size == offset_size, "DWARF macro offset-size flag disagrees with initial length");
-        std::set<std::uint8_t> vendor_opcodes;
+        std::map<std::uint8_t, std::vector<std::uint8_t>> vendor_opcodes;
         std::optional<std::uint64_t> line_offset;
         if (flags & 2u) {
             require(cursor <= unit_end && offset_size <= unit_end - cursor,
@@ -90,12 +113,14 @@ void parse_section(const ByteStorage &storage, ElfMetadata &metadata, const ElfS
             for (unsigned i = 0; i < count; ++i) {
                 require(unit_end - cursor >= 2, "DWARF macro opcode table entry is truncated");
                 const auto opcode = static_cast<std::uint8_t>(fixed(all, cursor, 1, metadata.header.order));
-                require(opcode >= 0xe0 && vendor_opcodes.insert(opcode).second,
+                require(opcode >= 0xe0 && !vendor_opcodes.contains(opcode),
                         "DWARF macro opcode table has a reserved or duplicate opcode");
                 const auto operand_count = uleb(all.first(unit_end), cursor);
                 require(operand_count <= 4096 - operands,
                         "DWARF macro opcode table exceeds its operand limit", ErrorCode::resource_limit);
                 operands += operand_count;
+                auto &forms = vendor_opcodes[opcode];
+                forms.reserve(static_cast<std::size_t>(operand_count));
                 for (std::uint64_t j = 0; j < operand_count; ++j) {
                     const auto form = fixed(all.first(unit_end), cursor, 1, metadata.header.order);
                     const bool known_form = form == 0x03 || form == 0x04 || form == 0x05 || form == 0x06 ||
@@ -105,6 +130,7 @@ void parse_section(const ByteStorage &storage, ElfMetadata &metadata, const ElfS
                         (form >= 0x25 && form <= 0x28);
                     require(known_form, "DWARF macro opcode table contains an unsupported operand form",
                             ErrorCode::unsupported);
+                    forms.push_back(static_cast<std::uint8_t>(form));
                 }
             }
         }
@@ -164,9 +190,78 @@ void parse_section(const ByteStorage &storage, ElfMetadata &metadata, const ElfS
                 record.string_index = uleb(all.first(unit_end), cursor);
                 break;
             default:
-                require(vendor_opcodes.contains(opcode), "Unknown DWARF macro opcode has no operand description",
+                {
+                const auto vendor = vendor_opcodes.find(opcode);
+                require(vendor != vendor_opcodes.end(), "Unknown DWARF macro opcode has no operand description",
                         ErrorCode::unsupported);
-                require(false, "DWARF vendor macro opcodes are not interpreted", ErrorCode::unsupported);
+                record.vendor_defined = true;
+                for (const auto form : vendor->second) {
+                    canceled(stop);
+                    require(record.vendor_operands.size() < 4096,
+                            "DWARF vendor macro opcode exceeds its operand limit", ErrorCode::resource_limit);
+                    budget.include(sizeof(ElfDwarfMacroOperand));
+                    ElfDwarfMacroOperand operand;
+                    operand.form = form;
+                    operand.section_offset = cursor;
+                    const auto read_block = [&](std::uint64_t length) {
+                        require(length <= 64u * 1024u, "DWARF vendor macro block exceeds 64 KiB",
+                                ErrorCode::resource_limit);
+                        require(cursor <= unit_end && length <= unit_end - cursor,
+                                "DWARF vendor macro block exceeds its unit");
+                        budget.include(length);
+                        operand.bytes.reserve(static_cast<std::size_t>(length));
+                        for (std::uint64_t i = 0; i < length; ++i)
+                            operand.bytes.push_back(static_cast<std::byte>(all[cursor++]));
+                    };
+                    switch (form) {
+                    case 0x03: case 0x04: case 0x09: case 0x0a: {
+                        std::uint64_t length = 0;
+                        if (form == 0x03) length = fixed(all.first(unit_end), cursor, 2, metadata.header.order);
+                        else if (form == 0x04) length = fixed(all.first(unit_end), cursor, 4, metadata.header.order);
+                        else if (form == 0x0a) length = fixed(all.first(unit_end), cursor, 1, metadata.header.order);
+                        else length = uleb(all.first(unit_end), cursor);
+                        read_block(length);
+                        break;
+                    }
+                    case 0x08:
+                        operand.text = cstring(all.first(unit_end), cursor, budget);
+                        break;
+                    case 0x0d:
+                        operand.signed_value = sleb(all.first(unit_end), cursor);
+                        break;
+                    case 0x0f: case 0x1a:
+                        operand.unsigned_value = uleb(all.first(unit_end), cursor);
+                        break;
+                    case 0x0e: case 0x17: case 0x1d: case 0x1f:
+                        operand.unsigned_value = fixed(all.first(unit_end), cursor, offset_size, metadata.header.order);
+                        break;
+                    case 0x1e:
+                        read_block(16);
+                        break;
+                    case 0x25:
+                        operand.unsigned_value = fixed(all.first(unit_end), cursor, 1, metadata.header.order); break;
+                    case 0x05:
+                        operand.unsigned_value = fixed(all.first(unit_end), cursor, 2, metadata.header.order); break;
+                    case 0x06: case 0x26:
+                        operand.unsigned_value = fixed(all.first(unit_end), cursor, form == 0x26 ? 2u : 4u, metadata.header.order); break;
+                    case 0x07:
+                        operand.unsigned_value = fixed(all.first(unit_end), cursor, 8, metadata.header.order); break;
+                    case 0x0b:
+                        operand.unsigned_value = fixed(all.first(unit_end), cursor, 1, metadata.header.order); break;
+                    case 0x0c:
+                        operand.unsigned_value = fixed(all.first(unit_end), cursor, 1, metadata.header.order);
+                        require(*operand.unsigned_value <= 1, "DWARF vendor macro flag operand is not zero or one");
+                        break;
+                    case 0x27:
+                        operand.unsigned_value = fixed(all.first(unit_end), cursor, 3, metadata.header.order); break;
+                    case 0x28:
+                        operand.unsigned_value = fixed(all.first(unit_end), cursor, 4, metadata.header.order); break;
+                    default:
+                        require(false, "DWARF vendor macro operand form is unsupported", ErrorCode::unsupported);
+                    }
+                    record.vendor_operands.push_back(std::move(operand));
+                }
+                }
             }
             require(cursor <= unit_end, "DWARF macro opcode operands exceed unit extent");
             unit.records.push_back(std::move(record));

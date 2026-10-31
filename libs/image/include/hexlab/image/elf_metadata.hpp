@@ -272,6 +272,15 @@ struct ElfSourceLine {
     bool end_sequence = false;
     bool operator==(const ElfSourceLine &) const = default;
 };
+struct ElfDwarfMacroOperand {
+    std::uint8_t form = 0;
+    std::uint64_t section_offset = 0;
+    std::optional<std::uint64_t> unsigned_value;
+    std::optional<std::int64_t> signed_value;
+    std::string text;
+    std::vector<std::byte> bytes;
+    bool operator==(const ElfDwarfMacroOperand &) const = default;
+};
 struct ElfDwarfMacroRecord {
     std::uint64_t section_offset = 0;
     std::uint64_t file_offset = 0;
@@ -280,6 +289,10 @@ struct ElfDwarfMacroRecord {
         supplementary_import_offset;
     bool supplementary_string = false;
     std::string text; // Raw NUL-terminated text for inline define/undef operations.
+    // Vendor opcode operands described by the unit's opcode table. These are
+    // structurally retained; their vendor-specific meaning is not inferred.
+    bool vendor_defined = false;
+    std::vector<ElfDwarfMacroOperand> vendor_operands;
     bool operator==(const ElfDwarfMacroRecord &) const = default;
 };
 struct ElfDwarfMacroUnit {

@@ -119,8 +119,15 @@ __cdecl()` stub signature. These labels identify compiler-generated symbols;
 they do not infer initialization or destruction behavior. Vcall thunks parse the owning scope, the `$B`
 marker, the encoded vftable byte offset, the `A` marker, and a supported
 calling-convention code. The rendered label reports the offset and convention
-without resolving the target or inferring dispatch behavior. Adjustment thunks
-and other special names remain unsupported.
+without resolving the target or inferring dispatch behavior. Near static
+`this`-adjustment thunks parse the access/class bytes `G` (private), `O`
+(protected), and `W` (public), followed by the signed MSVC number and the
+ordinary member-function type encoding. They render the decoded adjustment as
+encoded metadata, for example `public: adjustor thunk [this adjustment=-4] to
+void __thiscall Derived::run()`. The parser does not infer which base/derived
+object conversion the offset implements. Far static forms `H`, `P`, and `X`,
+virtual forms `$0` through `$5`, and extended virtual-adjustment records remain
+unsupported and preserve the raw symbol.
 For `??_R1`, the bounded presentation grammar is
 `??_R1<number><signed-number><number><number><qualified-name>8`; the numeric
 fields follow the MSVC number syntax below, and only the second field accepts
@@ -179,7 +186,7 @@ expression grammar, and broader operator/type
 encodings remain incomplete, including expression calls/casts,
 template parameter references inside expressions, and unrecognized vendor
 qualifiers. Other Itanium builtin extensions and newer instantiation-dependent
-builtin encodings remain unsupported. Microsoft adjustment thunks and other special names,
+builtin encodings remain unsupported. Microsoft far/virtual adjustment thunks and other special names,
 non-integral template values (including pointers, member pointers, symbol
 references, `auto` values, and parameter packs), template backreferences,
 many calling-convention/type codes remain unsupported in the Microsoft grammar.

@@ -127,15 +127,18 @@ Source archival/retention remains outside this automatic desktop schedule.
 
 For a saved project with a recorded external input, the File menu provides
 **Archive External Source...**, **Create Rotated Source Archive...**, **List Rotated
-Source Archives**, **Prune Rotated Source Archives...**, and **Verify Source
-Archive...**. These operations reopen the saved project read-only on a worker and
+Source Archives**, **Prune Rotated Source Archives...**, **Verify Source
+Archive...**, and **Restore Source Archive...**. These operations reopen the saved project read-only on a worker and
 check its UUID against the open project before acting. Direct archive creation
 asks for a new destination and never replaces an existing file. Rotated files
 use a sibling `-source-archives` base; retention is limited to 1 through 32.
 Pruning requires confirmation and removes only matching archives that pass
 embedded-input verification. Listing reports only validated files and marks a
 bounded scan incomplete; incomplete retention does not imply the target count
-was met.
+was met. Restore asks for an archive and a new output path, then verifies its
+size and SHA-256 against the input identity embedded in the project before
+atomically publishing the restored bytes. Existing files and project/source
+aliases are preserved.
 
 The database API has cooperative cancellation but no progress callback, so the
 desktop reports that work is running and exposes **Cancel Source Archive Work**

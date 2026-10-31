@@ -179,7 +179,7 @@ The supported fixed little-endian Windows CONTEXT layouts are:
 | Architecture | Captured register groups |
 | --- | --- |
 | x86 | Control (`ebp`, `eip`, `esp`, segments and flags), integer, segments, debug, legacy x87, and extended FXSAVE x87/XMM0-7/MXCSR. Extended storage takes precedence when both floating layouts are present. |
-| AMD64 | Control (`rsp`, `rip`, segments and flags), integer, segments, debug, and fixed x87/XMM0-15/MXCSR floating storage. Both top-level and FXSAVE MXCSR copies are retained. When `CONTEXT_XSTATE` and the two 64-bit XSAVE bitmap fields are present, `xstate_bv` and `xcomp_bv` expose the in-use and compacted-layout bitmaps; only those 16 header bytes are required for these fields. In compacted format, an in-use non-legacy component missing from `xcomp_bv` marks the context partial; payloads remain opaque because compacted offsets and alignment cannot be established from the available feature map. With a validated MiscInfo5 map, AVX feature 2 decodes its 16 YMM upper 128-bit halves as `ymm0_hi` through `ymm15_hi` in standard layout. AVX-512 features 5, 6 and 7 decode K0-K7, the upper 256-bit portions of ZMM0-ZMM15, and ZMM16-ZMM31 as source-backed 64-bit or 128-bit rows; 128-bit chunks preserve their source bytes without synthesizing full ZMM values. Component tails remain opaque. Other non-legacy components remain opaque 16-byte chunks except CET user state (feature 11), whose two 64-bit values are decoded as `ia32_u_cet` and `ia32_pl3_ssp`. Classic AMX features 17/18 retain validated palette 0/1 configuration and palette 1 tile storage; see [AMX bounds](minidump-amx-state.md). |
+| AMD64 | Control (`rsp`, `rip`, segments and flags), integer, segments, debug, and fixed x87/XMM0-15/MXCSR floating storage. Both top-level and FXSAVE MXCSR copies are retained. When `CONTEXT_XSTATE` and the two 64-bit XSAVE bitmap fields are present, `xstate_bv` and `xcomp_bv` expose the in-use and compacted-layout bitmaps; only those 16 header bytes are required for these fields. In compacted format, AVX feature 2 can be decoded when it is in-use, present in `xcomp_bv`, and validated as the first non-legacy component at XSAVE offset 576. Other compacted component offsets remain opaque because their alignment cannot be established from the feature map. With a validated MiscInfo5 map, AVX feature 2 decodes its 16 YMM upper 128-bit halves as `ymm0_hi` through `ymm15_hi` in standard layout. AVX-512 features 5, 6 and 7 decode K0-K7, the upper 256-bit portions of ZMM0-ZMM15, and ZMM16-ZMM31 as source-backed 64-bit or 128-bit rows; 128-bit chunks preserve their source bytes without synthesizing full ZMM values. Component tails remain opaque. Other non-legacy components remain opaque 16-byte chunks except CET user state (feature 11), whose two 64-bit values are decoded as `ia32_u_cet` and `ia32_pl3_ssp`. Classic AMX features 17/18 retain validated palette 0/1 configuration and palette 1 tile storage; see [AMX bounds](minidump-amx-state.md). |
 | ARM32 | Control (`sp`, `lr`, `pc`, `cpsr`), integer R0-12, FPSCR and D0-31/Q0-15 aliases, and fixed breakpoint/watchpoint registers. |
 | ARM64 | Control (`x29`, `x30`, `sp`, `pc`, `cpsr`), integer X0-28 with X18 retained only when explicitly requested by its separate flag, full or low/high partial NEON V-register storage, FPCR/FPSR when the low/full group is available, and fixed breakpoint/watchpoint registers. |
 | Breakpad ARM64 (`processor_architecture=0x8003`) | Its packed legacy layout and 64-bit ContextFlags are decoded separately: integer/control group includes X0-X30, SP, PC and CPSR; floating group includes FPSR, FPCR and V0-V31. |
@@ -253,8 +253,14 @@ original eight-byte source ranges. `xstate_bv` reports which components are in u
 of `xcomp_bv` identifies compacted layout. In compacted layout, an in-use
 non-legacy component must also be present in the `xcomp_bv` component mask; an
 inconsistent pair is retained with a diagnostic and partial context status.
-HexLab does not infer compacted payload offsets or alignment from the standard
-feature map, so it omits compacted component payloads. Legacy floating-point and SSE feature
+AVX feature 2 is the first non-legacy component in feature order. If it is
+marked in-use and present in `xcomp_bv`, its compacted payload starts directly
+after the 576-byte legacy XSAVE area, which is 64-byte aligned. HexLab decodes
+the YMM upper halves only when the validated MiscInfo5 feature entry also
+reports standard offset 576, at least 256 bytes, the full component fits the
+declared XSAVE extent and captured context, and the component is within the
+64 KiB context-state capture bound. The AVX component tail remains opaque.
+Other compacted component offsets or alignment are not inferred. Legacy floating-point and SSE feature
 IDs 0â€“1 remain in the fixed AMD64 context fields. Context XSTATE components
 are included only when the MiscInfo5 feature table validates and the checked
 XSAVE-relative range (`256 + feature offset`) is present in the original
