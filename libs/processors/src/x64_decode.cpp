@@ -413,6 +413,28 @@ DecodeResult decode_scalar(std::span<const std::byte> input, Address address, De
             }
         }
         const bool f3_bit_count = extended && (opcode == 0xbc || opcode == 0xbd || opcode == 0xb8);
+        // CMOVcc and SETcc share the architectural condition encoding used by
+        // Jcc. Preserve condition and FLAGS dependency in the typed decode.
+        bool conditional_data = false;
+        if (extended && opcode >= 0x40 && opcode <= 0x4f) {
+            const auto width = state.width();
+            const auto decoded = modrm(state, width);
+            state.i.opcode = Opcode::cmovcc;
+            state.i.condition = opcode & 0x0f;
+            state.i.x86_condition = static_cast<X86Condition>(state.i.condition);
+            state.operand(decoded.reg, OperandAccess::read_write);
+            state.operand(decoded.rm, OperandAccess::read);
+            state.flags_read = true;
+            conditional_data = true;
+        } else if (extended && opcode >= 0x90 && opcode <= 0x9f) {
+            const auto decoded = modrm(state, 8);
+            state.i.opcode = Opcode::setcc;
+            state.i.condition = opcode & 0x0f;
+            state.i.x86_condition = static_cast<X86Condition>(state.i.condition);
+            state.operand(decoded.rm, OperandAccess::write);
+            state.flags_read = true;
+            conditional_data = true;
+        }
         const bool string_form = !extended && ((opcode >= 0x6c && opcode <= 0x6f) ||
             (opcode >= 0xa4 && opcode <= 0xaf && !(opcode >= 0xa8 && opcode <= 0xa9)));
         const bool simd_form = simd(state, opcode, extended);
@@ -420,7 +442,7 @@ DecodeResult decode_scalar(std::span<const std::byte> input, Address address, De
             (state.group1 == 0xf3 && !f3_bit_count && !string_form &&
              !((!extended && (opcode == 0x90 || opcode == 0xc3)) || (extended && opcode == 0x1e)))))
             unsupported("Repeat/mandatory prefix form is not yet covered");
-        if (!simd_form && !(string_form && string_operation(state, opcode)) && !(!extended && x87(state, opcode)) &&
+        if (!conditional_data && !simd_form && !(string_form && string_operation(state, opcode)) && !(!extended && x87(state, opcode)) &&
             !move(state, opcode, extended) &&
             !accumulator_sign_extension(state, opcode, extended) && !bit_operations(state, opcode, extended) &&
             !arithmetic(state, opcode, extended) &&

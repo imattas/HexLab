@@ -11,6 +11,15 @@ namespace hexlab {
 
 enum class WasmExternalKind : std::uint8_t { function = 0, table = 1, memory = 2, global = 3 };
 
+// Describes what caller-supplied evidence was accepted for an import. These
+// states are analysis metadata only and never indicate an executable binding.
+enum class WasmImportResolutionStatus : std::uint8_t {
+    unresolved,
+    compatible_host_facts,
+    symbolic_host_binding,
+    supplied_global_value
+};
+
 struct WasmLimits {
     std::uint32_t minimum = 0;
     std::optional<std::uint32_t> maximum;
@@ -40,6 +49,9 @@ struct WasmImport {
     // Caller-supplied symbolic host mapping. This identifies an external
     // binding for analysis only; the loader never resolves or invokes it.
     std::optional<std::string> host_binding;
+    // Defaults to unresolved when no matching resolver supplies accepted
+    // evidence. A state other than unresolved is still not a runtime link.
+    WasmImportResolutionStatus resolution_status = WasmImportResolutionStatus::unresolved;
     std::uint32_t entry_index = 0;
     FileOffset section_file_offset{};
     FileOffset entry_file_offset{};

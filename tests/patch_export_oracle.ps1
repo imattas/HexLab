@@ -1,5 +1,11 @@
 param([Parameter(Mandatory=$true)][string]$Path)
 $ErrorActionPreference='Stop'
-$actual=(Get-FileHash -LiteralPath (Join-Path $Path 'patched.bin') -Algorithm SHA256).Hash.ToLowerInvariant()
+$sha256=[Security.Cryptography.SHA256]::Create()
+try {
+    $digest=$sha256.ComputeHash([IO.File]::ReadAllBytes((Join-Path $Path 'patched.bin')))
+    $actual=([BitConverter]::ToString($digest)).Replace('-','').ToLowerInvariant()
+} finally {
+    $sha256.Dispose()
+}
 $expected=(Get-Content -LiteralPath (Join-Path $Path 'patched.sha256') -Raw -Encoding ASCII).Trim()
 if($actual -cne $expected){throw 'Export receipt differs from independent Windows SHA-256'}

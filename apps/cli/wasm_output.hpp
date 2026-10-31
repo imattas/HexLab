@@ -41,6 +41,16 @@ inline const char *wasm_external_kind_name(WasmExternalKind kind) {
     }
     return "unknown";
 }
+
+inline const char *wasm_import_resolution_status_name(WasmImportResolutionStatus status) {
+    switch (status) {
+    case WasmImportResolutionStatus::unresolved: return "unresolved";
+    case WasmImportResolutionStatus::compatible_host_facts: return "compatible-host-facts";
+    case WasmImportResolutionStatus::symbolic_host_binding: return "symbolic-host-binding";
+    case WasmImportResolutionStatus::supplied_global_value: return "supplied-global-value";
+    }
+    return "unresolved";
+}
 inline const char *wasm_value_type_name(std::uint8_t type) {
     switch (type) {
     case 0x7f: return "i32";
@@ -183,6 +193,7 @@ inline void wasm_description(std::ostream &out, const ImageMetadata &metadata) {
         if (entry.global_value_type)
             out << " value-type=" << wasm_value_type_name(*entry.global_value_type)
                 << " mutable=" << (entry.global_mutable ? "true" : "false");
+        out << " resolution=" << wasm_import_resolution_status_name(entry.resolution_status);
         if (entry.host_binding) out << " host-binding=\"" << wasm_escape_name(*entry.host_binding) << "\"";
         out << " entry=" << entry.entry_index
             << " section-file=" << wasm_hex(entry.section_file_offset.value)

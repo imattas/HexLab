@@ -24,7 +24,7 @@ jobs:
         shell: pwsh
         run: ./tests/provision_x86_16_tools.ps1 -Download
       - name: Configure desktop distribution
-        run: cmake --preset windows-desktop
+        run: cmake --preset windows-desktop -DHEXLAB_ENABLE_PINNED_LLVM_ORACLES=OFF
       - name: Build Release applications and test targets
         run: cmake --build --preset windows-desktop --config Release --parallel 4
       - name: Build Release multi-file ZIP

@@ -73,6 +73,8 @@ struct PdbTypeImportResult {
     std::size_t skipped_unnamed = 0;
     std::size_t skipped_unsupported = 0;
     std::size_t skipped_duplicates = 0;
+    // Unique source names omitted because their graph identities could not
+    // be resolved without guessing between competing definitions.
     std::size_t skipped_ambiguous = 0;
 };
 

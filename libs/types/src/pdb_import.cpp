@@ -146,6 +146,10 @@ Result<PdbTypeImportResult> import_pdb_type_graph(const PdbTypeGraph &graph) {
     std::map<TypeKey, TypePtr> converted;
     PdbTypeImportResult result;
     std::set<std::string, std::less<>> ambiguous_names;
+    std::set<std::string, std::less<>> counted_ambiguous_names;
+    const auto count_ambiguous_name = [&](const std::string &name) {
+        if (counted_ambiguous_names.insert(name).second) ++result.skipped_ambiguous;
+    };
     const auto aggregate_identity_kind = [](CodeViewTypeKind kind) {
         return kind == CodeViewTypeKind::structure || kind == CodeViewTypeKind::class_type ||
                kind == CodeViewTypeKind::union_type || kind == CodeViewTypeKind::enumeration;
@@ -677,12 +681,12 @@ Result<PdbTypeImportResult> import_pdb_type_graph(const PdbTypeGraph &graph) {
                 continue;
             }
             if (ambiguous_names.contains(record.name)) {
-                ++result.skipped_ambiguous;
+                count_ambiguous_name(record.name);
                 continue;
             }
             const auto storage = storage_names.find({node.name_space, record.index});
             if (!record.name.empty() && storage == storage_names.end()) {
-                ++result.skipped_ambiguous;
+                count_ambiguous_name(record.name);
                 continue;
             }
             auto type = convert(node.name_space, record.index);
@@ -710,7 +714,7 @@ Result<PdbTypeImportResult> import_pdb_type_graph(const PdbTypeGraph &graph) {
                 } else {
                     result.definitions.erase(existing);
                     ambiguous_names.insert(record.name);
-                    ++result.skipped_ambiguous;
+                    count_ambiguous_name(record.name);
                 }
             }
         }

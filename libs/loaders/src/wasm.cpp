@@ -2575,6 +2575,7 @@ Result<LoadedImage> load_wasm(std::shared_ptr<const ByteStorage> storage, std::s
                 if (!(binding->type == wasm.function_types[*entry.function_type_index]))
                     return Error{ErrorCode::invalid_argument, "WebAssembly host function binding '" + binding->symbol + "' has an incompatible signature for import '" + entry.module + "." + entry.name + "'"};
                 entry.host_binding = std::move(binding->symbol);
+                entry.resolution_status = WasmImportResolutionStatus::symbolic_host_binding;
             }
         } catch (...) {
             return Error{ErrorCode::invalid_argument, "WebAssembly function import resolver threw an exception"};
@@ -2624,12 +2625,15 @@ Result<LoadedImage> load_wasm(std::shared_ptr<const ByteStorage> storage, std::s
                 return Error{ErrorCode::invalid_argument, "WebAssembly host object binding must not exceed 4096 bytes"};
             entry.host_binding = facts->binding;
         }
+        entry.resolution_status = facts->binding.empty()
+            ? WasmImportResolutionStatus::compatible_host_facts
+            : WasmImportResolutionStatus::symbolic_host_binding;
         wasm_diagnostics.push_back({DiagnosticSeverity::info,
             std::string("WebAssembly ") + kind + " import '" + import_name + "' has compatible host type and limits; runtime binding remains external", {}});
     }
     if (global_resolver) {
         try {
-            for (const auto &entry : wasm.imports) {
+            for (auto &entry : wasm.imports) {
                 if (stop.stop_requested()) return Error{ErrorCode::canceled, "WebAssembly import resolution canceled"};
                 if (entry.kind != WasmExternalKind::global || entry.index >= wasm.globals.size()) continue;
                 auto value = global_resolver(entry);
@@ -2642,6 +2646,7 @@ Result<LoadedImage> load_wasm(std::shared_ptr<const ByteStorage> storage, std::s
                 if (type != 0x7f && type != 0x7e && type != 0x7d && type != 0x7c)
                     return Error{ErrorCode::unsupported, "WebAssembly host global resolution supports only numeric value types"};
                 wasm.globals[entry.index].host_value_bits = *value;
+                entry.resolution_status = WasmImportResolutionStatus::supplied_global_value;
             }
         } catch (...) {
             return Error{ErrorCode::invalid_argument, "WebAssembly global import resolver threw an exception"};

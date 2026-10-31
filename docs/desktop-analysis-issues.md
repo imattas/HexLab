@@ -3,12 +3,14 @@
 The Binary metadata notebook has an **Analysis issues** page for reviewing
 function recovery output and load diagnostics. For projects it lists non-normal function stops, incomplete
 function boundaries, unconfirmed entry candidates, and overlapping function
-or decision records. A binary opened without a project still shows the loader
-and inspection diagnostics retained by its immutable document snapshot. It also
-shows bounded code-analysis warnings plus analysis-time and inspection-time
-string-scan diagnostics. Those rows retain producer severity and location and
-can be reviewed like other file-only findings. They disappear when the tab
-closes because file-only documents have no project database.
+or decision records. A binary opened without a project still shows the loader,
+inspection, code-analysis, and analysis-time and inspection-time string-scan
+diagnostics retained by its immutable document snapshot. Project snapshots also contribute diagnostics from
+their derived string scan. Project string-scan rows use the project's derived
+analysis identity for review marks and show as stale when that identity does
+not match the current project input. These rows retain producer severity and
+location. Project review marks use the derived analysis identity; file-only
+findings disappear when the tab closes because they have no project database.
 page also receives transient diagnostics from C header and PDB type imports
 and from the decompiler. Each row includes its severity, address, related address when
 available, owning function, and the analysis detail. Selecting a row navigates
@@ -173,4 +175,4 @@ rows cannot inherit marks from a report tied to a known source snapshot.
 Duplicate rows remain separate and use occurrence discriminators; a changed
 duplicate set drops ambiguous marks.
 
-Use **Stale diagnostic reports** in the category selector to isolate diagnostics whose source identity is missing or differs from the active analysis. This includes loader, type-import, decompiler, and minidump reports; the category combines with severity, review state, search, and function scope like the other filters.
+Use **Stale diagnostic reports** in the category selector to isolate diagnostics whose source identity is missing or differs from the active analysis. This includes loader, project string-scan, type-import, decompiler, and minidump reports; the category combines with severity, review state, search, and function scope like the other filters.

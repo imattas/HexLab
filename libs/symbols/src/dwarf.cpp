@@ -300,6 +300,7 @@ hexlab::Result<IndexedTableContribution> indexed_table_contribution(
     const bool lists = kind == IndexedTableKind::locations || kind == IndexedTableKind::ranges;
     const std::size_t fixed_header_after_length = lists ? 8 : 4;
     std::optional<IndexedTableContribution> selected;
+    bool unsupported_version_candidate = false;
     for (const std::uint8_t offset_size : {std::uint8_t{4}, std::uint8_t{8}}) {
         const std::size_t initial_size = offset_size == 4 ? 4 : 12;
         const std::size_t header_size = initial_size + fixed_header_after_length;
@@ -311,7 +312,18 @@ hexlab::Result<IndexedTableContribution> indexed_table_contribution(
         if (initial.value().length > section.size() - reader.position()) continue;
         const auto end = reader.position() + static_cast<std::size_t>(initial.value().length);
         auto version = reader.fixed(2);
-        if (!version || version.value() != 5) continue;
+        if (!version) continue;
+        if (version.value() != 5) {
+            // The supplied base identifies the header extent independently
+            // of its version. A bounded contribution with the expected
+            // header-sized prefix but an unsupported version is not random
+            // malformed data; report that this indexed-table format cannot
+            // be interpreted.
+            if (initial.value().length >= fixed_header_after_length &&
+                reader.position() + fixed_header_after_length - 2 == base && end >= base)
+                unsupported_version_candidate = true;
+            continue;
+        }
         auto width = reader.fixed(1);
         if (!width) continue;
         auto segment = reader.fixed(1);
@@ -334,7 +346,12 @@ hexlab::Result<IndexedTableContribution> indexed_table_contribution(
             selected = IndexedTableContribution{candidate, end, static_cast<std::size_t>(base), 0, offset_size};
         }
     }
-    if (!selected) return malformed("DWARF indexed-table base does not match a DWARF v5 contribution header");
+    if (!selected) {
+        if (unsupported_version_candidate)
+            return hexlab::Error{hexlab::ErrorCode::unsupported,
+                                 "DWARF indexed-table contribution version is unsupported"};
+        return malformed("DWARF indexed-table base does not match a DWARF v5 contribution header");
+    }
     return *selected;
 }
 

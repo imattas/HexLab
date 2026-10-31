@@ -1,3 +1,9 @@
 param([Parameter(Mandatory=$true)][string]$Path)
 $ErrorActionPreference='Stop'
-(Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+$sha256=[Security.Cryptography.SHA256]::Create()
+try {
+    $digest=$sha256.ComputeHash([IO.File]::ReadAllBytes($Path))
+    ([BitConverter]::ToString($digest)).Replace('-','').ToLowerInvariant()
+} finally {
+    $sha256.Dispose()
+}

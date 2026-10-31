@@ -644,11 +644,13 @@ void AnalysisIssuesView::rebuild() {
     const auto *durable_loader = project_ && project_->state ? &project_->state->loader_diagnostics : nullptr;
     const auto *durable_runtime = project_ && project_->state ? &project_->state->runtime_relocation_diagnostics : nullptr;
     const auto *durable_type_import = project_ && project_->state ? &project_->state->type_import_diagnostics : nullptr;
+    const auto *project_string_diagnostics = project_ && project_->strings ? &project_->strings->diagnostics : nullptr;
     const auto *loader_items = loaded ? &loaded->diagnostics : durable_loader;
     const auto *runtime_items = loaded ? &loaded->runtime_relocation_diagnostics : durable_runtime;
     const auto diagnostic_count = project_
         ? std::min(max_loader_rows, loader_items ? loader_items->size() : 0) +
-              std::min(max_loader_rows, runtime_items ? runtime_items->size() : 0)
+              std::min(max_loader_rows, runtime_items ? runtime_items->size() : 0) +
+              std::min(max_loader_rows, project_string_diagnostics ? project_string_diagnostics->size() : 0)
         : (file_diagnostics ? std::min(max_loader_rows, file_diagnostics->size()) : 0) +
           (file_analysis ? std::min(max_loader_rows, file_analysis->size()) : 0) +
           (file_analysis_strings ? std::min(max_loader_rows, file_analysis_strings->size()) : 0) +
@@ -664,7 +666,8 @@ void AnalysisIssuesView::rebuild() {
                                 std::min(max_loader_rows, active_decompiler ? active_decompiler->size() : durable_decompiler_count);
     const auto diagnostic_total = diagnostic_count + producer_count + std::min(max_loader_rows,static_cast<std::size_t>(durable_context_count));
     const bool diagnostic_source_truncated = project_
-        ? (loader_items && loader_items->size() > max_loader_rows) || (runtime_items && runtime_items->size() > max_loader_rows)
+        ? (loader_items && loader_items->size() > max_loader_rows) || (runtime_items && runtime_items->size() > max_loader_rows) ||
+          (project_string_diagnostics && project_string_diagnostics->size() > max_loader_rows)
         : (file_diagnostics && file_diagnostics->size() > max_loader_rows) ||
           (file_analysis && file_analysis->size() > max_loader_rows) ||
           (file_analysis_strings && file_analysis_strings->size() > max_loader_rows) ||
@@ -742,6 +745,29 @@ void AnalysisIssuesView::rebuild() {
     if (project_) {
         if (loader_items) add_diagnostics(*loader_items, "Loader", Kind::loader_diagnostic);
         if (runtime_items) add_diagnostics(*runtime_items, "Runtime relocation", Kind::runtime_relocation_diagnostic);
+        if (project_string_diagnostics) {
+            const bool current = project_->derived_key && current_loader_key &&
+                                 *project_->derived_key == *current_loader_key;
+            const auto identity = project_->derived_key ? import_identity(*project_->derived_key) : std::string{};
+            std::size_t emitted = 0;
+            for (const auto &diagnostic : *project_string_diagnostics) {
+                if (emitted >= max_loader_rows || diagnostic_rows >= diagnostic_budget) break;
+                wxString detail = "Project string scan " + severity_text(diagnostic.severity) + ": " +
+                                  preview_text(diagnostic.message, 4096);
+                Row row{Kind::file_analysis_diagnostic, diagnostic.location, {}, {}, std::move(detail)};
+                row.severity = diagnostic.severity;
+                row.stale_import = !current;
+                if (!identity.empty()) {
+                    row.source_identity = identity;
+                    row.source_label = import_identity_label(*project_->derived_key);
+                } else {
+                    row.source_label = "Source key unavailable; this report is kept ungrouped.";
+                }
+                rows_.push_back(std::move(row));
+                ++diagnostic_rows;
+                ++emitted;
+            }
+        }
         if (!active_type && durable_type_import) {
             std::size_t emitted=0;
             for (const auto &item : *durable_type_import) {

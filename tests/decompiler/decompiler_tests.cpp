@@ -1,5 +1,6 @@
 #include "hexlab/decompiler/decompiler.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstdlib>
 #include <iostream>
