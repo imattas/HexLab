@@ -286,15 +286,18 @@ bool decode_vector_floating(std::uint32_t w, RiscvInstruction &i) {
     const unsigned funct6 = w >> 26, vm = (w >> 25) & 1;
     const unsigned vs2 = (w >> 20) & 31, vs1 = (w >> 15) & 31;
     const unsigned funct3 = (w >> 12) & 7, vd = (w >> 7) & 31;
-    if (funct3 == 1 && (funct6 == 1 || funct6 == 3 || funct6 == 5 || funct6 == 7)) {
+    if (funct3 == 1 && (funct6 == 1 || funct6 == 3 || funct6 == 5 || funct6 == 7 ||
+                        funct6 == 0x31 || funct6 == 0x33)) {
         switch (funct6) {
         case 1: i.opcode = RiscvOpcode::vfredusum; break;
         case 3: i.opcode = RiscvOpcode::vfredosum; break;
         case 5: i.opcode = RiscvOpcode::vfredmin; break;
         case 7: i.opcode = RiscvOpcode::vfredmax; break;
+        case 0x31: i.opcode = RiscvOpcode::vfwredusum; break;
+        case 0x33: i.opcode = RiscvOpcode::vfwredosum; break;
         default: return false;
         }
-        i.reads_frm = funct6 == 1 || funct6 == 3;
+        i.reads_frm = funct6 == 1 || funct6 == 3 || funct6 == 0x31 || funct6 == 0x33;
         i.reads_fflags = true;
         i.writes_fflags = true;
         operand(i, RiscvRegister{static_cast<std::uint8_t>(vd), false, true}, RiscvOperandAccess::write);
@@ -1257,6 +1260,7 @@ bool decode_word(std::uint32_t w, RiscvInstruction &i, std::string &unsupported,
                                      (funct6 >= 0x18 && funct6 <= 0x1f) || (funct6 >= 0x20 && funct6 <= 0x23);
             const bool floating_implemented = funct6 == 0 || funct6 == 2 || funct6 == 4 || funct6 == 6 ||
                 funct6 == 1 || funct6 == 3 || funct6 == 5 || funct6 == 7 ||
+                funct6 == 0x31 || funct6 == 0x33 ||
                 funct6 == 8 || funct6 == 9 || funct6 == 10 || funct6 == 0x18 || funct6 == 0x19 ||
                 funct6 == 0x1b || funct6 == 0x1c || funct6 == 0x1d || funct6 == 0x1f ||
                 funct6 == 0x20 || funct6 == 0x24 || funct6 == 0x13;

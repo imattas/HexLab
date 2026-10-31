@@ -683,7 +683,9 @@ enum class Opcode {
     // Additional bounded W65C02 opcodes; append to preserve persisted IDs.
     m65c02_phx, m65c02_plx, m65c02_phy, m65c02_ply,
     m65c02_tsb, m65c02_trb, m65c02_rmb, m65c02_smb,
-    m65c02_bbr, m65c02_bbs, m65c02_wai, m65c02_stp
+    m65c02_bbr, m65c02_bbs, m65c02_wai, m65c02_stp,
+    // RVV widening floating-point reductions; append for stable IDs.
+    rv_vfwredusum, rv_vfwredosum
 };
 enum class OperandAccess { read, write, read_write, address };
 // The encoded x86 group-one repeat prefix is retained separately from the
