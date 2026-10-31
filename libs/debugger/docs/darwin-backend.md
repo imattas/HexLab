@@ -25,7 +25,14 @@ or 8 bytes and addresses must be naturally aligned. Execute and data
 comparators share four slots on x86-64; AArch64 uses the architecture's
 separate instruction and data comparator banks. Both architectures preserve the selected
 comparator's prior disabled state, verify the programmed comparator, and
-restore that state on disable, removal, and detach. Comparator changes made by
+restore that state on disable, removal, and detach. On AArch64, comparator
+controls are compared and saved in XNU's canonical EL0 form. XNU masks control
+fields and forces PMC_EL0 in [`machine_thread_set_state`](https://github.com/apple-oss-distributions/xnu/blob/main/osfmk/arm64/status.c)
+using the constants in [`proc_reg.h`](https://github.com/apple-oss-distributions/xnu/blob/main/osfmk/arm64/proc_reg.h).
+When the last enabled comparator is cleared, XNU drops the debug-state
+allocation and reads back an all-zero flavor; the backend treats that as the
+empty disabled state.
+Comparator changes made by
 another debugger are reported as conflicts rather than overwritten. Both
 remain limited to single-thread targets. On AArch64, an owned execute hit is
 matched against the stopped PC, its comparator is disabled for one instruction

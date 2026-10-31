@@ -13,6 +13,7 @@
 #include <chrono>
 #include <deque>
 #include <fstream>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <set>
@@ -955,13 +956,15 @@ public:
                 : "no free Darwin AArch64 watchpoint comparator is available"};
         }
         const auto old_address = execute ? state.__bvr[slot] : state.__wvr[slot];
-        const auto old_control = execute ? state.__bcr[slot] : state.__wcr[slot];
+        const auto old_control = execute ? normalize_arm_bcr(state.__bcr[slot])
+                                         : normalize_arm_wcr(state.__wcr[slot]);
         const auto byte_offset = static_cast<unsigned>(address & 7u);
         const auto byte_mask = ((1u << size) - 1u) << byte_offset;
         const auto access = kind == BreakpointKind::read ? 1u : kind == BreakpointKind::write ? 2u : 3u;
         const auto active_address = execute ? (address & ~std::uint64_t{3}) : (address & ~std::uint64_t{7});
-        const auto active_control = execute ? (1u | (0xfu << 5u) | (3u << 1u))
-                                            : (1u | (access << 3u) | (byte_mask << 5u));
+        const auto active_control = execute
+            ? normalize_arm_bcr(1u | (0xfu << 5u))
+            : normalize_arm_wcr(1u | (access << 3u) | (byte_mask << 5u));
         if (execute) { state.__bvr[slot] = active_address; state.__bcr[slot] = active_control; }
         else { state.__wvr[slot] = active_address; state.__wcr[slot] = active_control; }
         kr = thread_set_state(port.value(), ARM_DEBUG_STATE64,
@@ -975,8 +978,7 @@ public:
         kr = thread_get_state(port.value(), ARM_DEBUG_STATE64,
                               reinterpret_cast<thread_state_t>(&verify), &count);
         if (kr != KERN_SUCCESS || count != ARM_DEBUG_STATE64_COUNT ||
-            (execute ? verify.__bvr[slot] != active_address || verify.__bcr[slot] != active_control
-                     : verify.__wvr[slot] != active_address || verify.__wcr[slot] != active_control)) {
+            !arm_debug_state_matches(verify, slot, execute, active_address, active_control)) {
             if (execute) { state.__bvr[slot] = old_address; state.__bcr[slot] = old_control; }
             else { state.__wvr[slot] = old_address; state.__wcr[slot] = old_control; }
             const auto rollback = thread_set_state(port.value(), ARM_DEBUG_STATE64,
@@ -1277,6 +1279,37 @@ private:
         std::uint64_t old_address, old_control, active_address, active_control; bool enabled;
     };
 #if defined(__arm64__) || defined(__aarch64__)
+    // XNU sanitizes ARM_DEBUG_STATE64 controls on thread_set_state: it masks
+    // unsupported fields and forces PMC_EL0. Keep our saved/readback values in
+    // that canonical form instead of comparing against caller-supplied bits.
+    static constexpr std::uint64_t arm_debug_control_enable = 1u;
+    static constexpr std::uint64_t arm_debug_control_user = 2u << 1u;
+    static constexpr std::uint64_t arm_debug_bcr_allowed = 0x000001e0u | arm_debug_control_enable;
+    static constexpr std::uint64_t arm_debug_wcr_allowed = 0x1f000000u | 0x00001fe0u | 0x18u |
+        arm_debug_control_enable;
+    static constexpr std::uint64_t normalize_arm_bcr(std::uint64_t value) noexcept {
+        return (value & arm_debug_bcr_allowed) | arm_debug_control_user;
+    }
+    static constexpr std::uint64_t normalize_arm_wcr(std::uint64_t value) noexcept {
+        return (value & arm_debug_wcr_allowed) | arm_debug_control_user;
+    }
+    static bool arm_debug_state_is_empty(const arm_debug_state64_t& state) noexcept {
+        for (std::size_t i = 0; i < std::size(state.__bcr); ++i)
+            if (state.__bcr[i] != 0 || state.__bvr[i] != 0 ||
+                state.__wcr[i] != 0 || state.__wvr[i] != 0) return false;
+        return (state.__mdscr_el1 & 1u) == 0;
+    }
+    static bool arm_debug_state_matches(const arm_debug_state64_t& state, std::size_t slot,
+                                        bool execute, std::uint64_t expected_address,
+                                        std::uint64_t expected_control) noexcept {
+        const auto actual_address = execute ? state.__bvr[slot] : state.__wvr[slot];
+        const auto actual_control = execute ? state.__bcr[slot] : state.__wcr[slot];
+        if (actual_address == expected_address && actual_control == expected_control) return true;
+        // XNU frees the debug-state allocation once its last enabled comparator
+        // is cleared. In that state every slot reads as zero instead of the
+        // normalized disabled PMC_EL0 value.
+        return (expected_control & arm_debug_control_enable) == 0 && arm_debug_state_is_empty(state);
+    }
     Status update_watchpoint_state(const WatchpointRecord& record, bool enable) {
         if (!stopped_ || !task_suspended_)
             return Error{ErrorCode::busy, "hardware breakpoints can only be changed while the Darwin target is stopped"};
@@ -1298,7 +1331,8 @@ private:
             ? state.__bvr[record.slot] : state.__wvr[record.slot];
         auto& control = record.kind == BreakpointKind::execute
             ? state.__bcr[record.slot] : state.__wcr[record.slot];
-        if (address != expected_address || control != expected_control) {
+        if (!arm_debug_state_matches(state, record.slot,
+                record.kind == BreakpointKind::execute, expected_address, expected_control)) {
             mach_port_deallocate(mach_task_self(), port.value());
             return Error{ErrorCode::conflict, "Darwin hardware comparator changed outside this debugger"};
         }
@@ -1324,12 +1358,9 @@ private:
                               reinterpret_cast<thread_state_t>(&verify), &count);
         const auto target_address = enable ? record.active_address : record.old_address;
         const auto target_control = enable ? record.active_control : record.old_control;
-        const auto& verified_address = record.kind == BreakpointKind::execute
-            ? verify.__bvr[record.slot] : verify.__wvr[record.slot];
-        const auto& verified_control = record.kind == BreakpointKind::execute
-            ? verify.__bcr[record.slot] : verify.__wcr[record.slot];
         if (kr != KERN_SUCCESS || count != ARM_DEBUG_STATE64_COUNT ||
-            verified_address != target_address || verified_control != target_control) {
+            !arm_debug_state_matches(verify, record.slot,
+                record.kind == BreakpointKind::execute, target_address, target_control)) {
             address = expected_address;
             control = expected_control;
             const auto rollback = thread_set_state(port.value(), ARM_DEBUG_STATE64,
