@@ -87,18 +87,40 @@ R<std::string> referenced_string(const DwarfMacroSections &sections, std::uint64
     return value;
 }
 
-R<bool> attach_file_provenance(DwarfMacroRecord &record, const DwarfMacroUnit &unit,
-                               std::span<const DwarfLineUnit> line_units) {
-    if (!unit.line_table_offset || !record.file_index) return false;
+struct FileContext {
+    std::optional<std::uint64_t> index;
+    std::optional<std::string> name;
+    std::string source_id;
+};
+
+R<FileContext> resolve_file_context(const DwarfMacroUnit &unit, std::uint64_t index,
+                                    std::span<const DwarfLineUnit> line_units) {
+    FileContext context;
+    context.index = index;
+    if (!unit.line_table_offset) return context;
     const auto line = std::find_if(line_units.begin(), line_units.end(), [&](const auto &candidate) {
         return candidate.section_offset == *unit.line_table_offset;
     });
-    if (line == line_units.end()) return false;
-    record.file_source_id = line->source_id;
-    if (!*record.file_index || *record.file_index > line->files.size())
-        return malformed("DWARF macro file index is outside its matching line table");
-    record.file_name = line->files[static_cast<std::size_t>(*record.file_index - 1)].name;
-    return true;
+    if (line == line_units.end()) return context;
+    context.source_id = line->source_id;
+    std::size_t file_slot = 0;
+    if (line->version == 5) {
+        if (index >= line->files.size())
+            return malformed("DWARF v5 macro file index is outside its matching line table");
+        file_slot = static_cast<std::size_t>(index);
+    } else {
+        if (index == 0 || index > line->files.size())
+            return malformed("Legacy DWARF macro file index is outside its matching line table");
+        file_slot = static_cast<std::size_t>(index - 1);
+    }
+    context.name = line->files[file_slot].name;
+    return context;
+}
+
+void apply_file_context(DwarfMacroRecord &record, const FileContext &context) {
+    record.file_index = context.index;
+    record.file_name = context.name;
+    record.file_source_id = context.source_id;
 }
 } // namespace
 
@@ -107,6 +129,11 @@ R<std::vector<DwarfMacroUnit>> import_dwarf_macro_v5(const DwarfMacroSections &s
         return Error{ErrorCode::invalid_argument, "DWARF macro source ID and contribution bytes are required"};
     if (sections.macro.size() > 64u * 1024u * 1024u || sections.max_text_bytes > 64u * 1024u * 1024u)
         return Error{ErrorCode::resource_limit, "DWARF macro input exceeds 64 MiB"};
+    constexpr std::size_t hard_unit_limit = 65536;
+    constexpr std::size_t hard_record_limit = 1'000'000;
+    constexpr std::size_t hard_scope_limit = 65536;
+    const auto unit_limit = std::min(sections.max_units, hard_unit_limit);
+    const auto record_limit = std::min(sections.max_records, hard_record_limit);
 
     Reader all(sections.macro, sections.little_endian);
     std::vector<DwarfMacroUnit> units;
@@ -114,7 +141,7 @@ R<std::vector<DwarfMacroUnit>> import_dwarf_macro_v5(const DwarfMacroSections &s
     std::size_t total_text_bytes = 0;
     while (!all.done()) {
         if (sections.stop.stop_requested()) return Error{ErrorCode::canceled, "DWARF macro import canceled"};
-        if (units.size() >= sections.max_units)
+        if (units.size() >= unit_limit)
             return Error{ErrorCode::resource_limit, "DWARF macro unit count exceeds configured limit"};
 
         const auto local_unit_start = all.pos();
@@ -171,8 +198,10 @@ R<std::vector<DwarfMacroUnit>> import_dwarf_macro_v5(const DwarfMacroSections &s
                     return Error{ErrorCode::resource_limit, "DWARF macro opcode table exceeds operand limit"};
                 operand_count_total += operand_count.value();
                 for (std::uint64_t j = 0; j < operand_count.value(); ++j) {
-                    auto form = unit_reader.fixed(1);
+                    auto form = unit_reader.uleb();
                     if (!form) return form.error();
+                    if (form.value() > UINT8_MAX)
+                        return malformed("DWARF macro opcode-table form is not representable");
                     // The table is consumed to bound the header. Vendor opcodes
                     // themselves remain unsupported and are never skipped.
                 }
@@ -180,7 +209,7 @@ R<std::vector<DwarfMacroUnit>> import_dwarf_macro_v5(const DwarfMacroSections &s
         }
 
         bool terminated = false;
-        std::size_t file_scope_depth = 0;
+        std::vector<FileContext> file_scopes;
         while (!unit_reader.done()) {
             if (sections.stop.stop_requested()) return Error{ErrorCode::canceled, "DWARF macro import canceled"};
             const auto record_local_offset = unit_reader.pos();
@@ -188,7 +217,7 @@ R<std::vector<DwarfMacroUnit>> import_dwarf_macro_v5(const DwarfMacroSections &s
             if (!opcode_value) return opcode_value.error();
             const auto opcode = static_cast<std::uint8_t>(opcode_value.value());
             if (opcode == 0) { terminated = true; break; }
-            if (++total_records > sections.max_records)
+            if (++total_records > record_limit)
                 return Error{ErrorCode::resource_limit, "DWARF macro record count exceeds configured limit"};
             DwarfMacroRecord record;
             switch (opcode) {
@@ -203,17 +232,21 @@ R<std::vector<DwarfMacroUnit>> import_dwarf_macro_v5(const DwarfMacroSections &s
                 record.kind = DwarfMacroRecordKind::start_file;
                 if (auto line = unit_reader.uleb(); !line) return line.error(); else record.line = line.value();
                 if (auto file = unit_reader.uleb(); !file) return file.error();
-                else {
-                    if (!file.value()) return malformed("DWARF macro start_file uses file index zero");
-                    record.file_index = file.value();
+                else record.file_index = file.value();
+                {
+                    auto context = resolve_file_context(unit, *record.file_index, sections.line_units);
+                    if (!context) return context.error();
+                    apply_file_context(record, context.value());
+                    if (file_scopes.size() >= hard_scope_limit)
+                        return Error{ErrorCode::resource_limit, "DWARF macro file-scope nesting exceeds 65,536"};
+                    file_scopes.push_back(std::move(context.value()));
                 }
-                if (++file_scope_depth > 65536)
-                    return Error{ErrorCode::resource_limit, "DWARF macro file-scope nesting exceeds 65,536"};
                 break;
             case 4: // DW_MACRO_end_file
                 record.kind = DwarfMacroRecordKind::end_file;
-                if (!file_scope_depth) return malformed("DWARF macro end_file has no matching start_file");
-                --file_scope_depth;
+                if (file_scopes.empty()) return malformed("DWARF macro end_file has no matching start_file");
+                apply_file_context(record, file_scopes.back());
+                file_scopes.pop_back();
                 break;
             case 5: case 6: { // DW_MACRO_define_strp / DW_MACRO_undef_strp
                 record.kind = opcode == 5 ? DwarfMacroRecordKind::define : DwarfMacroRecordKind::undefine;
@@ -244,14 +277,15 @@ R<std::vector<DwarfMacroUnit>> import_dwarf_macro_v5(const DwarfMacroSections &s
             if (record.origin.record_offset < sections.section_offset)
                 return malformed("DWARF macro record source offset overflows");
             record.origin.record_size = unit_reader.pos() - record_local_offset;
-            auto file_status = attach_file_provenance(record, unit, sections.line_units);
-            if (!file_status) return file_status.error();
+            if (record.kind != DwarfMacroRecordKind::start_file &&
+                record.kind != DwarfMacroRecordKind::end_file && !file_scopes.empty())
+                apply_file_context(record, file_scopes.back());
             unit.records.push_back(std::move(record));
         }
         if (!terminated)
             return malformed("DWARF macro unit is missing its terminator");
         if (!unit_reader.done()) return malformed("DWARF macro unit has trailing bytes after its terminator");
-        if (file_scope_depth) return malformed("DWARF macro unit has unterminated file scopes");
+        if (!file_scopes.empty()) return malformed("DWARF macro unit has unterminated file scopes");
         all.seek(unit_end);
         units.push_back(std::move(unit));
     }
