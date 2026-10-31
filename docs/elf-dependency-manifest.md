@@ -37,6 +37,10 @@ children. In accordance with the documented precedence rule, `DT_RPATH` is
 ignored whenever `DT_RUNPATH` exists. The result retains whether a match came
 from RPATH or RUNPATH and the winning directory.
 
+A `DT_NEEDED` string containing `/` is treated as a direct pathname request:
+it retains exact manifest-name matching and bypasses RPATH/RUNPATH directory
+search.
+
 This is deliberately an offline candidate-order model, not a system loader:
 `LD_LIBRARY_PATH`, secure-execution rules, loader caches, default directories,
 hardware-capability directories, symlink traversal, namespaces, and actual
