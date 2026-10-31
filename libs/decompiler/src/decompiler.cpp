@@ -1543,6 +1543,114 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
             return effect;
         }
     }
+    const bool x86_opmask_arithmetic = instruction.opcode >= Opcode::kaddb &&
+                                       instruction.opcode <= Opcode::kunpckdq;
+    if (x86_context && x86_opmask_arithmetic && instruction.operands.size() == 3 && operands.size() == 3 &&
+        instruction.access.size() == 3 && instruction.access[0] == OperandAccess::write &&
+        instruction.access[1] == OperandAccess::read && instruction.access[2] == OperandAccess::read &&
+        !instruction.x86_evex && !instruction.x86_opmask && !instruction.x86_opmask_zeroing &&
+        !instruction.x86_evex_broadcast && !instruction.x86_evex_sae &&
+        !instruction.memory_read && !instruction.memory_write) {
+        unsigned width = 0;
+        enum class Operation : std::uint8_t { add, left, right, unpack } operation{};
+        switch (instruction.opcode) {
+#define HEXLAB_KADD_WIDTHS(prefix, op) \
+        case Opcode::prefix##b: width = 8; operation = Operation::op; break; \
+        case Opcode::prefix##w: width = 16; operation = Operation::op; break; \
+        case Opcode::prefix##d: width = 32; operation = Operation::op; break; \
+        case Opcode::prefix##q: width = 64; operation = Operation::op; break
+        HEXLAB_KADD_WIDTHS(kadd, add);
+#undef HEXLAB_KADD_WIDTHS
+        case Opcode::kshiftlb: width = 8; operation = Operation::left; break;
+        case Opcode::kshiftlw: width = 16; operation = Operation::left; break;
+        case Opcode::kshiftld: width = 32; operation = Operation::left; break;
+        case Opcode::kshiftlq: width = 64; operation = Operation::left; break;
+        case Opcode::kshiftrb: width = 8; operation = Operation::right; break;
+        case Opcode::kshiftrw: width = 16; operation = Operation::right; break;
+        case Opcode::kshiftrd: width = 32; operation = Operation::right; break;
+        case Opcode::kshiftrq: width = 64; operation = Operation::right; break;
+        case Opcode::kunpckbw: width = 16; operation = Operation::unpack; break;
+        case Opcode::kunpckwd: width = 32; operation = Operation::unpack; break;
+        case Opcode::kunpckdq: width = 64; operation = Operation::unpack; break;
+        default: break;
+        }
+        const auto *destination = std::get_if<RegisterOperand>(&instruction.operands[0]);
+        const auto *source1_register = std::get_if<RegisterOperand>(&instruction.operands[1]);
+        const bool shift = operation == Operation::left || operation == Operation::right;
+        const auto *source2_register = shift ? nullptr : std::get_if<RegisterOperand>(&instruction.operands[2]);
+        const auto *shift_immediate = shift ? std::get_if<ImmediateOperand>(&instruction.operands[2]) : nullptr;
+        const auto valid_k = [](const RegisterOperand *reg) {
+            return reg && reg->bank == RegisterBank::opmask && reg->index < 8 &&
+                reg->width == 64 && !reg->high_byte;
+        };
+        const auto has_read = [&](RegisterOperand reg) {
+            return std::find(instruction.register_reads.begin(), instruction.register_reads.end(), reg) !=
+                instruction.register_reads.end();
+        };
+        const bool read_shape = valid_k(source1_register) && has_read(*source1_register) &&
+            (shift || (valid_k(source2_register) && has_read(*source2_register)));
+        const bool no_extra_reads = std::all_of(instruction.register_reads.begin(), instruction.register_reads.end(),
+            [&](RegisterOperand reg) {
+                return valid_k(source1_register) && reg == *source1_register ||
+                    (!shift && valid_k(source2_register) && reg == *source2_register);
+            });
+        const bool valid_dest = valid_k(destination) && instruction.register_writes.size() == 1 &&
+            instruction.register_writes.front() == *destination;
+        const bool valid_shift = !shift || (shift_immediate && shift_immediate->encoded_width == 8 &&
+            operands[2]->type.bits == 8);
+        if (width != 0 && valid_dest && read_shape && no_extra_reads && valid_shift &&
+            operands[0]->type.bits == 64 && operands[1]->type.bits == 64 &&
+            (!source2_register || operands[2]->type.bits == 64)) {
+            const auto binary64 = [](std::string operation_name, ExpressionPtr left, ExpressionPtr right) {
+                return std::make_shared<Expression>(Expression{integer_type(64),
+                    BinaryValue{std::move(operation_name), std::move(left), std::move(right)}});
+            };
+            const std::uint64_t mask = width == 64 ? UINT64_MAX : (UINT64_C(1) << width) - 1;
+            const auto source1 = retag_expr(operands[1], integer_type(64));
+            ExpressionPtr value;
+            std::string intrinsic_name;
+            IntrinsicMemoryEffect memory_effect = IntrinsicMemoryEffect::none;
+            if (operation == Operation::add) {
+                const auto source2 = retag_expr(operands[2], integer_type(64));
+                value = binary64("and", binary64("add", source1, source2), constant_expr(mask, 64));
+                intrinsic_name = "x86_kadd_i" + std::to_string(width);
+            } else if (shift) {
+                const auto count = shift_immediate->value;
+                value = count >= width ? constant_expr(0, 64) :
+                    binary64("and", binary64(operation == Operation::left ? "shl" : "shr",
+                        binary64("and", source1, constant_expr(mask, 64)),
+                        constant_expr(count, 64)), constant_expr(mask, 64));
+                intrinsic_name = std::string(operation == Operation::left ? "x86_kshiftl_i" : "x86_kshiftr_i") +
+                    std::to_string(width);
+            } else {
+                const auto source2 = retag_expr(operands[2], integer_type(64));
+                const unsigned bytes = width / 16;
+                value = constant_expr(0, 64);
+                for (unsigned byte = 0; byte < bytes; ++byte) {
+                    const auto extract = [&](ExpressionPtr source, unsigned shift_amount) {
+                        return binary64("and", binary64("shr", std::move(source),
+                            constant_expr(shift_amount, 64)), constant_expr(0xff, 64));
+                    };
+                    auto first_byte = extract(source1, byte * 8);
+                    auto second_byte = extract(source2, byte * 8);
+                    if (byte != 0) first_byte = binary64("shl", std::move(first_byte), constant_expr(byte * 16, 64));
+                    second_byte = binary64("shl", std::move(second_byte), constant_expr(byte * 16 + 8, 64));
+                    value = binary64("or", std::move(value), binary64("or", std::move(first_byte),
+                        std::move(second_byte)));
+                }
+                intrinsic_name = "x86_kunpck_i" + std::to_string(width);
+            }
+            Intrinsic effect{std::move(intrinsic_name), {source1}, memory_effect};
+            if (operation == Operation::add || operation == Operation::unpack)
+                effect.operands.push_back(retag_expr(operands[2], integer_type(64)));
+            else
+                effect.operands.push_back(operands[2]);
+            effect.register_writes = instruction.register_writes;
+            effect.register_output_values = {std::move(value)};
+            effect.result_type = integer_type(64);
+            return effect;
+        }
+    }
     const bool x86_bit_scan = instruction.opcode == Opcode::bsf || instruction.opcode == Opcode::bsr ||
                               instruction.opcode == Opcode::tzcnt || instruction.opcode == Opcode::lzcnt;
     if (x86_context && x86_bit_scan && instruction.operands.size() == 2) {
