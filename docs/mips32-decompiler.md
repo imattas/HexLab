@@ -60,8 +60,10 @@ rounding forms likewise define the correct typed FPR result and an explicit
 unknown FCSR result. The sign/move family has exact bit-preserving lowering as
 described below.
 For all 16 classic S/D `C.<cond>` predicates, the intrinsic retains the
-predicate and selected FCC effect, while the FCC output is also expressed as
-symbolic SSA from ordered equal/less/less-equal and unordered terms. This
+predicate and incoming aggregate FCSR dependency. The selected FCC output is
+expressed as symbolic SSA from ordered equal/less/less-equal and unordered
+terms, and the post-compare aggregate FCSR is an explicit unknown output for
+Cause/Flag behavior. This
 allows `BC1T`/`BC1F`/`BC1TL`/`BC1FL` and downstream condition flow to consume the predicate
 without relying on host floating-point evaluation. Signaling-NaN exception
 details and FCSR Cause/Flag updates remain unevaluated.

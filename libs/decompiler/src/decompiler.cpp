@@ -3687,6 +3687,37 @@ a64_unhandled:
                 // exception behavior in the intrinsic, but expose the exact
                 // FCC truth value as ordinary symbolic SSA.
                 if (operands.size() >= 2) {
+                    const bool double_precision = op == Opcode::mips64_c_cond_d;
+                    const auto width = static_cast<std::uint16_t>(double_precision ? 64 : 32);
+                    const auto *left_register = instruction.operands.size() == 2
+                        ? std::get_if<RegisterOperand>(&instruction.operands[0]) : nullptr;
+                    const auto *right_register = instruction.operands.size() == 2
+                        ? std::get_if<RegisterOperand>(&instruction.operands[1]) : nullptr;
+                    const RegisterOperand fcsr{RegisterBank::mips_fcsr, 0, 32, false};
+                    const RegisterOperand fcc{RegisterBank::mips_fcsr,
+                        static_cast<std::uint8_t>(condition_code + 1), 32, false};
+                    const std::vector<RegisterOperand> expected_reads = left_register && right_register
+                        ? std::vector<RegisterOperand>{*left_register, *right_register, fcsr}
+                        : std::vector<RegisterOperand>{};
+                    const std::vector<RegisterOperand> expected_mips32_writes{fcc, fcsr};
+                    const bool valid_operands = left_register && right_register &&
+                        left_register->bank == RegisterBank::mips_fpr && right_register->bank == RegisterBank::mips_fpr &&
+                        left_register->index < 32 && right_register->index < 32 &&
+                        !left_register->high_byte && !right_register->high_byte &&
+                        left_register->width == width && right_register->width == width &&
+                        operands[0]->type == floating_type(width) && operands[1]->type == floating_type(width);
+                    const bool valid_writes = instruction.register_writes == std::vector<RegisterOperand>{fcsr} ||
+                        instruction.register_writes == expected_mips32_writes;
+                    if (!valid_operands || instruction.access !=
+                            std::vector<OperandAccess>{OperandAccess::read, OperandAccess::read} ||
+                        instruction.register_reads != expected_reads || !valid_writes ||
+                        instruction.memory_read || instruction.memory_write ||
+                        instruction.flow != FlowKind::fallthrough || instruction.delay_slots) {
+                        Intrinsic malformed{"mips_malformed_fp_compare", operands, IntrinsicMemoryEffect::unknown};
+                        for (const auto read : instruction.register_reads) malformed.operands.push_back(reg_expr(read));
+                        malformed.register_writes = instruction.register_writes;
+                        return malformed;
+                    }
                     const auto unordered = boolean_binary("fp_unordered", operands[0], operands[1]);
                     const auto equal = boolean_binary("fp_eq", operands[0], operands[1]);
                     const auto less = boolean_binary("fp_lt", operands[0], operands[1]);
@@ -3705,13 +3736,15 @@ a64_unhandled:
                     auto fcc_value = std::make_shared<Expression>(Expression{
                         integer_type(32), UnaryValue{"zext", std::move(truth)}});
                     // The compare intrinsic still represents FCSR Cause/Flag
-                    // side effects for signaling operands; only FCC is made
-                    // explicit here.
-                    const RegisterOperand fcc{RegisterBank::mips_fcsr,
-                        static_cast<std::uint8_t>(condition_code + 1), 32, false};
-                    Intrinsic effect{intrinsic_name, operands, IntrinsicMemoryEffect::none};
-                    effect.register_writes = {fcc};
-                    effect.register_output_values = {std::move(fcc_value)};
+                    // side effects for signaling operands. Keep the incoming
+                    // aggregate FCSR dependency and define its unmodeled
+                    // post-compare value alongside the exact selected FCC.
+                    Intrinsic effect{intrinsic_name, {operands[0], operands[1], reg_expr(fcsr)},
+                                     IntrinsicMemoryEffect::none};
+                    effect.register_writes = {fcc, fcsr};
+                    effect.register_output_values = {std::move(fcc_value),
+                        std::make_shared<Expression>(Expression{integer_type(32),
+                            UnknownValue{intrinsic_name + "_fcsr_after"}})};
                     return effect;
                 }
             }

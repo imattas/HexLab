@@ -398,7 +398,10 @@ DecodeResult decode_mips32(ByteOrder order, std::span<const std::byte> bytes, Ad
                 if (compare) {
                     i.operands = {left, right}; i.access = {OperandAccess::read, OperandAccess::read};
                     const auto condition_code = static_cast<unsigned>((i.condition >> 4) & 7);
-                    i.register_reads = {left, right}; i.register_writes = {fcc(condition_code)};
+                    // COP1 comparisons update both the selected condition
+                    // code and the aggregate FCSR exception state.
+                    i.register_reads = {left, right, fcsr()};
+                    i.register_writes = {fcc(condition_code), fcsr()};
                 } else {
                     const auto destination = fpr(fd, destination_width);
                     i.operands = unary ? std::vector<Operand>{destination, left}
