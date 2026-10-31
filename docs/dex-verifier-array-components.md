@@ -1,7 +1,28 @@
-# DEX array component verification
+# DEX array verifier component checks
 
-The bounded DEX register type-flow uses a tracked array reference's in-image descriptor to verify `aget` and `aput` component categories. It rejects a known non-array reference used by an array opcode, and rejects a primitive/object opcode whose component does not match the known array descriptor. The generic `aget`/`aput` opcodes accept both `I` and `F` components; `aget` preserves the exact component descriptor, and `aput` checks the stored register against that exact component type. The other primitive mappings are `J` or `D` (wide), `Z` (boolean), `B` (byte), `C` (char), and `S` (short). Wide registers retain the exact `J` or `D` component category when available.
+The bounded DEX register type-flow tracks an in-image reference descriptor when
+one is available. For `aget`/`aput` instructions (`0x44`–`0x51`), it uses that
+descriptor only when the reference has a valid type ID in the DEX type table.
 
-For a known object array, `aget-object` propagates the exact immediate component descriptor, including one fewer array dimension for multidimensional arrays. `aput-object` verifies that the array component and stored value are references, but does not compare their concrete classes: ART permits a class mismatch to throw `ArrayStoreException` at runtime. This matches ART's `VerifyAGet` and `VerifyAPut` behavior in [`method_verifier.cc`](https://android.googlesource.com/platform/art/+/master/runtime/verifier/method_verifier.cc).
+For a known descriptor, the verifier rejects a known non-array reference and
+checks the immediate component against the opcode: `aget`/`aput` use `I` or `F`,
+`-wide` uses `J` or `D`, `-object` uses an object or array descriptor, and the
+boolean, byte, char, and short forms use `Z`, `B`, `C`, and `S`. This handles
+multidimensional arrays by treating the immediate component as an array
+reference, retaining its remaining descriptor depth.
 
-Unknown references, null values, and reference values whose type ID is unavailable keep the prior conservative category checks. Primitive and object result facts are not invented from an unknown component. Missing component type IDs do not cause descriptor-table indexing. Definite mismatches include the method index, code-item file offset, and instruction code-unit offset. Existing instruction, register-state, hierarchy, and cancellation bounds continue to apply.
+Object and wide loads retain the component descriptor in register type-flow,
+including the distinction between `J` and `D`. Stores check the corresponding
+primitive or wide type. `aput-object` requires a reference value and an
+object/array component, but leaves compatibility between concrete reference
+classes to runtime array-store checking (`ArrayStoreException`).
+
+The existing conservative behavior remains for null, unknown, and references
+whose descriptor identity is not available: category checks still apply, while
+no component-specific conclusion is made. The verifier does not infer facts
+from external class hierarchies. Component mismatches proven by an in-image
+descriptor report the method index, code-item file offset, instruction code-unit
+offset, and opcode; malformed or absent type IDs are not dereferenced.
+
+These checks run inside the existing bounded, cancellable verifier worklist and
+add no unbounded hierarchy traversal.
