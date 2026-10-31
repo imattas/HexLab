@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.0 — 2026-10-30
+## 0.1.0 — 2026-10-31
 
 First public HexLab release. This version packages the current C++20 analysis
 engines, wxWidgets desktop application, command-line tools, and debugger server.

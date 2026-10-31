@@ -118,7 +118,6 @@ void publish_file(OwnedFile& source,const std::filesystem::path& destination,Rep
         );
         if(fd<0)throw Failure{native_error("Cannot reserve destination for publication")};
         NativeHandle guard{fd};
-        if(::flock(fd,LOCK_EX|LOCK_NB)!=0)throw Failure{{ErrorCode::busy,"Destination is still open in another reader or writer"}};
         struct stat guarded_identity{};
         if(::fstat(fd,&guarded_identity)!=0)throw Failure{native_error("Cannot inspect reserved publication destination")};
         if(!S_ISREG(guarded_identity.st_mode) || guarded_identity.st_dev!=destination_identity.st_dev ||
@@ -208,6 +207,18 @@ void publish_file(OwnedFile& source,const std::filesystem::path& destination,Rep
                     throw Failure{{ErrorCode::busy,"Destination WAL remains after SQLite checkpoint"}};
             }else if(errno!=ENOENT)throw Failure{native_error("Cannot recheck destination WAL")};
         }
+        // Acquire the publication lock only after SQLite has closed its
+        // recovery handle. On macOS the SQLite VFS may use flock-based
+        // database locks; taking LOCK_EX first would make our own SQLite
+        // journal-mode transition fail with SQLITE_BUSY.
+        if(::flock(fd,LOCK_EX|LOCK_NB)!=0)throw Failure{{ErrorCode::busy,"Destination is still open in another reader or writer"}};
+        struct stat locked_identity{},locked_path{};
+        if(::fstat(fd,&locked_identity)!=0 || ::lstat(destination.c_str(),&locked_path)!=0)
+            throw Failure{native_error("Cannot recheck destination after acquiring publication lock")};
+        if(!S_ISREG(locked_identity.st_mode) || !S_ISREG(locked_path.st_mode) ||
+           locked_identity.st_dev!=guarded_identity.st_dev || locked_identity.st_ino!=guarded_identity.st_ino ||
+           locked_path.st_dev!=guarded_identity.st_dev || locked_path.st_ino!=guarded_identity.st_ino)
+            throw Failure{{ErrorCode::conflict,"Destination changed before publication lock was acquired"}};
         auto parent=destination.parent_path();if(parent.empty())parent=".";
         int directory_fd=::open(parent.c_str(),O_RDONLY|O_CLOEXEC
 #ifdef O_DIRECTORY
