@@ -2173,6 +2173,9 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
                             } else if (opcode == 0xfa || opcode == 0xfb) {
                                 proto_index = word(3);
                                 receiver = true;
+                                const auto method_index = word(1);
+                                if (method_index < methods.size())
+                                    receiver_owner = methods[method_index].owner;
                             } else {
                                 const auto call_site_index = word(1);
                                 if (call_site_index < decoded_call_sites.size()) {
