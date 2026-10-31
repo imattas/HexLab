@@ -352,6 +352,7 @@ void usage(std::ostream &out) {
            "       hexlab_cli plugins scan|dependencies <directory> [--json] [--strict]  (data-only native plugin discovery)\n\n"
            "       hexlab_cli processors [--json]  (supported decoder variants)\n\n"
            "       hexlab_cli archive list <archive> [--thin-root <directory>]\n"
+           "       hexlab_cli archive index-audit <archive> [--thin-root <directory>]\n"
            "       hexlab_cli archive link-select <archive> --root-object <ET_REL|XCOFF64>\n"
            "       hexlab_cli archive link-audit <archive> --root-object <ET_REL|XCOFF64>\n"
            "       hexlab_cli archive link-exec <archive> --root-object <ET_REL> --entry <symbol> --output <ET_EXEC>\n"
@@ -1890,6 +1891,7 @@ int archive_command(std::span<const std::wstring_view> args, std::ostream &out, 
     using project_detail::take;
     if (args.size() < 2 || (args.size() == 2 && args[1] == L"--help")) {
         out << "Usage: hexlab_cli archive list <archive> [--thin-root <directory>]\n"
+               "       hexlab_cli archive index-audit <archive> [--thin-root <directory>]\n"
                "       hexlab_cli archive link-select <archive> --root-object <ET_REL|XCOFF64>\n"
                "       hexlab_cli archive link-audit <archive> --root-object <ET_REL|XCOFF64>\n"
                "       hexlab_cli archive link <archive> --root-object <ET_REL> --output <ET_REL>\n"
@@ -1922,6 +1924,82 @@ int archive_command(std::span<const std::wstring_view> args, std::ostream &out, 
         if(archive.thin&&action!=L"list"&&!resolver)
             argument_error("Thin archive reads/link actions require --thin-root <directory>");
         const auto open_member=[&](const ArMember& member){return open_ar_member(storage,member,resolver);};
+        if (action == L"index-audit") {
+            if (args.size() != 2) argument_error("archive index-audit takes one archive path");
+            constexpr std::size_t max_members = 4096;
+            constexpr std::size_t max_index_rows = 1'000'000;
+            constexpr std::uint64_t max_name_bytes = 64ULL * 1024 * 1024;
+            constexpr std::uint64_t max_member_bytes = 256ULL * 1024 * 1024;
+            if (archive.members.size() > max_members)
+                argument_error("Archive index audit exceeds 4096 members");
+            if (archive.symbols.size() > max_index_rows)
+                argument_error("Archive index audit exceeds one million index rows");
+            std::map<std::string, std::set<std::size_t>> expected;
+            std::set<std::size_t> audited_members;
+            std::uint64_t total_bytes = 0, total_symbols = 0, total_name_bytes = 0;
+            std::size_t skipped_members = 0;
+            for (std::size_t i = 0; i < archive.members.size(); ++i) {
+                const auto &member = archive.members[i];
+                if (member.kind != ArMemberKind::regular && member.kind != ArMemberKind::thin_external) continue;
+                auto member_storage = take(open_member(member));
+                const auto format = take(detect_format(*member_storage));
+                if (format != DetectedFormat::elf_candidate) { ++skipped_members; continue; }
+                if (member_storage->size() > max_member_bytes - total_bytes)
+                    argument_error("Archive index audit exceeds 256 MiB of ELF member data");
+                total_bytes += member_storage->size();
+                auto summary = take(summarize_elf_ar_member(*member_storage, i));
+                audited_members.insert(i);
+                total_symbols += summary.definitions.size();
+                if (total_symbols > 1'000'000)
+                    argument_error("Archive index audit exceeds one million defined symbols");
+                for (const auto &name : summary.definitions) {
+                    if (name.size() > max_name_bytes - total_name_bytes)
+                        argument_error("Archive index audit exceeds 64 MiB of decoded ELF symbol names");
+                    total_name_bytes += name.size();
+                    expected[name].insert(i);
+                }
+            }
+            std::set<std::pair<std::string, std::size_t>> actual;
+            std::size_t stale = 0, unverifiable = 0;
+            for (const auto &symbol : archive.symbols) {
+                if (symbol.name.size() > max_name_bytes - total_name_bytes)
+                    argument_error("Archive index audit exceeds 64 MiB of decoded symbol names");
+                total_name_bytes += symbol.name.size();
+                if (!audited_members.contains(symbol.member_index)) {
+                    ++unverifiable;
+                    out << "Unverifiable index row: symbol=" << safe_text(symbol.name)
+                        << " member=" << symbol.member_index << " reason=non-ELF-or-unsupported-member\n";
+                    continue;
+                }
+                actual.emplace(symbol.name, symbol.member_index);
+                const auto found = expected.find(symbol.name);
+                if (found == expected.end() || !found->second.contains(symbol.member_index)) {
+                    ++stale;
+                    out << "Stale index row: symbol=" << safe_text(symbol.name)
+                        << " member=" << symbol.member_index << " member-name="
+                        << safe_text(archive.members[symbol.member_index].name) << '\n';
+                }
+            }
+            std::size_t missing = 0;
+            for (const auto &[name, providers] : expected) {
+                for (const auto member_index : providers) {
+                    if (actual.contains({name, member_index})) continue;
+                    ++missing;
+                    out << "Missing index row: symbol=" << safe_text(name)
+                        << " member=" << member_index << " member-name="
+                        << safe_text(archive.members[member_index].name) << '\n';
+                }
+            }
+            out << "Archive index audit: format=ELF members=" << audited_members.size()
+                << " skipped-members=" << skipped_members << " defined-symbols=" << total_symbols
+                << " index-rows=" << archive.symbols.size() << " missing=" << missing
+                << " stale=" << stale << " unverifiable=" << unverifiable
+                << " index-present=" << (archive.has_symbol_index ? "true" : "false")
+                << " index-complete=" << (archive.symbol_index_complete ? "true" : "false") << '\n';
+            for (const auto &diagnostic : archive.diagnostics)
+                out << "Archive diagnostic: " << safe_text(diagnostic) << '\n';
+            return missing == 0 && stale == 0 && archive.has_symbol_index && archive.symbol_index_complete ? 0 : 1;
+        }
         if (action == L"link-pe") {
             if (args.size() != 8 || args[2] != L"--root-object" || args[4] != L"--entry" || args[6] != L"--output")
                 argument_error("archive link-pe requires --root-object <COFF .obj> --entry <symbol> --output <PE .exe>");
