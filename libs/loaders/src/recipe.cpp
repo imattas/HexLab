@@ -13,8 +13,63 @@
 #include <algorithm>
 #include <array>
 #include <mutex>
+#include <string_view>
+#include <system_error>
 namespace hexlab {
 namespace {
+Result<LoadRecipe> attach_adjacent_pe_pdb(const ByteStorage &storage, LoadRecipe recipe,
+                                          std::stop_token stop) {
+    if (recipe.format != Format::pe || recipe.pdb_path)
+        return recipe;
+    const auto *file = dynamic_cast<const FileStorage *>(&storage);
+    if (!file)
+        return recipe;
+    if (stop.stop_requested())
+        return Error{ErrorCode::canceled, "Image loading canceled"};
+    auto parsed = load_pe(file->shared_from_this(), stop);
+    if (!parsed) {
+        if (parsed.error().code == ErrorCode::canceled) return parsed.error();
+        return recipe;
+    }
+    std::vector<std::filesystem::path> names;
+    if (parsed.value().metadata.pe) {
+        for (const auto &identity : parsed.value().metadata.pe->codeview) {
+            if (!identity.rsds || identity.path.empty()) continue;
+            const auto separator = identity.path.find_last_of("/\\");
+            const auto basename = std::string_view(identity.path).substr(
+                separator == std::string::npos ? 0 : separator + 1);
+            if (basename.empty() || basename == "." || basename == "..") continue;
+            std::filesystem::path name;
+            try {
+                const auto *utf8 = reinterpret_cast<const char8_t *>(basename.data());
+                name = std::u8string(utf8, utf8 + basename.size());
+            } catch (const std::filesystem::filesystem_error &) {
+                continue;
+            }
+            if (!name.empty() && name != "." && name != ".." &&
+                std::find(names.begin(), names.end(), name) == names.end())
+                names.push_back(name);
+        }
+    }
+    auto fallback = file->backing_path().filename();
+    fallback.replace_extension(".pdb");
+    if (!fallback.empty() && std::find(names.begin(), names.end(), fallback) == names.end())
+        names.push_back(std::move(fallback));
+    for (const auto &name : names) {
+        if (stop.stop_requested())
+            return Error{ErrorCode::canceled, "Image loading canceled"};
+        const auto candidate = file->backing_path().parent_path() / name;
+        std::error_code error;
+        const auto status = std::filesystem::symlink_status(candidate, error);
+        // Treat CodeView paths as untrusted hints: only inspect a basename in
+        // the input directory, and never follow a symlink automatically.
+        if (!error && std::filesystem::is_regular_file(status)) {
+            recipe.pdb_path = candidate;
+            break;
+        }
+    }
+    return recipe;
+}
 Sha256Digest combine_external_fingerprints(const std::optional<Sha256Digest> &first,
                                            const Sha256Digest &second) {
     Sha256 combined;
@@ -626,6 +681,8 @@ Result<LoadRecipe> resolve_load_recipe(const ByteStorage &storage, const LoadRec
         auto detected = detect_format(storage);
         if (!detected)
             return detected.error();
+        if (recipe.pdb_path && detected.value() != DetectedFormat::pe_candidate)
+            return Error{ErrorCode::invalid_argument, "A local PDB can only be selected for a PE input"};
         if (detected.value() == DetectedFormat::macho_candidate) {
             if (recipe.pe_runtime_architecture)
                 return Error{ErrorCode::invalid_argument, "PE runtime architecture selection requires a PE input"};
@@ -635,8 +692,9 @@ Result<LoadRecipe> resolve_load_recipe(const ByteStorage &storage, const LoadRec
             return Error{ErrorCode::invalid_argument, "Slice options require a Mach-O input"};
         if (detected.value() == DetectedFormat::pe_candidate) {
             LoadRecipe selected{Format::pe, {}};
+            selected.pdb_path = recipe.pdb_path;
             selected.pe_runtime_architecture = recipe.pe_runtime_architecture;
-            return selected;
+            return attach_adjacent_pe_pdb(storage, std::move(selected), stop);
         }
         if (recipe.pe_runtime_architecture)
             return Error{ErrorCode::invalid_argument, "PE runtime architecture selection requires a PE input"};
@@ -672,7 +730,7 @@ Result<LoadRecipe> resolve_load_recipe(const ByteStorage &storage, const LoadRec
                           {},
                           container.value().universal ? std::optional{MachOOptions{selected.value()}} : std::nullopt};
     }
-    return recipe;
+    return attach_adjacent_pe_pdb(storage, recipe, stop);
 }
 Result<LoadedImage> load_image(std::shared_ptr<const ByteStorage> storage, const LoadRecipe &requested,
                                std::stop_token stop) {
