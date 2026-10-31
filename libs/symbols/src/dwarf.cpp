@@ -1346,6 +1346,11 @@ hexlab::Result<ImportResult> import_dwarf(const DwarfSections&sections){
     }
     if(sections.expected_split_dwo_id && (!output.split_unit || output.split_dwo_id!=sections.expected_split_dwo_id))
         return malformed("DWARF split contribution does not contain the requested DWO ID");
+    output.split_dwo_ids.reserve(pending_split_units.size());
+    for (const auto &request : pending_split_units) {
+        if (canceled()) return hexlab::Error{hexlab::ErrorCode::canceled,"DWARF import canceled"};
+        output.split_dwo_ids.push_back(request.dwo_id);
+    }
     if(!pending_split_units.empty()){
         if(!sections.split_unit_resolver){
             for(const auto &request:pending_split_units)

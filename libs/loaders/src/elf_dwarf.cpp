@@ -1023,6 +1023,67 @@ Result<bool> read_dwarf_info(const ByteStorage &storage, ElfMetadata &metadata, 
 } // namespace hexlab::elf_detail
 
 namespace hexlab {
+Result<bool> elf_dwp_matches_split_units(const ByteStorage &storage, const ElfHeader &primary_header,
+                                         std::span<const std::uint64_t> skeleton_dwo_ids,
+                                         std::stop_token stop, std::uint64_t max_bytes) {
+    using namespace elf_detail;
+    try {
+        require(max_bytes != 0, "DWP identity byte budget must be nonzero", ErrorCode::invalid_argument);
+        require(skeleton_dwo_ids.size() <= 4096, "DWP identity request count exceeds 4096",
+                ErrorCode::resource_limit);
+        if (skeleton_dwo_ids.empty()) return false;
+        canceled(stop);
+        require(storage.size() <= max_bytes, "DWP candidate exceeds its identity byte budget",
+                ErrorCode::resource_limit);
+
+        ElfMetadata package_metadata;
+        package_metadata.header = take(read_elf_header(storage, stop));
+        require(package_metadata.header.object_type == 1, "DWP candidate is not an ELF relocatable object",
+                ErrorCode::unsupported);
+        require(package_metadata.header.machine == primary_header.machine &&
+                    package_metadata.header.is_64 == primary_header.is_64 &&
+                    package_metadata.header.order == primary_header.order,
+                "DWP candidate ELF identity differs from its primary input", ErrorCode::unsupported);
+
+        Budget budget;
+        budget.limit = std::min(max_bytes, metadata_limit);
+        read_tables(storage, package_metadata, budget, stop);
+        const auto *index_section = optional_debug_section(package_metadata, ".debug_cu_index",
+                                                             ".debug_cu_index.dwo");
+        if (!index_section || !index_section->size) return false;
+        const auto index = read_package_index(storage, package_metadata, *index_section,
+            symbols::DwarfPackageIndexKind::compile_units, budget, stop);
+        const auto info_column = std::find(index->section_ids.begin(), index->section_ids.end(), 1u);
+        const auto abbrev_column = std::find(index->section_ids.begin(), index->section_ids.end(), 3u);
+        if (info_column == index->section_ids.end() || abbrev_column == index->section_ids.end()) return false;
+        const auto info_index = static_cast<std::size_t>(info_column - index->section_ids.begin());
+        const auto abbrev_index = static_cast<std::size_t>(abbrev_column - index->section_ids.begin());
+        std::unordered_set<std::uint64_t> requested;
+        requested.reserve(skeleton_dwo_ids.size());
+        for (const auto id : skeleton_dwo_ids) {
+            canceled(stop);
+            requested.insert(id);
+        }
+        std::unordered_set<std::uint64_t> matched;
+        matched.reserve(requested.size());
+        for (std::size_t row_index = 0; row_index < index->rows.size(); ++row_index) {
+            if ((row_index & 255u) == 0) canceled(stop);
+            const auto &row = index->rows[row_index];
+            if (!requested.contains(row.signature) || info_index >= row.sections.size() ||
+                abbrev_index >= row.sections.size()) continue;
+            if (row.sections[info_index].size != 0 && row.sections[abbrev_index].size != 0)
+                matched.insert(row.signature);
+        }
+        return matched.size() == requested.size();
+    } catch (const Failure &failure) {
+        return failure.error;
+    } catch (const std::bad_alloc &) {
+        return Error{ErrorCode::resource_limit, "Cannot allocate bounded DWP identity index"};
+    } catch (const std::length_error &) {
+        return Error{ErrorCode::resource_limit, "DWP identity index exceeds container limits"};
+    }
+}
+
 Result<ElfDwpSectionContribution> read_elf_dwp_section_contribution(
     const ByteStorage &storage, symbols::DwarfPackageIndexKind index_kind,
     std::uint64_t signature, std::uint32_t section_id, std::stop_token stop,
