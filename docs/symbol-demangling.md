@@ -37,9 +37,12 @@ declarators. Template arguments
 support bounded integer literals and recursive `X <expression> E` arithmetic,
 comparison, bitwise, logical, assignment, unary, and conditional (`qu`)
 expression forms. The
-supported expression operands are themselves integer literals; calls, casts,
-template-parameter references inside expressions, and other expression
-productions remain unsupported. Vendor-qualified types
+ABI conversion expressions `cv <type> <expression>` render as
+`static_cast<type>(expression)` and reuse the bounded type and expression
+parsers. This is a presentation of the encoded conversion; the demangler does
+not evaluate it or infer the resulting template value. Other expression
+operands are integer literals; calls, template-parameter references inside
+expressions, and other expression productions remain unsupported. Vendor-qualified types
 using `U <source-name> <type>` are presented as a GNU-style
 `__attribute__((name))` suffix. Vendor qualifiers may also carry the bounded
 template argument list `I...E`; these render with their arguments, for example
