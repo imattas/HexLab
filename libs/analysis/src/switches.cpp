@@ -2855,6 +2855,157 @@ std::optional<SwitchSite> riscv_indexed_absolute_switch(
         ? std::optional<SwitchSite>(std::move(site)) : std::nullopt;
 }
 
+std::optional<std::uint64_t> mips64_path_complete_constant(
+    const FunctionRecord &function, const FunctionSnapshot &snapshot, const SwitchGuardGraph &graph,
+    Address before, RegisterOperand wanted, const RelocationResolver *relocations,
+    bool control_flow_closed, std::stop_token stop) {
+    constexpr std::size_t path_max_blocks = 128;
+    constexpr std::size_t path_max_snapshot_blocks = 1024;
+    constexpr std::size_t path_max_nodes = 4096;
+    constexpr std::size_t path_max_edges = 8192;
+    constexpr std::size_t path_max_work = 32768;
+    if (!function.complete || !snapshot.complete || function.blocks.size() > path_max_blocks ||
+        snapshot.blocks.size() > path_max_snapshot_blocks || graph.nodes.size() > path_max_nodes ||
+        snapshot.candidates.size() > 8192 || wanted.bank != RegisterBank::mips_gpr ||
+        wanted.width != 64 || wanted.index == 0 || !control_flow_closed || stop.stop_requested())
+        return {};
+
+    const auto node = graph.addresses.find(guard_address(before));
+    if (node == graph.addresses.end() || !graph.nodes[node->second].fact ||
+        graph.nodes[node->second].fact->instruction.address != before)
+        return {};
+
+    using Key = std::tuple<std::size_t, std::uint16_t, bool>;
+    std::map<Key, std::optional<std::uint64_t>> memo;
+    std::set<Key> active;
+    std::size_t remaining_work = path_max_work;
+    std::function<std::optional<std::uint64_t>(std::size_t, std::uint16_t)> incoming;
+    std::function<std::optional<std::uint64_t>(std::size_t, std::uint16_t)> after;
+    const auto relocation_free = [&](const Instruction &instruction, std::uint32_t operand) {
+        if (!relocations) return true;
+        const auto resolution = relocations->operand(instruction, operand, stop);
+        return resolution && !resolution.value().relocated();
+    };
+    incoming = [&](std::size_t current, std::uint16_t reg) -> std::optional<std::uint64_t> {
+        if (reg == 0) return 0;
+        const Key key{current, reg, false};
+        if (const auto found = memo.find(key); found != memo.end()) return found->second;
+        if (stop.stop_requested() || remaining_work == 0 || !active.insert(key).second) return {};
+        --remaining_work;
+        const auto &node_value = graph.nodes[current];
+        if (!node_value.fact || node_value.alternate_entry || node_value.ambiguous ||
+            node_value.predecessors.empty()) {
+            active.erase(key);
+            memo.emplace(key, std::nullopt);
+            return {};
+        }
+        std::optional<std::uint64_t> unanimous;
+        std::size_t visited_edges = 0;
+        for (const auto predecessor : node_value.predecessors) {
+            if (stop.stop_requested() || remaining_work == 0 || ++visited_edges > path_max_edges) {
+                active.erase(key);
+                return {};
+            }
+            --remaining_work;
+            const auto value = after(predecessor, reg);
+            if (!value || (unanimous && *unanimous != *value)) {
+                active.erase(key);
+                memo.emplace(key, std::nullopt);
+                return {};
+            }
+            unanimous = value;
+        }
+        active.erase(key);
+        memo.emplace(key, unanimous);
+        return unanimous;
+    };
+    after = [&](std::size_t current, std::uint16_t reg) -> std::optional<std::uint64_t> {
+        if (reg == 0) return 0;
+        const Key key{current, reg, true};
+        if (const auto found = memo.find(key); found != memo.end()) return found->second;
+        if (stop.stop_requested() || remaining_work == 0 || !active.insert(key).second) return {};
+        --remaining_work;
+        const auto &node_value = graph.nodes[current];
+        if (!node_value.fact || node_value.ambiguous) {
+            active.erase(key);
+            memo.emplace(key, std::nullopt);
+            return {};
+        }
+        const auto &instruction = node_value.fact->instruction;
+        if (instruction.context.architecture != Architecture::mips64 ||
+            instruction.context.mode != ExecutionMode::mips64 || instruction.delay_slots ||
+            instruction.flow == FlowKind::call || instruction.flow == FlowKind::ret ||
+            instruction.flow == FlowKind::trap || instruction.flow == FlowKind::switch_dispatch ||
+            instruction.opcode == Opcode::opaque || instruction.opcode == Opcode::x86_opaque ||
+            (instruction.flow != FlowKind::fallthrough && instruction.flow != FlowKind::conditional_branch &&
+             instruction.flow != FlowKind::jump)) {
+            active.erase(key);
+            memo.emplace(key, std::nullopt);
+            return {};
+        }
+        if (!writes_register(instruction, RegisterOperand{RegisterBank::mips_gpr, reg, 64, false})) {
+            const auto value = incoming(current, reg);
+            active.erase(key);
+            memo.emplace(key, value);
+            return value;
+        }
+
+        const auto *destination = instruction.operands.empty() ? nullptr : register_operand(instruction, 0);
+        const auto *source = instruction.operands.size() > 1 ? register_operand(instruction, 1) : nullptr;
+        const auto immediate = [&](std::size_t index, bool signed_value, std::uint16_t effective_width)
+            -> std::optional<std::uint64_t> {
+            if (index >= instruction.operands.size() || !relocation_free(instruction,
+                    static_cast<std::uint32_t>(index))) return {};
+            const auto *value = std::get_if<ImmediateOperand>(&instruction.operands[index]);
+            if (!value || value->encoded_width != 16 || value->effective_width != effective_width ||
+                value->is_signed != signed_value || (!signed_value && value->value > 0xffff)) return {};
+            return value->value;
+        };
+        std::optional<std::uint64_t> result;
+        if (!destination || destination->bank != RegisterBank::mips_gpr || destination->width != 64 ||
+            destination->index != reg || destination->index == 0 || instruction.flow != FlowKind::fallthrough) {
+            result.reset();
+        } else if (instruction.opcode == Opcode::mips_lui && instruction.operands.size() == 2) {
+            if (const auto value = immediate(1, false, 16)) {
+                const auto word = static_cast<std::uint32_t>(*value << 16);
+                result = static_cast<std::uint64_t>(static_cast<std::int64_t>(std::bit_cast<std::int32_t>(word)));
+            }
+        } else if ((instruction.opcode == Opcode::mips_ori || instruction.opcode == Opcode::mips64_daddiu) &&
+                   instruction.operands.size() == 3 && source && source->bank == RegisterBank::mips_gpr &&
+                   source->width == 64) {
+            const auto literal = instruction.opcode == Opcode::mips_ori
+                ? immediate(2, false, 64) : immediate(2, true, 64);
+            const auto base = literal ? incoming(current, source->index) : std::nullopt;
+            if (base && literal) {
+                if (instruction.opcode == Opcode::mips_ori) result = *base | *literal;
+                else {
+                    const auto displacement = std::bit_cast<std::int64_t>(*literal);
+                    if (displacement < 0) {
+                        const auto magnitude = std::uint64_t{0} - *literal;
+                        if (*base >= magnitude) result = *base - magnitude;
+                    } else {
+                        const auto magnitude = static_cast<std::uint64_t>(displacement);
+                        if (*base <= UINT64_MAX - magnitude) result = *base + magnitude;
+                    }
+                }
+            }
+        } else if (instruction.opcode == Opcode::mips64_daddu && instruction.operands.size() == 3) {
+            const auto *left = register_operand(instruction, 1);
+            const auto *right = register_operand(instruction, 2);
+            if (left && right && left->bank == RegisterBank::mips_gpr && right->bank == RegisterBank::mips_gpr &&
+                left->width == 64 && right->width == 64) {
+                const auto lhs = incoming(current, left->index);
+                const auto rhs = incoming(current, right->index);
+                if (lhs && rhs && *lhs <= UINT64_MAX - *rhs) result = *lhs + *rhs;
+            }
+        }
+        active.erase(key);
+        memo.emplace(key, result);
+        return result;
+    };
+    return incoming(node->second, wanted.index);
+}
+
 std::optional<SwitchSite> mips64_register_absolute_switch(
     const Image &image, const FunctionRecord &function, const FunctionSnapshot &snapshot,
     const std::vector<std::shared_ptr<const InstructionFact>> &facts,
@@ -2931,6 +3082,75 @@ std::optional<SwitchSite> mips64_register_absolute_switch(
     };
     std::map<std::uint32_t, Value> registers;
     const auto remember = [&](std::uint32_t index, Value value) { registers[index] = std::move(value); };
+    // Carry only unanimously established 64-bit constants into this block.
+    // The dynamic selector and table facts remain local to the straight-line
+    // transfer below.
+    if (!facts.empty() && facts.front()) {
+        bool bounded_graph_candidate = function.complete && snapshot.complete &&
+            function.blocks.size() <= 128 && snapshot.blocks.size() <= 1024;
+        std::size_t function_instruction_count = 0;
+        if (bounded_graph_candidate) {
+            for (const auto id : function.blocks) {
+                const auto block = guards.blocks.find(id.value);
+                if (block == guards.blocks.end() || !block->second ||
+                    block->second->instructions.size() > 4096 - function_instruction_count) {
+                    bounded_graph_candidate = false;
+                    break;
+                }
+                function_instruction_count += block->second->instructions.size();
+            }
+        }
+        if (!guards.graph_attempted && bounded_graph_candidate) {
+            guards.graph_attempted = true;
+            guards.graph = switch_guard_graph(function, snapshot, guards, stop);
+        }
+        if (guards.graph) {
+            bool control_flow_closed = snapshot.complete && snapshot.blocks.size() <= 1024;
+            for (const auto &block : snapshot.blocks) {
+                if (!control_flow_closed) break;
+                if (stop.stop_requested() || !guards.scan(stop) || !block) {
+                    control_flow_closed = false;
+                    break;
+                }
+                for (const auto &fact : block->instructions) {
+                    if (stop.stop_requested() || !guards.scan(stop) || !fact) {
+                        control_flow_closed = false;
+                        break;
+                    }
+                    const auto &instruction = fact->instruction;
+                    if (instruction.address != dispatch.address &&
+                        (instruction.flow == FlowKind::switch_dispatch ||
+                         ((instruction.flow == FlowKind::jump || instruction.flow == FlowKind::call) &&
+                          !instruction.direct_target)))
+                        control_flow_closed = false;
+                }
+                if (!control_flow_closed) break;
+                for (const auto &edge : block->successors) {
+                    if (stop.stop_requested() || !guards.scan(stop)) {
+                        control_flow_closed = false;
+                        break;
+                    }
+                    if (edge.source != dispatch.address && !edge.target && edge.kind == BlockEdgeKind::unresolved)
+                        control_flow_closed = false;
+                }
+            }
+            std::set<std::uint16_t> entry_reads;
+            for (const auto &fact : facts) {
+                if (stop.stop_requested() || !fact) return {};
+                for (const auto &read : fact->instruction.register_reads)
+                    if (read.bank == RegisterBank::mips_gpr && read.width == 64 && read.index != 0)
+                        entry_reads.insert(read.index);
+            }
+            const auto block_entry = facts.front()->instruction.address;
+            for (const auto reg : entry_reads) {
+                if (stop.stop_requested()) return {};
+                const RegisterOperand operand{RegisterBank::mips_gpr, reg, 64, false};
+                if (const auto value = mips64_path_complete_constant(function, snapshot, *guards.graph,
+                        block_entry, operand, relocations, control_flow_closed, stop))
+                    remember(reg, Value{Address{dispatch.address.space, *value}});
+            }
+        }
+    }
     // The final DADDU in a relative table transforms the loaded offset into a
     // code address; keep it out of setup-value propagation so it cannot be
     // mistaken for a table-base adjustment.
