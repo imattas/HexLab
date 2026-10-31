@@ -3015,7 +3015,7 @@ std::optional<SwitchSite> mips64_register_absolute_switch(
     // straight-line block:
     //   LUI/ORI tableBase; DSLL index, selector, 3; DADDU address, tableBase, index;
     //   LD target, 0(address); JR target.
-    // Relative tables use LW for a sign-extended dword followed by
+    // Relative tables use sign-extending LW or LH followed by
     // DADDU target, codeBase, target; JR target.
     // The same register facts also accept DADDIU adjustments around the base.
     if (dispatch_index < 4 || dispatch_index >= facts.size() || stop.stop_requested() ||
@@ -3054,6 +3054,8 @@ std::optional<SwitchSite> mips64_register_absolute_switch(
     if (terminal_load_index >= facts.size() || !facts[terminal_load_index])
         return {};
     const auto &terminal_load = facts[terminal_load_index]->instruction;
+    const bool relative_halfword_table = relative_table && terminal_load.opcode == Opcode::mips_lh;
+    const std::size_t relative_entry_bytes = relative_halfword_table ? 2 : 4;
     const auto load_end = analysis_detail::continuation_address(terminal_load);
     const auto *loaded_register = terminal_load.operands.empty() ? nullptr : register_operand(terminal_load, 0);
     const auto expected_load_end = relative_table
@@ -3061,7 +3063,8 @@ std::optional<SwitchSite> mips64_register_absolute_switch(
         : std::optional<Address>{dispatch.address};
     if (!load_end || !expected_load_end || load_end.value() != expected_load_end.value() ||
         terminal_load.context != dispatch.context ||
-        terminal_load.opcode != (relative_table ? Opcode::mips_lw : Opcode::mips64_ld) ||
+        terminal_load.opcode != (relative_table
+            ? (relative_halfword_table ? Opcode::mips_lh : Opcode::mips_lw) : Opcode::mips64_ld) ||
         terminal_load.flow != FlowKind::fallthrough ||
         !loaded_register || !same_register(loaded_register, target_register))
         return {};
@@ -3291,11 +3294,13 @@ std::optional<SwitchSite> mips64_register_absolute_switch(
             continue;
         }
         if ((instruction.opcode == Opcode::mips64_ld ||
-             (relative_table && instruction.opcode == Opcode::mips_lw)) &&
+             (relative_table && (instruction.opcode == Opcode::mips_lw ||
+                                 instruction.opcode == Opcode::mips_lh))) &&
             instruction.operands.size() == 2 && destination) {
             const auto *memory = std::get_if<MemoryOperand>(&instruction.operands[1]);
             std::optional<Value> value;
-            const auto entry_width = instruction.opcode == Opcode::mips64_ld ? 64u : 32u;
+            const auto entry_width = instruction.opcode == Opcode::mips64_ld ? 64u
+                : instruction.opcode == Opcode::mips_lh ? 16u : 32u;
             if (destination->bank == RegisterBank::mips_gpr && destination->width == 64 && destination->index != 0 &&
                 memory && memory->data_width == entry_width && memory->address_width == 64 && memory->base &&
                 memory->base->bank == RegisterBank::mips_gpr && memory->base->width == 64 &&
@@ -3318,8 +3323,9 @@ std::optional<SwitchSite> mips64_register_absolute_switch(
 
     const auto found = registers.find(target_register->index);
     if (found == registers.end() || !found->second.table_base || !found->second.selector ||
-        found->second.scale != (relative_table ? 4u : 8u) || !found->second.has_scale_instruction ||
-        !file_backed_range(image, *found->second.table_base, relative_table ? 4u : 8u, false))
+        found->second.scale != (relative_table ? relative_entry_bytes : 8u) || !found->second.has_scale_instruction ||
+        !file_backed_range(image, *found->second.table_base,
+                           relative_table ? relative_entry_bytes : 8u, false))
         return {};
     std::optional<Address> relative_base;
     if (relative_table) {
@@ -3337,9 +3343,11 @@ std::optional<SwitchSite> mips64_register_absolute_switch(
     site.dispatch = dispatch.address;
     site.table = *found->second.table_base;
     site.selector = *found->second.selector;
-    site.scale = relative_table ? 4 : 8;
+    site.scale = static_cast<std::uint8_t>(relative_table ? relative_entry_bytes : 8);
     if (relative_table) {
-        site.entry_encoding = SwitchEntryEncoding::signed_offset_from_target_base;
+        site.entry_encoding = relative_halfword_table
+            ? SwitchEntryEncoding::signed_halfword_offset_from_target_base
+            : SwitchEntryEncoding::signed_offset_from_target_base;
         site.target_base = relative_base;
     }
     if (const auto bound = guarded_case_bound(image, function, snapshot, site.selector,
@@ -3353,15 +3361,16 @@ std::optional<SwitchSite> mips64_register_absolute_switch(
         if (stop.stop_requested()) return {};
         std::optional<TableTarget> target;
         if (relative_table) {
-            const auto slot = add_offset(site.table, static_cast<std::uint64_t>(index) * 4, image);
-            if (slot && file_backed_range(image, *slot, 4, false)) {
+            const auto slot = add_offset(site.table, static_cast<std::uint64_t>(index) * relative_entry_bytes, image);
+            if (slot && file_backed_range(image, *slot, relative_entry_bytes, false)) {
                 bool raw_slot = true;
                 if (relocations) {
-                    const auto evidence = relocations->data_at(image, *slot, 4, stop);
+                    const auto evidence = relocations->data_at(image, *slot,
+                        static_cast<std::uint8_t>(relative_entry_bytes), stop);
                     raw_slot = evidence && !evidence.value().relocated();
                 }
                 if (raw_slot)
-                    target = table_target(image, site.table, index, 4, true, nullptr, stop,
+                    target = table_target(image, site.table, index, relative_entry_bytes, true, nullptr, stop,
                                           relative_base, 64, false);
             }
         } else {
@@ -3370,7 +3379,9 @@ std::optional<SwitchSite> mips64_register_absolute_switch(
         if (!target || !decodes_at(image, dispatch.context, target->address, stop)) {
             site.complete = false;
             if (relative_table)
-                site.incomplete_reason = "MIPS64 signed-relative entry could not be resolved to executable code";
+                site.incomplete_reason = relative_halfword_table
+                    ? "MIPS64 signed halfword-relative entry could not be resolved to executable code"
+                    : "MIPS64 signed-relative entry could not be resolved to executable code";
             break;
         }
         site.cases.push_back({static_cast<std::uint32_t>(index), target->address, target->source,
