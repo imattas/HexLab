@@ -254,7 +254,7 @@ static DecodeResult decode_m6502_impl(std::span<const std::byte> bytes, Address 
             i.register_writes = {s};
             i.memory_write = true;
         } else {
-            i.register_reads = {s};
+            i.register_reads = {s, p};
             i.register_writes = {value, s, p};
             i.memory_read = true;
         }
