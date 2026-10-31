@@ -52,8 +52,9 @@ separate debugger daemon. The x86-64 host build continues to select
 - A continue-only thread schedule may pass an owned hardware execute breakpoint
   with selected peers: peers remain stopped while the event owner executes one
   instruction and its debug-register state is restored, then the selected peers
-  resume. The owner cannot request a user-visible step in that mixed schedule,
-  and its pending signal must be suppressed for the displaced instruction.
+  resume. The owner may instead request a user-visible step; selected peers stay
+  stopped through that returned step event. Non-owner steps remain unsupported,
+  and the owner's pending signal must be suppressed for the displaced instruction.
 - File-backed module inspection from `/proc/<pid>/maps`, grouped by exact path.
   Reported spans cover the min/max mapped range and can include gaps.
 
