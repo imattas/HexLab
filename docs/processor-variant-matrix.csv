@@ -12,6 +12,7 @@ processor.arm,ARM,profile,ARMv7E-M,"Cortex-M4 profile",not_assessed,,P01
 processor.arm,ARM,profile,ARMv7-R,"Cortex-R profile",not_assessed,,P01
 processor.arm,ARM,profile,ARMv7-A,"Cortex-A profile",not_assessed,,P01
 processor.arm,ARM,extension,DSP,"ARM DSP instructions",not_assessed,,P01
+processor.arm,ARM,extension,VFP register views,"S0-S63 and D0-D31 names with overlapping 32-bit lane identity; fallback operand/effect preservation only",partial,"docs/arm32-vfp-register-aliasing.md",P01
 processor.arm,ARM,extension,NEON Advanced SIMD,"ARM 32-bit SIMD",not_assessed,,P01
 processor.aarch64,AArch64,profile,ARMv8-A,"Cortex-A50 family examples",not_assessed,,P01
 processor.aarch64,AArch64,profile,ARMv8 custom,"Apple A7/A8 examples",not_assessed,,P01
