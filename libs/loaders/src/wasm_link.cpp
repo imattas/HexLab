@@ -28,9 +28,13 @@ std::vector<WasmLinkResolution> link_wasm_inventory(std::span<const WasmLinkModu
             else import_count += m.metadata->imports.size();
         }
     }
-    for (std::size_t i = 0; i < modules.size(); ++i)
-        for (std::size_t j = i + 1; j < modules.size(); ++j)
+    for (std::size_t i = 0; i < modules.size(); ++i) {
+        if (stop.stop_requested()) return out;
+        for (std::size_t j = i + 1; j < modules.size(); ++j) {
+            if (stop.stop_requested()) return out;
             if (modules[i].identity == modules[j].identity) inventory_ok = false;
+        }
+    }
     if (!inventory_ok) {
         out.push_back({{}, {}, {}, WasmExternalKind::function, WasmLinkStatus::invalid_inventory, {}, {},
                        "module inventory is null, unnamed, duplicated, or exceeds configured bounds"});
@@ -50,6 +54,7 @@ std::vector<WasmLinkResolution> link_wasm_inventory(std::span<const WasmLinkModu
             for (std::size_t pi = 0; pi < modules.size(); ++pi) {
                 if (pi == mi || modules[pi].identity == consumer.identity) continue;
                 for (const auto &candidate : modules[pi].metadata->exports) {
+                    if (stop.stop_requested()) return out;
                     if (++comparisons > options.maximum_export_comparisons) { budget_exhausted = true; break; }
                     if (candidate.name == imp.name && candidate.kind == imp.kind && modules[pi].identity == imp.module) {
                         ++hits; provider = &modules[pi]; exp = &candidate;
