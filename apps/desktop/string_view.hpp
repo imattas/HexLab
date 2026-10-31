@@ -4,6 +4,7 @@
 #include "hexlab/analysis/references.hpp"
 #include "hexlab/workspace/document_manager.hpp"
 #include <map>
+#include <cstdint>
 #include <wx/config.h>
 #include <wx/button.h>
 #include <wx/choice.h>
@@ -54,6 +55,7 @@ class StringBrowserView final : public wxPanel {
     wxButton *export_all_ = nullptr;
     wxButton *copy_ = nullptr;
     wxButton *comment_ = nullptr;
+    wxButton *classify_ = nullptr;
     wxButton *export_notes_ = nullptr;
     wxButton *import_notes_ = nullptr;
     wxStaticText *action_status_ = nullptr;
@@ -79,6 +81,7 @@ class StringBrowserView final : public wxPanel {
         std::optional<Location> context;
         bool context_known = false;
         std::map<std::string, wxString> standalone_comments;
+        std::map<std::string, std::uint8_t> standalone_dispositions;
     };
     std::map<std::uint64_t, Preferences> preferences_;
     std::string pending_selection_;
@@ -91,6 +94,8 @@ class StringBrowserView final : public wxPanel {
     bool persist_standalone_annotations(const Preferences &) const;
     void restore_selected_string();
     wxString comment_for_record(const DocumentSnapshot &, std::size_t) const;
+    wxString disposition_for_record(const DocumentSnapshot &, std::size_t) const;
+    bool set_standalone_disposition(Location, std::uint8_t);
 
     void refresh_strings();
     void refresh_cursor_context();

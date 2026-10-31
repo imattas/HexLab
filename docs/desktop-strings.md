@@ -55,8 +55,13 @@ selected visible interpretation, then prefers another visible candidate;
 it only clears filters when every containing string is hidden. View controls
 are retained per document and do not edit project data. Standalone documents
 can keep bounded local string comments in desktop session preferences; these
-remain separate from project annotations. String rewriting/reclassification
-remains outside this browser.
+remain separate from project annotations. Standalone strings also have a local
+review disposition: **Unclassified**, **Confirmed string**, **Not a string**, or
+**Review**. Use **Classify selected...** to set or clear it. The disposition is
+shown in the table, participates in text filtering, and is retained with the
+comment store under the same bounded per-input and per-string fingerprints. It
+records analyst intent only; it does not alter scanner results, create project
+annotations, or modify source bytes.
 
 Incoming references use the current project `ReferenceIndex`. Mapped strings query the file range together with virtual aliases; strings without a mapped address query the file range directly. Results are paged in groups of 128. **Copy page as TSV** copies the current bounded page with a header and one row per reference, including the destination string address and preview, source, kind, and operand. Use the paging buttons to copy another page; **Export filtered CSV...** and **Export all CSV...** remain available for complete file exports. Stale and pending analysis does not show old reference rows, and incomplete analysis is labeled. Standalone documents without a project reference index still support string filtering and navigation, but cannot browse references.
 
@@ -121,8 +126,10 @@ the workspace cursor. Interim loading cursors and unchanged context refreshes do
 not clear saved filters; subsequent navigation to a different location retains
 the existing reveal-hidden-string behavior.
 
-This remains a partial browser. String rewriting/reclassification and broader string
-editing remain unsupported. Crash recovery
+This remains a partial browser. Source-byte rewriting and analysis-level string
+reclassification (changing detected encoding/range or rescanning around a string)
+and broader string editing remain unsupported. Local review dispositions only
+record analyst intent; they do not change the discovered-string set. Crash recovery
 of unsaved UI changes and persistence for non-reopenable plugin or archive-member
 sessions are outside this slice.
 
