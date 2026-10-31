@@ -429,6 +429,7 @@ bool vex_simd(State &state, std::uint8_t opcode, unsigned map, unsigned pp, unsi
             : (width == 8 ? Opcode::kortestb : width == 16 ? Opcode::kortestw : width == 32 ? Opcode::kortestd : Opcode::kortestq);
         state.operand(destination, OperandAccess::read);
         state.operand(source, OperandAccess::read);
+        state.flags_read = true;
         state.flags_write = true;
         return true;
     }

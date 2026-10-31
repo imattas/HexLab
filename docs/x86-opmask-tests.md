@@ -4,6 +4,6 @@ The VEX.128.0F.W0 KTEST/KORTEST forms accept K-register operands and derive B/W/
 
 The first ModRM operand is DEST and the second is SRC. KTEST sets ZF when DEST AND SRC is zero and CF when DEST AND NOT SRC is zero. KORTEST sets ZF when DEST OR SRC is zero and CF when DEST OR SRC is all ones. Both clear OF, SF, AF, and PF. The evaluator returns a RFLAGS bit-vector and a written-bit mask so callers can preserve bits outside the architectural write set.
 
-No dedicated decompiler expression is emitted; generic flag-register access facts are available, and condition consumers remain supported through existing FLAGS analysis. The evaluator describes arithmetic flag bits only; reserved and system RFLAGS bits are preserved by the caller.
+The decompiler emits a typed `x86_ktest{8,16,32,64}` or `x86_kortest{8,16,32,64}` intrinsic and an explicit whole-RFLAGS bit-vector result. It retains the input flags with CF, PF, AF, ZF, SF, and OF masked out, then inserts only the defined CF and ZF results, so untouched RFLAGS bits are preserved and cleared flags remain zero. The evaluator similarly returns the written-bit mask for callers that need to compose the update.
 
 Reference: Intel 64 and IA-32 Architectures SDM, Volume 2A, KTEST/KORTEST entries, https://cdrdv2-public.intel.com/812383/253666-sdm-vol-2a.pdf
