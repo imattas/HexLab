@@ -220,7 +220,14 @@ Signals belonging to stop actions remain queued for that thread until a later
 resume or detach. When a signal is injected during a pending execute-breakpoint
 stop, the displaced-instruction helper is deferred so the original breakpoint
 remains installed and can be observed after the signal handler returns. Failed
-ptrace resumes retain queued signal state for retry. These rules use the
+ptrace resumes retain queued signal state for retry. If preparing a software
+breakpoint step fails after changing the stopped owner's PC or temporarily
+restoring the original instruction bytes, the backend restores the saved
+register image and trap before returning the failure. If either restoration
+fails, it blocks further resume and retries that exact rollback before accepting
+another schedule or permitting stopped-state memory access. Retrying a resume or
+detach completes rollback first. The owned stop event and peer stop states
+remain available through that recovery. These rules use the
 documented ptrace restart signal argument ([ptrace(2)](https://man7.org/linux/man-pages/man2/ptrace.2.html)).
 The RSP server advertises `C`/`S` only when its selected backend supports
 scheduled signal disposition; it preserves or suppresses the pending event
