@@ -676,6 +676,8 @@ enum class Opcode {
     kxnorb, kxnorw, kxnord, kxnorq, knotb, knotw, knotd, knotq,
     // AVX-512 opmask transfers; append to preserve persisted opcode IDs.
     kmovb, kmovw, kmovd, kmovq,
+    // VEX opmask flag tests; appended to preserve serialized opcode IDs.
+    ktestb, ktestw, ktestd, ktestq, kortestb, kortestw, kortestd, kortestq,
     // AArch64 inverted shifted-register logical forms; preserve old IDs.
     a64_bic, a64_orn, a64_eon, a64_bics,
     // MIPS32 REGIMM conditional link branches; append to preserve opcode IDs.

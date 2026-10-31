@@ -410,6 +410,28 @@ bool simd_0f3a(State &state, std::uint8_t opcode) {
 }
 
 bool vex_simd(State &state, std::uint8_t opcode, unsigned map, unsigned pp, unsigned vvvv, bool l, bool w) {
+    if (map == 1 && (opcode == 0x98 || opcode == 0x99)) {
+        if (l || vvvv != 0)
+            invalid("KTEST/KORTEST require VEX.L=0 and reserved VEX.vvvv");
+        if (pp > 1)
+            invalid("KTEST/KORTEST support only pp=none or 66");
+        const std::uint16_t width = pp ? (w ? 32 : 8) : (w ? 64 : 16);
+        auto decoded = modrm(state, 64, 64);
+        if (decoded.mod != 3 || decoded.reg.index > 7 ||
+            std::get<RegisterOperand>(decoded.rm).index > 7 || (state.rex & 7))
+            invalid("KTEST/KORTEST require direct K0-K7 operands");
+        auto destination = decoded.reg;
+        destination.bank = RegisterBank::opmask; destination.width = 64; destination.high_byte = false;
+        auto source = std::get<RegisterOperand>(decoded.rm);
+        source.bank = RegisterBank::opmask; source.width = 64; source.high_byte = false;
+        state.i.opcode = opcode == 0x99
+            ? (width == 8 ? Opcode::ktestb : width == 16 ? Opcode::ktestw : width == 32 ? Opcode::ktestd : Opcode::ktestq)
+            : (width == 8 ? Opcode::kortestb : width == 16 ? Opcode::kortestw : width == 32 ? Opcode::kortestd : Opcode::kortestq);
+        state.operand(destination, OperandAccess::read);
+        state.operand(source, OperandAccess::read);
+        state.flags_write = true;
+        return true;
+    }
     if (map == 3 && opcode == 0x02) {
         if (pp != 1)
             invalid("VPBLENDD requires VEX.pp=66");
