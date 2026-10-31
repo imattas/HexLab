@@ -211,15 +211,22 @@ struct Mips32WordConversionResult {
     bool operator==(const Mips32WordConversionResult &) const = default;
 };
 
-// Evaluate ROUND.W/TRUNC.W/CEIL.W/FLOOR.W for an IEEE binary32 or binary64
-// source bit pattern. These operations select their named rounding mode
-// independently of FCSR.RM. Infinity, NaNs, and rounded results outside the
-// signed-word range produce the architectural default INT32_MAX and Invalid.
+// Evaluate CVT.W.S/D using FCSR.RM and ROUND.W/TRUNC.W/CEIL.W/FLOOR.W using
+// their opcode-selected rounding mode. Infinity, NaNs, and rounded results
+// outside signed-word range produce the MIPS32 default result (0x7fffffff)
+// and Invalid when Invalid is not enabled.
 // With FCSR.FS set, a subnormal source is replaced by signed zero and raises
 // Inexact (Release 5+ behavior).
 HEXLAB_PROCESSORS_EXPORT std::optional<Mips32WordConversionResult>
 evaluate_mips32_word_conversion(bool double_precision, Mips32WordRounding,
                                 std::uint64_t source_bits, std::uint32_t fcsr) noexcept;
+
+// Instruction adapter for CVT.W.S/D and ROUND.W/TRUNC.W/CEIL.W/FLOOR.W.S/D.
+// Rejects malformed decoded operand/effect facts before evaluating.
+HEXLAB_PROCESSORS_EXPORT std::optional<Mips32WordConversionResult>
+evaluate_mips32_word_conversion_instruction(const Instruction &instruction,
+                                            std::uint64_t source_bits,
+                                            std::uint32_t fcsr) noexcept;
 
 enum class Mips32FpSignOperation { abs, mov, neg };
 

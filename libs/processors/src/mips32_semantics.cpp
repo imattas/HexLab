@@ -1032,15 +1032,14 @@ std::optional<Mips32WordConversionResult> evaluate_mips32_word_conversion(
         result.exception_taken = (result.exception_bits & enabled) != 0;
         result.writes_destination = !result.exception_taken;
         result.fcsr_after = (fcsr & ~cause_mask) |
-            (static_cast<std::uint32_t>(result.exception_bits) << 12);
-        if (!result.exception_taken)
-            result.fcsr_after = (result.fcsr_after & ~flag_mask) |
-                ((fcsr & flag_mask) | (static_cast<std::uint32_t>(result.exception_bits) << 2));
+            (static_cast<std::uint32_t>(result.exception_bits) << 12) |
+            (fcsr & flag_mask) |
+            (static_cast<std::uint32_t>(result.exception_bits) << 2);
     };
 
     if (exponent == exponent_mask) {
-        // MIPS specifies the default positive maximum word for every
-        // unrepresentable conversion, including infinities and NaNs.
+        // MIPS32 specifies +2^31-1 as the default result for an invalid
+        // floating-to-word conversion when Invalid is not enabled.
         result.value_bits = UINT32_C(0x7fffffff);
         result.exception_bits |= invalid;
         finish();
@@ -1101,6 +1100,46 @@ std::optional<Mips32WordConversionResult> evaluate_mips32_word_conversion(
     }
     finish();
     return result;
+}
+
+std::optional<Mips32WordConversionResult> evaluate_mips32_word_conversion_instruction(
+    const Instruction &instruction, std::uint64_t source_bits, std::uint32_t fcsr) noexcept {
+    if (instruction.context.architecture != Architecture::mips32 ||
+        instruction.context.mode != ExecutionMode::mips32 ||
+        instruction.flow != FlowKind::fallthrough || instruction.delay_slots != 0 ||
+        instruction.memory_read || instruction.memory_write || instruction.operands.size() != 2 ||
+        instruction.access != std::vector<OperandAccess>{OperandAccess::write, OperandAccess::read})
+        return {};
+
+    const auto op = instruction.opcode;
+    bool double_precision = false;
+    Mips32WordRounding rounding{};
+    switch (op) {
+    case Opcode::mips_cvt_w_s: rounding = static_cast<Mips32WordRounding>(fcsr & 3u); break;
+    case Opcode::mips_cvt_w_d: double_precision = true; rounding = static_cast<Mips32WordRounding>(fcsr & 3u); break;
+    case Opcode::mips_round_w_s: rounding = Mips32WordRounding::nearest_even; break;
+    case Opcode::mips_trunc_w_s: rounding = Mips32WordRounding::toward_zero; break;
+    case Opcode::mips_ceil_w_s: rounding = Mips32WordRounding::toward_positive; break;
+    case Opcode::mips_floor_w_s: rounding = Mips32WordRounding::toward_negative; break;
+    case Opcode::mips_round_w_d: double_precision = true; rounding = Mips32WordRounding::nearest_even; break;
+    case Opcode::mips_trunc_w_d: double_precision = true; rounding = Mips32WordRounding::toward_zero; break;
+    case Opcode::mips_ceil_w_d: double_precision = true; rounding = Mips32WordRounding::toward_positive; break;
+    case Opcode::mips_floor_w_d: double_precision = true; rounding = Mips32WordRounding::toward_negative; break;
+    default: return {};
+    }
+    const auto *destination = std::get_if<RegisterOperand>(&instruction.operands[0]);
+    const auto *source = std::get_if<RegisterOperand>(&instruction.operands[1]);
+    const auto expected_width = static_cast<std::uint16_t>(double_precision ? 64 : 32);
+    if (!destination || destination->bank != RegisterBank::mips_fpr || destination->index >= 32 ||
+        destination->width != 32 || destination->high_byte || !source ||
+        source->bank != RegisterBank::mips_fpr || source->index >= 32 ||
+        source->width != expected_width || source->high_byte)
+        return {};
+    const RegisterOperand fcsr_reg{RegisterBank::mips_fcsr, 0, 32, false};
+    if (instruction.register_reads != std::vector<RegisterOperand>{*source, fcsr_reg} ||
+        instruction.register_writes != std::vector<RegisterOperand>{*destination, fcsr_reg})
+        return {};
+    return evaluate_mips32_word_conversion(double_precision, rounding, source_bits, fcsr);
 }
 
 std::uint64_t evaluate_mips32_fp_sign_operation(Mips32FpSignOperation operation, bool double_precision,
