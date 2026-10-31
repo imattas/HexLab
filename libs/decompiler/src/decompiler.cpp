@@ -12041,6 +12041,138 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                 if (auto structured = try_three_latch_tree(true)) return *structured;
                 if (auto structured = try_three_latch_tree(false)) return *structured;
             }
+
+            // Generalize the post-tested dispatch tree to four or more latch
+            // leaves. Every edge is traced from its exact predecessor, each
+            // leaf must branch only to this loop header and one shared return
+            // block, and the proven tree must own every function block.
+            if (true_arm && false_arm && !true_arm->empty() && !false_arm->empty()) {
+                struct LatchTreeNode {
+                    std::vector<const LiftedBlock *> path;
+                    const Branch *condition = nullptr;
+                    bool latch = false;
+                    bool repeat_on_true = false;
+                    Address exit;
+                    std::size_t true_child = 0;
+                    std::size_t false_child = 0;
+                };
+                std::vector<LatchTreeNode> tree;
+                std::vector<std::size_t> leaves;
+                std::function<std::optional<std::size_t>(Address, std::uint64_t, unsigned)> trace_tree;
+                trace_tree = [&](Address start, std::uint64_t initial_predecessor,
+                                 unsigned depth) -> std::optional<std::size_t> {
+                    if (depth >= 64 || tree.size() >= 127) return {};
+                    LatchTreeNode node;
+                    std::set<std::uint64_t> seen;
+                    auto *cursor = find_block(start);
+                    auto predecessor = initial_predecessor;
+                    while (cursor && cursor != entry && node.path.size() < 64 &&
+                           seen.insert(cursor->id.value).second &&
+                           predecessors[cursor->id.value] == std::set<std::uint64_t>{predecessor} &&
+                           cursor->phis.empty() && !cursor->memory_phi &&
+                           cursor->memory_partition_phis.empty() && !cursor->switch_dispatch &&
+                           !contains_return(*cursor) && has_only_simple_statements(*cursor)) {
+                        node.path.push_back(cursor);
+                        const auto *condition = terminal_conditional(*cursor);
+                        if (condition) {
+                            if (!condition->true_target || !condition->false_target ||
+                                *condition->true_target == *condition->false_target ||
+                                !conditional_edges_match_targets(*cursor, *condition) ||
+                                cursor->successors.size() != 2)
+                                return {};
+                            node.condition = condition;
+                            const bool repeats_true = *condition->true_target == entry->begin;
+                            const bool repeats_false = *condition->false_target == entry->begin;
+                            if (repeats_true != repeats_false) {
+                                node.latch = true;
+                                node.repeat_on_true = repeats_true;
+                                node.exit = repeats_true ? *condition->false_target : *condition->true_target;
+                                break;
+                            }
+                            const auto index = tree.size();
+                            tree.push_back(std::move(node));
+                            const auto *branch = tree[index].condition;
+                            const auto true_child = trace_tree(*branch->true_target,
+                                tree[index].path.back()->id.value, depth + 1);
+                            if (!true_child) return {};
+                            const auto false_child = trace_tree(*branch->false_target,
+                                tree[index].path.back()->id.value, depth + 1);
+                            if (!false_child) return {};
+                            tree[index].true_child = *true_child;
+                            tree[index].false_child = *false_child;
+                            return index;
+                        }
+                        if (cursor->successors.size() != 1 || !cursor->successors.front().target ||
+                            (cursor->successors.front().kind != BlockEdgeKind::jump &&
+                             cursor->successors.front().kind != BlockEdgeKind::fallthrough) ||
+                            !has_unconditional_edge(*cursor, *cursor->successors.front().target))
+                            return {};
+                        predecessor = cursor->id.value;
+                        cursor = find_block(*cursor->successors.front().target);
+                    }
+                    if (node.path.empty() || !node.latch) return {};
+                    const auto index = tree.size();
+                    tree.push_back(std::move(node));
+                    leaves.push_back(index);
+                    return index;
+                };
+                const auto true_root = trace_tree(*dispatch_condition->true_target,
+                    entry->id.value, 0);
+                const auto false_root = true_root
+                    ? trace_tree(*dispatch_condition->false_target, entry->id.value, 0)
+                    : std::optional<std::size_t>{};
+                if (true_root && false_root && leaves.size() >= 4 && leaves.size() <= 64) {
+                    const auto exit_address = tree[leaves.front()].exit;
+                    std::set<std::uint64_t> covered{entry->id.value}, latch_ids;
+                    bool valid_tree = true;
+                    for (const auto index : leaves) {
+                        const auto &leaf = tree[index];
+                        valid_tree = valid_tree && leaf.latch && leaf.exit == exit_address &&
+                            latch_ids.insert(leaf.path.back()->id.value).second;
+                    }
+                    for (const auto &node : tree)
+                        for (const auto *block : node.path)
+                            if (!covered.insert(block->id.value).second) valid_tree = false;
+                    const auto *exit = find_block(exit_address);
+                    valid_tree = valid_tree && exit && has_only_terminal_return(*exit) &&
+                        exit->phis.empty() && !exit->memory_phi && exit->memory_partition_phis.empty() &&
+                        predecessors[entry->id.value] == latch_ids && predecessors[exit->id.value] == latch_ids &&
+                        covered.insert(exit->id.value).second && covered.size() == function.blocks.size() &&
+                        std::all_of(function.blocks.begin(), function.blocks.end(), [&](const auto &block) {
+                            return covered.contains(block.id.value);
+                        });
+                    if (valid_tree) {
+                        std::function<void(std::size_t, unsigned)> emit_tree;
+                        emit_tree = [&](std::size_t index, unsigned indent) {
+                            const auto &node = tree[index];
+                            for (const auto *block : node.path) emit_block(*block, indent, true);
+                            const std::string pad(indent, ' ');
+                            if (node.latch) {
+                                const auto condition = branch_condition_text(*node.condition);
+                                out << pad << "if (" << (node.repeat_on_true ? condition : "!(" + condition + ")") << ") {\n"
+                                    << pad << "    continue;\n" << pad << "} else {\n"
+                                    << pad << "    break;\n" << pad << "}\n";
+                                return;
+                            }
+                            out << pad << "if (" << branch_condition_text(*node.condition) << ") {\n";
+                            emit_tree(node.true_child, indent + 4);
+                            out << pad << "} else {\n";
+                            emit_tree(node.false_child, indent + 4);
+                            out << pad << "}\n";
+                        };
+                        out << "function " << address_label(function.entry) << "() {\n    do {\n";
+                        emit_block(*entry, 8, true);
+                        out << "        if (" << branch_condition_text(*dispatch_condition) << ") {\n";
+                        emit_tree(*true_root, 12);
+                        out << "        } else {\n";
+                        emit_tree(*false_root, 12);
+                        out << "        }\n    } while (true);\n";
+                        emit_block(*exit, 4);
+                        out << "}\n";
+                        return {out.str(), false, {}};
+                    }
+                }
+            }
         }
         const auto trace_linear = [&](Address start)
             -> std::optional<std::vector<const LiftedBlock *>> {
