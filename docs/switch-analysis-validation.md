@@ -437,6 +437,21 @@ also rejected as unresolved inputs to this raw-byte pattern. CLI JSON reports
 `signed_byte_offset_from_target_base`. PIC/GOT bases, cross-block dynamic
 values, and other load/sign-extension sequences remain unsupported.
 
+For all these N64 table forms, proven table/code-base constants may include
+fixed `DSLL` and `DSLL32` shifts between the immediate construction steps.
+This supports full 64-bit multiword bases such as `LUI; ORI; DSLL 16; ORI;
+DSLL 16; ORI`, including in-place shifts and constants proved on every bounded
+predecessor path. Shift results truncate to 64 bits; `DSLL32` consumes the
+already adjusted 32..63 count provided by the decoder. Exact unsigned
+six-bit/effective-64 operands and opcode-appropriate counts are required.
+Relocation-covered shifts cannot supply raw constant bits. Dynamic selector
+scaling remains separate and must equal the entry width; shifted symbolic
+table addresses do not establish a base. The existing 4096-entry bound,
+file-backed reads, relocation-aware absolute slots, raw relative slots, and
+executable target decoding still apply. Variable shifts and PIC/GOT/runtime
+base reconstruction remain unsupported. This slice was built without adding
+or running tests; runtime recognition remains unverified.
+
 MIPS32 O32 also recognizes a bounded signed-relative form:
 `LW target, tableBase, scaledIndex; ADDU target, codeBase, target; JR target`
 (the ADDU sources may be reversed). The scale is four, and the code base must

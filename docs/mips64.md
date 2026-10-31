@@ -74,13 +74,33 @@ in executable segments.
 
 MIPS64 signed-relative switch dispatch can also use a code base established
 before the dispatch block when every bounded predecessor path agrees. The
-proof tracks only exact `LUI`, `ORI`, `DADDIU`, and `DADDU` constants, rejects
-relocation-covered immediates, ambiguous or alternate entries, unresolved CFG
+proof tracks only exact `LUI`, `ORI`, `DADDIU`, `DADDU`, `DSLL`, and `DSLL32`
+constants, rejects relocation-covered immediates, ambiguous or alternate entries, unresolved CFG
 paths and cycles, and is capped at 128 function blocks, 1,024 snapshot blocks,
 4,096 graph nodes, 8,192 edges, and 32,768 proof steps. Instructions with
 classic delay slots are not traversed as ordinary constant-transfer nodes, so
 such paths retain the existing conservative fallback. Same-block switch
-recognition and signed `LW` entry interpretation remain unchanged.
+recognition and signed `LW` entry interpretation use the existing bounds.
+
+Switch table and code bases can be assembled from full-width constants, for
+example `LUI base,0x1234; ORI base,base,0x5678; DSLL base,base,16;
+ORI base,base,0x9abc; DSLL base,base,16; ORI base,base,0xdef0`, yielding
+`0x123456789abcdef0`. Proven constants are shifted as unsigned 64-bit values,
+discarding high bits just as the instruction does. `DSLL32` uses the decoder's
+effective shift count of 32 through 63; its implicit 32 is not added twice.
+Both same-block propagation and the bounded predecessor proof use this rule.
+Unknown values remain selector candidates only in the local scale path;
+shifting an existing symbolic table-address fact does not establish a new
+table base. A constant shift does not establish a dynamic selector. Malformed
+shift operands, signed counts, opcode/count mismatches, and relocation-covered
+shift instructions fail closed. Variable shifts and runtime/PIC/GOT bases
+remain unsupported. Final tables still require readable file-backed bytes,
+at most 4096 entries, and executable decoded targets; absolute slots retain
+their existing relocation provenance and relative slots remain relocation-free.
+Switch-derived targets also feed persisted function CFG edges. The
+`mips64-full-width-switch-bases-v1` function-engine fingerprint marker prevents
+reuse of snapshots produced before this extension; the cache payload format
+is unchanged.
 
 MIPS HI16/LO16 and any other unsupported, incomplete, or ambiguous instruction
 relocations remain opaque. A relocation-covered instruction is never used as

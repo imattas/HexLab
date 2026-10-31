@@ -2855,8 +2855,30 @@ std::optional<SwitchSite> riscv_indexed_absolute_switch(
         ? std::optional<SwitchSite>(std::move(site)) : std::nullopt;
 }
 
+std::optional<unsigned> mips64_fixed_left_shift_amount(const Image &image, const Instruction &instruction,
+                                                     const RelocationResolver *relocations,
+                                                     std::stop_token stop) {
+    if ((instruction.opcode != Opcode::mips64_dsll && instruction.opcode != Opcode::mips64_dsll32) ||
+        instruction.operands.size() != 3 || instruction.length != 4 || stop.stop_requested())
+        return {};
+    const auto *amount = std::get_if<ImmediateOperand>(&instruction.operands[2]);
+    // The decoder includes DSLL32's implicit 32 in its effective count.
+    if (!amount || amount->encoded_width != 6 || amount->effective_width != 64 || amount->is_signed ||
+        (instruction.opcode == Opcode::mips64_dsll ? amount->value >= 32
+                                                  : amount->value < 32 || amount->value >= 64))
+        return {};
+    if (relocations) {
+        // Packed MIPS fields can share a relocation-owned instruction word.
+        // Check the complete word, including when field coordinates are absent.
+        const auto resolution = relocations->data_at(image, instruction.address, 4, stop);
+        if (!resolution || resolution.value().relocated())
+            return {};
+    }
+    return static_cast<unsigned>(amount->value);
+}
+
 std::optional<std::uint64_t> mips64_path_complete_constant(
-    const FunctionRecord &function, const FunctionSnapshot &snapshot, const SwitchGuardGraph &graph,
+    const Image &image, const FunctionRecord &function, const FunctionSnapshot &snapshot, const SwitchGuardGraph &graph,
     Address before, RegisterOperand wanted, const RelocationResolver *relocations,
     bool control_flow_closed, std::stop_token stop) {
     constexpr std::size_t path_max_blocks = 128;
@@ -2989,6 +3011,14 @@ std::optional<std::uint64_t> mips64_path_complete_constant(
                     }
                 }
             }
+        } else if ((instruction.opcode == Opcode::mips64_dsll || instruction.opcode == Opcode::mips64_dsll32) &&
+                   instruction.operands.size() == 3 && source && source->bank == RegisterBank::mips_gpr &&
+                   source->width == 64) {
+            const auto amount = mips64_fixed_left_shift_amount(image, instruction, relocations, stop);
+            const auto base = amount ? incoming(current, source->index) : std::nullopt;
+            // Unsigned shifts keep precisely the low 64 bits, including when
+            // discarding LUI's sign-extension while building a multiword base.
+            if (base && amount) result = *base << *amount;
         } else if (instruction.opcode == Opcode::mips64_daddu && instruction.operands.size() == 3) {
             const auto *left = register_operand(instruction, 1);
             const auto *right = register_operand(instruction, 2);
@@ -3017,7 +3047,8 @@ std::optional<SwitchSite> mips64_register_absolute_switch(
     //   LD target, 0(address); JR target.
     // Relative tables use sign-extending LW, LH, or LB followed by
     // DADDU target, codeBase, target; JR target.
-    // The same register facts also accept DADDIU adjustments around the base.
+    // The same register facts also accept DADDIU adjustments and constant
+    // DSLL/DSLL32 shifts while constructing a full-width table or code base.
     if (dispatch_index < 4 || dispatch_index >= facts.size() || stop.stop_requested() ||
         !facts[dispatch_index])
         return {};
@@ -3150,7 +3181,7 @@ std::optional<SwitchSite> mips64_register_absolute_switch(
             for (const auto reg : entry_reads) {
                 if (stop.stop_requested()) return {};
                 const RegisterOperand operand{RegisterBank::mips_gpr, reg, 64, false};
-                if (const auto value = mips64_path_complete_constant(function, snapshot, *guards.graph,
+                if (const auto value = mips64_path_complete_constant(image, function, snapshot, *guards.graph,
                         block_entry, operand, relocations, control_flow_closed, stop))
                     remember(reg, Value{Address{dispatch.address.space, *value}});
             }
@@ -3242,15 +3273,23 @@ std::optional<SwitchSite> mips64_register_absolute_switch(
             if (value) remember(destination->index, std::move(*value));
             continue;
         }
-        if (instruction.opcode == Opcode::mips64_dsll && instruction.operands.size() == 3 && destination) {
+        if ((instruction.opcode == Opcode::mips64_dsll || instruction.opcode == Opcode::mips64_dsll32) &&
+            instruction.operands.size() == 3 && destination) {
             const auto *source = register_operand(instruction, 1);
-            const auto *amount = std::get_if<ImmediateOperand>(&instruction.operands[2]);
+            const auto amount = mips64_fixed_left_shift_amount(image, instruction, relocations, stop);
             std::optional<Value> value;
             if (destination->bank == RegisterBank::mips_gpr && destination->width == 64 && destination->index != 0 &&
-                source && source->bank == RegisterBank::mips_gpr && source->width == 64 && source->index != 0 &&
-                amount && amount->effective_width == 64 && amount->value < 64) {
-                const auto factor = UINT64_C(1) << amount->value;
-                value = Value{{}, {}, *source, factor, instruction.address, true};
+                source && source->bank == RegisterBank::mips_gpr && source->width == 64 && amount) {
+                std::optional<Value> base;
+                if (source->index == 0) base = Value{Address{dispatch.address.space, 0}};
+                else if (const auto found = registers.find(source->index); found != registers.end())
+                    base = found->second;
+                if (base && base->constant && base->constant->space == dispatch.address.space) {
+                    value = Value{Address{dispatch.address.space, base->constant->offset << *amount}};
+                } else if (!base && source->index != 0) {
+                    const auto factor = UINT64_C(1) << *amount;
+                    value = Value{{}, {}, *source, factor, instruction.address, true};
+                }
             }
             erase_written();
             if (value) remember(destination->index, std::move(*value));
