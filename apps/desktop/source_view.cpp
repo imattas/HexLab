@@ -2331,6 +2331,22 @@ void SourceView::update_mapping_controls() {
 
 void SourceView::load_or_cancel_full_source() {
     if (source_load_running_) {
+        if (source_load_rendering_) {
+            source_load_timer_.Stop();
+            source_load_rendering_ = false;
+            source_load_running_ = false;
+            std::string{}.swap(source_load_render_buffer_);
+            source_load_render_offset_ = source_load_next_progress_ = 0;
+            source_load_document_.reset();
+            source_load_path_.clear();
+            source_load_selection_.reset();
+            source_->Enable(true);
+            update_source_edit_controls();
+            if (displayed_source_row_)
+                render_source_row(*displayed_source_row_, displayed_context_);
+            status_->SetLabel("Full-file source rendering canceled; restored the mapped excerpt");
+            return;
+        }
         source_load_stop_.request_stop();
         status_->SetLabel("Canceling full-file source load...");
         return;
@@ -2373,41 +2389,129 @@ void SourceView::load_or_cancel_full_source() {
 }
 
 void SourceView::poll_full_source_load() {
-    if (!source_load_running_ || !source_load_future_.valid() ||
-        source_load_future_.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready)
+    if (!source_load_running_)
         return;
-    SourceFileLoadResult result;
-    try {
-        result = source_load_future_.get();
-    } catch (const std::exception &error) {
-        result.failure = error.what();
-    } catch (...) {
-        result.failure = "Unexpected full-file source load failure";
-    }
-    source_load_timer_.Stop();
     const bool stale = document_ != source_load_document_ ||
         source_load_stamp_ != source_revision_stamp(document_) || rendered_path_ != source_load_path_ ||
         selection_address_ != source_load_selection_;
-    source_load_running_ = false;
+    if (!source_load_rendering_ &&
+        (!source_load_future_.valid() ||
+         source_load_future_.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready)) {
+        // Keep polling until the async future is consumed. Destroying or
+        // replacing a std::async future before it is ready can join its worker
+        // on the UI thread; stale navigation only requests cooperative stop.
+        if (stale) source_load_stop_.request_stop();
+        return;
+    }
+    if (stale) {
+        source_load_stop_.request_stop();
+        source_load_timer_.Stop();
+        source_load_running_ = source_load_rendering_ = false;
+        std::string{}.swap(source_load_render_buffer_);
+        source_load_render_offset_ = source_load_next_progress_ = 0;
+        source_load_document_.reset();
+        source_load_path_.clear();
+        source_load_selection_.reset();
+        source_->Enable(true);
+        update_source_edit_controls();
+        return;
+    }
+
+    if (!source_load_rendering_) {
+        if (!source_load_future_.valid() ||
+            source_load_future_.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready)
+            return;
+        SourceFileLoadResult result;
+        try {
+            result = source_load_future_.get();
+        } catch (const std::exception &error) {
+            result.failure = error.what();
+        } catch (...) {
+            result.failure = "Unexpected full-file source load failure";
+        }
+        if (!result.failure.empty()) {
+            source_load_timer_.Stop();
+            source_load_running_ = false;
+            source_load_document_.reset();
+            source_load_path_.clear();
+            source_load_selection_.reset();
+            source_->Enable(true);
+            update_source_edit_controls();
+            status_->SetLabel("Could not load full source file: " + text(result.failure));
+            return;
+        }
+        // Worker-side decoding already validated the complete UTF-8 stream.
+        // Convert and append bounded chunks on successive timer ticks so the
+        // UI thread never handles a 64 MiB ChangeValue or re-encodes the file.
+        source_load_render_buffer_ = std::move(result.utf8_text);
+        source_load_render_offset_ = 0;
+        source_load_next_progress_ = 1024u * 1024u;
+        source_load_rendering_ = true;
+        source_load_timer_.Start(8);
+        updating_ = true;
+        source_->SetEditable(false);
+        source_->ChangeValue({});
+        updating_ = false;
+    }
+
+    constexpr std::size_t chunk_bytes = 256u * 1024u;
+    const auto size = source_load_render_buffer_.size();
+    if (source_load_render_offset_ < size) {
+        auto end = std::min(size, source_load_render_offset_ + chunk_bytes);
+        // Never split a UTF-8 scalar between timer ticks. The worker validated
+        // the stream, so backing up over continuation bytes is sufficient.
+        while (end < size && end > source_load_render_offset_ &&
+               (static_cast<unsigned char>(source_load_render_buffer_[end]) & 0xc0u) == 0x80u)
+            --end;
+        if (end == source_load_render_offset_) {
+            source_load_timer_.Stop();
+            source_load_rendering_ = source_load_running_ = false;
+            std::string{}.swap(source_load_render_buffer_);
+            source_load_render_offset_ = source_load_next_progress_ = 0;
+            source_load_document_.reset();
+            source_load_path_.clear();
+            source_load_selection_.reset();
+            source_->Enable(true);
+            update_source_edit_controls();
+            status_->SetLabel("Could not split the validated source text at a UTF-8 boundary");
+            return;
+        }
+        const auto count = end - source_load_render_offset_;
+        const auto *begin = source_load_render_buffer_.data() + source_load_render_offset_;
+        const auto content = wxString::FromUTF8(begin, count);
+        if (utf8(content) != std::string_view(begin, count)) {
+            source_load_timer_.Stop();
+            source_load_rendering_ = source_load_running_ = false;
+            std::string{}.swap(source_load_render_buffer_);
+            source_load_render_offset_ = source_load_next_progress_ = 0;
+            source_load_document_.reset();
+            source_load_path_.clear();
+            source_load_selection_.reset();
+            source_->Enable(true);
+            update_source_edit_controls();
+            status_->SetLabel("Source text chunk could not be represented safely by the desktop text control");
+            return;
+        }
+        source_->AppendText(content);
+        source_load_render_offset_ = end;
+        if (source_load_render_offset_ >= source_load_next_progress_) {
+            status_->SetLabel(wxString::Format("Rendering complete source file: %s (%zu / %zu UTF-8 bytes)",
+                display_path(source_load_path_), source_load_render_offset_, size));
+            source_load_next_progress_ = source_load_render_offset_ + 1024u * 1024u;
+        }
+        if (source_load_render_offset_ < size)
+            return;
+    }
+
+    full_file_display_ = true;
+    source_load_timer_.Stop();
+    source_load_rendering_ = source_load_running_ = false;
+    std::string{}.swap(source_load_render_buffer_);
+    source_load_render_offset_ = source_load_next_progress_ = 0;
     source_load_document_.reset();
     source_load_path_.clear();
     source_load_selection_.reset();
     source_->Enable(true);
-    update_source_edit_controls();
-    if (stale) return;
-    if (!result.failure.empty()) {
-        status_->SetLabel("Could not load full source file: " + text(result.failure));
-        return;
-    }
-    const auto content = wxString::FromUTF8(result.utf8_text.data(), result.utf8_text.size());
-    if (utf8(content) != result.utf8_text) {
-        status_->SetLabel("Source file could not be represented safely by the desktop text control");
-        return;
-    }
-    full_file_display_ = true;
-    updating_ = true;
-    source_->SetEditable(false);
-    source_->ChangeValue(content);
     if (displayed_source_row_ && displayed_source_row_->line > 0 &&
         displayed_source_row_->line <= source_->GetNumberOfLines()) {
         const auto line = static_cast<long>(displayed_source_row_->line - 1);
@@ -2418,10 +2522,9 @@ void SourceView::poll_full_source_load() {
             source_->ShowPosition(start);
         }
     }
-    updating_ = false;
     update_source_edit_controls();
     status_->SetLabel(wxString::Format("Loaded complete source file: %s (%zu UTF-8 bytes)",
-        display_path(rendered_path_), result.utf8_text.size()));
+        display_path(rendered_path_), size));
 }
 
 void SourceView::render_unavailable(const wxString &message) {

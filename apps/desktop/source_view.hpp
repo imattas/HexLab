@@ -153,6 +153,10 @@ class SourceView final : public wxPanel {
     std::future<SourceFileLoadResult> source_load_future_;
     std::stop_source source_load_stop_;
     bool source_load_running_ = false;
+    bool source_load_rendering_ = false;
+    std::string source_load_render_buffer_;
+    std::size_t source_load_render_offset_ = 0;
+    std::size_t source_load_next_progress_ = 0;
     std::future<SourceExcerptLoadResult> source_excerpt_future_;
     std::stop_source source_excerpt_stop_;
     bool source_excerpt_running_ = false;
