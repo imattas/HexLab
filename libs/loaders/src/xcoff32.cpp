@@ -119,11 +119,17 @@ Result<Xcoff32Object> inspect_xcoff32_object(const ByteStorage &storage,
         require(symbol_offset >= header_end, "XCOFF32 symbol table overlaps headers");
         const auto symbols = read(storage, symbol_offset, symbol_bytes, budget, limits, stop);
         const auto string_offset = symbol_offset + symbol_bytes;
-        const auto string_header = read(storage, string_offset, 4, budget, limits, stop);
-        result.string_table_size = be(string_header, 0, 4);
-        require(result.string_table_size >= 4, "XCOFF32 string table is smaller than its header");
-        const auto strings = result.string_table_size == 4 ? string_header :
-            read(storage, string_offset, result.string_table_size, budget, limits, stop);
+        std::vector<std::byte> strings;
+        // A string table is optional when all retained names are inline. If
+        // present, lengths <= 4 describe an empty table; larger lengths are
+        // checked against the source extent before any name lookup.
+        if (contains(storage.size(), string_offset, 4)) {
+            const auto string_header = read(storage, string_offset, 4, budget, limits, stop);
+            result.string_table_size = be(string_header, 0, 4);
+            strings = result.string_table_size > 4
+                ? read(storage, string_offset, result.string_table_size, budget, limits, stop)
+                : string_header;
+        }
         // A conservative charge for every slot bounds retained primary records
         // even when there are no auxiliary rows and every name is empty.
         charge(std::uint64_t{result.symbol_count} * sizeof(Xcoff32Object::Symbol), budget, limits);

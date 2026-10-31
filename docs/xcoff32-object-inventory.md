@@ -21,19 +21,23 @@ budget (256 MiB by default). Limits also bound section count (4096), symbol slot
 (one million) and each decoded name (4096 bytes). Name scans stop at that limit.
 The reader checks cancellation before and after storage reads and during section
 and symbol traversal, checks complete reads and table extents, and maps allocation
-failures to resource-limit errors. It checks ordinary 10-byte relocation and
-6-byte line-number table extents without reading or decoding the rows. Section
+failures to resource-limit errors. The string table may be absent when names are
+inline; when present, empty tables (size at most four bytes) are accepted. It
+checks ordinary 10-byte relocation and 6-byte line-number table extents without
+reading or decoding the rows. Section
 type flags determine whether raw data is BSS/TBSS; names are only metadata.
 A zero raw-data pointer denotes absent raw data, including in a nonempty section.
 
 The subset rejects executable (`F_EXEC`) objects, optional headers, deleted
-section headers, overflow sections/count sentinels, and loader relocation rows.
-It does not validate overlap between payload tables, decode auxiliary csect
-records, validate relocation symbol targets or arithmetic, decode line records,
-resolve symbols, apply relocations, or produce linked output. No runtime tests
-were added or run for this slice; the production loader target was compiled.
-This is partial structural inspection, not full XCOFF support or verification
-of archive linking capability.
+section headers and overflow sections/count sentinels. Loader-section payloads
+and their embedded loader relocation tables remain uninterpreted; ordinary
+section relocation and line-number rows are extent-checked only. It does not
+validate overlap between payload tables, decode auxiliary csect records,
+validate relocation symbol targets or arithmetic, decode line records, resolve
+symbols, apply relocations, or produce linked output. No runtime tests were
+added or run for this slice; the production loader target was compiled. This is
+partial structural inspection, not full XCOFF support or verification of
+archive linking capability.
 
 Record layouts and section/name rules follow IBM's [AIX XCOFF object file
 format](https://www.ibm.com/docs/en/aix/7.3.0?topic=formats-xcoff-object-file-format)
