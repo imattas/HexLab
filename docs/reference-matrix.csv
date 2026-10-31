@@ -1,5 +1,5 @@
 id,area,reference_family,hexlab_state,variant_audit,hexlab_evidence,source_id,next_stage
-processor.wasm,processor,WASM,absent,open,,P01,8
+processor.wasm,processor,WASM,partial,partial,"libs/processors/src/wasm.cpp; libs/loaders/src/wasm.cpp; libs/decompiler/src/wasm_lifting.cpp; docs/wasm-analysis.md; docs/wasm-decompilation.md; validated/lifted WebAssembly SIMD subset, multi-value scalar validation, structured CFG lifting, calls, imports/exports and references; full MVP/proposal coverage and exact runtime SIMD semantics remain incomplete",P01,8
 processor.3dnow,processor,3DNow!,absent,open,,P01,8
 processor.arm,processor,ARM,absent,open,,P01,4
 processor.aarch64,processor,AArch64,absent,open,,P01,4
