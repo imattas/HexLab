@@ -153,6 +153,19 @@ struct MachOFileSetEntry {
     std::uint32_t child_cpu_type = 0, child_cpu_subtype = 0, child_file_type = 0;
     std::uint32_t child_command_count = 0, child_command_bytes = 0;
     bool child_commands_valid = false;
+    std::optional<std::array<std::uint8_t, 16>> child_uuid;
+    std::optional<FileOffset> child_uuid_source;
+    struct Segment {
+        std::uint32_t command_index = 0, section_count = 0;
+        std::uint64_t record_file_offset = 0, address = 0, memory_size = 0;
+        std::uint64_t raw_file_offset = 0, file_size = 0;
+        std::uint32_t maximum_protection = 0, initial_protection = 0, flags = 0;
+        std::string name;
+        std::optional<FileOffset> file_offset;
+        bool file_range_valid = false;
+        bool operator==(const Segment &) const = default;
+    };
+    std::vector<Segment> child_segments;
     bool operator==(const MachOFileSetEntry &) const = default;
 };
 struct MachOEntry {

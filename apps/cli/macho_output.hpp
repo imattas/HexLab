@@ -44,6 +44,15 @@ inline std::string macho_version(std::uint32_t value) {
     return std::to_string(value >> 16) + "." + std::to_string((value >> 8) & 0xff) + "." +
            std::to_string(value & 0xff);
 }
+inline std::string macho_uuid_text(const std::array<std::uint8_t, 16> &bytes) {
+    std::ostringstream value;
+    value << std::hex << std::setfill('0');
+    for (std::size_t byte = 0; byte < bytes.size(); ++byte) {
+        if (byte == 4 || byte == 6 || byte == 8 || byte == 10) value << '-';
+        value << std::setw(2) << unsigned(bytes[byte]);
+    }
+    return value.str();
+}
 inline const char *macho_symbol_state(MachOSymbolState state) {
     switch (state) {
     case MachOSymbolState::undefined:
@@ -191,6 +200,34 @@ inline void macho_description(std::ostream &out, const ImageMetadata &metadata, 
         out << "  note command=" << row.command_index << " owner=" << macho_text(row.data_owner)
             << " data=file:" << macho_hex(row.data_offset.value) << " size=" << macho_hex(row.data_size)
             << " record=file:" << macho_hex(row.record_file_offset) << '\n';
+    constexpr std::size_t max_fileset_rows = 256;
+    const auto shown_fileset_rows = std::min(m.fileset_entries.size(), max_fileset_rows);
+    out << "Mach-O fileset entries: " << m.fileset_entries.size() << '\n';
+    for (std::size_t index = 0; index < shown_fileset_rows; ++index) {
+        const auto &row = m.fileset_entries[index];
+        out << "  fileset-entry command=" << row.command_index << " id=" << macho_text(row.entry_id)
+            << " vm=" << macho_hex(row.vm_address) << " file=" << macho_hex(row.raw_file_offset)
+            << " cpu=" << macho_hex(row.child_cpu_type) << " subtype=" << macho_hex(row.child_cpu_subtype)
+            << " type=" << row.child_file_type << " commands=" << row.child_command_count
+            << " commands-valid=" << row.child_commands_valid
+            << " record=file:" << macho_hex(row.record_file_offset) << '\n';
+        if (row.child_uuid && row.child_uuid_source)
+            out << "    uuid=" << macho_uuid_text(*row.child_uuid)
+                << " value-file=" << macho_hex(row.child_uuid_source->value) << '\n';
+        for (const auto &segment : row.child_segments)
+            out << "    segment command=" << segment.command_index << " name=" << macho_text(segment.name)
+                << " vm=" << macho_hex(segment.address) << " size=" << macho_hex(segment.memory_size)
+                << " raw-file=" << macho_hex(segment.raw_file_offset)
+                << " initialized=" << macho_hex(segment.file_size)
+                << " file-range-valid=" << segment.file_range_valid
+                << " file=" << (segment.file_offset ? macho_hex(segment.file_offset->value) : std::string("unmapped"))
+                << " sections=" << segment.section_count
+                << " protection=" << macho_hex(segment.initial_protection)
+                << " record=file:" << macho_hex(segment.record_file_offset) << '\n';
+    }
+    if (shown_fileset_rows < m.fileset_entries.size())
+        out << "  fileset-entry rows omitted=" << m.fileset_entries.size() - shown_fileset_rows
+            << " (CLI limit " << max_fileset_rows << ")\n";
     for (const auto &row : m.segments)
         out << "  segment command=" << row.command_index << " name=" << macho_text(row.name)
             << " address=" << macho_hex(row.address) << " size=" << macho_hex(row.memory_size)
