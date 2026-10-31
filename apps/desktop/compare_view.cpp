@@ -91,19 +91,18 @@ std::string csv_field(std::string_view value) {
     result += '"';
     return result;
 }
-std::string csv_row(std::initializer_list<std::string> fields) {
+constexpr std::size_t csv_column_count = 60;
+std::string csv_row(std::span<const std::string> fields) {
     std::string result;
-    bool first = true;
-    std::size_t count = 0;
-    for (const auto &field : fields) {
-        if (!first) result += ',';
-        first = false;
-        result += csv_field(field);
-        ++count;
+    for (std::size_t i = 0; i < csv_column_count; ++i) {
+        if (i) result += ',';
+        if (i < fields.size()) result += csv_field(fields[i]);
     }
-    while (count++ < 26) result += ',';
     result += "\r\n";
     return result;
+}
+std::string csv_row(std::initializer_list<std::string> fields) {
+    return csv_row(std::span<const std::string>(fields.begin(), fields.size()));
 }
 std::string csv_address(const std::optional<std::uint64_t> &value) {
     return value ? wxString::Format("0x%llX", static_cast<unsigned long long>(*value)).ToStdString() : std::string{};
@@ -513,7 +512,17 @@ void CompareView::export_csv() {
                        "summary_metric", "summary_value", "old_instruction_start", "old_instruction_count",
                        "new_instruction_start", "new_instruction_count", "old_region_size", "new_region_size",
                        "compared_bytes", "equal_bytes", "changed_bytes", "ignored_bytes", "added_bytes", "removed_bytes",
-                       "old_instruction_address", "new_instruction_address"});
+                       "old_instruction_address", "new_instruction_address", "old_block_index", "new_block_index",
+                       "block_confidence_percent", "block_supporting_neighbors", "block_instruction_evidence_available",
+                       "block_old_instruction_coverage_percent", "block_new_instruction_coverage_percent",
+                       "block_fingerprint_similarity_percent", "block_adjacency_similarity_percent",
+                       "block_instruction_diff_available", "block_instruction_equal", "block_instruction_changed",
+                       "block_instruction_removed", "block_instruction_added", "block_instruction_diff_budget_exhausted",
+                       "block_instruction_evidence_complete", "block_correspondence_budget_exhausted",
+                       "block_correspondence_instruction_diff_budget_exhausted", "block_semantic_evidence_available",
+                       "block_semantic_opcode_changes",
+                       "block_semantic_flow_changes", "block_semantic_operand_changes", "block_semantic_effect_changes",
+                       "block_semantic_unclassified_changes"});
     const auto &summary = report_.summary;
     const auto summary_row = [&](std::string label, std::uint64_t value) {
         output << csv_row({"summary", utf8(old_name_), utf8(new_name_), {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
@@ -595,6 +604,53 @@ void CompareView::export_csv() {
                 std::to_string(run.new_start), std::to_string(run.new_count), {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
                 run.old_address ? function_address(run.old_address->entry, run.old_address->address_space).ToStdString() : std::string{},
                 run.new_address ? function_address(run.new_address->entry, run.new_address->address_space).ToStdString() : std::string{}});
+        for (const auto &block : body.block_correspondence.blocks) {
+            const char *kind = block.kind == compare::BlockMatchKind::matched ? "matched" :
+                block.kind == compare::BlockMatchKind::added ? "added" :
+                block.kind == compare::BlockMatchKind::removed ? "removed" : "ambiguous";
+            const auto &instruction = block.instruction_diff;
+            const auto &semantic = instruction.semantic;
+            std::vector<std::string> fields(csv_column_count);
+            fields[0] = "function_block";
+            fields[1] = utf8(old_name_);
+            fields[2] = utf8(new_name_);
+            fields[3] = kind;
+            fields[5] = function_address(body.old_entry, body.old_space).ToStdString();
+            fields[6] = function_address(body.new_entry, body.new_space).ToStdString();
+            fields[12] = old_function;
+            fields[13] = new_function;
+            if (block.old_block) fields[36] = std::to_string(*block.old_block);
+            if (block.new_block) fields[37] = std::to_string(*block.new_block);
+            fields[38] = std::to_string(block.confidence);
+            fields[39] = std::to_string(block.supporting_neighbors);
+            fields[40] = block.instruction_evidence.available ? "true" : "false";
+            if (block.instruction_evidence.available) {
+                fields[41] = std::to_string(block.instruction_evidence.old_coverage_percent);
+                fields[42] = std::to_string(block.instruction_evidence.new_coverage_percent);
+                fields[43] = std::to_string(block.instruction_evidence.fingerprint_similarity);
+                fields[44] = std::to_string(block.instruction_evidence.adjacency_similarity);
+                fields[51] = block.instruction_evidence.complete ? "true" : "false";
+            }
+            fields[45] = block.instruction_diff_available ? "true" : "false";
+            fields[50] = block.instruction_diff_budget_exhausted ? "true" : "false";
+            fields[52] = body.block_correspondence.budget_exhausted ? "true" : "false";
+            fields[53] = body.block_correspondence.instruction_diff_budget_exhausted ? "true" : "false";
+            fields[54] = semantic.available ? "true" : "false";
+            if (block.instruction_diff_available) {
+                fields[46] = std::to_string(instruction.equal_instructions);
+                fields[47] = std::to_string(instruction.changed_instructions);
+                fields[48] = std::to_string(instruction.removed_instructions);
+                fields[49] = std::to_string(instruction.added_instructions);
+            }
+            if (block.instruction_diff_available && semantic.available) {
+                fields[55] = std::to_string(semantic.opcode_changes);
+                fields[56] = std::to_string(semantic.flow_changes);
+                fields[57] = std::to_string(semantic.operand_changes);
+                fields[58] = std::to_string(semantic.effect_changes);
+                fields[59] = std::to_string(semantic.unclassified_changes);
+            }
+            output << csv_row(fields);
+        }
     }
     output.flush();
     if (!output) {
