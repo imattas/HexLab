@@ -3405,6 +3405,7 @@ int macho_chained_targets_command(std::span<const std::wstring_view> args, std::
         case MachOChainedExternalTargetStatus::missing_base: return "missing-base";
         case MachOChainedExternalTargetStatus::invalid_encoding: return "invalid-encoding";
         case MachOChainedExternalTargetStatus::overflow: return "overflow";
+        case MachOChainedExternalTargetStatus::outside_mapping: return "outside-mapping";
         }
         return "unknown";
     };

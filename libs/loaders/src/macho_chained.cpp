@@ -5,6 +5,7 @@
 #include <map>
 #include <tuple>
 #include <algorithm>
+#include <iterator>
 namespace hexlab::macho_detail {
 namespace {
 constexpr std::uint32_t max_chained_imports = 1'000'000;
@@ -800,6 +801,48 @@ Result<std::vector<MachOChainedExternalTarget>> resolve_macho_chained_external_t
     if (metadata.chained_pointers.size() > limits.max_pointer_rows || limits.max_pointer_rows > 1'000'000)
         return Error{ErrorCode::resource_limit, "Mach-O chained target resolution exceeds its pointer-row limit"};
     try {
+        using AddressRange = std::pair<std::uint64_t, std::uint64_t>;
+        const auto prepare_mappings = [&](const std::vector<MachOChainedTargetBases::Mapping> &mappings)
+            -> Result<std::vector<AddressRange>> {
+            if (mappings.size() > 65'536)
+                return Error{ErrorCode::resource_limit, "Mach-O chained cache mapping count exceeds its limit"};
+            std::vector<AddressRange> ranges;
+            ranges.reserve(mappings.size());
+            for (const auto &mapping : mappings) {
+                if (stop.stop_requested())
+                    return Error{ErrorCode::canceled, "Mach-O chained target resolution canceled"};
+                if (!mapping.size || mapping.address > UINT64_MAX - mapping.size)
+                    return Error{ErrorCode::invalid_argument, "Mach-O chained cache mapping has an invalid VM range"};
+                ranges.emplace_back(mapping.address, mapping.address + mapping.size);
+            }
+            std::sort(ranges.begin(), ranges.end());
+            std::vector<AddressRange> merged;
+            merged.reserve(ranges.size());
+            for (const auto &range : ranges) {
+                if (!merged.empty() && range.first <= merged.back().second)
+                    merged.back().second = std::max(merged.back().second, range.second);
+                else
+                    merged.push_back(range);
+            }
+            return merged;
+        };
+        auto shared_ranges = prepare_mappings(bases.shared_cache_mappings);
+        if (!shared_ranges) return shared_ranges.error();
+        std::array<std::vector<AddressRange>, 4> level_ranges;
+        std::size_t total_mapping_count = bases.shared_cache_mappings.size();
+        for (std::size_t level = 0; level < level_ranges.size(); ++level) {
+            if (bases.cache_level_mappings[level].size() > 65'536 - total_mapping_count)
+                return Error{ErrorCode::resource_limit, "Mach-O chained cache mapping count exceeds its combined limit"};
+            total_mapping_count += bases.cache_level_mappings[level].size();
+            auto prepared = prepare_mappings(bases.cache_level_mappings[level]);
+            if (!prepared) return prepared.error();
+            level_ranges[level] = std::move(prepared.value());
+        }
+        const auto contains = [](const std::vector<AddressRange> &ranges, std::uint64_t address) {
+            const auto after = std::upper_bound(ranges.begin(), ranges.end(), address,
+                [](std::uint64_t value, const AddressRange &range) { return value < range.first; });
+            return after != ranges.begin() && address < std::prev(after)->second;
+        };
         std::vector<MachOChainedExternalTarget> output;
         for (std::size_t index = 0; index < metadata.chained_pointers.size(); ++index) {
             if (stop.stop_requested())
@@ -859,6 +902,11 @@ Result<std::vector<MachOChainedExternalTarget>> resolve_macho_chained_external_t
                 continue;
             }
             auto target = *base + *row.target;
+            const std::vector<AddressRange> *mappings = nullptr;
+            if (*row.target_base_kind == MachOChainedTargetBaseKind::cache_level)
+                mappings = &level_ranges[*row.cache_level];
+            else
+                mappings = &shared_ranges.value();
             if (pointer_format == 13 && !row.authenticated) {
                 if (target > UINT64_C(0x00ffffffffffffff)) {
                     resolved.status = MachOChainedExternalTargetStatus::overflow;
@@ -866,6 +914,11 @@ Result<std::vector<MachOChainedExternalTarget>> resolve_macho_chained_external_t
                     continue;
                 }
                 target |= std::uint64_t(row.high8) << 56;
+            }
+            if (!mappings->empty() && !contains(*mappings, target)) {
+                resolved.status = MachOChainedExternalTargetStatus::outside_mapping;
+                output.push_back(std::move(resolved));
+                continue;
             }
             resolved.status = MachOChainedExternalTargetStatus::resolved;
             resolved.target_address = target;
