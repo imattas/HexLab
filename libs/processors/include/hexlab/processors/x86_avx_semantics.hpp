@@ -621,7 +621,7 @@ inline std::optional<X86AvxPackedResult> evaluate_x86_avx_packed(
 
     const bool store = move && std::holds_alternative<MemoryOperand>(instruction.operands[0]);
     std::uint16_t bits = 0;
-    std::optional<std::uint8_t> register_destination;
+    std::optional<std::uint16_t> register_destination;
     if (move) {
         const auto *vector_register = store
             ? std::get_if<RegisterOperand>(&instruction.operands[1])
