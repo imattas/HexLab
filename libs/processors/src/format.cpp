@@ -186,7 +186,7 @@ std::string register_name(const RegisterOperand &r) {
     if (r.bank == RegisterBank::arm32_gpr)
         return r.index < 16 && r.width == 32 ? "r" + std::to_string(r.index) : "?arm32-register";
     if (r.bank == RegisterBank::arm32_vfp)
-        return r.index < 32 && (r.width == 32 || r.width == 64)
+        return arm32_vfp_register_valid(r)
             ? std::string(r.width == 64 ? "d" : "s") + std::to_string(r.index) : "?arm32-vfp-register";
     static constexpr const char *names8[]{"al",  "cl",  "dl",   "bl",   "spl",  "bpl",  "sil",  "dil",
                                           "r8b", "r9b", "r10b", "r11b", "r12b", "r13b", "r14b", "r15b"};

@@ -81,6 +81,8 @@ std::optional<RegisterOperand> named_register(csh handle, unsigned reg, unsigned
         if(n=="nzcv") return RegisterOperand{RegisterBank::arm_flags,0,4,false};
     }
     if(arch==Architecture::arm){
+        if(auto i=number("d",32)) return RegisterOperand{RegisterBank::arm32_vfp,static_cast<std::uint8_t>(*i),64,false};
+        if(auto i=number("s",64)) return RegisterOperand{RegisterBank::arm32_vfp,static_cast<std::uint8_t>(*i),32,false};
         if(n=="sp") return RegisterOperand{RegisterBank::arm32_gpr,13,static_cast<std::uint16_t>(width),false};
         if(n=="lr") return RegisterOperand{RegisterBank::arm32_gpr,14,static_cast<std::uint16_t>(width),false};
         if(n=="pc") return RegisterOperand{RegisterBank::arm32_gpr,15,static_cast<std::uint16_t>(width),false};

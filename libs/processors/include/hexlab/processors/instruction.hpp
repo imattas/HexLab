@@ -692,6 +692,23 @@ struct RegisterOperand {
     bool high_byte;
     bool operator==(const RegisterOperand &) const = default;
 };
+// AArch32 VFP S and D names are alternate views of one 32-bit lane file:
+// S<n> names lane n, while D<n> names lanes 2*n and 2*n+1. This helper is
+// deliberately specific to that bank so clients can invalidate/read state
+// through either view without conflating unrelated register banks.
+inline constexpr bool arm32_vfp_register_valid(const RegisterOperand &reg) noexcept {
+    return reg.bank == RegisterBank::arm32_vfp &&
+           ((reg.width == 32 && reg.index < 64) || (reg.width == 64 && reg.index < 32));
+}
+inline constexpr bool arm32_vfp_registers_overlap(const RegisterOperand &a,
+                                                   const RegisterOperand &b) noexcept {
+    if (!arm32_vfp_register_valid(a) || !arm32_vfp_register_valid(b)) return false;
+    const unsigned a_first = a.width == 64 ? 2u * a.index : a.index;
+    const unsigned b_first = b.width == 64 ? 2u * b.index : b.index;
+    const unsigned a_end = a_first + (a.width == 64 ? 2u : 1u);
+    const unsigned b_end = b_first + (b.width == 64 ? 2u : 1u);
+    return a_first < b_end && b_first < a_end;
+}
 struct MemoryOperand {
     std::uint16_t data_width = 0, address_width = 64;
     std::optional<RegisterOperand> segment, base, index;
