@@ -11601,6 +11601,103 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
             }
             if (!body_valid) break;
         }
+        // A post-tested loop may route its body through either of two latch
+        // blocks. Accept only the small diamond-free form where both arms end
+        // at a distinct conditional latch, and both latches have the same
+        // exact repeat and exit destinations. The predecessor sets below
+        // prove that neither arm nor exit has an unrecognized side entry.
+        if (body_valid && function.blocks.size() >= 4 && function.blocks.size() <= 128 &&
+            terminal_conditional(*entry) && entry->phis.empty() && !entry->memory_phi &&
+            entry->memory_partition_phis.empty() && !entry->switch_dispatch &&
+            has_only_simple_statements(*entry) && conditional_edges_match_targets(*entry, *terminal_conditional(*entry))) {
+            const auto *dispatch_condition = terminal_conditional(*entry);
+            const auto trace_latch_arm = [&](Address start)
+                -> std::optional<std::vector<const LiftedBlock *>> {
+                std::vector<const LiftedBlock *> path;
+                std::set<std::uint64_t> seen;
+                auto *cursor = find_block(start);
+                auto predecessor = entry->id.value;
+                while (cursor && cursor != entry && path.size() < 64 && seen.insert(cursor->id.value).second &&
+                       predecessors[cursor->id.value] == std::set<std::uint64_t>{predecessor} &&
+                       cursor->phis.empty() && !cursor->memory_phi && cursor->memory_partition_phis.empty() &&
+                       !cursor->switch_dispatch && !contains_return(*cursor) && has_only_simple_statements(*cursor)) {
+                    path.push_back(cursor);
+                    if (terminal_conditional(*cursor)) return path;
+                    if (cursor->successors.size() != 1 || !cursor->successors.front().target ||
+                        (cursor->successors.front().kind != BlockEdgeKind::jump &&
+                         cursor->successors.front().kind != BlockEdgeKind::fallthrough) ||
+                        !has_unconditional_edge(*cursor, *cursor->successors.front().target)) return {};
+                    predecessor = cursor->id.value;
+                    cursor = find_block(*cursor->successors.front().target);
+                }
+                return {};
+            };
+            const auto true_arm = dispatch_condition->true_target ? trace_latch_arm(*dispatch_condition->true_target)
+                                                                  : std::optional<std::vector<const LiftedBlock *>>{};
+            const auto false_arm = dispatch_condition->false_target ? trace_latch_arm(*dispatch_condition->false_target)
+                                                                    : std::optional<std::vector<const LiftedBlock *>>{};
+            if (true_arm && false_arm && !true_arm->empty() && !false_arm->empty()) {
+                const auto *true_latch = true_arm->back();
+                const auto *false_latch = false_arm->back();
+                const auto *true_test = terminal_conditional(*true_latch);
+                const auto *false_test = terminal_conditional(*false_latch);
+                const auto latch_targets_valid = [&](const LiftedBlock &latch, const Branch &test) {
+                    return test.true_target && test.false_target && *test.true_target != *test.false_target &&
+                        latch.successors.size() == 2 && conditional_edges_match_targets(latch, test);
+                };
+                if (true_latch != false_latch && true_test && false_test &&
+                    latch_targets_valid(*true_latch, *true_test) && latch_targets_valid(*false_latch, *false_test)) {
+                    const bool true_repeats_true = *true_test->true_target == entry->begin;
+                    const bool true_repeats_false = *true_test->false_target == entry->begin;
+                    const bool false_repeats_true = *false_test->true_target == entry->begin;
+                    const bool false_repeats_false = *false_test->false_target == entry->begin;
+                    const Address true_exit = true_repeats_true ? *true_test->false_target : *true_test->true_target;
+                    const Address false_exit = false_repeats_true ? *false_test->false_target : *false_test->true_target;
+                    const auto *exit = find_block(true_exit);
+                    std::set<std::uint64_t> covered{entry->id.value};
+                    const auto claim_arm = [&](const auto &arm) {
+                        for (const auto *block : arm)
+                            if (!covered.insert(block->id.value).second) return false;
+                        return true;
+                    };
+                    const bool arms_disjoint = claim_arm(*true_arm) && claim_arm(*false_arm);
+                    const bool exact_terminations = (true_repeats_true != true_repeats_false) &&
+                        (false_repeats_true != false_repeats_false) && true_exit == false_exit && exit &&
+                        has_only_terminal_return(*exit) && exit->phis.empty() && !exit->memory_phi &&
+                        exit->memory_partition_phis.empty() &&
+                        predecessors[entry->id.value] == std::set<std::uint64_t>{true_latch->id.value, false_latch->id.value} &&
+                        predecessors[exit->id.value] == std::set<std::uint64_t>{true_latch->id.value, false_latch->id.value};
+                    const bool complete_coverage = exit && covered.insert(exit->id.value).second &&
+                        std::all_of(function.blocks.begin(), function.blocks.end(), [&](const auto &block) {
+                            return covered.contains(block.id.value);
+                        });
+                    if (arms_disjoint && exact_terminations && complete_coverage) {
+                        const auto emit_arm = [&](const std::vector<const LiftedBlock *> &arm,
+                                                  const LiftedBlock &latch, const Branch &test,
+                                                  bool repeat_on_true) {
+                            for (std::size_t i = 0; i + 1 < arm.size(); ++i) emit_block(*arm[i], 12, true);
+                            emit_block(latch, 12, true);
+                            const auto cond = branch_condition_text(test);
+                            out << "            if (" << (repeat_on_true ? cond : "!(" + cond + ")") << ") {\n"
+                                << "                continue;\n            } else {\n"
+                                << "                break;\n            }\n";
+                        };
+                        out << "function " << address_label(function.entry) << "() {\n"
+                            << "    do {\n";
+                        emit_block(*entry, 8, true);
+                        out << "        if (" << branch_condition_text(*dispatch_condition) << ") {\n";
+                        emit_arm(*true_arm, *true_latch, *true_test, true_repeats_true);
+                        out << "        } else {\n";
+                        emit_arm(*false_arm, *false_latch, *false_test, false_repeats_true);
+                        out << "        }\n"
+                            << "    } while (true);\n";
+                        emit_block(*exit, 4);
+                        out << "}\n";
+                        return {out.str(), false, {}};
+                    }
+                }
+            }
+        }
         const auto trace_linear = [&](Address start)
             -> std::optional<std::vector<const LiftedBlock *>> {
             std::vector<const LiftedBlock *> path;
