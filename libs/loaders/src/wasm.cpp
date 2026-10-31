@@ -2039,9 +2039,128 @@ bool validate_body(const FunctionBody &body, std::span<const std::byte> module,
         } else if (op == 0xfd) {
             std::uint32_t subopcode = 0;
             if (!code.uleb(subopcode)) return fail("invalid SIMD subopcode");
+            if (subopcode == 12) {
+                if (!code.skip(16)) return fail("truncated v128.const immediate");
+                if (!push(0x7b)) return fail("operand stack limit exceeded");
+                continue;
+            }
+            if (subopcode == 13) {
+                for (unsigned lane = 0; lane < 16; ++lane) {
+                    std::uint8_t selector = 0;
+                    if (!code.byte(selector) || selector >= 32)
+                        return fail("i8x16.shuffle lane selector is truncated or out of range");
+                }
+                if (!pop(0x7b) || !pop(0x7b) || !push(0x7b))
+                    return fail("i8x16.shuffle requires two v128 operands");
+                continue;
+            }
+            if (subopcode >= 15 && subopcode <= 20) {
+                static constexpr std::array<std::uint8_t, 6> scalar_types{
+                    0x7f, 0x7f, 0x7f, 0x7e, 0x7d, 0x7c};
+                if (!pop(scalar_types[subopcode - 15]) || !push(0x7b))
+                    return fail("SIMD splat scalar type mismatch");
+                continue;
+            }
+            if (subopcode >= 21 && subopcode <= 34) {
+                static constexpr std::array<std::uint8_t, 14> lane_counts{
+                    16, 16, 16, 8, 8, 8, 4, 4, 2, 2, 4, 4, 2, 2};
+                static constexpr std::array<std::uint8_t, 14> scalar_types{
+                    0x7f, 0x7f, 0x7f, 0x7f, 0x7f, 0x7f, 0x7f, 0x7f,
+                    0x7e, 0x7e, 0x7d, 0x7d, 0x7c, 0x7c};
+                std::uint8_t lane = 0;
+                const auto lane_index = static_cast<std::size_t>(subopcode - 21);
+                if (!code.byte(lane) || lane >= lane_counts[lane_index])
+                    return fail("SIMD lane immediate is truncated or outside its lane count");
+                const bool replace = subopcode == 23 || subopcode == 26 || subopcode == 28 ||
+                                     subopcode == 30 || subopcode == 32 || subopcode == 34;
+                if (replace) {
+                    if (!pop(scalar_types[lane_index]) || !pop(0x7b) || !push(0x7b))
+                        return fail("SIMD lane replacement operands have invalid types");
+                } else if (!pop(0x7b) || !push(scalar_types[lane_index])) {
+                    return fail("SIMD lane extraction operand has an invalid type");
+                }
+                continue;
+            }
+            const bool simd_memory = subopcode <= 11 || (subopcode >= 84 && subopcode <= 93);
+            if (simd_memory) {
+                if (metadata.imported_memories + metadata.defined_memories != 1)
+                    return fail("SIMD memory instruction requires one memory");
+                static constexpr std::array<std::uint8_t, 12> alignments{
+                    4, 3, 3, 3, 3, 3, 3, 0, 1, 2, 3, 4};
+                unsigned natural_alignment = 0;
+                if (subopcode <= 11) natural_alignment = alignments[subopcode];
+                else if (subopcode <= 87) natural_alignment = subopcode - 84;
+                else if (subopcode <= 91) natural_alignment = subopcode - 88;
+                else natural_alignment = subopcode - 90;
+                std::uint32_t alignment = 0, offset = 0;
+                if (!code.uleb(alignment) || !code.uleb(offset) || alignment > natural_alignment)
+                    return fail("SIMD memory immediate is truncated or over-aligned");
+                const bool lane_access = subopcode >= 84 && subopcode <= 91;
+                if (lane_access) {
+                    std::uint8_t lane = 0;
+                    const auto lane_count = 16u >> natural_alignment;
+                    if (!code.byte(lane) || lane >= lane_count)
+                        return fail("SIMD memory lane index is truncated or out of range");
+                }
+                const bool store = subopcode == 11 || (subopcode >= 88 && subopcode <= 91);
+                if (store) {
+                    if (!pop(0x7b) || !pop(0x7f))
+                        return fail("SIMD store requires a v128 value and i32 address");
+                } else if (lane_access) {
+                    if (!pop(0x7b) || !pop(0x7f) || !push(0x7b))
+                        return fail("SIMD lane load requires an i32 address and v128 value");
+                } else if (!pop(0x7f) || !push(0x7b)) {
+                    return fail("SIMD load requires an i32 address");
+                }
+                continue;
+            }
             if (wasm_simd_integer_binary_op(subopcode)) {
                 if (!pop(0x7b) || !pop(0x7b) || !push(0x7b))
                     return fail("SIMD integer arithmetic requires two v128 operands");
+                continue;
+            }
+            const bool comparison = (subopcode >= 0x23 && subopcode <= 0x4c) ||
+                                    (subopcode >= 0xd6 && subopcode <= 0xdb);
+            const bool float_binary = (subopcode >= 0xe4 && subopcode <= 0xeb) ||
+                                     (subopcode >= 0xf0 && subopcode <= 0xf7);
+            if (subopcode == 82) {
+                if (!pop(0x7b) || !pop(0x7b) || !pop(0x7b) || !push(0x7b))
+                    return fail("v128.bitselect requires three v128 operands");
+                continue;
+            }
+            const bool binary = comparison || float_binary || subopcode == 14 ||
+                (subopcode >= 78 && subopcode <= 81) ||
+                subopcode == 0x65 || subopcode == 0x66 || subopcode == 0x85 || subopcode == 0x86 ||
+                (subopcode >= 0x9c && subopcode <= 0x9f) || (subopcode >= 0xbc && subopcode <= 0xbf) ||
+                (subopcode >= 0xdc && subopcode <= 0xdf);
+            if (binary) {
+                if (!pop(0x7b) || !pop(0x7b) || !push(0x7b))
+                    return fail("SIMD binary operator requires two v128 operands");
+                continue;
+            }
+            const bool integer_unary = (subopcode >= 0x60 && subopcode <= 0x64) ||
+                subopcode == 0x80 || subopcode == 0x81 || subopcode == 0x83 || subopcode == 0x84 ||
+                subopcode == 0xa0 || subopcode == 0xa1 || subopcode == 0xa3 || subopcode == 0xa4 ||
+                subopcode == 0xc0 || subopcode == 0xc1 || subopcode == 0xc3 || subopcode == 0xc4;
+            const bool integer_extend = (subopcode >= 0x7c && subopcode <= 0x7f) ||
+                (subopcode >= 0x87 && subopcode <= 0x8a) || (subopcode >= 0xa7 && subopcode <= 0xaa) ||
+                (subopcode >= 0xc7 && subopcode <= 0xca);
+            const bool float_unary = subopcode == 0x67 || subopcode == 0x68 || subopcode == 0x69 ||
+                subopcode == 0x6a || subopcode == 0x74 || subopcode == 0x75 || subopcode == 0x7a ||
+                subopcode == 0x94 || subopcode == 0xe0 || subopcode == 0xe1 || subopcode == 0xe3 ||
+                subopcode == 0xec || subopcode == 0xed || subopcode == 0xef;
+            if (subopcode == 77 || integer_unary || integer_extend || float_unary) {
+                const auto result_type = integer_unary &&
+                    (subopcode == 0x63 || subopcode == 0x64 || subopcode == 0x83 || subopcode == 0x84 ||
+                     subopcode == 0xa3 || subopcode == 0xa4 || subopcode == 0xc3 || subopcode == 0xc4)
+                        ? static_cast<std::uint8_t>(0x7f) : static_cast<std::uint8_t>(0x7b);
+                if (!pop(0x7b) || !push(result_type))
+                    return fail("SIMD unary operator requires a v128 operand");
+                continue;
+            }
+            if (subopcode == 83) {
+                if (!pop(0x7b) || !push(0x7f))
+                    return fail("v128.any_true requires a v128 operand");
                 continue;
             }
             const bool shift = (subopcode >= 0x6b && subopcode <= 0x6d) ||
