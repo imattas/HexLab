@@ -14,6 +14,10 @@
 #include <wx/config.h>
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 namespace hexlab::desktop {
 namespace {
 constexpr std::size_t recent_find_limit = 16, recent_find_value_limit = 4096;
@@ -318,13 +322,32 @@ struct SearchView::Rows {
         std::shared_ptr<const ProjectSnapshot> project;
         std::shared_ptr<const SearchPage> page;
         std::array<wxString, 6> cells;
-        wxString metadata;
+        std::string metadata;
     };
     std::vector<Item> items;
     std::vector<std::filesystem::path> protected_paths;
     bool searched = false;
 };
-SearchView::SearchView(wxWindow *parent) : wxPanel(parent) {
+struct SearchView::FilterWork {
+    struct Request {
+        std::uint64_t generation = 0;
+        std::shared_ptr<const Rows> rows;
+        std::string needle;
+    };
+    struct Completion {
+        std::uint64_t generation = 0;
+        std::shared_ptr<const Rows> rows;
+        std::vector<std::size_t> visible;
+    };
+    std::atomic<std::uint64_t> generation{0};
+    std::mutex mutex;
+    std::condition_variable_any ready;
+    std::optional<Request> request;
+    std::optional<Completion> completion;
+    std::jthread worker;
+};
+SearchView::SearchView(wxWindow *parent) : wxPanel(parent), filter_work_(std::make_shared<FilterWork>()),
+                                           filter_timer_(this) {
     SetName("search-view");
     const int pad = FromDIP(4);
     auto *box = new wxBoxSizer(wxVERTICAL);
@@ -394,6 +417,7 @@ SearchView::SearchView(wxWindow *parent) : wxPanel(parent) {
         }
     };
     filter_->Bind(wxEVT_TEXT, [this](wxCommandEvent &) { render(); });
+    Bind(wxEVT_TIMER, [this](wxTimerEvent &) { poll_filter(); }, filter_timer_.GetId());
     clear->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { filter_->SetValue(""); });
     previous_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { step(false); });
     next_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { step(true); });
@@ -424,6 +448,47 @@ SearchView::SearchView(wxWindow *parent) : wxPanel(parent) {
     });
     table_->SetToolTip("Search results. Use Up/Down to select a result; Enter or double-click navigates. Alt+Up/Down moves to the previous/next visible result.");
     filter_->SetToolTip("Filter loaded result metadata. Ctrl+L focuses this field; Enter the document, offset, address, size, operand index, or history text to narrow the list.");
+    auto *work = filter_work_.get();
+    work->worker = std::jthread([work](std::stop_token stop) {
+        while (!stop.stop_requested()) {
+            FilterWork::Request request;
+            {
+                std::unique_lock lock(work->mutex);
+                work->ready.wait(lock, stop, [&] { return work->request.has_value(); });
+                if (stop.stop_requested()) return;
+                request = std::move(*work->request);
+                work->request.reset();
+            }
+            FilterWork::Completion completion;
+            completion.generation = request.generation;
+            completion.rows = std::move(request.rows);
+            if (completion.rows) {
+                completion.visible.reserve(completion.rows->items.size());
+                for (std::size_t index = 0; index < completion.rows->items.size(); ++index) {
+                    if ((index & 255u) == 0 &&
+                        (stop.stop_requested() || work->generation.load(std::memory_order_acquire) != completion.generation))
+                        break;
+                    const auto &item = completion.rows->items[index];
+                    if (request.needle.empty() || item.metadata.find(request.needle) != std::string::npos)
+                        completion.visible.push_back(index);
+                }
+            }
+            if (stop.stop_requested()) return;
+            if (work->generation.load(std::memory_order_acquire) != completion.generation) continue;
+            {
+                std::lock_guard lock(work->mutex);
+                if (work->generation.load(std::memory_order_relaxed) == completion.generation)
+                    work->completion = std::move(completion);
+            }
+        }
+    });
+}
+SearchView::~SearchView() {
+    filter_timer_.Stop();
+    if (filter_work_ && filter_work_->worker.joinable()) {
+        filter_work_->worker.request_stop();
+        filter_work_->ready.notify_all();
+    }
 }
 void SearchView::update(std::optional<DocumentId> document, const SearchHistory *history, bool pending,
                         const wxString &reason, std::shared_ptr<const Image> image,
@@ -479,8 +544,11 @@ void SearchView::update_all(const std::vector<SearchDocumentView> &documents) {
                               address ? location_text(*address, document.image.get()) : wxString("file only"),
                               number(match.size), match.operand_index ? number(*match.operand_index) : wxString{},
                               number(item.index + 1)};
-                for (const auto &cell : item.cells) item.metadata += cell + "\n";
-                item.metadata.MakeLower();
+                wxString metadata;
+                for (const auto &cell : item.cells) metadata += cell + "\n";
+                metadata.MakeLower();
+                const auto encoded_metadata = metadata.utf8_string();
+                item.metadata.assign(encoded_metadata.data(), encoded_metadata.length());
                 rows->items.push_back(std::move(item));
             }
     }
@@ -509,16 +577,49 @@ void SearchView::update_all(const std::vector<SearchDocumentView> &documents) {
     render();
 }
 void SearchView::render() {
-    const auto rows = rows_;
-    auto visible = std::make_shared<std::vector<std::size_t>>();
-    const auto needle = filter_->GetValue().Lower();
+    if (!filter_work_) return;
+    const auto generation = filter_work_->generation.fetch_add(1, std::memory_order_acq_rel) + 1;
+    const auto needle = filter_->GetValue().Lower().utf8_string();
+    {
+        std::lock_guard lock(filter_work_->mutex);
+        filter_work_->request = FilterWork::Request{generation, rows_, needle};
+        filter_work_->completion.reset();
+    }
+    // While a new filter is being computed, remove all selectable rows so an
+    // old filter can never navigate to a result that no longer matches.
+    visible_.reset();
+    table_->populate(0, {});
+    previous_->Disable();
+    next_->Disable();
+    copy_->Disable();
+    export_->Disable();
+    const auto status = wxString("Filtering ") + number(rows_ ? rows_->items.size() : 0) + " loaded search results…";
+    status_->SetLabel(status);
+    status_->SetToolTip(status);
+    preview_->ChangeValue("Filtering loaded search results; navigation is paused until the current filter finishes.");
+    if (!filter_timer_.IsRunning()) filter_timer_.Start(25);
+    filter_work_->ready.notify_one();
+}
+void SearchView::poll_filter() {
+    if (!filter_work_) return;
+    std::optional<FilterWork::Completion> completion;
+    {
+        std::lock_guard lock(filter_work_->mutex);
+        if (filter_work_->completion) {
+            completion = std::move(filter_work_->completion);
+            filter_work_->completion.reset();
+        }
+    }
+    if (!completion || completion->generation != filter_work_->generation.load(std::memory_order_acquire) ||
+        completion->rows != rows_) return;
+    filter_timer_.Stop();
+    auto visible = std::make_shared<std::vector<std::size_t>>(std::move(completion->visible));
     std::optional<std::size_t> selected;
-    if (rows) for (std::size_t index = 0; index < rows->items.size(); ++index) {
-        const auto &item = rows->items[index];
-        if (!needle.empty() && item.metadata.Find(needle) == wxNOT_FOUND) continue;
+    const auto rows = rows_;
+    if (rows) for (std::size_t row = 0; row < visible->size(); ++row) {
+        const auto &item = rows->items[(*visible)[row]];
         if (selected_document_ && item.document == *selected_document_ && item.index == selected_index_ && item.page == selected_page_)
-            selected = visible->size();
-        visible->push_back(index);
+            selected = row;
     }
     visible_ = visible;
     table_->populate(visible->size(), [rows, visible](std::size_t row, int column) {
