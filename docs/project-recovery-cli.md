@@ -49,15 +49,18 @@ hexlab_cli project recovery inspect-journal .\projects\sample.hxproj-journal --j
 ```
 
 The read-only inspector validates the rollback-journal magic, bounded page and
-sector sizes, and each complete page record's nonce-based checksum in the
-first journal segment. It reports the initial database page count, declared
-or inferred record count, checksum-valid prefix, partial trailing bytes, and
-why inspection stopped. `--max-records` accepts 1..65536 and `--max-bytes`
-accepts 64..67108864; defaults are 4096 records and 64 MiB. Journal headers
-use sector padding, which is respected when locating the first page record.
-SQLite may place later segment headers after a declared record group; bytes
-beyond the first segment are reported as uninspected rather than treated as
-validated. The command never opens the database through SQLite, associates
+sector sizes, and each complete page record's nonce-based checksum across
+sector-aligned journal segments. Each later segment must retain the first
+segment's page and sector sizes; inter-segment padding must be zero. It reports
+the initial database page count, aggregate declared or inferred record count,
+checksum-valid prefix, partial trailing bytes, and why inspection stopped.
+The database API also reports how many segments were seen and fully checked.
+`--max-records` accepts 1..65536 and `--max-bytes` accepts 64..67108864;
+defaults are 4096 records and 64 MiB. The byte limit includes segment headers,
+page records, padding reads, and the final source-header recheck. Segment
+traversal is capped at 4096 headers. Invalid later headers, inconsistent
+geometry, nonzero inter-segment padding, or truncated records remain explicit
+incomplete diagnostics. The command never opens the database through SQLite, associates
 the journal with a base file, or replays pages. A valid prefix is diagnostic
 evidence only, not a repaired or recoverable project. See the
 [SQLite rollback journal format](https://sqlite.org/fileformat.html#rollback_journal).
