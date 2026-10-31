@@ -2498,6 +2498,39 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
                     return Store{operands.front(), reg_expr(value_register)};
             }
         }
+        const bool logical = instruction.opcode == Opcode::m6502_and || instruction.opcode == Opcode::m6502_ora ||
+                             instruction.opcode == Opcode::m6502_eor;
+        if (logical && instruction.operands.size() == 1 && operands.size() == 1 && operands.front() &&
+            operands.front()->type == integer_type(8) && instruction.flow == FlowKind::fallthrough &&
+            instruction.access == std::vector<OperandAccess>{OperandAccess::read} && !instruction.memory_write &&
+            instruction.register_writes == std::vector<RegisterOperand>{accumulator, status}) {
+            const auto *immediate = std::get_if<ImmediateOperand>(&instruction.operands.front());
+            const auto *memory = std::get_if<MemoryOperand>(&instruction.operands.front());
+            const bool immediate_form = immediate && immediate->encoded_width == 8 && immediate->effective_width == 8 &&
+                !immediate->is_signed && immediate->value <= 0xff && !instruction.memory_read;
+            const bool valid_memory_index = !memory || !memory->index ||
+                (memory->index->bank == RegisterBank::mos6502 && memory->index->width == 8 &&
+                 (memory->index->index == 1 || memory->index->index == 2));
+            const bool memory_form = memory && memory->data_width == 8 && memory->address_width == 16 &&
+                instruction.memory_read && !memory->base && !memory->ip_relative && valid_memory_index &&
+                std::holds_alternative<MemoryValue>(operands.front()->value);
+            std::vector<RegisterOperand> expected_reads;
+            if (memory && memory->index) expected_reads.push_back(*memory->index);
+            expected_reads.push_back(accumulator);
+            expected_reads.push_back(status);
+            if ((immediate_form || memory_form) && instruction.register_reads == expected_reads) {
+                const auto operation = instruction.opcode == Opcode::m6502_and ? "and" :
+                                       instruction.opcode == Opcode::m6502_ora ? "or" : "xor";
+                const auto result = binary(operation, reg_expr(accumulator), operands.front());
+                Intrinsic effect{instruction.opcode == Opcode::m6502_and ? "m65c02_and" :
+                                 instruction.opcode == Opcode::m6502_ora ? "m65c02_ora" : "m65c02_eor",
+                    {reg_expr(accumulator), operands.front(), reg_expr(status)},
+                    memory_form ? IntrinsicMemoryEffect::read : IntrinsicMemoryEffect::none};
+                effect.register_writes = {accumulator, status};
+                effect.register_output_values = {result, update_nz(result, reg_expr(status))};
+                return effect;
+            }
+        }
         const auto opcode = instruction.opcode;
         const bool accumulator_adjust = opcode == Opcode::m6502_inc || opcode == Opcode::m6502_dec;
         const bool index_adjust = opcode == Opcode::m6502_inx || opcode == Opcode::m6502_dex ||
