@@ -3925,7 +3925,7 @@ struct MainFrame::Impl {
                 // starts in the dialog's cancellable worker after the UI has opened the chooser.
                 auto sources = std::make_shared<NameSearchSources>();
                 JumpSuggestionsDialog chooser(&frame, requested,
-                    [source_document, source_project, sources](const wxString &query, NamedLocationScope scope,
+                    [source_document, source_project, sources, requested](const wxString &query, NamedLocationScope scope,
                                      NamedLocationSearchMode mode, const std::atomic_bool &cancelled,
                                      std::size_t offset, std::size_t page_size) {
                         if (!sources->ready) {
@@ -3973,6 +3973,21 @@ struct MainFrame::Impl {
                             for (const auto *collection : {&sources->annotations, &sources->bookmarks, &sources->functions})
                                 sources->all.insert(sources->all.end(), collection->begin(), collection->end());
                             sources->ready = true;
+                        }
+                        // Preserve Jump's exact-name fast path without scanning on the UI thread.
+                        // Exact resolution includes checked named displacements and section bounds.
+                        if (query.CmpNoCase(requested) == 0) {
+                            const auto exact = resolve_named_location_expression(
+                                sources->all, sources->sections, requested);
+                            if (exact.location || exact.ambiguous) {
+                                NamedLocationSearch result;
+                                result.candidates = exact.candidates;
+                                result.truncated = sources->truncated;
+                                result.unique_exact_match = exact.location.has_value() && !sources->truncated;
+                                if (sources->truncated)
+                                    result.limitation = "source snapshot capped at 200000 records";
+                                return result;
+                            }
                         }
                         const auto *selected_entries = &sources->all;
                         const auto *selected_bounds = &sources->sections;

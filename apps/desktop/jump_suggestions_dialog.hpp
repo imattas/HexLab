@@ -323,6 +323,11 @@ private:
         }
         list_->Set(rows);
         if (!candidates_.empty()) list_->SetSelection(preserved);
+        if (result.unique_exact_match && !result.truncated && candidates_.size() == 1) {
+            list_->SetSelection(0);
+            EndModal(wxID_OK);
+            return;
+        }
         auto needle = query_->GetValue(); needle.Trim(true).Trim(false);
         const auto required = mode_->GetSelection() == static_cast<int>(NamedLocationSearchMode::exact) ? 1u : 2u;
         status_->SetLabel(needle.length() < required
