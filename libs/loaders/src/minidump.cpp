@@ -286,7 +286,8 @@ ContextArchitectureSelection select_compatible_context_architecture(
     if (amd64_context) return {amd64, false};
     return {system_architecture, false};
 }
-void add_arm64ec_candidate_overlay(MinidumpContext &context) {
+void add_arm64ec_candidate_overlay(MinidumpContext &context,
+                                   std::optional<std::pair<std::uint64_t, std::uint64_t>> teb_source = {}) {
     // ARM64EC_NT_CONTEXT overlays selected ARM64 core registers on the same
     // storage used by an AMD64 CONTEXT. These are candidate aliases only:
     // ARM64 SystemInfo plus an AMD64-shaped context cannot distinguish
@@ -347,6 +348,23 @@ void add_arm64ec_candidate_overlay(MinidumpContext &context) {
     // each composite register as four noncontiguous 16-bit x87 slot fields.
     add_composite("x16", {0x128, 0x138, 0x148, 0x158});
     add_composite("x17", {0x168, 0x178, 0x188, 0x198});
+    // X18 is fixed to the thread's TEB in user-mode ARM64EC. The AMD64
+    // CONTEXT has no GS.base value, but MINIDUMP_THREAD carries the TEB VA.
+    // Keep the row conditional because the same AMD64 context can be x64 code.
+    if (teb_source && teb_source->first != 0) {
+        MinidumpRegister alias;
+        alias.name = "arm64ec_candidate_x18";
+        alias.width = 64;
+        alias.value = teb_source->first;
+        alias.file_offset = {teb_source->second};
+        alias.bytes.reserve(8);
+        alias.byte_file_offsets.reserve(8);
+        for (std::size_t byte = 0; byte < 8; ++byte) {
+            alias.bytes.push_back(static_cast<std::byte>((teb_source->first >> (byte * 8)) & 0xff));
+            alias.byte_file_offsets.push_back({teb_source->second + byte});
+        }
+        aliases.push_back(std::move(alias));
+    }
     if (aliases.empty()) return;
     context.registers.insert(context.registers.begin() + static_cast<std::ptrdiff_t>(insert_at),
                              aliases.begin(), aliases.end());
@@ -1064,7 +1082,8 @@ Result<LoadedImage> load_minidump(std::shared_ptr<const ByteStorage> storage, st
             }
         }
 
-        auto context_at = [&](std::uint32_t size, std::uint32_t rva)
+        auto context_at = [&](std::uint32_t size, std::uint32_t rva,
+                              std::optional<std::pair<std::uint64_t, std::uint64_t>> teb_source)
             -> Result<std::optional<MinidumpContext>> {
             if (stop.stop_requested()) return Error{ErrorCode::canceled, "Minidump context decoding canceled"};
             if (!size) return std::optional<MinidumpContext>{};
@@ -1115,7 +1134,7 @@ Result<LoadedImage> load_minidump(std::shared_ptr<const ByteStorage> storage, st
                         : "AMD64-compatible 1232-byte context selected from its AMD64 ContextFlags; ARM64EC versus x64 emulation is not distinguishable from this context alone");
                 }
                 if (metadata.processor_architecture == 12 && selection.architecture == 9 && size == 1232)
-                    add_arm64ec_candidate_overlay(decoded);
+                    add_arm64ec_candidate_overlay(decoded, teb_source);
             }
             auto context = std::move(decoded);
             if (context.status != MinidumpContextStatus::decoded) ++context_issue_count;
@@ -1358,7 +1377,10 @@ Result<LoadedImage> load_minidump(std::shared_ptr<const ByteStorage> storage, st
                     (thread.backing_store_size && (thread.backing_store_address > UINT64_MAX - thread.backing_store_size ||
                                                    !extent(thread.backing_store_rva, thread.backing_store_size, storage->size()))))
                     return Error{ErrorCode::malformed, "Minidump thread stack/context/backing-store data is outside the input"};
-                auto context = context_at(thread.context_size, thread.context_rva);
+                const auto teb_source = thread.teb
+                    ? std::make_optional(std::make_pair(thread.teb, thread.record_file_offset.value + 16))
+                    : std::nullopt;
+                auto context = context_at(thread.context_size, thread.context_rva, teb_source);
                 if (!context) return context.error();
                 thread.context = std::move(context.value());
                 metadata.threads.push_back(std::move(thread));
@@ -1389,7 +1411,13 @@ Result<LoadedImage> load_minidump(std::shared_ptr<const ByteStorage> storage, st
             row.context_rva = static_cast<std::uint32_t>(u(bytes.value().bytes, 164, 4));
             if (row.context_size && !extent(row.context_rva, row.context_size, storage->size()))
                 return Error{ErrorCode::malformed, "Minidump exception context is outside the input"};
-            auto context = context_at(row.context_size, row.context_rva);
+            const auto thread = std::find_if(metadata.threads.begin(), metadata.threads.end(), [&](const auto &candidate) {
+                return candidate.id == row.thread_id;
+            });
+            const auto teb_source = thread != metadata.threads.end() && thread->teb
+                ? std::make_optional(std::make_pair(thread->teb, thread->record_file_offset.value + 16))
+                : std::nullopt;
+            auto context = context_at(row.context_size, row.context_rva, teb_source);
             if (!context) return context.error();
             row.context = std::move(context.value());
             metadata.exception = std::move(row);
