@@ -24,8 +24,11 @@ class Itanium {
         if (take("GV")) return parse_object_special_name("guard variable for ");
         if (take("TH")) return parse_object_special_name("TLS init function for ");
         if (take("TW")) return parse_object_special_name("TLS wrapper function for ");
-        if (take("Th")) return parse_thunk("non-virtual thunk", false);
-        if (take("Tv")) return parse_thunk("virtual thunk", false);
+        if (input_.substr(at_, 2) == "Th" || input_.substr(at_, 2) == "Tv") {
+            // The h/v marker belongs to <call-offset>, not the T prefix.
+            ++at_;
+            return parse_thunk(peek() == 'h' ? "non-virtual thunk" : "virtual thunk", false);
+        }
         if (take("Tc")) return parse_thunk("covariant return thunk", true);
         if (take("TC")) return parse_construction_vtable();
         if (input_.substr(at_, 2) == "TV" || input_.substr(at_, 2) == "TT" ||
@@ -51,16 +54,20 @@ class Itanium {
         const bool negative = take("n");
         const auto begin = at_;
         while (peek() >= '0' && peek() <= '9') ++at_;
-        if (begin == at_ || !take("_") || (at_ - begin > 2 && input_[begin] == '0')) malformed();
+        const auto digits_end = at_;
+        if (begin == digits_end || (digits_end - begin > 1 && input_[begin] == '0') || !take("_")) malformed();
         std::uint64_t magnitude = 0;
-        const auto [end, error] = std::from_chars(input_.data() + begin, input_.data() + at_ - 1, magnitude);
-        if (error != std::errc{} || end != input_.data() + at_ - 1 ||
-            magnitude > static_cast<std::uint64_t>((std::numeric_limits<std::int64_t>::max)())) malformed();
-        return (negative ? "-" : "+") + std::to_string(magnitude);
+        const auto [end, error] = std::from_chars(input_.data() + begin, input_.data() + digits_end, magnitude);
+        const auto max_magnitude = static_cast<std::uint64_t>((std::numeric_limits<std::int64_t>::max)()) +
+                                   (negative ? 1u : 0u);
+        if (error != std::errc{} || end != input_.data() + digits_end || magnitude > max_magnitude ||
+            (negative && magnitude == 0)) malformed();
+        // Keep the magnitude unsigned so INT64_MIN never requires signed negation.
+        return combine({negative ? "-" : "+", std::to_string(magnitude)});
     }
     std::string render_offset(const Offset &offset) const {
-        if (!offset.virtual_adjustment) return "this=" + offset.value;
-        return "this=" + offset.value + ", vcall=" + offset.vcall;
+        if (!offset.virtual_adjustment) return combine({"this=", offset.value});
+        return combine({"this=", offset.value, ", vcall=", offset.vcall});
     }
     std::string parse_thunk(std::string_view kind, bool covariant) {
         const auto this_offset = parse_offset();

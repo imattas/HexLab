@@ -228,6 +228,24 @@ and a complete target function encoding. Their rendered names include the
 encoded `this` and optional vcall/return adjustments, for example
 `virtual thunk [this=-8, vcall=+16] to Widget::run()`. Offset values are
 reported as encoded; HexLab does not infer runtime adjustment behavior.
+The ordinary thunk productions are `_ZT h <number>_ <function-encoding>`
+and `_ZT v <number>_ <number>_ <function-encoding>` (spaces shown only for
+readability). The `h` or `v` is consumed once as part of the call offset;
+the target uses the same bounded name, substitution, parameter, and member
+qualifier grammar as ordinary functions. For example,
+`_ZThn8_N6Widget3runEv` renders as
+`non-virtual thunk [this=-8] to Widget::run()`, and
+`_ZTv0_n24_NK6Widget3runEi` renders as
+`virtual thunk [this=+0, vcall=-24] to Widget::run(int) const`.
+Each offset uses canonical decimal digits with an optional `n` negative
+marker and a required underscore. Values must fit the signed 64-bit range
+(`-9223372036854775808` through `9223372036854775807`); leading zeroes,
+negative zero, explicit signs, missing fields or delimiters, and overflow are
+malformed. The target must include a function parameter encoding, so an
+object-only name or truncated target cannot produce a thunk label. All label
+and offset rendering obeys `max_output_bytes`, and failures retain the raw
+symbol. These rules follow the ABI's
+[virtual override thunk grammar](https://itanium-cxx-abi.github.io/cxx-abi/abi.html#mangling-special-thunks).
 `GR` lifetime-extended temporary names parse their complete object name and
 optional base-36 sequence ID; the first temporary has no encoded sequence ID.
 Output labels distinguish the first temporary from later sequence IDs without
