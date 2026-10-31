@@ -12,7 +12,7 @@
 namespace hexlab {
 enum class DecodeStatus { decoded, unsupported, invalid, truncated };
 enum class FlowKind { fallthrough, call, conditional_branch, jump, ret, trap, switch_dispatch, data };
-enum class RegisterBank { gpr, ip, flags, segment, arm32_gpr, arm64_gpr, arm64_sp, arm64_zero, arm_flags, riscv_gpr, mips_gpr, mos6502, mips_hilo, mips_cp0, x87, ppc_gpr, ppc_cr, ppc_lr, ppc_ctr, xmm, riscv_fpr, riscv_fstatus, mips_fpr, mips_fcsr, cil_stack, ymm, riscv_vpr, riscv_vcsr, cil_continuation, ppc_xer, x87_status, x87_control, x87_tag, arm64_simd, dex_vreg, jvm_local, wasm_stack, mxcsr, zmm, opmask, ppc_fpr, jvm_stack, ppc_fpscr, ppc_vr, wasm_local, ppc_crbit, arm32_vfp };
+enum class RegisterBank { gpr, ip, flags, segment, arm32_gpr, arm64_gpr, arm64_sp, arm64_zero, arm_flags, riscv_gpr, mips_gpr, mos6502, mips_hilo, mips_cp0, x87, ppc_gpr, ppc_cr, ppc_lr, ppc_ctr, xmm, riscv_fpr, riscv_fstatus, mips_fpr, mips_fcsr, cil_stack, ymm, riscv_vpr, riscv_vcsr, cil_continuation, ppc_xer, x87_status, x87_control, x87_tag, arm64_simd, dex_vreg, jvm_local, wasm_stack, mxcsr, zmm, opmask, ppc_fpr, jvm_stack, ppc_fpscr, ppc_vr, wasm_local, ppc_crbit, arm32_vfp, arm_saved_flags };
 enum class Opcode {
     mov,
     movzx,
@@ -584,6 +584,8 @@ enum class Opcode {
     a32_sxtb16, a32_sxtab16, a32_uxtb16, a32_uxtab16,
     // PowerPC scalar population-count operations; append to preserve cache IDs.
     ppc_popcntw, ppc_popcntd,
+    // A32 CPSR/SPSR transfer instructions; appended for stable cache IDs.
+    a32_mrs, a32_msr,
     // AVX2 lane-local dword immediate shuffle; appended to preserve IDs.
     vpshufd,
     // RISC-V Ztso fence encoding; append to preserve persisted opcode values.
@@ -931,4 +933,3 @@ struct DecodeResult {
     bool semantic_decoder_used = false;
 };
 } // namespace hexlab
-
