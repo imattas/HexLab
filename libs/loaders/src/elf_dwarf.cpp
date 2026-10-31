@@ -101,6 +101,7 @@ void relocate_dwarf_data(const ElfMetadata &metadata,
         const bool riscv = metadata.header.machine == 243;
         const bool i386 = metadata.header.machine == 3;
         const bool arm32 = metadata.header.machine == 40;
+        const bool ppc64 = metadata.header.machine == 21 && metadata.header.is_64;
         std::uint8_t width = 0;
         if (x64 && rel.type == 1) width = 8;          // R_X86_64_64
         else if (x64 && rel.type == 2) width = 4;     // bounded same-section R_X86_64_PC32
@@ -113,12 +114,18 @@ void relocate_dwarf_data(const ElfMetadata &metadata,
         else if (i386 && rel.type == 2) width = 4;   // bounded same-section R_386_PC32
         else if (arm32 && rel.type == 2) width = 4;  // R_ARM_ABS32
         else if (arm32 && rel.type == 3) width = 4;  // bounded same-section R_ARM_REL32
+        else if (ppc64 && rel.type == 1) width = 4;  // R_PPC64_ADDR32
+        else if (ppc64 && rel.type == 26) width = 4; // bounded same-section R_PPC64_REL32
+        else if (ppc64 && rel.type == 38) width = 8; // R_PPC64_ADDR64
+        else if (ppc64 && rel.type == 44) width = 8; // bounded same-section R_PPC64_REL64
         else if (riscv && rel.type == 1) width = 4;  // R_RISCV_32
         else if (riscv && rel.type == 2 && metadata.header.is_64) width = 8; // R_RISCV_64
         else if (riscv && rel.type == 57) width = 4; // bounded same-section R_RISCV_32_PCREL
         else throw Failure{{ErrorCode::unsupported, "unsupported ELF relocation in DWARF section (type " + std::to_string(rel.type) + ")"}};
         require(metadata.header.order == ByteOrder::little, "big-endian DWARF relocation is unsupported", ErrorCode::unsupported);
         require(rel.field_size && *rel.field_size == width, "DWARF relocation width is not proven");
+        require(!ppc64 || rel.explicit_addend,
+                "PPC64 DWARF relocations require ABI-defined RELA addends", ErrorCode::unsupported);
         require(rel.symbol_index_validated && rel.symbol_table.has_value(), "DWARF relocation symbol provenance is unavailable", ErrorCode::unsupported);
         const ElfSymbol *symbol = nullptr;
         std::size_t symbol_matches = 0;
@@ -141,14 +148,17 @@ void relocate_dwarf_data(const ElfMetadata &metadata,
             // Sample original section bytes. Writes are deferred until all
             // rows are validated, so another relocation cannot change A.
             const bool unsigned_word_rel = width == 4 &&
-                ((i386 && rel.type == 1) || (arm32 && rel.type == 2));
+                ((i386 && rel.type == 1) || (arm32 && rel.type == 2) ||
+                 (ppc64 && rel.type == 1));
             const bool signed_word_rel = width == 4 &&
                 ((x64 && (rel.type == 2 || rel.type == 10 || rel.type == 11)) ||
                  (i386 && rel.type == 2) || (arm32 && rel.type == 3) ||
+                 (ppc64 && rel.type == 26) ||
                  (a64 && (rel.type == 258 || rel.type == 261)) ||
                  (riscv && (rel.type == 1 || rel.type == 57)));
             const bool signed_wide_rel = width == 8 &&
                 ((x64 && rel.type == 1) || (a64 && (rel.type == 257 || rel.type == 260)) ||
+                 (ppc64 && rel.type == 44) ||
                  (riscv && metadata.header.is_64 && rel.type == 2));
             require(unsigned_word_rel || signed_word_rel || signed_wide_rel,
                     "unsupported implicit-addend DWARF relocation", ErrorCode::unsupported);
@@ -164,7 +174,7 @@ void relocate_dwarf_data(const ElfMetadata &metadata,
         std::uint64_t sum = symbol->value;
         if ((x64 && rel.type == 2) || (i386 && rel.type == 2) ||
             (arm32 && rel.type == 3) || (a64 && (rel.type == 260 || rel.type == 261)) ||
-            (riscv && rel.type == 57)) {
+            (riscv && rel.type == 57) || (ppc64 && (rel.type == 26 || rel.type == 44))) {
             // Without final section placement, a cross-section PC-relative
             // value cannot be proven. Same-section offsets cancel P's base.
             require(symbol->section_index == *rel.target_section && symbol->value <= INT64_MAX &&
@@ -183,7 +193,8 @@ void relocate_dwarf_data(const ElfMetadata &metadata,
                         "PC-relative DWARF relocation result overflows signed 32-bit field");
                 sum = static_cast<std::uint32_t>(static_cast<std::int32_t>(result));
             }
-        } else if ((x64 && rel.type == 1) || (a64 && rel.type == 257) || (riscv && rel.type == 2)) {
+        } else if ((x64 && rel.type == 1) || (a64 && rel.type == 257) ||
+                   (riscv && rel.type == 2) || (ppc64 && rel.type == 38)) {
             // These 64-bit absolute relocations store the ABI-defined low
             // 64 bits of S+A.
             sum += static_cast<std::uint64_t>(addend);
