@@ -56,6 +56,7 @@ class DebuggerView final : public wxPanel {
         std::uint64_t runtime_address = 0;
         std::string source_location;
         bool instruction_step_over = false;
+        bool source_step_over = false;
     };
     std::shared_ptr<debugger::DebugSession> session_;
     std::shared_ptr<TerminationState> termination_state_;
