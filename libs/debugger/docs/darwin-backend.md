@@ -13,23 +13,31 @@ interrupt, detaches, and terminates. Stop events retain their sequence until
 the caller explicitly continues them. Detach restores owned software
 breakpoints before releasing the target.
 
-On native AArch64, stopped single-thread targets can install read, write, or
-read/write data watchpoints through Mach `ARM_DEBUG_STATE64`. Widths are 1, 2,
-4, or 8 bytes; each must be naturally aligned and stay within one eight-byte
-granule. Native x86-64 supports one-byte execution breakpoints and write or
+On native AArch64, stopped single-thread targets can install four-byte aligned
+hardware execute breakpoints and read, write, or read/write data watchpoints
+through Mach `ARM_DEBUG_STATE64`. Execute breakpoints use a logical size of one
+byte, matching the instruction-breakpoint API convention. Watchpoint widths
+are 1, 2, 4, or 8 bytes; each must be naturally aligned and stay within one
+eight-byte granule. Native x86-64 supports one-byte execution breakpoints and write or
 read/write data watchpoints through Mach `x86_DEBUG_STATE64`; read-only
 watchpoints are unsupported by x86 debug registers. Data widths are 1, 2, 4,
 or 8 bytes and addresses must be naturally aligned. Execute and data
-comparators share four slots. Both architectures preserve the selected
+comparators share four slots on x86-64; AArch64 uses the architecture's
+separate instruction and data comparator banks. Both architectures preserve the selected
 comparator's prior disabled state, verify the programmed comparator, and
 restore that state on disable, removal, and detach. Comparator changes made by
 another debugger are reported as conflicts rather than overwritten. Both
-remain limited to single-thread targets; AArch64 hardware execute breakpoints
-remain unsupported.
+remain limited to single-thread targets. On AArch64, an owned execute hit is
+matched against the stopped PC, its comparator is disabled for one instruction
+while the target single-steps, then the comparator is restored before the
+single-step event is delivered. A failed re-enable retains the pending event
+and comparator ownership so the caller can retry or detach cleanly.
 On x86-64, DR6 identifies owned execution and data comparator hits and the
 backend clears the reported hit bits before the stop is resumed. On AArch64,
 the backend attributes a data-watchpoint stop only when ESR identifies a valid,
-precise comparator hit owned by the session; other traps remain generic.
+precise comparator hit owned by the session. Hardware execute stops require an
+AArch64 breakpoint exception class and an exact match to an enabled owned
+comparator at PC; other traps remain generic.
 
 Lifecycle waits use a backend-local steady-clock deadline and
 `waitpid(WNOHANG | WUNTRACED)` polling with one-millisecond sleeps. The default
@@ -171,8 +179,7 @@ A batch that writes both aliases of one register is rejected before any Mach
 state is changed. Register values use the native little-endian byte order.
 
 Software breakpoints use x86 `INT3` or aligned AArch64 `BRK #0`, with
-enable/disable, restoration, and displaced-instruction stepping. Hardware
-breakpoints and watchpoints return `unsupported`. Cross-architecture debugging,
+enable/disable, restoration, and displaced-instruction stepping. Cross-architecture debugging,
 translated Rosetta register contexts, and accurate universal-binary slice
 identification during attach remain outside the current contract.
 

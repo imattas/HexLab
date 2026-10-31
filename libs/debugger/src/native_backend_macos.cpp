@@ -403,6 +403,16 @@ public:
                     if (!rearmed) return rearmed.error();
                 }
                 stepping_breakpoint_.reset();
+            }
+            if (step_expected_ && stepping_hardware_breakpoint_) {
+                const auto owned = std::find_if(watchpoints_.begin(), watchpoints_.end(), [&](const auto& item) {
+                    return item.id == *stepping_hardware_breakpoint_;
+                });
+                if (owned == watchpoints_.end())
+                    return Error{ErrorCode::conflict, "Darwin AArch64 execute-breakpoint ownership was lost during step-over"};
+                auto rearmed = set_watchpoint_enabled(*owned, true);
+                if (!rearmed) return rearmed.error();
+                stepping_hardware_breakpoint_.reset();
             } else if (stepping_breakpoint_ && WSTOPSIG(status) == SIGTRAP) {
                 // A prior attempt may have restored the original instruction
                 // before a Mach PC write failed. Reuse that exact ownership.
@@ -494,9 +504,9 @@ public:
                     mach_port_deallocate(mach_task_self(), port.value());
                 }
 #elif defined(__arm64__) || defined(__aarch64__)
-                // Darwin's AArch64 watchpoint exception carries the comparator
-                // index in ESR_EL1. Attribute only architecturally identified,
-                // valid and precise hits that belong to a live backend slot.
+                // AArch64 watchpoints identify their comparator in ESR_EL1;
+                // breakpoint exceptions identify the trapped PC. Attribute
+                // only exact matches to enabled comparators owned by us.
                 if (!watchpoints_.empty()) {
                     auto port = thread_port(event.thread);
                     if (!port) return port.error();
@@ -521,13 +531,29 @@ public:
                         index_valid && !may_be_false_positive && !far_not_precise && far_valid) {
                         const auto owned = std::find_if(watchpoints_.begin(), watchpoints_.end(),
                             [watchpoint_index](const WatchpointRecord& watchpoint) {
-                                return watchpoint.enabled && watchpoint.slot == watchpoint_index;
+                                return watchpoint.enabled && watchpoint.kind != BreakpointKind::execute &&
+                                    watchpoint.slot == watchpoint_index;
                             });
                         if (owned != watchpoints_.end()) {
                             event.address = owned->address;
                             event.breakpoint_ids.push_back(owned->id);
                             event.kind = EventKind::breakpoint;
                             event.message = "hardware watchpoint";
+                        }
+                    } else if (exception_class == 0x30u || exception_class == 0x31u) {
+                        const auto owned = std::find_if(watchpoints_.begin(), watchpoints_.end(),
+                            [pc](const WatchpointRecord& breakpoint) {
+                                return breakpoint.enabled && breakpoint.kind == BreakpointKind::execute &&
+                                    breakpoint.address == pc;
+                            });
+                        if (owned != watchpoints_.end()) {
+                            auto disabled = set_watchpoint_enabled(*owned, false);
+                            if (!disabled) return disabled.error();
+                            stepping_hardware_breakpoint_ = owned->id;
+                            event.address = owned->address;
+                            event.breakpoint_ids.push_back(owned->id);
+                            event.kind = EventKind::breakpoint;
+                            event.message = "hardware execute breakpoint";
                         }
                     }
                 }
@@ -566,6 +592,13 @@ public:
         if (stepping_breakpoint_) {
             const int signal = disposition == ContinueStatus::handled ? 0 : pending_signal_;
             if (ptrace(PT_STEP, pid_, reinterpret_cast<caddr_t>(1), signal) != 0) return sys_error("ptrace PT_STEP over breakpoint");
+            step_expected_ = true;
+            stopped_ = false; resume_incomplete_ = true;
+            return finish_resume();
+        }
+        if (stepping_hardware_breakpoint_) {
+            const int signal = disposition == ContinueStatus::handled ? 0 : pending_signal_;
+            if (ptrace(PT_STEP, pid_, reinterpret_cast<caddr_t>(1), signal) != 0) return sys_error("ptrace PT_STEP over hardware breakpoint");
             step_expected_ = true;
             stopped_ = false; resume_incomplete_ = true;
             return finish_resume();
@@ -844,6 +877,8 @@ public:
     }
 
     Result<Breakpoint> add_breakpoint(std::uint64_t address, BreakpointKind kind) override {
+        if (kind == BreakpointKind::hardware)
+            return add_hardware_breakpoint(address, BreakpointKind::execute, 1);
         if (kind != BreakpointKind::software) return unsupported("Darwin backend currently supports software breakpoints only");
         if (!stopped_) return Error{ErrorCode::busy, "software breakpoints can only be changed while the target is stopped"};
         const auto arch = process_architecture(pid_);
@@ -851,6 +886,10 @@ public:
         const auto size = arch == Architecture::arm64 ? 4u : 1u;
         if (arch == Architecture::arm64 && (address & 3u) != 0)
             return Error{ErrorCode::invalid_argument, "AArch64 software breakpoint address must be four-byte aligned"};
+        if (std::any_of(watchpoints_.begin(), watchpoints_.end(), [&](const auto& value) {
+                return value.address == address && value.kind == BreakpointKind::execute;
+            }))
+            return Error{ErrorCode::conflict, "software and hardware execute breakpoints cannot share an address"};
         if (breakpoints_.contains(address)) return Error{ErrorCode::conflict, "breakpoint already exists at address"};
         auto original = read_memory(address, size); if (!original) return original.error();
         std::vector<std::byte> trap = arch == Architecture::arm64
@@ -870,15 +909,24 @@ public:
 
     Result<Breakpoint> add_hardware_breakpoint(std::uint64_t address, BreakpointKind kind,
                                                std::uint8_t size) override {
+        if (kind == BreakpointKind::hardware) kind = BreakpointKind::execute;
 #if defined(__arm64__) || defined(__aarch64__)
-        if (kind != BreakpointKind::read && kind != BreakpointKind::write && kind != BreakpointKind::access)
-            return unsupported("Darwin AArch64 currently supports data watchpoints, not hardware execute breakpoints");
-        if (size != 1 && size != 2 && size != 4 && size != 8)
-            return Error{ErrorCode::invalid_argument, "Darwin AArch64 watchpoint size must be 1, 2, 4, or 8 bytes"};
-        if ((address & (size - 1u)) != 0 || (address & 7u) + size > 8)
-            return Error{ErrorCode::invalid_argument, "Darwin AArch64 watchpoint must be naturally aligned and fit one eight-byte granule"};
+        const bool execute = kind == BreakpointKind::execute;
+        if (!execute && kind != BreakpointKind::read && kind != BreakpointKind::write && kind != BreakpointKind::access)
+            return Error{ErrorCode::invalid_argument, "invalid Darwin AArch64 hardware breakpoint kind"};
+        if (execute) {
+            if (size != 1 || (address & 3u) != 0)
+                return Error{ErrorCode::invalid_argument, "Darwin AArch64 execute breakpoints require logical size 1 and four-byte alignment"};
+        } else {
+            if (size != 1 && size != 2 && size != 4 && size != 8)
+                return Error{ErrorCode::invalid_argument, "Darwin AArch64 watchpoint size must be 1, 2, 4, or 8 bytes"};
+            if ((address & (size - 1u)) != 0 || (address & 7u) + size > 8)
+                return Error{ErrorCode::invalid_argument, "Darwin AArch64 watchpoint must be naturally aligned and fit one eight-byte granule"};
+        }
         if (!stopped_ || !task_suspended_)
             return Error{ErrorCode::busy, "hardware breakpoints can only be changed while the Darwin target is stopped"};
+        if (kind == BreakpointKind::execute && breakpoints_.contains(address))
+            return Error{ErrorCode::conflict, "software and hardware execute breakpoints cannot share an address"};
         if (std::any_of(watchpoints_.begin(), watchpoints_.end(), [&](const auto& value) {
                 return value.address == address && value.kind == kind && value.size == size;
             }))
@@ -894,21 +942,28 @@ public:
             mach_port_deallocate(mach_task_self(), port.value());
             return Error{ErrorCode::malformed, "incomplete Darwin AArch64 debug register state"};
         }
-        constexpr auto watchpoint_slots = sizeof(state.__wvr) / sizeof(state.__wvr[0]);
-        std::size_t slot = watchpoint_slots;
-        for (std::size_t i = 0; i < watchpoint_slots; ++i)
-            if ((state.__wcr[i] & 1u) == 0) { slot = i; break; }
-        if (slot == watchpoint_slots) {
-            mach_port_deallocate(mach_task_self(), port.value());
-            return Error{ErrorCode::resource_limit, "no free Darwin AArch64 watchpoint comparator is available"};
+        constexpr auto slots = sizeof(state.__wvr) / sizeof(state.__wvr[0]);
+        std::size_t slot = slots;
+        for (std::size_t i = 0; i < slots; ++i) {
+            const auto control = execute ? state.__bcr[i] : state.__wcr[i];
+            if ((control & 1u) == 0) { slot = i; break; }
         }
-        const auto old_address = state.__wvr[slot];
-        const auto old_control = state.__wcr[slot];
+        if (slot == slots) {
+            mach_port_deallocate(mach_task_self(), port.value());
+            return Error{ErrorCode::resource_limit, execute
+                ? "no free Darwin AArch64 hardware breakpoint comparator is available"
+                : "no free Darwin AArch64 watchpoint comparator is available"};
+        }
+        const auto old_address = execute ? state.__bvr[slot] : state.__wvr[slot];
+        const auto old_control = execute ? state.__bcr[slot] : state.__wcr[slot];
         const auto byte_offset = static_cast<unsigned>(address & 7u);
         const auto byte_mask = ((1u << size) - 1u) << byte_offset;
         const auto access = kind == BreakpointKind::read ? 1u : kind == BreakpointKind::write ? 2u : 3u;
-        state.__wvr[slot] = address & ~std::uint64_t{7};
-        state.__wcr[slot] = 1u | (access << 3u) | (byte_mask << 5u);
+        const auto active_address = execute ? (address & ~std::uint64_t{3}) : (address & ~std::uint64_t{7});
+        const auto active_control = execute ? (1u | (0xfu << 5u) | (3u << 1u))
+                                            : (1u | (access << 3u) | (byte_mask << 5u));
+        if (execute) { state.__bvr[slot] = active_address; state.__bcr[slot] = active_control; }
+        else { state.__wvr[slot] = active_address; state.__wcr[slot] = active_control; }
         kr = thread_set_state(port.value(), ARM_DEBUG_STATE64,
                               reinterpret_cast<thread_state_t>(&state), count);
         if (kr != KERN_SUCCESS) {
@@ -920,22 +975,23 @@ public:
         kr = thread_get_state(port.value(), ARM_DEBUG_STATE64,
                               reinterpret_cast<thread_state_t>(&verify), &count);
         if (kr != KERN_SUCCESS || count != ARM_DEBUG_STATE64_COUNT ||
-            verify.__wvr[slot] != state.__wvr[slot] || verify.__wcr[slot] != state.__wcr[slot]) {
-            state.__wvr[slot] = old_address;
-            state.__wcr[slot] = old_control;
+            (execute ? verify.__bvr[slot] != active_address || verify.__bcr[slot] != active_control
+                     : verify.__wvr[slot] != active_address || verify.__wcr[slot] != active_control)) {
+            if (execute) { state.__bvr[slot] = old_address; state.__bcr[slot] = old_control; }
+            else { state.__wvr[slot] = old_address; state.__wcr[slot] = old_control; }
             const auto rollback = thread_set_state(port.value(), ARM_DEBUG_STATE64,
                                                    reinterpret_cast<thread_state_t>(&state), ARM_DEBUG_STATE64_COUNT);
             mach_port_deallocate(mach_task_self(), port.value());
             if (rollback != KERN_SUCCESS)
-                return Error{ErrorCode::io, "Darwin watchpoint verification failed and comparator rollback failed: " +
+                return Error{ErrorCode::io, "Darwin hardware comparator verification failed and rollback failed: " +
                              mach_error("thread_set_state rollback", rollback).message};
             if (kr != KERN_SUCCESS) return mach_error("thread_get_state verifying ARM_DEBUG_STATE64", kr);
-            return Error{ErrorCode::io, "Darwin watchpoint comparator did not retain the requested state"};
+            return Error{ErrorCode::io, "Darwin AArch64 comparator did not retain the requested state"};
         }
         mach_port_deallocate(mach_task_self(), port.value());
         const auto id = next_breakpoint_++;
         watchpoints_.push_back({id, address, kind, size, static_cast<std::uint8_t>(slot), old_address, old_control,
-                                state.__wvr[slot], state.__wcr[slot], true});
+                                active_address, active_control, true});
         return Breakpoint{id, address, kind, true, size};
 #elif defined(__x86_64__)
         if (kind != BreakpointKind::execute && kind != BreakpointKind::read &&
@@ -1194,7 +1250,7 @@ private:
     Status prepare_detach() {
         detach_signal_ = pending_signal_;
         if (pending_signal_ != SIGTRAP) return std::monostate{};
-        if (step_expected_ || stepping_breakpoint_) { detach_signal_ = 0; return std::monostate{}; }
+        if (step_expected_ || stepping_breakpoint_ || stepping_hardware_breakpoint_) { detach_signal_ = 0; return std::monostate{}; }
         if (breakpoints_.empty()) return std::monostate{};
         auto single = require_single_thread(); if (!single) return single.error();
         auto registers = read_registers_raw_for_id(single.value()); if (!registers) return registers.error();
@@ -1231,23 +1287,64 @@ private:
         auto kr = thread_get_state(port.value(), ARM_DEBUG_STATE64,
                                    reinterpret_cast<thread_state_t>(&state), &count);
         if (kr != KERN_SUCCESS) { mach_port_deallocate(mach_task_self(), port.value()); return mach_error("thread_get_state ARM_DEBUG_STATE64", kr); }
-        constexpr auto watchpoint_slots = sizeof(state.__wvr) / sizeof(state.__wvr[0]);
-        if (count != ARM_DEBUG_STATE64_COUNT || record.slot >= watchpoint_slots) {
+        constexpr auto slots = sizeof(state.__wvr) / sizeof(state.__wvr[0]);
+        if (count != ARM_DEBUG_STATE64_COUNT || record.slot >= slots) {
             mach_port_deallocate(mach_task_self(), port.value());
-            return Error{ErrorCode::malformed, "incomplete Darwin AArch64 watchpoint state"};
+            return Error{ErrorCode::malformed, "incomplete Darwin AArch64 hardware comparator state"};
         }
         const auto expected_address = enable ? record.old_address : record.active_address;
         const auto expected_control = enable ? record.old_control : record.active_control;
-        if (state.__wvr[record.slot] != expected_address || state.__wcr[record.slot] != expected_control) {
+        auto& address = record.kind == BreakpointKind::execute
+            ? state.__bvr[record.slot] : state.__wvr[record.slot];
+        auto& control = record.kind == BreakpointKind::execute
+            ? state.__bcr[record.slot] : state.__wcr[record.slot];
+        if (address != expected_address || control != expected_control) {
             mach_port_deallocate(mach_task_self(), port.value());
-            return Error{ErrorCode::conflict, "Darwin watchpoint comparator changed outside this debugger"};
+            return Error{ErrorCode::conflict, "Darwin hardware comparator changed outside this debugger"};
         }
-        state.__wvr[record.slot] = enable ? record.active_address : record.old_address;
-        state.__wcr[record.slot] = enable ? record.active_control : record.old_control;
+        address = enable ? record.active_address : record.old_address;
+        control = enable ? record.active_control : record.old_control;
         kr = thread_set_state(port.value(), ARM_DEBUG_STATE64,
                               reinterpret_cast<thread_state_t>(&state), count);
+        if (kr != KERN_SUCCESS) {
+            const auto apply_error = mach_error("thread_set_state ARM_DEBUG_STATE64", kr);
+            address = expected_address;
+            control = expected_control;
+            const auto rollback = thread_set_state(port.value(), ARM_DEBUG_STATE64,
+                reinterpret_cast<thread_state_t>(&state), ARM_DEBUG_STATE64_COUNT);
+            mach_port_deallocate(mach_task_self(), port.value());
+            if (rollback != KERN_SUCCESS)
+                return Error{apply_error.code, apply_error.message + "; comparator rollback failed: " +
+                    mach_error("thread_set_state rollback", rollback).message};
+            return apply_error;
+        }
+        arm_debug_state64_t verify{};
+        count = ARM_DEBUG_STATE64_COUNT;
+        kr = thread_get_state(port.value(), ARM_DEBUG_STATE64,
+                              reinterpret_cast<thread_state_t>(&verify), &count);
+        const auto target_address = enable ? record.active_address : record.old_address;
+        const auto target_control = enable ? record.active_control : record.old_control;
+        const auto& verified_address = record.kind == BreakpointKind::execute
+            ? verify.__bvr[record.slot] : verify.__wvr[record.slot];
+        const auto& verified_control = record.kind == BreakpointKind::execute
+            ? verify.__bcr[record.slot] : verify.__wcr[record.slot];
+        if (kr != KERN_SUCCESS || count != ARM_DEBUG_STATE64_COUNT ||
+            verified_address != target_address || verified_control != target_control) {
+            address = expected_address;
+            control = expected_control;
+            const auto rollback = thread_set_state(port.value(), ARM_DEBUG_STATE64,
+                reinterpret_cast<thread_state_t>(&state), ARM_DEBUG_STATE64_COUNT);
+            mach_port_deallocate(mach_task_self(), port.value());
+            if (rollback != KERN_SUCCESS)
+                return Error{ErrorCode::io, "Darwin comparator verification failed and rollback failed: " +
+                    mach_error("thread_set_state rollback", rollback).message};
+            if (kr != KERN_SUCCESS) return mach_error("thread_get_state verifying ARM_DEBUG_STATE64", kr);
+            if (count != ARM_DEBUG_STATE64_COUNT)
+                return Error{ErrorCode::malformed, "incomplete Darwin AArch64 comparator state during verification"};
+            return Error{ErrorCode::io, "Darwin AArch64 comparator did not retain the requested state"};
+        }
         mach_port_deallocate(mach_task_self(), port.value());
-        return kr == KERN_SUCCESS ? Status{std::monostate{}} : Status{mach_error("thread_set_state ARM_DEBUG_STATE64", kr)};
+        return std::monostate{};
     }
 #elif defined(__x86_64__)
     Status update_watchpoint_state(const WatchpointRecord& record, bool enable) {
@@ -1746,7 +1843,7 @@ private:
         pid_ = 0; stopped_ = false; exited_ = false;
         task_suspended_ = false;
         pending_.reset(); initial_event_.reset(); pending_signal_ = 0; step_expected_ = false;
-        stepping_breakpoint_.reset(); breakpoints_.clear(); watchpoints_.clear();
+        stepping_breakpoint_.reset(); stepping_hardware_breakpoint_.reset(); breakpoints_.clear(); watchpoints_.clear();
         module_snapshot_.clear(); module_events_.clear(); deferred_event_.reset(); pending_module_event_ = false;
     }
     pid_t pid_ = 0;
@@ -1760,6 +1857,7 @@ private:
     std::optional<std::uint64_t> pending_;
     std::optional<DebugEvent> initial_event_;
     std::optional<std::pair<std::uint64_t, std::vector<std::byte>>> stepping_breakpoint_;
+    std::optional<BreakpointId> stepping_hardware_breakpoint_;
     std::map<std::uint64_t, BreakpointRecord> breakpoints_;
     std::vector<WatchpointRecord> watchpoints_;
     std::vector<ModuleInfo> module_snapshot_;
