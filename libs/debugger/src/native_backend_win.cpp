@@ -983,6 +983,10 @@ public:
         }
         auto restored_x86_step = restore_scheduled_x86_step();
         if (!restored_x86_step) return restored_x86_step;
+        auto restored_arm64_step = restore_scheduled_arm64_step();
+        if (!restored_arm64_step) return restored_arm64_step;
+        auto restored_arm64_hardware_step = restore_arm64_hardware_step();
+        if (!restored_arm64_hardware_step) return restored_arm64_hardware_step;
         if (arm32_step_) {
             auto restored = restore_arm32_step();
             if (!restored) return restored;
@@ -1149,21 +1153,24 @@ public:
             }
         }
         const bool completed_arm64_step = arm64_step_thread_ && *arm64_step_thread_ == event.dwThreadId;
+        const bool interrupted_arm64_step = arm64_step_thread_ && !completed_arm64_step;
         std::string arm64_step_restore_diagnostic;
-        if (completed_arm64_step && event.dwDebugEventCode != EXIT_THREAD_DEBUG_EVENT &&
+        if (arm64_step_thread_ && event.dwDebugEventCode != EXIT_PROCESS_DEBUG_EVENT &&
+            !(event.dwDebugEventCode == EXIT_THREAD_DEBUG_EVENT && event.dwThreadId == *arm64_step_thread_) &&
             arm64_step_original_cpsr_) {
-            auto restored = restore_arm64_step_cpsr(event.dwThreadId, *arm64_step_original_cpsr_);
+            auto restored = restore_arm64_step_cpsr(*arm64_step_thread_, *arm64_step_original_cpsr_);
             if (restored) {
                 arm64_step_thread_.reset();
                 arm64_step_original_cpsr_.reset();
             } else arm64_step_restore_diagnostic = restored.error().message;
-        } else if (completed_arm64_step) {
+        } else if (arm64_step_thread_ && (event.dwDebugEventCode == EXIT_PROCESS_DEBUG_EVENT ||
+                   (event.dwDebugEventCode == EXIT_THREAD_DEBUG_EVENT && event.dwThreadId == *arm64_step_thread_))) {
             arm64_step_thread_.reset();
             arm64_step_original_cpsr_.reset();
         }
         std::string arm64_hw_step_restore_diagnostic;
-        if (arm64_hardware_step_ && arm64_hardware_step_->thread == event.dwThreadId &&
-            event.dwDebugEventCode != EXIT_THREAD_DEBUG_EVENT && event.dwDebugEventCode != EXIT_PROCESS_DEBUG_EVENT) {
+        if (arm64_hardware_step_ && event.dwDebugEventCode != EXIT_THREAD_DEBUG_EVENT &&
+            event.dwDebugEventCode != EXIT_PROCESS_DEBUG_EVENT) {
             auto restored = restore_arm64_hardware_step();
             if (!restored) arm64_hw_step_restore_diagnostic = restored.error().message;
         } else if (arm64_hardware_step_ &&
@@ -1306,6 +1313,8 @@ public:
             result.message += "; scheduled x86 single-step flags restoration failed: " + restored_x86_step.error().message;
         else if (interrupted_x86_step && event.dwDebugEventCode != EXIT_PROCESS_DEBUG_EVENT)
             result.message += "; scheduled event-owner step interrupted by a peer event";
+        if (interrupted_arm64_step && event.dwDebugEventCode != EXIT_PROCESS_DEBUG_EVENT)
+            result.message += "; scheduled ARM64 event-owner step interrupted by a peer event";
         return result;
     }
 
@@ -1322,10 +1331,6 @@ public:
             return Error{ErrorCode::invalid_argument, "the debugger-owned ARM32 step trap must be handled"};
         if (arm32_step_) {
             auto restored = restore_arm32_step();
-            if (!restored) return restored;
-        }
-        if (arm64_hardware_step_ && arm64_hardware_step_->thread == pending_->dwThreadId) {
-            auto restored = restore_arm64_hardware_step();
             if (!restored) return restored;
         }
         if (resume_event_owner && status == ContinueStatus::handled && target_architecture() == Architecture::arm64 &&
@@ -1446,12 +1451,17 @@ public:
             return found != breakpoints_.end() && found->second.enabled;
         }();
         const bool x86_step = target_architecture() == Architecture::x86 || target_architecture() == Architecture::x86_64;
+        const bool arm64_step = target_architecture() == Architecture::arm64;
         if (steps && (steps != 1 || owner_action->kind != ThreadResumeKind::single_step ||
-                      (runnable.size() != 1 && !arm64_execute_hit && !arm64_software_breakpoint_hit && !x86_step)))
-            return Error{ErrorCode::unsupported, "Windows schedules support one event-thread step or a continue-only thread subset; x86/x64 steps and ARM64 execute-breakpoint step-over may also continue selected peers"};
+                      (runnable.size() != 1 && !arm64_execute_hit && !arm64_software_breakpoint_hit && !x86_step && !arm64_step)))
+            return Error{ErrorCode::unsupported, "Windows schedules support one event-thread step or a continue-only thread subset; x86/x64 and ARM64 steps may also continue selected peers"};
         if (steps && disposition == ContinueStatus::not_handled)
             return Error{ErrorCode::unsupported,
                          "a Windows single-step cannot both pass an exception to the debuggee and execute an instruction"};
+        auto restored_arm64_step = restore_scheduled_arm64_step();
+        if (!restored_arm64_step) return restored_arm64_step;
+        auto restored_arm64_hardware_step = restore_arm64_hardware_step();
+        if (!restored_arm64_hardware_step) return restored_arm64_hardware_step;
         if (steps) {
             if (runnable.size() > 1 && x86_step)
                 return single_step_x86(sequence, disposition, runnable);
@@ -1469,6 +1479,10 @@ public:
     Status continue_selected_threads(std::uint64_t sequence, std::span<const ThreadId> selected, ContinueStatus status) {
         if (!pending_ || sequence != sequence_ || selected.empty() || selected.size() > max_inspection_threads)
             return Error{ErrorCode::invalid_argument, "thread-filtered continue has no matching pending event or selected threads"};
+        auto restored_arm64_step = restore_scheduled_arm64_step();
+        if (!restored_arm64_step) return restored_arm64_step;
+        auto restored_arm64_hardware_step = restore_arm64_hardware_step();
+        if (!restored_arm64_hardware_step) return restored_arm64_hardware_step;
         if (stepping_breakpoint_.active())
             return Error{ErrorCode::busy, "a displaced software-breakpoint step must complete before changing its thread schedule"};
         const bool event_owner_selected = std::find(selected.begin(), selected.end(),
@@ -3232,7 +3246,8 @@ private:
             CloseHandle(thread);
             return error;
         }
-        context.Cpsr = cpsr;
+        constexpr DWORD single_step_bit = DWORD{1} << 21;
+        context.Cpsr = (context.Cpsr & ~single_step_bit) | (cpsr & single_step_bit);
         const bool ok = SetThreadContext(thread, &context) != FALSE;
         const auto error = ok ? Error{} : win_error("SetThreadContext restoring ARM64 single-step flags");
         CloseHandle(thread);
@@ -3294,6 +3309,16 @@ private:
         // even when a peer stops first, so a later run cannot inherit the step.
         auto restored = write_eflags(thread, (flags.value() & ~trap_flag) | (original_flags & trap_flag));
         if (restored) scheduled_x86_step_.reset();
+        return restored;
+    }
+
+    Status restore_scheduled_arm64_step() {
+        if (!arm64_step_thread_ || !arm64_step_original_cpsr_) return std::monostate{};
+        auto restored = restore_arm64_step_cpsr(*arm64_step_thread_, *arm64_step_original_cpsr_);
+        if (restored) {
+            arm64_step_thread_.reset();
+            arm64_step_original_cpsr_.reset();
+        }
         return restored;
     }
 
