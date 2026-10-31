@@ -223,6 +223,11 @@ Result<std::vector<ElfLibraryResolution>> resolve_elf_needed_libraries(
 
     for (auto &resolution : base.value()) {
         if (stop.stop_requested()) return Error{ErrorCode::canceled, "ELF dependency resolution canceled"};
+        // A slash makes DT_NEEDED a direct pathname request rather than a
+        // library-name lookup. Keep the exact manifest result and do not
+        // prepend RPATH/RUNPATH directories.
+        if (resolution.needed_name.find('/') != std::string::npos)
+            continue;
         const auto original = resolution.candidates;
         resolution.state = ElfLibraryResolutionState::missing;
         resolution.manifest_index.reset();
