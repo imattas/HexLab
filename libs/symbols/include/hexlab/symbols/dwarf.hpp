@@ -321,6 +321,42 @@ struct SourceOrigin {
     bool operator==(const SourceOrigin &) const = default;
 };
 
+enum class DwarfMacroRecordKind : std::uint8_t { define, undefine, start_file, end_file };
+struct DwarfMacroRecord {
+    DwarfMacroRecordKind kind = DwarfMacroRecordKind::define;
+    SourceOrigin origin;
+    std::uint64_t line = 0;
+    std::optional<std::uint64_t> file_index;
+    std::optional<std::string> file_name;
+    std::string file_source_id;
+    std::string text;
+    bool operator==(const DwarfMacroRecord &) const = default;
+};
+struct DwarfMacroUnit {
+    std::string source_id;
+    std::uint16_t version = 0;
+    std::uint64_t section_offset = 0;
+    std::optional<std::uint64_t> line_table_offset;
+    std::vector<DwarfMacroRecord> records;
+    bool operator==(const DwarfMacroUnit &) const = default;
+};
+struct DwarfMacroSections {
+    std::string source_id;
+    std::span<const std::uint8_t> macro, strings;
+    std::span<const DwarfLineUnit> line_units;
+    std::uint64_t section_offset = 0;
+    bool little_endian = true;
+    std::size_t max_units = 65536;
+    std::size_t max_records = 1'000'000;
+    std::size_t max_text_bytes = 64u * 1024u * 1024u;
+    std::stop_token stop;
+};
+// Parses bounded DWARF v5 macro units for inline/strp define and undef records
+// plus start_file/end_file scope records. Supplementary, indexed-string, and
+// imported macro units fail explicitly as unsupported.
+HEXLAB_SYMBOLS_EXPORT hexlab::Result<std::vector<DwarfMacroUnit>> import_dwarf_macro_v5(
+    const DwarfMacroSections &sections);
+
 struct DwarfDeclarationLocation {
     // Raw DW_AT_decl_file index in the owning unit's line table.
     std::optional<std::uint64_t> file_index;
@@ -492,6 +528,7 @@ struct ImportResult {
     std::vector<ImportedEnumerator> enumerators;
     std::vector<DwarfLineUnit> line_units;
     std::vector<DwarfMacroContribution> macro_contributions;
+    std::vector<DwarfMacroUnit> macro_units;
     bool split_unit = false;
     std::optional<std::uint64_t> split_dwo_id;
     std::vector<std::string> diagnostics;
@@ -518,9 +555,10 @@ HEXLAB_SYMBOLS_EXPORT hexlab::Result<ImportResult> import_dwarf(const DwarfSecti
 // Imports one bounded DWARF v2/v5 DWP compile-unit contribution. The caller
 // owns package discovery and section extraction; strings and line_strings are
 // the shared DWO string sections. LINE and RNGLISTS contributions are consumed
-// when present; a matching indexed macro contribution is retained as opaque
-// bytes with package-index provenance. Indexed contributions are selected by
-// DWO ID, which is carried in the returned result.
+// when present; a matching indexed macro contribution is retained as raw
+// bytes with package-index provenance and parsed for the bounded v5 macro
+// subset. Indexed contributions are selected by DWO ID, which is carried in
+// the returned result.
 HEXLAB_SYMBOLS_EXPORT hexlab::Result<ImportResult> import_dwarf_package_unit(
     const DwarfPackageIndex &index, std::uint64_t dwo_id,
     std::span<const DwarfPackageSectionData> sections,
