@@ -340,22 +340,29 @@ graphs retain the existing fallback.
 
 An explicit-preheader post-tested loop may also use a bounded nested body-
 dispatch tree whose leaves end in distinct conditional latches. Each latch must
-target the dispatcher header on one edge and the same terminal exit block on
-the other. The shared exit may be an explicit return or one recognized
-non-returning `throw`, `rethrow_current_exception`, or `exception_unhandled`
-intrinsic. Internal dispatches and linear arm paths must have exact single-
-predecessor links; the complete function must be covered by the preheader,
-header, dispatch tree, latches, and one exit block. The tree is limited to 64
+target the dispatcher header on one edge and the same exit cleanup head on
+the other. The shared cleanup may contain up to 64 blocks including its final
+explicit return or recognized non-returning `throw`,
+`rethrow_current_exception`, or `exception_unhandled` intrinsic. The cleanup
+head's predecessors must be exactly all latch blocks. Every cleanup block
+after the head is register-phi-free and has exactly its preceding block
+as its CFG predecessor. Nonterminal cleanup blocks have one exact unconditional
+jump or fallthrough edge and cannot contain returns or explicit exception
+transfers. The cleanup cannot overlap the loop or preheader. Internal
+dispatches and linear arm paths must have exact single-predecessor links; the
+complete function must be covered by the preheader, header, dispatch tree,
+latches, and cleanup chain. The tree is limited to 64
 latch leaves, 127 branch nodes, and at most 64 nodes along any dispatch path
 (including its latch leaf); each linear path is capped at 64 blocks, and the
 complete function at 128 blocks and 4,096 edges. Header
 register phis must have exactly one initial input from the preheader and one
-recurrent input from every latch. Exit-block register phis must match exactly
+recurrent input from every latch. Cleanup-head register phis must match exactly
 the latch edges. The formatter emits the preheader once, applies initial phi
 copies, then emits each latch's repeat or exit copies before `continue` or
-`break`. Memory phis, shared paths, extra exits, side entries, branched or
-chained non-return exits, and malformed edge/phi sets retain the existing
-lossless fallback.
+`break`. It emits the shared cleanup once after the loop, so cleanup effects
+execute only on exit. Memory phis, register phis after the cleanup head, shared
+body paths, extra exits, side entries, branched cleanup, cleanup chains beyond
+64 blocks, and malformed edge/phi sets retain the existing lossless fallback.
 
 The acyclic structurer also handles nested regions with multiple explicit
 terminal returns. An analysis-only virtual exit supplies post-dominators for

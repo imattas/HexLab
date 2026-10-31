@@ -10649,8 +10649,8 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
     // A post-tested loop may begin at a conditional body dispatcher after a
     // straight-line function-entry/preheader chain. Bounded nested dispatch
     // trees can lead to multiple conditional latches which either repeat at
-    // the dispatcher or leave through one shared return. Every dispatch arm,
-    // latch, and phi edge is validated before emitting this form.
+    // the dispatcher or leave through one shared terminal cleanup chain. Every
+    // dispatch arm, latch, and phi edge is validated before emitting this form.
     auto try_explicit_preheader_multi_latch_loop = [&]() -> std::optional<StructuredPseudocode> {
         if (function.blocks.size() < 5 || function.blocks.size() > 128) return {};
         std::map<std::uint64_t, std::set<std::uint64_t>> predecessors;
@@ -10776,14 +10776,39 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
             !shared_exit_address) return {};
         roots = {*true_root, *false_root};
         const auto *exit = find_block(*shared_exit_address);
-        if (!exit || (!has_only_terminal_return(*exit) && !has_only_terminal_nonreturn(*exit)) ||
-            predecessors[header->id.value] != [&] {
+        if (!exit || predecessors[header->id.value] != [&] {
                 auto expected = latch_ids;
                 expected.insert(preheader->id.value);
                 return expected;
             }() || predecessors[exit->id.value] != latch_ids) return {};
 
-        if (!claimed.insert(exit->id.value).second || claimed.size() != function.blocks.size()) return {};
+        // All latch exits merge at the same cleanup head. Only that head may
+        // carry register phis; every later block has one exact incoming edge,
+        // and the entire chain executes once after leaving the loop.
+        std::vector<const LiftedBlock *> exit_path;
+        auto *cleanup = exit;
+        auto expected_predecessors = latch_ids;
+        while (cleanup && exit_path.size() < 64) {
+            if (predecessors[cleanup->id.value] != expected_predecessors ||
+                (cleanup != exit && !cleanup->phis.empty()) ||
+                !claimed.insert(cleanup->id.value).second) return {};
+            exit_path.push_back(cleanup);
+            if (has_only_terminal_return(*cleanup) || has_only_terminal_nonreturn(*cleanup)) break;
+            if (contains_return(*cleanup) || cleanup->successors.size() != 1 ||
+                !cleanup->successors.front().target ||
+                (cleanup->successors.front().kind != BlockEdgeKind::jump &&
+                 cleanup->successors.front().kind != BlockEdgeKind::fallthrough) ||
+                !has_unconditional_edge(*cleanup, *cleanup->successors.front().target) ||
+                std::any_of(cleanup->instructions.begin(), cleanup->instructions.end(), [](const auto &item) {
+                    const auto *intrinsic = std::get_if<Intrinsic>(&item.statement);
+                    return intrinsic && (intrinsic->name == "throw" ||
+                        intrinsic->name == "rethrow_current_exception" || intrinsic->name == "exception_unhandled");
+                })) return {};
+            expected_predecessors = {cleanup->id.value};
+            cleanup = find_block(*cleanup->successors.front().target);
+        }
+        if (exit_path.empty() || (!has_only_terminal_return(*exit_path.back()) &&
+            !has_only_terminal_nonreturn(*exit_path.back())) || claimed.size() != function.blocks.size()) return {};
 
         std::size_t phi_input_count = 0;
         const auto build_copies = [&](const LiftedBlock &target, const std::set<std::uint64_t> &expected,
@@ -10813,7 +10838,6 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
         header_predecessors.insert(preheader->id.value);
         if (!build_copies(*header, header_predecessors, header_copies) ||
             !build_copies(*exit, latch_ids, exit_copies)) return {};
-        if (exit->successors.size() != 0) return {};
 
         std::function<void(std::size_t, unsigned)> emit_tree;
         emit_tree = [&](std::size_t index, unsigned indent) {
@@ -10855,7 +10879,7 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
         out << "        } else {\n";
         emit_tree(roots[1], 12);
         out << "        }\n    }\n";
-        emit_block(*exit, 4, false);
+        for (const auto *block : exit_path) emit_block(*block, 4, true);
         out << "}\n";
         return StructuredPseudocode{out.str(), false, {}};
     };
