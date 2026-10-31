@@ -323,6 +323,11 @@ struct MinidumpLinuxStringRecord {
     FileOffset record_file_offset{};
     bool operator==(const MinidumpLinuxStringRecord &) const = default;
 };
+struct MinidumpLinuxKeyValueRecord {
+    std::string key, value;
+    FileOffset line_file_offset{};
+    bool operator==(const MinidumpLinuxKeyValueRecord &) const = default;
+};
 struct MinidumpLinuxTextStream {
     std::uint32_t stream_type = 0, declared_size = 0;
     FileOffset stream_file_offset{};
@@ -334,6 +339,11 @@ struct MinidumpLinuxTextStream {
     // records between delimiters.
     std::vector<MinidumpLinuxStringRecord> nul_separated_records;
     bool nul_separated_records_complete = true;
+    // Populated only for Breakpad cpuinfo and lsb-release text streams.
+    // Duplicate keys are retained in source order (cpuinfo commonly repeats
+    // per-processor fields); raw stream bytes remain authoritative.
+    std::vector<MinidumpLinuxKeyValueRecord> key_value_records;
+    bool key_value_records_complete = true;
     // Populated only for Breakpad's Linux maps stream. Invalid rows remain in
     // captured_bytes and make maps_complete false.
     std::vector<MinidumpLinuxMemoryMap> memory_maps;

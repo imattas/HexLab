@@ -531,6 +531,61 @@ Result<LoadedImage> load_minidump(std::shared_ptr<const ByteStorage> storage, st
                 if (!bytes) return bytes.error();
                 parsed.captured_bytes.assign(bytes.value().bytes.begin(), bytes.value().bytes.end());
             }
+            if (type == stream_linux_cpu_info || type == stream_linux_lsb_release) {
+                constexpr std::size_t max_linux_key_value_records = 8192;
+                constexpr std::size_t max_linux_key_bytes = 256;
+                constexpr std::size_t max_linux_value_bytes = 4096;
+                constexpr std::size_t max_linux_line_bytes = max_linux_key_bytes + max_linux_value_bytes + 8;
+                parsed.key_value_records_complete = !parsed.truncated;
+                const auto is_space = [](char ch) { return ch == ' ' || ch == '\t' || ch == '\r'; };
+                std::size_t cursor = 0;
+                while (cursor < parsed.captured_bytes.size()) {
+                    if (stop.stop_requested())
+                        return Error{ErrorCode::canceled, "Minidump Linux key/value stream parsing canceled"};
+                    const auto begin = cursor;
+                    while (cursor < parsed.captured_bytes.size() && parsed.captured_bytes[cursor] != std::byte{'\n'}) ++cursor;
+                    const auto end = cursor;
+                    if (cursor < parsed.captured_bytes.size()) ++cursor;
+                    if (begin == end) continue;
+                    if (end - begin > max_linux_line_bytes) {
+                        parsed.key_value_records_complete = false;
+                        continue;
+                    }
+                    const auto *line_data = reinterpret_cast<const char *>(parsed.captured_bytes.data() + begin);
+                    std::string_view line(line_data, end - begin);
+                    while (!line.empty() && is_space(line.back())) line.remove_suffix(1);
+                    std::size_t first = 0;
+                    while (first < line.size() && is_space(line[first])) ++first;
+                    line.remove_prefix(first);
+                    if (line.empty()) continue;
+                    const auto delimiter = line.find_first_of(":=");
+                    if (delimiter == std::string_view::npos || delimiter == 0 || delimiter > max_linux_key_bytes) {
+                        parsed.key_value_records_complete = false;
+                        continue;
+                    }
+                    auto key = line.substr(0, delimiter);
+                    while (!key.empty() && is_space(key.back())) key.remove_suffix(1);
+                    std::size_t value_begin = delimiter + 1;
+                    while (value_begin < line.size() && is_space(line[value_begin])) ++value_begin;
+                    auto value = line.substr(value_begin);
+                    if (key.empty() || key.size() > max_linux_key_bytes || value.size() > max_linux_value_bytes ||
+                        parsed.key_value_records.size() >= max_linux_key_value_records) {
+                        parsed.key_value_records_complete = false;
+                        if (parsed.key_value_records.size() >= max_linux_key_value_records) break;
+                        continue;
+                    }
+                    const auto cost = sizeof(MinidumpLinuxKeyValueRecord) + key.size() + value.size();
+                    if (cost > max_metadata_bytes - std::min<std::uint64_t>(budget, max_metadata_bytes))
+                        return Error{ErrorCode::resource_limit, "Minidump Linux key/value records exceed metadata byte budget"};
+                    parsed.key_value_records.push_back({std::string(key), std::string(value),
+                        FileOffset{std::uint64_t{row->rva} + begin}});
+                    budget += cost;
+                }
+                if (!parsed.key_value_records_complete)
+                    metadata.diagnostics.emplace_back(type == stream_linux_cpu_info
+                        ? "Minidump Linux cpuinfo has truncated, malformed, or over-limit rows; raw bytes remain available"
+                        : "Minidump Linux lsb-release has truncated, malformed, or over-limit rows; raw bytes remain available");
+            }
             if (type == stream_linux_cmd_line || type == stream_linux_environ) {
                 parsed.nul_separated_records_complete = !parsed.truncated;
                 std::size_t cursor = 0;

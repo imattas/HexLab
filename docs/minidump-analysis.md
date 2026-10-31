@@ -400,3 +400,17 @@ the shared metadata budget; larger streams keep the prefix and produce a
 truncation diagnostic. HexLab does not parse Intel PT packets, synchronize
 trace packets to instruction addresses, or reconstruct execution from this
 stream.
+
+## Breakpad Linux cpuinfo and release streams
+
+Breakpad's Linux `cpuinfo` (`0x47670003`) and `lsb-release` (`0x47670005`)
+streams retain their captured bytes and additionally expose bounded key/value
+rows. The parser accepts the first `:` or `=` separator, trims surrounding
+ASCII horizontal whitespace, preserves duplicate keys and source order, and
+records each row's original file offset. Duplicate keys are expected in
+`cpuinfo`, where processor-specific fields repeat. Up to 8,192 rows are
+retained; keys are capped at 256 bytes, values at 4 KiB, and individual lines
+at 4,360 bytes. Truncated streams or malformed/over-limit rows mark the parsed
+view incomplete and add a diagnostic while preserving the original byte
+prefix. No CPU feature strings are interpreted as host capabilities, and
+release values are not treated as trusted identity claims.
