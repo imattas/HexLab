@@ -340,53 +340,32 @@ int processors_command(std::span<const std::wstring_view> arguments, std::ostrea
 }
 
 void usage(std::ostream &out) {
-    out << "Usage: hexlab_cli [--help | --version]\n"
-           "       hexlab_cli inspect <path> [options]\n"
-           "       hexlab_cli disassemble <path> [options] [--json]\n\n"
-           "       hexlab_cli functions <path> [options] [--limit <count>] [--json]\n\n"
-           "       hexlab_cli decompile <path> [options]\n\n"
-           "       hexlab_cli compare <old-image> <new-image> [--window <bytes>] [--anchor <bytes>] [--limit <runs>] [--functions]\n\n"
-           "       hexlab_cli modules [--sysroot <dir>] [--discover] [--glibc-system-search] [--search-dir <dir>] [--target-cwd <dir>] [--lib-token <value>] [--platform-token <value>] [--graph] <binary>...\n\n"
-           "       hexlab_cli pe-deps --sysroot <dir> [--search-dir <dir>] [--windows-defaults] <PE image>\n\n"
-           "       hexlab_cli project --help  (persistent projects and editing)\n\n"
-           "       hexlab_cli plugins scan|dependencies <directory> [--json] [--strict]  (data-only native plugin discovery)\n\n"
-           "       hexlab_cli processors [--json]  (supported decoder variants)\n\n"
-           "       hexlab_cli archive list <archive> [--thin-root <directory>]\n"
-           "       hexlab_cli archive index-audit <archive> [--thin-root <directory>]\n"
-           "       hexlab_cli archive link-select <archive> --root-object <ET_REL|XCOFF32|XCOFF64>\n"
-           "       hexlab_cli archive link-audit <archive> --root-object <ET_REL|XCOFF64>\n"
-           "       hexlab_cli archive link-exec <archive> --root-object <ET_REL> --entry <symbol> --output <ET_EXEC>\n"
-           "       hexlab_cli archive link-pe <archive> --root-object <COFF .obj> --entry <symbol> --output <PE .exe>\n"
-           "       hexlab_cli archive link-macho <archive> --root-object <Mach-O .o> --entry <symbol> --output <Mach-O executable>\n"
-           "       hexlab_cli archive extract <archive> --member <index> --output <path> [--replace]\n"
-           "       hexlab_cli archive open <archive> --member <index> --project <project.hxproj> [--replace]\n"
-           "       Thin archive reads/link actions require --thin-root <directory>\n\n"
-           "       hexlab_cli jar list <package.jar>\n"
-           "       hexlab_cli jar inspect <package.jar> --member <index>\n"
-           "       hexlab_cli jar list --volume <path> --volume <path> ...\n"
-           "       hexlab_cli jar inspect --volume <path> --volume <path> ... --member <index>\n\n"
-           "       hexlab_cli dex container <path> [--json]  (inventory DEX 041 logical members)\n"
-           "       hexlab_cli dex load-container <path> [--json]  (parse every DEX 041 member)\n\n"
-           "       hexlab_cli dex apk <path> [--json]  (load Android APK multidex entries)\n\n"
-           "       hexlab_cli dex vdex <path> [--json]  (inventory Android VDEX 027 sections and DEX members)\n\n"
-           "       hexlab_cli jvm module-path [--release <feature>] [--archive-volume <path>]... [--module-path <dir-or-jar>]... [--class-path <dir-or-jar>]...\n\n"
-           "       hexlab_cli macho chained-targets <image> [--shared-cache-base <address>] [--cache-level-base <0..3> <address>]...\n"
-           "       hexlab_cli firmware inspect <path> --format ihex|srec|uefi|uefi-capsule\n"
-           "       hexlab_cli firmware inspect <path> --fit-offset <file-offset> --format fit\n\n"
-           "       hexlab_cli firmware inspect <path> --microcode-offset <file-offset> --format intel-microcode\n\n"
-           "Input options:\n  --format auto|pe|elf|raw|macho|wasm|dex|jvm\n"
-           "  --pe-runtime arm64|x64-compatible  (select an ARM64X PE process view)\n"
-           "  --slice <index>  (Mach-O universal slice; zero-based, auto or macho format)\n"
-           "  --arch x86-32|x86-64|a64|6502|rv32|rv64|mips64|ppc32le|ppc32be|ppc64le|ppc64be --base <address> [--entry <address>]  (raw only)\n"
-           "  --profile <file>  (segmented raw x86-16/32; replaces arch/base/entry)\n"
-           "  --arm-profile <file>  (raw ARM/Thumb/data declarations; replaces arch/base/entry)\n"
-           "  --plugin <module>  (load a native plugin for detection and display decoding; repeatable)\n"
-           "  --pdb <file> --pdb-search <directory>  (local PE PDB binding; no network lookup)\n"
-           "  --dwarf-supplementary-package <file>  (explicit supplementary ELF/DWP; otherwise a safe local .debug_sup hint may be used)\n"
-           "Analysis options:\n  --instruction-budget <count> --string-budget <count> --show-strings\n"
-           "  --min-string-length <count>\n"
-           "Function inventory options (with `functions`): --limit <count> (default 10000, max 100000)\n"
-           "Addresses use decimal or 0x-prefixed hexadecimal. Use -- before an option-like path.\n";
+    out << "Usage: hexlab_cli [--help] [--version]\n"
+           "       hexlab_cli <command> [arguments...]\n\n"
+           "Commands:\n"
+           "  inspect <path> [options]                 Inspect a binary image\n"
+           "  hexdump <path> [options]                 Print bytes as hex and ASCII\n"
+           "  disassemble <path> [options] [--json]    Disassemble an image\n"
+           "  functions <path> [options] [--limit N]   List discovered functions\n"
+           "  decompile <path> [options]               Decompile an image\n"
+           "  compare <old> <new> [options]            Compare two images\n"
+           "  modules [options] <binary>...            Resolve binary dependencies\n"
+           "  pe-deps --sysroot <dir> [options] <image> Resolve PE dependencies\n"
+           "  project --help                            Persistent projects and editing\n"
+           "  plugins scan|dependencies <dir> [options] Inspect native plugins\n"
+           "  processors [--json]                      List decoder variants\n"
+           "  archive, jar, dex, jvm, macho, firmware   Format-specific commands\n\n"
+           "Hex dump options:\n"
+           "  --offset <bytes>   Start at this file offset (default 0)\n"
+           "  --length <bytes>   Number of bytes to print (default: to end of file)\n"
+           "  --width <columns>  Bytes per row, 1..32 (default 16)\n\n"
+           "Common input options:\n"
+           "  --format auto|pe|elf|raw|macho|wasm|dex|jvm\n"
+           "  --plugin <module>  Load a native plugin (repeatable)\n"
+           "  --                 End options; useful when a path begins with '-'\n\n"
+           "Analysis commands accept --instruction-budget, --string-budget, and --show-strings.\n"
+           "Use 'hexlab_cli <command> --help' for command-specific options.\n"
+           "Addresses accept decimal or 0x-prefixed hexadecimal.\n";
 }
 
 std::string_view function_seed_name(FunctionSeedKind kind) {
@@ -2913,6 +2892,90 @@ std::uint64_t number(std::wstring_view text) {
         argument_error(value.error().message);
     return value.value();
 }
+int hexdump_command(std::span<const std::wstring_view> args, std::ostream &out, std::ostream &err) {
+    if (args.size() == 2 && args[1] == L"--help") {
+        out << "Usage: hexlab_cli hexdump <path> [--offset <bytes>] [--length <bytes>] [--width <columns>]\n"
+               "Print file bytes with a hexadecimal column and printable ASCII view.\n"
+               "Offsets and lengths accept decimal or 0x-prefixed hexadecimal values.\n";
+        return 0;
+    }
+    if (args.size() < 2) {
+        err << "Usage: hexlab_cli hexdump <path> [--offset <bytes>] [--length <bytes>] [--width <columns>]\n";
+        return 2;
+    }
+    try {
+        std::uint64_t offset = 0;
+        std::optional<std::uint64_t> length;
+        std::size_t width = 16;
+        bool offset_seen = false, length_seen = false, width_seen = false;
+        for (std::size_t i = 2; i < args.size(); ++i) {
+            const auto option_name = args[i];
+            if (option_name == L"--offset" || option_name == L"--length" || option_name == L"--width") {
+                if (i + 1 >= args.size() || args[i + 1].starts_with(L"--"))
+                    argument_error("hexdump option requires a value");
+                const auto value = number(args[++i]);
+                if (option_name == L"--offset") {
+                    if (offset_seen) argument_error("--offset may appear once");
+                    offset = value; offset_seen = true;
+                } else if (option_name == L"--length") {
+                    if (length_seen) argument_error("--length may appear once");
+                    length = value; length_seen = true;
+                } else {
+                    if (width_seen) argument_error("--width may appear once");
+                    if (value < 1 || value > 32) argument_error("--width must be between 1 and 32");
+                    width = static_cast<std::size_t>(value); width_seen = true;
+                }
+            } else {
+                argument_error("unknown hexdump option; use --help for usage");
+            }
+        }
+        auto opened = FileStorage::open(path_from_wide(args[1]));
+        if (!opened) {
+            err << "hexdump: " << opened.error().message << '\n';
+            return 1;
+        }
+        const auto &storage = *opened.value();
+        if (offset > storage.size()) argument_error("--offset is past end of file");
+        const auto available = storage.size() - offset;
+        const auto count = std::min<std::uint64_t>(length.value_or(available), available);
+        const auto offset_digits = std::max<std::size_t>(8, [&] {
+            std::size_t digits = 1;
+            for (auto value = offset + count; value > 0xf; value >>= 4) ++digits;
+            return digits;
+        }());
+        for (std::uint64_t cursor = 0; cursor < count;) {
+            const auto row_size = static_cast<std::size_t>(std::min<std::uint64_t>(width, count - cursor));
+            auto row = storage.read_at({offset + cursor}, row_size);
+            if (!row) {
+                err << "hexdump: " << row.error().message << '\n';
+                return 1;
+            }
+            out << std::hex << std::nouppercase << std::setfill('0')
+                << std::setw(static_cast<int>(offset_digits)) << offset + cursor << "  ";
+            for (std::size_t i = 0; i < width; ++i) {
+                if (i < row_size)
+                    out << std::setw(2) << std::to_integer<unsigned>(row.value().bytes[i]);
+                else
+                    out << "  ";
+                out << (i + 1 == width / 2 && width > 1 ? "  " : " ");
+            }
+            out << " |";
+            for (std::size_t i = 0; i < row_size; ++i) {
+                const auto byte = std::to_integer<unsigned char>(row.value().bytes[i]);
+                out << (byte >= 0x20 && byte <= 0x7e ? static_cast<char>(byte) : '.');
+            }
+            out << "|\n" << std::dec;
+            cursor += row_size;
+        }
+        return 0;
+    } catch (const ArgumentError &error) {
+        err << error.message << '\n';
+        return 2;
+    } catch (const std::exception &error) {
+        err << "hexdump: " << error.what() << '\n';
+        return 1;
+    }
+}
 std::string_view string_encoding_label(StringEncoding encoding) {
     switch (encoding) {
     case StringEncoding::ascii: return "ASCII";
@@ -3485,6 +3548,8 @@ int run_cli(std::span<const std::wstring_view> arguments, std::ostream &out, std
         return firmware_command(arguments.subspan(1), out, err);
     if (arguments[0] == L"compare")
         return run_compare_cli(arguments.subspan(1), out, err);
+    if (arguments[0] == L"hexdump")
+        return hexdump_command(arguments, out, err);
     if (arguments[0] == L"modules")
         return modules_command(arguments.subspan(1), out, err);
     if (arguments[0] == L"pe-deps")

@@ -1,9 +1,9 @@
-# HexLab 0.1.0
+# HexLab 0.1.1
 
-HexLab 0.1.0 is the first public development release. Download platform
-packages from the [GitHub release page](https://github.com/imattas/HexLab/releases/tag/v0.1.0).
-This release makes the current workbench installable and reviewable; it is an
-early-stage reverse-engineering tool, not feature-complete IDA Pro parity.
+HexLab 0.1.1 is a quality-of-life update to the first public development
+release. Download platform packages from the [GitHub release page](https://github.com/imattas/HexLab/releases/tag/v0.1.1).
+HexLab remains an early-stage reverse-engineering tool, not feature-complete
+IDA Pro parity.
 
 See [the changelog](CHANGELOG.md) for release highlights and known limits.
 

@@ -139,15 +139,26 @@ inline std::vector<std::pair<wxString, Location>> image_symbol_locations(
     return entries;
 }
 
+inline bool named_location_less(const Location &left, const Location &right) {
+    if (left.index() != right.index()) return left.index() < right.index();
+    if (const auto *address = std::get_if<Address>(&left)) {
+        const auto &other = std::get<Address>(right);
+        if (address->space.value != other.space.value) return address->space.value < other.space.value;
+        return address->offset < other.offset;
+    }
+    return std::get<FileOffset>(left).value < std::get<FileOffset>(right).value;
+}
+
 inline std::vector<NamedLocationCandidate> named_location_candidates(
-    const std::vector<std::pair<wxString, Location>> &entries, const wxString &requested) {
+    const std::vector<std::pair<wxString, Location>> &entries, const wxString &requested,
+    const std::atomic_bool *cancelled = nullptr) {
     std::vector<NamedLocationCandidate> result;
+    std::set<Location, decltype(&named_location_less)> destinations(&named_location_less);
     for (const auto &[name, location] : entries) {
+        if (cancelled && cancelled->load(std::memory_order_relaxed)) break;
         if (name.empty() || name.CmpNoCase(requested) != 0)
             continue;
-        if (std::none_of(result.begin(), result.end(), [&](const auto &candidate) {
-                return candidate.location == location;
-            }))
+        if (destinations.insert(location).second)
             result.push_back({name, location, {}});
     }
     return result;
@@ -181,14 +192,19 @@ inline bool apply_location_displacement(Location &location, bool add, std::uint6
 
 inline NamedLocationMatch resolve_named_location_expression(
     const std::vector<std::pair<wxString, Location>> &entries,
-    const std::vector<NamedLocationCandidate> &bounded_entries, const wxString &requested) {
-    auto exact = named_location_candidates(entries, requested);
-    for (const auto &candidate : bounded_entries)
-        if (candidate.name.CmpNoCase(requested) == 0 &&
-            std::none_of(exact.begin(), exact.end(), [&](const auto &existing) {
-                return existing.location == candidate.location;
-            }))
+    const std::vector<NamedLocationCandidate> &bounded_entries, const wxString &requested,
+    const std::atomic_bool *cancelled = nullptr) {
+    auto exact = named_location_candidates(entries, requested, cancelled);
+    std::set<Location, decltype(&named_location_less)> exact_destinations(&named_location_less);
+    for (std::size_t index = 0; index < exact.size(); ++index) {
+        if ((index & 255u) == 0 && cancelled && cancelled->load(std::memory_order_relaxed)) return {};
+        exact_destinations.insert(exact[index].location);
+    }
+    for (const auto &candidate : bounded_entries) {
+        if (cancelled && cancelled->load(std::memory_order_relaxed)) return {};
+        if (candidate.name.CmpNoCase(requested) == 0 && exact_destinations.insert(candidate.location).second)
             exact.push_back(candidate);
+    }
     if (!exact.empty()) {
         NamedLocationMatch match;
         if (exact.size() == 1)
@@ -203,28 +219,78 @@ inline NamedLocationMatch resolve_named_location_expression(
         return {};
 
     std::vector<NamedLocationCandidate> candidates;
+    std::set<Location, decltype(&named_location_less)> adjusted_destinations(&named_location_less);
     auto append_adjusted = [&](NamedLocationCandidate candidate) {
         if (candidate.relative_extent && (!expression->add ||
             expression->displacement >= *candidate.relative_extent))
             return;
         if (!apply_location_displacement(candidate.location, expression->add, expression->displacement))
             return;
-        if (std::none_of(candidates.begin(), candidates.end(), [&](const auto &existing) {
-                return existing.location == candidate.location;
-            }))
+        if (adjusted_destinations.insert(candidate.location).second)
             candidates.push_back(std::move(candidate));
     };
-    for (auto candidate : bounded_entries)
+    for (auto candidate : bounded_entries) {
+        if (cancelled && cancelled->load(std::memory_order_relaxed)) return {};
         if (candidate.name.CmpNoCase(expression->base_name) == 0)
             append_adjusted(std::move(candidate));
-    for (const auto &[name, location] : entries)
+    }
+    for (const auto &[name, location] : entries) {
+        if (cancelled && cancelled->load(std::memory_order_relaxed)) return {};
         if (name.CmpNoCase(expression->base_name) == 0)
             append_adjusted({name, location, {}});
+    }
     if (candidates.size() == 1)
         return {candidates.front().location, false};
     NamedLocationMatch match{{}, candidates.size() > 1};
     match.candidates = std::move(candidates);
     return match;
+}
+
+// Bottom-up stable merge sort keeps large literal result ordering cancellable.
+// The candidate count is capped by the caller, and cancellation discards the
+// partially moved working vectors without publishing them.
+inline bool cancellable_sort_named_candidates(std::vector<NamedLocationCandidate> &values,
+                                              const std::atomic_bool *cancelled) {
+    const auto count = values.size();
+    if (count < 2) return !(cancelled && cancelled->load(std::memory_order_relaxed));
+    const auto less = [](const auto &left, const auto &right) {
+        wxString left_folded = left.name, right_folded = right.name;
+        left_folded.MakeLower(); right_folded.MakeLower();
+        if (left_folded != right_folded) return left_folded < right_folded;
+        if (left.name != right.name) return left.name < right.name;
+        if (left.location.index() != right.location.index()) return left.location.index() < right.location.index();
+        if (const auto *address = std::get_if<Address>(&left.location)) {
+            const auto &other = std::get<Address>(right.location);
+            if (address->space.value != other.space.value) return address->space.value < other.space.value;
+            return address->offset < other.offset;
+        }
+        return std::get<FileOffset>(left.location).value < std::get<FileOffset>(right.location).value;
+    };
+    std::vector<NamedLocationCandidate> scratch(count);
+    auto *source = &values;
+    auto *destination = &scratch;
+    std::size_t operations = 0;
+    for (std::size_t width = 1; width < count;) {
+        for (std::size_t begin = 0; begin < count;) {
+            const auto middle = begin + std::min(width, count - begin);
+            const auto end = middle + std::min(width, count - middle);
+            auto left = begin, right = middle;
+            for (auto output = begin; output < end; ++output) {
+                if (((++operations) & 255u) == 0 && cancelled &&
+                    cancelled->load(std::memory_order_relaxed)) return false;
+                if (left == middle || (right < end && less((*source)[right], (*source)[left])))
+                    (*destination)[output] = std::move((*source)[right++]);
+                else
+                    (*destination)[output] = std::move((*source)[left++]);
+            }
+            begin = end;
+        }
+        std::swap(source, destination);
+        if (width > count / 2) width = count;
+        else width *= 2;
+    }
+    if (source != &values) values.swap(*source);
+    return !(cancelled && cancelled->load(std::memory_order_relaxed));
 }
 
 inline NamedLocationSearch search_ranked_named_locations(
@@ -358,19 +424,11 @@ inline NamedLocationSearch search_named_locations(
             add(candidate.name, candidate.location);
             if (result.truncated) break;
         }
-    std::sort(ordered_matches.begin(), ordered_matches.end(), [](const auto &left, const auto &right) {
-        wxString left_folded = left.name, right_folded = right.name;
-        left_folded.MakeLower(); right_folded.MakeLower();
-        if (left_folded != right_folded) return left_folded < right_folded;
-        if (left.name != right.name) return left.name < right.name;
-        if (left.location.index() != right.location.index()) return left.location.index() < right.location.index();
-        if (const auto *address = std::get_if<Address>(&left.location)) {
-            const auto &other = std::get<Address>(right.location);
-            if (address->space.value != other.space.value) return address->space.value < other.space.value;
-            return address->offset < other.offset;
-        }
-        return std::get<FileOffset>(left.location).value < std::get<FileOffset>(right.location).value;
-    });
+    if (!cancellable_sort_named_candidates(ordered_matches, cancelled)) {
+        result.truncated = true;
+        result.limitation = "search canceled";
+        return result;
+    }
     const auto begin = std::min(offset, ordered_matches.size());
     const auto end = std::min(ordered_matches.size(), begin + page_size);
     result.truncated = end < ordered_matches.size() || result.truncated;

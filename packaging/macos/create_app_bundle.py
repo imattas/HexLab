@@ -157,8 +157,8 @@ def create_bundle(archive_pathname: Path, output: Path) -> None:
             "CFBundleInfoDictionaryVersion": "6.0",
             "CFBundleName": "HexLab",
             "CFBundlePackageType": "APPL",
-            "CFBundleShortVersionString": str(manifest.get("version", "0.1.0")),
-            "CFBundleVersion": str(manifest.get("version", "0.1.0")),
+            "CFBundleShortVersionString": str(manifest.get("version", "0.1.1")),
+            "CFBundleVersion": str(manifest.get("version", "0.1.1")),
             "LSApplicationCategoryType": "public.app-category.developer-tools",
             "NSHighResolutionCapable": True,
         }

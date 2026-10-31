@@ -75,7 +75,7 @@ const char *edge_name(GraphEdgeKind kind) {
 } // namespace
 GraphCanvas::GraphCanvas(wxWindow *parent) : wxPanel(parent) {
     SetName("graph-canvas");
-    SetHelpText("Graph keyboard controls: Tab and Shift+Tab move between nodes; Up and Down move between instructions; Ctrl+Up and Ctrl+Down cycle edges; Enter activates the focused item; Home fits the graph; plus and minus zoom; arrow keys pan; Ctrl+Left and Ctrl+Right move between graphs; F6 returns focus to graph items.");
+    SetHelpText("Drag empty graph space with the left button, or drag with the middle button, to pan. Drag a node to move it. Graph keyboard controls: Tab and Shift+Tab move between nodes; Up and Down move between instructions; Ctrl+Up and Ctrl+Down cycle edges; Enter activates the focused item; Home fits the graph; plus and minus zoom; arrow keys pan; Ctrl+Left and Ctrl+Right move between graphs; F6 returns focus to graph items.");
     SetToolTip(GetHelpText());
     SetBackgroundStyle(wxBG_STYLE_PAINT);
     Bind(wxEVT_PAINT, &GraphCanvas::paint, this);
@@ -95,10 +95,25 @@ GraphCanvas::GraphCanvas(wxWindow *parent) : wxPanel(parent) {
             Refresh();
             if (focus_changed) focus_changed();
         } else {
-            activate(event.GetPosition(), false);
+            // Dragging empty canvas pans the view; a short click retains the
+            // usual graph activation/deselection behavior on mouse-up.
+            left_pan_dragging_ = true;
+            dragging_ = true;
+            node_drag_moved_ = false;
+            last_ = event.GetPosition();
+            node_drag_start_ = last_;
+            CaptureMouse();
         }
     });
     Bind(wxEVT_LEFT_UP, [this](wxMouseEvent &event) {
+        if (left_pan_dragging_) {
+            left_pan_dragging_ = false;
+            dragging_ = false;
+            if (HasCapture()) ReleaseMouse();
+            if (!node_drag_moved_) activate(event.GetPosition(), false);
+            node_drag_moved_ = false;
+            return;
+        }
         if (!node_dragging_) return;
         node_dragging_ = false;
         if (HasCapture()) ReleaseMouse();
@@ -125,6 +140,7 @@ GraphCanvas::GraphCanvas(wxWindow *parent) : wxPanel(parent) {
     });
     Bind(wxEVT_MOUSE_CAPTURE_LOST, [this](wxMouseCaptureLostEvent &) {
         dragging_ = false;
+        left_pan_dragging_ = false;
         node_dragging_ = false;
         node_drag_moved_ = false;
         drag_node_.reset();
@@ -138,6 +154,14 @@ GraphCanvas::GraphCanvas(wxWindow *parent) : wxPanel(parent) {
         }
         if (dragging_) {
             auto at = event.GetPosition();
+            if (left_pan_dragging_) {
+                const auto delta = at - last_;
+                if (std::abs(at.x - node_drag_start_.x) >= 4 || std::abs(at.y - node_drag_start_.y) >= 4)
+                    node_drag_moved_ = true;
+                pan_by(delta);
+                last_ = at;
+                return;
+            }
             pan_by(at - last_);
             last_ = at;
         }
