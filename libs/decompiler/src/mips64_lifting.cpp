@@ -362,6 +362,14 @@ std::optional<Statement> lift_mips64_instruction(const Instruction &instruction)
             }
             effect.operands.push_back(std::move(value));
         }
+        // COP1 word conversions read FCSR.RM (CVT.W) and update FCSR Cause,
+        // Flags, and possibly suppress the destination write. Carry the full
+        // FCSR value into the intrinsic so SSA constant propagation can fold
+        // only when that architectural input is known.
+        const bool converts_to_word = op == Opcode::mips_cvt_w_s || op == Opcode::mips_cvt_w_d ||
+            (op >= Opcode::mips_round_w_s && op <= Opcode::mips_floor_w_d);
+        if (converts_to_word)
+            effect.operands.push_back(reg({RegisterBank::mips_fcsr, 0, 32, false}));
         effect.result_type = (op == Opcode::mips_cvt_w_s || op == Opcode::mips_cvt_w_d ||
             (op >= Opcode::mips_round_w_s && op <= Opcode::mips_floor_w_d)) ? integer(32) :
             floating(op == Opcode::mips_cvt_s_d || op == Opcode::mips_cvt_s_w ? 32 : 64);

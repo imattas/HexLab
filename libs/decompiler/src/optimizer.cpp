@@ -1,5 +1,6 @@
 #include "hexlab/decompiler/optimizer.hpp"
 #include "hexlab/processors/riscv_semantics.hpp"
+#include "hexlab/processors/mips32_semantics.hpp"
 #include "hexlab/processors/x86_crc32_semantics.hpp"
 
 #include <algorithm>
@@ -2074,8 +2075,34 @@ void invalidate_registers(std::map<Key, ConstantValue> &constants,
 bool usable_constant(const ConstantValue &value) {
     return value.type.bits && value.type.bits <= 64 &&
         (value.type.kind == TypeKind::integer || value.type.kind == TypeKind::boolean ||
-         value.type.kind == TypeKind::pointer) &&
+         value.type.kind == TypeKind::pointer ||
+         (value.type.kind == TypeKind::floating && (value.type.bits == 32 || value.type.bits == 64))) &&
         (value.value & ~width_mask(value.type.bits)) == 0;
+}
+
+std::optional<Mips32WordConversionResult> fold_mips32_word_conversion(Intrinsic &intrinsic) {
+    if (intrinsic.operands.size() != 3 || intrinsic.register_writes.size() != 2 ||
+        intrinsic.register_writes[0].bank != RegisterBank::mips_fpr ||
+        intrinsic.register_writes[0].width != 32 ||
+        intrinsic.register_writes[1] != RegisterOperand{RegisterBank::mips_fcsr, 0, 32, false})
+        return {};
+    if (!intrinsic.operands[1] || !intrinsic.operands[2]) return {};
+    const auto *source = std::get_if<ConstantValue>(&intrinsic.operands[1]->value);
+    const auto *fcsr = std::get_if<ConstantValue>(&intrinsic.operands[2]->value);
+    if (!source || !fcsr || fcsr->type.bits != 32 ||
+        source->type.kind != TypeKind::floating || (source->type.bits != 32 && source->type.bits != 64))
+        return {};
+    const bool is_double = source->type.bits == 64;
+    Mips32WordRounding rounding;
+    const auto &name = intrinsic.name;
+    if (name == (is_double ? "mips.cvt.w.d" : "mips.cvt.w.s"))
+        rounding = static_cast<Mips32WordRounding>(fcsr->value & 3u);
+    else if (name == (is_double ? "mips.round.w.d" : "mips.round.w.s")) rounding = Mips32WordRounding::nearest_even;
+    else if (name == (is_double ? "mips.trunc.w.d" : "mips.trunc.w.s")) rounding = Mips32WordRounding::toward_zero;
+    else if (name == (is_double ? "mips.ceil.w.d" : "mips.ceil.w.s")) rounding = Mips32WordRounding::toward_positive;
+    else if (name == (is_double ? "mips.floor.w.d" : "mips.floor.w.s")) rounding = Mips32WordRounding::toward_negative;
+    else return {};
+    return evaluate_mips32_word_conversion(is_double, rounding, source->value, static_cast<std::uint32_t>(fcsr->value));
 }
 
 struct SummaryWorker {
@@ -2132,7 +2159,27 @@ struct SummaryWorker {
         else if (const auto *intrinsic = std::get_if<Intrinsic>(&statement)) {
             // Opaque instruction effects cannot preserve register facts.
             if (intrinsic->name != "nop" || !intrinsic->register_writes.empty() ||
-                intrinsic->memory_effect != IntrinsicMemoryEffect::none) constants.clear();
+                intrinsic->memory_effect != IntrinsicMemoryEffect::none) {
+                constants.clear();
+                if (auto *mutable_intrinsic = std::get_if<Intrinsic>(&statement);
+                    mutable_intrinsic && mutable_intrinsic->memory_effect == IntrinsicMemoryEffect::none &&
+                    mutable_intrinsic->register_output_versions.size() == mutable_intrinsic->register_writes.size()) {
+                    if (const auto result = fold_mips32_word_conversion(*mutable_intrinsic)) {
+                        const auto fcsr_index = std::size_t{1};
+                        constants.emplace(key(mutable_intrinsic->register_writes[fcsr_index],
+                            mutable_intrinsic->register_output_versions[fcsr_index]),
+                            ConstantValue{result->fcsr_after, {TypeKind::integer, 32, false}});
+                        if (result->writes_destination) {
+                            mutable_intrinsic->register_output_values = {
+                                constant_expression({result->value_bits, {TypeKind::integer, 32, false}}),
+                                constant_expression({result->fcsr_after, {TypeKind::integer, 32, false}})};
+                            constants.emplace(key(mutable_intrinsic->register_writes[0],
+                                mutable_intrinsic->register_output_versions[0]),
+                                ConstantValue{result->value_bits, {TypeKind::integer, 32, false}});
+                        }
+                    }
+                }
+            }
         } else if (const auto *assignment = std::get_if<Assign>(&statement);
                    assignment && assignment->destination_version && assignment->value) {
             const auto *constant = std::get_if<ConstantValue>(&assignment->value->value);
