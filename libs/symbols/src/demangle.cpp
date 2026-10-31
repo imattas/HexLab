@@ -19,6 +19,7 @@ class Itanium {
     Itanium(std::string_view input, const DemangleLimits &limits) : input_(input), limits_(limits) {}
     std::string parse() {
         if (!take("_Z")) throw Failure{DemangleStatus::malformed};
+        if (take("TA")) return parse_template_parameter_object();
         if (take("GR")) return parse_lifetime_temporary();
         if (take("GTt")) return combine({"transaction-safe entry point to ", parse_encoding(true)});
         if (take("GV")) return parse_object_special_name("guard variable for ");
@@ -158,6 +159,11 @@ class Itanium {
     };
     struct Name { TypeName type; bool template_id = false, special_member = false; };
     struct Argument { std::string text, key; std::optional<TypeName> type; };
+    std::string parse_template_parameter_object() {
+        const auto argument = template_argument(0);
+        if (at_ != input_.size()) malformed();
+        return combine({"template parameter object for ", argument.text});
+    }
     [[noreturn]] static void limit() { throw Failure{DemangleStatus::resource_limit}; }
     [[noreturn]] static void malformed() { throw Failure{DemangleStatus::malformed}; }
     [[noreturn]] static void unsupported() { throw Failure{DemangleStatus::unsupported}; }
@@ -564,6 +570,22 @@ class Itanium {
             const auto target = render(parse_type_node(d + 1));
             const auto value = expression(d + 1);
             return combine({"static_cast<", target, ">(", value, ")"});
+        }
+        if (take("tl")) {
+            // Structural template values use the ABI's typed braced initializer.
+            // Designated initializers remain outside the supported expression subset.
+            auto value = combine({render(parse_type_node(d + 1)), "{"});
+            bool first = true;
+            while (peek() != 'E') {
+                if (!peek()) malformed();
+                const auto element = expression(d + 1);
+                if (!first) append(value, ", ");
+                first = false;
+                append(value, element);
+            }
+            if (!take("E")) malformed();
+            append(value, "}");
+            return value;
         }
         static constexpr std::pair<std::string_view, std::string_view> unary[] = {
             {"ps", "+"}, {"ng", "-"}, {"ad", "&"}, {"de", "*"}, {"co", "~"}, {"nt", "!"}};

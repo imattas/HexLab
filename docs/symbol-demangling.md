@@ -259,6 +259,24 @@ the raw symbol. Other Itanium special names remain unsupported. These
 encodings follow the [Itanium C++ ABI](https://itanium-cxx-abi.github.io/cxx-abi/abi.html),
 which specifies the special-name and lifetime-extended temporary productions.
 
+Template parameter objects (`TA <template-arg>`) render as
+`template parameter object for <argument>`. Their argument uses the existing
+bounded template-argument grammar. Typed braced-initializer expressions
+`tl <type> <expression>* E` now render as `Type{...}`, including empty and
+recursively nested initializers. For example, `_ZTAXtl1ALi1EEE` presents as
+`template parameter object for A{1 /* int */}`. This displays the encoded
+subobject values without inferring omitted members, object layout, or the
+original source initializer. The same expression form works inside ordinary
+template arguments. Designated initializers, untyped initializer lists, and
+other unsupported expression operands still preserve the raw symbol.
+Missing argument/initializer delimiters, trailing bytes, or exhausted input,
+depth, component, dictionary, or output budgets cannot produce a partial
+label. The `TA` extension follows the implemented grammar in
+[LLVM's Itanium demangler](https://github.com/llvm/llvm-project/blob/main/libcxxabi/src/demangle/ItaniumDemangle.h)
+and the ABI's [class-type template-argument discussion](https://github.com/itanium-cxx-abi/cxx-abi/issues/63);
+the typed initializer follows the ABI's
+[expression grammar](https://itanium-cxx-abi.github.io/cxx-abi/abi.html#mangling-expressions).
+
 The ABI transaction-safe entry-point special name `GTt <encoding>` is rendered
 as **transaction-safe entry point to** the bounded ordinary function spelling.
 Transaction-safe function types encoded with `DxF...E` retain a
