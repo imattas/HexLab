@@ -2783,7 +2783,7 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
         }
     }
     const bool m6502 = instruction.context.architecture == Architecture::mos6502 &&
-                       instruction.context.mode == ExecutionMode::m6502;
+                       (instruction.context.mode == ExecutionMode::m6502 || m65c02);
     if (m6502) {
         const RegisterOperand accumulator{RegisterBank::mos6502, 0, 8, false};
         const RegisterOperand index_x{RegisterBank::mos6502, 1, 8, false};
@@ -2883,7 +2883,8 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
             if (pointer && !pointer->base && !pointer->index && !pointer->ip_relative &&
                 pointer->displacement >= 0 && pointer->displacement <= UINT16_MAX) {
                 const auto slot = static_cast<std::uint16_t>(pointer->displacement);
-                const auto high_slot = static_cast<std::uint16_t>((slot & 0xff00u) | ((slot + 1u) & 0x00ffu));
+                const auto high_slot = m65c02 ? static_cast<std::uint16_t>(slot + 1u) :
+                    static_cast<std::uint16_t>((slot & 0xff00u) | ((slot + 1u) & 0x00ffu));
                 const auto byte_load = [&](std::uint16_t address) -> ExpressionPtr {
                     MemoryValue value;
                     value.type = integer_type(8);
@@ -3089,6 +3090,13 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
                 const auto binary_status = binary("or",
                     binary("or", binary("or", preserved, bit(carry, 0)), bit(zero, 1)),
                     binary("or", bit(overflow, 6), bit(negative, 7)));
+                const auto corrected_cmos_status = [&](ExpressionPtr corrected, ExpressionPtr decimal_carry) {
+                    const auto corrected_zero = boolean_binary("eq", corrected, constant_expr(0, 8));
+                    const auto corrected_negative = boolean_binary("bit_extract", corrected, constant_expr(7, 8));
+                    return binary("or", binary("or", binary("or", preserved, bit(decimal_carry, 0)),
+                        bit(corrected_zero, 1)),
+                        binary("or", bit(overflow, 6), bit(corrected_negative, 7)));
+                };
                 const auto decimal_bit = boolean_binary("bit_extract", status_value, constant_expr(3, 8));
                 ExpressionPtr decimal_result;
                 ExpressionPtr decimal_status;
@@ -3126,12 +3134,17 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
                     const auto valid_high_b = boolean_binary("ule", binary("shr", rhs, constant_expr(4, 8)), constant_expr(9, 8));
                     const auto valid = boolean_binary("and", boolean_binary("and", valid_a, valid_b),
                         boolean_binary("and", valid_high_a, valid_high_b));
-                    decimal_result = binary("select_if", valid, binary("pair", corrected_byte, decimal_unknown));
                     const auto valid_status = binary("or",
                         binary("or", binary("or", preserved, bit(decimal_carry, 0)), bit(zero, 1)),
                         binary("or", bit(decimal_overflow, 6), bit(decimal_negative, 7)));
-                    decimal_status = binary("select_if", valid,
-                        binary("pair", valid_status, binary("or", preserved, decimal_unknown_flags)));
+                    if (m65c02) {
+                        decimal_result = corrected_byte;
+                        decimal_status = corrected_cmos_status(corrected_byte, decimal_carry);
+                    } else {
+                        decimal_result = binary("select_if", valid, binary("pair", corrected_byte, decimal_unknown));
+                        decimal_status = binary("select_if", valid,
+                            binary("pair", valid_status, binary("or", preserved, decimal_unknown_flags)));
+                    }
                 } else {
                     const auto borrow = boolean_unary("not", carry_in);
                     const auto low_a = binary("and", lhs, constant_expr(0x0f, 8));
@@ -3164,18 +3177,25 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
                     const auto valid_high_b = boolean_binary("ule", binary("shr", rhs, constant_expr(4, 8)), constant_expr(9, 8));
                     const auto valid = boolean_binary("and", boolean_binary("and", valid_a, valid_b),
                         boolean_binary("and", valid_high_a, valid_high_b));
-                    decimal_result = binary("select_if", valid, binary("pair", corrected_byte, decimal_unknown));
                     const auto valid_status = binary("or",
                         binary("or", binary("or", preserved, bit(carry, 0)), bit(zero, 1)),
                         binary("or", bit(decimal_overflow, 6), bit(decimal_negative, 7)));
-                    decimal_status = binary("select_if", valid,
-                        binary("pair", valid_status, binary("or", preserved, decimal_unknown_flags)));
+                    if (m65c02) {
+                        decimal_result = corrected_byte;
+                        decimal_status = corrected_cmos_status(corrected_byte,
+                            boolean_unary("not", high_borrow));
+                    } else {
+                        decimal_result = binary("select_if", valid, binary("pair", corrected_byte, decimal_unknown));
+                        decimal_status = binary("select_if", valid,
+                            binary("pair", valid_status, binary("or", preserved, decimal_unknown_flags)));
+                    }
                 }
                 const auto alternatives = binary("pair", decimal_result, result_byte);
                 const auto selected_result = binary("select_if", decimal_bit, alternatives);
                 const auto status_alternatives = binary("pair", decimal_status, binary_status);
                 const auto selected_status = binary("select_if", decimal_bit, status_alternatives);
                 Intrinsic effect{rra ? "m6502_rra_ror_then_adc" : isc ? "m6502_isc_increment_then_sbc" :
+                    m65c02 ? (subtract ? "m65c02_sbc" : "m65c02_adc") :
                     subtract ? "m6502_sbc" : "m6502_adc",
                     (rra || isc) ? std::vector<ExpressionPtr>{old_byte, rhs, reg_expr(accumulator), status_value} :
                           std::vector<ExpressionPtr>{},
