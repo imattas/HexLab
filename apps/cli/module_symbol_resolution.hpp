@@ -298,6 +298,8 @@ inline void print_elf_copy_dependencies(const std::vector<SuppliedModule> &modul
         });
     };
     out << "ELF COPY relocation dependencies (candidate sources only; no bytes copied):\n";
+    std::size_t lookup_work = 0;
+    bool lookup_exhausted = false;
     for (const auto &importer : modules) {
         if (!importer.metadata || !importer.metadata->elf) continue;
         const auto &elf = *importer.metadata->elf;
@@ -317,8 +319,7 @@ inline void print_elf_copy_dependencies(const std::vector<SuppliedModule> &modul
         for (const auto &symbol : elf.symbols)
             if (symbol.table && std::binary_search(dynamic_symbols.begin(), dynamic_symbols.end(), *symbol.table))
                 symbols.emplace(std::pair{static_cast<std::size_t>(*symbol.table), symbol.index}, &symbol);
-        std::size_t emitted = 0, omitted = 0, lookup_work = 0;
-        bool lookup_exhausted = false;
+        std::size_t emitted = 0, omitted = 0;
         out << "  " << importer.path << " (dynamic metadata " << (elf.dynamic_complete ? "complete" : "partial")
             << ", relocation metadata " << (elf.relocations_complete ? "complete" : "partial") << ")\n";
         for (const auto row_index : dynamic_rows) {
@@ -387,7 +388,7 @@ inline void print_elf_copy_dependencies(const std::vector<SuppliedModule> &modul
                 }
                 if (lookup_exhausted) break;
             }
-            if (lookup_exhausted) out << "unsupported (1000000 COPY provider/symbol lookup work cap reached)";
+            if (lookup_exhausted) out << "unsupported (invocation-wide 1000000 COPY provider/symbol lookup work cap reached)";
             else if (matches > 1) out << "ambiguous (" << matches << " eligible supplied source definitions)";
             else if (unsupported) out << "unsupported (" << unsupported
                 << " matching source definitions have unsupported type/state/visibility/size/storage)";

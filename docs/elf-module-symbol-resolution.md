@@ -26,9 +26,11 @@ metadata completeness, relocation type, metadata row, table and record file
 offsets, table-local index, exact dynamic symbol table and symbol index,
 destination image address, symbol version and allocated size. Missing symbol
 namespace information remains unsupported.
-Source lookup also has a shared one-million provider/symbol-visit budget per
-importer. Exhaustion marks the current and subsequent source lookups
-unsupported; a partially scanned candidate set never yields a unique source.
+Source lookup also has one aggregate one-million provider/symbol-visit budget
+for the entire command invocation, shared across all importers. Exhaustion
+marks the current and all subsequent source lookups, including those in later
+importers, unsupported; a partially scanned candidate set never yields a
+unique source. The COPY output-row cap remains per importer.
 
 Supported destinations are `ET_EXEC`, or `ET_DYN` with `PT_INTERP` or
 `DF_1_PIE` evidence. They must name a nonempty, defined, default-visible
