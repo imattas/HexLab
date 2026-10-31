@@ -8,8 +8,36 @@ event-sequence contract.
 The desktop Debugger view exposes this operation as **Step** beside Continue.
 It requires a pending stop event, resumes one instruction, and restarts the
 event poller so the next stop refreshes thread/register state and locals. The
-step is instruction-level; it does not perform source-level step-over or
-step-out.
+**Step** operation is instruction-level. The Debugger view also offers a
+conservative source-level **Step out** operation, described below. Source-level
+step-over remains unsupported.
+
+## Source step-out
+
+Source step-out uses the current stopped thread's recovered stack frames. It
+requires fresh frames for the pending event, an identifiable event-owning
+thread, and a caller frame whose return PC belongs to the same currently loaded
+module as the stopped PC. Both PCs must resolve to unambiguous source-line
+records in that image, and the caller return PC must be in initialized
+executable data and round-trip through the module mapping. The current module
+mapping is refreshed and must match the mapping used to recover those frames.
+
+When these conditions hold, the desktop view places a one-shot session
+breakpoint at the caller return PC and continues the pending event. It removes
+the temporary breakpoint on the next target stop and reports whether the
+caller return address was reached. A stop in another thread, any intervening
+stop, process exit, or module/process change cancels the operation. The user
+can cancel it by removing the temporary breakpoint from the breakpoint list.
+The target is bound to the process, thread, source document identity and
+revision observed when the operation starts; the UI reports if the source
+document changes while execution continues.
+
+The implementation does not guess when frames are stale or unavailable,
+source-line records are absent or ambiguous, the caller crosses into another
+module, an existing breakpoint occupies the return address, or the target
+architecture is outside the recovered x86/x64/AArch64 frame path. In those
+cases it reports why source step-out cannot proceed. This does not establish
+source-level step-over support.
 
 On Windows, when the pending event is an `INT3` at a software breakpoint owned
 by the backend, stepping temporarily restores the byte saved when that
