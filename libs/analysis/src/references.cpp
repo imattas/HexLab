@@ -5575,6 +5575,10 @@ RegisterReferenceFacts arm_reference_facts(const Image *image, const RelocationC
         if (!instruction.arm) return {};
         auto target_mode = instruction.arm->target_mode.value_or(instruction.context.mode);
         switch (instruction.arm->exchange) {
+        case ArmExchange::saved_status:
+            // LDM^ with PC restores CPSR from SPSR. Without a proven saved
+            // T/J state, the raw loaded PC does not identify its decode mode.
+            return {};
         case ArmExchange::address_bit0:
             // BXWritePC reserves 0b10 for an unpredictable A32 target.
             if ((raw_value & 3u) == 2u) return {};

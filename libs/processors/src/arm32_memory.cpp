@@ -11,7 +11,9 @@ bool multiple(Instruction &i, std::uint32_t w) {
     const auto rn = (w >> 16) & 15;
     const auto mask = static_cast<std::uint16_t>(w);
     const bool load = w & 0x100000, wb = w & 0x200000, up = w & 0x800000, pre = w & 0x1000000;
-    if ((w & 0x400000) || rn == 15 || !mask || (wb && (mask & (1u << rn))))
+    const bool restore_status = (w & 0x400000) != 0;
+    const bool exception_return = restore_status && load && (mask & 0x8000u);
+    if ((restore_status && !exception_return) || rn == 15 || !mask || (wb && (mask & (1u << rn))))
         return false; // Privileged/user-bank, empty list and base overlap not enabled.
     i.opcode = load ? Opcode::a32_ldm : Opcode::a32_stm;
     i.arm->multiple_mode =
@@ -35,10 +37,21 @@ bool multiple(Instruction &i, std::uint32_t w) {
     i.memory_write = !load;
     if (load && (mask & 0x8000)) {
         i.arm->writes_pc = true;
-        i.arm->exchange = ArmExchange::address_bit0;
+        i.arm->exchange = exception_return ? ArmExchange::saved_status : ArmExchange::address_bit0;
         i.flow = rn == 13 && up && !pre && wb ? FlowKind::ret
                  : i.condition < 14                 ? FlowKind::conditional_branch
                                                     : FlowKind::jump;
+        if (exception_return) {
+            // LDM^ with PC loads the saved program status into CPSR. The
+            // decoder models NZCV as invalidated; the restored mode/state
+            // bits are not statically known to function analysis.
+            const RegisterOperand spsr{RegisterBank::arm_saved_flags, 0, 32, false};
+            const RegisterOperand cpsr_flags{RegisterBank::arm_flags, 0, 4, false};
+            read(i, spsr);
+            i.register_writes.push_back(cpsr_flags);
+            i.arm->flags_written = 15;
+            i.arm->flags_known = false;
+        }
     }
     return true;
 }
