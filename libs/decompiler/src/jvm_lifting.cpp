@@ -438,12 +438,53 @@ Reference hierarchy_join(const HierarchyIndex &index, HierarchyWork &work, const
     if (joined) joined->defining_loader = minimal.front().defining_loader;
     return joined;
 }
-bool hierarchy_assignable(const HierarchyIndex &index, HierarchyWork &work, const ReferenceIdentity &actual, const ReferenceIdentity &expected) {
+std::optional<bool> verifier_assignability(const HierarchyIndex *index, HierarchyWork &work,
+                                           const ReferenceIdentity &actual,
+                                           const ReferenceIdentity &expected,
+                                           unsigned depth = 0) {
     if (actual == expected) return true;
-    auto ancestors = complete_ancestors(index, TypeId{actual.descriptor.size() > 2 ? actual.descriptor.substr(1, actual.descriptor.size()-2) : "", actual.defining_loader}, work);
-    if (!ancestors || expected.defining_loader.empty() || expected.descriptor.size() < 3 || expected.descriptor.front() != 'L' || expected.descriptor.back() != ';') return false;
-    const TypeId target{expected.descriptor.substr(1, expected.descriptor.size()-2), expected.defining_loader};
+    if (actual.kind == JvmVerificationKind::null_value)
+        return expected.kind == JvmVerificationKind::object;
+    if (actual.kind != JvmVerificationKind::object || expected.kind != JvmVerificationKind::object)
+        return false;
+    if (depth > 255) return {};
+    const bool actual_array = actual.descriptor.starts_with('[');
+    const bool expected_array = expected.descriptor.starts_with('[');
+    if (actual_array && expected_array) {
+        const auto from = std::string_view(actual.descriptor).substr(1);
+        const auto to = std::string_view(expected.descriptor).substr(1);
+        const auto primitive = [](std::string_view value) {
+            return value.size() == 1 && std::string_view("BCDFIJSZ").find(value.front()) != std::string_view::npos;
+        };
+        if (primitive(from) || primitive(to)) return from == to;
+        ReferenceIdentity from_component{JvmVerificationKind::object, std::string(from), 0,
+                                         actual.defining_loader};
+        ReferenceIdentity to_component{JvmVerificationKind::object, std::string(to), 0,
+                                       expected.defining_loader};
+        return verifier_assignability(index, work, from_component, to_component, depth + 1);
+    }
+    if (expected_array) return false;
+    if (actual_array) {
+        if (actual.defining_loader.empty() || actual.defining_loader != expected.defining_loader)
+            return {};
+        if (expected.descriptor == "Ljava/lang/Object;" || expected.descriptor == "Ljava/lang/Cloneable;" ||
+            expected.descriptor == "Ljava/io/Serializable;")
+            return true;
+        return false;
+    }
+    if (actual.descriptor.size() < 3 || actual.descriptor.front() != 'L' || actual.descriptor.back() != ';' ||
+        expected.descriptor.size() < 3 || expected.descriptor.front() != 'L' || expected.descriptor.back() != ';' ||
+        actual.defining_loader.empty() || actual.defining_loader != expected.defining_loader || !index)
+        return {};
+    auto ancestors = complete_ancestors(*index,
+        TypeId{actual.descriptor.substr(1, actual.descriptor.size() - 2), actual.defining_loader}, work);
+    if (!ancestors) return {};
+    const TypeId target{expected.descriptor.substr(1, expected.descriptor.size() - 2), expected.defining_loader};
     return std::find(ancestors->begin(), ancestors->end(), target) != ancestors->end();
+}
+bool hierarchy_assignable(const HierarchyIndex &index, HierarchyWork &work,
+                          const ReferenceIdentity &actual, const ReferenceIdentity &expected) {
+    return verifier_assignability(&index, work, actual, expected).value_or(false);
 }
 Reference method_reference_result(std::string_view descriptor) {
     const auto end = descriptor.find(')');
@@ -763,6 +804,31 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
             if (references && value->type == ref32()) identities[value] = std::move(reference);
             return value;
         };
+        const auto known_array = [&](const ExpressionPtr &value) -> Result<Reference> {
+            if (!references) return Reference{};
+            auto reference = identity(value);
+            if (!reference) return Reference{};
+            if (reference->kind == JvmVerificationKind::uninitialized ||
+                reference->kind == JvmVerificationKind::uninitialized_this)
+                return no("array access uses an uninitialized verifier value");
+            if (reference->kind == JvmVerificationKind::object && !reference->descriptor.starts_with('['))
+                return no("array access receiver has a known non-array verifier type");
+            return reference;
+        };
+        const auto array_opcode_matches = [](std::string_view component, unsigned operation) {
+            const bool reference_component = component.starts_with('L') || component.starts_with('[');
+            switch (operation) {
+            case 0: return component == "I";
+            case 1: return component == "J";
+            case 2: return component == "F";
+            case 3: return component == "D";
+            case 4: return reference_component;
+            case 5: return component == "B" || component == "Z";
+            case 6: return component == "C";
+            case 7: return component == "S";
+            default: return false;
+            }
+        };
         if (references) {
             if (references->stack.size() != stack.size()) return no("reference evidence disagrees with stack height");
             for (std::size_t slot = 0; slot < stack.size(); ++slot) evidence(stack[slot], references->stack[slot]);
@@ -987,6 +1053,10 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
                 static constexpr const char *names[]={"iaload","laload","faload","daload","aaload","baload","caload","saload"};
                 const ValueType types[]={int32(),int64(),fp32(),fp64(),ref32(),int32(),int32(),int32()};
                 auto index=pop(int32());if(!index)return index.error();auto array=pop(ref32());if(!array)return array.error();
+                auto array_type=known_array(array.value());if(!array_type)return array_type.error();
+                if(array_type.value() && array_type.value()->kind==JvmVerificationKind::object &&
+                   !array_opcode_matches(std::string_view(array_type.value()->descriptor).substr(1),op-0x2e))
+                    return no("array load opcode disagrees with the known verifier component type");
                 const auto null_condition=bin("eq",array.value(),con(0,ref32()),int32());
                 dst.trap_edges.push_back({i.address,TrapEdgeKind::may_trap,"java.lang.NullPointerException from "+i.mnemonic_override,null_condition});
                 // Array loads can also throw for either side of the signed
@@ -1003,12 +1073,8 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
                 load.memory_effect=IntrinsicMemoryEffect::read;load.result_type=types[op-0x2e];
                 const auto result_name=load.name;const auto result_type=*load.result_type;emit(*fact,std::move(load));
                 Reference element;
-                if (op == 0x32) {
-                    const auto array_type = identity(array.value());
-                    if (array_type && array_type->kind == JvmVerificationKind::object &&
-                        array_type->descriptor.starts_with("["))
-                        element = reference_descriptor(std::string_view(array_type->descriptor).substr(1));
-                }
+                if (op == 0x32 && array_type.value() && array_type.value()->kind == JvmVerificationKind::object)
+                    element = reference_descriptor(std::string_view(array_type.value()->descriptor).substr(1));
                 stack.push_back(evidence(unknown(result_name,result_type),std::move(element)));continue;
             }
             if(op>=0x4f&&op<=0x56){
@@ -1016,6 +1082,27 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
                 const ValueType types[]={int32(),int64(),fp32(),fp64(),ref32(),int32(),int32(),int32()};
                 const auto slot=op-0x4f;auto value=pop(types[slot]);if(!value)return value.error();
                 auto index=pop(int32());if(!index)return index.error();auto array=pop(ref32());if(!array)return array.error();
+                auto array_type=known_array(array.value());if(!array_type)return array_type.error();
+                const auto component = array_type.value() && array_type.value()->kind==JvmVerificationKind::object
+                    ? std::string_view(array_type.value()->descriptor).substr(1) : std::string_view{};
+                if(array_type.value() && array_type.value()->kind==JvmVerificationKind::object &&
+                   !array_opcode_matches(component,slot))
+                    return no("array store opcode disagrees with the known verifier component type");
+                std::optional<bool> store_compatible;
+                if(op==0x53 && array_type.value() && array_type.value()->kind==JvmVerificationKind::object) {
+                    if(!component.starts_with('L') && !component.starts_with('['))
+                        return no("aastore receiver has a primitive verifier component type");
+                    const auto stored=identity(value.value());
+                    if(stored && (stored->kind==JvmVerificationKind::uninitialized ||
+                                  stored->kind==JvmVerificationKind::uninitialized_this))
+                        return no("aastore value is an uninitialized verifier value");
+                    if(stored) {
+                        ReferenceIdentity expected{JvmVerificationKind::object,std::string(component),0,
+                                                    array_type.value()->defining_loader};
+                        store_compatible=verifier_assignability(hierarchy ? &*hierarchy : nullptr,
+                            hierarchy_work,*stored,expected);
+                    }
+                }
                 const auto null_condition=bin("eq",array.value(),con(0,ref32()),int32());
                 dst.trap_edges.push_back({i.address,TrapEdgeKind::may_trap,"java.lang.NullPointerException from "+i.mnemonic_override,null_condition});
                 const auto length=un("jvm_arraylength",array.value(),int32());
@@ -1024,10 +1111,11 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
                 dst.trap_edges.push_back({i.address,TrapEdgeKind::may_trap,
                     "java.lang.ArrayIndexOutOfBoundsException from "+i.mnemonic_override,
                     bin("or",negative,past_end,int32())});
-                if(op==0x53) {
+                if(op==0x53 && (!store_compatible || !*store_compatible)) {
                     dst.trap_edges.push_back({i.address,TrapEdgeKind::may_trap,
                         "java.lang.ArrayStoreException from aastore",
-                        bin("jvm_array_store_type_mismatch",array.value(),value.value(),int32())});
+                        store_compatible && !*store_compatible ? con(1,int32()) :
+                            bin("jvm_array_store_type_mismatch",array.value(),value.value(),int32())});
                 }
                 Intrinsic store;store.name=std::string("jvm_")+names[slot];store.operands={array.value(),index.value(),value.value()};
                 store.memory_effect=IntrinsicMemoryEffect::write;emit(*fact,std::move(store));continue;
@@ -1530,16 +1618,11 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
     };
     const auto verifier_assignable = [&](const ReferenceIdentity &actual,
                                          const ReferenceIdentity &expected) {
-        if (actual == expected) return true;
-        // The verifier's null type is assignable to every initialized object
-        // type. Uninitialized allocation identities remain exact and cannot
-        // be widened through the ordinary class hierarchy.
-        if (actual.kind == JvmVerificationKind::null_value &&
-            expected.kind == JvmVerificationKind::object)
-            return true;
-        return hierarchy && actual.kind == JvmVerificationKind::object &&
-            expected.kind == JvmVerificationKind::object &&
-            hierarchy_assignable(*hierarchy, hierarchy_work, actual, expected);
+        // Array covariance, the verifier's Object/Cloneable/Serializable array
+        // supertypes, null, and loader-qualified class ancestry share one
+        // bounded assignability rule.
+        return verifier_assignability(hierarchy ? &*hierarchy : nullptr,
+                                      hierarchy_work, actual, expected).value_or(false);
     };
     std::vector<const JvmStackMapFrame *> frames(count, nullptr);
     if (code && code->stack_map_table) {
