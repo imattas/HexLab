@@ -544,6 +544,32 @@ std::optional<Address> static_pointer_load(const Image &image, const RelocationC
         return {};
     return target;
 }
+std::optional<std::uint32_t> static_mips32_word(const Image &image,
+                                                const RelocationCoverage &relocations,
+                                                Address source, ByteOrder order) {
+    if ((source.offset & 3u) != 0) return {};
+    const auto *space = image.space(source.space);
+    const auto *segment = image.segment_at(source);
+    if (!space || space->width_bits != 32 || space->order != order || !segment || !segment->readable ||
+        source.offset < segment->begin.offset)
+        return {};
+    const auto relative = source.offset - segment->begin.offset;
+    constexpr std::uint64_t width = 4;
+    if (relative > segment->file_size || width > segment->file_size - relative ||
+        relocations.overlaps(source, width))
+        return {};
+    const auto bytes = image.read(source, static_cast<std::size_t>(width));
+    if (!bytes || bytes.value().size() != width) return {};
+    std::uint32_t value = 0;
+    if (space->order == ByteOrder::little) {
+        for (std::size_t index = 0; index < bytes.value().size(); ++index)
+            value |= std::uint32_t(std::to_integer<std::uint8_t>(bytes.value()[index])) << (index * 8);
+    } else {
+        for (const auto byte : bytes.value())
+            value = (value << 8) | std::to_integer<std::uint8_t>(byte);
+    }
+    return value;
+}
 std::optional<Address> static_signed_word_pointer_load(const Image &image,
                                                        const RelocationCoverage &relocations,
                                                        Address source) {
@@ -5056,14 +5082,24 @@ RegisterReferenceFacts mips_reference_facts(const Image *image, const Relocation
                 for (std::size_t i = 0; i < instruction.operands.size(); ++i) {
                     const auto *memory = std::get_if<MemoryOperand>(&instruction.operands[i]);
                     if (!memory || !memory->base || memory->base->bank != RegisterBank::mips_gpr ||
-                        memory->base->index == 0 || memory->base->width != width || i >= instruction.access.size())
+                        memory->base->width != width || i >= instruction.access.size())
                         continue;
-                    const auto base = registers.find(memory->base->index);
-                    if (base == registers.end() || base->second.space != instruction.address.space)
-                        continue;
-                    const Address target{base->second.space, riscv_add(base->second.offset, memory->displacement, width)};
-                    const auto access_width = std::max<std::uint64_t>(1, (memory->data_width + 7) / 8);
-                    if (riscv_target_segment(*image, target, instruction.access[i], access_width)) {
+                    std::optional<Address> base_value;
+                    if (memory->base->index == 0)
+                        base_value = Address{instruction.address.space, 0};
+                    else if (const auto base = registers.find(memory->base->index);
+                             base != registers.end() && base->second.space == instruction.address.space)
+                        base_value = base->second;
+                    if (!base_value) continue;
+                    const Address target{base_value->space,
+                        riscv_add(base_value->offset, memory->displacement, width)};
+                    const bool merge_load = mips32 &&
+                        (instruction.opcode == Opcode::mips_lwl || instruction.opcode == Opcode::mips_lwr);
+                    const Address memory_range = merge_load
+                        ? Address{target.space, target.offset & ~UINT64_C(3)} : target;
+                    const auto access_width = merge_load ? UINT64_C(4) :
+                        std::max<std::uint64_t>(1, (memory->data_width + 7) / 8);
+                    if (riscv_target_segment(*image, memory_range, instruction.access[i], access_width)) {
                         result.memory_targets[{fact->id, static_cast<std::uint32_t>(i)}] = target;
                         const auto *destination = architecture_register(instruction, 0, RegisterBank::mips_gpr, width);
                         const bool destination_written = destination && destination->index != 0 &&
@@ -5071,13 +5107,29 @@ RegisterReferenceFacts mips_reference_facts(const Image *image, const Relocation
                                 [&](const RegisterOperand &written) {
                                     return written.bank == destination->bank && written.index == destination->index;
                                 });
+                        if (merge_load && instruction.access[i] == OperandAccess::read &&
+                            memory->data_width == 32 && destination_written) {
+                            const auto prior = registers.find(destination->index);
+                            if (prior != registers.end() && prior->second.space == instruction.address.space) {
+                                const auto word = static_mips32_word(*image, relocations, memory_range,
+                                                                     instruction.context.order);
+                                if (word) {
+                                    const auto merged = evaluate_mips32_merge_load_instruction(
+                                        instruction, *word, static_cast<std::uint32_t>(prior->second.offset),
+                                        static_cast<std::uint8_t>(target.offset & 3u));
+                                    if (merged && merged->writes_destination)
+                                        loaded_pointer = std::pair{destination->index,
+                                            Address{instruction.address.space, merged->value}};
+                                }
+                            }
+                        }
                         const bool full_width_pointer_load =
                             (mips32 && instruction.opcode == Opcode::mips_lw) ||
                             (mips64 && instruction.opcode == Opcode::mips64_ld);
                         const bool mips64_zero_extended_pointer_load = mips64 &&
                             instruction.opcode == Opcode::mips64_lwu && memory->data_width == 32 &&
                             destination && destination->width == 64;
-                        if ((full_width_pointer_load || mips64_zero_extended_pointer_load) &&
+                        if (!merge_load && (full_width_pointer_load || mips64_zero_extended_pointer_load) &&
                             instruction.access[i] == OperandAccess::read &&
                             memory->data_width == (mips64_zero_extended_pointer_load ? 32 : width) &&
                             destination_written)
