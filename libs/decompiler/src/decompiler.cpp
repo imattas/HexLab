@@ -2410,6 +2410,61 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
         return effect;
     }
 
+    const bool m65c02 = instruction.context.architecture == Architecture::mos6502 &&
+                        instruction.context.mode == ExecutionMode::m65c02;
+    if (m65c02) {
+        const RegisterOperand accumulator{RegisterBank::mos6502, 0, 8, false};
+        const RegisterOperand status{RegisterBank::mos6502, 3, 8, false};
+        const auto binary = [](std::string operation, ExpressionPtr left, ExpressionPtr right,
+                               std::uint16_t width = 8) -> ExpressionPtr {
+            return std::make_shared<Expression>(Expression{
+                integer_type(width), BinaryValue{std::move(operation), std::move(left), std::move(right)}});
+        };
+        const auto zero = constant_expr(0, 8);
+        if (instruction.opcode == Opcode::m65c02_stz && instruction.operands.size() == 1 &&
+            operands.size() == 1 && is_memory(instruction.operands.front()) &&
+            instruction.access == std::vector<OperandAccess>{OperandAccess::write} &&
+            !instruction.memory_read && instruction.memory_write &&
+            instruction.flow == FlowKind::fallthrough) {
+            const auto *memory = std::get_if<MemoryOperand>(&instruction.operands.front());
+            if (memory && memory->data_width == 8 && memory->address_width == 16 &&
+                !memory->base && !memory->ip_relative &&
+                (!memory->index || *memory->index == RegisterOperand{RegisterBank::mos6502, 1, 8, false}) &&
+                operands.front() && operands.front()->type == integer_type(8) &&
+                std::holds_alternative<MemoryValue>(operands.front()->value))
+                return Store{operands.front(), zero};
+        }
+        if ((instruction.opcode == Opcode::m65c02_tsb || instruction.opcode == Opcode::m65c02_trb) &&
+            instruction.operands.size() == 1 && operands.size() == 1 && is_memory(instruction.operands.front()) &&
+            instruction.access == std::vector<OperandAccess>{OperandAccess::read_write} &&
+            instruction.memory_read && instruction.memory_write &&
+            instruction.flow == FlowKind::fallthrough &&
+            instruction.register_reads == std::vector<RegisterOperand>{accumulator, status} &&
+            instruction.register_writes == std::vector<RegisterOperand>{status} &&
+            operands.front() && operands.front()->type == integer_type(8) &&
+            std::holds_alternative<MemoryValue>(operands.front()->value)) {
+            const auto *memory = std::get_if<MemoryOperand>(&instruction.operands.front());
+            if (memory && memory->data_width == 8 && memory->address_width == 16 &&
+                !memory->base && !memory->index && !memory->ip_relative) {
+                const auto old_byte = operands.front();
+                ExpressionPtr written = instruction.opcode == Opcode::m65c02_tsb
+                    ? binary("or", old_byte, reg_expr(accumulator))
+                    : binary("and", old_byte, binary("xor", reg_expr(accumulator), constant_expr(0xff, 8)));
+                auto status_value = reg_expr(status);
+                auto tested = binary("and", old_byte, reg_expr(accumulator));
+                auto zero_flag = std::make_shared<Expression>(Expression{integer_type(8), UnaryValue{"zext",
+                    boolean_binary("eq", std::move(tested), zero)}});
+                auto updated_status = binary("or", binary("and", status_value, constant_expr(0xfd, 8)),
+                    binary("shl", std::move(zero_flag), constant_expr(1, 8)));
+                Intrinsic effect{instruction.opcode == Opcode::m65c02_tsb ? "m65c02_tsb" : "m65c02_trb",
+                    {old_byte, written, reg_expr(accumulator), status_value}, IntrinsicMemoryEffect::read_write};
+                effect.register_writes = {status};
+                effect.register_output_values = {std::move(updated_status)};
+                effect.memory_output = IntrinsicMemoryOutput{0, 1};
+                return effect;
+            }
+        }
+    }
     const bool m6502 = instruction.context.architecture == Architecture::mos6502 &&
                        instruction.context.mode == ExecutionMode::m6502;
     if (m6502) {
