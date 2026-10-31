@@ -479,6 +479,19 @@ void mark_incoming_mips_n64_argument(StackFrameAnalysis &result, std::int64_t of
     }
 }
 
+void mark_incoming_mips_n32_argument(StackFrameAnalysis &result, std::int64_t offset, std::uint16_t width,
+                                     bool read) {
+    // N32 uses eight argument slots; overflow begins at the entry stack pointer.
+    if (offset < 0 || !read) return;
+    const auto slot = std::find_if(result.slots.begin(), result.slots.end(), [&](const auto &candidate) {
+        return candidate.offset_from_entry_sp == offset && candidate.width == width;
+    });
+    if (slot != result.slots.end()) {
+        slot->incoming_argument = true;
+        slot->incoming_argument_abi = StackArgumentAbi::mips_n32;
+    }
+}
+
 void mark_incoming_ppc64_elfv2_argument(StackFrameAnalysis &result, std::int64_t offset, std::uint16_t width,
                                        bool read) {
     // ELFv2's parameter save area starts at entry SP+32 and reserves eight
@@ -1434,6 +1447,12 @@ std::optional<CallingConvention> default_stack_calling_convention(const ImageMet
         constexpr std::uint16_t em_mips = 8;
         constexpr std::uint32_t ef_mips_abi2 = 0x20;
         constexpr std::uint32_t ef_mips_abi_mask = 0xf000;
+        // Linux N32 uses ELF32 plus EF_MIPS_ABI2. Restrict automatic selection
+        // to generic Linux/SysV OSABI and no conflicting ABI selector.
+        if (header.machine == em_mips && !header.is_64 &&
+            (header.flags & ef_mips_abi2) != 0 && (header.flags & ef_mips_abi_mask) == 0 &&
+            (header.os_abi == 0 || header.os_abi == 3))
+            return CallingConvention::mips_n32;
         // N64 is the ELF64 MIPS ABI with neither the N32 marker nor a
         // conflicting explicit ABI selector. Accept only generic SysV/Linux
         // OSABI metadata; other MIPS environments have independent rules.
@@ -2560,6 +2579,10 @@ Result<StackFrameAnalysis> analyze_stack_frame(const FunctionRecord &function, c
                         instruction.context.mode == ExecutionMode::mips64 && image_default_convention &&
                         *image_default_convention == CallingConvention::mips_n64)
                         mark_incoming_mips_n64_argument(result, offset, width, read);
+                    if (instruction.context.architecture == Architecture::mips64 &&
+                        instruction.context.mode == ExecutionMode::mips64 && image_default_convention &&
+                        *image_default_convention == CallingConvention::mips_n32)
+                        mark_incoming_mips_n32_argument(result, offset, width, read);
                     if (instruction.context.architecture == Architecture::powerpc &&
                         instruction.context.mode == ExecutionMode::ppc64 && image_default_convention &&
                         *image_default_convention == CallingConvention::ppc64le_elfv2)

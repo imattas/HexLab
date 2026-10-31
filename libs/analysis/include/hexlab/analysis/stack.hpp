@@ -26,7 +26,9 @@ enum class StackArgumentAbi : std::uint8_t {
     // x86-32 stack arguments covered by a consistent `ret imm16` epilogue.
     x86_32_callee_cleanup,
     // MIPS N64 overflow arguments beyond the eight 64-bit argument slots.
-    mips_n64
+    mips_n64,
+    // MIPS N32 overflow arguments begin at the callee's entry SP.
+    mips_n32
 };
 
 struct StackSlotAccess {

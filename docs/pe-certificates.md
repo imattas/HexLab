@@ -63,6 +63,17 @@ as bounded DER values; this inventory function does not verify signer
 signatures or certificate trust. The separate Windows-only verification API
 below checks cryptographic signatures.
 
+`inspect_pe_authenticode_certificates` inventories embedded X.509 certificates
+from the selected PKCS#7 SignedData certificate set. The result is capped at
+1,024 certificates within the existing 64 MiB payload bound and includes each
+certificate's file span, serial number, issuer and subject DER spans, raw
+UTCTime/GeneralizedTime validity strings, and outer signature-algorithm OID.
+Issuer and subject names remain navigable DER bytes rather than rendered or
+normalized names. Non-X.509 CMS certificate choices are reported as
+unsupported. This is certificate metadata only: dates are not evaluated,
+certificate signatures and chains are not validated, revocation is not checked,
+and no publisher identity or trust decision is made.
+
 `verify_pe_authenticode_signatures` adds a Windows-only Crypt32 pass for each
 CMS signer in the selected PKCS#7 record. It decodes the signed message and
 asks Crypt32 to verify each indexed signer against certificates embedded in

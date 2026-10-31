@@ -36,3 +36,19 @@ evidence includes returning a stack-derived pointer, storing it to another
 address, or passing it through an opaque intrinsic. This allows common
 adjusted-SP locals to be recognized while keeping aliases outside the
 function's frame model conservative.
+
+## MIPS N32 incoming stack arguments
+
+For MIPS64-mode functions with an explicitly selected `mips_n32` convention,
+an exact-width stack slot read at or above entry SP is marked as a possible
+incoming argument. N32 places the first eight scalar argument positions in
+registers and starts overflow arguments at entry SP, in successive eight-byte
+slots; the classifier uses this same zero-based stack offset. Writes alone do
+not establish incoming-argument evidence. Automatic convention selection is
+limited to ELF32 MIPS files with `EF_MIPS_ABI2`, no conflicting MIPS ABI
+selector, and generic Linux/SysV OSABI. Other MIPS ELF variants remain
+unselected. This is slot evidence only: the analysis does not infer which
+parameter ordinal owns a slot, reconstruct split values, or claim N32
+aggregate/variadic placements. The ELF marker follows the Linux N32 loader's
+[ABI identification](https://code.googlesource.com/linux/torvalds/linux/%2B/56bf6fc266ca14d2b9276c8a62e4ff6783bfe68b/arch/mips/kernel/binfmt_elfn32.c);
+the supported scalar placements are documented in [ABI classification](abi-classification.md#mips-n32-scalar-subset).

@@ -5,7 +5,7 @@ else()
 endif()
 hexlab_add_library(database SOURCES src/connection.cpp src/codec.cpp src/schema.cpp src/project_state.cpp
   src/transaction.cpp src/history.cpp src/history_replay.cpp src/user_rows.cpp src/collaboration.cpp
-  src/input.cpp src/backup.cpp src/wal_inspection.cpp src/integrity.cpp ${HEXLAB_DATABASE_NATIVE}
+  src/input.cpp src/backup.cpp src/wal_inspection.cpp src/journal_inspection.cpp src/integrity.cpp ${HEXLAB_DATABASE_NATIVE}
   src/cache.cpp src/derived_cache.cpp
   DEPENDS hexlab::core hexlab::loaders hexlab::analysis hexlab::types)
 target_link_libraries(hexlab_database PRIVATE hexlab_sqlite3)

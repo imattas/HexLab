@@ -181,11 +181,12 @@ Arguments parse(std::span<const std::wstring_view> args) {
         option_start = 3;
     } else if (args[0] == L"recovery") {
         require(args.size() >= 3 && (args[1] == L"list" || args[1] == L"restore" ||
-                    args[1] == L"restore-in-place" || args[1] == L"inspect-wal"),
-                "Recovery requires list, restore, restore-in-place, or inspect-wal and an input path");
+                    args[1] == L"restore-in-place" || args[1] == L"inspect-wal" || args[1] == L"inspect-journal"),
+                "Recovery requires list, restore, restore-in-place, inspect-wal, or inspect-journal and an input path");
         result.action = args[1] == L"list" ? L"recovery-list" :
             args[1] == L"restore" ? L"recovery-restore" :
-            args[1] == L"restore-in-place" ? L"recovery-restore-in-place" : L"recovery-inspect-wal";
+            args[1] == L"restore-in-place" ? L"recovery-restore-in-place" :
+            args[1] == L"inspect-wal" ? L"recovery-inspect-wal" : L"recovery-inspect-journal";
         result.path = path_from_wide(args[2]);
         option_start = 3;
     } else if (args[0] == L"backup") {
@@ -344,6 +345,16 @@ Arguments parse(std::span<const std::wstring_view> args) {
         require(frames >= 1 && frames <= database::wal_inspection_frame_limit,
                 "WAL inspection max frames must be 1..65536");
         result.wal_inspection_limits.max_frames = static_cast<std::size_t>(frames);
+    } else if (result.action == L"recovery-inspect-journal") {
+        result.recovery_json = options.flag(L"--json");
+        result.journal_inspection_limits.max_bytes = options.count(L"--max-bytes", result.journal_inspection_limits.max_bytes);
+        require(result.journal_inspection_limits.max_bytes >= 64 &&
+                    result.journal_inspection_limits.max_bytes <= database::journal_inspection_byte_limit,
+                "Journal inspection max bytes must be 64..67108864");
+        const auto records = options.count(L"--max-records", result.journal_inspection_limits.max_records);
+        require(records >= 1 && records <= database::journal_inspection_record_limit,
+                "Journal inspection max records must be 1..65536");
+        result.journal_inspection_limits.max_records = static_cast<std::size_t>(records);
     } else if (result.action == L"recovery-restore") {
         result.output = path_from_wide(options.needed(L"--output"));
         result.replace = options.flag(L"--replace");

@@ -759,3 +759,12 @@ passes listed signals directly to the inferior while reporting other signals
 to the debugger; each packet replaces the previous list. The client does not
 change signal handling unless the caller explicitly invokes this API. See the
 [GDB QPassSignals packet](https://sourceware.org/gdb/current/onlinedocs/gdb.html/General-Query-Packets.html#QPassSignals).
+
+`DebugSession::set_remote_pass_signals()` exposes this operation to C++ session
+clients. It is accepted only while a target is stopped, validates the complete
+1–256 item strictly increasing list before sending a packet, and forwards
+cancellation to the RSP client. Native backends return `unsupported`; remote
+stubs without the advertised feature also return `unsupported`. An acknowledged
+packet replaces the stub's previous pass-through list. RSP has no standard
+readback, so the API reports the packet result and does not claim to know the
+stub's signal policy after a transport failure.

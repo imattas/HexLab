@@ -793,7 +793,8 @@ Decoded read_payload(std::span<const std::byte> bytes, const Image &image, const
             slot.incoming_argument = in.flag();
             if (version >= 54 && in.flag()) {
                 const auto abi = in.number(1);
-                const auto maximum_stack_argument_abi = version >= 88 ? StackArgumentAbi::mips_n64
+                const auto maximum_stack_argument_abi = version >= 95 ? StackArgumentAbi::mips_n32
+                    : version >= 88 ? StackArgumentAbi::mips_n64
                     : version >= 83 ? StackArgumentAbi::x86_32_callee_cleanup
                     : version >= 73 ? StackArgumentAbi::ppc64le_elfv2
                     : version >= 65 ? StackArgumentAbi::mips_o32

@@ -2088,6 +2088,11 @@ public:
         if (!client_) return Error{ErrorCode::invalid_argument, "remote debugger is not connected"};
         return client_->run_monitor_command(command, stop);
     }
+    Status set_remote_pass_signals(std::span<const unsigned> signals,
+        std::stop_token stop) override {
+        if (!client_) return Error{ErrorCode::invalid_argument, "remote debugger is not connected"};
+        return client_->set_pass_signals(signals, stop);
+    }
     Result<std::vector<RegisterValue>> read_registers(ThreadId thread) override {
         if (!client_) return Error{ErrorCode::invalid_argument, "remote debugger is not connected"};
         const auto wire_id = thread_id(thread);
@@ -2515,6 +2520,8 @@ public:
         std::stop_token stop) override { return active().read_remote_symlink(path, maximum_size, stop); }
     Result<std::vector<std::byte>> run_remote_monitor_command(std::string_view command,
         std::stop_token stop) override { return active().run_remote_monitor_command(command, stop); }
+    Status set_remote_pass_signals(std::span<const unsigned> signals,
+        std::stop_token stop) override { return active().set_remote_pass_signals(signals, stop); }
     Result<std::vector<RegisterValue>> read_registers(ThreadId thread) override { return active().read_registers(thread); }
     Status write_registers(ThreadId thread, std::span<const RegisterValue> registers) override { return active().write_registers(thread, registers); }
     Result<Breakpoint> add_breakpoint(std::uint64_t address, BreakpointKind kind) override { return active().add_breakpoint(address, kind); }

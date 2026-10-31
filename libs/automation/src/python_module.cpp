@@ -1363,6 +1363,7 @@ PyObject* call_project(PyObject*,PyObject* args){return guarded([&]()->PyObject*
                 case StackArgumentAbi::ppc64le_elfv2:abi="ppc64le-elfv2";break;
                 case StackArgumentAbi::x86_32_callee_cleanup:abi="x86-32-callee-cleanup";break;
                 case StackArgumentAbi::mips_n64:abi="mips-n64";break;
+                case StackArgumentAbi::mips_n32:abi="mips-n32";break;
             }
             set(item,"incoming_argument_abi",abi?Object(PyUnicode_FromString(abi)):none());append(list,item.release());}
         return list.release();

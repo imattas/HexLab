@@ -168,6 +168,39 @@ int run_wal_inspection(const project_detail::Arguments &args, std::ostream &out)
     return report.scan_complete ? 0 : 3;
 }
 
+int run_journal_inspection(const project_detail::Arguments &args, std::ostream &out) {
+    using namespace project_detail;
+    const auto report = take(database::inspect_rollback_journal(args.path, args.journal_inspection_limits));
+    if (args.recovery_json) {
+        out << "{\"schema\":1,\"operation\":\"inspect-rollback-journal\",\"diagnostic_only\":true,\"path\":"
+            << json_string(path_utf8(args.path))
+            << ",\"file_bytes\":" << report.file_bytes << ",\"inspected_bytes\":" << report.inspected_bytes
+            << ",\"header_valid\":" << (report.header_valid ? "true" : "false")
+            << ",\"page_size\":" << report.page_size << ",\"sector_size\":" << report.sector_size
+            << ",\"initial_database_pages\":" << report.initial_database_pages
+            << ",\"record_count_to_end\":" << (report.record_count_to_end ? "true" : "false")
+            << ",\"records_claimed\":" << report.records_claimed
+            << ",\"complete_records\":" << report.complete_records
+            << ",\"valid_records\":" << report.valid_records
+            << ",\"checksum_failures\":" << report.checksum_failures
+            << ",\"trailing_bytes\":" << report.trailing_bytes
+            << ",\"scan_complete\":" << (report.scan_complete ? "true" : "false")
+            << ",\"stop_reason\":" << json_string(report.stop_reason)
+            << ",\"diagnostic\":" << json_string(report.diagnostic) << "}\n";
+    } else {
+        out << "Read-only rollback-journal diagnosis: " << escape(path_utf8(args.path)) << '\n'
+            << "  header_valid=" << (report.header_valid ? "yes" : "no") << " page_size=" << report.page_size
+            << " sector_size=" << report.sector_size << " initial_database_pages=" << report.initial_database_pages
+            << " inspected_bytes=" << report.inspected_bytes << " file_bytes=" << report.file_bytes << '\n'
+            << "  checksum_valid_records=" << report.valid_records << '/' << report.records_claimed
+            << " complete_records=" << report.complete_records << " checksum_failures=" << report.checksum_failures
+            << " trailing_bytes=" << report.trailing_bytes << '\n'
+            << "  " << report.stop_reason << ": " << report.diagnostic << '\n'
+            << "  Diagnostic only: first journal segment read only; no database association or rollback established.\n";
+    }
+    return report.scan_complete ? 0 : 3;
+}
+
 struct RecoveryWalRow {
     std::string name;
     std::optional<database::WalInspection> report;
@@ -1067,6 +1100,7 @@ void project_usage(std::ostream &out) {
            "       hexlab_cli project recovery restore <artifact.tmp> --output <project.hxproj> [--replace] [--json]\n"
            "       hexlab_cli project recovery restore-in-place <previous-version.tmp> --target <existing-project.hxproj> [--json]\n"
            "       hexlab_cli project recovery inspect-wal <file-wal> [--max-bytes <n>] [--max-frames <n>] [--json]\n"
+           "       hexlab_cli project recovery inspect-journal <file-journal> [--max-bytes <n>] [--max-records <n>] [--json]\n"
            "       hexlab_cli project backup <project.hxproj> --output <backup.hxproj> [--replace]\n"
            "       hexlab_cli project backup create-bundle <project.hxproj> --output <new-directory> [--max-source-bytes N] [--json]\n"
            "       hexlab_cli project backup restore-bundle <bundle-directory> --output <new-directory> [--max-source-bytes N] [--json]\n"
@@ -1209,6 +1243,8 @@ int run_project_cli(std::span<const std::wstring_view> arguments, std::ostream &
             return run_recovery_list(args, out);
         if (args.action == L"recovery-inspect-wal")
             return run_wal_inspection(args, out);
+        if (args.action == L"recovery-inspect-journal")
+            return run_journal_inspection(args, out);
         if (args.action == L"recovery-restore")
             return run_recovery_restore(args, out);
         if (args.action == L"recovery-restore-in-place")
