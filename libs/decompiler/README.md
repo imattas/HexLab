@@ -234,19 +234,21 @@ The formatter also handles two reducible loop shapes: a pre-tested `while`
 with one condition header, a single-successor chain of straight-line body
 blocks, and one terminal exit; and a post-tested `do ... while` whose latch
 branches back to its body or exits. A bounded post-tested form also handles
-two-latch dispatch and a three-latch conditional tree. The three-latch form
-has one direct latch arm and one arm that dispatches to two more straight-line
-latch arms. Every latch must share the same repeat destination and terminal
-return exit, and exact predecessor sets must prove dispatch and exit coverage.
-These forms are phi-free and limited to 128 blocks and 64 blocks per arm; the
-three-latch proof and its fallback cases are described in
+binary conditional dispatch trees with up to 64 latch leaves and 127
+dispatch/latch nodes. Every latch must share the same repeat destination and
+terminal return exit, and exact predecessor sets must prove dispatch and exit
+coverage. Header and return register phis are accepted only with exact edge
+coverage; memory phis remain unsupported. The whole function is limited to
+128 blocks, with at most 64 blocks on each traced path. The proof and fallback
+cases are described in
 [`docs/multi-latch-loops.md`](docs/multi-latch-loops.md).
 For a post-tested loop with the back edge on the false branch, it inverts the
 rendered condition. The `while` form lowers header phis with exactly one
 preheader input and one back-edge input into assignments before and at the end
 of the loop body. For a multi-block body, the recurrent phi value is selected
 from the final latch block regardless of block storage order. The multi-latch
-post-tested forms are phi-free. Multiple latch forms outside those exact shapes,
+post-tested forms support only the validated header/return register phis above.
+Multiple latch forms outside those exact shapes,
 unsupported loop phis, side exits, internal branches, and nested loop bodies
 remain on the explicit label/goto path until their edge copies can be
 represented faithfully. Nested-loop regions may have multiple proven
