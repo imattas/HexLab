@@ -1,6 +1,6 @@
 # RISC-V vector integer reductions
 
-`evaluate_riscv_vector_integer_operation` evaluates the unmasked RVV integer
+`evaluate_riscv_vector_integer_operation` evaluates the RVV integer
 reduction family `vredsum`, `vredand`, `vredor`, `vredxor`, `vredmin[u]`, and
 `vredmax[u]` for supported SEW values from 8 through 64 bits. `vs1[0]` is the
 initial scalar accumulator; active `vs2` lanes below `vl` are folded in
@@ -10,20 +10,23 @@ reduction restart restriction. With `vl=0`, the seed is returned unchanged.
 
 Only destination lane zero is updated; other lanes preserve the caller's old
 destination because this configuration does not carry tail-agnostic policy.
-The evaluator rejects masked configurations, uses caller-supplied lane spans,
-and does not model register-group state or dispatch decoded instructions.
+The evaluator supports caller-supplied predicate bytes for masked reductions,
+uses caller-supplied lane spans, and does not model register-group state or
+dispatch decoded instructions.
 
 ## Floating-point reductions
 
 The decoder also recognizes the RVV 1.0 single-width floating reductions
-`vfredusum.vs`, `vfredosum.vs`, `vfredmin.vs`, and `vfredmax.vs`. They retain
-the three vector operands, optional `v0` mask, `vl`/`vtype`/`vstart` state,
-and the `frm` and sticky `fflags` dependencies required by floating-point
-arithmetic. The bounded floating evaluator currently evaluates only the
-minimum and maximum reductions. It does not evaluate either sum form: exact
-ordered sums require scalar rounding at every addition, while unordered sums
-allow a deterministic reduction tree with per-node rounding. A host floating
-operation cannot stand in for those architectural rules or exception flags.
+`vfredusum.vs`, `vfredosum.vs`, `vfredmin.vs`, and `vfredmax.vs`. The floating
+evaluator now evaluates both sum forms for binary32 and binary64 using raw-bit
+addition, all five RISC-V rounding modes, signaling-NaN and invalid-operation
+flags, overflow selection, inexact and tininess-after-rounding flags. It folds
+active elements in increasing lane order from `vs1[0]`; `vfredusum` uses the
+ordered implementation, which is a permitted implementation of the unordered
+instruction. Masked-off lanes do not affect the result or flags. `vstart` must
+be zero, and with no active lanes the seed is copied unchanged. Other lanes
+preserve the caller's old destination because this configuration does not
+carry tail-agnostic policy. Host floating arithmetic is not used.
 
 The widening forms `vfwredusum.vs` and `vfwredosum.vs` are decoded and formatted
 as well. Their vector operands and floating control dependencies are retained,
