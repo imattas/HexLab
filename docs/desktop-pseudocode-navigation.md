@@ -77,3 +77,5 @@ currently supported workflow.
 The pseudocode pane has dedicated **A-**, **A+**, and **Reset** controls for its
 text size. The range is bounded to 6–32 points, and changing it affects only
 the rendered view; it does not alter the generated pseudocode or project data.
+
+Phi destinations shown in the Variables table use a deterministic UI identity made from the join block address and destination register. This keeps a selected phi value recognizable when the same analysis snapshot is refreshed, without adding project records or changing the project format. Selection recovery is scoped to the snapshot's AnalysisKey (input identity, byte and decision revisions, and analysis fingerprints); snapshots without a key recover selection only when the same in-memory snapshot is reused. The identity can change when the CFG changes, and it does not identify a phi across different inputs or analysis revisions. Phi values remain read-only because their block-entry address cannot safely identify a persisted annotation.

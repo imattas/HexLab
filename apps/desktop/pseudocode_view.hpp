@@ -96,6 +96,8 @@ class PseudocodeView final : public wxPanel {
     std::optional<std::size_t> selected_variable_;
     struct SourceState {
         Address function;
+        std::optional<AnalysisKey> analysis_key;
+        const FunctionSnapshot *snapshot = nullptr;
         long begin = 0, end = 0;
         std::optional<std::string> variable;
     };
