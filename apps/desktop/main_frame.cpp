@@ -3910,48 +3910,6 @@ struct MainFrame::Impl {
         if (dialog.mode->GetSelection() == 0 && !std::wstring_view(input).starts_with(L"va:")) {
             auto requested = dialog.value->GetValue();
             requested.Trim(true).Trim(false);
-            const auto image_entries = image_symbol_locations(source_document->metadata_view());
-            std::vector<std::pair<wxString, Location>> entries = image_entries;
-            std::vector<std::pair<wxString, Location>> annotation_entries, bookmark_entries, function_entries;
-            std::vector<NamedLocationCandidate> bounded_entries;
-            for (const auto &segment : source_document->image->layout().segments) {
-                if (segment.name.empty())
-                    continue;
-                const Location start{segment.begin};
-                const auto label = wxString::FromUTF8(segment.name.data(), segment.name.size());
-                bounded_entries.push_back({"section:" + label, start, segment.size});
-                bounded_entries.push_back({"segment:" + label, start, segment.size});
-            }
-            if (source_project && source_project->state && source_project->state->user) {
-                for (const auto &annotation : source_project->state->user->annotations)
-                    annotation_entries.emplace_back(text(annotation.name), annotation.location);
-                for (const auto &bookmark : source_project->state->user->bookmarks)
-                    bookmark_entries.emplace_back(text(bookmark.label), bookmark.location);
-                if (source_project->functions)
-                    for (const auto &function : source_project->functions->functions)
-                        if (function)
-                            function_entries.emplace_back(text(presentation_name(*source_project, function->entry)), function->entry);
-            }
-            for (const auto *named_entries : {&annotation_entries, &bookmark_entries, &function_entries})
-                entries.insert(entries.end(), named_entries->begin(), named_entries->end());
-            const auto match = resolve_named_location_expression(entries, bounded_entries, requested);
-            if (match.location) {
-                navigate_from_source(*match.location);
-                return;
-            }
-            if (match.ambiguous) {
-                wxArrayString labels;
-                for (const auto &candidate : match.candidates)
-                    labels.Add(candidate.name + " — " + location_text(
-                        candidate.location, source_document->image.get()));
-                wxSingleChoiceDialog chooser(&frame,
-                    "This name refers to more than one location. Choose the destination:",
-                    "Ambiguous name: " + requested, labels);
-                if (chooser.ShowModal() == wxID_OK && chooser.GetSelection() >= 0 &&
-                    static_cast<std::size_t>(chooser.GetSelection()) < match.candidates.size())
-                    navigate_from_source(match.candidates[static_cast<std::size_t>(chooser.GetSelection())].location);
-                return;
-            }
             const bool address_expression = parse_named_location_expression(requested).has_value() ||
                 parse_address(requested.ToStdWstring()).has_value();
             if (!address_expression && !requested.empty()) {
@@ -3960,34 +3918,85 @@ struct MainFrame::Impl {
                     std::vector<NamedLocationCandidate> sections;
                     std::vector<std::pair<wxString, Location>> empty_entries;
                     std::vector<NamedLocationCandidate> empty_bounds;
+                    bool ready = false;
+                    bool truncated = false;
                 };
-                // Keep the worker's inputs alive after the modal dialog closes.
-                // These vectors are a snapshot of the exact document state that
-                // produced the chooser, and are immutable once captured.
-                auto search_sources = std::make_shared<const NameSearchSources>(NameSearchSources{
-                    std::move(entries), std::move(image_entries), std::move(annotation_entries),
-                    std::move(bookmark_entries), std::move(function_entries), std::move(bounded_entries), {}, {}});
+                // Capture only immutable document/project snapshots here. Large source collection
+                // starts in the dialog's cancellable worker after the UI has opened the chooser.
+                auto sources = std::make_shared<NameSearchSources>();
                 JumpSuggestionsDialog chooser(&frame, requested,
-                    [search_sources](const wxString &query, NamedLocationScope scope, NamedLocationSearchMode mode,
-                                     const std::atomic_bool &cancelled, std::size_t offset, std::size_t page_size) {
-                        const auto *selected_entries = &search_sources->all;
-                        const auto *selected_bounds = &search_sources->sections;
+                    [source_document, source_project, sources](const wxString &query, NamedLocationScope scope,
+                                     NamedLocationSearchMode mode, const std::atomic_bool &cancelled,
+                                     std::size_t offset, std::size_t page_size) {
+                        if (!sources->ready) {
+                            sources->all.clear(); sources->symbols.clear(); sources->annotations.clear();
+                            sources->bookmarks.clear(); sources->functions.clear(); sources->sections.clear();
+                            sources->truncated = false;
+                            sources->symbols = image_symbol_locations(source_document->metadata_view(), &cancelled);
+                            if (cancelled.load(std::memory_order_relaxed)) return NamedLocationSearch{{}, true, "source collection canceled"};
+                            std::size_t collected = sources->symbols.size();
+                            constexpr std::size_t source_limit = 200000;
+                            sources->truncated = collected >= source_limit;
+                            for (const auto &segment : source_document->image->layout().segments) {
+                                if (cancelled.load(std::memory_order_relaxed)) return NamedLocationSearch{{}, true, "source collection canceled"};
+                                if (segment.name.empty()) continue;
+                                if (collected + 2 > source_limit) { sources->truncated = true; break; }
+                                const auto label = wxString::FromUTF8(segment.name.data(), segment.name.size());
+                                sources->sections.push_back({"section:" + label, Location{segment.begin}, segment.size});
+                                sources->sections.push_back({"segment:" + label, Location{segment.begin}, segment.size});
+                                collected += 2;
+                            }
+                            if (source_project && source_project->state && source_project->state->user) {
+                                const auto &user = *source_project->state->user;
+                                for (const auto &annotation : user.annotations) {
+                                    if (cancelled.load(std::memory_order_relaxed)) return NamedLocationSearch{{}, true, "source collection canceled"};
+                                    if (collected == source_limit) { sources->truncated = true; break; }
+                                    sources->annotations.emplace_back(text(annotation.name), annotation.location);
+                                    ++collected;
+                                }
+                                for (const auto &bookmark : user.bookmarks) {
+                                    if (cancelled.load(std::memory_order_relaxed)) return NamedLocationSearch{{}, true, "source collection canceled"};
+                                    if (collected == source_limit) { sources->truncated = true; break; }
+                                    sources->bookmarks.emplace_back(text(bookmark.label), bookmark.location);
+                                    ++collected;
+                                }
+                                if (source_project->functions)
+                                    for (const auto &function : source_project->functions->functions) {
+                                        if (cancelled.load(std::memory_order_relaxed)) return NamedLocationSearch{{}, true, "source collection canceled"};
+                                        if (collected == source_limit) { sources->truncated = true; break; }
+                                        if (function) sources->functions.emplace_back(
+                                            text(presentation_name(*source_project, function->entry)), function->entry);
+                                        if (function) ++collected;
+                                    }
+                            }
+                            sources->all = sources->symbols;
+                            for (const auto *collection : {&sources->annotations, &sources->bookmarks, &sources->functions})
+                                sources->all.insert(sources->all.end(), collection->begin(), collection->end());
+                            sources->ready = true;
+                        }
+                        const auto *selected_entries = &sources->all;
+                        const auto *selected_bounds = &sources->sections;
                         switch (scope) {
                         case NamedLocationScope::all: break;
-                        case NamedLocationScope::symbols: selected_entries = &search_sources->symbols; selected_bounds = &search_sources->empty_bounds; break;
-                        case NamedLocationScope::annotations: selected_entries = &search_sources->annotations; selected_bounds = &search_sources->empty_bounds; break;
-                        case NamedLocationScope::bookmarks: selected_entries = &search_sources->bookmarks; selected_bounds = &search_sources->empty_bounds; break;
-                        case NamedLocationScope::functions: selected_entries = &search_sources->functions; selected_bounds = &search_sources->empty_bounds; break;
+                        case NamedLocationScope::symbols: selected_entries = &sources->symbols; selected_bounds = &sources->empty_bounds; break;
+                        case NamedLocationScope::annotations: selected_entries = &sources->annotations; selected_bounds = &sources->empty_bounds; break;
+                        case NamedLocationScope::bookmarks: selected_entries = &sources->bookmarks; selected_bounds = &sources->empty_bounds; break;
+                        case NamedLocationScope::functions: selected_entries = &sources->functions; selected_bounds = &sources->empty_bounds; break;
                         case NamedLocationScope::sections:
-                            selected_entries = &search_sources->empty_entries; selected_bounds = &search_sources->sections; break;
+                            selected_entries = &sources->empty_entries; selected_bounds = &sources->sections; break;
                         }
-                        return search_named_locations(*selected_entries, *selected_bounds, query, 200000, mode,
-                                                      offset, page_size, &cancelled);
+                        auto result = search_named_locations(*selected_entries, *selected_bounds, query, 200000, mode,
+                                                             offset, page_size, &cancelled);
+                        if (sources->truncated) {
+                            result.truncated = true;
+                            if (result.limitation.empty()) result.limitation = "source snapshot capped at 200000 records";
+                        }
+                        return result;
                     },
                     [source_document](const NamedLocationCandidate &candidate) {
                         return candidate.name + " - " + location_text(candidate.location, source_document->image.get());
                     }, requested.length() == 1 ? NamedLocationSearchMode::exact : NamedLocationSearchMode::contains,
-                    "Jump name suggestions", "Search this document's captured names, then choose a destination:",
+                    "Jump name suggestions", "Search this document's names, then choose a destination:",
                     true, true, true);
                 if (chooser.ShowModal() == wxID_OK)
                     if (const auto selected = chooser.selected_candidate())
