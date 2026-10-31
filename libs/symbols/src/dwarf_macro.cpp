@@ -1,6 +1,7 @@
 #include "hexlab/symbols/dwarf.hpp"
 
 #include <algorithm>
+#include <limits>
 #include <set>
 
 namespace hexlab::symbols {
@@ -87,6 +88,58 @@ R<std::string> referenced_string(const DwarfMacroSections &sections, std::uint64
     return value;
 }
 
+R<std::string> indexed_string(const DwarfMacroSections &sections, std::uint64_t index,
+                              std::size_t &text_bytes) {
+    if (sections.string_offsets.empty())
+        return Error{ErrorCode::unsupported, "DWARF macro strx opcode requires .debug_str_offsets.dwo"};
+    if (!sections.string_offsets_base)
+        return Error{ErrorCode::unsupported, "DWARF macro strx opcode requires the split unit's DW_AT_str_offsets_base"};
+    const auto base = *sections.string_offsets_base;
+    std::optional<std::pair<std::size_t, std::size_t>> contribution;
+    std::optional<std::size_t> selected_width;
+    for (const std::size_t offset_size : {std::size_t{4}, std::size_t{8}}) {
+        const auto header_size = offset_size == 4 ? std::size_t{8} : std::size_t{16};
+        if (base < header_size || base > sections.string_offsets.size()) continue;
+        const auto begin = static_cast<std::size_t>(base) - header_size;
+        Reader header(sections.string_offsets, sections.little_endian, begin);
+        auto initial_length = header.fixed(4);
+        if (!initial_length) continue;
+        std::size_t actual_width = 4;
+        if (initial_length.value() == UINT32_MAX) {
+            auto extended = header.fixed(8);
+            if (!extended) continue;
+            initial_length = extended;
+            actual_width = 8;
+        } else if (initial_length.value() >= 0xfffffff0u) {
+            continue;
+        }
+        if (actual_width != offset_size || initial_length.value() > header.end() - header.pos()) continue;
+        const auto end = header.pos() + static_cast<std::size_t>(initial_length.value());
+        if (end < base || end > header.end()) continue;
+        auto version = header.fixed(2);
+        auto padding = header.fixed(2);
+        if (!version || !padding || version.value() != 5 || padding.value() != 0 || header.pos() != base)
+            continue;
+        if ((end - static_cast<std::size_t>(base)) % offset_size != 0) continue;
+        if (contribution)
+            return malformed("DWARF macro strx base identifies multiple string-offset contributions");
+        contribution = std::pair{static_cast<std::size_t>(base), end};
+        selected_width = offset_size;
+    }
+    if (!contribution || !selected_width)
+        return malformed("DWARF macro strx base does not identify a DWARF v5 string-offset contribution");
+    const auto [entries, end] = *contribution;
+    const auto count = (end - entries) / *selected_width;
+    if (index >= count) return malformed("DWARF macro strx index is outside its contribution");
+    if (index > (std::numeric_limits<std::size_t>::max() - entries) / *selected_width)
+        return malformed("DWARF macro strx entry offset overflows");
+    const auto entry = entries + static_cast<std::size_t>(index) * *selected_width;
+    Reader offset_reader(sections.string_offsets, sections.little_endian, entry, entry + *selected_width);
+    auto string_offset = offset_reader.fixed(*selected_width);
+    if (!string_offset) return string_offset.error();
+    return referenced_string(sections, string_offset.value(), text_bytes);
+}
+
 struct FileContext {
     std::optional<std::uint64_t> index;
     std::optional<std::string> name;
@@ -127,7 +180,9 @@ void apply_file_context(DwarfMacroRecord &record, const FileContext &context) {
 R<std::vector<DwarfMacroUnit>> import_dwarf_macro_v5(const DwarfMacroSections &sections) {
     if (sections.source_id.empty() || sections.macro.empty())
         return Error{ErrorCode::invalid_argument, "DWARF macro source ID and contribution bytes are required"};
-    if (sections.macro.size() > 64u * 1024u * 1024u || sections.max_text_bytes > 64u * 1024u * 1024u)
+    if (sections.macro.size() > 64u * 1024u * 1024u ||
+        sections.string_offsets.size() > 64u * 1024u * 1024u ||
+        sections.max_text_bytes > 64u * 1024u * 1024u)
         return Error{ErrorCode::resource_limit, "DWARF macro input exceeds 64 MiB"};
     constexpr std::size_t hard_unit_limit = 65536;
     constexpr std::size_t hard_record_limit = 1'000'000;
@@ -264,8 +319,16 @@ R<std::vector<DwarfMacroUnit>> import_dwarf_macro_v5(const DwarfMacroSections &s
                 return Error{ErrorCode::unsupported, "DW_MACRO_define_sup/undef_sup require supplementary strings"};
             case 10:
                 return Error{ErrorCode::unsupported, "DW_MACRO_import_sup requires a supplementary macro unit"};
-            case 11: case 12:
-                return Error{ErrorCode::unsupported, "DW_MACRO_define_strx/undef_strx require .debug_str_offsets.dwo"};
+            case 11: case 12: {
+                record.kind = opcode == 11 ? DwarfMacroRecordKind::define : DwarfMacroRecordKind::undefine;
+                if (auto line = unit_reader.uleb(); !line) return line.error(); else record.line = line.value();
+                auto index = unit_reader.uleb();
+                if (!index) return index.error();
+                auto text = indexed_string(sections, index.value(), total_text_bytes);
+                if (!text) return text.error();
+                record.text = std::move(text.value());
+                break;
+            }
             default:
                 return Error{ErrorCode::unsupported, "Unsupported DWARF macro opcode " + std::to_string(opcode)};
             }

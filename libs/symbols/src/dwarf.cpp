@@ -791,6 +791,8 @@ hexlab::Result<ImportResult> import_dwarf(const DwarfSections&sections){
         }
         if(version.value()==5){
             const auto *str_base=num(dies.front(),attr_str_offsets_base),*addr_base=num(dies.front(),attr_addr_base);
+            if (unit_type == 5 && output.split_unit)
+                output.split_string_offsets_base = str_base ? std::optional<std::uint64_t>{*str_base} : std::nullopt;
             std::optional<std::uint64_t> implicit_split_type_str_base;
             if (unit_type == 6 && !str_base && !sections.string_offsets.empty()) {
                 implicit_split_type_str_base = 8;
