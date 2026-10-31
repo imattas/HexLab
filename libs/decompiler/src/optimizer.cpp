@@ -85,6 +85,19 @@ std::optional<ConstantValue> fold_unary(const UnaryValue &unary, ValueType resul
     if (!operand || !operand->type.bits || operand->type.bits > 64 ||
         !result_type.bits || result_type.bits > 64)
         return {};
+    if ((unary.operation == "fcvtmod.w.d" || unary.operation == "fcvtmod.w.d.exceptions") &&
+        operand->type == ValueType{TypeKind::floating, 64, false} &&
+        result_type == (unary.operation == "fcvtmod.w.d.exceptions"
+            ? ValueType{TypeKind::integer, 5, false}
+            : ValueType{TypeKind::integer, 32, true})) {
+        // FCVTMOD's value and flags are derived from raw binary64 bits. Keep
+        // the architecture helper as the single source of truth, and fold the
+        // parallel sticky-fflags input separately so this cannot erase it.
+        const auto evaluated = evaluate_riscv_fcvtmod_w_d(operand->value, 32);
+        if (!evaluated) return {};
+        return ConstantValue{unary.operation == "fcvtmod.w.d.exceptions"
+            ? evaluated->fflags_set : evaluated->value, result_type};
+    }
     // FCLASS is a raw-encoding operation: classify the IEEE bit pattern rather
     // than interpreting it as a host float (which could canonicalize NaNs).
     if ((unary.operation == "fclass.s" || unary.operation == "fclass.d") &&

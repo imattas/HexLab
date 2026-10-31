@@ -13,5 +13,9 @@ precedence over NX for out-of-range results. The caller merges the returned
 accepted; other XLEN values return no result.
 
 This models only this operation. It does not model F-register NaN boxing,
-register state, other conversion opcodes, or sticky-flag updates. The behavior
+register state, other conversion opcodes, or sticky-flag updates. The typed
+decompiler lift preserves the conversion as an explicit operation, and constant
+propagation folds its value and `fflags` result through this same evaluator
+when the source bits are known. Sticky flags remain an explicit OR with the
+prior `fflags` value. The behavior
 follows the [RISC-V Zfa specification, §25.1.4](https://docs.riscv.org/reference/isa/unpriv/zfa.html).
