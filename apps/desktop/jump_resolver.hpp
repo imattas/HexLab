@@ -45,6 +45,7 @@ struct NamedLocationSearch {
     std::vector<NamedLocationCandidate> candidates;
     bool truncated = false;
     wxString limitation;
+    bool unique_exact_match = false;
 };
 enum class NamedLocationSearchMode { contains, prefix, exact, fuzzy };
 enum class NamedLocationScope { all, symbols, annotations, bookmarks, functions, sections };
