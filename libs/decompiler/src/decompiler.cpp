@@ -11655,22 +11655,22 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
             }
             if (!body_valid) break;
         }
-        // A post-tested loop may route its body through either of two latch
-        // blocks. Accept only the small diamond-free form where both arms end
-        // at a distinct conditional latch, and both latches have the same
-        // exact repeat and exit destinations. The predecessor sets below
-        // prove that neither arm nor exit has an unrecognized side entry.
+        // A post-tested loop may route its body through two or three latch
+        // blocks. Accept only small, phi-free conditional dispatch trees whose
+        // straight-line arms end at distinct latches with the same exact
+        // repeat and exit destinations. Predecessor sets prove that no arm,
+        // latch, or exit has an unrecognized side entry.
         if (body_valid && function.blocks.size() >= 4 && function.blocks.size() <= 128 &&
             terminal_conditional(*entry) && entry->phis.empty() && !entry->memory_phi &&
             entry->memory_partition_phis.empty() && !entry->switch_dispatch &&
             has_only_simple_statements(*entry) && conditional_edges_match_targets(*entry, *terminal_conditional(*entry))) {
             const auto *dispatch_condition = terminal_conditional(*entry);
-            const auto trace_latch_arm = [&](Address start)
+            const auto trace_latch_arm = [&](Address start, std::uint64_t initial_predecessor)
                 -> std::optional<std::vector<const LiftedBlock *>> {
                 std::vector<const LiftedBlock *> path;
                 std::set<std::uint64_t> seen;
                 auto *cursor = find_block(start);
-                auto predecessor = entry->id.value;
+                auto predecessor = initial_predecessor;
                 while (cursor && cursor != entry && path.size() < 64 && seen.insert(cursor->id.value).second &&
                        predecessors[cursor->id.value] == std::set<std::uint64_t>{predecessor} &&
                        cursor->phis.empty() && !cursor->memory_phi && cursor->memory_partition_phis.empty() &&
@@ -11686,19 +11686,19 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                 }
                 return {};
             };
-            const auto true_arm = dispatch_condition->true_target ? trace_latch_arm(*dispatch_condition->true_target)
+            const auto true_arm = dispatch_condition->true_target ? trace_latch_arm(*dispatch_condition->true_target, entry->id.value)
                                                                   : std::optional<std::vector<const LiftedBlock *>>{};
-            const auto false_arm = dispatch_condition->false_target ? trace_latch_arm(*dispatch_condition->false_target)
+            const auto false_arm = dispatch_condition->false_target ? trace_latch_arm(*dispatch_condition->false_target, entry->id.value)
                                                                     : std::optional<std::vector<const LiftedBlock *>>{};
+            const auto latch_targets_valid = [&](const LiftedBlock &latch, const Branch &test) {
+                return test.true_target && test.false_target && *test.true_target != *test.false_target &&
+                    latch.successors.size() == 2 && conditional_edges_match_targets(latch, test);
+            };
             if (true_arm && false_arm && !true_arm->empty() && !false_arm->empty()) {
                 const auto *true_latch = true_arm->back();
                 const auto *false_latch = false_arm->back();
                 const auto *true_test = terminal_conditional(*true_latch);
                 const auto *false_test = terminal_conditional(*false_latch);
-                const auto latch_targets_valid = [&](const LiftedBlock &latch, const Branch &test) {
-                    return test.true_target && test.false_target && *test.true_target != *test.false_target &&
-                        latch.successors.size() == 2 && conditional_edges_match_targets(latch, test);
-                };
                 if (true_latch != false_latch && true_test && false_test &&
                     latch_targets_valid(*true_latch, *true_test) && latch_targets_valid(*false_latch, *false_test)) {
                     const bool true_repeats_true = *true_test->true_target == entry->begin;
@@ -11750,6 +11750,100 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                         return {out.str(), false, {}};
                     }
                 }
+            }
+            // Extend the same proof to a three-arm tree: one entry edge reaches
+            // a direct latch arm, while the other reaches a second conditional
+            // dispatcher whose two straight-line arms reach the other latches.
+            // Keep this shape deliberately narrow so emitted nested ifs retain
+            // the original dispatch and block provenance without code motion.
+            if (true_arm && false_arm && !true_arm->empty() && !false_arm->empty()) {
+                const auto try_three_latch_tree = [&](bool split_on_true) -> std::optional<StructuredPseudocode> {
+                    const auto &split_arm = split_on_true ? *true_arm : *false_arm;
+                    const auto &direct_arm = split_on_true ? *false_arm : *true_arm;
+                    if (split_arm.empty() || direct_arm.empty()) return {};
+                    const auto *split = split_arm.back();
+                    const auto *split_condition = terminal_conditional(*split);
+                    const auto *direct_latch = direct_arm.back();
+                    const auto *direct_test = terminal_conditional(*direct_latch);
+                    if (!split_condition || !split_condition->true_target || !split_condition->false_target ||
+                        !conditional_edges_match_targets(*split, *split_condition) || !direct_test ||
+                        !latch_targets_valid(*direct_latch, *direct_test)) return {};
+                    const auto before_split = split_arm.size() == 1 ? entry->id.value : split_arm[split_arm.size() - 2]->id.value;
+                    if (predecessors[split->id.value] != std::set<std::uint64_t>{before_split}) return {};
+                    const auto yes_arm = trace_latch_arm(*split_condition->true_target, split->id.value);
+                    const auto no_arm = trace_latch_arm(*split_condition->false_target, split->id.value);
+                    if (!yes_arm || !no_arm || yes_arm->empty() || no_arm->empty()) return {};
+                    const auto *yes_latch = yes_arm->back();
+                    const auto *no_latch = no_arm->back();
+                    const auto *yes_test = terminal_conditional(*yes_latch);
+                    const auto *no_test = terminal_conditional(*no_latch);
+                    if (!yes_test || !no_test || !latch_targets_valid(*yes_latch, *yes_test) ||
+                        !latch_targets_valid(*no_latch, *no_test)) return {};
+                    if (direct_latch == yes_latch || direct_latch == no_latch || yes_latch == no_latch) return {};
+
+                    const auto repeat_target = [&](const Branch &test) -> std::optional<bool> {
+                        const bool on_true = *test.true_target == entry->begin;
+                        const bool on_false = *test.false_target == entry->begin;
+                        if (on_true == on_false) return {};
+                        return on_true;
+                    };
+                    const auto direct_repeat = repeat_target(*direct_test);
+                    const auto yes_repeat = repeat_target(*yes_test);
+                    const auto no_repeat = repeat_target(*no_test);
+                    if (!direct_repeat || !yes_repeat || !no_repeat) return {};
+                    const Address exit_address = *direct_repeat ? *direct_test->false_target : *direct_test->true_target;
+                    if ((*yes_repeat ? *yes_test->false_target : *yes_test->true_target) != exit_address ||
+                        (*no_repeat ? *no_test->false_target : *no_test->true_target) != exit_address) return {};
+                    const auto *exit = find_block(exit_address);
+                    if (!exit || !has_only_terminal_return(*exit) || !exit->phis.empty() || exit->memory_phi ||
+                        !exit->memory_partition_phis.empty()) return {};
+
+                    std::set<std::uint64_t> covered{entry->id.value};
+                    const auto claim = [&](const auto &arm) {
+                        for (const auto *block : arm)
+                            if (!covered.insert(block->id.value).second) return false;
+                        return true;
+                    };
+                    if (!claim(direct_arm) || !claim(split_arm) || !claim(*yes_arm) || !claim(*no_arm)) return {};
+                    const std::set<std::uint64_t> latches{direct_latch->id.value, yes_latch->id.value, no_latch->id.value};
+                    if (predecessors[entry->id.value] != latches || predecessors[exit->id.value] != latches ||
+                        !covered.insert(exit->id.value).second || covered.size() != function.blocks.size() ||
+                        !std::all_of(function.blocks.begin(), function.blocks.end(), [&](const auto &block) {
+                            return covered.contains(block.id.value);
+                        })) return {};
+
+                    const auto emit_latch_arm = [&](const auto &arm, const Branch &test,
+                                                    bool repeat_on_true, unsigned indent) {
+                        for (const auto *block : arm) emit_block(*block, indent, true);
+                        const auto condition = branch_condition_text(test);
+                        const std::string pad(indent, ' ');
+                        out << pad << "if (" << (repeat_on_true ? condition : "!(" + condition + ")") << ") {\n"
+                            << pad << "    continue;\n" << pad << "} else {\n"
+                            << pad << "    break;\n" << pad << "}\n";
+                    };
+                    const auto emit_split = [&]() {
+                        for (std::size_t i = 0; i + 1 < split_arm.size(); ++i) emit_block(*split_arm[i], 12, true);
+                        emit_block(*split, 12, true);
+                        out << "            if (" << branch_condition_text(*split_condition) << ") {\n";
+                        emit_latch_arm(*yes_arm, *yes_test, *yes_repeat, 16);
+                        out << "            } else {\n";
+                        emit_latch_arm(*no_arm, *no_test, *no_repeat, 16);
+                        out << "            }\n";
+                    };
+                    out << "function " << address_label(function.entry) << "() {\n    do {\n";
+                    emit_block(*entry, 8, true);
+                    out << "        if (" << (split_on_true ? branch_condition_text(*dispatch_condition) :
+                        "!(" + branch_condition_text(*dispatch_condition) + ")") << ") {\n";
+                    emit_split();
+                    out << "        } else {\n";
+                    emit_latch_arm(direct_arm, *direct_test, *direct_repeat, 12);
+                    out << "        }\n    } while (true);\n";
+                    emit_block(*exit, 4);
+                    out << "}\n";
+                    return StructuredPseudocode{out.str(), false, {}};
+                };
+                if (auto structured = try_three_latch_tree(true)) return *structured;
+                if (auto structured = try_three_latch_tree(false)) return *structured;
             }
         }
         const auto trace_linear = [&](Address start)
