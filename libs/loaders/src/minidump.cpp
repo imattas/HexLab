@@ -1121,7 +1121,8 @@ Result<LoadedImage> load_minidump(std::shared_ptr<const ByteStorage> storage, st
             if (context.status != MinidumpContextStatus::decoded) ++context_issue_count;
             std::uint64_t cost = sizeof(MinidumpContext) + context.registers.size() * sizeof(MinidumpRegister);
             cost += context.captured_prefix.size();
-            for (const auto &reg : context.registers) cost += reg.name.size() + reg.bytes.size();
+            for (const auto &reg : context.registers)
+                cost += reg.name.size() + reg.bytes.size() + reg.byte_file_offsets.size() * sizeof(FileOffset);
             for (const auto &diagnostic : context.diagnostics) cost += diagnostic.size();
             if (budget > max_metadata_bytes || cost > max_metadata_bytes - budget)
                 return Error{ErrorCode::resource_limit, "Minidump register contexts exceed the metadata budget"};
