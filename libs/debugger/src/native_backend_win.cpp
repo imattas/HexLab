@@ -3518,6 +3518,7 @@ private:
             CONTEXT context{};
             context.ContextFlags = CONTEXT_ARM64_DEBUG_REGISTERS;
             if (!GetThreadContext(thread, &context)) return win_error("GetThreadContext for ARM64 hardware breakpoint");
+            const CONTEXT original = context;
             for (std::size_t i = 0; i < std::max(desired->breakpoint_count, expected->breakpoint_count); ++i) {
                 const bool was_owned = i < expected->breakpoint_count;
                 const bool will_be_owned = i < desired->breakpoint_count;
@@ -3545,6 +3546,34 @@ private:
                 context.Wvr[i] = will_be_owned ? desired->watch_value[i] : 0;
             }
             if (!SetThreadContext(thread, &context)) return win_error("SetThreadContext for ARM64 hardware breakpoint");
+            // CONTEXT_ARM64_DEBUG_REGISTERS exposes fixed-size arrays, but a
+            // target is not required to implement every comparator. Read the
+            // requested state back so a masked or unavailable watchpoint is
+            // reported as unsupported instead of being advertised as active.
+            CONTEXT observed{};
+            observed.ContextFlags = CONTEXT_ARM64_DEBUG_REGISTERS;
+            if (!GetThreadContext(thread, &observed)) {
+                const auto read_error = win_error("GetThreadContext verifying ARM64 hardware breakpoint");
+                if (!SetThreadContext(thread, &original))
+                    return Error{ErrorCode::io, read_error.message + "; ARM64 debug-register rollback failed"};
+                return read_error;
+            }
+            bool verified = true;
+            for (std::size_t i = 0; i < std::max(desired->breakpoint_count, expected->breakpoint_count); ++i) {
+                const auto control = i < desired->breakpoint_count ? desired->breakpoint_control[i] : 0u;
+                const auto value = i < desired->breakpoint_count ? desired->breakpoint_value[i] : 0u;
+                verified = verified && observed.Bcr[i] == control && observed.Bvr[i] == value;
+            }
+            for (std::size_t i = 0; i < std::max(desired->watch_count, expected->watch_count); ++i) {
+                const auto control = i < desired->watch_count ? desired->watch_control[i] : 0u;
+                const auto value = i < desired->watch_count ? desired->watch_value[i] : 0u;
+                verified = verified && observed.Wcr[i] == control && observed.Wvr[i] == value;
+            }
+            if (!verified) {
+                if (!SetThreadContext(thread, &original))
+                    return Error{ErrorCode::io, "ARM64 target does not expose the requested debug comparator configuration and rollback failed"};
+                return Error{ErrorCode::unsupported, "ARM64 target does not expose the requested hardware breakpoint or watchpoint comparator configuration"};
+            }
             return std::monostate{};
 #endif
         }
