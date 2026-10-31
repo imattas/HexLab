@@ -23,6 +23,10 @@ archives, reporting trigger and unresolved symbols. This is selection evidence
 only: XCOFF linking, relocation application, and optional-header objects remain
 unsupported.
 
+The public [XCOFF32 object inventory](xcoff32-object-inventory.md) additionally
+retains bounded file, section and primary-symbol metadata from member storage;
+it does not decode relocation rows or link objects.
+
 `archive link-audit <archive> --root-object <XCOFF64>` adds a bounded structural
 relocation and selected-object symbol-provider report. Recognized type names
 remain unapplied; unknown relocation types and loader-section encoding remain
