@@ -764,12 +764,14 @@ std::optional<RegisterOperand> classified_register(std::string_view name) {
 }
 
 std::optional<RegisterOperand> ppc64_classified_register(std::string_view name) {
-    if (name.size() < 2 || (name[0] != 'R' && name[0] != 'F')) return {};
+    if (name.size() < 2 || (name[0] != 'R' && name[0] != 'F' && name[0] != 'V')) return {};
     unsigned index = 0;
     const auto parsed = std::from_chars(name.data() + 1, name.data() + name.size(), index);
     if (parsed.ec != std::errc{} || parsed.ptr != name.data() + name.size() || index >= 32) return {};
-    return RegisterOperand{name[0] == 'R' ? RegisterBank::ppc_gpr : RegisterBank::ppc_fpr,
-                           static_cast<std::uint8_t>(index), 64, false};
+    const auto bank = name[0] == 'R' ? RegisterBank::ppc_gpr :
+                      name[0] == 'F' ? RegisterBank::ppc_fpr : RegisterBank::ppc_vr;
+    return RegisterOperand{bank, static_cast<std::uint8_t>(index),
+                           name[0] == 'V' ? std::uint16_t{128} : std::uint16_t{64}, false};
 }
 
 std::optional<RegisterOperand> mips_n32_classified_register(std::string_view name) {
@@ -1000,7 +1002,8 @@ std::vector<AbiArgumentSlot> ppc64_elfv2_prototype_slots(const types::TypePtr &p
         const auto &type = prototype->parameters()[index].type;
         const auto parameter_type = unqualified_type(type);
         const auto value_class = parameter_type && parameter_type->kind() == types::Kind::floating
-            ? AbiValueClass::floating : AbiValueClass::integer;
+            ? AbiValueClass::floating : parameter_type && parameter_type->kind() == types::Kind::vector
+            ? AbiValueClass::vector : AbiValueClass::integer;
         if (!argument.supported || argument.locations.size() != 1 || !type) continue;
         const auto &location = argument.locations.front();
         if (location.kind == AbiLocationKind::register_) {
@@ -1608,6 +1611,10 @@ AbiDescription ppc64le_elfv2_abi() {
         a.floating_argument_registers.push_back(
             {RegisterBank::ppc_fpr, static_cast<std::uint8_t>(index), 64, false});
     a.floating_return_register = RegisterOperand{RegisterBank::ppc_fpr, 1, 64, false};
+    for (unsigned index = 2; index <= 13; ++index)
+        a.vector_argument_registers.push_back(
+            {RegisterBank::ppc_vr, static_cast<std::uint8_t>(index), 128, false});
+    a.vector_return_register = RegisterOperand{RegisterBank::ppc_vr, 2, 128, false};
     a.stack_argument_base = RegisterOperand{RegisterBank::ppc_gpr, 1, 64, false};
     // The first eight doublewords are assigned to R3-R10. Stack locations in
     // the caller's parameter-save area follow the 32-byte linkage area.
