@@ -24,6 +24,12 @@ inline std::string macho_objc_class_ro_flags(std::uint32_t flags) {
     }
     return result;
 }
+inline std::string macho_objc_layout_hex(const MachOObjCIvarLayout &layout) {
+    std::ostringstream out;
+    out << std::hex << std::setfill('0');
+    for (const auto byte : layout.encoded_bytes) out << std::setw(2) << unsigned(byte);
+    return out.str();
+}
 inline const char *macho_pac_key(std::uint8_t key) {
     constexpr const char *names[] = {"IA", "IB", "DA", "DB"};
     return key < 4 ? names[key] : "unknown";
@@ -594,6 +600,10 @@ inline void macho_description(std::ostream &out, const ImageMetadata &metadata, 
                     << " flag-semantics=" << (row.flags ? macho_objc_class_ro_flags(*row.flags) : "-")
                     << " instance-start=" << (row.instance_start ? macho_hex(*row.instance_start) : "-")
                     << " instance-size=" << (row.instance_size ? macho_hex(*row.instance_size) : "-")
+                    << " ivar-layout=" << macho_text(row.ivar_layout.status) << "/" << macho_text(row.ivar_layout.pointer_status) << ':' << macho_objc_layout_hex(row.ivar_layout)
+                    << " weak-ivar-layout=" << macho_text(row.weak_ivar_layout.status) << "/" << macho_text(row.weak_ivar_layout.pointer_status) << ':' << macho_objc_layout_hex(row.weak_ivar_layout)
+                    << " metaclass-ivar-layout=" << macho_text(row.metaclass_ivar_layout.status) << "/" << macho_text(row.metaclass_ivar_layout.pointer_status) << ':' << macho_objc_layout_hex(row.metaclass_ivar_layout)
+                    << " metaclass-weak-ivar-layout=" << macho_text(row.metaclass_weak_ivar_layout.status) << "/" << macho_text(row.metaclass_weak_ivar_layout.pointer_status) << ':' << macho_objc_layout_hex(row.metaclass_weak_ivar_layout)
                     << " methods=" << macho_text(row.methods.status);
                 if (row.methods.address) out << ':' << format_location(*row.methods.address, image);
                 if (row.methods.count) out << " count=" << *row.methods.count << " stride=" << *row.methods.stride;
