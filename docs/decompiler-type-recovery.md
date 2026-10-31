@@ -278,8 +278,14 @@ extension, and the additive index's memory scale equals the complete
 array-element size.
 Direct element access must also match the element width; indexed field access
 must match one unique field through a complete, non-overlapping element layout.
-Dynamic indices into arbitrary pointers, multiple dynamic array levels, and
-possibly overlapping member layouts remain raw memory expressions.
+For an arbitrary recovered pointer, a direct dynamic access can print as
+`base[index]`, `base[index + k]`, or `base[index - k]` when the positive
+unshifted index scale exactly matches the access width and the constant
+displacement is an exact multiple of that width. The displacement is folded
+into the element index, including negative biases. Shifted, extended,
+subtracting, mismatched-width, or non-element-aligned accesses remain raw
+memory expressions. This notation does not infer array bounds. Multiple dynamic
+array levels and possibly overlapping member layouts also remain raw.
 When an explicit or recovered structure contains nested structures or fixed
 arrays of structures, typed pseudocode can also follow a flattened constant
 displacement through the complete member path, such as

@@ -665,7 +665,11 @@ enum class Opcode {
     // Hardware random/seed instructions; append for persisted opcode stability.
     rdrand, rdseed,
     // MIPS64 PREF prefetch hint; append to preserve serialized opcode IDs.
-    mips64_pref
+    mips64_pref,
+    // AVX-512 opmask Boolean instructions; append to preserve serialized IDs.
+    kandb, kandw, kandd, kandq, kandnb, kandnw, kandnd, kandnq,
+    korb, korw, kord, korq, kxorb, kxorw, kxord, kxorq,
+    kxnorb, kxnorw, kxnord, kxnorq, knotb, knotw, knotd, knotq
 };
 enum class OperandAccess { read, write, read_write, address };
 // The encoded x86 group-one repeat prefix is retained separately from the

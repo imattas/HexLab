@@ -71,6 +71,17 @@ lane's sign bit to the matching K bit and clears bits above the active vector
 length. Only VL128/256/512 register forms are supported; memory operands,
 EVEX.aaa/EVEX.z, and EVEX.b are rejected.
 
+VEX opmask Boolean instructions decode as register-only K-register operations:
+`KAND`, `KANDN`, `KOR`, `KXOR`, and `KXNOR` support byte, word, dword, and
+qword widths, while `KNOT` supports the same four widths with one source.
+The decoder validates map/prefix/`W`/`L` combinations, reserved `vvvv` for
+`KNOT`, and rejects memory operands or encodings outside K0-K7. Formatting
+prints the width-specific mnemonic and the instruction effects identify the
+full K-register reads and write; the opcode variant carries the active low
+8/16/32/64-bit operation width, with bits above that width cleared in the
+destination. No pure runtime mask evaluator or typed decompiler lift is added
+here; CPU feature checks and exception delivery remain caller-owned.
+
 EVEX immediate packed shifts support word, dword, and qword logical left and
 right forms plus arithmetic right word and dword forms. They use map 1
 opcodes `71`/`72`/`73`, `pp=66`, and the documented ModRM group selectors;

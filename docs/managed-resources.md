@@ -9,6 +9,8 @@ Nil Implementation identifies an embedded resource. File-backed resources
 also retain the referenced File name and `ContainsNoMetadata` flag.
 AssemblyRef-backed resources retain the referenced assembly name, four-part
 version, neutral-or-named culture, flags, and PublicKeyOrToken blob index.
+They also retain the AssemblyRef `HashValue` blob and the owning Assembly's
+`HashAlgId` when present.
 ExportedType implementations retain their metadata token. The default parser
 retains external identities but does not resolve files or assemblies.
 
@@ -29,9 +31,13 @@ algorithms remain unresolved. `ContainsNoMetadata` files expose their bounded
 raw payload; metadata-bearing files require a unique same-name embedded
 ManifestResource row. AssemblyRef implementations require a unique supplied
 assembly with matching name, culture, version, flags, and public-key identity,
-including token derivation from a supplied full strong-name key, then a unique
-same-name embedded resource with the exact ManifestResource offset. Nested
-external providers are not followed.
+including token derivation from a supplied full strong-name key. If the
+AssemblyRef row has a nonempty `HashValue`, its supplied candidate must also
+match that hash under the owning Assembly's `HashAlgId`; an absent hash
+preserves identity-only matching. SHA-1 and SHA-256 are supported for this
+check. The candidate must then contain a unique same-name embedded resource
+with the exact ManifestResource offset. Nested external providers are not
+followed.
 Missing, ambiguous, unsupported-hash, and mismatched-hash cases retain an
 explicit resolution state and diagnostic without discarding metadata.
 
@@ -40,8 +46,10 @@ and defaults to a 64 MiB aggregate resolved-payload budget. The project CLI
 accepts an explicit UTF-8 path list with one caller-selected input per line:
 `hexlab_cli project managed-resources <project> --inputs-list <paths.txt>`.
 Relative entries are resolved only against the list file's directory. No
-search paths are inferred. `--json` emits each resource's resolution state
-and diagnostic. For decoded `.resources` payloads, both text and JSON output
+search paths are inferred. `--json` emits each resource's resolution state,
+diagnostic, and (when present) implementation hash algorithm, full hash byte
+count, and at most the first 32 hash bytes in hexadecimal. Text output uses
+the same bounded hash prefix. For decoded `.resources` payloads, both text and JSON output
 include a bounded record summary with type code, value kind, type name,
 support status, payload-relative data span, and decoded scalar bits or string
 text when available. Record byte contents are never deserialized or emitted.

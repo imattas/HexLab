@@ -791,8 +791,19 @@ int print_derived(std::ostream &out, const Arguments &args, const ProjectSnapsho
                    <<",\"identity\":"<<search_json_string(resource.implementation_name)
                    <<",\"resolution\":"<<search_json_string(resolution_name(resource.resolution))
                    <<",\"payload_bytes\":"<<resource.payload.size()
-                   <<",\"records\":"<<resource.records.size()
-                   <<",\"record_details\":[";
+                   <<",\"records\":"<<resource.records.size();
+                if(!resource.implementation_hash.empty()){
+                    constexpr std::size_t hash_prefix_bytes=32;
+                    const auto hash_prefix=std::min(resource.implementation_hash.size(),hash_prefix_bytes);
+                    std::ostringstream hash_hex;hash_hex<<std::hex<<std::setfill('0');
+                    for(std::size_t hash_index=0;hash_index<hash_prefix;++hash_index)
+                        hash_hex<<std::setw(2)<<std::to_integer<unsigned>(resource.implementation_hash[hash_index]);
+                    out<<",\"implementation_hash_algorithm\":"<<resource.implementation_hash_algorithm
+                       <<",\"implementation_hash_bytes\":"<<resource.implementation_hash.size()
+                       <<",\"implementation_hash_prefix_hex\":"<<search_json_string(hash_hex.str())
+                       <<",\"implementation_hash_truncated\":"<<(hash_prefix<resource.implementation_hash.size()?"true":"false");
+                }
+                out<<",\"record_details\":[";
                 for(std::size_t record_index=0;record_index<record_detail_count;++record_index){
                     if(record_index)out<<',';
                     const auto& record=resource.records[record_index];
@@ -831,6 +842,16 @@ int print_derived(std::ostream &out, const Arguments &args, const ProjectSnapsho
                 } else {
                     out << " contains-metadata=" << (resource.implementation_file_contains_metadata ? "yes" : "no");
                 }
+            }
+            if(!resource.implementation_hash.empty()){
+                constexpr std::size_t hash_prefix_bytes=32;
+                const auto hash_prefix=std::min(resource.implementation_hash.size(),hash_prefix_bytes);
+                out<<" implementation-hash-algorithm=0x"<<std::hex<<resource.implementation_hash_algorithm<<std::dec
+                   <<" implementation-hash-bytes="<<resource.implementation_hash.size()<<" implementation-hash-prefix=";
+                for(std::size_t hash_index=0;hash_index<hash_prefix;++hash_index)
+                    out<<std::hex<<std::setw(2)<<std::setfill('0')<<std::to_integer<unsigned>(resource.implementation_hash[hash_index]);
+                out<<std::dec<<std::setfill(' ');
+                if(hash_prefix<resource.implementation_hash.size())out<<"...";
             }
             out << " resolution=" << resolution_name(resource.resolution);
             if (resource.payload.size()||resource.data_size)

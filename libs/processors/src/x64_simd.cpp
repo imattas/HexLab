@@ -1,4 +1,4 @@
-#include "x64_simd_internal.hpp"
+﻿#include "x64_simd_internal.hpp"
 #include "hexlab/processors/x86_avx_semantics.hpp"
 #include "hexlab/processors/x86_alignr_semantics.hpp"
 #include "hexlab/processors/x86_mask_extract.hpp"
@@ -410,6 +410,62 @@ bool simd_0f3a(State &state, std::uint8_t opcode) {
 }
 
 bool vex_simd(State &state, std::uint8_t opcode, unsigned map, unsigned pp, unsigned vvvv, bool l, bool w) {
+    if (map == 1 && (opcode == 0x41 || opcode == 0x42 || opcode == 0x44 ||
+                     opcode == 0x45 || opcode == 0x46 || opcode == 0x47)) {
+        if (pp > 1)
+            invalid("VEX opmask Boolean instruction has an unsupported mandatory prefix");
+        if (state.rex & 7)
+            invalid("VEX opmask Boolean instructions encode only K0-K7");
+        const bool unary = opcode == 0x44;
+        if (l != !unary)
+            invalid("VEX opmask Boolean instruction has an invalid L field");
+        if (unary && vvvv != 0)
+            invalid("KNOT requires the reserved VEX.vvvv encoding");
+        if (!unary && vvvv > 7)
+            invalid("VEX opmask Boolean source must encode K0-K7");
+        const std::uint16_t width = pp ? (w ? 32 : 8) : (w ? 64 : 16);
+        auto decoded = modrm(state, 64, 64);
+        if (decoded.mod != 3)
+            invalid("VEX opmask Boolean instructions require register operands");
+        if (decoded.reg.index > 7 || std::get<RegisterOperand>(decoded.rm).index > 7)
+            invalid("VEX opmask Boolean instructions encode only K0-K7");
+
+        const auto select = [width](Opcode b, Opcode word, Opcode dword, Opcode qword) {
+            switch (width) {
+            case 8: return b;
+            case 16: return word;
+            case 32: return dword;
+            default: return qword;
+            }
+        };
+        switch (opcode) {
+        case 0x41: state.i.opcode = select(Opcode::kandb, Opcode::kandw, Opcode::kandd, Opcode::kandq); break;
+        case 0x42: state.i.opcode = select(Opcode::kandnb, Opcode::kandnw, Opcode::kandnd, Opcode::kandnq); break;
+        case 0x44: state.i.opcode = select(Opcode::knotb, Opcode::knotw, Opcode::knotd, Opcode::knotq); break;
+        case 0x45: state.i.opcode = select(Opcode::korb, Opcode::korw, Opcode::kord, Opcode::korq); break;
+        case 0x46: state.i.opcode = select(Opcode::kxnorb, Opcode::kxnorw, Opcode::kxnord, Opcode::kxnorq); break;
+        case 0x47: state.i.opcode = select(Opcode::kxorb, Opcode::kxorw, Opcode::kxord, Opcode::kxorq); break;
+        default: return false;
+        }
+
+        auto destination = decoded.reg;
+        destination.bank = RegisterBank::opmask;
+        destination.width = 64;
+        destination.high_byte = false;
+        auto right = std::get<RegisterOperand>(decoded.rm);
+        right.bank = RegisterBank::opmask;
+        right.width = 64;
+        right.high_byte = false;
+        state.operand(destination, OperandAccess::write);
+        if (unary) {
+            state.operand(right, OperandAccess::read);
+        } else {
+            auto left = RegisterOperand{RegisterBank::opmask, static_cast<std::uint16_t>(vvvv), 64, false};
+            state.operand(left, OperandAccess::read);
+            state.operand(right, OperandAccess::read);
+        }
+        return true;
+    }
     if (map == 2 && opcode == 0x17) {
         if (pp != 1)
             invalid("VPTEST requires VEX.pp=66");

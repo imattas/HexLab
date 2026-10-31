@@ -1839,8 +1839,9 @@ static Result<TypeRecoveryResult> recover_types_impl(
                         : x.index_shift == "lsl" && x.index_shift_amount < 31 && x.scale <= (1u << 20) >> x.index_shift_amount
                             ? static_cast<std::uint32_t>(x.scale) << x.index_shift_amount
                             : 0u;
-                    if (x.index && x.index_add && x.displacement == 0 &&
-                        x.type.bits && x.type.bits % 8 == 0 && effective_scale == access_bytes) {
+                    if (x.index && x.index_add && x.type.bits && x.type.bits % 8 == 0 &&
+                        effective_scale == access_bytes && effective_scale != 0 &&
+                        x.displacement % static_cast<std::int64_t>(effective_scale) == 0) {
                         if (base.indexed_element_bits && *base.indexed_element_bits != x.type.bits) {
                             base.indexed_element_bits.reset();
                             base.indexed_element_ambiguous = true;

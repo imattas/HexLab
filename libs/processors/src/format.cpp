@@ -445,6 +445,13 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
     if (op == Opcode::vmovmskps) return "vmovmskps";
     if (op == Opcode::vmovmskpd) return "vmovmskpd";
     if (op == Opcode::vpmovmskb) return "vpmovmskb";
+    if (op >= Opcode::kandb && op <= Opcode::knotq) {
+        static constexpr const char *names[]{"kandb", "kandw", "kandd", "kandq",
+            "kandnb", "kandnw", "kandnd", "kandnq", "korb", "korw", "kord", "korq",
+            "kxorb", "kxorw", "kxord", "kxorq", "kxnorb", "kxnorw", "kxnord", "kxnorq",
+            "knotb", "knotw", "knotd", "knotq"};
+        return names[static_cast<std::size_t>(op) - static_cast<std::size_t>(Opcode::kandb)];
+    }
     if (op >= Opcode::movdqa && op <= Opcode::divsd) {
         static constexpr const char *names[]{"movdqa", "movdqu", "paddd", "paddq", "psubd", "psubq", "pand", "por",
             "pxor", "movss", "movsd", "addss", "addsd", "subss", "subsd", "mulss", "mulsd", "divss", "divsd"};
