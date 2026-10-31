@@ -2034,7 +2034,7 @@ struct MainFrame::Impl {
                     return;
                 }
                 frame.Navigate(Address{AddressSpaceId{location.address_space}, location.entry});
-            });
+            }, old_functions, new_functions);
         view->Show();
         frame.SetStatusText("Binary comparison complete");
     }
@@ -2068,7 +2068,7 @@ struct MainFrame::Impl {
             std::optional<compare::Report> report;
             std::optional<std::vector<compare::FunctionMatch>> function_matches;
             std::optional<std::vector<compare::FunctionBodyDiff>> function_body_diffs;
-            std::shared_ptr<const FunctionSnapshot> comparison_old_functions;
+            std::shared_ptr<const FunctionSnapshot> comparison_old_functions, comparison_new_functions;
             std::string error;
             try {
                 auto old_input = compare_input(*current_image, source_project->loaded->metadata, stop);
@@ -2100,6 +2100,7 @@ struct MainFrame::Impl {
                     auto new_functions = recover_functions(*loaded.value()->image, loaded.value()->metadata,
                                                            {}, source_project->analysis_options, stop);
                     if (new_functions) {
+                        comparison_new_functions = new_functions.value();
                         const auto old_features = compare_function_features(*old_functions,
                             source_project->loaded->metadata, source_project.get(), stop);
                         if (stop.stop_requested()) throw std::runtime_error("Binary comparison canceled");
@@ -2129,6 +2130,7 @@ struct MainFrame::Impl {
                 compare_work.function_matches = std::move(function_matches);
                 compare_work.function_body_diffs = std::move(function_body_diffs);
                 compare_work.comparison_old_functions = std::move(comparison_old_functions);
+                compare_work.comparison_new_functions = std::move(comparison_new_functions);
                 compare_work.error = std::move(error);
                 compare_work.complete = true;
             }

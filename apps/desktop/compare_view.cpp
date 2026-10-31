@@ -1,6 +1,9 @@
 #include "compare_view.hpp"
 #include "main_frame.hpp"
+#include "compare_adapter.hpp"
+#include "../compare_instruction_features.hpp"
 #include "hexlab/processors/instruction.hpp"
+#include "hexlab/processors/format.hpp"
 #include <wx/sizer.h>
 #include <wx/stattext.h>
 #include <wx/notebook.h>
@@ -264,17 +267,20 @@ CompareView::CompareView(wxWindow *parent, compare::Report report, wxString old_
                          std::function<void(const compare::ChangeRun &)> navigate_new,
                          std::function<void(const compare::FunctionMatch &)> navigate_new_function,
                          std::function<void(const compare::FunctionAddress &)> navigate_old_instruction,
-                         std::function<void(const compare::FunctionAddress &)> navigate_new_instruction)
+                         std::function<void(const compare::FunctionAddress &)> navigate_new_instruction,
+                         std::shared_ptr<const FunctionSnapshot> old_instructions,
+                         std::shared_ptr<const FunctionSnapshot> new_instructions)
     : wxFrame(parent, wxID_ANY, "Binary Comparison", wxDefaultPosition, wxDefaultSize),
       report_(std::move(report)), function_matches_(std::move(functions)),
       function_body_diffs_(std::move(function_body_diffs)),
+      old_instructions_(std::move(old_instructions)), new_instructions_(std::move(new_instructions)),
       old_name_(std::move(old_name)), new_name_(std::move(new_name)), navigate_old_(std::move(navigate_old)),
       navigate_old_function_(std::move(navigate_old_function)), navigate_new_(std::move(navigate_new)),
       navigate_new_function_(std::move(navigate_new_function)),
       navigate_old_instruction_(std::move(navigate_old_instruction)),
       navigate_new_instruction_(std::move(navigate_new_instruction)) {
     SetName("binary-compare-view");
-    SetClientSize(FromDIP(wxSize(900, 560)));
+    SetClientSize(FromDIP(wxSize(1100, 800)));
     CreateStatusBar();
     auto *menu_bar = new wxMenuBar;
     auto *file = new wxMenu;
@@ -452,11 +458,32 @@ CompareView::CompareView(wxWindow *parent, compare::Report report, wxString old_
     function_diff_runs_->AppendColumn("Old index / range", wxLIST_FORMAT_LEFT, FromDIP(220));
     function_diff_runs_->AppendColumn("New index / range", wxLIST_FORMAT_LEFT, FromDIP(220));
     function_box->Add(function_diff_runs_, 1, wxEXPAND | wxALL, FromDIP(8));
+    instruction_review_summary_ = new wxStaticText(function_page, wxID_ANY,
+        "Select an instruction run to review retained decoded evidence.");
+    instruction_review_summary_->SetName("compare-instruction-review-summary");
+    function_box->Add(instruction_review_summary_, 0, wxEXPAND | wxLEFT | wxRIGHT, FromDIP(8));
+    auto *review = new wxBoxSizer(wxHORIZONTAL);
+    const auto add_review_side = [&](const char *label, const char *name) {
+        auto *side = new wxBoxSizer(wxVERTICAL);
+        side->Add(new wxStaticText(function_page, wxID_ANY, label), 0, wxBOTTOM, FromDIP(4));
+        auto *text = new wxTextCtrl(function_page, wxID_ANY, {}, wxDefaultPosition,
+            FromDIP(wxSize(350, 150)), wxTE_MULTILINE | wxTE_READONLY | wxTE_DONTWRAP);
+        text->SetName(name);
+        text->SetFont(wxFontInfo(9).Family(wxFONTFAMILY_TELETYPE));
+        side->Add(text, 1, wxEXPAND);
+        review->Add(side, 1, wxEXPAND | wxRIGHT, FromDIP(4));
+        return text;
+    };
+    instruction_review_old_ = add_review_side("Old decoded instructions", "compare-instruction-review-old");
+    instruction_review_new_ = add_review_side("New decoded instructions", "compare-instruction-review-new");
+    function_box->Add(review, 1, wxEXPAND | wxALL, FromDIP(8));
     function_diff_runs_->Bind(wxEVT_LIST_ITEM_SELECTED, [this](wxListEvent &) {
         update_instruction_navigation();
+        show_instruction_review();
     });
     function_diff_runs_->Bind(wxEVT_LIST_ITEM_DESELECTED, [this](wxListEvent &) {
         update_instruction_navigation();
+        show_instruction_review();
     });
     function_diff_old_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) {
         const auto row = function_diff_runs_->GetNextItem(-1, wxLIST_NEXT_ALL, wxLIST_STATE_SELECTED);
@@ -783,9 +810,11 @@ void CompareView::activate_run_new(std::size_t index) {
         navigate_new_(report_.runs[index]);
 }
 void CompareView::show_function_diff(std::size_t index) {
+    selected_function_diff_.reset();
     function_diff_runs_->DeleteAllItems();
     visible_instruction_runs_.clear();
     update_instruction_navigation();
+    show_instruction_review();
     if (index >= function_matches_.size()) {
         function_diff_summary_->SetLabel("Select a function match to inspect its instruction alignment.");
         return;
@@ -805,6 +834,7 @@ void CompareView::show_function_diff(std::size_t index) {
         return;
     }
     const auto &diff = found->diff;
+    selected_function_diff_ = index;
     auto summary = wxString::Format(
         "Instructions: equal %llu; changed %llu; removed %llu; added %llu. Semantic changes: opcode %llu, flow %llu, operands %llu, effects %llu, unclassified %llu. Blocks: matched %llu; added %llu; removed %llu; ambiguous %llu.",
         static_cast<unsigned long long>(diff.equal_instructions),
@@ -824,6 +854,8 @@ void CompareView::show_function_diff(std::size_t index) {
     if (found->block_correspondence.instruction_diff_budget_exhausted)
         summary += " Block instruction diff budget exhausted; unresolved instruction summaries are omitted.";
     function_diff_summary_->SetLabel(summary);
+    function_diff_summary_->Wrap(std::max(FromDIP(250), function_diff_runs_->GetClientSize().GetWidth()));
+    function_diff_summary_->GetParent()->Layout();
     for (const auto &run : diff.runs) {
         visible_instruction_runs_.push_back(run);
         const auto row = function_diff_runs_->InsertItem(function_diff_runs_->GetItemCount(),
@@ -885,6 +917,78 @@ void CompareView::update_instruction_navigation() {
     function_diff_old_->Enable(run && run->old_address && bool(navigate_old_instruction_));
     function_diff_new_->Enable(run && run->new_address && bool(navigate_new_instruction_));
 }
+void CompareView::show_instruction_review() {
+    if (!instruction_review_old_ || !instruction_review_new_) return;
+    instruction_review_old_->ChangeValue({});
+    instruction_review_new_->ChangeValue({});
+    const auto selected = function_diff_runs_->GetNextItem(-1, wxLIST_NEXT_ALL, wxLIST_STATE_SELECTED);
+    if (!selected_function_diff_ || selected < 0 ||
+        static_cast<std::size_t>(selected) >= visible_instruction_runs_.size()) {
+        instruction_review_summary_->SetLabel("Select a whole-function instruction run to review decoded evidence; block rows contain summaries only.");
+        return;
+    }
+    const auto &match = function_matches_[*selected_function_diff_];
+    const auto &run = visible_instruction_runs_[static_cast<std::size_t>(selected)];
+    auto summary = function_diff_kind_text(run.kind) + " run; first " + number(compare_instruction_review_limit) +
+        " instructions per side at most. Changed rows are positional substitutions within this run.";
+    if (run.semantic.available)
+        summary += wxString::Format(" Categories: opcode %llu, flow %llu, operands %llu, effects %llu, unclassified %llu (can overlap).",
+            static_cast<unsigned long long>(run.semantic.opcode_changes),
+            static_cast<unsigned long long>(run.semantic.flow_changes),
+            static_cast<unsigned long long>(run.semantic.operand_changes),
+            static_cast<unsigned long long>(run.semantic.effect_changes),
+            static_cast<unsigned long long>(run.semantic.unclassified_changes));
+    else summary += " Stored change categories unavailable.";
+    instruction_review_summary_->SetLabel(summary);
+    instruction_review_summary_->Wrap(std::max(FromDIP(250), function_diff_runs_->GetClientSize().GetWidth()));
+    instruction_review_summary_->GetParent()->Layout();
+    const auto render = [&](wxTextCtrl *pane, const std::shared_ptr<const FunctionSnapshot> &snapshot,
+                            const compare::FunctionAddress &entry, std::uint64_t start,
+                            std::uint64_t count, const std::optional<compare::FunctionAddress> &expected) {
+        if (!count) { pane->ChangeValue("No instructions on this side of the run."); return; }
+        if (!snapshot) {
+            pane->ChangeValue("Decoded instruction snapshot unavailable.\nSaved sessions retain ranges and category counters only.");
+            return;
+        }
+        auto facts = review_compare_instructions(*snapshot, entry, start, count);
+        if (!facts) { pane->ChangeValue(from_utf8(facts.error().message)); return; }
+        if (expected && (facts.value().front()->instruction.address.offset != expected->entry ||
+            facts.value().front()->instruction.address.space.value != expected->address_space)) {
+            pane->ChangeValue("Retained decoded facts do not match this run's stored start address.");
+            return;
+        }
+        wxString content = "Showing " + number(facts.value().size()) + " / " + number(count) + " instructions";
+        if (facts.value().size() < count) content += " (remaining instructions omitted)";
+        content += "\nNormalized signatures are comparison evidence; equality does not prove semantic equivalence.\n\n";
+        for (std::size_t i = 0; i < facts.value().size(); ++i) {
+            const auto &instruction = facts.value()[i]->instruction;
+            content += wxString::Format("#%llu  space %u:0x%llX\n",
+                static_cast<unsigned long long>(start + i), instruction.address.space.value,
+                static_cast<unsigned long long>(instruction.address.offset));
+            // Keep formatting/signature work bounded even for unusual bytecode
+            // or extension-provided instruction records.
+            if (instruction.operands.size() > 32 || instruction.access.size() > 32 ||
+                instruction.mnemonic_override.size() > 2048) {
+                content += "Decoded text/signatures omitted: instruction display limit.\n\n";
+                continue;
+            }
+            auto decoded = from_utf8(format_instruction(instruction));
+            if (decoded.length() > 2048) decoded = decoded.Left(2048) + " [text truncated]";
+            content += decoded + "\n";
+            const auto feature = ::hexlab::app::compare_semantic_feature(instruction, 0);
+            content += wxString::Format("opcode %u; flow %u; operands %016llX; effects %016llX\n\n",
+                feature.opcode, feature.flow,
+                static_cast<unsigned long long>(feature.operand_signature),
+                static_cast<unsigned long long>(feature.effect_signature));
+        }
+        pane->ChangeValue(content);
+        pane->ShowPosition(0);
+    };
+    render(instruction_review_old_, old_instructions_, {*match.old_entry, match.old_space},
+           run.old_start, run.old_count, run.old_address);
+    render(instruction_review_new_, new_instructions_, {*match.new_entry, match.new_space},
+           run.new_start, run.new_count, run.new_address);
+}
 void CompareView::refresh_functions() {
     if (!functions_) return;
     CompareFunctionFilter filter;
@@ -943,9 +1047,11 @@ void CompareView::refresh_functions() {
             static_cast<unsigned long long>(calls.ambiguous))
         : wxString("Unavailable"));
     }
+    selected_function_diff_.reset();
     if (function_diff_runs_) function_diff_runs_->DeleteAllItems();
     visible_instruction_runs_.clear();
     update_instruction_navigation();
+    show_instruction_review();
     if (function_diff_summary_)
         function_diff_summary_->SetLabel("Select a matched function to inspect its instruction alignment.");
 }

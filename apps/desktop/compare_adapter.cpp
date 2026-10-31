@@ -4,6 +4,67 @@
 #include <tuple>
 
 namespace hexlab::desktop {
+compare::Result<std::vector<std::shared_ptr<const InstructionFact>>> review_compare_instructions(
+    const FunctionSnapshot &snapshot, const compare::FunctionAddress &entry,
+    std::uint64_t start, std::uint64_t count) {
+    using Facts = std::vector<std::shared_ptr<const InstructionFact>>;
+    if (!count) return Facts{};
+    const auto shown = std::min<std::uint64_t>(count, compare_instruction_review_limit);
+    if (start > UINT64_MAX - shown)
+        return compare::Error{compare::ErrorCode::overflow, "Instruction review range overflows."};
+    // Bound all lookup and sequence visits, including null records. A failed
+    // lookup never publishes a misleading partial sequence.
+    std::size_t remaining = 1'000'000;
+    const auto visit = [&]() {
+        if (!remaining) return false;
+        --remaining;
+        return true;
+    };
+    const auto budget_error = [] {
+        return compare::Error{compare::ErrorCode::resource_limit, "Decoded instruction review lookup budget exhausted."};
+    };
+    const FunctionRecord *function = nullptr;
+    for (const auto &candidate : snapshot.functions) {
+        if (!visit()) return budget_error();
+        if (candidate && candidate->entry.offset == entry.entry &&
+            candidate->entry.space.value == entry.address_space) {
+            function = candidate.get();
+            break;
+        }
+    }
+    if (!function)
+        return compare::Error{compare::ErrorCode::invalid_argument, "Function is absent from the retained decoded snapshot."};
+    std::map<std::uint64_t, const BasicBlock *> blocks;
+    for (const auto id : function->blocks) {
+        if (!visit()) return budget_error();
+        blocks.emplace(id.value, nullptr);
+    }
+    for (const auto &block : snapshot.blocks) {
+        if (!visit()) return budget_error();
+        if (!block) continue;
+        const auto found = blocks.find(block->id.value);
+        if (found != blocks.end() && !found->second) found->second = block.get();
+    }
+    Facts result;
+    result.reserve(static_cast<std::size_t>(shown));
+    std::uint64_t position = 0;
+    for (const auto id : function->blocks) {
+        if (!visit()) return budget_error();
+        const auto *block = blocks.at(id.value);
+        // Feature extraction also skips absent blocks and null instruction facts.
+        if (!block) continue;
+        for (const auto &fact : block->instructions) {
+            if (!visit()) return budget_error();
+            if (!fact) continue;
+            if (position++ < start) continue;
+            result.push_back(fact);
+            if (result.size() == shown) return result;
+        }
+    }
+    return compare::Error{compare::ErrorCode::invalid_argument,
+        "Instruction range is absent from the retained decoded snapshot."};
+}
+
 void populate_direct_call_neighborhoods(const FunctionSnapshot &snapshot,
                                         std::span<compare::FunctionFeature> features) {
     using QualifiedAddress = std::pair<std::uint32_t, std::uint64_t>;
