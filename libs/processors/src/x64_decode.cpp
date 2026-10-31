@@ -319,7 +319,14 @@ DecodeResult decode_scalar(std::span<const std::byte> input, Address address, De
             finish(state, reason);
             return {DecodeStatus::decoded, std::move(state.i), std::move(reason)};
         }
-        if (state.rules.long_mode() && (next == 0xc4 || next == 0xc5)) {
+        // In legacy modes C4/C5 are LES/LDS opcodes. Their second byte can
+        // distinguish a VEX prefix only when the top two bits are both set.
+        // Keep 16-bit mode on the legacy path until its full VEX constraints
+        // are modeled; 32-bit mode shares the existing VEX instruction forms.
+        const bool vex_legacy32 = state.i.context.mode == ExecutionMode::x86_32 &&
+                                  (next == 0xc4 || next == 0xc5) && state.position + 1 < state.input.size() &&
+                                  (std::to_integer<unsigned>(state.input[state.position + 1]) & 0xc0) == 0xc0;
+        if ((state.rules.long_mode() || vex_legacy32) && (next == 0xc4 || next == 0xc5)) {
             if (state.group1 || state.operand_override || state.rex)
                 invalid("Legacy mandatory or REX prefix preceding VEX is invalid");
             const auto lead = static_cast<std::uint8_t>(state.take(1));
@@ -343,6 +350,14 @@ DecodeResult decode_scalar(std::span<const std::byte> input, Address address, De
                 vvvv = (~b3 >> 3) & 15;
                 l = (b3 & 4) != 0;
                 pp = b3 & 3;
+            }
+            if (!state.rules.long_mode()) {
+                // AVX in 32-bit mode has only XMM/YMM0-7 and GPR0-7.
+                // VEX.R/X/B and the upper vvvv register numbers cannot name
+                // registers there.
+                if ((state.rex & 7) || vvvv > 7)
+                    invalid("VEX register extension is unavailable in 32-bit mode");
+                state.rex = 0;
             }
             const auto opcode = static_cast<std::uint8_t>(state.take(1));
             if (!vex_simd(state, opcode, map, pp, vvvv, l, w))

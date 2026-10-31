@@ -1,5 +1,16 @@
 # x86 SSE2 integer and scalar floating-point coverage
 
+## 32-bit VEX prefix recognition
+
+The implemented VEX instruction subset is also available through the x86-32
+decoder. In that mode, C4/C5 are treated as VEX only when the following byte
+has its top two bits set, preserving the legacy LES/LDS interpretation for
+other encodings. Register extension bits and VEX.vvvv values that would name
+registers 8-15 are rejected, and BMI1/BMI2 forms with 64-bit operands remain
+64-bit-mode-only. This does not add AVX instruction forms: unsupported VEX
+opcodes, including VZEROUPPER, remain outside the typed subset, and x86-16
+VEX recognition is not enabled.
+
 Legacy `PSADBW` (`66 0F F6 /r`) is decoded as a destructive XMM operation with
 an XMM or 128-bit memory source. It sums eight unsigned byte absolute
 differences independently in each 8-byte half and writes the two sums into
