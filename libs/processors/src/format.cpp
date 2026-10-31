@@ -271,6 +271,9 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
     case Opcode::mips_ins: return "ins";
     case Opcode::rdrand: return "rdrand";
     case Opcode::rdseed: return "rdseed";
+    case Opcode::rdtsc: return "rdtsc";
+    case Opcode::rdtscp: return "rdtscp";
+    case Opcode::rdpmc: return "rdpmc";
     case Opcode::crc32: return "crc32";
     case Opcode::comiss: return "comiss";
     case Opcode::ucomiss: return "ucomiss";
