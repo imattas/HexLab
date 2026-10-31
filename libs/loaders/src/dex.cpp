@@ -1788,15 +1788,9 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
                     }
                     incoming_states.emplace(0, initial);
                     type_work.push_back(0);
-                    for (const auto handler : handler_starts) {
-                        if (!incoming_states.contains(handler)) {
-                            // Per-instruction exceptional edges are not yet
-                            // modeled, so a handler cannot inherit entry
-                            // parameter facts from an invented predecessor.
-                            incoming_states.emplace(handler, TypeState(registers, RegType::unknown));
-                            type_work.push_back(handler);
-                        }
-                    }
+                    // Handler states are admitted only from modeled exceptional
+                    // predecessors below. Seeding every handler with an all-
+                    // unknown state would erase useful facts at every join.
                     const auto max_type_steps = control_instructions.size() * 8 + 1024;
                     std::size_t type_steps = 0;
                     while (!type_work.empty()) {
@@ -2199,6 +2193,47 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
                             }
                         }
 
+                        const auto merge_into = [&](std::uint32_t successor, const TypeState &incoming_state) {
+                            auto [target, inserted] = incoming_states.try_emplace(successor, incoming_state);
+                            if (inserted) { type_work.push_back(successor); return; }
+                            bool changed = false;
+                            for (std::size_t reg = 0; reg < incoming_state.size(); ++reg) {
+                                const auto old = target->second[reg];
+                                const auto incoming = incoming_state[reg];
+                                const auto merged = merge_type(old, incoming);
+                                if (merged != target->second[reg]) { target->second[reg] = merged; changed = true; }
+                                auto merged_reference = UINT32_MAX;
+                                if (merged == RegType::reference) {
+                                    if (old == RegType::reference && incoming == RegType::reference &&
+                                        target->second.references[reg] == incoming_state.references[reg])
+                                        merged_reference = target->second.references[reg];
+                                    else if (old == RegType::zero && incoming == RegType::reference)
+                                        merged_reference = incoming_state.references[reg];
+                                    else if (incoming == RegType::zero && old == RegType::reference)
+                                        merged_reference = target->second.references[reg];
+                                }
+                                if (target->second.references[reg] != merged_reference) {
+                                    target->second.references[reg] = merged_reference;
+                                    changed = true;
+                                }
+                            }
+                            if (changed) type_work.push_back(successor);
+                        };
+                        // An invoke can transfer control to a catch handler
+                        // before its normal result is written. Preserve the
+                        // instruction's pre-state on this exceptional edge;
+                        // the adjacent move-result remains a normal edge only.
+                        const bool invoke = (opcode >= 0x6e && opcode <= 0x72) ||
+                            (opcode >= 0x74 && opcode <= 0x78) ||
+                            (opcode >= 0xfa && opcode <= 0xfd);
+                        if (invoke) {
+                            for (const auto &region : exception_regions) {
+                                if (offset < region.begin || offset >= region.end) continue;
+                                for (const auto &handler : region.handlers)
+                                    merge_into(handler.address, before);
+                            }
+                        }
+
                         std::vector<std::uint32_t> successors;
                         const auto next = control.offset + control.length;
                         const auto add_next = [&] { if (next < insns * 2) successors.push_back(next); };
@@ -2213,32 +2248,7 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
                                 cases != switch_cases_by_source.end())
                                 successors.insert(successors.end(), cases->second.begin(), cases->second.end());
                         }
-                        for (const auto successor : successors) {
-                            auto [target, inserted] = incoming_states.try_emplace(successor, state);
-                            if (inserted) { type_work.push_back(successor); continue; }
-                            bool changed = false;
-                            for (std::size_t reg = 0; reg < state.size(); ++reg) {
-                                const auto old = target->second[reg];
-                                const auto incoming = state[reg];
-                                const auto merged = merge_type(old, incoming);
-                                if (merged != target->second[reg]) { target->second[reg] = merged; changed = true; }
-                                auto merged_reference = UINT32_MAX;
-                                if (merged == RegType::reference) {
-                                    if (old == RegType::reference && incoming == RegType::reference &&
-                                        target->second.references[reg] == state.references[reg])
-                                        merged_reference = target->second.references[reg];
-                                    else if (old == RegType::zero && incoming == RegType::reference)
-                                        merged_reference = state.references[reg];
-                                    else if (incoming == RegType::zero && old == RegType::reference)
-                                        merged_reference = target->second.references[reg];
-                                }
-                                if (target->second.references[reg] != merged_reference) {
-                                    target->second.references[reg] = merged_reference;
-                                    changed = true;
-                                }
-                            }
-                            if (changed) type_work.push_back(successor);
-                        }
+                        for (const auto successor : successors) merge_into(successor, state);
                     }
                 }
                 code.push_back({static_cast<std::uint32_t>(method_idx),insns_off,insns*2,debug,registers,ins,std::move(exception_regions)});

@@ -370,8 +370,10 @@ inventory and does not establish verifier or runtime member-resolution semantics
 For completely decoded methods, the loader now propagates a small register
 type state over the validated branch/switch control-flow graph. It seeds
 incoming parameter words from the method prototype, follows normal edges and
-separately seeds exception-handler entries, and merges states at joins under
-per-method and aggregate state-cell budgets.
+propagates the pre-invoke state to handlers covering standard, range,
+polymorphic, and custom invoke instructions. Normal and exceptional states
+merge at joins under per-method and aggregate state-cell budgets. Invoke
+exception edges do not receive the normal-path move-result write.
 
 The current transfer subset recognizes scalar/wide constants,
 string/class/new-instance/new-array results, scalar/wide/object moves,
@@ -415,8 +417,9 @@ null. External hierarchy gaps are kept unresolved instead of being treated as
 either a proven match or a malformed DEX. The pass does not resolve
 external class definitions, infer common supertypes at joins, validate
 field-owner receivers, or prove access, dispatch target identity, constructor
-uninitialized-object rules, or quick/inline call signatures. Exception-state
-propagation from each protected instruction and the complete Dalvik verifier
-lattice also remain unsupported.
+uninitialized-object rules, or quick/inline call signatures. Exceptional
+state propagation currently covers invoke instructions only; handlers reached
+through other potentially throwing instructions are outside this type-flow
+slice. The complete Dalvik verifier lattice remains unsupported.
 Methods with unsupported instruction decoding do not receive this CFG type
 pass. It is a bounded partial verifier, not Android ART verification.
