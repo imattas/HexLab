@@ -29,3 +29,22 @@ https://www.intel.com/content/dam/www/public/us/en/documents/manuals/64-ia-32-ar
 Intel Architecture Instruction Set Extensions Programming Reference,
 KADD/KUNPCK entries,
 https://www.intel.com/content/dam/develop/external/us/en/documents/319433-024-697869.pdf
+
+## Boolean logic
+
+The VEX opmask decoder accepts register-only KANDB/W/D/Q, KANDNB/W/D/Q,
+KORB/W/D/Q, KXORB/W/D/Q, KXNORB/W/D/Q, and KNOTB/W/D/Q. These use K0-K7
+registers; memory and extended-register encodings are rejected. Each operation
+uses only the selected low 8, 16, 32, or 64 bits and clears the remaining bits
+of its 64-bit destination. KANDN computes `(~SRC1) & SRC2`, and KNOT computes
+`~SRC`; all operations preserve flags.
+
+The decompiler emits a typed `x86_kand_iN`, `x86_kandn_iN`, `x86_kor_iN`,
+`x86_kxor_iN`, `x86_kxnor_iN`, or `x86_knot_iN` intrinsic (where N is 8,
+16, 32, or 64) with an explicit zero-extended i64 destination expression.
+Unsupported operand, access, register, or instruction-context facts retain the
+normal conservative fallback.
+
+Reference: Intel 64 and IA-32 Architectures SDM, Volume 2A, KAND/KANDN/KOR/KXOR/
+KXNOR/KNOT entries, https://www.intel.com/content/dam/www/us/en/developer/
+articles/technical/intel-sdm.html
