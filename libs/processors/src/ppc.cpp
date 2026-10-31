@@ -223,17 +223,25 @@ DecodeResult decode_powerpc(DecodeContext context, std::span<const std::byte> by
             i.opcode = Opcode::ppc_nop;
             i.operands.clear(); i.access.clear(); i.register_reads.clear(); i.register_writes.clear();
         }
-    } else if (op == 48 || op == 50 || op == 52 || op == 54) {
-        const bool load = op == 48 || op == 50;
-        const unsigned bits = op == 48 || op == 52 ? 32u : 64u;
+    } else if (op == 48 || op == 49 || op == 50 || op == 51 || op == 52 || op == 53 || op == 54 || op == 55) {
+        const bool update = (op & 1) != 0;
+        const bool load = op == 48 || op == 49 || op == 50 || op == 51;
+        const unsigned bits = op == 48 || op == 49 || op == 52 || op == 53 ? 32u : 64u;
+        if (update && ra == 0)
+            return fail(DecodeStatus::invalid, "PowerPC floating update-form load/store requires a nonzero base register");
         const auto data = fpr(rt, bits);
         MemoryOperand memory{static_cast<std::uint16_t>(bits), static_cast<std::uint16_t>(width), {},
-            ra ? std::optional<R>(gpr(ra, width)) : std::nullopt, {}, 1, sext(w & 0xffff, 16), false, {}, EncodedField{2, 2}};
-        i.opcode = op == 48 ? Opcode::ppc_lfs : op == 50 ? Opcode::ppc_lfd : op == 52 ? Opcode::ppc_stfs : Opcode::ppc_stfd;
+            ra ? std::optional<R>(gpr(ra, width)) : std::nullopt, {}, 1, sext(w & 0xffff, 16), update, {}, EncodedField{2, 2}};
+        memory.writeback_displacement = update ? memory.displacement : 0;
+        i.opcode = op == 48 ? Opcode::ppc_lfs : op == 49 ? Opcode::ppc_lfsu :
+                   op == 50 ? Opcode::ppc_lfd : op == 51 ? Opcode::ppc_lfdu :
+                   op == 52 ? Opcode::ppc_stfs : op == 53 ? Opcode::ppc_stfsu :
+                              op == 54 ? Opcode::ppc_stfd : Opcode::ppc_stfdu;
         i.operands = {data, memory};
         i.access = {load ? OperandAccess::write : OperandAccess::read, OperandAccess::address};
         if (load) i.register_writes.push_back(data); else i.register_reads.push_back(data);
         if (ra) i.register_reads.push_back(gpr(ra, width));
+        if (update) i.register_writes.push_back(gpr(ra, width));
         i.memory_read = load;
         i.memory_write = !load;
     } else if (op == 32 || op == 33 || op == 34 || op == 35 || op == 36 || op == 37 ||

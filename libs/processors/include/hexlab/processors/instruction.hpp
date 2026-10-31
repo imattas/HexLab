@@ -706,7 +706,9 @@ enum class Opcode {
     // A32 byte reversal and bit-reversal operations; appended for cache stability.
     a32_rev, a32_rev16, a32_revsh, a32_rbit,
     // RVV widening integer reductions, appended to preserve serialized IDs.
-    rv_vwredsum, rv_vwredsumu
+    rv_vwredsum, rv_vwredsumu,
+    // PowerPC floating-point D-form update memory operations; appended for cache stability.
+    ppc_lfsu, ppc_lfdu, ppc_stfsu, ppc_stfdu
 };
 enum class OperandAccess { read, write, read_write, address };
 // The encoded x86 group-one repeat prefix is retained separately from the

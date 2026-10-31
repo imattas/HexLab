@@ -163,9 +163,15 @@ context and memory IR; neither indexed load reverses bytes.
 This slice follows IBM's primary [Assembler Language Reference](https://www.ibm.com/docs/ssw_aix_71/assembler/assembler_pdf.pdf)
 entries for LWA/LWAX/LWAUX and LLVM's
 [PPC64 instruction definitions](https://github.com/llvm/llvm-project/blob/main/llvm/lib/Target/PowerPC/PPCInstr64Bit.td).
-Memory faults, alignment enforcement, access permissions, and fault-suppressed
-writeback are not executed by the decompiler. Other update-form memory
-families retain their existing lifting behavior; broader Power ISA integer,
+Memory faults, alignment enforcement, and access permissions are not executed
+by the decompiler. The D-form floating update operations `lfsu`, `lfdu`,
+`stfsu`, and `stfdu` decode in PPC32 and PPC64 with the correct 32- or 64-bit
+FPR data width and signed 16-bit displacement. They reject RA=0 and lift as a
+single memory-effect intrinsic whose base output is `old_RA + displacement`;
+loads also expose an unknown floating result. Keeping the memory operation and
+writeback in one intrinsic preserves fault ordering without claiming a value
+for a faulting instruction. Other update-form memory families retain their
+existing lifting behavior; broader Power ISA integer,
 FP/vector/system instructions and ABI/debugger coverage remain incomplete.
 
 ## High-word multiply
