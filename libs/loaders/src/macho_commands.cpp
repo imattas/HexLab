@@ -308,20 +308,65 @@ void fileset_entry(const Reader &reader, const MachOLoadCommand &command, const 
             "Mach-O fileset child command extent exceeds the containing slice", ErrorCode::resource_limit);
     budget.include(row.child_command_bytes);
     std::uint64_t cursor = 0;
+    bool child_ranges_valid = true;
     for (std::uint32_t index = 0; index < row.child_command_count; ++index) {
         canceled(stop);
         require(cursor <= row.child_command_bytes && 8 <= row.child_command_bytes - cursor,
                 "Truncated Mach-O fileset child load-command envelope");
-        const auto envelope = reader.bytes(row.raw_file_offset + 32 + cursor, 8);
+        const auto command_relative = row.raw_file_offset + 32 + cursor;
+        const auto envelope = reader.bytes(command_relative, 8);
+        const auto kind = static_cast<std::uint32_t>(reader.value(envelope.bytes, 0, 4));
         const auto size = static_cast<std::uint32_t>(reader.value(envelope.bytes, 4, 4));
         require(size >= 8 && size % 8 == 0 && size <= row.child_command_bytes - cursor,
                 "Invalid Mach-O fileset child load-command size or alignment");
+        if (kind == 0x19) { // LC_SEGMENT_64
+            require(size >= 72, "Truncated fileset child LC_SEGMENT_64");
+            const auto fixed = reader.bytes(command_relative, 72);
+            const auto segment_name = std::span<const std::byte>(fixed.bytes).subspan(8, 16);
+            const auto name_end = std::find(segment_name.begin(), segment_name.end(), std::byte{0});
+            MachOFileSetEntry::Segment segment;
+            segment.command_index = index;
+            segment.record_file_offset = reader.file(command_relative, size).value;
+            segment.name.assign(reinterpret_cast<const char *>(segment_name.data()),
+                                static_cast<std::size_t>(name_end - segment_name.begin()));
+            segment.address = reader.value(fixed.bytes, 24, 8);
+            segment.memory_size = reader.value(fixed.bytes, 32, 8);
+            segment.raw_file_offset = reader.value(fixed.bytes, 40, 8);
+            segment.file_size = reader.value(fixed.bytes, 48, 8);
+            segment.maximum_protection = static_cast<std::uint32_t>(reader.value(fixed.bytes, 56, 4));
+            segment.initial_protection = static_cast<std::uint32_t>(reader.value(fixed.bytes, 60, 4));
+            segment.section_count = static_cast<std::uint32_t>(reader.value(fixed.bytes, 64, 4));
+            segment.flags = static_cast<std::uint32_t>(reader.value(fixed.bytes, 68, 4));
+            const auto expected = std::uint64_t{72} + std::uint64_t{segment.section_count} * 80;
+            require(expected == size, "Fileset child segment section table has an invalid extent");
+            segment.file_range_valid = segment.raw_file_offset <= slice.size &&
+                segment.file_size <= slice.size - segment.raw_file_offset;
+            if (segment.file_range_valid)
+                segment.file_offset = reader.file(segment.raw_file_offset, segment.file_size);
+            else
+                child_ranges_valid = false;
+            budget.include(sizeof(segment) + segment.name.size());
+            row.child_segments.push_back(std::move(segment));
+        } else if (kind == 0x1b) { // LC_UUID
+            require(size == 24, "Fileset child LC_UUID has an invalid extent");
+            const auto uuid = reader.bytes(command_relative + 8, 16);
+            std::array<std::uint8_t, 16> value{};
+            for (std::size_t byte = 0; byte < value.size(); ++byte)
+                value[byte] = std::to_integer<std::uint8_t>(uuid.bytes[byte]);
+            if (row.child_uuid) {
+                child_ranges_valid = false;
+                metadata.commands_complete = false;
+            } else {
+                row.child_uuid = value;
+                row.child_uuid_source = reader.file(command_relative + 8, 16);
+            }
+        }
         cursor += size;
     }
     require(cursor == row.child_command_bytes,
             "Mach-O fileset child command count does not consume sizeofcmds");
     row.child_commands_valid = row.child_cpu_type == slice.header.cpu_type &&
-                               row.child_cpu_subtype == slice.header.cpu_subtype;
+                               row.child_cpu_subtype == slice.header.cpu_subtype && child_ranges_valid;
     if (!row.child_commands_valid)
         metadata.commands_complete = false;
     for (const auto &previous : metadata.fileset_entries)
