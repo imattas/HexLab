@@ -1,6 +1,7 @@
 #include "hexlab/processors/m6502_semantics.hpp"
 
 #include <algorithm>
+#include <cstddef>
 
 namespace hexlab {
 
@@ -502,6 +503,48 @@ evaluate_m6502_branch_instruction(const Instruction &instruction, std::uint8_t s
         instruction.register_reads.end())
         return {};
     return evaluate_m6502_branch(instruction.opcode, status);
+}
+
+std::optional<bool>
+evaluate_m65c02_bit_branch(Opcode opcode, std::uint8_t bit, std::uint8_t value) noexcept {
+    if (bit > 7 || (opcode != Opcode::m65c02_bbr && opcode != Opcode::m65c02_bbs))
+        return {};
+    const bool set = (value & static_cast<std::uint8_t>(1u << bit)) != 0;
+    return opcode == Opcode::m65c02_bbs ? set : !set;
+}
+
+std::optional<bool>
+evaluate_m65c02_bit_branch_instruction(const Instruction &instruction,
+                                       std::uint8_t zero_page_value) noexcept {
+    if (instruction.context.architecture != Architecture::mos6502 ||
+        instruction.context.mode != ExecutionMode::m65c02 ||
+        (instruction.opcode != Opcode::m65c02_bbr && instruction.opcode != Opcode::m65c02_bbs) ||
+        instruction.condition > 7 || instruction.flow != FlowKind::conditional_branch ||
+        instruction.length != 3 || instruction.operands.size() != 2 ||
+        instruction.access.size() != 2 || instruction.access[0] != OperandAccess::read ||
+        instruction.access[1] != OperandAccess::address || !instruction.memory_read ||
+        instruction.memory_write || !instruction.direct_target || instruction.address.offset > UINT16_MAX)
+        return {};
+    const auto opcode_byte = std::to_integer<std::uint8_t>(instruction.bytes[0]);
+    const bool set_branch = instruction.opcode == Opcode::m65c02_bbs;
+    if ((opcode_byte & 0x0fu) != 0x0fu || ((opcode_byte >> 4) & 7u) != instruction.condition ||
+        ((opcode_byte & 0x80u) != 0) != set_branch)
+        return {};
+    const auto *memory = std::get_if<MemoryOperand>(&instruction.operands[0]);
+    const auto *relative = std::get_if<RelativeOperand>(&instruction.operands[1]);
+    if (!memory || memory->data_width != 8 || memory->address_width != 16 || memory->segment ||
+        memory->base || memory->index || memory->ip_relative || memory->scale != 1 || memory->writeback ||
+        !memory->resolved_address || memory->resolved_address->space != instruction.address.space ||
+        memory->resolved_address->offset > 0xff || memory->displacement < 0 ||
+        static_cast<std::uint64_t>(memory->displacement) != memory->resolved_address->offset ||
+        !relative || relative->encoded_width != 8 || relative->effective_width != 16 ||
+        relative->displacement != static_cast<std::int8_t>(std::to_integer<std::uint8_t>(instruction.bytes[2])))
+        return {};
+    const auto expected_target = static_cast<std::uint16_t>(instruction.address.offset + 3 + relative->displacement);
+    if (*instruction.direct_target != Address{instruction.address.space, expected_target} ||
+        memory->resolved_address->offset != std::to_integer<std::uint8_t>(instruction.bytes[1]))
+        return {};
+    return evaluate_m65c02_bit_branch(instruction.opcode, instruction.condition, zero_page_value);
 }
 
 } // namespace hexlab

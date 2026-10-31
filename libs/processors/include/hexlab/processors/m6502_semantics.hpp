@@ -210,4 +210,12 @@ evaluate_m6502_branch(Opcode opcode, std::uint8_t status) noexcept;
 HEXLAB_PROCESSORS_EXPORT std::optional<bool>
 evaluate_m6502_branch_instruction(const Instruction &instruction, std::uint8_t status) noexcept;
 
+// Evaluate a W65C02 BBR/BBS branch from its zero-page byte. `bit` is the
+// decoded bit number (0-7); the result is only the branch decision.
+HEXLAB_PROCESSORS_EXPORT std::optional<bool>
+evaluate_m65c02_bit_branch(Opcode opcode, std::uint8_t bit, std::uint8_t value) noexcept;
+HEXLAB_PROCESSORS_EXPORT std::optional<bool>
+evaluate_m65c02_bit_branch_instruction(const Instruction &instruction,
+                                       std::uint8_t zero_page_value) noexcept;
+
 } // namespace hexlab
