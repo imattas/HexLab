@@ -550,6 +550,7 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
     case Opcode::ppc_mtfsb1: return "mtfsb1";
     case Opcode::ppc_mtfsfi: return "mtfsfi";
     case Opcode::ppc_mtfsf: return "mtfsf";
+    case Opcode::ppc_mcrfs: return "mcrfs";
     case Opcode::ppc_vaddubm: return "vaddubm";
     case Opcode::ppc_vadduhm: return "vadduhm";
     case Opcode::ppc_vadduwm: return "vadduwm";
