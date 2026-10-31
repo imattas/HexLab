@@ -273,6 +273,23 @@ struct DwarfLineUnit {
     std::vector<DwarfLineRow> rows;
     bool operator==(const DwarfLineUnit &) const = default;
 };
+
+// Opaque macro data attached to the split unit selected by a DWP package
+// index. The bytes are one bounded DW_SECT_MACRO contribution; strings remain
+// the package's shared tables so consumers can interpret indexed operands
+// without losing the original contribution provenance.
+struct DwarfMacroContribution {
+    std::string source_id;
+    DwarfPackageIndexKind index_kind = DwarfPackageIndexKind::compile_units;
+    std::uint32_t package_index_version = 0;
+    std::uint64_t signature = 0;
+    std::uint32_t section_id = 0;
+    std::uint64_t section_offset = 0;
+    std::vector<std::uint8_t> bytes;
+    std::vector<std::uint8_t> strings;
+    std::vector<std::uint8_t> line_strings;
+    bool operator==(const DwarfMacroContribution &) const = default;
+};
 struct DwarfLineSections {
     std::string source_id;
     std::span<const std::uint8_t> line;
@@ -474,6 +491,7 @@ struct ImportResult {
     std::vector<ImportedVariable> variables;
     std::vector<ImportedEnumerator> enumerators;
     std::vector<DwarfLineUnit> line_units;
+    std::vector<DwarfMacroContribution> macro_contributions;
     bool split_unit = false;
     std::optional<std::uint64_t> split_dwo_id;
     std::vector<std::string> diagnostics;
@@ -497,11 +515,12 @@ HEXLAB_SYMBOLS_EXPORT hexlab::Result<ImportResult> import_dwarf_v4(const DwarfV4
 // DW_AT_specification/DW_AT_abstract_origin references.
 HEXLAB_SYMBOLS_EXPORT hexlab::Result<ImportResult> import_dwarf(const DwarfSections &sections);
 
-// Imports one bounded DWARF v5 DWP compile-unit contribution. The caller owns
-// package discovery and section extraction; strings and line_strings are the
-// shared DWO string sections. LINE and RNGLISTS contributions are consumed
-// when present, and indexed contributions are selected by DWO ID. The returned
-// result carries the checked split DWO ID for use by a resolver.
+// Imports one bounded DWARF v2/v5 DWP compile-unit contribution. The caller
+// owns package discovery and section extraction; strings and line_strings are
+// the shared DWO string sections. LINE and RNGLISTS contributions are consumed
+// when present; a matching indexed macro contribution is retained as opaque
+// bytes with package-index provenance. Indexed contributions are selected by
+// DWO ID, which is carried in the returned result.
 HEXLAB_SYMBOLS_EXPORT hexlab::Result<ImportResult> import_dwarf_package_unit(
     const DwarfPackageIndex &index, std::uint64_t dwo_id,
     std::span<const DwarfPackageSectionData> sections,

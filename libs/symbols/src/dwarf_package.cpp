@@ -305,6 +305,7 @@ hexlab::Result<ImportResult> import_dwarf_package_unit(
     std::uint64_t info_section_offset = 0;
     std::span<const std::uint8_t> line_contribution;
     std::uint64_t line_section_offset = 0;
+    std::optional<DwarfPackageSectionSlice> macro_contribution;
     for (const auto &section : contribution.value().sections) {
         switch (section.section_id) {
         case 1: dwarf.info = section.bytes; info_section_offset = section.section_offset; break; // DW_SECT_INFO
@@ -312,17 +313,39 @@ hexlab::Result<ImportResult> import_dwarf_package_unit(
         case 4: line_contribution = section.bytes; line_section_offset = section.section_offset; break; // DW_SECT_LINE
         case 5: if(index.version==2) dwarf.locations = section.bytes; else dwarf.location_lists = section.bytes; break;
         case 6: dwarf.string_offsets = section.bytes; break; // DW_SECT_STR_OFFSETS
-        case 8: if(index.version==5) dwarf.range_lists = section.bytes; break;
+        case 8:
+            if (index.version == 5) dwarf.range_lists = section.bytes;
+            else if (!section.bytes.empty()) macro_contribution = section;
+            break;
         case 9: dwarf.addresses = section.bytes; break;      // DW_SECT_ADDR
+        case 7: if (index.version == 5 && !section.bytes.empty()) macro_contribution = section; break;
         default:
-            // Macro contributions remain available to callers through the
-            // bounded lookup API; this importer does not interpret them.
             break;
         }
     }
     dwarf.info_section_offset = info_section_offset;
     auto imported = import_dwarf(dwarf);
     if (!imported) return imported.error();
+    if (macro_contribution) {
+        constexpr std::size_t macro_payload_limit = 64u * 1024u * 1024u;
+        std::size_t macro_payload_size = macro_contribution->bytes.size();
+        if (!checked_add(macro_payload_size, strings.size(), macro_payload_size) ||
+            !checked_add(macro_payload_size, line_strings.size(), macro_payload_size) ||
+            macro_payload_size > macro_payload_limit)
+            return too_large("DWP macro contribution and shared strings exceed the 64 MiB import limit");
+        DwarfMacroContribution macro;
+        macro.source_id = "DWARF v" + std::to_string(index.version) + " DWP CU " +
+            std::to_string(dwo_id) + " macro contribution";
+        macro.index_kind = index.kind;
+        macro.package_index_version = index.version;
+        macro.signature = dwo_id;
+        macro.section_id = macro_contribution->section_id;
+        macro.section_offset = macro_contribution->section_offset;
+        macro.bytes.assign(macro_contribution->bytes.begin(), macro_contribution->bytes.end());
+        macro.strings.assign(strings.begin(), strings.end());
+        macro.line_strings.assign(line_strings.begin(), line_strings.end());
+        imported.value().macro_contributions.push_back(std::move(macro));
+    }
     if (!line_contribution.empty()) {
         DwarfLineSections line;
         line.source_id = "DWARF v" + std::to_string(index.version) + " DWP CU " +
