@@ -1834,6 +1834,10 @@ Result<std::vector<ManagedResource>> parse_managed_resources(std::span<const std
         if(culture_index){auto culture=read_string(culture_index);if(!culture)return culture.error();value.implementation_culture=std::move(culture.value());}
         const auto hash_index=index(row,12+blob_width+2*string_width,blob_width);
         auto hash_valid=validate_blob(hash_index);if(!hash_valid)return hash_valid.error();
+        auto assembly_hash=read_blob_value(hash_index);if(!assembly_hash)return assembly_hash.error();
+        value.implementation_hash_blob_index=hash_index;
+        value.implementation_hash=std::move(assembly_hash.value());
+        value.implementation_hash_algorithm=assembly_hash_algorithm;
         value.implementation_name=std::move(assembly_name.value());
         value.resolution=ManagedResourceResolutionState::unresolved;
         value.resolution_diagnostic="AssemblyRef resource has not been resolved against caller-supplied input";
@@ -2737,14 +2741,43 @@ Result<std::vector<ManagedResource>> inspect_managed_resources(
         resource.implementation_major,resource.implementation_minor,resource.implementation_build,
         resource.implementation_revision,resource.implementation_flags,resource.implementation_key_or_token};
       std::vector<std::size_t> matches;
+      bool saw_hash_mismatch=false,saw_unsupported_hash=false;
+      if(!resource.implementation_hash.empty()&&resource.implementation_hash_algorithm==0){
+        resource.resolution=ManagedResourceResolutionState::unsupported_hash;
+        resource.resolution_diagnostic="AssemblyRef HashValue has no usable owning Assembly.HashAlgId";
+        continue;
+      }
       for(std::size_t i=0;i<candidates.size();++i){
         if(stop.stop_requested())return Error{ErrorCode::canceled,"CLR AssemblyRef resource binding canceled"};
         auto& candidate=candidates[i];
         const auto identity=candidate_identity(candidate);
-        if(identity&&managed_resource_assembly_identity_matches(wanted,*identity))matches.push_back(i);
+        if(!identity||!managed_resource_assembly_identity_matches(wanted,*identity))continue;
+        if(resource.implementation_hash.empty()){matches.push_back(i);continue;}
+        if(const auto found=candidate.hashes.find(resource.implementation_hash_algorithm);found!=candidate.hashes.end()){
+          if(found->second==resource.implementation_hash)matches.push_back(i);else saw_hash_mismatch=true;
+          continue;
+        }
+        if(candidate.hash_errors.contains(resource.implementation_hash_algorithm)){saw_unsupported_hash=true;continue;}
+        auto hash=managed_resource_hash(*candidate.storage,resource.implementation_hash_algorithm,stop);
+        if(!hash){
+          if(hash.error().code==ErrorCode::canceled)return hash.error();
+          if(hash.error().code==ErrorCode::unsupported){candidate.hash_errors[resource.implementation_hash_algorithm]=hash.error().message;saw_unsupported_hash=true;}
+          else return hash.error();
+        }else if(hash.value()==resource.implementation_hash){
+          candidate.hashes.emplace(resource.implementation_hash_algorithm,std::move(hash.value()));matches.push_back(i);
+        }else{
+          candidate.hashes.emplace(resource.implementation_hash_algorithm,std::move(hash.value()));saw_hash_mismatch=true;
+        }
       }
-      if(matches.empty()){resource.resolution=ManagedResourceResolutionState::unresolved;resource.resolution_diagnostic="No supplied managed assembly has the exact AssemblyRef identity";continue;}
-      if(matches.size()!=1){resource.resolution=ManagedResourceResolutionState::ambiguous;resource.resolution_diagnostic="Multiple supplied managed assemblies have the exact AssemblyRef identity";continue;}
+      if(matches.empty()){
+        resource.resolution=saw_hash_mismatch?ManagedResourceResolutionState::hash_mismatch:
+            saw_unsupported_hash?ManagedResourceResolutionState::unsupported_hash:ManagedResourceResolutionState::unresolved;
+        resource.resolution_diagnostic=saw_hash_mismatch?"Supplied AssemblyRef identity candidate hash does not match AssemblyRef.HashValue":
+            saw_unsupported_hash?"Supplied AssemblyRef identity candidate uses an unsupported Assembly.HashAlgId":
+            "No supplied managed assembly has the exact AssemblyRef identity";
+        continue;
+      }
+      if(matches.size()!=1){resource.resolution=ManagedResourceResolutionState::ambiguous;resource.resolution_diagnostic="Multiple supplied managed assemblies match the AssemblyRef identity and hash";continue;}
       auto parsed=candidate_resources(candidates[matches.front()]);
       if(!parsed){resource.resolution_diagnostic=parsed.error().message;continue;}
       const ManagedResource* target=nullptr;

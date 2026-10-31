@@ -200,8 +200,9 @@ struct ManagedResourceResolutionLimits {
 };
 // Resolves external resource entries only against explicitly supplied inputs.
 // File candidates require an exact name and supported, matching Assembly
-// HashAlgId/File.HashValue. AssemblyRef candidates require an exact identity
-// and unique resource-name match. No host paths are searched.
+// HashAlgId/File.HashValue. AssemblyRef candidates require an exact identity,
+// matching AssemblyRef.HashValue when present, and a unique resource-name
+// match. No host paths are searched.
 HEXLAB_LOADERS_EXPORT Result<std::vector<ManagedResource>> inspect_managed_resources(
     const LoadedImage& loaded, std::span<const ManagedResourceInput> supplied,
     const ManagedResourceResolutionLimits& limits={}, std::stop_token stop={});

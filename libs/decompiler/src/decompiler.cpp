@@ -6759,10 +6759,18 @@ std::string expression_text(const Expression &expression) {
             if (value.stack_variable) return *value.stack_variable;
             const auto access_bytes = static_cast<std::uint16_t>((value.type.bits + 7u) / 8u);
             if (value.base && value.index && value.index_add && value.index_shift.empty() &&
-                value.displacement == 0 && value.type.bits && value.type.bits % 8 == 0 &&
-                value.scale == access_bytes)
-                return register_name(*value.base, value.base_version) + "[" +
-                       register_name(*value.index, value.index_version) + "]";
+                value.index_shift_amount == 0 && value.index_extend.empty() && value.scale &&
+                value.type.bits && value.type.bits % 8 == 0 && value.scale == access_bytes &&
+                value.displacement % static_cast<std::int64_t>(value.scale) == 0) {
+                std::string index = register_name(*value.index, value.index_version);
+                const auto element_bias = value.displacement / static_cast<std::int64_t>(value.scale);
+                if (element_bias > 0) index += " + " + std::to_string(element_bias);
+                else if (element_bias < 0) {
+                    const auto magnitude = static_cast<std::uint64_t>(-(element_bias + 1)) + 1;
+                    index += " - " + std::to_string(magnitude);
+                }
+                return register_name(*value.base, value.base_version) + "[" + index + "]";
+            }
             if (const auto member = typed_member_access(value)) return *member;
             return "*[(" + address_text(value) + ")]";
         } else if constexpr (std::is_same_v<T, UnaryValue>) {
