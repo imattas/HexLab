@@ -54,6 +54,13 @@ read-only; source editing retains its separate 1 MiB limit. **Copy excerpt**
 rejects complete-file contents above the 1 MiB clipboard limit before making
 an encoded copy.
 
+After the worker validates the UTF-8 text, the UI appends it in 256 KiB
+UTF-8-boundary chunks on successive timer events. This keeps conversion and
+text-control updates bounded per UI event while retaining the 64 MiB file cap.
+**Cancel load** remains available during this rendering phase; canceling drops
+the partial text and restores the mapped excerpt. Each chunk is discarded if
+the document, project revision, source path, or selected address has changed.
+
 Full-file reads and decoding run off the UI thread. Navigation and document
 changes request cancellation; the result is applied only if the selected path,
 address, document revision, and project edit/byte/decision revision still match
