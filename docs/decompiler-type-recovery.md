@@ -64,8 +64,10 @@ provided, its ordered slots control parameter order and can interleave integer
 and floating register classes with exact stack locations. The slot class
 supplies floating classification while the observed register or load width
 supplies size; integer slots retain pointer and signedness evidence from the
-IR. Vector slots infer a type only when lane metadata provides a supported,
-internally consistent shape. A missing slot also ends the prefix, even when a
+IR. Vector argument slots infer a type only when lane metadata provides a supported,
+internally consistent shape. A vector return with known total width but no lane
+metadata retains its result class and width as an explicitly opaque byte vector;
+it does not make an opaque vector argument slot inferable. A missing slot also ends the prefix, even when a
 later slot is observed, since the prototype arity and skipped parameter type
 are ambiguous. Parameters are named `arg0`, `arg1`, and so on. When the
 ordered map is absent, the older integer-register plus exact-stack-offset
