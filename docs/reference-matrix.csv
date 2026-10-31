@@ -22,7 +22,7 @@ processor.i860,processor,860XR,absent,open,,P01,8
 processor.i960,processor,960,absent,open,,P01,8
 processor.x86,processor,x86,partial,partial,tests/x86_32_decoder_tests.cpp; docs/x86-32-coverage.csv; raw/PE32 recovery/cache/editing and CLI/wx selection integrated; selected Win32 CPU oracle and Release/install acceptance passed; x86-16 absent,P01,4
 processor.x87,processor,x87,partial,partial,libs/processors/src/x64_x87.cpp; tests/x86_16_decoder_tests.cpp; tests/x86_32_decoder_tests.cpp; docs/x87-decoder-coverage.md; D8-DF decode and stack register/effect coverage,P01,8
-processor.x86_simd,processor,x86 SIMD,partial,partial,"libs/processors/src/x64_simd.cpp; libs/processors/src/x64_decode.cpp; libs/processors/include/hexlab/processors/x86_alignr_semantics.hpp; tests/x64_simd_tests.cpp; docs/x64-simd-coverage.md; SSE2 integer/scalar subset, SSSE3/AVX2 lane-local PALIGNR and VPALIGNR decode/evaluation; broader ISA families remain incomplete",P01,8
+processor.x86_simd,processor,x86 SIMD,partial,partial,"libs/processors/src/x64_simd.cpp; libs/processors/src/x64_decode.cpp; libs/processors/include/hexlab/processors/x86_alignr_semantics.hpp; tests/x64_simd_tests.cpp; docs/x64-simd-coverage.md; SSE2 integer/scalar subset; selected VEX/AVX forms decode in x86-32 and x86-64 with shared bounded evaluation and typed lifting; broader ISA families remain incomplete",P01,8
 processor.jvm,processor,JVM,absent,open,,P01,8
 processor.kr1878,processor,KR1878,absent,open,,P01,8
 processor.cli,processor,.NET CLI,absent,open,,P01,8

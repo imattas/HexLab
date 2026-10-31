@@ -27,6 +27,12 @@ inline bool x86_context(const Instruction &instruction) noexcept {
     return instruction.context.architecture == Architecture::x86 ||
            instruction.context.architecture == Architecture::x86_64;
 }
+inline bool x86_32_or_64_context(const Instruction &instruction) noexcept {
+    return (instruction.context.architecture == Architecture::x86 &&
+            instruction.context.mode == ExecutionMode::x86_32) ||
+           (instruction.context.architecture == Architecture::x86_64 &&
+            instruction.context.mode == ExecutionMode::x86_64);
+}
 } // namespace x64_instruction_semantics_detail
 
 // Validate the typed hardware-random instruction before evaluating a caller-
@@ -1227,7 +1233,7 @@ inline std::optional<X86Bmi1Result>
 evaluate_x86_bmi1_instruction(const Instruction &instruction, std::uint64_t source1,
                               std::optional<std::uint64_t> source2 = std::nullopt) noexcept {
     using namespace x64_instruction_semantics_detail;
-    if (!x86_context(instruction) || instruction.context.mode != ExecutionMode::x86_64)
+    if (!x86_32_or_64_context(instruction))
         return std::nullopt;
     X86Bmi1 operation;
     bool unary = false;
@@ -1244,16 +1250,19 @@ evaluate_x86_bmi1_instruction(const Instruction &instruction, std::uint64_t sour
         instruction.access[0] != OperandAccess::write)
         return std::nullopt;
     const auto *destination = std::get_if<RegisterOperand>(&instruction.operands[0]);
-    if (!destination || destination->bank != RegisterBank::gpr || destination->index > 15 ||
+    const auto max_register = static_cast<std::uint8_t>(instruction.context.architecture == Architecture::x86 ? 7 : 15);
+    if (!destination || destination->bank != RegisterBank::gpr || destination->index > max_register ||
         destination->high_byte || (destination->width != 32 && destination->width != 64))
         return std::nullopt;
     const unsigned width = destination->width;
+    if (width == 64 && instruction.context.mode != ExecutionMode::x86_64)
+        return std::nullopt;
     for (unsigned index = 1; index < count; ++index) {
         if (instruction.access[index] != OperandAccess::read ||
             operand_width(instruction.operands[index]) != width)
             return std::nullopt;
         if (const auto *reg = std::get_if<RegisterOperand>(&instruction.operands[index])) {
-            if (reg->bank != RegisterBank::gpr || reg->index > 15 || reg->high_byte)
+            if (reg->bank != RegisterBank::gpr || reg->index > max_register || reg->high_byte)
                 return std::nullopt;
         } else if (!std::holds_alternative<MemoryOperand>(instruction.operands[index])) {
             return std::nullopt;
@@ -1312,8 +1321,7 @@ inline std::optional<std::uint64_t> evaluate_x86_bmi2_shift_instruction(
     const Instruction &instruction, std::uint64_t source,
     std::uint64_t runtime_count = 0) noexcept {
     using namespace x64_instruction_semantics_detail;
-    if (instruction.context.architecture != Architecture::x86_64 ||
-        instruction.context.mode != ExecutionMode::x86_64 ||
+    if (!x86_32_or_64_context(instruction) ||
         instruction.flow != FlowKind::fallthrough || instruction.memory_write ||
         (instruction.opcode != Opcode::shlx && instruction.opcode != Opcode::shrx &&
          instruction.opcode != Opcode::sarx && instruction.opcode != Opcode::rorx) ||
@@ -1322,15 +1330,17 @@ inline std::optional<std::uint64_t> evaluate_x86_bmi2_shift_instruction(
         instruction.access[2] != OperandAccess::read)
         return std::nullopt;
     const bool immediate_count = instruction.opcode == Opcode::rorx;
+    const auto max_register = static_cast<std::uint8_t>(instruction.context.architecture == Architecture::x86 ? 7 : 15);
     const auto *destination = std::get_if<RegisterOperand>(&instruction.operands[0]);
     const unsigned width = destination ? destination->width : 0;
-    if (!destination || destination->bank != RegisterBank::gpr || destination->index > 15 || destination->high_byte ||
+    if (!destination || destination->bank != RegisterBank::gpr || destination->index > max_register || destination->high_byte ||
         (width != 32 && width != 64) || operand_width(instruction.operands[1]) != width ||
+        (width == 64 && instruction.context.mode != ExecutionMode::x86_64) ||
         (std::holds_alternative<MemoryOperand>(instruction.operands[1]) && !instruction.memory_read) ||
         (std::holds_alternative<RegisterOperand>(instruction.operands[1]) && instruction.memory_read))
         return std::nullopt;
     const auto *source_register = std::get_if<RegisterOperand>(&instruction.operands[1]);
-    if (source_register && (source_register->bank != RegisterBank::gpr || source_register->index > 15 ||
+    if (source_register && (source_register->bank != RegisterBank::gpr || source_register->index > max_register ||
                             source_register->high_byte))
         return std::nullopt;
     const auto has = [](const auto &registers, RegisterOperand reg) {
@@ -1347,7 +1357,7 @@ inline std::optional<std::uint64_t> evaluate_x86_bmi2_shift_instruction(
         count = immediate->value;
     } else {
         const auto *count_register = std::get_if<RegisterOperand>(&instruction.operands[2]);
-        if (!count_register || count_register->bank != RegisterBank::gpr || count_register->index > 15 ||
+        if (!count_register || count_register->bank != RegisterBank::gpr || count_register->index > max_register ||
             count_register->width != width ||
             count_register->high_byte || !has(instruction.register_reads, *count_register))
             return std::nullopt;
@@ -1373,8 +1383,7 @@ inline std::optional<std::uint64_t> evaluate_x86_bmi2_shift_instruction(
 inline std::optional<X86BzhiResult> evaluate_x86_bzhi_instruction(
     const Instruction &instruction, std::uint64_t source, std::uint64_t index) noexcept {
     using namespace x64_instruction_semantics_detail;
-    if (instruction.context.architecture != Architecture::x86_64 ||
-        instruction.context.mode != ExecutionMode::x86_64 ||
+    if (!x86_32_or_64_context(instruction) ||
         instruction.flow != FlowKind::fallthrough || instruction.opcode != Opcode::bzhi ||
         instruction.memory_write || instruction.operands.size() != 3 || instruction.access.size() != 3 ||
         instruction.access[0] != OperandAccess::write || instruction.access[1] != OperandAccess::read ||
@@ -1382,10 +1391,12 @@ inline std::optional<X86BzhiResult> evaluate_x86_bzhi_instruction(
         return std::nullopt;
     const auto *destination = std::get_if<RegisterOperand>(&instruction.operands[0]);
     const auto *index_register = std::get_if<RegisterOperand>(&instruction.operands[2]);
+    const auto max_register = static_cast<std::uint8_t>(instruction.context.architecture == Architecture::x86 ? 7 : 15);
     if (!destination || !index_register || destination->bank != RegisterBank::gpr ||
-        destination->index > 15 || destination->high_byte ||
+        destination->index > max_register || destination->high_byte ||
         (destination->width != 32 && destination->width != 64) ||
-        index_register->bank != RegisterBank::gpr || index_register->index > 15 ||
+        (destination->width == 64 && instruction.context.mode != ExecutionMode::x86_64) ||
+        index_register->bank != RegisterBank::gpr || index_register->index > max_register ||
         index_register->width != destination->width || index_register->high_byte ||
         operand_width(instruction.operands[1]) != destination->width)
         return std::nullopt;
@@ -1393,7 +1404,7 @@ inline std::optional<X86BzhiResult> evaluate_x86_bzhi_instruction(
         return std::find(registers.begin(), registers.end(), reg) != registers.end();
     };
     const auto *source_register = std::get_if<RegisterOperand>(&instruction.operands[1]);
-    if (source_register && (source_register->bank != RegisterBank::gpr || source_register->index > 15 ||
+    if (source_register && (source_register->bank != RegisterBank::gpr || source_register->index > max_register ||
                             source_register->high_byte))
         return std::nullopt;
     if ((std::holds_alternative<MemoryOperand>(instruction.operands[1]) && !instruction.memory_read) ||
