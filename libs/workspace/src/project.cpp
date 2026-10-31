@@ -16,7 +16,7 @@ std::shared_ptr<ProjectSnapshot> project_bytes(const ProjectSnapshot& before,std
         output->effective=take(make_overlay(output->original,output->state->user->patches));
         ReadSet candidates;if(before.state)for(auto& span:before.state->user->patches)take(candidates.include(span.begin,span.replacement.size()));for(auto& span:output->state->user->patches)take(candidates.include(span.begin,span.replacement.size()));
         ReadSet changed=before.effective?effective_changes(*before.effective,*output->effective,candidates,stop):std::move(candidates);for(auto range:changed.ranges())take(output->pending_byte_ranges.include(range.begin,range.size));
-        bool reparse=!before.loaded || !before.state || !before.loaded->metadata_complete ||
+        bool reparse=!before.loaded || !before.state ||
                      (!before.loaded->metadata_reads_complete && !changed.ranges().empty()) ||
                      take(encode_recipe(before.state->recipe))!=take(encode_recipe(output->state->recipe));
         if(!reparse){for(auto range:changed.ranges())if(take(before.loaded->metadata_reads.intersects(range.begin,range.size))){reparse=true;break;}}

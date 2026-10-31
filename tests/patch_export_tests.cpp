@@ -41,7 +41,22 @@ void failure_tests(const std::filesystem::path& directory){
     auto state=std::make_shared<ProjectState>(*snapshot->state);state->input.sha256[0]^=std::byte{1};auto mismatched=*snapshot;mismatched.state=state;auto mismatch=export_patched(mismatched,output,ReplacePolicy::replace_existing,{});check(!mismatch && mismatch.error().code==ErrorCode::integrity && read_file(output)==baseline,"original identity is verified before publication");
     image_testing::fail_next_write();check(!export_patched(*snapshot,output,ReplacePolicy::replace_existing,{}) && read_file(output)==baseline,"injected write error preserves preceding output");
     image_testing::fail_next_publication();check(!export_patched(*snapshot,output,ReplacePolicy::replace_existing,{}) && read_file(output)==baseline,"injected publication error preserves preceding output");
-    auto reader=FileStorage::open(output).value();auto locked=export_patched(*snapshot,output,ReplacePolicy::replace_existing,{});check(!locked && locked.error().code==ErrorCode::busy && read_file(output)==baseline,"native live reader prevents replacement without losing old output");reader.reset();
+    auto reader=FileStorage::open(output).value();
+#ifdef _WIN32
+    auto locked=export_patched(*snapshot,output,ReplacePolicy::replace_existing,{});check(!locked && locked.error().code==ErrorCode::busy && read_file(output)==baseline,"Windows live reader prevents replacement without losing old output");
+#else
+    // POSIX readers retain the old inode across atomic rename, so publication
+    // may safely replace the pathname while an existing mapping remains live.
+    auto replaced=export_patched(*snapshot,output,ReplacePolicy::replace_existing,{});
+    auto old_view=reader->read_at({0},baseline.size());
+    auto expected_view=snapshot->effective->read_at({0},snapshot->effective->size());
+    const auto published=read_file(output);
+    check(bool(replaced) && old_view && expected_view && std::equal(old_view.value().bytes.begin(),old_view.value().bytes.end(),baseline.begin(),baseline.end()) && published.size()==expected_view.value().bytes.size() && std::equal(published.begin(),published.end(),expected_view.value().bytes.begin(),expected_view.value().bytes.end()),"POSIX live reader retains old inode across atomic replacement");
+#endif
+    reader.reset();
+    // The live-reader scenario may publish successfully on POSIX. Reestablish
+    // the independent baseline for the companion-file safety assertion.
+    write_file(output,baseline);
     auto wal=output;wal+=L"-wal";write_file(wal,bytes({1}));check(!export_patched(*snapshot,output,ReplacePolicy::replace_existing,{}) && read_file(output)==baseline && read_file(wal)==bytes({1}),"export cannot overwrite a database with journal companions");std::filesystem::remove(wal);
 }
 void alias_tests(const std::filesystem::path& directory){
@@ -66,8 +81,8 @@ void path_stability_tests(const std::filesystem::path& directory){
     std::filesystem::current_path(saved_directory);auto session=ProjectSession::attach(reopened,{},{}).value();auto guarded=export_patched(*session->snapshot(),input.path,ReplacePolicy::replace_existing,{});check(!guarded && guarded.error().code==ErrorCode::invalid_argument,"relocated readonly project protects original after cwd changes");auto unicode=saved_directory/L"patched-\u8d44\u6599-\u00e9.bin";std::filesystem::remove(unicode,ignored);check(bool(export_patched(*session->snapshot(),unicode,ReplacePolicy::fail_if_exists,{})) && read_file(unicode)==bytes({0x90,0xc3}),"native Unicode output succeeds after cwd changes");session.reset();reopened.reset();store.reset();std::filesystem::remove(absolute_project,ignored);for(auto suffix:{L"-wal",L"-shm"}){auto side=absolute_project;side+=suffix;std::filesystem::remove(side,ignored);}
 }
 void virtual_alias_tests(const std::filesystem::path& directory){
-    auto data=pe_fixture();put(data,0x86,2,2);put(data,0xd0,0x3000,4);put_text(data,0x1b0,".alias");put(data,0x1b8,2,4);put(data,0x1bc,0x2000,4);put(data,0x1c0,0x200,4);put(data,0x1c4,0x200,4);put(data,0x1d4,0x60000020,4);
-    Fixture fixture(data,{Format::pe,{}});auto initial=fixture.session->snapshot();if(!initial->loaded)throw std::runtime_error(initial->reason);auto patched=fixture.session->execute(PatchBytes{Address{{0},0x140002000},bytes({0xcc})},0,{});if(!patched)throw std::runtime_error(patched.error().message);check(true,"second PE virtual alias accepts a canonical file patch");auto snapshot=patched.value();if(!snapshot->loaded)throw std::runtime_error(snapshot->reason);check(snapshot->loaded->image->read(Address{{0},0x140001000},1).value()[0]==std::byte{0xcc} && snapshot->loaded->image->read(Address{{0},0x140002000},1).value()[0]==std::byte{0xcc},"both virtual aliases observe the same effective patch");data[0x200]=std::byte{0xcc};auto output=directory/L"alias-patched.bin";std::error_code ignored;std::filesystem::remove(output,ignored);check(bool(export_patched(*snapshot,output,ReplacePolicy::fail_if_exists,{})) && read_file(output)==data,"aliased VA patch exports exactly one changed file byte");
+    auto data=pe_fixture();data.resize(0x600);put(data,0x86,2,2);put(data,0xd0,0x3000,4);put_text(data,0x1b0,".alias");put(data,0x1b8,2,4);put(data,0x1bc,0x2000,4);put(data,0x1c0,0x200,4);put(data,0x1c4,0x400,4);put(data,0x1d4,0x60000020,4);
+    Fixture fixture(data,{Format::pe,{}});auto initial=fixture.session->snapshot();if(!initial->loaded)throw std::runtime_error(initial->reason);auto patched=fixture.session->execute(PatchBytes{Address{{0},0x140002000},bytes({0xcc})},0,{});if(!patched)throw std::runtime_error(patched.error().message);check(true,"second PE section accepts an address patch");auto snapshot=patched.value();if(!snapshot->loaded)throw std::runtime_error(snapshot->reason);check(snapshot->loaded->image->read(Address{{0},0x140001000},1).value()[0]==std::byte{0x90} && snapshot->loaded->image->read(Address{{0},0x140002000},1).value()[0]==std::byte{0xcc},"disjoint PE sections retain independent effective bytes");data[0x400]=std::byte{0xcc};auto output=directory/L"alias-patched.bin";std::error_code ignored;std::filesystem::remove(output,ignored);check(bool(export_patched(*snapshot,output,ReplacePolicy::fail_if_exists,{})) && read_file(output)==data,"second-section VA patch exports its mapped file byte");
 }
 }
 void persistent_round_trip_tests(const std::filesystem::path& directory){

@@ -29,8 +29,8 @@ void thin_headers() {
                   "thin class/order/outer source extent remain exact");
             check(header.cpu_type == (wide ? 0x01000007u : 7u) && header.cpu_subtype == 0x80000003 &&
                       header.file_type == 1 && header.flags == 0x80002000 &&
-                      header.reserved == (wide ? 0x12345678u : 0u),
-                  "full32-bit CPU/subtype/type/flags/reserved values are not truncated");
+                      header.reserved == 0,
+                  "full32-bit CPU/subtype/type/flags values parse with a zero reserved field");
             check(header.command_count == 2 && header.command_bytes == 24 && header.commands.size() == 2 &&
                       header.commands[0].index == 0 && header.commands[0].command == 0x70000001 &&
                       header.commands[0].size == 8 && header.commands[0].file_offset == (wide ? 32u : 28u) &&
@@ -58,8 +58,13 @@ void universal_headers() {
                       !container.slices[0].header.is_64 && container.slices[1].header.is_64 &&
                       container.slices[1].header.order == ByteOrder::big && container.slices[1].index == 1 &&
                       container.slices[1].header.commands[0].file_offset == 544 && container.slices[1].alignment == 8 &&
-                      container.slices[1].reserved == (wide ? 0x0badf00du : 0u),
+                      container.slices[1].reserved == 0,
                   "each slice has independent header context and outer-container command coordinates");
+            if (wide) {
+                auto bad = universal(wide, big);
+                put(bad, 8 + 28, 1, 4, big);
+                check(!inspect(bad), "nonzero FAT64 architecture reserved field is rejected");
+            }
         }
 }
 void malformed() {
@@ -70,6 +75,13 @@ void malformed() {
                 check(!inspect(std::vector<std::byte>(data.begin(), data.begin() + count)),
                       "every thin header/command truncation fails");
             const auto header = wide ? 32u : 28u;
+            if (wide) {
+                auto bad = data;
+                put(bad, 28, 1, 4, big);
+                const auto compatible = inspect(bad);
+                check(compatible && compatible.value().slices[0].header.reserved == 1,
+                      "nonzero Mach-O64 header reserved word is retained for historical-file compatibility");
+            }
             for (auto [at, value] : {std::pair{0u, 0u},
                                      {16u, 65537u},
                                      {20u, 0xffffffffu},

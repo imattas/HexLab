@@ -898,6 +898,8 @@ struct DecodeResult {
     DecodeStatus status;
     std::optional<Instruction> instruction;
     std::string reason;
+    // True when analysis obtained this record from the host-provided decoder.
+    bool semantic_decoder_used = false;
 };
 } // namespace hexlab
 

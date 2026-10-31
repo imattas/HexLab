@@ -576,6 +576,8 @@ Result<PdbTypeImportResult> import_pdb_type_graph(const PdbTypeGraph &graph) {
         case CodeViewTypeKind::enumeration: {
             auto underlying = convert(target_namespace, record.underlying_type);
             if (!underlying) return fail(underlying.error());
+            if (underlying.value()->kind() != Kind::integer)
+                return fail(Error{ErrorCode::unsupported, "PDB enum has a non-integer underlying type"});
             std::vector<Enumerator> values;
             for (const auto &field : node.expanded_fields) {
                 if (field.leaf != 0x1502)

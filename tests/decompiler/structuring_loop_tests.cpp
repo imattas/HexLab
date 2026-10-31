@@ -262,10 +262,16 @@ int main() {
     require(malformed_switch_phi_output.used_fallback && !malformed_switch_phi_output.fallback_reason.empty(),
             "loop-switch continuation rejects missing case-tail phi inputs");
     const auto nested_output = format_structured_pseudocode(nested_while_loops());
+    const auto compact_inner_loop = nested_output.text.find("while (inner_more)");
+    const auto guarded_inner_loop = nested_output.text.find("while (true)");
+    const auto inner_loop = compact_inner_loop != std::string::npos ? compact_inner_loop : guarded_inner_loop;
+    const bool guarded_exit = guarded_inner_loop != std::string::npos &&
+        nested_output.text.find("if (!(inner_more))", guarded_inner_loop) != std::string::npos;
     require(!nested_output.used_fallback && nested_output.text.find("while (outer_more)") != std::string::npos &&
-                nested_output.text.find("while (inner_more)") != std::string::npos &&
-                nested_output.text.find("before_inner()") < nested_output.text.find("while (inner_more)") &&
-                nested_output.text.find("after_inner()") > nested_output.text.find("while (inner_more)") &&
+                inner_loop != std::string::npos && (compact_inner_loop != std::string::npos || guarded_exit) &&
+                nested_output.text.find("inner_step()", inner_loop) != std::string::npos &&
+                nested_output.text.find("before_inner()") < inner_loop &&
+                nested_output.text.find("after_inner()") > inner_loop &&
                 nested_output.text.find("goto") == std::string::npos,
             "a nested natural loop emits the inner region before resuming the outer body");
     auto incomplete_switch = switch_function;

@@ -166,6 +166,8 @@ inline std::optional<IntegerDataflowShape> evex_integer_shape(Opcode opcode) noe
     case Opcode::vpandq: case Opcode::vpandnq: case Opcode::vporq: case Opcode::vpxorq:
         return IntegerDataflowShape{64,64,64,false,false,false};
     case Opcode::vpavgb: case Opcode::vpavgw: case Opcode::vpsadbw: case Opcode::vpermb:
+    case Opcode::vpunpcklbw: case Opcode::vpunpcklwd: case Opcode::vpunpckldq: case Opcode::vpunpcklqdq:
+    case Opcode::vpunpckhbw: case Opcode::vpunpckhwd: case Opcode::vpunpckhdq: case Opcode::vpunpckhqdq:
     case Opcode::vpminsb: case Opcode::vpminsd: case Opcode::vpminsq: case Opcode::vpminuw: case Opcode::vpminud: case Opcode::vpminuq:
     case Opcode::vpmaxsb: case Opcode::vpmaxsd: case Opcode::vpmaxsq: case Opcode::vpmaxuw: case Opcode::vpmaxud: case Opcode::vpmaxuq:
     case Opcode::vpmulld: case Opcode::vpmullq: case Opcode::vpmuldq: case Opcode::vpmuludq:

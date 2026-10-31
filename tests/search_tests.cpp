@@ -12,9 +12,24 @@ SearchSource source(std::shared_ptr<const Image> image){SearchSource s;s.effecti
 void bytes_tests(){
     auto s=source(memory_image(bytes({0xaa,0xaa,0xaa,0xab,0xaa})));
     SearchQuery q=BytePattern{"AA AA"};SearchLimits limits;limits.max_results=1;
-    auto first=take(search(s,q,{},limits,{}));check(first.matches.size()==1 && first.matches[0].offset.value==0 && first.matches[0].address==Address{{0},0x1000} && first.next.has_value(),"first byte page retains canonical offset and mapping");
+    auto first=take(search(s,q,{},limits,{}));check(first.matches.size()==1 && first.matches[0].offset.value==0 && first.matches[0].address==Address{{0},0x1000} && first.next.has_value() && first.next->end_offset==s.effective->size(),"first byte page retains canonical offset, mapping, and full-source cursor range");
     auto second=take(search(s,q,first.next,limits,{}));check(second.matches.size()==1 && second.matches[0].offset.value==1,"continuation retains overlapping match");
     auto last=take(search(s,q,second.next,limits,{}));check(last.complete && last.matches.empty(),"last byte page terminates without duplicates");
+    SearchLimits bounded_range;bounded_range.max_results=1;bounded_range.end_offset=4;
+    SearchQuery bounded_query=BytePattern{"AA"};
+    auto bounded_first=take(search(s,bounded_query,{},bounded_range,{}));
+    check(bounded_first.next && bounded_first.next->end_offset==4 && bounded_first.matches[0].offset.value==0,
+          "bounded first page retains its exclusive end in the continuation");
+    auto bounded_second=take(search(s,bounded_query,bounded_first.next,bounded_range,{}));
+    auto bounded_third=take(search(s,bounded_query,bounded_second.next,bounded_range,{}));
+    auto bounded_last=take(search(s,bounded_query,bounded_third.next,bounded_range,{}));
+    check(bounded_second.matches.size()==1 && bounded_second.matches[0].offset.value==1 &&
+              bounded_third.matches.size()==1 && bounded_third.matches[0].offset.value==2 &&
+              bounded_last.matches.empty() && bounded_last.complete,
+          "bounded continuation resumes at the next match and stops at its exclusive end");
+    auto changed_range=bounded_range;changed_range.end_offset=5;
+    check(!search(s,bounded_query,bounded_third.start,changed_range,{}),
+          "bounded continuation rejects a different exclusive end");
     auto changed=s;changed.key.byte_revision++;check(!search(changed,q,first.next,limits,{}),"continuation rejects changed byte revision");check(!search(s,BytePattern{"AA AB"},first.next,limits,{}),"continuation rejects another query");
     for(auto pattern:{"","A","GG","0xAA","AA,BB"})check(!search(s,BytePattern{pattern},{},{},{}),"malformed octet pattern rejected");
     SearchLimits bounded;bounded.max_candidates=2;auto wildcard=take(search(s,BytePattern{"??"},{},bounded,{}));check(wildcard.matches.size()==2 && wildcard.next && !wildcard.complete && wildcard.examined_candidates==2,"all wildcard query honors finite work budget");

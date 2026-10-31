@@ -232,8 +232,9 @@ inline DecodeContext context_for(std::span<const DomainContext> domains, Address
     }
     return baseline;
 }
-Instruction checked_instruction(std::span<const std::byte>, std::span<const DomainContext>, const Image *,
-                                const AnalysisOptions&, std::stop_token);
+struct CheckedInstruction { Instruction instruction; bool semantic_decoder_used=false; };
+CheckedInstruction checked_instruction(std::span<const std::byte>, std::span<const DomainContext>, const Image *,
+                                       const AnalysisOptions&, std::stop_token);
 Sha256Digest checksum(std::span<const std::byte>, std::stop_token);
 inline bool same_reads(const ReadSet &a, const ReadSet &b) {
     auto x = a.ranges(), y = b.ranges();

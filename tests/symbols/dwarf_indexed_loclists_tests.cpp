@@ -55,7 +55,13 @@ Fixture build(std::vector<std::uint8_t> list, std::vector<std::uint64_t> address
 }
 
 Result<ImportResult> import(const Fixture& f) {
-    return import_dwarf({"indexed-loclists.o", f.info, f.abbrev, {}, {}, f.addresses, {}, {}, {}, f.locations});
+    DwarfSections sections;
+    sections.source_id = "indexed-loclists.o";
+    sections.info = f.info;
+    sections.abbrev = f.abbrev;
+    sections.addresses = f.addresses;
+    sections.location_lists = f.locations;
+    return import_dwarf(sections);
 }
 std::vector<std::uint8_t> expression(std::uint8_t literal) { return {literal}; }
 void add_expression(std::vector<std::uint8_t>& list, std::uint8_t literal) { uleb(list, 1); list.push_back(literal); }

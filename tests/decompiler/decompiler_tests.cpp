@@ -552,16 +552,24 @@ int main() {
     Instruction a64_flag_clobber;
     a64_flag_clobber.address = a64_next;
     a64_flag_clobber.context = a64_subs.context;
-    a64_flag_clobber.opcode = Opcode::nop;
-    a64_flag_clobber.register_writes = {RegisterOperand{RegisterBank::arm_flags, 0, 32, false}};
+    a64_flag_clobber.opcode = Opcode::a64_adds;
+    a64_flag_clobber.operands = {RegisterOperand{RegisterBank::arm64_gpr, 0, 64, false},
+                                 RegisterOperand{RegisterBank::arm64_gpr, 1, 64, false},
+                                 RegisterOperand{RegisterBank::arm64_gpr, 2, 64, false}};
+    a64_flag_clobber.register_reads = {RegisterOperand{RegisterBank::arm64_gpr, 1, 64, false},
+                                       RegisterOperand{RegisterBank::arm64_gpr, 2, 64, false}};
+    a64_flag_clobber.register_writes = {RegisterOperand{RegisterBank::arm64_gpr, 0, 64, false},
+                                        RegisterOperand{RegisterBank::arm_flags, 0, 4, false}};
     auto a64_clobber_block = std::make_shared<BasicBlock>(*a64_branch_block);
     a64_clobber_block->instructions.insert(a64_clobber_block->instructions.begin(),
         std::make_shared<InstructionFact>(InstructionFact{93, a64_flag_clobber, {}}));
     auto a64_clobber_snapshot = a64_snapshot;
     a64_clobber_snapshot.blocks[0] = a64_clobber_block;
     const auto a64_clobbered = lift_function(a64_record, a64_clobber_snapshot);
-    require(a64_clobbered && format_pseudocode(a64_clobbered.value()).find("condition_0") != std::string::npos,
-            "AArch64 comparison facts are discarded when a successor writes NZCV");
+    const auto a64_clobbered_text = a64_clobbered ? format_pseudocode(a64_clobbered.value()) : a64_clobbered.error().message;
+    require(a64_clobbered && a64_clobbered_text.find("if (bit(flags, 0x2))") != std::string::npos &&
+                a64_clobbered_text.find("if ((x1 == x2))") == std::string::npos,
+            ("AArch64 successor NZCV write replaces the prior comparison predicate:\n" + a64_clobbered_text).c_str());
 
     const Address left_compare_address{{0}, 0x1030};
     const Address right_compare_address{{0}, 0x1040};
@@ -856,6 +864,7 @@ int main() {
     auto shift_branch = equal_branch;
     shift_branch.address = Address{{0}, 0x1002};
     shift_branch.x86_condition = X86Condition::overflow;
+    shift_branch.register_reads = {flags};
     auto shift_block = std::make_shared<BasicBlock>();
     shift_block->id = BlockId{20};
     shift_block->begin = compare_entry;
@@ -867,10 +876,12 @@ int main() {
     FunctionSnapshot shift_snapshot;
     shift_snapshot.blocks = {shift_block};
     const auto shift_lifted = lift_function(shift_record, shift_snapshot);
-    require(shift_lifted && format_pseudocode(shift_lifted.value()).find("(r1 << 0x1)") != std::string::npos,
-            "x86 immediate shifts are lifted with their decoded count and destination width");
-    require(shift_lifted && format_pseudocode(shift_lifted.value()).find("bit(r1, 0x1f)") != std::string::npos,
-            "one-bit SHL carries the shifted-out bit into its overflow predicate");
+    const auto shift_text = shift_lifted ? format_pseudocode(shift_lifted.value()) : shift_lifted.error().message;
+    require(shift_lifted && shift_text.find("x86_shl(r1, 0x1)") != std::string::npos &&
+                shift_text.find("writes r1, flags") != std::string::npos,
+            ("x86 immediate SHL retains its typed count, destination, and flags effects:\n" + shift_text).c_str());
+    require(shift_lifted && shift_text.find("bit(flags, 0xb)") != std::string::npos,
+            ("one-bit SHL overflow branch consumes OF from the produced flags value:\n" + shift_text).c_str());
 
     FunctionSnapshot missing;
     auto rejected = lift_function(record, missing);
@@ -960,11 +971,13 @@ int main() {
     require(extension_folded && std::get<ConstantValue>(std::get<Assign>(
                 extension_folded.value().blocks[0].instructions[1].statement).value->value).value == 0xc0,
             "arithmetic right shift fills the declared bit width");
+    Call unknown_call{Address{{0}, 0x5000}, {}};
+    unknown_call.register_writes = {r0};
     LiftedFunction call_barrier{FunctionId{16}, entry,
         {{BlockId{43}, entry,
           {{{entry, 66}, Assign{r0, value(5)}},
            {{Address{{0}, 0x200c}, 67}, Assign{r2, reg}},
-           {{Address{{0}, 0x2010}, 68}, Call{Address{{0}, 0x5000}, {}}},
+           {{Address{{0}, 0x2010}, 68}, unknown_call},
            {{Address{{0}, 0x2014}, 69}, Assign{r1, reg}}}, {}, {}}}, {}};
     auto call_barrier_ssa = to_ssa(call_barrier);
     auto call_barrier_result = call_barrier_ssa ? simplify_constants(call_barrier_ssa.value())
@@ -1057,18 +1070,35 @@ int main() {
     const auto phi_edges_lowered = [&]() {
         if (!nested_ssa || nested_ssa.value().blocks[0].phis.size() != 1 ||
             nested_ssa.value().blocks[3].phis.size() != 2) return false;
-        const auto edge_copies_exist = [&](std::size_t block_index) {
-            for (const auto &phi : nested_ssa.value().blocks[block_index].phis) {
-                for (const auto &input : phi.inputs) {
-                    const auto copy = "r" + std::to_string(phi.destination.index) + "_" +
-                        std::to_string(phi.version) + " = r" + std::to_string(phi.destination.index) + "_" +
-                        std::to_string(input.version) + ";";
-                    if (nested_versioned.text.find(copy) == std::string::npos) return false;
-                }
-            }
-            return true;
+        // Inner phi inputs are copied at their predecessor edges. The outer
+        // join uses parallel-copy temporaries so one phi write cannot clobber
+        // another phi's incoming value on the same edge.
+        const auto &inner_phi = nested_ssa.value().blocks[0].phis.front();
+        const auto &outer_phi_r0 = nested_ssa.value().blocks[3].phis[0];
+        const auto &outer_phi_r1 = nested_ssa.value().blocks[3].phis[1];
+        if (inner_phi.destination.index != 0 || inner_phi.version != 2 || inner_phi.inputs.size() != 2 ||
+            outer_phi_r0.destination.index != 0 || outer_phi_r1.destination.index != 1 ||
+            outer_phi_r0.inputs.size() != 2 || outer_phi_r1.inputs.size() != 2) return false;
+        const auto has_input = [](const auto &phi, std::uint32_t predecessor, std::uint32_t version) {
+            return std::any_of(phi.inputs.begin(), phi.inputs.end(), [&](const auto &input) {
+                return input.predecessor.value == predecessor && input.version == version;
+            });
         };
-        return edge_copies_exist(0) && edge_copies_exist(3);
+        if (!has_input(inner_phi, 76, 3) || !has_input(inner_phi, 81, 4) ||
+            !has_input(outer_phi_r0, 75, 2) || !has_input(outer_phi_r0, 80, 5) ||
+            !has_input(outer_phi_r1, 75, 2) || !has_input(outer_phi_r1, 80, 0)) return false;
+        return nested_versioned.text.find("r0_4 = 0x1;") != std::string::npos &&
+            nested_versioned.text.find("r0_2 = r0_4;") != std::string::npos &&
+            nested_versioned.text.find("r0_3 = 0x2;") != std::string::npos &&
+            nested_versioned.text.find("r0_2 = r0_3;") != std::string::npos &&
+            nested_versioned.text.find("auto __hexlab_phi_0 = r0_2;") != std::string::npos &&
+            nested_versioned.text.find("auto __hexlab_phi_1 = r1_2;") != std::string::npos &&
+            nested_versioned.text.find("r0_1 = __hexlab_phi_0;") != std::string::npos &&
+            nested_versioned.text.find("r1_1 = __hexlab_phi_1;") != std::string::npos &&
+            nested_versioned.text.find("auto __hexlab_phi_2 = r0_5;") != std::string::npos &&
+            nested_versioned.text.find("auto __hexlab_phi_3 = r1_0;") != std::string::npos &&
+            nested_versioned.text.find("r0_1 = __hexlab_phi_2;") != std::string::npos &&
+            nested_versioned.text.find("r1_1 = __hexlab_phi_3;") != std::string::npos;
     }();
     require(nested_ssa && !nested_versioned.used_fallback &&
                 nested_versioned.text.find("if (outer_test)") != std::string::npos &&
@@ -1101,8 +1131,16 @@ int main() {
            {irreducible_right, irreducible_exit, BlockId{93}, BlockEdgeKind::conditional_false}}, {}},
          {BlockId{93}, irreducible_exit, {{{irreducible_exit, 111}, Return{}}}, {}, {}}}, {}};
     const auto irreducible_output = format_structured_pseudocode(irreducible);
-    require(irreducible_output.used_fallback && !irreducible_output.fallback_reason.empty(),
-            "irreducible cyclic flow is never rewritten as nested structured conditionals");
+    require(!irreducible_output.used_fallback &&
+                irreducible_output.text.find("while (true)") != std::string::npos &&
+                irreducible_output.text.find("case 1:") != std::string::npos &&
+                irreducible_output.text.find("case 2:") != std::string::npos &&
+                irreducible_output.text.find("block_id = 1;") != std::string::npos &&
+                irreducible_output.text.find("block_id = 2;") != std::string::npos &&
+                irreducible_output.text.find("if (left_edge)") != std::string::npos &&
+                irreducible_output.text.find("if (right_edge)") != std::string::npos &&
+                irreducible_output.text.find("return;") != std::string::npos,
+            "irreducible multi-entry cycles retain dispatcher transitions and their reachable exit");
 
     const Address dispatch_entry{{0}, 0x2140}, switch_case0{{0}, 0x2150};
     const Address switch_case1{{0}, 0x2160}, switch_case2{{0}, 0x2170};
@@ -1301,9 +1339,23 @@ int main() {
     auto chained_loop_ssa = to_ssa(chained_loop);
     const auto chained_loop_versioned = chained_loop_ssa ? format_structured_pseudocode(chained_loop_ssa.value())
         : StructuredPseudocode{};
+    const auto chained_header_phi = chained_loop_ssa && chained_loop_ssa.value().blocks.size() > 3 &&
+        !chained_loop_ssa.value().blocks[3].phis.empty()
+        ? &chained_loop_ssa.value().blocks[3].phis.front() : nullptr;
+    const auto chained_has_phi_input = [&](std::uint32_t predecessor, std::uint32_t version) {
+        return chained_header_phi && std::any_of(chained_header_phi->inputs.begin(),
+            chained_header_phi->inputs.end(), [&](const auto &input) {
+                return input.predecessor == BlockId{predecessor} && input.version == version;
+            });
+    };
     require(chained_loop_ssa && !chained_loop_versioned.used_fallback &&
-                chained_loop_versioned.text.find("r0_2 = r0_1;") != std::string::npos &&
-                chained_loop_versioned.text.find("r0_2 = r0_3;") != std::string::npos &&
+                chained_header_phi && chained_header_phi->destination.index == 0 &&
+                chained_header_phi->version == 2 && chained_has_phi_input(63, 1) &&
+                chained_has_phi_input(61, 3) &&
+                chained_loop_versioned.text.find("auto __hexlab_phi_0 = r0_1;") != std::string::npos &&
+                chained_loop_versioned.text.find("auto __hexlab_phi_2 = r0_3;") != std::string::npos &&
+                chained_loop_versioned.text.find("r0_2 = __hexlab_phi_0;") != std::string::npos &&
+                chained_loop_versioned.text.find("r0_2 = __hexlab_phi_2;") != std::string::npos &&
                 chained_loop_versioned.text.find("goto") == std::string::npos,
             "multi-block loop SSA phi copies use the actual final latch predecessor");
     auto side_exit_chained_loop = chained_loop;
@@ -1498,6 +1550,7 @@ int main() {
     const RegisterOperand f1{RegisterBank::mips_fpr,1,32,false}, f2{RegisterBank::mips_fpr,2,32,false};
     const RegisterOperand f3{RegisterBank::mips_fpr,3,32,false}, fcsr{RegisterBank::mips_fcsr,0,32,false};
     mips_fp.operands = {f3,f1,f2};
+    mips_fp.access = {OperandAccess::write, OperandAccess::read, OperandAccess::read};
     mips_fp.register_reads = {f1,f2,fcsr};
     mips_fp.register_writes = {f3,fcsr};
     auto fp_block = std::make_shared<BasicBlock>();
@@ -1511,8 +1564,12 @@ int main() {
     if (fp_lifted && std::holds_alternative<Intrinsic>(fp_lifted.value().blocks[0].instructions[0].statement)) {
         const auto &effect = std::get<Intrinsic>(fp_lifted.value().blocks[0].instructions[0].statement);
         require(effect.operands[0]->type == ValueType{TypeKind::floating,32,false} &&
+                    effect.result_type == ValueType{TypeKind::floating,32,false} &&
+                    !effect.operands.empty() &&
+                    std::holds_alternative<RegisterValue>(effect.operands.back()->value) &&
+                    std::get<RegisterValue>(effect.operands.back()->value).reg == fcsr &&
                     effect.register_writes == std::vector<RegisterOperand>{f3,fcsr},
-                "COP1 lifting keeps FPRs floating typed and preserves FCSR effects");
+                "COP1 S lifting keeps f32 result types and preserves FCSR effects");
     }
     Instruction mips_double = mips_fp;
     mips_double.opcode = Opcode::mips_add_d;
@@ -1532,12 +1589,17 @@ int main() {
     if (double_lifted && std::holds_alternative<Intrinsic>(double_lifted.value().blocks[0].instructions[0].statement)) {
         const auto &effect = std::get<Intrinsic>(double_lifted.value().blocks[0].instructions[0].statement);
         require(effect.name == "mips.add.d" && effect.operands[0]->type == ValueType{TypeKind::floating,64,false} &&
+                    effect.result_type == ValueType{TypeKind::floating,64,false} &&
+                    !effect.operands.empty() &&
+                    std::holds_alternative<RegisterValue>(effect.operands.back()->value) &&
+                    std::get<RegisterValue>(effect.operands.back()->value).reg == fcsr &&
                     effect.register_writes == std::vector<RegisterOperand>{fdst,fcsr},
-                "COP1 D lifting preserves 64-bit floating types and FCSR effects");
+                "COP1 D lifting preserves f64 result types and FCSR effects");
     }
     Instruction mips_cvt = mips_fp;
     mips_cvt.opcode = Opcode::mips_cvt_s_d;
     mips_cvt.operands = {f3,fleft};
+    mips_cvt.access = {OperandAccess::write, OperandAccess::read};
     mips_cvt.register_reads = {fleft,fcsr};
     mips_cvt.register_writes = {f3,fcsr};
     double_block->instructions.push_back(std::make_shared<InstructionFact>(InstructionFact{403,mips_cvt,{}}));
@@ -1554,6 +1616,7 @@ int main() {
     mips_cvt_word.opcode = Opcode::mips_cvt_w_d;
     const RegisterOperand fword{RegisterBank::mips_fpr,8,32,false};
     mips_cvt_word.operands = {fword,fleft};
+    mips_cvt_word.access = {OperandAccess::write, OperandAccess::read};
     mips_cvt_word.register_reads = {fleft,fcsr};
     mips_cvt_word.register_writes = {fword,fcsr};
     double_block->instructions.push_back(std::make_shared<InstructionFact>(InstructionFact{404,mips_cvt_word,{}}));

@@ -73,11 +73,25 @@ void scalar_tests() {
     auto short_add = instruction({0x66, 0x83, 0xc0, 0xff});
     immediate = std::get<ImmediateOperand>(short_add.operands[1]);
     check(immediate.value == 0xffff && immediate.effective_width == 16, "word immediate never inherits a 64-bit mask");
-    for (auto data : {bytes({0x63, 0xc0}), bytes({0x0f, 0x05}), bytes({0xc5, 0xf8, 0x77}), bytes({0x0f, 0xb2, 0})}) {
+    const auto arpl = instruction({0x63, 0xc0});
+    check(arpl.opcode == Opcode::arpl && arpl.operands.size() == 2 &&
+              arpl.access == std::vector{OperandAccess::read_write, OperandAccess::read} &&
+              std::get<RegisterOperand>(arpl.operands[0]).width == 16 &&
+              std::get<RegisterOperand>(arpl.operands[1]).width == 16,
+          "legacy ARPL uses fixed 16-bit destination and source widths");
+    for (auto data : {bytes({0x0f, 0x05}), bytes({0x0f, 0xb2, 0})}) {
         auto unsupported = decode_x86_32(data, {{0}, 0x1000});
         check(unsupported.status == DecodeStatus::unsupported && !unsupported.instruction,
               "unimplemented legacy segment-state/system/vector/ARPL forms remain explicit");
     }
+    const auto vex32 = decode_x86_32(bytes({0xc5, 0xf8, 0x77}), {{0}, 0x1000});
+    check(vex32.status == DecodeStatus::unsupported && !vex32.instruction,
+          "legacy decoder recognizes a valid VEX prefix outside its typed subset");
+    const auto vzeroupper = decode_instruction(mode, bytes({0xc5, 0xf8, 0x77}), {{0}, 0x1000});
+    check(vzeroupper.instruction && vzeroupper.instruction->opcode == Opcode::x86_opaque &&
+              vzeroupper.instruction->length == 3 &&
+              vzeroupper.instruction->mnemonic_override.find("vzeroupper") != std::string::npos,
+          "valid VZEROUPPER retains its exact boundary and display spelling in legacy mode");
     auto locked = decode_x86_32(bytes({0xf0, 0x40}), {{0}, 0x1000});
     check(locked.status == DecodeStatus::invalid && !locked.instruction,
           "LOCK register INC is invalid rather than a prefix-only success");

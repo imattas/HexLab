@@ -92,13 +92,15 @@ int main() {
     LayoutOptions packed_one;
     packed_one.maximum_member_alignment = 1;
     auto packed_record = layout(*padding_record.value(), Abi::x86_64, packed_one);
-    if (!packed_record || packed_record.value().members[1].offset != 1 || packed_record.value().size != 9 ||
-        packed_record.value().alignment != 1 || packed_record.value().padding.size() != 0)
+    if (!packed_record || packed_record.value().members[1].offset != 1 || packed_record.value().size != 16 ||
+        packed_record.value().alignment != 8 || packed_record.value().padding.size() != 1 ||
+        packed_record.value().padding[0].offset != 9 || packed_record.value().padding[0].size != 7)
         return 22;
     auto packed_four = layout(*padding_record.value(), Abi::x86_64, LayoutOptions{4});
-    if (!packed_four || packed_four.value().members[1].offset != 4 || packed_four.value().size != 12 ||
-        packed_four.value().alignment != 4 || packed_four.value().padding.size() != 1 ||
-        packed_four.value().padding[0].size != 3)
+    if (!packed_four || packed_four.value().members[1].offset != 4 || packed_four.value().size != 16 ||
+        packed_four.value().alignment != 8 || packed_four.value().padding.size() != 2 ||
+        packed_four.value().padding[0].offset != 1 || packed_four.value().padding[0].size != 3 ||
+        packed_four.value().padding[1].offset != 12 || packed_four.value().padding[1].size != 4)
         return 23;
 
     auto invalid_pack = layout(*padding_record.value(), Abi::x86_64, LayoutOptions{3});
@@ -124,7 +126,7 @@ int main() {
     const auto vector_encoded = encode(*vector_type.value());
     const auto vector_decoded = vector_encoded ? decode(vector_encoded.value()) :
         hexlab::Result<TypePtr>(vector_encoded.error());
-    if (!vector_decoded || vector_encoded.value().front() != std::byte{5} ||
+    if (!vector_decoded || vector_encoded.value().front() != std::byte{19} ||
         vector_decoded.value()->id() != vector_type.value()->id() ||
         vector_decoded.value()->element()->kind() != Kind::integer)
         return 31;
@@ -149,20 +151,21 @@ int main() {
     if (!nested)
         return 26;
     auto packed_nested = layout(*nested.value(), Abi::x86_64, packed_one);
-    if (!packed_nested || packed_nested.value().members[1].offset != 9 || packed_nested.value().size != 17 ||
-        packed_nested.value().members[0].size != 9)
+    if (!packed_nested || packed_nested.value().members[1].offset != 16 || packed_nested.value().size != 24 ||
+        packed_nested.value().members[0].size != 16)
         return 27;
     auto packed_scalar = layout(*wide.value(), Abi::x86_64, packed_one);
     if (!packed_scalar || packed_scalar.value().alignment != 8)
         return 28;
     auto packed_union = layout(*union_type.value(), Abi::x86_64, packed_one);
-    if (!packed_union || packed_union.value().size != 8 || packed_union.value().alignment != 1 ||
+    if (!packed_union || packed_union.value().size != 8 || packed_union.value().alignment != 8 ||
         packed_union.value().members[1].alignment != 1)
         return 24;
     auto record32 = layout(*padding_record.value(), Abi::x86_32);
-    if (!record32 || record32.value().members[1].offset != 4 || record32.value().alignment != 4 ||
-        record32.value().size != 12 || record32.value().padding.size() != 1 ||
-        record32.value().padding[0].size != 3)
+    if (!record32 || record32.value().members[1].offset != 4 || record32.value().alignment != 8 ||
+        record32.value().size != 16 || record32.value().padding.size() != 2 ||
+        record32.value().padding[0].offset != 1 || record32.value().padding[0].size != 3 ||
+        record32.value().padding[1].offset != 12 || record32.value().padding[1].size != 4)
         return 17;
     auto enumeration = Type::enumeration("State", wide.value(), {"ready", "done"});
     if (!enumeration || enumeration.value()->enumerator_values()[0].value != 0 ||

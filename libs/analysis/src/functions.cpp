@@ -1944,6 +1944,7 @@ Node &Recovery::node(Address address, ThumbITState incoming_it) {
         }
         auto fact = std::make_shared<InstructionFact>();
         fact->instruction = std::move(*decoded.instruction);
+        fact->semantic_decoder_used = decoded.semantic_decoder_used;
         const auto &instruction = fact->instruction;
         fact->id = ids.make(FactKind::instruction, address, instruction.encoded_bytes());
         for (size_t i = 0; i < instruction.byte_length(); ++i) {
@@ -1953,6 +1954,9 @@ Node &Recovery::node(Address address, ThumbITState incoming_it) {
                 if (std::find(value.decisions.begin(), value.decisions.end(), region->id) == value.decisions.end())
                     value.decisions.push_back(region->id);
         }
+        if (fact->semantic_decoder_used)
+            for (const auto &range : semantic_decoder_image_ranges)
+                take(fact->reads.include(range.begin, range.size));
         if (fact->instruction.opcode == Opcode::dex_switch) {
             auto table = function_detail::populate_dex_switch_table(image, fact->instruction, &fact->reads, stop);
             if (!table) {
@@ -2912,6 +2916,23 @@ bool semantic_decoder_read_set_complete(const AnalysisOptions &options) noexcept
         return true;
     return capture_semantic_decoder_manifest(options).has_value();
 }
+std::vector<FileRange> semantic_decoder_image_read_ranges(const AnalysisOptions &options) noexcept {
+    if (!options.semantic_decoder)
+        return {};
+    const auto manifest = capture_semantic_decoder_manifest(options);
+    if (!manifest)
+        return {};
+    try {
+        ReadSet reads;
+        for (const auto &input : manifest->inputs)
+            for (const auto &range : input.image_reads)
+                if (!reads.include(range.begin, range.size))
+                    return {};
+        return {reads.ranges().begin(), reads.ranges().end()};
+    } catch (...) {
+        return {};
+    }
+}
 bool semantic_decoder_image_reads_intersect(const AnalysisOptions &options,
                                              std::span<const FileRange> changed_ranges,
                                              std::uint64_t image_size) noexcept {
@@ -2988,7 +3009,7 @@ Sha256Digest function_engine_fingerprint(const AnalysisOptions &options) {
     } else {
         (void)hash.update(encode_u64(0));
     }
-    constexpr std::string_view read_set_domain = "semantic-decoder-external-read-set-v2";
+    constexpr std::string_view read_set_domain = "semantic-decoder-external-read-set-v3";
     (void)hash.update(std::as_bytes(std::span(read_set_domain)));
     if (!options.semantic_decoder) {
         (void)hash.update(encode_u64(0));

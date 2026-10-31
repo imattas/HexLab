@@ -41,7 +41,7 @@ int main(int argc, char **argv) {
     const auto descriptor = hexlab::plugins::sdk::make_api("test", "test", "1", nullptr, 0,
                                                             nullptr, nullptr, &sdk_capability, 1);
     if (descriptor.struct_size != sizeof(HexLabPluginApi) || descriptor.abi_major != 1u ||
-        descriptor.abi_minor != 6u || descriptor.declared_capabilities != &sdk_capability ||
+        descriptor.abi_minor != hexlab::plugins::sdk::abi_minor || descriptor.declared_capabilities != &sdk_capability ||
         descriptor.declared_capability_count != 1) return fail(__LINE__);
     if (argc != 6) return 2;
     Fake fake;
@@ -94,7 +94,9 @@ int main(int argc, char **argv) {
         loaded.value().declared_capabilities[1].id != "processor.decode.display" ||
         loaded.value().declared_capabilities[1].minor_version != 1) return fail(__LINE__);
     const auto actions = manager.actions();
-    if (actions.size() != 1 || actions[0].id != "sample.inspect" ||
+    const auto menu_actions = manager.menu_actions();
+    if (actions.size() != 2 || actions[0].id != "sample.inspect" || actions[1].id != "sample.inspect.menu" ||
+        menu_actions.size() != 1 || menu_actions[0].menu_path != "Analysis/Examples" ||
         !manager.invoke_action("org.hexlab.example", "sample.inspect")) return fail(__LINE__);
     auto edited_project = hexlab::automation::Project::open(project_path, true);
     if (!edited_project) return fail(__LINE__);
@@ -139,7 +141,11 @@ int main(int argc, char **argv) {
     if (manager.decode_processor("example", "mode32", 0, unknown_code).value().has_value()) return fail(__LINE__);
     const std::array<std::uint8_t, 1> bad_code{0xff};
     const auto failed_decode = manager.decode_processor("example", "mode32", 0, bad_code);
-    if (failed_decode || failed_decode.error().code != hexlab::ErrorCode::io) return fail(__LINE__);
+    const auto processor_failures = manager.extension_failures();
+    if (!failed_decode || failed_decode.value().has_value() ||
+        std::none_of(processor_failures.begin(), processor_failures.end(), [](const auto& failure) {
+            return failure.kind == "processor" && failure.extension_id == "sample.processor";
+        })) return fail(__LINE__);
     const std::array<std::byte, 1> semantic_code{std::byte{0xcc}};
     const auto semantic_decode = manager.decode_processor_semantic(
         {hexlab::Architecture::x86_64, hexlab::ExecutionMode::x86_64}, {{0}, 0x401000}, semantic_code);
@@ -194,10 +200,18 @@ int main(int argc, char **argv) {
         if (action_fault || action_fault.error().code != hexlab::ErrorCode::io) return fail(__LINE__);
         const std::array<std::uint8_t, 2> probe_bytes{0x7f, 0x45};
         const auto probe_fault = faults.probe_loaders(probe_bytes);
-        if (probe_fault || probe_fault.error().code != hexlab::ErrorCode::io) return fail(__LINE__);
+        const auto loader_failures = faults.extension_failures();
+        if (!probe_fault || probe_fault.value().has_value() ||
+            std::none_of(loader_failures.begin(), loader_failures.end(), [](const auto& failure) {
+                return failure.kind == "loader" && failure.extension_id == "throw.loader";
+            })) return fail(__LINE__);
         const std::array<std::uint8_t, 1> decode_bytes{0x90};
         const auto decode_fault = faults.decode_processor("x86_64", "x86_64", 0x1000, decode_bytes);
-        if (decode_fault || decode_fault.error().code != hexlab::ErrorCode::io) return fail(__LINE__);
+        const auto quarantined = faults.extension_failures();
+        if (!decode_fault || decode_fault.value().has_value() ||
+            std::none_of(quarantined.begin(), quarantined.end(), [](const auto& failure) {
+                return failure.kind == "processor" && failure.extension_id == "throw.processor";
+            })) return fail(__LINE__);
         if (!faults.unload("test.throw-callback") || !faults.plugins().empty() ||
             !faults.actions().empty() || !faults.loader_extensions().empty() ||
             !faults.processor_extensions().empty() || !std::filesystem::exists(stop_marker)) return fail(__LINE__);

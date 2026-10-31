@@ -96,7 +96,7 @@ void read_exports(const Reader &reader, const Image &image, MachOMetadata &metad
                 !((row.flags & 8) && ((row.flags & 0x10) || kind != 0));
             if (!terminal_layout_known)
                 row.complete = false;
-            if (row.flags & 8) {
+            if (terminal_layout_known && (row.flags & 8)) {
                 row.library_ordinal = terminal.uleb();
                 require(*row.library_ordinal != 0 && *row.library_ordinal <= libraries,
                         "Mach-O reexport library ordinal exceeds dependency list");
@@ -104,7 +104,7 @@ void read_exports(const Reader &reader, const Image &image, MachOMetadata &metad
                 budget.include(row.import_name->size());
                 if (!valid_utf8(*row.import_name))
                     row.complete = false;
-            } else {
+            } else if (terminal_layout_known) {
                 row.value = terminal.uleb();
                 if (kind == 0) {
                     row.address = relative_address(*row.value);

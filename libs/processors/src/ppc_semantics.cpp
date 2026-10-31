@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cstdlib>
 
 namespace hexlab {
 
@@ -260,6 +261,111 @@ std::optional<PpcFpUnaryBitsResult> evaluate_ppc_fp_unary_bits_instruction(
     if (record)
         cr1_value = static_cast<std::uint8_t>((fpscr_before >> 28) & 0xfu);
     return PpcFpUnaryBitsResult{value, cr1_value};
+}
+
+std::optional<PpcFpArithmeticResult> evaluate_ppc_fp_arithmetic_instruction(
+    const Instruction &instruction, std::uint64_t lhs_fpr_bits,
+    std::uint64_t rhs_fpr_bits, std::uint32_t fpscr_before) noexcept {
+    if (instruction.context.architecture != Architecture::powerpc ||
+        (instruction.context.mode != ExecutionMode::ppc32 &&
+         instruction.context.mode != ExecutionMode::ppc64) ||
+        (instruction.opcode != Opcode::ppc_fadds && instruction.opcode != Opcode::ppc_fsubs &&
+         instruction.opcode != Opcode::ppc_fmuls) || instruction.flow != FlowKind::fallthrough ||
+        instruction.delay_slots != 0 || instruction.memory_read || instruction.memory_write ||
+        instruction.operands.size() != 3 ||
+        instruction.access != std::vector<OperandAccess>{OperandAccess::write, OperandAccess::read,
+                                                         OperandAccess::read} ||
+        (fpscr_before & 0x4u) != 0) return {};
+
+    const auto *destination = std::get_if<RegisterOperand>(&instruction.operands[0]);
+    const auto *left = std::get_if<RegisterOperand>(&instruction.operands[1]);
+    const auto *right = std::get_if<RegisterOperand>(&instruction.operands[2]);
+    const auto valid_fpr = [](const RegisterOperand *reg) {
+        return reg && reg->bank == RegisterBank::ppc_fpr && reg->index < 32 &&
+            reg->width == 32 && !reg->high_byte;
+    };
+    if (!valid_fpr(destination) || !valid_fpr(left) || !valid_fpr(right)) return {};
+
+    const RegisterOperand fpscr{RegisterBank::ppc_fpscr, 0, 32, false};
+    const RegisterOperand cr1{RegisterBank::ppc_cr, 1, 4, false};
+    const auto expected_reads = std::vector<RegisterOperand>{*left, *right, fpscr};
+    const bool record = instruction.register_writes.size() == 3 &&
+                        instruction.register_writes.back() == cr1;
+    const auto expected_writes = record
+        ? std::vector<RegisterOperand>{*destination, fpscr, cr1}
+        : std::vector<RegisterOperand>{*destination, fpscr};
+    if (instruction.register_reads != expected_reads || instruction.register_writes != expected_writes)
+        return {};
+
+    const auto as_single = [](std::uint64_t bits) -> std::optional<std::uint32_t> {
+        const auto exponent = static_cast<unsigned>((bits >> 52) & 0x7ffu);
+        const auto fraction = bits & UINT64_C(0x000fffffffffffff);
+        const auto sign = (bits >> 32) & UINT64_C(0x80000000);
+        if (exponent == 0x7ffu) return {};
+        if (exponent == 0) {
+            if (fraction != 0) return {};
+            return static_cast<std::uint32_t>(sign);
+        }
+        const int unbiased = static_cast<int>(exponent) - 1023;
+        if (unbiased < -126 || unbiased > 127 || (fraction & ((UINT64_C(1) << 29) - 1)) != 0)
+            return {};
+        return static_cast<std::uint32_t>(sign) |
+            (static_cast<std::uint32_t>(unbiased + 127) << 23) |
+            static_cast<std::uint32_t>(fraction >> 29);
+    };
+    const auto lhs_bits = as_single(lhs_fpr_bits);
+    const auto rhs_bits = as_single(rhs_fpr_bits);
+    if (!lhs_bits || !rhs_bits) return {};
+
+    const auto top_exponent = [](std::uint32_t bits) {
+        const auto exponent = static_cast<int>((bits >> 23) & 0xffu);
+        return exponent == 0 ? -10000 : exponent - 127;
+    };
+    if (instruction.opcode != Opcode::ppc_fmuls && (*lhs_bits & 0x7fffffffu) != 0 &&
+        (*rhs_bits & 0x7fffffffu) != 0 &&
+        std::abs(top_exponent(*lhs_bits) - top_exponent(*rhs_bits)) > 29) return {};
+
+    const auto lhs_double = std::bit_cast<double>(lhs_fpr_bits);
+    const auto rhs_double = std::bit_cast<double>(rhs_fpr_bits);
+    double exact = instruction.opcode == Opcode::ppc_fmuls
+        ? lhs_double * rhs_double
+        : instruction.opcode == Opcode::ppc_fsubs ? lhs_double - rhs_double : lhs_double + rhs_double;
+    const bool zero_operands = (*lhs_bits & 0x7fffffffu) == 0 && (*rhs_bits & 0x7fffffffu) == 0;
+    std::uint32_t result_bits = 0;
+    if (exact == 0.0) {
+        const bool lhs_negative = (*lhs_bits >> 31) != 0;
+        const bool rhs_negative = ((*rhs_bits >> 31) != 0) ^ (instruction.opcode == Opcode::ppc_fsubs);
+        const bool negative = instruction.opcode == Opcode::ppc_fmuls
+            ? lhs_negative ^ rhs_negative
+            : zero_operands && lhs_negative == rhs_negative ? lhs_negative : (fpscr_before & 3u) == 3u;
+        result_bits = negative ? 0x80000000u : 0;
+    } else {
+        const auto exact_bits = std::bit_cast<std::uint64_t>(exact);
+        const auto exponent = static_cast<unsigned>((exact_bits >> 52) & 0x7ffu);
+        const auto fraction = exact_bits & UINT64_C(0x000fffffffffffff);
+        const int unbiased = static_cast<int>(exponent) - 1023;
+        if (exponent == 0 || exponent == 0x7ffu || unbiased < -126 || unbiased > 127 ||
+            (fraction & ((UINT64_C(1) << 29) - 1)) != 0) return {};
+        result_bits = static_cast<std::uint32_t>((exact_bits >> 32) & 0x80000000u) |
+            (static_cast<std::uint32_t>(unbiased + 127) << 23) |
+            static_cast<std::uint32_t>(fraction >> 29);
+    }
+
+    const auto sign64 = static_cast<std::uint64_t>(result_bits & 0x80000000u) << 32;
+    const auto result_exponent = (result_bits >> 23) & 0xffu;
+    const auto result_fraction = result_bits & 0x007fffffu;
+    const std::uint64_t fpr_bits = result_exponent == 0
+        ? sign64
+        : sign64 | (static_cast<std::uint64_t>(result_exponent - 127 + 1023) << 52) |
+              (static_cast<std::uint64_t>(result_fraction) << 29);
+    const bool negative = (result_bits >> 31) != 0;
+    const auto fprf = result_exponent == 0 ? (negative ? 0x12u : 0x02u)
+                                           : (negative ? 0x08u : 0x04u);
+    constexpr std::uint32_t fprf_round_mask = 0x0007f000u;
+    const auto fpscr_after = (fpscr_before & ~fprf_round_mask) | (fprf << 12);
+    return PpcFpArithmeticResult{fpr_bits, fpscr_after,
+                                 record ? std::optional<std::uint8_t>{static_cast<std::uint8_t>(fpscr_after >> 28)}
+                                        : std::nullopt};
 }
 
 std::optional<PpcVectorBits> evaluate_ppc_vmx_integer_operation(Opcode opcode,

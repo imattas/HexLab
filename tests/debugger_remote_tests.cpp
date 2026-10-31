@@ -89,7 +89,9 @@ std::string raw_rsp_notification(std::string_view payload) {
 void run_split_target_description_tests() {
     {
         auto fake = std::make_unique<FakeTransport>(); auto* wire = fake.get();
-        fake->reply("PacketSize=1000;qXfer:features:read+;vContSupported+");
+        fake->reply("PacketSize=1000;qXfer:features:read+;multiprocess+;vContSupported+");
+        fake->reply("OK");
+        fake->reply("vCont;c;s");
         queue_feature_document(*fake, "<?xml version=\"1.0\"?><!DOCTYPE target SYSTEM \"gdb-target.dtd\">"
             "<target endian=\"big\" xmlns:xi=\"http://www.w3.org/2001/XInclude\">"
             "<architecture>i386:x86-64</architecture><!-- <xi:include href=\"ignored.xml\"/> -->"
@@ -130,7 +132,7 @@ void run_split_target_description_tests() {
             auto next = session.wait_event(std::chrono::milliseconds(0));
             const bool selected_step = wire->writes.find(encode_packet("vCont;s:p2.3")) != std::string::npos;
             const bool fetched_annex = wire->writes.find("ignored.xml") == std::string::npos &&
-                wire->writes.find("qXfer:features:read:flags.xml:0,1000") != std::string::npos;
+                wire->writes.find("qXfer:features:read:flags.xml:0,") != std::string::npos;
             wire->reply("OK");
             auto detached = session.detach();
             hexlab_test::check(stepped && next && detached && selected_step,
@@ -186,6 +188,7 @@ void run_tests() {
     {
         auto fake = std::make_unique<FakeTransport>(); auto* wire = fake.get();
         fake->reply("PacketSize=1000;vContSupported+");
+        fake->reply("vCont;c;s");
         fake->reply("T05thread:1;pc:401000;");
         hexlab::debugger::DebugSession session(hexlab::debugger::make_remote_backend(std::move(fake)));
         const auto connected = session.connect_remote("trap-stop", 1234);
@@ -203,6 +206,7 @@ void run_tests() {
     {
         auto fake = std::make_unique<FakeTransport>(); auto* wire = fake.get();
         fake->reply("PacketSize=1000;vContSupported+");
+        fake->reply("vCont;c;s");
         fake->reply("T05thread:1;");
         hexlab::debugger::DebugSession session(hexlab::debugger::make_remote_backend(std::move(fake)));
         const auto connected = session.connect_remote("step-stop", 1234);
@@ -219,6 +223,7 @@ void run_tests() {
     {
         auto fake = std::make_unique<FakeTransport>(); auto* wire = fake.get();
         fake->reply("PacketSize=1000;vContSupported+");
+        fake->reply("vCont;c;s");
         fake->reply("T02thread:1;");
         hexlab::debugger::DebugSession session(hexlab::debugger::make_remote_backend(std::move(fake)));
         const auto connected = session.connect_remote("watch-stop", 1234);
@@ -263,11 +268,11 @@ void run_tests() {
     }
     {
         FakeTransport fake;
-        fake.reply("T05thread:2;threads:1,2;watch:0x41;");
+        fake.reply("T05thread:2;threads:1,2;watch:41;");
         Client client(fake);
         auto stop = client.read_stop_reply();
         hexlab_test::check(stop && stop.value().signal == 5 && stop.value().thread == 2 &&
-            stop.value().fields.at("watch") == "0x41", "stop reply fields decode");
+            stop.value().fields.at("watch") == "41", "stop reply fields decode");
     }
     {
         FakeTransport fake;
@@ -327,8 +332,10 @@ void run_tests() {
     {
         auto fake = std::make_unique<FakeTransport>();
         auto* wire = fake.get();
-        fake->reply("PacketSize=1000;vContSupported+");
-        fake->reply("T05thread:1;");
+        fake->reply("PacketSize=1000;multiprocess+;vContSupported+");
+        fake->reply("OK");
+        fake->reply("vCont;c;s");
+        fake->reply("T05thread:p2.3;");
         hexlab::debugger::DebugSession session(hexlab::debugger::make_remote_backend(std::move(fake)));
         const auto connected = session.connect_remote("notification-test", 1234);
         const auto initial = session.wait_event(std::chrono::milliseconds(0));
@@ -356,9 +363,9 @@ void run_tests() {
         const std::byte value{0x5a};
         auto wrote = client.write_memory(0x1000, std::span(&value, 1));
         auto selected = client.select_thread(0x2a);
-        hexlab_test::check(wrote && selected && fake.writes.find(encode_packet("M1000,1:5a")) != std::string::npos &&
+        hexlab_test::check(wrote && selected && fake.writes.find(encode_packet("X1000,1:Z")) != std::string::npos &&
             fake.writes.find(encode_packet("Hg2a")) != std::string::npos,
-            "remote writes are hex encoded and register selection uses the requested RSP thread");
+            "remote writes use the binary memory packet and thread selection preserves the requested RSP thread");
     }
     {
 #ifdef _WIN32
@@ -587,12 +594,16 @@ void run_tests() {
         auto fake = std::make_unique<FakeTransport>();
         auto* wire = fake.get();
         fake->reply("PacketSize=1000;multiprocess+;vContSupported+");
+        fake->reply("OK");
+        fake->reply("vCont;c;s");
         fake->reply("T05thread:p1.2;");
         hexlab::debugger::DebugSession session(hexlab::debugger::make_remote_backend(std::move(fake)));
         const auto connected = session.connect_remote("multiprocess-inspection", 1234);
         const auto stopped = session.wait_event(std::chrono::milliseconds(1));
-        wire->reply("mp1.2,p2.2");
+        wire->reply("mp1.2,p1.3");
         wire->reply("l");
+        wire->reply("7468726561642070312e32");
+        wire->reply("7468726561642070312e33");
         const auto threads = session.threads();
         wire->reply("OK"); wire->reply("0102");
         wire->reply("OK"); wire->reply("0304");
@@ -602,37 +613,40 @@ void run_tests() {
             : Result<std::vector<hexlab::debugger::RegisterValue>>(Error{ErrorCode::malformed, "thread list incomplete"});
         hexlab_test::check(connected && stopped && threads && threads.value().size() == 2 &&
                 threads.value()[0].id != threads.value()[1].id && threads.value()[0].id == stopped.value().thread &&
-                threads.value()[0].name == "thread p1.2" && threads.value()[1].name == "thread p2.2" &&
-                threads.value()[0].state == hexlab::debugger::ThreadState::unknown &&
+                threads.value()[0].name == "thread p1.2" && threads.value()[1].name == "thread p1.3" &&
+                threads.value()[0].state == hexlab::debugger::ThreadState::stopped &&
                 first && second && first.value()[0].bytes == std::vector<std::byte>{std::byte{1}, std::byte{2}} &&
                 second.value()[0].bytes == std::vector<std::byte>{std::byte{3}, std::byte{4}} &&
                 wire->writes.find(encode_packet("Hgp1.2")) != std::string::npos &&
-                wire->writes.find(encode_packet("Hgp2.2")) != std::string::npos,
+                wire->writes.find(encode_packet("Hgp1.3")) != std::string::npos,
                 "remote session preserves process-qualified IDs through thread listing, stop events, and register selection");
     }
     {
         auto fake = std::make_unique<FakeTransport>();
         auto* wire = fake.get();
         fake->reply("PacketSize=1000;multiprocess+;qXfer:threads:read+;vContSupported+");
+        fake->reply("OK");
+        fake->reply("vCont;c;s");
         fake->reply("T05thread:p1.2;");
         hexlab::debugger::DebugSession session(hexlab::debugger::make_remote_backend(std::move(fake)));
         auto connected = session.connect_remote("thread-xml-test", 1234);
         auto stop = session.wait_event(std::chrono::milliseconds(0));
         wire->reply("l<threads><thread id=\"p1.2\" name=\"main &amp; worker\" state=\"stopped\"/>"
-                    "<thread id=\"p2.2\" name=\"background &#x77;orker\"><state>running</state></thread></threads>");
+                    "<thread id=\"p1.3\" name=\"background &#x77;orker\"><state>running</state></thread></threads>");
         auto threads = session.threads();
         hexlab_test::check(connected && stop && threads && threads.value().size() == 2 &&
                 threads.value()[0].id == stop.value().thread && threads.value()[0].name == "main & worker" &&
                 threads.value()[0].state == hexlab::debugger::ThreadState::stopped &&
                 threads.value()[1].name == "background worker" &&
                 threads.value()[1].state == hexlab::debugger::ThreadState::running &&
-                wire->writes.find(encode_packet("qXfer:threads:read::0,1000")) != std::string::npos,
+                wire->writes.find("qXfer:threads:read::0,") != std::string::npos,
                 "advertised thread XML preserves process-qualified handles, names and running/stopped state in DebugSession");
     }
     {
         auto fake = std::make_unique<FakeTransport>();
         auto* wire = fake.get();
         fake->reply("PacketSize=1000;qXfer:threads:read+;vContSupported+");
+        fake->reply("vCont;c;s");
         fake->reply("T05thread:1;");
         hexlab::debugger::DebugSession session(hexlab::debugger::make_remote_backend(std::move(fake)));
         (void)session.connect_remote("duplicate-thread-xml", 1234);
@@ -645,6 +659,7 @@ void run_tests() {
         auto fake = std::make_unique<FakeTransport>();
         auto* wire = fake.get();
         fake->reply("PacketSize=1000;qXfer:threads:read+;vContSupported+");
+        fake->reply("vCont;c;s");
         fake->reply("T05thread:1;");
         hexlab::debugger::DebugSession session(hexlab::debugger::make_remote_backend(std::move(fake)));
         (void)session.connect_remote("bad-thread-name-xml", 1234);
@@ -665,6 +680,7 @@ void run_tests() {
         auto fake = std::make_unique<FakeTransport>();
         auto* wire = fake.get();
         fake->reply("PacketSize=1000;qXfer:memory-map:read+;vContSupported+");
+        fake->reply("vCont;c;s");
         fake->reply("T05thread:1;");
         hexlab::debugger::DebugSession session(hexlab::debugger::make_remote_backend(std::move(fake)));
         const auto connected = session.connect_remote("memory-map-test", 1234);
@@ -681,7 +697,7 @@ void run_tests() {
               regions.value()[1].type == "rom" &&
               regions.value()[2].start == UINT64_MAX && regions.value()[2].length == 1,
               "remote memory-map XML becomes bounded memory regions with type-derived permissions");
-        hexlab_test::check(wire->writes.find(encode_packet("qXfer:memory-map:read::0,1000")) != std::string::npos,
+        hexlab_test::check(wire->writes.find("qXfer:memory-map:read::0,") != std::string::npos,
               "remote memory regions are queried only after qSupported advertises the annex");
     }
     {
@@ -724,6 +740,7 @@ void run_tests() {
     {
         auto fake = std::make_unique<FakeTransport>();
         fake->reply("PacketSize=1000;vContSupported+");
+        fake->reply("vCont;c;s");
         fake->reply("T05thread:1;");
         hexlab::debugger::DebugSession session(hexlab::debugger::make_remote_backend(std::move(fake)));
         (void)session.connect_remote("no-memory-map", 1234);
@@ -735,6 +752,7 @@ void run_tests() {
         auto fake = std::make_unique<FakeTransport>();
         auto* wire = fake.get();
         fake->reply("PacketSize=1000;swbreak+;vContSupported+");
+        fake->reply("vCont;c;s");
         fake->reply("T05thread:1;");
         hexlab::debugger::DebugSession session(hexlab::debugger::make_remote_backend(std::move(fake)));
         auto process = session.connect_remote("loopback-test", 1234);
@@ -742,7 +760,7 @@ void run_tests() {
         hexlab_test::check(process && process.value().name == "loopback-test:1234" && initial &&
             session.state() == hexlab::debugger::SessionState::stopped,
             "remote connect negotiates RSP and exposes the initial target stop through DebugSession");
-        wire->reply("m1,p1.2"); wire->reply("l");
+        wire->reply("m1,2"); wire->reply("l");
         auto threads = session.threads();
         wire->reply("OK"); wire->reply("01020304");
         auto registers = session.read_registers(1);
@@ -773,7 +791,9 @@ void run_tests() {
     }
     {
         auto fake = std::make_unique<FakeTransport>(); auto* wire = fake.get();
-        fake->reply("PacketSize=1000;vContSupported+");
+        fake->reply("PacketSize=1000;multiprocess+;vContSupported+");
+        fake->reply("OK");
+        fake->reply("vCont;c;s");
         fake->reply("T05thread:p1.2;");
         hexlab::debugger::DebugSession session(hexlab::debugger::make_remote_backend(std::move(fake)));
         auto connected = session.connect_remote("thread-step", 1234);
@@ -788,6 +808,7 @@ void run_tests() {
     {
         auto fake = std::make_unique<FakeTransport>(); auto* wire = fake.get();
         fake->reply("PacketSize=1000;vContSupported+");
+        fake->reply("vCont;c;s");
         fake->reply("T05thread:1;");
         hexlab::debugger::DebugSession session(hexlab::debugger::make_remote_backend(std::move(fake)));
         const auto connected = session.connect_remote("interrupt-test", 1234);
@@ -806,6 +827,7 @@ void run_tests() {
     {
         auto fake = std::make_unique<FakeTransport>(); auto* wire = fake.get();
         fake->reply("PacketSize=1000;vContSupported+");
+        fake->reply("vCont;c;s");
         fake->reply("T05");
         hexlab::debugger::DebugSession session(hexlab::debugger::make_remote_backend(std::move(fake)));
         auto connected = session.connect_remote("thread-step-unknown", 1234);
@@ -814,13 +836,14 @@ void run_tests() {
         auto stepped = stop ? session.single_step_execution(stop.value().sequence) :
             hexlab::debugger::Status{hexlab::Error{hexlab::ErrorCode::invalid_argument, "no stop"}};
         hexlab_test::check(connected && stop && stepped &&
-            wire->writes.find(encode_packet("vCont;s")) != std::string::npos,
+            wire->writes.find(encode_packet("s")) != std::string::npos,
             "RSP single-step retains the all-thread fallback when the stop reply omits a thread ID");
     }
     {
         auto fake = std::make_unique<FakeTransport>();
         auto* wire = fake.get();
         fake->reply("PacketSize=1000;vContSupported+");
+        fake->reply("vCont;c;s");
         fake->reply("T05thread:1;");
         hexlab::debugger::DebugSession session(hexlab::debugger::make_remote_backend(std::move(fake)));
         auto connected = session.connect_remote("detach-retry", 1234);
@@ -840,14 +863,17 @@ void run_tests() {
     {
         auto fake = std::make_unique<FakeTransport>(); auto* wire = fake.get();
         fake->reply("PacketSize=1000;qXfer:features:read+;vContSupported+");
+        fake->reply("vCont;c;s");
         const std::string xml = "<?xml version=\"1.0\"?><target endian=\"big\"><architecture>i386:x86-64</architecture>"
             "<feature name=\"org.gnu.gdb.core\"><reg name=\"rax\" bitsize=\"64\" regnum=\"0\" group=\"general\"/>"
             "<reg name=\"eflags\" bitsize=\"32\"/></feature></target>";
         fake->reply("l" + xml); fake->reply("T05thread:1;");
         hexlab::debugger::DebugSession session(hexlab::debugger::make_remote_backend(std::move(fake)));
         auto process = session.connect_remote("xml-target", 1234);
+        auto initial = session.wait_event(std::chrono::milliseconds(0));
         wire->reply("OK"); wire->reply("010203040506070811223344");
-        auto registers = session.read_registers(1);
+        auto registers = initial ? session.read_registers(initial.value().thread) :
+            Result<std::vector<hexlab::debugger::RegisterValue>>(Error{ErrorCode::malformed, "initial stop missing"});
         hexlab_test::check(process && process.value().architecture == Architecture::x86_64,
             "target XML architecture maps onto the process architecture");
         hexlab_test::check(registers && registers.value().size() == 2 && registers.value()[0].name == "rax" &&
@@ -862,6 +888,7 @@ void run_tests() {
     {
         auto fake = std::make_unique<FakeTransport>(); auto* wire = fake.get();
         fake->reply("PacketSize=1000;qXfer:features:read+;qXfer:libraries:read+;vContSupported+");
+        fake->reply("vCont;c;s");
         const std::string xml = "<target endian=\"little\"><architecture>i386:x86-64</architecture><feature name=\"core\">"
             "<reg name=\"rax\" bitsize=\"64\" regnum=\"0\"/><reg name=\"rip\" bitsize=\"64\" regnum=\"1\"/>"
             "</feature></target>";

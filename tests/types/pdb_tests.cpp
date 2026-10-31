@@ -150,7 +150,10 @@ int main(int argc, char **argv) {
        std::none_of(extended_graph.value().references.begin(),extended_graph.value().references.end(),[](const auto &edge){return edge.kind==hexlab::types::PdbTypeReferenceKind::member && edge.target_index==0x74 && edge.primitive && edge.resolved;}) ||
        std::none_of(extended_graph.value().references.begin(),extended_graph.value().references.end(),[](const auto &edge){return edge.kind==hexlab::types::PdbTypeReferenceKind::nested_type && edge.target_index==0x75 && edge.primitive && edge.resolved;})) return 53;
     auto extended_import=hexlab::types::import_pdb_type_graph(extended_graph.value());
-    if(!extended_import || extended_import.value().definitions.contains("H")) return 54;
+    if(!extended_import || !extended_import.value().definitions.contains("H") ||
+       extended_import.value().definitions.at("H")->kind()!=hexlab::types::Kind::structure ||
+       extended_import.value().definitions.at("H")->size()!=4 ||
+       !extended_import.value().definitions.at("H")->members().empty()) return 54;
     hexlab::types::PdbDatabase malformed_static_db; malformed_static_db.streams.resize(3); malformed_static_db.streams[2].emplace(56+12,std::byte{0});
     auto &malformed_static=*malformed_static_db.streams[2];put(malformed_static,0,20040203,4);put(malformed_static,4,56,4);put(malformed_static,8,0x1000,4);put(malformed_static,12,0x1001,4);put(malformed_static,16,12,4);
     put(malformed_static,56,10,2);put(malformed_static,58,0x1203,2);put(malformed_static,60,0x150e,2);put(malformed_static,62,0,2);put(malformed_static,64,0x74,4);
@@ -317,7 +320,9 @@ int main(int argc, char **argv) {
     std::vector<std::byte> frame_local_body(8, std::byte{0});
     put(frame_local_body, 0, static_cast<std::uint32_t>(-16), 4); put(frame_local_body, 4, 0x1001, 4);
     append_name_record(0x0100, std::move(frame_local_body), "temporary"); // S_BPREL32.
-    append_symbol(0x1103, {}); // Nested S_BLOCK32 scope.
+    std::vector<std::byte> block_scope_body(18, std::byte{0});
+    put(block_scope_body, 8, 4, 4); put(block_scope_body, 12, 0x140, 4); put(block_scope_body, 16, 2, 2);
+    append_symbol(0x1103, std::move(block_scope_body)); // Nested S_BLOCK32 scope: section 2:[0x140,0x144).
     std::vector<std::byte> register_local_body(10, std::byte{0});
     put(register_local_body, 0, 8, 4); put(register_local_body, 4, 0x74, 4); put(register_local_body, 8, 17, 2);
     append_name_record(0x1111, std::move(register_local_body), "register_local"); // S_REGREL32.
@@ -424,7 +429,7 @@ int main(int argc, char **argv) {
     if (hexlab::types::parse_pdb_symbols(truncated_global_name)) return 32;
     const auto canceled_globals = hexlab::types::parse_pdb_symbols(symbol_db, stopped.get_token());
     if (canceled_globals || canceled_globals.error().code != hexlab::ErrorCode::canceled) return 33;
-    auto malformed_symbols = symbol_db; (*malformed_symbols.streams[4])[4] = std::byte{0xff};
+    auto malformed_symbols = symbol_db; put(*malformed_symbols.streams[3], 64 + 34, 0xfffe, 2);
     if (hexlab::types::parse_pdb_symbols(malformed_symbols)) return 17;
     const auto canceled_symbols = hexlab::types::parse_pdb_symbols(symbol_db, stopped.get_token());
     if (canceled_symbols || canceled_symbols.error().code != hexlab::ErrorCode::canceled) return 18;

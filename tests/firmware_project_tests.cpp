@@ -55,17 +55,30 @@ void project_roundtrip(unsigned tag, std::string_view text, Address address, uns
     take(session->execute(Rename{address, "firmware_start"}, 0, {}));
     check(!export_project_exchange(*session->snapshot()),
           "virtual annotation exchange cannot mistake packed backing offsets for text file offsets");
-    auto rejected = session->execute(PatchBytes{address, bytes({0xcc})}, 0, {});
-    check(!rejected && session->snapshot()->state->revisions.edit == 1 &&
-              !action_availability(session->snapshot().get(), ProjectActionKind::patch, address).enabled,
-          "target-memory patches never overwrite unrelated source record text");
-    session.reset(); snapshot.reset(); store.reset();
+    auto patched = session->execute(PatchBytes{address, bytes({0xcc})}, 0, {});
+    auto patched_snapshot = session->snapshot();
+    check(patched && patched_snapshot->state->revisions.edit == 2 &&
+              action_availability(patched_snapshot.get(), ProjectActionKind::patch, address).enabled,
+          "target-memory patches update the owning firmware data record");
+    const auto patched_source = take(patched_snapshot->effective->read_at({0}, text.size()));
+    const auto patched_text = std::string(reinterpret_cast<const char *>(patched_source.bytes.data()),
+                                          patched_source.bytes.size());
+    auto expected_text = std::string(text);
+    const auto data = expected_text.find("AA");
+    const auto line_end = expected_text.find('\n');
+    if (data != std::string::npos && line_end != std::string::npos) {
+        expected_text.replace(data, 2, "CC");
+        expected_text.replace(line_end - 2, 2, text.starts_with(":") ? "23" : "1F");
+    }
+    check(patched_text == expected_text,
+          "firmware record patch preserves unrelated source text and recalculates its checksum");
+    session.reset(); patched_snapshot.reset(); snapshot.reset(); store.reset();
     check(std::filesystem::remove(input.path), "project reopen does not need the external firmware file");
     store = take(database::ProjectStore::open(project.path, database::ProjectMode::read_only, {}));
     session = take(ProjectSession::attach(store, {}, {}));
     snapshot = session->snapshot();
     check(snapshot->loaded && snapshot->loaded->metadata.firmware &&
-              take(snapshot->loaded->image->read(address, 1))[0] == std::byte(octet) &&
+              take(snapshot->loaded->image->read(address, 1))[0] == std::byte{0xcc} &&
               presentation_name(*snapshot, address) == "firmware_start",
           "readonly reopen restores firmware bytes and virtual annotations from embedded input");
 }

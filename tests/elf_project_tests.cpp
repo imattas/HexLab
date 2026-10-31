@@ -16,6 +16,12 @@ using namespace hexlab_test;
 using namespace hexlab_test::elf_metadata_fixture;
 using namespace std::chrono_literals;
 namespace {
+std::uint32_t test_gnu_hash(std::string_view name) {
+    std::uint32_t hash = 5381;
+    for (const auto character : name)
+        hash = hash * 33u + static_cast<unsigned char>(character);
+    return hash;
+}
 template <class T> T take(Result<T> value) {
     if (!value)
         throw std::runtime_error(value.error().message);
@@ -118,6 +124,8 @@ void mutations(bool wide, bool rela) {
     auto original = relocatable(wide, rela);
     PersistentFixture f(original);
     auto initial = f.session->snapshot();
+    check(initial->loaded && !initial->loaded->metadata_complete && initial->loaded->metadata_reads_complete,
+          "partial ELF interpretation still has a complete primary-input dependency map");
     auto previous = initial->loader_parses;
     auto patched = take(f.session->execute(PatchBytes{FileOffset{3500}, bytes({0x56})}, 0, {}));
     check(patched->loader_parses == previous, "uninterpreted ELF file padding does not reparse metadata");
@@ -301,10 +309,16 @@ void dynamic_dependencies(bool wide) {
         check(undo->loaded && undo->loaded->metadata == initial->loaded->metadata,
               "undo restores sectionless dynamic metadata and source identity");
     };
+    const auto string_change = dyn::str + 1;
+    const auto gnu_chain = dyn::gnu + 16 + word + 4;
+    std::vector<std::byte> renamed(gnu_chain + 4 - string_change);
+    std::copy_n(original.begin() + string_change, renamed.size(), renamed.begin());
+    renamed.front() = std::byte{0x44};
+    put(renamed, gnu_chain - string_change, test_gnu_hash("Defined") & ~std::uint32_t{1}, 4);
     mutate(
-        dyn::str + 1, bytes({0x44}),
+        string_change, std::move(renamed),
         [](const auto &s) { return s.loaded && s.loaded->metadata.elf->symbols[1].name == "Defined"; },
-        "dynamic string bytes invalidate sectionless symbol names");
+        "sectionless symbol name and GNU hash changes invalidate ELF metadata together");
     std::vector<std::byte> changed(word);
     put(changed, 0, base + 257, word);
     mutate(

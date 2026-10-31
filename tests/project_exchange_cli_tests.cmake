@@ -18,5 +18,5 @@ run_cli(0 "Edit revision:" "^$" bookmark "${source}" --at file:1 --label "portab
 run_cli(0 "Edit revision:" "^$" reference "${source}" --at file:2 --to file:3 --kind read)
 run_cli(0 "Exported exchange: 1 annotations, 1 bookmarks, 1 references" "^$" exchange export "${source}" --output "${exchange}")
 run_cli(0 "Saved:" "^$" create "${target}" --input "${work}/input.bin" --format raw --arch x86-64 --base 0x1000)
-run_cli(0 "Imported exchange: 1 annotations, 1 bookmarks, 1 references, 0 types, 0 type assignments, 0 skipped" "^$" exchange import "${target}" --input "${exchange}")
-run_cli(0 "Imported exchange: 0 annotations, 0 bookmarks, 0 references, 0 types, 0 type assignments, 3 skipped" "^$" exchange import "${target}" --input "${exchange}")
+run_cli(0 "Imported exchange: annotations=1 bookmarks=1 references=1 .*types=0 type-assignments=0 .*skipped=0" "^$" exchange import "${target}" --input "${exchange}")
+run_cli(0 "Imported exchange: annotations=0 bookmarks=0 references=0 .*types=0 type-assignments=0 .*skipped=3" "^$" exchange import "${target}" --input "${exchange}")

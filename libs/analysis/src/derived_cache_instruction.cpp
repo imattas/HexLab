@@ -215,8 +215,8 @@ std::vector<std::byte> instruction_bytes(const Instruction &value, std::stop_tok
     }
     return std::move(out.bytes);
 }
-Instruction checked_instruction(std::span<const std::byte> payload, std::span<const DomainContext> domains,
-                                const Image *image, const AnalysisOptions& options, std::stop_token stop) {
+CheckedInstruction checked_instruction(std::span<const std::byte> payload, std::span<const DomainContext> domains,
+                                       const Image *image, const AnalysisOptions& options, std::stop_token stop) {
     require(payload.size() <= 32768, "Cached instruction record exceeds field budget");
     Reader in{payload, stop};
     auto context = in.context();
@@ -248,7 +248,7 @@ Instruction checked_instruction(std::span<const std::byte> payload, std::span<co
             require(payload.size() >= prefix.size() &&
                         std::equal(prefix.begin(), prefix.end(), payload.begin()),
                     "Cached DEX switch instruction bytes differ from canonical decoding");
-            return std::move(*decoded.instruction);
+            return {std::move(*decoded.instruction), decoded.semantic_decoder_used};
         }
         auto table = function_detail::populate_dex_switch_table(*image, *decoded.instruction, nullptr, stop);
         if (!table)
@@ -258,7 +258,7 @@ Instruction checked_instruction(std::span<const std::byte> payload, std::span<co
     auto canonical = instruction_bytes(*decoded.instruction, stop);
     require(canonical.size() == payload.size() && std::equal(canonical.begin(), canonical.end(), payload.begin()),
             "Cached typed operands/modifiers differ from decoded bytes");
-    return std::move(*decoded.instruction);
+    return {std::move(*decoded.instruction), decoded.semantic_decoder_used};
 }
 Sha256Digest checksum(std::span<const std::byte> bytes, std::stop_token stop) {
     Sha256 hash;

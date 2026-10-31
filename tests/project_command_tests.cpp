@@ -677,8 +677,9 @@ void session_reuse_tests() {
     check(header->loader_parses == initial->loader_parses + 1 && header->loaded->metadata.image_size == 0x3000,
           "changed recorded header read triggers exactly one loader parse");
     auto code = pe.session->execute(PatchBytes{FileOffset{0x200}, bytes({0xcc})}, 0, {}).value();
-    check(code->loader_parses == header->loader_parses,
-          "unchanged previous header patch does not force another metadata parse");
+    check(code->loader_parses == header->loader_parses + 1 &&
+              code->loaded->metadata.pe->image_checksum->computed != header->loaded->metadata.pe->image_checksum->computed,
+          "code-byte patch reparses because PE checksum metadata covers the entire input");
     auto baseline = f.session->snapshot();
     check(bool(f.session->execute(PatchBytes{FileOffset{16}, bytes({0xcc})}, 0, {})) && bool(f.session->undo({})) &&
               bool(f.session->refresh_analysis({})),

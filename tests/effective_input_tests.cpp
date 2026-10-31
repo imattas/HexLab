@@ -31,15 +31,20 @@ void effective_tests(){
     auto data=pe_metadata_fixture();put_text(data,0x220,"original-string");FixtureFile fixture(data);auto original=FileStorage::open(fixture.path).value();
     std::vector<PatchSpan> changes{{{0x200},bytes({0x90}),bytes({0xc3})},{{0x220},bytes({'o'}),bytes({'e'})},{{0x492},bytes({'F'}),bytes({'P'})}};
     auto source=make_overlay(original,changes).value();auto loaded=load_image(source,{Format::pe,{}},{}).value();
-    check(loaded.image->storage()==source,"published image retains effective untracked storage");
+    auto mapped=loaded.image->storage()->read_at({0},static_cast<std::size_t>(source->size()));
+    auto effective=source->read_at({0},static_cast<std::size_t>(source->size()));
+    check(mapped && effective && mapped.value().bytes.size()==source->size() &&
+          effective.value().bytes.size()==source->size() &&
+          std::equal(mapped.value().bytes.begin(),mapped.value().bytes.end(),effective.value().bytes.begin()),
+          "published image retains effective bytes through the metadata tracking view");
     check(loaded.metadata.imports[0].name=="PixtureFn","import parsing reads effective bytes");
     check(loaded.metadata_reads.intersects({0x492},1).value(),"metadata dependency includes import name");
-    check(!loaded.metadata_reads.intersects({0x220},1).value(),"code/string bytes are not header dependencies");
+    check(loaded.metadata_reads.intersects({0x220},1).value(),"whole-image PE checksum makes code/string bytes metadata dependencies");
     auto analysis=analyze(*loaded.image,{},{}).value();
     check(analysis.instructions.size()==1,"code analysis sees replacement return");
     bool found=false;for(const auto& value:analysis.strings.records)if(value.preview=="eriginal-string")found=true;
     check(found,"string analysis sees effective bytes");
-    check(!loaded.metadata_reads.intersects({0x220},1).value(),"later analysis cannot contaminate metadata dependencies");
+    check(loaded.metadata_reads.intersects({0x220},1).value(),"later analysis leaves whole-image checksum dependencies intact");
     check(original->read_at({0x200},1).value().bytes[0]==std::byte{0x90},"loader never changes original bytes");
     auto moved=changes;moved.push_back({{0xb3},bytes({0x40}),bytes({0x50})});
     auto rebased=load_image(make_overlay(original,moved).value(),{Format::pe,{}},{}).value();

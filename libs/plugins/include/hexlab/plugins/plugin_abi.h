@@ -314,9 +314,10 @@ typedef int32_t (*HexLabRegisterMenuAction)(void* host_context, const char* menu
                                             void* action_context, void (*invoke)(void* action_context));
 struct HexLabCapability;
 
-/* ABI 1.33: host-owned, plugin-ID-scoped opaque state. Values live for the
-   PluginManager lifetime and survive module unload/reload, but are not saved
-   to project or host configuration files. Mutations use per-key revisions. */
+/* ABI 1.33: host-owned, plugin-ID-scoped opaque state. When the host is
+   configured with a state file, values survive manager/process restarts and
+   module unload/reload; they are separate from project files. Mutations use
+   per-key revisions. */
 #define HEXLAB_PLUGIN_STATE_API_VERSION 1u
 #define HEXLAB_PLUGIN_STATE_MAX_KEY 128u
 #define HEXLAB_PLUGIN_STATE_MAX_VALUE 65536u

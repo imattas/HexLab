@@ -150,7 +150,7 @@ Result<DecodeResult> decode_analysis_instruction(DecodeContext context, std::spa
     for (const auto access : instruction.access)
         if (static_cast<unsigned>(access) > static_cast<unsigned>(OperandAccess::address))
             return Error{ErrorCode::integrity, "Semantic decoder returned an invalid operand effect"};
-    return DecodeResult{DecodeStatus::decoded, std::move(instruction), {}};
+    return DecodeResult{DecodeStatus::decoded, std::move(instruction), {}, true};
 }
 Result<DecodeResult> decode_at(const Image &image, Address address) {
     auto context = image.context_at(address);

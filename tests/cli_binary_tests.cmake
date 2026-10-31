@@ -25,7 +25,7 @@ if(NOT "${decompile_status}" STREQUAL "0" OR NOT decompile_output MATCHES "Funct
    NOT decompile_output MATCHES "return;" OR NOT "${decompile_error}" STREQUAL "")
   message(FATAL_ERROR "Raw decompilation failed: status=${decompile_status}\nstdout=${decompile_output}\nstderr=${decompile_error}")
 endif()
-check_binary(3 "opcode_286" "semantics are unavailable" decompile "${FIXTURES}/unsupported.bin"
+check_binary(3 "opcode_290" "semantics are unavailable" decompile "${FIXTURES}/unsupported.bin"
   --format raw --arch x86-64 --base 0x1000)
 check_binary(0 "Image base: 0x1000" "^$" inspect "${FIXTURES}/raw.bin" --format raw --arch x86-64 --base 4096)
 check_binary(3 "vzeroupper" "semantics" disassemble "${FIXTURES}/unsupported.bin" --format raw --arch x86-64 --base 0x1000)
@@ -33,7 +33,7 @@ check_binary(3 "Disassembly:" "truncated" disassemble "${FIXTURES}/truncated.bin
 check_binary(3 "nop" "budget" disassemble "${FIXTURES}/raw.bin" --format raw --arch x86-64 --base 0x1000 --instruction-budget 1)
 check_binary(0 "0x401000.*nop" "^$" disassemble "${FIXTURES}/minimal32.exe")
 check_binary(0 "0x401001.*ret" "^$" disassemble "${FIXTURES}/minimal32.exe")
-check_binary(3 "udf #0xc390" "typed operand/control-flow semantics are unavailable" disassemble "${FIXTURES}/minimalarm64.exe")
+check_binary(3 "udf #0xc390" "Control flow reaches uninitialized bytes" disassemble "${FIXTURES}/minimalarm64.exe")
 check_binary(1 "^$" "Cannot open" inspect "${FIXTURES}/does-not-exist")
 check_binary(1 "^$" "Truncated PE" inspect "${FIXTURES}/bad.exe")
 check_binary(1 "^$" "Unknown format" inspect "${FIXTURES}/raw.bin")

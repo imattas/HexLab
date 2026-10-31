@@ -18,6 +18,7 @@ ManagedMethodAnalysis method(std::vector<std::byte> il) {
     CilMethodBody body;
     body.max_stack = 8;
     body.il = std::move(il);
+    body.code_size = static_cast<std::uint32_t>(body.il.size());
     result.body = std::move(body);
     auto decoded = decode_cil_instructions(result.body->il);
     if (!decoded) throw std::runtime_error(decoded.error().message);
@@ -43,12 +44,15 @@ void core_stack_cfg_and_pseudocode() {
             "pseudocode retains conditional control flow and return value");
 }
 void exception_regions_are_preserved_and_use_opaque_fallback() {
-    auto input = method({std::byte{0x00}, std::byte{0x2a}});
+    // Try body: nop; leave.s IL_4. Finally handler: endfinally; continuation: ret.
+    auto input = method({std::byte{0x00}, std::byte{0xde}, std::byte{0x01},
+                         std::byte{0xdc}, std::byte{0x2a}});
     input.body->has_more_sections = true;
-    input.body->exception_clauses.push_back({CilExceptionKind::finally_clause, 0, 1, 1, 1, 0, 0});
+    input.body->exception_clauses.push_back({CilExceptionKind::finally_clause, 0, 3, 3, 1, 0, 0});
     auto result = decompile_managed_method(input);
-    require(!result && result.error().code == ErrorCode::unsupported,
-            "CIL EH clause is retained without inventing dispatch or finally edges");
+    require(result && !result.value().complete && result.value().exception_clauses.size() == 1 &&
+                !result.value().exception_regions.empty(),
+            "valid CIL finally region is retained as incomplete explicit control-flow metadata");
 }
 void tokenized_calls_and_returns() {
     auto input = method({std::byte{0x02}, std::byte{0x28}, std::byte{0x02}, std::byte{0x00},
@@ -138,8 +142,8 @@ void explicit_failure_cases() {
     auto partial = decompile_managed_method(unknown);
     require(bool(partial) && !partial.value().complete && !partial.value().lifted.diagnostics.empty(),
             "unknown opcode remains explicit and marks decompilation incomplete");
-    auto known_unsupported = method({std::byte{0x7e}, std::byte{0x01}, std::byte{0x00},
-                                    std::byte{0x00}, std::byte{0x04}, std::byte{0x2a}});
+    auto known_unsupported = method({std::byte{0x17}, std::byte{0x17}, std::byte{0x17},
+                                    std::byte{0xfe}, std::byte{0x17}, std::byte{0x2a}});
     auto unsupported = decompile_managed_method(known_unsupported);
     require(bool(unsupported) && !unsupported.value().complete && !unsupported.value().lifted.diagnostics.empty(),
             "known unsupported opcode remains explicit and marks decompilation incomplete");

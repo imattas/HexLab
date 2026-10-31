@@ -51,24 +51,25 @@ int main() {
     };
     const auto lifted = lift_program(program);
     const auto text = format_pseudocode(lifted);
-    require(text.find("m6502_load(0x2a) /* writes A, P */;") != std::string::npos,
+    require(text.find("m6502_load(0x2a, P) /* writes A, P */;") != std::string::npos,
             "LDA immediate defines accumulator and status outputs");
     require(text.find("*[(0x2000)] = A;") != std::string::npos,
             "STA absolute becomes a memory store");
     require(text.find("m6502_transfer(A, P) /* writes X, P */;") != std::string::npos &&
-                text.find("m6502_increment(X, P) /* writes X, P */;") != std::string::npos,
+                text.find("m6502_increment(X, ((X + 0x1) & 0xff), P) /* writes X, P */;") != std::string::npos,
             "register transfer and increment retain their register and status effects");
     require(text.find("if (((P & 0x2) == 0x2)) goto loc_100b;") != std::string::npos,
             "BEQ tests the zero bit in the status register");
-    require(text.find("return;") != std::string::npos,
+    require(text.find("return unknown(RTS pulls") != std::string::npos,
             "RTS becomes a function return");
     const auto ssa = to_ssa(lifted);
     require(bool(ssa), "6502 lifted operations convert to SSA");
     const auto ssa_text = format_pseudocode(ssa.value());
-    require(ssa_text.find("m6502_cmp(") != std::string::npos &&
-                ssa_text.find("writes P_") != std::string::npos,
-            "opaque status-producing instructions define explicit SSA register outputs");
-    const auto branch = ssa_text.find("if (((P_");
-    require(branch != std::string::npos && ssa_text.find("& 0x2)", branch) != std::string::npos,
+    require(ssa_text.find("P_4 = ") != std::string::npos &&
+                ssa_text.find("A_1 UGE 0x2a") != std::string::npos &&
+                ssa_text.find("A_1 == 0x2a") != std::string::npos &&
+                ssa_text.find("signbit((A_1 - 0x2a))") != std::string::npos,
+            "CMP explicitly defines carry, zero, and negative bits in the SSA status version");
+    require(ssa_text.find("if (((P_4 & 0x2) == 0x2))") != std::string::npos,
             "a following BEQ reads the status version produced by CMP");
 }

@@ -21,7 +21,7 @@ public:
     }
 };
 AnalysisBasis basis(std::vector<std::byte> data,ImageMetadata metadata={}){
-    AnalysisBasis value;value.image=memory_image(std::move(data));value.metadata=std::make_shared<const ImageMetadata>(std::move(metadata));value.key.input={value.image->storage()->size(),hash_source(*value.image->storage(),{}).value()};value.key.engine_fingerprint=function_engine_fingerprint(value.options);
+    AnalysisBasis value;value.image=memory_image(std::move(data));value.metadata=std::make_shared<const ImageMetadata>(std::move(metadata));value.metadata_reads_complete=true;value.key.input={value.image->storage()->size(),hash_source(*value.image->storage(),{}).value()};value.key.engine_fingerprint=function_engine_fingerprint(value.options);
     value.functions=recover_functions(*value.image,*value.metadata,value.decisions,value.options,value.key,{}).value();value.references=derive_references(*value.functions,*value.metadata,value.decisions,{}).value();value.strings=std::make_shared<const StringScan>(find_strings(*value.image,value.options,{}).value());return value;
 }
 std::shared_ptr<const Image> patch(const AnalysisBasis& old,uint64_t offset,std::vector<std::byte> data){auto original=old.image->storage()->read_at({offset},data.size()).value();PatchSpan row{{offset},{original.bytes.begin(),original.bytes.end()},std::move(data)};auto source=make_overlay(old.image->storage(),std::span(&row,1)).value();return Image::create(std::move(source),old.image->layout()).value();}
@@ -163,9 +163,11 @@ void string_and_metadata_tests(){
         metadata_edit.decisions,metadata_key,{},false,true).value();
     auto metadata_proposal=reanalyze(metadata_edit,edited_image,after_metadata,metadata_edit.decisions,
         metadata_plan,metadata_key,{}).value();
-    check(metadata_plan.metadata_invalid && metadata_proposal.counters.reused_instructions==2 &&
-          metadata_proposal.counters.decoded_instructions==0 && function(*metadata_proposal.functions,0x1001),
-          "certified loader-metadata edit reuses unaffected decodes while rebuilding roots and ownership");
+    check(metadata_plan.metadata_invalid,"certified loader byte dependency marks the metadata snapshot dirty");
+    check(metadata_proposal.counters.reused_instructions>=2 && metadata_proposal.counters.decoded_instructions==0,
+          "certified metadata edit retains unaffected instruction decodes");
+    check(function(*metadata_proposal.functions,0x1001),
+          "certified metadata edit rebuilds roots at the refreshed export address");
     auto metadata_cancellation=std::make_shared<std::stop_source>();
     auto cancel_metadata_image=Image::create(std::make_shared<CancelOnReadStorage>(edited_image->storage(),
         metadata_cancellation),edited_image->layout()).value();
@@ -181,5 +183,55 @@ void string_and_metadata_tests(){
     auto engine=old.key;engine.engine_fingerprint[0]^=std::byte{1};auto incompatible=plan_invalidation(old,{},old.decisions,engine,{}).value();check(!incompatible.full_reason.empty(),"engine key changes cannot reuse old facts silently");check(!reanalyze(old,old.image,old.metadata,old.decisions,incompatible,engine,{}),"unknown engine fingerprint is rejected by enabled implementation");
     auto unicode=std::vector<std::byte>(24);unicode[0]=std::byte{0xc3};for(size_t i=0;i<8;++i)unicode[4+2*i]=std::byte('A'+i);auto utf16=basis(unicode);auto split=patch(utf16,12,bytes({0,0}));auto unicode_key=utf16.key;++unicode_key.byte_revision;FileRange utf_range{{12},2};auto utf_plan=plan_invalidation(utf16,std::span(&utf_range,1),utf16.decisions,unicode_key,{}).value();auto rescanned=reanalyze(utf16,split,utf16.metadata,utf16.decisions,utf_plan,unicode_key,{}).value();bool exact=false,obsolete=false;for(auto& record:rescanned.strings->records)if(record.encoding==StringEncoding::utf16le){exact=exact || (record.file_offset.value==4 && record.characters==4 && record.byte_length==8 && record.terminated);obsolete=obsolete || (record.file_offset.value==4 && record.characters==8);}check(exact && !obsolete,"UTF-16 terminator edit rescans alignment and removes obsolete full run");
 }
+void semantic_decoder_incremental_reads_test(){
+    std::vector<std::byte> raw(32,std::byte{0});
+    for (const auto offset : {0u, 16u}) {
+        raw[offset+0]=std::byte{0xff}; raw[offset+1]=std::byte{0xff};
+        raw[offset+2]=std::byte{0xff}; raw[offset+3]=std::byte{0xff};
+    }
+    // A built-in A64 function is independent of the host decoder's declared
+    // image read at file offset 24.
+    raw[8]=std::byte{0x1f}; raw[9]=std::byte{0x20}; raw[10]=std::byte{0x03}; raw[11]=std::byte{0xd5};
+    raw[12]=std::byte{0xc0}; raw[13]=std::byte{0x03}; raw[14]=std::byte{0x5f}; raw[15]=std::byte{0xd6};
+    auto storage=std::make_shared<MemoryStorage>(raw);
+    Address entry{{0},0x1000};
+    ImageLayout layout{{{0},64,1,ByteOrder::little},Architecture::arm64,ExecutionMode::a64,
+        {{"a64",entry,raw.size(),{0},raw.size(),true,false,true}},{entry}};
+    auto image=Image::create(storage,std::move(layout)).value();
+    AnalysisOptions options;
+    options.semantic_decoder=[](DecodeContext context,Address address,std::span<const std::byte> bytes)
+        -> Result<std::optional<Instruction>> {
+        if (address.offset!=0x1000 && address.offset!=0x1010) return std::optional<Instruction>{};
+        Instruction value; value.context=context; value.address=address; value.length=4;
+        value.opcode=Opcode::opaque; value.flow=FlowKind::ret;
+        std::copy_n(bytes.begin(),4,value.bytes.begin());
+        return std::optional<Instruction>{std::move(value)};
+    };
+    options.semantic_decoder_identity=[] { return std::vector<std::byte>{std::byte{1}}; };
+    options.semantic_decoder_read_set=[] {
+        AnalysisOptions::SemanticDecoderInput input;
+        input.identity="host-table"; input.sha256[0]=std::byte{1};
+        input.image_reads.push_back({{24},1});
+        return std::vector<AnalysisOptions::SemanticDecoderInput>{input};
+    };
+    AnalysisBasis old; old.image=image; old.metadata=std::make_shared<const ImageMetadata>();
+    old.options=options; old.metadata_reads_complete=true; old.key.input={storage->size(),hash_source(*storage,{}).value()};
+    old.key.engine_fingerprint=function_engine_fingerprint(options);
+    ImageMetadata metadata; metadata.exports.push_back({1,"extension_a",Address{{0},0x1000},{}});
+    metadata.exports.push_back({2,"builtin",Address{{0},0x1008},{}});
+    metadata.exports.push_back({3,"extension_b",Address{{0},0x1010},{}});
+    old.metadata=std::make_shared<const ImageMetadata>(metadata);
+    old.functions=recover_functions(*image,*old.metadata,old.decisions,options,old.key,{}).value();
+    old.references=derive_references(*old.functions,*old.metadata,old.decisions,{}).value();
+    old.strings=std::make_shared<const StringScan>(find_strings(*image,options,{}).value());
+    check(old.functions->instructions.size()==4,"fixture has two host-decoded and two built-in instructions");
+    auto next=patch(old,24,bytes({0x42})); auto key=old.key; ++key.byte_revision;
+    const FileRange changed{{24},1};
+    const auto plan=plan_invalidation(old,std::span(&changed,1),old.decisions,key,{},false,true).value();
+    check(plan.full_reason.empty(),"a declared host-decoder byte read uses fact dependencies instead of forcing a whole-analysis rebuild");
+    const auto updated=reanalyze(old,next,old.metadata,old.decisions,plan,key,{}).value();
+    check(updated.counters.decoded_instructions==2 && updated.counters.reused_instructions==2,
+          "host-decoder external reads invalidate only host-decoded instructions and retain unrelated built-in decodes");
 }
-int main(){return run([]{reuse_tests();incomplete_dirty_range_tests();discovery_tests();ownership_and_decision_tests();string_and_metadata_tests();});}
+}
+int main(){return run([]{reuse_tests();incomplete_dirty_range_tests();discovery_tests();ownership_and_decision_tests();string_and_metadata_tests();semantic_decoder_incremental_reads_test();});}

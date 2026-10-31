@@ -211,7 +211,7 @@ void eh_frame_runtime() {
               arm_outcome.value().caller.at(MachOUnwindRegister::arm64_sp) == 0x4000,
           "arm64 eh_frame CFI restores LR, frame pointer, PC, and SP");
     auto malformed = m.eh_frame_functions.front();
-    malformed.instructions = {std::byte{0x10}}; // unsupported set_loc/expression family member
+    malformed.instructions = {std::byte{0x23}}; // Reserved primary opcode is outside the supported subset.
     auto unsupported = metadata(0x01000007u, 0);
     unsupported.compact_unwind_functions.clear();
     unsupported.eh_frame_functions.push_back(malformed);
@@ -258,11 +258,12 @@ void negatives() {
     m = metadata(0x01000007u, 0x02000000u | (1u << 10) | 0x3ffu);
     result = evaluate_macho_unwind(m, {{0}, 0x1000}, {{MachOUnwindRegister::x86_64_rsp, 0x2000}}, read);
     check(!result && result.error().code == ErrorCode::malformed, "invalid frameless permutation rejected");
-    m = metadata(0x01000007u, 0x03000000u);
-    result = evaluate_macho_unwind(m, {{0}, 0x1000}, {{MachOUnwindRegister::x86_64_rsp, 0x2000}}, read);
-    check(!result && result.error().code == ErrorCode::unsupported &&
-          result.error().message.find("mode") != std::string::npos,
-          "x86_64 indirect stack mode remains unsupported without instruction memory");
+    m = metadata(0x01000007u, 0x03030000u);
+    auto unavailable = [](std::uint64_t, std::uint8_t) -> std::optional<std::uint64_t> { return std::nullopt; };
+    result = evaluate_macho_unwind(m, {{0}, 0x1000}, {{MachOUnwindRegister::x86_64_rsp, 0x2000}}, unavailable);
+    check(!result && result.error().code == ErrorCode::out_of_bounds &&
+              result.error().message.find("unreadable") != std::string::npos,
+          "x86_64 indirect stack mode requires readable prologue bytes");
     m = metadata(0x01000007u, 0x02000000u | (1u << 13));
     result = evaluate_macho_unwind(m, {{0}, 0x1000}, {{MachOUnwindRegister::x86_64_rsp, 0x2000}}, read);
     check(!result && result.error().code == ErrorCode::malformed, "immediate stack reserved adjustment rejected");
@@ -280,8 +281,8 @@ void negatives() {
     m = metadata(0x0100000cu, 0x05000000u);
     result = evaluate_macho_unwind(m, {{0}, 0x1000}, {}, read);
     check(!result && result.error().code == ErrorCode::unsupported &&
-          result.error().message.find("pointer-authenticated") != std::string::npos,
-          "arm64e authenticated-LR mode is rejected explicitly");
+              result.error().message.find("arm64e slice") != std::string::npos,
+          "authenticated compact-unwind recipe requires an arm64e CPU subtype");
     m.selected_slice = 1;
     result = evaluate_macho_unwind(m, {{0}, 0x1000}, {}, read);
     check(!result && result.error().code == ErrorCode::malformed, "invalid selected slice rejected");

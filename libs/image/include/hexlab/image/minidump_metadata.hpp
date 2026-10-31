@@ -282,6 +282,15 @@ struct MinidumpComment {
     bool truncated = false;
     bool operator==(const MinidumpComment &) const = default;
 };
+// Intel Processor Trace data is retained as an opaque, bounded stream prefix.
+// Its packet grammar and execution reconstruction are intentionally separate.
+struct MinidumpIptTrace {
+    std::uint32_t declared_size = 0;
+    FileOffset stream_file_offset{};
+    std::vector<std::byte> captured_bytes;
+    bool truncated = false;
+    bool operator==(const MinidumpIptTrace &) const = default;
+};
 struct MinidumpLinuxProcStatusField {
     std::string key, value;
     FileOffset line_file_offset{};
@@ -386,6 +395,7 @@ struct MinidumpMetadata {
     std::optional<MinidumpSystemMemoryInfo> system_memory_info;
     std::optional<MinidumpFunctionTableList> function_tables;
     std::vector<MinidumpComment> comments;
+    std::optional<MinidumpIptTrace> ipt_trace;
     std::optional<MinidumpLinuxProcStatus> linux_proc_status;
     std::vector<MinidumpLinuxTextStream> linux_text_streams;
     std::optional<MinidumpAssertionInfo> assertion;

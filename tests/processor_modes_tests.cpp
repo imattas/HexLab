@@ -65,10 +65,14 @@ void context_tests() {
 void capstone_opaque_tests() {
     const DecodeContext a64{Architecture::arm64, ExecutionMode::a64, ByteOrder::little};
     auto fp = decode_instruction(a64, bytes({0x20, 0x28, 0x22, 0x1e}), {{0}, 0x2000});
-    check(fp.status == DecodeStatus::decoded && fp.instruction && fp.instruction->opcode == Opcode::opaque &&
-              fp.instruction->length == 4 && fp.instruction->operands.empty() &&
+    check(fp.status == DecodeStatus::decoded && fp.instruction && fp.instruction->opcode == Opcode::a64_fadd &&
+              fp.instruction->length == 4 && fp.instruction->operands.size() == 3 &&
+              std::any_of(fp.instruction->register_writes.begin(), fp.instruction->register_writes.end(),
+                  [](RegisterOperand reg) { return reg.bank == RegisterBank::arm64_simd && reg.width == 32; }) &&
+              std::any_of(fp.instruction->register_writes.begin(), fp.instruction->register_writes.end(),
+                  [](RegisterOperand reg) { return reg.bank == RegisterBank::arm64_simd && reg.width == 128; }) &&
               fp.instruction->flow == FlowKind::fallthrough && format_instruction(*fp.instruction).starts_with("fadd"),
-          "Capstone A64 FP fallback preserves display and width without invented semantics");
+          "A64 scalar FADD uses typed SIMD operands and a 32-bit destination");
     const DecodeContext rv64{Architecture::riscv64, ExecutionMode::rv64, ByteOrder::little};
     auto rv_fp = decode_instruction(rv64, bytes({0xd3, 0x00, 0x31, 0x00}), {{0}, 0x3000});
     check(rv_fp.status == DecodeStatus::decoded && rv_fp.instruction && rv_fp.instruction->opcode == Opcode::rv_fadd_s &&
@@ -76,13 +80,13 @@ void capstone_opaque_tests() {
               rv_fp.instruction->flow == FlowKind::fallthrough && format_instruction(*rv_fp.instruction).starts_with("fadd.s"),
           "RISC-V scalar FP dispatch uses native typed semantics instead of the opaque fallback");
     const DecodeContext mips{Architecture::mips32, ExecutionMode::mips32, ByteOrder::little};
-    // MFC1 is valid but unimplemented by the typed subset, so Capstone may
-    // supply display text while semantic operands remain opaque.
+    // MFC1 is a typed COP1 transfer with an integer destination and FPR source.
     auto mips_fp = decode_instruction(mips, bytes({0x00, 0x08, 0x02, 0x44}), {{0}, 0x4000});
-    check(mips_fp.status == DecodeStatus::decoded && mips_fp.instruction && mips_fp.instruction->opcode == Opcode::opaque &&
-              mips_fp.instruction->length == 4 && mips_fp.instruction->operands.empty() &&
+    check(mips_fp.status == DecodeStatus::decoded && mips_fp.instruction && mips_fp.instruction->opcode == Opcode::mips_mfc1 &&
+              mips_fp.instruction->length == 4 && mips_fp.instruction->operands.size() == 2 &&
+              mips_fp.instruction->register_writes == std::vector{RegisterOperand{RegisterBank::mips_gpr, 2, 32, false}} &&
               format_instruction(*mips_fp.instruction).starts_with("mfc1"),
-          "Capstone MIPS coprocessor fallback has no fabricated operands");
+          "MIPS32 MFC1 preserves its integer destination and FPR source effects");
 }
 
 void m6502_tests() {
@@ -111,8 +115,10 @@ void m6502_tests() {
               decoded.instruction->direct_target == Address{{3}, 0x8002} &&
               format_instruction(*decoded.instruction) == "bne 0x8002",
           "6502 signed relative branch resolves from the following instruction");
-    check(decode_instruction(mode, bytes({0x80}), {{3}, 0}).status == DecodeStatus::unsupported,
-          "65C02 BRA remains explicitly unsupported in the NMOS mode");
+    const auto unofficial_nop = decode_instruction(mode, bytes({0x80, 0x00}), {{3}, 0});
+    check(unofficial_nop.instruction && unofficial_nop.instruction->opcode == Opcode::nop &&
+              unofficial_nop.instruction->length == 2,
+          "NMOS immediate unofficial NOP is distinguished from the 65C02 BRA encoding");
     check(decode_instruction(mode, bytes({0xa9}), {{3}, 0}).status == DecodeStatus::truncated,
           "6502 immediate truncation is distinguished from invalid opcodes");
     const auto jmp = decode_instruction(mode, bytes({0x4c, 0x34, 0x12}), {{3}, 0xfffc});
@@ -180,9 +186,10 @@ void m6502_tests() {
               !decoded.instruction->direct_target && decoded.instruction->memory_read &&
               format_instruction(*decoded.instruction) == "jmp (0x1234)",
           "indirect JMP retains an unresolved pointer and the NMOS page-wrap case is not fabricated");
-    const auto illegal = decode_instruction(mode, bytes({0x03, 0x44}), {{3}, 0x1000});
-    check(illegal.status == DecodeStatus::unsupported && illegal.reason.find("Undocumented") != std::string::npos,
-          "undocumented NMOS opcode is explicitly unsupported rather than assigned invented semantics");
+    const auto unofficial = decode_instruction(mode, bytes({0x03, 0x44}), {{3}, 0x1000});
+    check(unofficial.instruction && unofficial.instruction->opcode == Opcode::m6502_slo &&
+              format_instruction(*unofficial.instruction).starts_with("slo"),
+          "implemented NMOS SLO retains its combined unofficial-opcode identity");
     const std::array<std::pair<unsigned, const char *>, 8> addressing_forms{{
         {0x01, "ora (0x34, x)"}, {0x05, "ora 0x34"}, {0x09, "ora #0x34"}, {0x0d, "ora 0x1234"},
         {0x11, "ora (0x34), y"}, {0x15, "ora 0x34, x"}, {0x19, "ora 0x1234, y"}, {0x1d, "ora 0x1234, x"}}};
@@ -207,7 +214,7 @@ void riscv_dispatch_tests() {
     const auto csrrw = decode_instruction(rv64, bytes({0xf3, 0x12, 0x03, 0x30}), {{0}, 0x1000});
     check(csrrw.instruction && csrrw.instruction->opcode == Opcode::rv_csrrw && csrrw.instruction->csr_read &&
               csrrw.instruction->csr_write &&
-              format_instruction(*csrrw.instruction) == "csrrw x5, 0x300, x6",
+              format_instruction(*csrrw.instruction) == "csrrw x5, mstatus, x6",
           "generic RV64 dispatch preserves Zicsr identity, effects, and canonical CSR operand formatting");
     const auto csrrsi = decode_instruction(rv64, bytes({0xf3, 0x62, 0x00, 0xc0}), {{0}, 0x1004});
     check(csrrsi.instruction && csrrsi.instruction->opcode == Opcode::rv_csrrsi &&

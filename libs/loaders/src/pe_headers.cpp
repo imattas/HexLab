@@ -411,7 +411,9 @@ Result<LoadedImage> load_pe_impl(std::shared_ptr<const ByteStorage> storage,
                     ErrorCode::unsupported);
             auto rebased = apply_pe_relocations(*loaded.image, loaded.metadata, requested_base, stop);
             if (!rebased) return rebased.error();
-            auto overlay = make_overlay(storage, rebased.value().patches);
+            // The preferred-base image was created by moving `storage` above.
+            // Rebase overlays must use the retained source storage instead.
+            auto overlay = make_overlay(original, rebased.value().patches);
             if (!overlay) return overlay.error();
             auto moved = Image::create(std::move(overlay.value()), std::move(rebased.value().layout));
             if (!moved) return moved.error();

@@ -887,10 +887,19 @@ void conditional_data_tests() {
           "REX.B selects an extended low-byte register for SETcc");
 }
 void prefix_tests() {
-    for(auto data:{bytes({0xc5,0xf8,0x77}),bytes({0x62,0xf1,0x7c,0x48}),bytes({0x0f,0x38,0})}) {
-        const auto result=decode_x64(data,{{0},0x1000});
-        check(result.status==DecodeStatus::unsupported && !result.instruction,"unsupported map has no invented instruction");
-    }
+    const auto vzeroupper = decode_instruction(
+        {Architecture::x86_64, ExecutionMode::x86_64, ByteOrder::little},
+        bytes({0xc5,0xf8,0x77}), {{0},0x1000});
+    check(vzeroupper.instruction && vzeroupper.instruction->opcode == Opcode::x86_opaque &&
+              vzeroupper.instruction->length == 3 &&
+              vzeroupper.instruction->mnemonic_override.find("vzeroupper") != std::string::npos,
+          "valid VZEROUPPER retains its exact boundary and display spelling as an opaque instruction");
+    const auto truncated_evex = decode_x64(bytes({0x62,0xf1,0x7c,0x48}),{{0},0x1000});
+    check(truncated_evex.status == DecodeStatus::truncated && !truncated_evex.instruction,
+          "incomplete EVEX prefix is reported as truncated without inventing an instruction");
+    const auto unsupported_vex = decode_x64(bytes({0xc4,0xe2,0x78,0x58,0xc1}),{{0},0x1000});
+    check(unsupported_vex.status == DecodeStatus::unsupported && !unsupported_vex.instruction,
+          "unsupported VEX map/opcode combination remains explicit");
     check(format_instruction(instruction({0x41,0x90}))=="xchg eax, r8d",
           "REX.B 90 is XCHG EAX,R8D, not a reserved encoding");
     for(auto data:{bytes({0xf0,0x90}),bytes({0xf0,0x01,0xc8}),bytes({0x48,0x8d,0xc0}),
@@ -938,8 +947,11 @@ void mips32_tests() {
     check(result.status == DecodeStatus::decoded && result.instruction,
           "MIPS32 COP1 C.EQ.S known-answer encoding decodes");
     const auto nonzero_compare_cc = bytes({0x32,0x09,0x02,0x46});
-    check(decode_mips32(ByteOrder::little, nonzero_compare_cc, {{0},0x1000}).status == DecodeStatus::unsupported,
-          "COP1 compare to a nonzero condition code is outside this subset");
+    const auto nonzero_compare = decode_mips32(ByteOrder::little, nonzero_compare_cc, {{0},0x1000});
+    check(nonzero_compare.instruction && nonzero_compare.instruction->condition == 0x12 &&
+              nonzero_compare.instruction->register_writes ==
+                  std::vector<RegisterOperand>{{RegisterBank::mips_fcsr,2,32,false}},
+          "COP1 compare selects FCC1 and writes its condition-code register");
     const auto reserved_compare_bits = bytes({0x72,0x08,0x02,0x46});
     check(decode_mips32(ByteOrder::little, reserved_compare_bits, {{0},0x1000}).status == DecodeStatus::invalid,
           "COP1 compare rejects reserved condition-code bits");
@@ -949,8 +961,10 @@ void mips32_tests() {
           "MIPS32 COP1 BC1T retains conditional flow and its architectural delay slot");
     const auto bad_cc_bytes = bytes({0x04,0x00,0x05,0x45});
     const auto bad_cc = decode_mips32(ByteOrder::little, bad_cc_bytes, {{0},0x1000});
-    check(bad_cc.status == DecodeStatus::unsupported,
-          "COP1 branch to a nonzero condition code is outside this subset");
+    check(bad_cc.instruction && bad_cc.instruction->flow == FlowKind::conditional_branch &&
+              bad_cc.instruction->register_reads ==
+                  std::vector<RegisterOperand>{{RegisterBank::mips_fcsr,2,32,false}},
+          "COP1 branch to FCC1 reads its condition-code register");
     check(decode({0x04,0x00,0x01,0x46}).status == DecodeStatus::invalid,
           "COP1 unary operations reject a nonzero unused ft field");
     const auto cop1 = [&](unsigned fmt, unsigned ft, unsigned fs, unsigned fd, unsigned function) {
@@ -962,9 +976,10 @@ void mips32_tests() {
               format_instruction(*result.instruction) == "add.d f6, f2, f4",
           "MIPS32 COP1 double arithmetic decodes with 64-bit paired FPRs");
     result = cop1(17, 4, 2, 0, 0x32); // c.eq.d f2,f4
-    check(result.instruction && result.instruction->opcode == Opcode::mips_c_eq_d &&
-              result.instruction->register_writes == std::vector<RegisterOperand>{{RegisterBank::mips_fcsr,0,32,false}},
-          "MIPS32 COP1 double compare writes FCSR");
+    check(result.instruction && result.instruction->opcode == Opcode::mips64_c_cond_d &&
+              result.instruction->condition == 2 &&
+              result.instruction->register_writes == std::vector<RegisterOperand>{{RegisterBank::mips_fcsr,1,32,false}},
+          "MIPS32 COP1 double compare writes FCC0");
     result = cop1(17, 0, 2, 6, 0x20); // cvt.s.d f6,f2
     check(result.instruction && result.instruction->opcode == Opcode::mips_cvt_s_d &&
               format_instruction(*result.instruction) == "cvt.s.d f6, f2",
@@ -1116,8 +1131,12 @@ void mips32_tests() {
               register_name(zero_mtc0.instruction->register_reads.front()) == "zero",
           "MIPS32 MTC0 observes the architectural zero-register value");
     const auto likely = decode({0x02,0x00,0x13,0x04});
-    check(likely.instruction && likely.instruction->opcode == Opcode::opaque && likely.instruction->operands.empty(),
-          "valid but unimplemented MIPS branch-likely retains display-only length without semantic facts");
+    check(likely.instruction && likely.instruction->opcode == Opcode::opaque &&
+              likely.instruction->length == 4 &&
+              likely.instruction->mnemonic_override.find("bgezall") != std::string::npos &&
+              likely.instruction->flow == FlowKind::fallthrough && !likely.instruction->direct_target &&
+              likely.instruction->delay_slots == 0,
+          "unimplemented BGEZALL remains a bounded opaque instruction without invented control flow");
     check(decode({0x00,0x00,0x00,0x00}, 0x1001).status == DecodeStatus::invalid &&
               decode({0x00,0x00,0x00,0x00}, 0x100000000ULL).status == DecodeStatus::invalid,
           "MIPS32 unaligned and out-of-domain addresses are invalid");

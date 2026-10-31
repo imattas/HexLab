@@ -58,7 +58,7 @@ void raw_references() {
         }
         check(rebase && bind, "rebases carry actual preferred pointer values while imports remain typed unresolved");
         const auto wire = take(encode_reference_index(*refs, {}));
-        check(wire[0] == std::byte{9}, "Thumb relative expressions require a distinct reference payload version");
+        check(wire[0] == std::byte{19}, "dyld provenance uses reference payload version 19");
         const auto restored = take(decode_reference_index(wire, {}));
         check(take(encode_reference_index(*restored, {})) == wire, "owned dyld provenance roundtrips canonically");
     }
@@ -170,7 +170,7 @@ void partial_roundtrips() {
             put(data, 772, 0x80000, 8, false);
         }
         if (variant == 3)
-            put(data, chains_at + 24, 1, 4, false);
+            compress_chained_symbol_pool(data);
         const auto loaded = load(data);
         const auto refs = take(derive_references(*loaded.image, FunctionSnapshot{}, loaded.metadata, {}, {}));
         const auto wire = take(encode_reference_index(*refs, {}));
@@ -259,7 +259,11 @@ int main(int argc, char **argv) {
     if (argc != 2)
         return 2;
     return run([&] {
-        check(sizeof(ReferenceProvenance) <= 256, "ordinary references retain a bounded inline provenance footprint");
+        // Current optional ELF/Mach-O source records, producer graph headers,
+        // and target-mode marker occupy 392 bytes on MSVC x64. Keep a tight
+        // 400-byte cap so future fields cannot silently bloat every row.
+        check(sizeof(ReferenceProvenance) <= 400,
+              "expanded source provenance remains within its bounded inline footprint");
         raw_references();
         source_bound_forgery();
         owned_word_forgery();

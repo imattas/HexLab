@@ -343,6 +343,166 @@ std::optional<Mips32DivSResult> evaluate_mips32_div_s_instruction(
     return evaluate_mips32_div_s(lhs_bits, rhs_bits, fcsr_value);
 }
 
+std::optional<Mips32ArithmeticSResult> evaluate_mips32_arithmetic_s(
+    Mips32SArithmeticOperation operation, std::uint32_t lhs_bits,
+    std::uint32_t rhs_bits, std::uint32_t fcsr) noexcept {
+    constexpr std::uint32_t sign_mask = 0x80000000u;
+    constexpr std::uint32_t exponent_mask = 0x7f800000u;
+    constexpr std::uint32_t fraction_mask = 0x007fffffu;
+    const auto rounding = fcsr & 3u;
+    Mips32ArithmeticSResult result{};
+
+    if (operation != Mips32SArithmeticOperation::add &&
+        operation != Mips32SArithmeticOperation::subtract &&
+        operation != Mips32SArithmeticOperation::multiply) return {};
+    if ((lhs_bits & exponent_mask) == exponent_mask ||
+        (rhs_bits & exponent_mask) == exponent_mask) return {};
+
+    const bool flush_inputs = (fcsr & fcsr_flush_subnormal) != 0;
+    const auto flush = [&](std::uint32_t &bits) {
+        if ((bits & exponent_mask) == 0 && (bits & fraction_mask) != 0) {
+            bits &= sign_mask;
+            result.exception_bits |= fp_inexact;
+        }
+    };
+    if (flush_inputs) {
+        flush(lhs_bits);
+        flush(rhs_bits);
+    }
+
+    const auto top_exponent = [](std::uint32_t bits) {
+        const auto exponent = (bits & exponent_mask) >> 23;
+        const auto fraction = bits & fraction_mask;
+        if (exponent != 0) return static_cast<int>(exponent) - 127;
+        return fraction == 0 ? -10000 : static_cast<int>(std::bit_width(fraction)) - 1 - 149;
+    };
+    if (operation != Mips32SArithmeticOperation::multiply &&
+        (lhs_bits & ~sign_mask) != 0 && (rhs_bits & ~sign_mask) != 0 &&
+        std::abs(top_exponent(lhs_bits) - top_exponent(rhs_bits)) > 29) return {};
+
+    const auto lhs = static_cast<double>(std::bit_cast<float>(lhs_bits));
+    auto rhs = static_cast<double>(std::bit_cast<float>(rhs_bits));
+    if (operation == Mips32SArithmeticOperation::subtract) rhs = -rhs;
+    const double exact = operation == Mips32SArithmeticOperation::multiply ? lhs * rhs : lhs + rhs;
+    const bool zero_operands = (lhs_bits & ~sign_mask) == 0 && (rhs_bits & ~sign_mask) == 0;
+    if (exact == 0.0) {
+        const bool lhs_negative = (lhs_bits & sign_mask) != 0;
+        const bool rhs_negative = ((rhs_bits & sign_mask) != 0) ^
+                                  (operation == Mips32SArithmeticOperation::subtract);
+        const bool negative = operation == Mips32SArithmeticOperation::multiply
+            ? lhs_negative ^ rhs_negative
+            : zero_operands && lhs_negative == rhs_negative ? lhs_negative : rounding == 3;
+        result.value_bits = negative ? sign_mask : 0;
+        goto finalize;
+    }
+
+    {
+        const auto exact_bits = std::bit_cast<std::uint64_t>(exact);
+        const bool negative = (exact_bits >> 63) != 0;
+        int exponent = static_cast<int>((exact_bits >> 52) & 0x7ffu) - 1023;
+        const std::uint64_t significand = (exact_bits & UINT64_C(0x000fffffffffffff)) |
+                                           (UINT64_C(1) << 52);
+        if ((fcsr & fcsr_flush_subnormal) != 0 && exponent < -126) {
+            result.value_bits = negative ? sign_mask : 0;
+            result.exception_bits |= fp_underflow | fp_inexact;
+            goto finalize;
+        }
+        const int shift = exponent >= -126 ? 29 : -exponent - 97;
+        std::uint64_t rounded = 0;
+        std::uint64_t remainder = significand;
+        bool increment = false;
+        if (shift < 64) {
+            rounded = significand >> shift;
+            remainder = significand & ((UINT64_C(1) << shift) - 1);
+            if (remainder != 0) {
+                switch (rounding) {
+                case 0: {
+                    const auto halfway = UINT64_C(1) << (shift - 1);
+                    increment = remainder > halfway || (remainder == halfway && (rounded & 1));
+                    break;
+                }
+                case 1: break;
+                case 2: increment = !negative; break;
+                case 3: increment = negative; break;
+                }
+            }
+        } else if (shift == 64) {
+            if (rounding == 0) increment = remainder > (UINT64_C(1) << 63);
+            else if (rounding == 2) increment = !negative;
+            else if (rounding == 3) increment = negative;
+        } else {
+            if (rounding == 2) increment = !negative;
+            else if (rounding == 3) increment = negative;
+        }
+        if (remainder != 0) result.exception_bits |= fp_inexact;
+        if (increment) ++rounded;
+
+        if (exponent >= -126) {
+            if (rounded == UINT64_C(0x01000000)) {
+                rounded >>= 1;
+                ++exponent;
+            }
+            if (exponent > 127) {
+                result.value_bits = overflow_result(negative, rounding);
+                result.exception_bits |= fp_overflow | fp_inexact;
+                goto finalize;
+            }
+            result.value_bits = (negative ? sign_mask : 0) |
+                (static_cast<std::uint32_t>(exponent + 127) << 23) |
+                (static_cast<std::uint32_t>(rounded) & fraction_mask);
+        } else {
+            if (rounded >= UINT64_C(0x00800000))
+                result.value_bits = (negative ? sign_mask : 0) | 0x00800000u;
+            else {
+                if ((result.exception_bits & fp_inexact) != 0) result.exception_bits |= fp_underflow;
+                result.value_bits = (negative ? sign_mask : 0) | static_cast<std::uint32_t>(rounded);
+                if ((fcsr & fcsr_flush_subnormal) != 0 && rounded != 0) {
+                    result.value_bits = negative ? sign_mask : 0;
+                    result.exception_bits |= fp_underflow | fp_inexact;
+                }
+            }
+        }
+    }
+
+finalize:
+    result.exception_taken = (result.exception_bits & ((fcsr & fcsr_enable_mask) >> 7)) != 0;
+    result.writes_destination = !result.exception_taken;
+    result.fcsr_after = (fcsr & ~fcsr_cause_mask) |
+        (static_cast<std::uint32_t>(result.exception_bits) << 12);
+    if (!result.exception_taken)
+        result.fcsr_after = (result.fcsr_after & ~fcsr_flag_mask) |
+            ((fcsr & fcsr_flag_mask) | (static_cast<std::uint32_t>(result.exception_bits) << 2));
+    return result;
+}
+
+std::optional<Mips32ArithmeticSResult> evaluate_mips32_arithmetic_s_instruction(
+    const Instruction &instruction, std::uint32_t lhs_bits, std::uint32_t rhs_bits,
+    std::uint32_t fcsr) noexcept {
+    if (instruction.context.architecture != Architecture::mips32 ||
+        instruction.context.mode != ExecutionMode::mips32 ||
+        (instruction.opcode != Opcode::mips_add_s && instruction.opcode != Opcode::mips_sub_s &&
+         instruction.opcode != Opcode::mips_mul_s) || instruction.operands.size() != 3 ||
+        instruction.access != std::vector<OperandAccess>{OperandAccess::write, OperandAccess::read,
+                                                         OperandAccess::read} ||
+        instruction.memory_read || instruction.memory_write || instruction.flow != FlowKind::fallthrough ||
+        instruction.delay_slots != 0) return {};
+    const auto *destination = std::get_if<RegisterOperand>(&instruction.operands[0]);
+    const auto *left = std::get_if<RegisterOperand>(&instruction.operands[1]);
+    const auto *right = std::get_if<RegisterOperand>(&instruction.operands[2]);
+    const auto valid = [](const RegisterOperand *reg) {
+        return reg && reg->bank == RegisterBank::mips_fpr && reg->width == 32 &&
+            reg->index < 32 && !reg->high_byte;
+    };
+    if (!valid(destination) || !valid(left) || !valid(right)) return {};
+    const RegisterOperand fcsr_reg{RegisterBank::mips_fcsr, 0, 32, false};
+    if (instruction.register_reads != std::vector<RegisterOperand>{*left, *right, fcsr_reg} ||
+        instruction.register_writes != std::vector<RegisterOperand>{*destination, fcsr_reg}) return {};
+    const auto operation = instruction.opcode == Opcode::mips_add_s ? Mips32SArithmeticOperation::add :
+        instruction.opcode == Opcode::mips_sub_s ? Mips32SArithmeticOperation::subtract :
+        Mips32SArithmeticOperation::multiply;
+    return evaluate_mips32_arithmetic_s(operation, lhs_bits, rhs_bits, fcsr);
+}
+
 std::optional<bool>
 evaluate_mips32_fcc_branch_instruction(const Instruction &instruction,
                                        bool condition_code_value) noexcept {

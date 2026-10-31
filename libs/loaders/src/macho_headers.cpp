@@ -87,8 +87,8 @@ MachOHeader header(const ByteStorage &storage, const MachOSlice &slice, Budget &
     out.command_bytes = value(20);
     out.flags = value(24);
     out.reserved = kind.wide ? value(28) : 0;
-    require(!kind.wide || out.reserved == 0,
-            "Mach-O 64-bit header reserved field is nonzero");
+    // Keep the reserved word as source metadata, but do not reject older
+    // binaries that left it populated. It does not affect address mapping.
     require(out.command_count <= 65536 && out.command_count <= 1048576 - budget.commands,
             "Mach-O command count exceeds budget", ErrorCode::resource_limit);
     require(out.command_bytes <= slice.size - size, "Mach-O command extent crosses slice boundary");

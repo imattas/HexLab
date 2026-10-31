@@ -76,6 +76,26 @@ evaluate_ppc_fp_unary_bits_instruction(const Instruction &instruction,
                                        std::uint64_t source_bits,
                                        std::uint32_t fpscr_before = 0) noexcept;
 
+struct PpcFpArithmeticResult {
+    // FPR contents use the architectural 64-bit double-format representation;
+    // single-precision instructions store an exactly widened single result.
+    std::uint64_t fpr_bits = 0;
+    std::uint32_t fpscr_after = 0;
+    std::optional<std::uint8_t> cr1;
+    bool operator==(const PpcFpArithmeticResult &) const = default;
+};
+
+// Evaluate exact finite fadds/fsubs/fmuls operations. Inputs must already be
+// exact normal-or-zero single values in architectural double-format FPRs, and
+// the exact result must be normal-or-zero single precision. Inexact, overflow,
+// underflow/subnormal, NaN/Infinity, and non-IEEE FPSCR modes return no value.
+// The evaluator validates the complete decoded FPR/FPSCR/CR1 effects.
+HEXLAB_PROCESSORS_EXPORT std::optional<PpcFpArithmeticResult>
+evaluate_ppc_fp_arithmetic_instruction(const Instruction &instruction,
+                                       std::uint64_t lhs_fpr_bits,
+                                       std::uint64_t rhs_fpr_bits,
+                                       std::uint32_t fpscr_before) noexcept;
+
 // Evaluates the decoded VMX wrapping add/subtract and logical integer forms.
 // Add/subtract lanes are interpreted big-endian within each architectural
 // lane, and arithmetic wraps modulo the lane width. Unknown opcodes return no

@@ -111,7 +111,12 @@ Result<PdbTypeStream> parse_pdb_types(const PdbDatabase &database, std::stop_tok
                     if (rec.vftable_slot_kinds.size() < count)
                         rec.vftable_slot_kinds.push_back(packed >> 4);
                 }
-                require(at == limit, "CodeView LF_VTSHAPE has trailing bytes");
+                const auto padding = limit - at;
+                require(padding <= 3, "CodeView LF_VTSHAPE has unexpected trailing bytes");
+                for (std::size_t i = 0; i < padding; ++i)
+                    require(std::to_integer<unsigned>(bytes[at + i]) == 0xf0u + padding - i,
+                            "CodeView LF_VTSHAPE has invalid trailing padding");
+                at = limit;
                 break;
             }
             case 0x1002: { // LF_POINTER: referent plus packed pointer attributes.
@@ -338,13 +343,26 @@ Result<PdbTypeStream> parse_pdb_types(const PdbDatabase &database, std::stop_tok
             }
             case 0x1206: { // LF_METHODLIST: bounded overload entries.
                 rec.kind=CodeViewTypeKind::method_list;
-                while (at + 6 <= limit) {
-                    CodeViewField method; method.leaf=0x1511; method.attributes=r16(); method.type=r32();
+                while (at < limit) {
+                    if (std::to_integer<unsigned>(bytes[at]) >= 0xf0 &&
+                        std::to_integer<unsigned>(bytes[at]) <= 0xff) {
+                        const auto padding = std::to_integer<unsigned>(bytes[at++]) & 0x0f;
+                        require(padding != 0 && padding - 1 <= limit - at,
+                                "Invalid CodeView method-list padding");
+                        for (unsigned i = 1; i < padding; ++i)
+                            require(std::to_integer<unsigned>(bytes[at + i - 1]) == 0xf0u + padding - i,
+                                    "Invalid CodeView method-list padding");
+                        at += padding - 1;
+                        continue;
+                    }
+                    require(at + 8 <= limit, "Truncated CodeView LF_METHODLIST entry");
+                    CodeViewField method; method.leaf=0x1511; method.attributes=r16();
+                    require(r16() == 0, "CodeView LF_METHODLIST has nonzero reserved padding");
+                    method.type=r32();
                     const auto property = (method.attributes >> 2) & 7;
                     if (property == 4 || property == 6) method.value=r32();
                     rec.fields.push_back(std::move(method));
                 }
-                require(at == limit, "Truncated CodeView LF_METHODLIST entry");
                 break;
             }
             case 0x1515: { // LF_TYPESERVER2: referenced indices stay in the server TPI namespace.
@@ -1179,7 +1197,7 @@ Result<PdbSymbolTable> parse_pdb_symbols(const PdbDatabase &database, std::stop_
                     require(result.symbols.size() <= 2'000'000,
                             "PDB symbol count exceeds inspection limit", ErrorCode::resource_limit);
                 } else if (record_kind == S_FRAMEPROC) {
-                    require(end - payload == 26, "Invalid CodeView S_FRAMEPROC size");
+                    require(end - payload >= 26 && end - payload <= 29, "Invalid CodeView S_FRAMEPROC size");
                     if (active_procedure && !procedure_has_frame) {
                         auto &procedure = result.symbols[*active_procedure];
                         procedure.frame_size = r32(symbols, payload); payload += 4;
@@ -1188,10 +1206,19 @@ Result<PdbSymbolTable> parse_pdb_symbols(const PdbDatabase &database, std::stop_
                         procedure.callee_saved_register_bytes = r32(symbols, payload); payload += 4;
                         procedure.exception_handler_offset = r32(symbols, payload); payload += 4;
                         procedure.exception_handler_section = r16(symbols, payload); payload += 2;
-                        procedure.frame_flags = r32(symbols, payload);
+                        procedure.frame_flags = r32(symbols, payload); payload += 4;
                         procedure.has_frame_data = true;
                         procedure_has_frame = true;
+                    } else payload += 26;
+                    const auto padding = end - payload;
+                    bool zero_padding = true;
+                    bool leaf_padding = true;
+                    for (std::size_t i = 0; i < padding; ++i) {
+                        const auto actual = std::to_integer<unsigned>(symbols[payload + i]);
+                        zero_padding = zero_padding && actual == 0;
+                        leaf_padding = leaf_padding && actual == 0xf0u + padding - i;
                     }
+                    require(zero_padding || leaf_padding, "Invalid CodeView S_FRAMEPROC padding");
                 } else if (active_procedure && (record_kind == S_BLOCK32 || record_kind == S_INLINESITE)) {
                     ++procedure_scope_depth;
                 } else if (active_procedure && (record_kind == S_END || record_kind == S_PROC_ID_END ||
@@ -1589,8 +1616,11 @@ Result<PdbLocalTable> parse_pdb_locals(const PdbDatabase &database, std::stop_to
                     std::int64_t line_delta = 0;
                     std::optional<std::uint32_t> file_id;
                     auto emit = [&](std::uint32_t size) {
-                        require(code <= site.procedure_size && size <= site.procedure_size - code,
-                                "Inline annotation range exceeds its procedure");
+                        if (code > site.procedure_size || size > site.procedure_size - code)
+                            throw Failure{{ErrorCode::malformed, "Inline annotation range [" +
+                                std::to_string(code) + ", " + std::to_string(code + size) +
+                                ") exceeds procedure size " + std::to_string(site.procedure_size) +
+                                " for " + site.procedure_name}};
                         if (size) {
                             require(++inline_range_count <= 1'000'000,
                                     "PDB inline range count exceeds limit", ErrorCode::resource_limit);
@@ -1629,7 +1659,10 @@ Result<PdbLocalTable> parse_pdb_locals(const PdbDatabase &database, std::stop_to
                         // have no effect on this slice's start-line attribution.
                         default: break;
                         }
-                        require(code <= site.procedure_size, "Inline annotation offset exceeds its procedure");
+                        if (code > site.procedure_size)
+                            throw Failure{{ErrorCode::malformed, "Inline annotation offset " + std::to_string(code) +
+                                " exceeds procedure size " + std::to_string(site.procedure_size) +
+                                " for " + site.procedure_name + " at opcode " + std::to_string(op)}};
                     }
                     const auto storage = sizeof(PdbInlineSite) + site.procedure_name.size() +
                         site.ranges.size() * sizeof(PdbInlineRange);

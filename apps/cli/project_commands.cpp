@@ -1535,7 +1535,7 @@ int run_project_cli(std::span<const std::wstring_view> arguments, std::ostream &
                 << recognized.functions.size() << " function entries recognized\n";
             return 0;
         }
-        if (query)
+        if (query || (args.action == L"signatures" && args.signature_function_entries))
             return print_derived(out, args, *current.snapshot,*actor);
         auto edited = args.command             ? reply(actor->execute(take(args.command(*current.snapshot))))
                       : args.action == L"undo" ? reply(actor->undo())
