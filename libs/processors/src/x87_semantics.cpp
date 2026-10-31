@@ -807,7 +807,6 @@ std::optional<X87CompareResult> evaluate_x87_compare(const X87CompareRequest &re
     // unmasked invalid exception; C0/C2/C3 are retired below by form.
     result.status_word = static_cast<std::uint16_t>(request.status_word & ~fsw_c1);
     result.invalid_operation = invalid;
-    result.denormal_operand = denormal;
 
     if (invalid) result.status_word |= fsw_invalid;
     if (invalid && !masked) {
@@ -822,6 +821,7 @@ std::optional<X87CompareResult> evaluate_x87_compare(const X87CompareRequest &re
     }
 
     if (denormal) {
+        result.denormal_operand = true;
         result.status_word |= fsw_denormal;
         if ((request.control_word & fcw_denormal_mask) == 0) {
             result.status_word = signal_exception(result.status_word, fsw_denormal);

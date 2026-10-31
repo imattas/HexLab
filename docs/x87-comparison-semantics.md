@@ -33,8 +33,9 @@ fault interaction remains caller-owned.
 When an unmasked invalid operand and a denormal operand occur together, the
 helper reports the higher-priority invalid-operation exception (IE), ES, and
 B, and does not report DE because comparison processing is suspended before
-the lower-priority denormal exception is handled. If invalid is masked, the
-comparison continues to denormal handling and can report both sticky flags.
+the lower-priority denormal exception is handled. Its result therefore leaves
+`denormal_operand` false in that case. If invalid is masked, the comparison
+continues to denormal handling and can report both sticky flags.
 
 `evaluate_x87_test` evaluates decoded `FTST` using the same ordered
 comparison rules with positive binary80 zero as the right operand. It returns
