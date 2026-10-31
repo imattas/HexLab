@@ -1037,6 +1037,18 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
     if (op == Opcode::m6502_kil) return "kil";
     if (op == Opcode::m65c02_bra) return "bra";
     if (op == Opcode::m65c02_stz) return "stz";
+    if (op == Opcode::m65c02_phx) return "phx";
+    if (op == Opcode::m65c02_plx) return "plx";
+    if (op == Opcode::m65c02_phy) return "phy";
+    if (op == Opcode::m65c02_ply) return "ply";
+    if (op == Opcode::m65c02_tsb) return "tsb";
+    if (op == Opcode::m65c02_trb) return "trb";
+    if (op == Opcode::m65c02_rmb) return std::string("rmb") + std::to_string(condition & 7);
+    if (op == Opcode::m65c02_smb) return std::string("smb") + std::to_string(condition & 7);
+    if (op == Opcode::m65c02_bbr) return std::string("bbr") + std::to_string(condition & 7);
+    if (op == Opcode::m65c02_bbs) return std::string("bbs") + std::to_string(condition & 7);
+    if (op == Opcode::m65c02_wai) return "wai";
+    if (op == Opcode::m65c02_stp) return "stp";
     if (op == Opcode::palignr) return "palignr";
     if (op == Opcode::vpalignr) return "vpalignr";
     const auto index = static_cast<std::size_t>(op);
@@ -1074,6 +1086,13 @@ std::string format_instruction(const Instruction &i) {
         std::string out = opcode_name(i.opcode, i.condition);
         if (i.operands.empty()) return out;
         out += " ";
+        if ((i.opcode == Opcode::m65c02_bbr || i.opcode == Opcode::m65c02_bbs) && i.operands.size() == 2) {
+            if (const auto *mem = std::get_if<MemoryOperand>(&i.operands[0]))
+                out += hex(static_cast<std::uint64_t>(mem->displacement));
+            if (const auto *rel = std::get_if<RelativeOperand>(&i.operands[1]))
+                out += ", " + (i.direct_target ? hex(i.direct_target->offset) : signed_hex(rel->displacement));
+            return out;
+        }
         if (const auto *imm = std::get_if<ImmediateOperand>(&i.operands[0]))
             out += "#" + hex(imm->value);
         else if (const auto *rel = std::get_if<RelativeOperand>(&i.operands[0]))
@@ -1082,6 +1101,7 @@ std::string format_instruction(const Instruction &i) {
             const auto encoded = i.bytes[0];
             const auto address = hex(static_cast<std::uint64_t>(mem->displacement));
             if (encoded == std::byte{0x6c}) out += "(" + address + ")";
+            else if (i.context.mode == ExecutionMode::m65c02 && encoded == std::byte{0x7c}) out += "(" + address + ", x)";
             else if (i.context.mode == ExecutionMode::m65c02 && (std::to_integer<unsigned>(encoded) & 0x1f) == 0x12) out += "(" + address + ")";
             else if ((std::to_integer<unsigned>(encoded) & 0x1f) == 0x01) out += "(" + address + ", x)";
             else if ((std::to_integer<unsigned>(encoded) & 0x1f) == 0x11) out += "(" + address + "), y";

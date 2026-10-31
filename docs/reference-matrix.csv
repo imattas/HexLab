@@ -7,7 +7,7 @@ processor.arc,processor,ARC,absent,open,,P01,8
 processor.avr,processor,AVR,absent,open,,P01,8
 processor.pdp11,processor,PDP-11,absent,open,,P01,8
 processor.fr,processor,FR,absent,open,,P01,8
-processor.mos6502,processor,6502/65C02,partial,partial,"libs/processors/src/m6502.cpp; tests/processor_modes_tests.cpp; tests/raw_profiles_tests.cpp; tests/function_tests.cpp; tests/reference_tests.cpp; tests/decompiler/m6502_lifting_tests.cpp; docs/m6502.md; NMOS 6502 documented opcodes plus bounded stable unofficial subset including KIL terminal traps; remaining/unstable unofficial opcodes and 65C02 extensions remain",P01,8
+processor.mos6502,processor,6502/65C02,partial,partial,"libs/processors/src/m6502.cpp; tests/processor_modes_tests.cpp; tests/raw_profiles_tests.cpp; tests/function_tests.cpp; tests/reference_tests.cpp; tests/decompiler/m6502_lifting_tests.cpp; docs/m6502.md; NMOS 6502 documented opcodes and bounded unofficial subset; W65C02 decoder mode covers zero-page indirect ALU forms, BRA, STZ, TSB/TRB, stack X/Y, BIT immediate/indexed, indexed JMP, RMB/SMB, BBR/BBS, WAI/STP; CMOS lifting, timing, and loader profiles remain incomplete",P01,8
 processor.w65c816,processor,65C816,absent,open,,P01,8
 processor.z80,processor,Z80,absent,open,,P01,8
 processor.h8,processor,H8,absent,open,,P01,8

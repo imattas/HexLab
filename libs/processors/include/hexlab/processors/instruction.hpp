@@ -679,7 +679,11 @@ enum class Opcode {
     // AArch64 inverted shifted-register logical forms; preserve old IDs.
     a64_bic, a64_orn, a64_eon, a64_bics,
     // MIPS32 REGIMM conditional link branches; append to preserve opcode IDs.
-    mips_bltzal, mips_bgezal, mips_bltzall, mips_bgezall
+    mips_bltzal, mips_bgezal, mips_bltzall, mips_bgezall,
+    // Additional bounded W65C02 opcodes; append to preserve persisted IDs.
+    m65c02_phx, m65c02_plx, m65c02_phy, m65c02_ply,
+    m65c02_tsb, m65c02_trb, m65c02_rmb, m65c02_smb,
+    m65c02_bbr, m65c02_bbs, m65c02_wai, m65c02_stp
 };
 enum class OperandAccess { read, write, read_write, address };
 // The encoded x86 group-one repeat prefix is retained separately from the
