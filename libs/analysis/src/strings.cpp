@@ -10,6 +10,7 @@ namespace {
 #include "strings_cp932_table.inc"
 #include "strings_gbk_table.inc"
 #include "strings_cp949_table.inc"
+#include "strings_cp950_table.inc"
 struct ScanFailure {Error error;};
 struct BudgetEnd {};
 struct WorkBudgetEnd {};
@@ -178,6 +179,15 @@ std::optional<std::uint32_t> decode_windows949_pair(unsigned lead, unsigned trai
     else return {};
     const auto scalar = windows949_pair_table[(lead - 0x81) * 178 + trail_index];
     return scalar ? std::optional<std::uint32_t>{scalar} : std::nullopt;
+}
+std::optional<std::uint32_t> decode_windows950_pair(unsigned lead, unsigned trail) {
+    if (lead < 0x81 || lead > 0xfe) return {};
+    std::size_t trail_index = 0;
+    if (trail >= 0x40 && trail <= 0x7e) trail_index = trail - 0x40;
+    else if (trail >= 0xa1 && trail <= 0xfe) trail_index = 63 + trail - 0xa1;
+    else return {};
+    const auto scalar = windows950_pair_table[(lead - 0x81) * 157 + trail_index];
+    return scalar == 0xffff ? std::nullopt : std::optional<std::uint32_t>{scalar};
 }
 struct Utf8Unit { std::uint32_t scalar=0; unsigned length=0; };
 Utf8Unit decode_utf8(Cursor& input,std::uint64_t at,std::uint64_t end) {
@@ -1118,6 +1128,31 @@ Result<StringScan> scan_selected(const Image& image,const AnalysisOptions& optio
             output.records.erase(std::remove_if(output.records.begin()+static_cast<std::ptrdiff_t>(windows949_first_record),
                                                 output.records.end(),[&](const StringRecord& record) {
                 if(record.encoding!=StringEncoding::windows949)return false;
+                return std::find(strict_utf8_extents.begin(),strict_utf8_extents.end(),
+                    std::pair{record.file_offset.value,record.byte_length})!=strict_utf8_extents.end();
+            }),output.records.end());
+            const auto windows950_first_record = output.records.size();
+            run={};
+            for(auto at=range.begin;at<range.end;) {
+                if(((at-range.begin)&4095)==0)check_stop(stop);
+                const auto first=input.byte(at);
+                if(first==0) {emit(run,true,StringEncoding::windows950,range,options,output,true);++at;continue;}
+                std::optional<std::uint32_t> scalar;
+                unsigned length=1;
+                if(first>=0x81 && first<=0xfe) {
+                    if(range.end-at>=2) {
+                        scalar=decode_windows950_pair(first,input.byte(at+1));
+                        if(scalar) length=2;
+                    }
+                } else if(first<0x80) scalar=first;
+                if(scalar && printable(*scalar)) {run.add(at,*scalar,length);at+=length;}
+                else {emit(run,false,StringEncoding::windows950,range,options,output,true);++at;}
+            }
+            emit(run,false,StringEncoding::windows950,range,options,output,true);
+            // Keep strict UTF-8 as the preferred interpretation for identical bytes.
+            output.records.erase(std::remove_if(output.records.begin()+static_cast<std::ptrdiff_t>(windows950_first_record),
+                                                output.records.end(),[&](const StringRecord& record) {
+                if(record.encoding!=StringEncoding::windows950)return false;
                 return std::find(strict_utf8_extents.begin(),strict_utf8_extents.end(),
                     std::pair{record.file_offset.value,record.byte_length})!=strict_utf8_extents.end();
             }),output.records.end());

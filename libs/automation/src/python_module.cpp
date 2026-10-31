@@ -70,6 +70,7 @@ const char* string_encoding_name(StringEncoding encoding){
     case StringEncoding::windows932:return "Windows-932";
     case StringEncoding::windows936:return "Windows-936 (GBK)";
     case StringEncoding::windows949:return "Windows-949 (UHC)";
+    case StringEncoding::windows950:return "Windows-950 (Big5)";
     }
     return "unknown";
 }
