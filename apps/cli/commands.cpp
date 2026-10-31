@@ -1402,6 +1402,7 @@ int modules_command(std::span<const std::wstring_view> arguments, std::ostream &
         supplied.push_back({path_text(module.path), &module.document->metadata});
     print_pe_import_resolutions(supplied, out);
     print_elf_import_resolutions(supplied, out);
+    print_elf_copy_dependencies(supplied, out);
     print_macho_import_resolutions(supplied, out);
     return 0;
 }

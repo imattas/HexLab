@@ -4,7 +4,7 @@
 
 The pass treats undefined non-local symbols in non-section dynamic symbol tables as imports. Candidate providers must be ELF inputs supplied on the command line and, when the importer has `DT_NEEDED` entries, have a basename named by one of those entries. A candidate provider must have the same ELF class, byte order, and machine as the importer. Conflicting nonzero OSABI tags are also rejected; OSABI 0 is treated as unspecified because it is common across otherwise compatible System V/Linux binaries. If no compatible candidate remains, the report names the first incompatibility category (class/byte order/machine or concrete OSABI conflict). Provider exports are read only from symbol tables referenced by the provider's dynamic tables, so a definition present only in a static symbol table cannot satisfy a dynamic import. Matching uses the exact base symbol name. A versioned import requires an export with the exact GNU version name and, when present, the `DT_VERNEED` library basename. An unversioned import can match an unversioned export or the default (non-hidden) version of a versioned export. Hidden and internal exports are excluded; protected exports remain eligible to external importers. Global, weak, and GNU-unique exports are eligible, including absolute definitions; local and other binding classes are excluded. If both the import and export declare a non-`STT_NOTYPE` symbol type, differing types are not treated as matches; if that leaves no eligible export, the row reports an unsupported symbol-type mismatch. `STT_NOTYPE` on either side is treated as unknown and does not block a match. Exactly one eligible matching symbol resolves; no match is unresolved and multiple matches are ambiguous. Each importer is capped at 100,000 rows.
 
-This is metadata matching, not a runtime loader simulation. It does not apply relocations, choose among ELF search-path precedence or symbol interposition rules, model namespaces/auditing, or infer providers when no supplied file is named by `DT_NEEDED`. The compatibility check covers ELF class, byte order, machine, conflicting concrete OSABI tags, concrete symbol-type mismatches, and selected machine-specific `e_flags`: RISC-V FLOAT_ABI/RVE/RV64ILP32, ARM EABI version and (for EABI v5+) hard/soft-float procedure-call ABI, PPC64 ELF ABI version (ELFv1/ELFv2), MIPS `EF_MIPS_ABI2` (N32) / nonzero `EF_MIPS_ABI` selector values, and LoongArch's low `e_flags` ABI selector byte. MIPS and LoongArch ABI flags are compared only when both files provide a nonzero selector; missing flags remain unknown and do not conflict. RVC and TSO differences are allowed because the RISC-V psABI defines those fields as mergeable. For ARM and PPC64, zero/unknown flag values do not conflict with a concrete value; this avoids rejecting providers whose ABI metadata is absent. The [LoongArch ELF ABI specification](https://loongson.github.io/LoongArch-Documentation/LoongArch-ELF-ABI-EN.pdf) identifies ABI type using ELF class and `e_flags[7:0]`. Other machine-specific ABI flags remain unchecked; equal symbol types do not establish full ABI compatibility, and `STT_NOTYPE` is accepted as unknown. A matching TLS or GNU IFUNC export is reported unsupported because resolving it requires runtime allocation or resolver execution. Copy relocations and weak-zero fallback are also not modeled. The report prints a file address only when the loader recorded one; it does not imply that address is a process runtime address. Inputs without parsed ELF dynamic symbol tables can have no rows to resolve. The policies follow the [RISC-V ELF psABI](https://github.com/riscv-non-isa/riscv-elf-psabi-doc/blob/master/riscv-elf.adoc#file-header), [Arm ELF ABI](https://github.com/ARM-software/abi-aa/blob/main/aaelf32/aaelf32.rst#52-elf-header), [64-bit PowerPC ELF ABI](https://refspecs.linuxfoundation.org/ELF/ppc64/PPC-elf64abi.pdf), and [MIPS ELF ABI Supplement](https://refspecs.linuxbase.org/elf/mipsabi.pdf); MIPS e_flags names and encodings are cross-checked against [LLVM's ELF constants](https://github.com/llvm/llvm-project/blob/main/llvm/include/llvm/BinaryFormat/ELF.h).
+This is metadata matching, not a runtime loader simulation. It does not apply relocations, choose among ELF search-path precedence or symbol interposition rules, model namespaces/auditing, or infer providers when no supplied file is named by `DT_NEEDED`. The compatibility check covers ELF class, byte order, machine, conflicting concrete OSABI tags, concrete symbol-type mismatches, and selected machine-specific `e_flags`: RISC-V FLOAT_ABI/RVE/RV64ILP32, ARM EABI version and (for EABI v5+) hard/soft-float procedure-call ABI, PPC64 ELF ABI version (ELFv1/ELFv2), MIPS `EF_MIPS_ABI2` (N32) / nonzero `EF_MIPS_ABI` selector values, and LoongArch's low `e_flags` ABI selector byte. MIPS and LoongArch ABI flags are compared only when both files provide a nonzero selector; missing flags remain unknown and do not conflict. RVC and TSO differences are allowed because the RISC-V psABI defines those fields as mergeable. For ARM and PPC64, zero/unknown flag values do not conflict with a concrete value; this avoids rejecting providers whose ABI metadata is absent. The [LoongArch ELF ABI specification](https://loongson.github.io/LoongArch-Documentation/LoongArch-ELF-ABI-EN.pdf) identifies ABI type using ELF class and `e_flags[7:0]`. Other machine-specific ABI flags remain unchecked; equal symbol types do not establish full ABI compatibility, and `STT_NOTYPE` is accepted as unknown. A matching TLS or GNU IFUNC export is reported unsupported because resolving it requires runtime allocation or resolver execution. COPY relocation application remains unsupported; candidate source relationships are described below. The report prints a file address only when the loader recorded one; it does not imply that address is a process runtime address. Inputs without parsed ELF dynamic symbol tables can have no rows to resolve. The policies follow the [RISC-V ELF psABI](https://github.com/riscv-non-isa/riscv-elf-psabi-doc/blob/master/riscv-elf.adoc#file-header), [Arm ELF ABI](https://github.com/ARM-software/abi-aa/blob/main/aaelf32/aaelf32.rst#52-elf-header), [64-bit PowerPC ELF ABI](https://refspecs.linuxfoundation.org/ELF/ppc64/PPC-elf64abi.pdf), and [MIPS ELF ABI Supplement](https://refspecs.linuxbase.org/elf/mipsabi.pdf); MIPS e_flags names and encodings are cross-checked against [LLVM's ELF constants](https://github.com/llvm/llvm-project/blob/main/llvm/include/llvm/BinaryFormat/ELF.h).
 
 Undefined `STB_WEAK` imports resolve to zero when no eligible definition exists
 among the supplied, ABI-compatible `DT_NEEDED` providers. A matching TLS or
@@ -12,3 +12,55 @@ GNU IFUNC export and a concrete symbol-type mismatch remain unsupported; an
 incompatible provider set also remains unsupported. This zero result is scoped
 to the supplied candidate set and does not claim that an unprovided runtime
 module could not define the symbol.
+
+## COPY relocation source relationships
+
+`modules` also prints a separate `ELF COPY relocation dependencies` report.
+A COPY relocation refers to the executable's allocated definition, so scanning
+only undefined symbols misses this dependency. The report follows only rows
+referenced by parsed dynamic relocation tables and classified as COPY by the
+loader's machine-specific relocation decoder. Static-only relocation tables
+do not create these relationships. Each importer emits at most 100,000 COPY
+rows, with an explicit omitted count. The report prints dynamic/relocation
+metadata completeness, relocation type, metadata row, table and record file
+offsets, table-local index, exact dynamic symbol table and symbol index,
+destination image address, symbol version and allocated size. Missing symbol
+namespace information remains unsupported.
+Source lookup also has a shared one-million provider/symbol-visit budget per
+importer. Exhaustion marks the current and subsequent source lookups
+unsupported; a partially scanned candidate set never yields a unique source.
+
+Supported destinations are `ET_EXEC`, or `ET_DYN` with `PT_INTERP` or
+`DF_1_PIE` evidence. They must name a nonempty, defined, default-visible
+`STT_OBJECT` with global or weak binding, nonzero size, and a relocation
+destination equal to the symbol value within writable `PT_LOAD` memory.
+Candidate sources come only from other supplied `ET_DYN` shared objects
+whose file basename occurs in the executable's direct `DT_NEEDED` names;
+`ET_EXEC` and explicit `DF_1_PIE` providers are excluded. `PT_INTERP` alone does
+not disqualify a source shared object, since runnable shared libraries such as
+libc can carry it. The existing ELF ABI checks and exact GNU
+version/version-need library matching apply. Source definitions must be
+dynamic, default-visible, global/weak/GNU-unique `STT_OBJECT` symbols with the
+same nonzero size and a recorded address within readable `PT_LOAD` memory.
+The range checks use memory size, allowing zero-initialized object storage.
+Protected exports, absolute definitions, TLS/IFUNC, unknown symbol types,
+size changes and missing storage metadata remain unsupported. Rejected ABI
+candidates are counted. Multiple eligible sources remain ambiguous, and an
+otherwise matching unsupported definition prevents a unique candidate claim.
+Weak COPY destinations never receive the undefined-import zero fallback.
+
+An eligible source is labeled `candidate source`, with its file, symbol-table
+offset/index, image address and size. This is an offline source-to-destination
+relationship: it copies no bytes, chooses no runtime provider, and does not
+model transitive lookup scope, preloads, interposition, namespaces, aliases
+through `DT_SONAME`, or loader-specific size-mismatch copying. No filesystem
+search is initiated by this report. Discovered files already retained by graph
+discovery are included in the supplied candidate set. The executable's copy
+definition cannot satisfy its own source relationship. The distinction follows
+the [GNU C Library COPY lookup classification and x86-64 implementation](https://codebrowser.dev/glibc/glibc/sysdeps/x86_64/dl-machine.h.html),
+which excludes the main executable from COPY source lookup and checks source
+and destination sizes before copying. Addresses printed here are preferred
+image addresses, not process addresses.
+
+`ET_DYN` files without `DF_1_PIE` remain candidate shared objects; this
+metadata cannot reliably identify older PIE executables that omit that flag.

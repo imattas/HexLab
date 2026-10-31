@@ -174,6 +174,17 @@ unresolved graph edges. The existing symbol report also includes the retained
 discovered modules; it remains a supplied-candidate report rather than a
 simulated runtime link map.
 
+The symbol report also includes a separate bounded ELF COPY source inventory.
+Dynamic COPY relocations name allocated executable definitions, so these rows
+are not found by the undefined-import pass. Each row retains relocation and
+symbol provenance, destination and size; an eligible direct `DT_NEEDED`
+supplied shared-object definition is labeled `candidate source`. ABI/version
+checks, exact nonzero object sizes and mapped-storage checks apply. Multiple
+sources stay ambiguous and unsupported definitions stay explicit. No bytes
+are copied and no runtime lookup order is inferred. See
+[ELF COPY relocation source relationships](elf-module-symbol-resolution.md#copy-relocation-source-relationships)
+for supported destination forms, bounds and limitations.
+
 Discovery shares the 4,096-module, 100,000-dependency-row, 16-MiB-name and
 64-level graph bounds. It additionally limits the entire traversal to 4,096
 distinct inspected files, one million dynamic metadata entries, 100,000 exact

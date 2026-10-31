@@ -267,6 +267,144 @@ inline std::vector<std::size_t> elf_dynamic_symbol_table_indices(const ElfMetada
     return indices;
 }
 
+// COPY names a definition in the executable, so it is deliberately separate
+// from the undefined-symbol pass. Retain the relocation's exact namespace
+// and never treat that destination definition as its own source provider.
+inline void print_elf_copy_dependencies(const std::vector<SuppliedModule> &modules, std::ostream &out) {
+    constexpr std::size_t row_cap = 100000, lookup_work_cap = 1000000;
+    const auto pie = [](const ElfMetadata &elf) {
+        for (const auto &table : elf.dynamic_tables)
+            for (const auto &entry : table.entries)
+                if (entry.tag == 0x6ffffffb && (entry.value & 0x08000000)) return true; // DF_1_PIE
+        return false;
+    };
+    const auto executable = [&](const ElfMetadata &elf) {
+        return elf.header.object_type == 2 || // ET_EXEC
+            (elf.header.object_type == 3 && (elf.interpreter || pie(elf)));
+    };
+    std::vector<std::vector<std::size_t>> dynamic_tables_by_module(modules.size());
+    std::vector<bool> pie_by_module(modules.size());
+    for (std::size_t i = 0; i < modules.size(); ++i)
+        if (modules[i].metadata && modules[i].metadata->elf) {
+            dynamic_tables_by_module[i] = elf_dynamic_symbol_table_indices(*modules[i].metadata->elf);
+            pie_by_module[i] = pie(*modules[i].metadata->elf);
+        }
+    const auto mapped_object = [](const ElfMetadata &elf, std::uint64_t value,
+                                  std::uint64_t size, std::uint32_t permission) {
+        return size != 0 && std::any_of(elf.programs.begin(), elf.programs.end(), [&](const auto &program) {
+            return program.type == 1 && (program.flags & permission) == permission &&
+                value >= program.address && value - program.address <= program.memory_size &&
+                size <= program.memory_size - (value - program.address);
+        });
+    };
+    out << "ELF COPY relocation dependencies (candidate sources only; no bytes copied):\n";
+    for (const auto &importer : modules) {
+        if (!importer.metadata || !importer.metadata->elf) continue;
+        const auto &elf = *importer.metadata->elf;
+        const auto dynamic_symbols = elf_dynamic_symbol_table_indices(elf);
+        std::set<std::uint64_t> dynamic_rows;
+        std::set<std::string> needed;
+        for (const auto &table : elf.dynamic_tables) {
+            for (const auto &entry : table.entries)
+                if (entry.tag == 1 && entry.string_value) needed.insert(module_leaf(*entry.string_value));
+            for (const auto &reference : table.relocation_tables)
+                if (reference.table_index < elf.relocation_tables.size()) {
+                    const auto &rows = elf.relocation_tables[static_cast<std::size_t>(reference.table_index)].rows;
+                    dynamic_rows.insert(rows.begin(), rows.end());
+                }
+        }
+        std::map<std::pair<std::size_t, std::uint32_t>, const ElfSymbol *> symbols;
+        for (const auto &symbol : elf.symbols)
+            if (symbol.table && std::binary_search(dynamic_symbols.begin(), dynamic_symbols.end(), *symbol.table))
+                symbols.emplace(std::pair{static_cast<std::size_t>(*symbol.table), symbol.index}, &symbol);
+        std::size_t emitted = 0, omitted = 0, lookup_work = 0;
+        bool lookup_exhausted = false;
+        out << "  " << importer.path << " (dynamic metadata " << (elf.dynamic_complete ? "complete" : "partial")
+            << ", relocation metadata " << (elf.relocations_complete ? "complete" : "partial") << ")\n";
+        for (const auto row_index : dynamic_rows) {
+            if (row_index >= elf.relocations.size()) continue;
+            const auto &row = elf.relocations[static_cast<std::size_t>(row_index)];
+            if (row.kind != ElfRelocationKind::copy) continue;
+            if (emitted == row_cap) { ++omitted; continue; }
+            ++emitted;
+            out << "    COPY type=" << row.type << " row=" << row_index << " record=0x" << std::hex
+                << row.record_file_offset << " table=0x" << row.source.file_offset << std::dec
+                << " index=" << row.index << " symbol-index=" << row.symbol_index << " destination=0x"
+                << std::hex << row.offset << std::dec;
+            const ElfSymbol *wanted = nullptr;
+            if (row.symbol_index_validated && row.symbol_table)
+                for (const auto table_index : dynamic_symbols)
+                    if (elf.symbol_tables[table_index].source == *row.symbol_table) {
+                        const auto found = symbols.find({table_index, row.symbol_index});
+                        if (found != symbols.end()) wanted = found->second;
+                        break;
+                    }
+            if (!wanted) { out << " -> unsupported (dynamic symbol namespace unavailable)\n"; continue; }
+            out << " symbol-table=0x" << std::hex << row.symbol_table->file_offset << std::dec
+                << " " << wanted->name;
+            if (wanted->version_name) out << "@" << *wanted->version_name;
+            out << " size=" << wanted->size << " -> ";
+            if (!executable(elf)) { out << "unsupported (destination is not a known executable)\n"; continue; }
+            if (wanted->name.empty() || wanted->state != ElfSymbolState::defined || wanted->type != 1 ||
+                (wanted->binding != 1 && wanted->binding != 2) || wanted->visibility != 0 ||
+                wanted->value != row.offset || !row.place ||
+                !mapped_object(elf, row.offset, wanted->size, 2)) {
+                out << "unsupported (COPY requires a nonempty defined default-visible OBJECT in writable executable storage)\n";
+                continue;
+            }
+            const SuppliedModule *match_provider = nullptr;
+            const ElfSymbol *match_symbol = nullptr;
+            std::size_t matches = 0, incompatible = 0, unsupported = 0;
+            for (std::size_t provider_index = 0; provider_index < modules.size(); ++provider_index) {
+                if (lookup_work == lookup_work_cap) { lookup_exhausted = true; break; }
+                ++lookup_work;
+                const auto &provider = modules[provider_index];
+                if (&provider == &importer || !provider.metadata || !provider.metadata->elf) continue;
+                if (!needed.contains(module_leaf(provider.path))) continue;
+                const auto &candidate_elf = *provider.metadata->elf;
+                if (elf_abi_incompatibility(elf.header, candidate_elf.header)) { ++incompatible; continue; }
+                // Some shared libraries (including libc) also have PT_INTERP.
+                // Only ET_EXEC and explicit DF_1_PIE sources are excluded.
+                if (candidate_elf.header.object_type != 3 || pie_by_module[provider_index]) continue;
+                if (wanted->version_file && module_leaf(*wanted->version_file) != module_leaf(provider.path)) continue;
+                const auto &provider_tables = dynamic_tables_by_module[provider_index];
+                for (const auto &candidate : candidate_elf.symbols) {
+                    if (lookup_work == lookup_work_cap) { lookup_exhausted = true; break; }
+                    ++lookup_work;
+                    if (!candidate.table || !std::binary_search(provider_tables.begin(), provider_tables.end(), *candidate.table) ||
+                        candidate.name != wanted->name ||
+                        (candidate.binding != 1 && candidate.binding != 2 && candidate.binding != 10) ||
+                        candidate.visibility == 1 || candidate.visibility == 2) continue;
+                    if (wanted->version_name ? candidate.version_name != wanted->version_name
+                                             : candidate.version_name && candidate.version_hidden) continue;
+                    if (candidate.state == ElfSymbolState::undefined) continue;
+                    if (candidate.state != ElfSymbolState::defined || candidate.type != 1 || candidate.visibility != 0 ||
+                        candidate.size != wanted->size || !candidate.address ||
+                        !mapped_object(candidate_elf, candidate.value, candidate.size, 4)) { ++unsupported; continue; }
+                    ++matches;
+                    match_provider = &provider;
+                    match_symbol = &candidate;
+                }
+                if (lookup_exhausted) break;
+            }
+            if (lookup_exhausted) out << "unsupported (1000000 COPY provider/symbol lookup work cap reached)";
+            else if (matches > 1) out << "ambiguous (" << matches << " eligible supplied source definitions)";
+            else if (unsupported) out << "unsupported (" << unsupported
+                << " matching source definitions have unsupported type/state/visibility/size/storage)";
+            else if (!matches) out << "unresolved (no eligible supplied DT_NEEDED shared-object source)";
+            else {
+                out << "candidate source " << match_provider->path << " symbol-table=0x" << std::hex
+                    << match_symbol->table_offset << std::dec << " symbol-index=" << match_symbol->index
+                    << " address=0x" << std::hex << match_symbol->address->offset << std::dec
+                    << " size=" << match_symbol->size;
+            }
+            if (incompatible) out << " (" << incompatible << " incompatible supplied providers rejected)";
+            out << "\n";
+        }
+        if (omitted) out << "    ... omitted " << omitted << " COPY rows (100000 row cap)\n";
+    }
+}
+
 // Resolve undefined ELF dynamic symbols against explicitly supplied objects.
 // We intentionally require a unique DT_NEEDED basename when available; no
 // ambient loader search path or filesystem probing is performed.
