@@ -125,6 +125,12 @@ struct JvmTypeAnnotation {
     std::vector<std::uint8_t> target_info;
     std::vector<std::pair<std::uint8_t, std::uint8_t>> type_path;
     JvmAnnotation annotation;
+    // Indexes into the immediate declaration owner's generic_signature tree.
+    // The root precedes type_path navigation; the terminal identifies the
+    // annotated array/type variable/class segment/type argument or bound.
+    std::optional<std::uint32_t> target_signature_node, annotated_signature_node;
+    // Raw target_info/type_path always survive unavailable or invalid binding.
+    std::string target_diagnostic;
     bool operator==(const JvmTypeAnnotation &) const = default;
 };
 struct JvmMethodParameter {

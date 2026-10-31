@@ -187,7 +187,18 @@ inline void jvm_description(std::ostream &out, const ImageMetadata &metadata) {
     out << "Interfaces: " << j.interfaces.size() << " Fields: " << j.fields.size()
         << " Methods: " << j.methods.size() << " Constant pool: " << (j.constant_pool.size() - 1) << '\n';
     const auto annotations=[&](const auto &items,const char *visibility,const char *owner){for(const auto &annotation:items)out<<visibility<<" annotation "<<owner<<": "<<annotation.descriptor<<" elements="<<annotation.elements.size()<<'\n';};
-    const auto type_annotations=[&](const auto &items,const char *visibility,const std::string &owner){for(const auto &annotation:items)out<<visibility<<" type annotation "<<owner<<" target=0x"<<std::hex<<static_cast<unsigned>(annotation.target_type)<<std::dec<<" path="<<annotation.type_path.size()<<": "<<annotation.annotation.descriptor<<" elements="<<annotation.annotation.elements.size()<<'\n';};
+    const auto type_annotations=[&](const auto &items,const char *visibility,const std::string &owner){
+        std::size_t rows=0;
+        for(const auto &annotation:items){
+            if(rows++>=128)continue;
+            out<<visibility<<" type annotation "<<owner<<" target=0x"<<std::hex<<static_cast<unsigned>(annotation.target_type)<<std::dec<<" path="<<annotation.type_path.size()<<": "<<jvm_utf8_prefix(annotation.annotation.descriptor,256)<<" elements="<<annotation.annotation.elements.size();
+            if(annotation.target_signature_node)out<<" signature-root=#"<<*annotation.target_signature_node;
+            if(annotation.annotated_signature_node)out<<" annotated-node=#"<<*annotation.annotated_signature_node;
+            if(!annotation.target_diagnostic.empty())out<<" unresolved="<<jvm_utf8_prefix(annotation.target_diagnostic,256);
+            out<<'\n';
+        }
+        if(items.size()>128)out<<visibility<<" type annotation "<<owner<<" rows omitted="<<items.size()-128<<" (limit 128)\n";
+    };
     annotations(j.visible_annotations,"visible","class");annotations(j.invisible_annotations,"invisible","class");
     type_annotations(j.visible_type_annotations,"visible","class");type_annotations(j.invisible_type_annotations,"invisible","class");
     if (j.nest_host_reference) {

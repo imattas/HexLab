@@ -17,3 +17,52 @@ resolve or execute bootstrap methods, check their runtime linkage behavior,
 validate bootstrap method signatures against each call site, or evaluate
 dynamic constants. Bootstrap entry and aggregate argument retention are each
 capped at 8,192; oversized tables are rejected rather than partially retained.
+
+## Generic type-annotation targets
+
+Declaration type annotations now bind to the owning declaration's parsed
+`Signature` tree after all classfile attributes have been read. Binding covers
+class/method type parameter declarations and their bounds, class supertypes,
+field/Record-component types, and ordinary method result types. Both visibility
+variants receive the same handling. The original `target_info`, `type_path`,
+and annotation value remain intact.
+
+`target_signature_node` identifies the declaration/type root;
+`annotated_signature_node` identifies the selected type, class segment or
+wildcard after following the encoded type path. Both indexes address the
+immediate owner's `generic_signature.parsed.nodes`. Existing node text spans
+and signature constant-pool/source offsets locate the selected source bytes.
+Array elements, nested class segments, wildcard bounds and indexed type
+arguments are navigated without expanding or copying signature text. Bound
+index zero remains reserved for the class-bound slot even when that slot is
+empty; such an empty slot cannot supply an annotated type.
+
+A missing, malformed, over-budget or semantically unresolved signature, an
+out-of-range type parameter/bound, or an incompatible path leaves the original
+annotation available with `target_diagnostic` and marks metadata incomplete.
+Binding failure does not reject otherwise readable classfile bytes. Non-generic
+field/result/supertype declarations without a Signature are retained without a
+binding attempt. A valid root can remain available when path navigation fails.
+The CLI prints root/terminal node indexes or the diagnostic and caps output at
+128 type annotations per visibility and owner.
+
+Formal parameter, throws, receiver, constructor-result and Code targets remain
+in their existing raw representation. Formal parameter indexes can differ from
+method descriptor positions because of synthetic parameters. Generic throws
+clauses can omit ordinary exceptions, and a constructor's Signature result is
+`V` although its return-type annotation denotes the constructed class. The
+loader does not guess those mappings, infer nested class segments from `$` in
+binary names, resolve external types, or navigate paths against descriptors
+when generic syntax is unavailable. These rules follow the
+[JVMS target_info and type_path definitions](https://docs.oracle.com/javase/specs/jvms/se25/html/jvms-4.html#jvms-4.7.20.1).
+
+Binding performs one bounded traversal of each retained signature root and at
+most 255 steps for each retained annotation path. Existing class budgets cap
+signature retention at 100,000 nodes and combined annotation metadata at 65,536
+items; the binder introduces no recursive traversal or signature-text copies.
+Cancellation is checked for every annotation.
+
+Validation on Windows x64 Debug: configured with `BUILD_TESTING=OFF`, built and
+linked `hexlab_loaders`, and compiled all CLI translation units with MSBuild
+`/t:ClCompile /p:BuildProjectReferences=false`. Both commands exited zero. The
+full CLI executable link was not run. No tests were added or run.

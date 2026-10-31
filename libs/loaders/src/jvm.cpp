@@ -211,6 +211,94 @@ SmapParseResult parse_source_debug_map(std::string_view source, std::stop_token 
     result.map = std::move(map);
     return result;
 }
+// Bind only declaration targets whose relationship to Signature is unambiguous.
+// Formal parameter indexes can omit synthetic descriptor parameters; throws
+// signatures may omit non-generic exceptions, so neither is mapped by position.
+Result<bool> bind_generic_type_annotations(std::vector<JvmTypeAnnotation> &annotations,
+                                           const JvmGenericSignatureAnalysis *analysis,
+                                           std::stop_token stop, bool constructor = false) {
+    if (annotations.empty()) return true;
+    const JvmGenericSignature *tree = analysis && analysis->parsed ? &*analysis->parsed : nullptr;
+    std::vector<std::uint32_t> formals, superclasses, interfaces, results, fields;
+    if (tree && !tree->nodes.empty()) {
+        for (const auto index : tree->nodes.front().children) {
+            const auto &node = tree->nodes[index];
+            if (node.kind == JvmGenericNodeKind::type_parameter) formals.push_back(index);
+            else if (node.kind == JvmGenericNodeKind::superclass) superclasses.push_back(index);
+            else if (node.kind == JvmGenericNodeKind::superinterface) interfaces.push_back(index);
+            else if (node.kind == JvmGenericNodeKind::result) results.push_back(index);
+            else if (tree->kind == JvmGenericSignatureKind::field_signature) fields.push_back(index);
+        }
+    }
+    bool complete = true;
+    for (auto &annotation : annotations) {
+        if (stop.stop_requested()) return Error{ErrorCode::canceled, "generic type-annotation binding canceled"};
+        const auto target = annotation.target_type;
+        if (target != 0x00 && target != 0x01 && target != 0x10 && target != 0x11 &&
+            target != 0x12 && target != 0x13 && target != 0x14) continue;
+        if (target == 0x14 && constructor) continue; // Constructor result denotes the new class, not Signature V.
+        // Signature is optional for non-generic field/result/supertype roots.
+        const bool requires_generic_declaration = target == 0x00 || target == 0x01 || target == 0x11 || target == 0x12;
+        if (!analysis && !requires_generic_declaration) continue;
+        const auto fail = [&](const char *message) { annotation.target_diagnostic = message; complete = false; };
+        if (!tree || tree->nodes.empty() || !analysis->diagnostic.empty()) {
+            fail("type-annotation target has no usable generic Signature");
+            continue;
+        }
+        std::optional<std::uint32_t> selected;
+        const auto unwrap = [&](const std::vector<std::uint32_t> &nodes, std::size_t index) -> std::optional<std::uint32_t> {
+            if (index >= nodes.size()) return std::nullopt;
+            const auto &children = tree->nodes[nodes[index]].children;
+            return children.size() == 1 ? std::optional<std::uint32_t>{children.front()} : std::nullopt;
+        };
+        if (target == 0x00 || target == 0x01 || target == 0x11 || target == 0x12) {
+            if (annotation.target_info.empty() || annotation.target_info[0] >= formals.size()) {
+                fail("type-annotation type parameter index exceeds generic Signature"); continue;
+            }
+            selected = formals[annotation.target_info[0]];
+            if (target == 0x11 || target == 0x12) {
+                // The empty class-bound slot still occupies index zero.
+                if (annotation.target_info.size() != 2) { fail("type-annotation bound target is incomplete"); continue; }
+                selected = unwrap(tree->nodes[*selected].children, annotation.target_info[1]);
+            }
+        } else if (target == 0x10) {
+            if (annotation.target_info.size() != 2) { fail("type-annotation supertype target is incomplete"); continue; }
+            const auto index = (std::uint16_t(annotation.target_info[0]) << 8) | annotation.target_info[1];
+            selected = index == 0xffff ? unwrap(superclasses, 0) : unwrap(interfaces, index);
+        } else if (target == 0x13) {
+            if (fields.size() == 1) selected = fields.front();
+        } else if (target == 0x14) selected = unwrap(results, 0);
+        if (!selected || tree->nodes[*selected].kind == JvmGenericNodeKind::void_type) {
+            fail("type-annotation target does not identify an encoded generic type or bound"); continue;
+        }
+        annotation.target_signature_node = selected;
+        std::size_t segment = 0;
+        bool valid = true;
+        for (const auto &[kind, argument] : annotation.type_path) {
+            const auto &node = tree->nodes[*selected];
+            if (kind == 0 && node.kind == JvmGenericNodeKind::array_type && node.children.size() == 1) {
+                selected = node.children.front(); segment = 0;
+            } else if (kind == 1 && node.kind == JvmGenericNodeKind::class_type && segment + 1 < node.children.size()) {
+                ++segment;
+            } else if (kind == 2 && (node.kind == JvmGenericNodeKind::extends_argument ||
+                       node.kind == JvmGenericNodeKind::super_argument) && node.children.size() == 1) {
+                selected = node.children.front(); segment = 0;
+            } else if (kind == 3 && node.kind == JvmGenericNodeKind::class_type && segment < node.children.size()) {
+                const auto &arguments = tree->nodes[node.children[segment]].children;
+                if (argument >= arguments.size()) { valid = false; break; }
+                selected = arguments[argument];
+                const auto &value = tree->nodes[*selected];
+                if (value.kind == JvmGenericNodeKind::exact_argument && value.children.size() == 1) selected = value.children.front();
+                segment = 0;
+            } else { valid = false; break; }
+        }
+        if (!valid) { fail("type-annotation type_path does not select a type in generic Signature"); continue; }
+        const auto &node = tree->nodes[*selected];
+        annotation.annotated_signature_node = node.kind == JvmGenericNodeKind::class_type && segment < node.children.size()
+            ? node.children[segment] : *selected;
+    }
+    return complete;
+}
 std::unordered_set<std::string> generic_formals(const JvmGenericSignatureAnalysis *analysis) {
     std::unordered_set<std::string> names;
     if(!analysis||!analysis->parsed||analysis->parsed->nodes.empty())return names;
@@ -1686,6 +1774,21 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage,std::stop_t
             }
         }
     }
+    // Deferred binding sees all sibling attributes, including Signature entries
+    // which occur after the annotation table. Failures preserve raw metadata.
+    const auto bind_annotations = [&](auto &owner, bool constructor = false) -> Result<bool> {
+        const auto *analysis = owner.generic_signature ? &*owner.generic_signature : nullptr;
+        auto visible = bind_generic_type_annotations(owner.visible_type_annotations, analysis, stop, constructor);
+        if (!visible) return visible.error();
+        auto invisible = bind_generic_type_annotations(owner.invisible_type_annotations, analysis, stop, constructor);
+        if (!invisible) return invisible.error();
+        if (!visible.value() || !invisible.value()) metadata_complete = false;
+        return true;
+    };
+    auto bound_annotations = bind_annotations(md); if (!bound_annotations) return bound_annotations.error();
+    for (auto &field : md.fields) { auto bound = bind_annotations(field); if (!bound) return bound.error(); }
+    for (auto &method : md.methods) { auto bound = bind_annotations(method, method.name == "<init>"); if (!bound) return bound.error(); }
+    for (auto &component : md.record_components) { auto bound = bind_annotations(component); if (!bound) return bound.error(); }
     for(std::size_t i=1;i<md.constant_pool.size();++i)if(md.constant_pool[i].tag==17||md.constant_pool[i].tag==18){
         const auto bootstrap_index=md.constant_pool[i].first;
         if(!md.bootstrap_methods||bootstrap_index>=md.bootstrap_methods->size())return malformed("dynamic constant references a missing BootstrapMethods entry");
