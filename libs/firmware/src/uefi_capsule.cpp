@@ -30,7 +30,10 @@ constexpr std::array<std::uint8_t, 16> pkcs7_guid{
     0x9d,0xd2,0xaf,0x4a,0xdf,0x68,0xee,0x49,0x8a,0xa9,0x34,0x7d,0x37,0x56,0x65,0xa7};
 constexpr std::uint32_t fmp_payload_signature = 0x3153534d; // "MSS1"
 constexpr std::uint32_t capsule_reserved_spec_flags = 0xfff80000u;
+constexpr std::uint64_t capsule_support_authentication = 0x1;
 constexpr std::uint64_t capsule_support_dependency = 0x2;
+constexpr std::uint64_t capsule_support_known_bits =
+    capsule_support_authentication | capsule_support_dependency;
 constexpr std::size_t max_dependency_expression_bytes = 1024 * 1024;
 Error malformed(const char *message) { return {ErrorCode::malformed, message}; }
 
@@ -417,7 +420,15 @@ Result<UefiCapsule> parse_fmp_impl(std::span<const std::byte> bytes, UefiCapsule
             item.update_image_size = u32(bytes, p + 24);
             item.vendor_code_size = u32(bytes, p + 28);
             if (item.image_header_version >= 2) item.hardware_instance = u64(bytes, p + 32);
-            if (item.image_header_version >= 3) item.image_capsule_support = u64(bytes, p + 40);
+            if (item.image_header_version >= 3) {
+                item.image_capsule_support_offset = p + 40;
+                item.image_capsule_support = u64(bytes, p + 40);
+                item.capsule_support_authentication_advertised =
+                    (item.image_capsule_support & capsule_support_authentication) != 0;
+                item.capsule_support_dependency_advertised =
+                    (item.image_capsule_support & capsule_support_dependency) != 0;
+                item.capsule_support_unrecognized_bits = item.image_capsule_support & ~capsule_support_known_bits;
+            }
             const std::uint64_t content_size = item.image_header_size + item.update_image_size + item.vendor_code_size;
             if (content_size != item.size) return malformed("FMP image and vendor-code sizes do not match item extent");
             item.payload_offset = item.file_offset + item.image_header_size;
@@ -447,6 +458,13 @@ Result<UefiCapsule> parse_fmp_impl(std::span<const std::byte> bytes, UefiCapsule
                     item.authentication_header_size = 8 + certificate_size;
                     item.payload_offset += item.authentication_header_size;
                 }
+            }
+            if (item.image_header_version >= 3 &&
+                item.capsule_support_authentication_advertised != item.authentication_present) {
+                item.capsule_support_authentication_mismatch = true;
+                item.capsule_support_authentication_diagnostic = item.capsule_support_authentication_advertised
+                    ? "CAPSULE_SUPPORT_AUTHENTICATION is set but the PKCS#7 authentication prefix was not recognized"
+                    : "PKCS#7 authentication prefix is present while CAPSULE_SUPPORT_AUTHENTICATION is clear";
             }
 
             item.firmware_image_offset = item.payload_offset;
