@@ -12250,6 +12250,9 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
         const auto count = function.blocks.size();
         constexpr std::size_t max_return_tree_blocks = 4096;
         constexpr std::size_t max_return_tree_depth = max_return_tree_blocks;
+        constexpr std::size_t max_return_tree_occurrences = 65536;
+        constexpr std::size_t max_return_tree_phi_copies = 65536;
+        constexpr std::size_t max_return_tree_instructions = 262144;
         constexpr unsigned max_return_tree_indent = 256;
         if (count < 3 || count > max_return_tree_blocks) return {};
         using AddressKey = std::pair<std::uint64_t, std::uint64_t>;
@@ -12258,7 +12261,7 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
         for (std::size_t i = 0; i < count; ++i) {
             const auto &block = function.blocks[i];
             if (!by_address.emplace(AddressKey{block.begin.space.value, block.begin.offset}, i).second ||
-                !by_id.emplace(block.id.value, i).second || block.switch_dispatch) return {};
+                !by_id.emplace(block.id.value, i).second) return {};
         }
         const auto index_of = [&](Address address) -> std::optional<std::size_t> {
             const auto found = by_address.find({address.space.value, address.offset});
@@ -12269,6 +12272,8 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
         std::vector<std::vector<std::size_t>> children(count);
         std::vector<std::vector<std::size_t>> predecessors(count);
         std::vector<std::size_t> predecessor_count(count, 0);
+        std::size_t return_tree_edges = 0;
+        std::size_t return_tree_cases = 0;
         for (std::size_t i = 0; i < count; ++i) {
             const auto &block = function.blocks[i];
             std::size_t branch_count = 0;
@@ -12277,12 +12282,41 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                 ++branch_count;
                 if (n + 1 != block.instructions.size()) return {};
             }
-            if (branch_count > 1 || block.successors.size() > 2 ||
-                (contains_return(block) && !has_only_terminal_return(block))) return {};
+            if (branch_count > 1 || (contains_return(block) && !has_only_terminal_return(block))) return {};
+            if (block.switch_dispatch) {
+                const auto &dispatch = *block.switch_dispatch;
+                if (!dispatch.complete || !dispatch.selector || dispatch.cases.empty() || !dispatch.default_target)
+                    return {};
+                if (dispatch.cases.size() > 4096 - return_tree_cases) return {};
+                return_tree_cases += dispatch.cases.size();
+                std::set<std::uint64_t> case_values;
+                std::set<AddressKey> switch_targets, cfg_targets;
+                for (const auto &item : dispatch.cases) {
+                    if (!case_values.insert(item.value).second) return {};
+                    switch_targets.emplace(item.target.space.value, item.target.offset);
+                }
+                switch_targets.emplace(dispatch.default_target->space.value, dispatch.default_target->offset);
+                for (const auto &edge : block.successors) {
+                    if (!edge.target) return {};
+                    cfg_targets.emplace(edge.target->space.value, edge.target->offset);
+                }
+                if (switch_targets != cfg_targets || branch_count > 1) return {};
+                if (branch_count == 1) {
+                    const auto &transfer = std::get<Branch>(block.instructions.back().statement);
+                    if (transfer.condition != "true" || transfer.true_target || transfer.false_target ||
+                        transfer.predicate) return {};
+                }
+            } else if (block.successors.size() > 2) {
+                return {};
+            }
+            if (block.successors.size() > 4096 - return_tree_edges) return {};
+            return_tree_edges += block.successors.size();
+            std::set<std::size_t> unique_children;
             for (const auto &edge : block.successors) {
                 if (!edge.target) return {};
                 const auto next = index_of(*edge.target);
-                if (!next || (edge.block && (!by_id.contains(edge.block->value) || by_id.at(edge.block->value) != *next)))
+                if (!next || !unique_children.insert(*next).second ||
+                    (edge.block && (!by_id.contains(edge.block->value) || by_id.at(edge.block->value) != *next)))
                     return {};
                 children[i].push_back(*next);
                 predecessors[*next].push_back(i);
@@ -12292,15 +12326,18 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                 if (!has_only_terminal_return(block) || branch_count != 0) return {};
             } else if (children[i].size() == 1) {
                 if (contains_return(block)) return {};
-                if (block.successors.front().kind != BlockEdgeKind::jump &&
+                if (!block.switch_dispatch &&
+                    block.successors.front().kind != BlockEdgeKind::jump &&
                     block.successors.front().kind != BlockEdgeKind::fallthrough) return {};
-                if (branch_count == 1) {
+                if (!block.switch_dispatch && branch_count == 1) {
                     const auto &unconditional = std::get<Branch>(block.instructions.back().statement);
                     if (unconditional.condition != "true" || !unconditional.true_target ||
                         unconditional.false_target ||
                         !has_unconditional_edge(block, *unconditional.true_target) ||
                         *unconditional.true_target != function.blocks[children[i][0]].begin) return {};
                 }
+            } else if (block.switch_dispatch) {
+                if (contains_return(block)) return {};
             } else if (children[i].size() == 2) {
                 const auto *condition = terminal_conditional(block);
                 if (contains_return(block) || !condition || !condition->true_target || !condition->false_target)
@@ -12311,6 +12348,8 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                     std::find(children[i].begin(), children[i].end(), *true_child) == children[i].end() ||
                     std::find(children[i].begin(), children[i].end(), *false_child) == children[i].end())
                     return {};
+            } else {
+                return {};
             }
         }
         if (predecessor_count[*root] != 0) return {};
@@ -12319,12 +12358,29 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
         // Accepting complete memory phis avoids falling back solely because a
         // return arm carries a token merge that has no source-level assignment.
         std::size_t memory_phi_inputs = 0;
+        std::size_t register_phi_inputs = 0;
         for (std::size_t i = 0; i < count; ++i) {
             const auto &block = function.blocks[i];
             if (block.memory_partition_phis.size() > 4096) return {};
             std::set<std::uint64_t> expected;
             for (const auto predecessor : predecessors[i])
                 expected.insert(function.blocks[predecessor].id.value);
+            if (i == *root && (!block.phis.empty() || block.memory_phi ||
+                               !block.memory_partition_phis.empty())) return {};
+            if (block.phis.size() > 4096) return {};
+            std::vector<RegisterOperand> destinations;
+            for (const auto &phi : block.phis) {
+                if (phi.inputs.size() != expected.size() ||
+                    phi.inputs.size() > 65536 - register_phi_inputs ||
+                    std::find(destinations.begin(), destinations.end(), phi.destination) != destinations.end()) return {};
+                destinations.push_back(phi.destination);
+                register_phi_inputs += phi.inputs.size();
+                std::set<std::uint64_t> seen;
+                for (const auto &input : phi.inputs)
+                    if (!expected.contains(input.predecessor.value) ||
+                        !seen.insert(input.predecessor.value).second) return {};
+                if (seen != expected) return {};
+            }
             const auto valid_memory_phi = [&](const auto &phi) {
                 if (phi.inputs.size() != expected.size() ||
                     phi.inputs.size() > 65536 - memory_phi_inputs) return false;
@@ -12341,80 +12397,44 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                 if (phi.partition.empty() || !partitions.insert(phi.partition).second ||
                     !valid_memory_phi(phi)) return {};
         }
-        const auto shared_terminal_return = [&](std::size_t i) {
-            const auto &block = function.blocks[i];
-            if (!children[i].empty() || !has_only_terminal_return(block) ||
-                predecessor_count[i] <= 1 || predecessor_count[i] > 64) return false;
-            std::set<std::uint64_t> expected;
-            for (const auto predecessor : predecessors[i])
-                expected.insert(function.blocks[predecessor].id.value);
-            std::vector<RegisterOperand> destinations;
-            for (const auto &phi : block.phis) {
-                if (phi.inputs.size() != expected.size() ||
-                    std::find(destinations.begin(), destinations.end(), phi.destination) != destinations.end())
-                    return false;
-                destinations.push_back(phi.destination);
-                std::set<std::uint64_t> seen;
-                for (const auto &input : phi.inputs) {
-                    if (!expected.contains(input.predecessor.value) ||
-                        !seen.insert(input.predecessor.value).second) return false;
-                }
-                if (seen != expected) return false;
-            }
-            return true;
-        };
-        const auto shared_return_branch = [&](std::size_t i) {
-            const auto &block = function.blocks[i];
-            const auto *condition = terminal_conditional(block);
-            if (children[i].size() != 2 || !condition || predecessor_count[i] <= 1 ||
-                predecessor_count[i] > 64) return false;
-            const auto yes = index_of(*condition->true_target);
-            const auto no = index_of(*condition->false_target);
-            if (!yes || !no || *yes == *no || !children[*yes].empty() || !children[*no].empty() ||
-                !has_only_terminal_return(function.blocks[*yes]) ||
-                !has_only_terminal_return(function.blocks[*no])) return false;
-            std::set<std::uint64_t> expected;
-            for (const auto predecessor : predecessors[i])
-                expected.insert(function.blocks[predecessor].id.value);
-            if (expected.size() != predecessor_count[i]) return false;
-            std::size_t input_count = 0;
-            std::vector<RegisterOperand> destinations;
-            for (const auto &phi : block.phis) {
-                if (phi.inputs.size() != expected.size() ||
-                    phi.inputs.size() > 65536 - input_count ||
-                    std::find(destinations.begin(), destinations.end(), phi.destination) != destinations.end())
-                    return false;
-                input_count += phi.inputs.size();
-                destinations.push_back(phi.destination);
-                std::set<std::uint64_t> seen;
-                for (const auto &input : phi.inputs) {
-                    if (!expected.contains(input.predecessor.value) ||
-                        !seen.insert(input.predecessor.value).second) return false;
-                }
-                if (seen != expected) return false;
-            }
-            return true;
-        };
         for (std::size_t i = 0; i < count; ++i) {
-            if (!function.blocks[i].phis.empty() && !shared_terminal_return(i) && !shared_return_branch(i))
-                return {};
-            if (i != *root && predecessor_count[i] != 1 &&
-                !shared_terminal_return(i) && !shared_return_branch(i)) return {};
+            if (i != *root && predecessor_count[i] == 0) return {};
+            if (predecessor_count[i] > 64) return {};
         }
+
+        // Shared return subtrees are duplicated under each incoming path, so
+        // the source result remains acyclic only if the validated CFG is a DAG.
+        std::vector<std::size_t> remaining_predecessors = predecessor_count;
+        std::vector<std::size_t> acyclic_work;
+        for (std::size_t i = 0; i < count; ++i)
+            if (remaining_predecessors[i] == 0) acyclic_work.push_back(i);
+        std::size_t acyclic_count = 0;
+        while (!acyclic_work.empty()) {
+            const auto node = acyclic_work.back();
+            acyclic_work.pop_back();
+            ++acyclic_count;
+            for (const auto next : children[node])
+                if (--remaining_predecessors[next] == 0) acyclic_work.push_back(next);
+        }
+        if (acyclic_count != count) return {};
 
         std::vector<bool> visited(count, false);
         std::vector<std::pair<std::size_t, std::size_t>> pending{{*root, 1}};
+        std::size_t occurrence_count = 0;
+        std::size_t emitted_phi_copies = 0;
+        std::size_t emitted_instructions = 0;
         while (!pending.empty()) {
             const auto [node, depth] = pending.back();
             pending.pop_back();
-            if (depth > max_return_tree_depth) return {};
-            // Shared terminal returns and a validated terminal-decision block
-            // are duplicated into each guarded arm during emission; other
-            // repeated nodes still imply an unsupported shared region.
-            if (visited[node]) {
-                if (shared_terminal_return(node) || shared_return_branch(node)) continue;
-                return {};
+            if (depth > max_return_tree_depth || ++occurrence_count > max_return_tree_occurrences) return {};
+            if (node != *root) {
+                const auto phi_count = function.blocks[node].phis.size();
+                if (phi_count > max_return_tree_phi_copies - emitted_phi_copies) return {};
+                emitted_phi_copies += phi_count;
             }
+            const auto instruction_count = function.blocks[node].instructions.size();
+            if (instruction_count > max_return_tree_instructions - emitted_instructions) return {};
+            emitted_instructions += instruction_count;
             visited[node] = true;
             for (const auto next : children[node]) pending.emplace_back(next, depth + 1);
         }
@@ -12426,6 +12446,8 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
             unsigned indent = 0;
             std::uint8_t phase = 0;
             std::optional<std::size_t> incoming;
+            std::vector<SwitchArmGroup> switch_groups;
+            std::size_t switch_arm = 0;
         };
         const auto emit_return_phi_copies = [&](std::size_t node, std::size_t incoming, unsigned indent) {
             const auto predecessor_id = function.blocks[incoming].id;
@@ -12448,6 +12470,38 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
             const auto node = frame.node;
             const auto indent = frame.indent;
             const auto &block = function.blocks[node];
+            if (block.switch_dispatch) {
+                const auto spaces = std::string(indent, ' ');
+                const auto labels = std::string(std::min(indent + 4, max_return_tree_indent), ' ');
+                if (frame.phase == 0) {
+                    if (!block.phis.empty() &&
+                        (!frame.incoming || !emit_return_phi_copies(node, *frame.incoming, indent))) return {};
+                    emit_block(block, indent, true);
+                    frame.switch_groups = group_switch_arms(*block.switch_dispatch);
+                    out << spaces << "switch (" << expression_text(*block.switch_dispatch->selector) << ") {\n";
+                    frame.phase = 1;
+                } else if (frame.phase == 1) {
+                    if (frame.switch_arm == frame.switch_groups.size()) {
+                        out << spaces << "}\n";
+                        emit_stack.pop_back();
+                        continue;
+                    }
+                    const auto &arm = frame.switch_groups[frame.switch_arm];
+                    for (const auto value : arm.values)
+                        out << labels << "case 0x" << std::hex << value << std::dec << ":\n";
+                    if (arm.is_default) out << labels << "default:\n";
+                    out << labels << "{\n";
+                    const auto target = index_of(arm.target);
+                    if (!target) return {};
+                    frame.phase = 2;
+                    emit_stack.push_back({*target, std::min(indent + 8, max_return_tree_indent), 0, node});
+                } else {
+                    out << labels << "}\n";
+                    ++frame.switch_arm;
+                    frame.phase = 1;
+                }
+                continue;
+            }
             if (children[node].size() < 2) {
                 if (frame.phase++ == 0) {
                     if (!block.phis.empty() &&

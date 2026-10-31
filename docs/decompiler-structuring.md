@@ -8,19 +8,21 @@ as each region's join. It lowers SSA phi values into edge-specific assignments
 and follows multi-block straight-line arms. A simple conditional early return
 is also structured, including the case where the return is on the branch's
 false edge.
-Decision trees whose leaves all return are also structured when each block is
-reachable exactly once from the entry, every non-entry block has one incoming
-edge, and the leaves are terminal returns. This covers two-return conditionals
-and nested return-only branches without requiring a common post-dominator.
-Shared return blocks remain on the label/goto path unless they are terminal
-returns with bounded fan-in and valid edge-specific register phis. Unresolved
-edges and mixed return/non-return leaves also retain the fallback unless
-another existing recognizer handles them. Return-only trees use iterative validation and emission, so nesting depth
-does not consume recursive C++ stack frames. The recognizer accepts up to
-4,096 blocks and a path as deep as that block bound. To keep generated source
-size bounded for unusually deep trees, indentation stops increasing after 256
-spaces; the braces and branch nesting remain explicit. Larger trees retain the
-fallback.
+Decision trees whose leaves all return are also structured without requiring a
+common post-dominator. Their nodes may be nested two-way conditionals, complete
+multiway switches, or single-successor cleanup blocks. Shared terminal returns
+and nonterminal return subtrees may be duplicated under their incoming guarded
+paths when every CFG predecessor is represented in the tree, fan-in is at most
+64, and each register or memory phi has exactly one input for every actual
+predecessor. Phi copies are lowered for the incoming edge at each expansion.
+Unresolved edges, incomplete switch metadata, cycles, external side entries,
+and mixed return/non-return leaves retain the fallback unless another existing
+recognizer handles them. Return-only trees use iterative validation and
+emission, so nesting depth does not consume recursive C++ stack frames. The
+recognizer accepts up to 4,096 blocks, 4,096 edges, and switch cases, 65,536
+expanded block occurrences and phi copies, and 262,144 emitted instruction
+copies. A path may be as deep as the block bound; indentation stops increasing
+after 256 spaces. Larger or malformed trees retain the fallback.
 
 Ghidra's native C++ decompiler is a useful architectural reference for this
 stage. Its `blockaction.cc` tracks loop heads, tails, and loop containment, then
