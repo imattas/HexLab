@@ -22,6 +22,7 @@
 #include <wx/dataobj.h>
 #include <wx/filedlg.h>
 #include <wx/msgdlg.h>
+#include <wx/choicdlg.h>
 #include <wx/sizer.h>
 #include <wx/settings.h>
 #include <wx/wrapsizer.h>
@@ -34,6 +35,7 @@ constexpr std::size_t maximum_string_preferences = 512;
 constexpr std::size_t maximum_string_query = 2048;
 constexpr std::size_t maximum_preference_token = 256;
 constexpr std::size_t maximum_standalone_comments = 2048;
+constexpr std::size_t maximum_standalone_dispositions = 2048;
 constexpr std::size_t maximum_standalone_comment_bytes = 4096;
 constexpr std::size_t maximum_standalone_comment_total = 1024 * 1024;
 constexpr std::size_t maximum_standalone_comment_serialized = 2 * 1024 * 1024;
@@ -249,6 +251,9 @@ StringBrowserView::StringBrowserView(wxWindow *parent) : wxPanel(parent), filter
     comment_ = new wxButton(this, wxID_ANY, "Comment selected string...");
     comment_->SetName("strings-comment");
     comment_->Enable(false);
+    classify_ = new wxButton(this, wxID_ANY, "Classify selected...");
+    classify_->SetName("strings-classify");
+    classify_->Enable(false);
     export_notes_ = new wxButton(this, wxID_ANY, "Export standalone notes...");
     export_notes_->SetName("strings-export-notes");
     export_notes_->Enable(false);
@@ -258,6 +263,7 @@ StringBrowserView::StringBrowserView(wxWindow *parent) : wxPanel(parent), filter
     layout->Add(filter_row, 0, wxEXPAND | wxALL, FromDIP(4));
     auto *annotation_row = new wxBoxSizer(wxHORIZONTAL);
     annotation_row->Add(comment_, 0, wxEXPAND | wxRIGHT, FromDIP(4));
+    annotation_row->Add(classify_, 0, wxEXPAND | wxRIGHT, FromDIP(4));
     annotation_row->Add(export_notes_, 0, wxEXPAND | wxRIGHT, FromDIP(4));
     annotation_row->Add(import_notes_, 0, wxEXPAND);
     layout->Add(annotation_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, FromDIP(4));
@@ -368,7 +374,7 @@ StringBrowserView::StringBrowserView(wxWindow *parent) : wxPanel(parent), filter
     auto *string_panel = new wxPanel(splitter);
     auto *string_layout = new wxBoxSizer(wxVERTICAL);
     strings_ = new VirtualTable(string_panel, "strings-list", {"Address / offset", "Text", "Encoding", "Bytes",
-                                                             "Characters", "Terminated", "Comment"});
+                                                             "Characters", "Terminated", "Comment", "Disposition"});
     string_layout->Add(strings_, 1, wxEXPAND);
     string_panel->SetSizer(string_layout);
 
@@ -443,6 +449,21 @@ StringBrowserView::StringBrowserView(wxWindow *parent) : wxPanel(parent), filter
     });
     export_notes_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { export_standalone_notes(); });
     import_notes_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { import_standalone_notes(); });
+    classify_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) {
+        if (!standalone_document_ || !selected_string_ || !document_) return;
+        const wxString labels[] = {"Unclassified", "Confirmed string", "Not a string", "Review"};
+        const auto current = disposition_for_record(*document_, *selected_string_);
+        int choice = 0;
+        for (int i = 0; i < 4; ++i) if (labels[i] == current) choice = i;
+        wxSingleChoiceDialog dialog(this, "Set a local review disposition for this string.",
+                                    "Classify string", 4, labels);
+        dialog.SetSelection(choice);
+        if (dialog.ShowModal() != wxID_OK) return;
+        const int selected = dialog.GetSelection();
+        if (selected >= 0 && selected <= 3)
+            if (const auto location = string_location(*selected_string_))
+                (void)set_standalone_disposition(*location, static_cast<std::uint8_t>(selected));
+    });
     filter_->Bind(wxEVT_TEXT_ENTER, [this](wxCommandEvent &) {
         filter_timer_.Stop();
         refresh_strings();
@@ -578,6 +599,8 @@ void StringBrowserView::remember_preferences() {
     saved.context_known = context_known_;
     if (previous != preferences_.end() && previous->second.identity == *identity)
         saved.standalone_comments = previous->second.standalone_comments;
+    if (previous != preferences_.end() && previous->second.identity == *identity)
+        saved.standalone_dispositions = previous->second.standalone_dispositions;
     preferences_.insert_or_assign(document_->id.value, std::move(saved));
 }
 
@@ -599,12 +622,13 @@ void StringBrowserView::restore_standalone_annotations() {
         return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || c == ':';
     };
     std::optional<std::map<std::string, wxString>> restored;
+    std::map<std::string, std::uint8_t> restored_dispositions;
     for (const auto candidate : candidates) {
         config->SetPath(wxString::FromUTF8(store_path + "/Slot" + std::to_string(candidate)));
         long version = 0, count = 0;
         wxString saved_identity;
         std::map<std::string, wxString> comments;
-        bool valid = config->Read("Version", &version) && version == 1 &&
+        bool valid = config->Read("Version", &version) && (version == 1 || version == 2) &&
             config->Read("Identity", &saved_identity) && utf8(saved_identity) == *input_fingerprint &&
             config->Read("Count", &count) && count >= 0 &&
             static_cast<std::size_t>(count) <= maximum_standalone_comments;
@@ -633,8 +657,23 @@ void StringBrowserView::restore_standalone_annotations() {
             total_bytes += encoded_comment.size();
             serialized_bytes += encoded_key.size() + encoded_comment.size() + 64;
         }
+        std::map<std::string, std::uint8_t> dispositions;
+        long disposition_count = 0;
+        if (valid && version >= 2 && (!config->Read("DispositionCount", &disposition_count) || disposition_count < 0 ||
+                static_cast<std::size_t>(disposition_count) > maximum_standalone_dispositions)) valid = false;
+        for (long index = 0; valid && index < disposition_count; ++index) {
+            wxString key;
+            long value = 0;
+            if (!config->Read(wxString::Format("Disposition%ldKey", index), &key) || key.empty() ||
+                key.length() > maximum_preference_token || !config->Read(wxString::Format("Disposition%ldValue", index), &value) ||
+                value < 1 || value > 3) { valid = false; break; }
+            const auto encoded_key = utf8(key);
+            if (!std::all_of(encoded_key.begin(), encoded_key.end(), token_character) ||
+                !dispositions.emplace(encoded_key, static_cast<std::uint8_t>(value)).second) valid = false;
+        }
         if (valid) {
             restored = std::move(comments);
+            restored_dispositions = std::move(dispositions);
             break;
         }
     }
@@ -656,6 +695,7 @@ void StringBrowserView::restore_standalone_annotations() {
         updated.match_project_uuid = true;
     }
     updated.standalone_comments = std::move(*restored);
+    updated.standalone_dispositions = std::move(restored_dispositions);
     preferences_.insert_or_assign(id, std::move(updated));
 }
 
@@ -664,7 +704,8 @@ bool StringBrowserView::persist_standalone_annotations(const Preferences &prefer
     auto *config = wxConfigBase::Get(false);
     const auto input_identity = standalone_annotation_key(*document_->project);
     const auto input_fingerprint = preference_identity(*document_->project, false);
-    if (!config || !input_identity || !input_fingerprint || preferences.standalone_comments.size() > maximum_standalone_comments)
+    if (!config || !input_identity || !input_fingerprint || preferences.standalone_comments.size() > maximum_standalone_comments ||
+        preferences.standalone_dispositions.size() > maximum_standalone_dispositions)
         return false;
 
     std::size_t total_bytes = 0, serialized_bytes = 0;
@@ -682,6 +723,14 @@ bool StringBrowserView::persist_standalone_annotations(const Preferences &prefer
         total_bytes += value_bytes;
         serialized_bytes += key.size() + value_bytes + 64;
     }
+    for (const auto &[key, value] : preferences.standalone_dispositions) {
+        if (key.empty() || key.size() > maximum_preference_token || value < 1 || value > 3 ||
+            !std::all_of(key.begin(), key.end(), [](char c) {
+                return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || c == ':';
+            }) || key.size() > maximum_standalone_comment_serialized - serialized_bytes ||
+            68 > maximum_standalone_comment_serialized - serialized_bytes - key.size()) return false;
+        serialized_bytes += key.size() + 68;
+    }
     const auto previous_path = config->GetPath();
     const auto root = wxString("/Desktop/StandaloneStringAnnotations");
     const auto store = root + "/" + wxString::FromUTF8(*input_identity);
@@ -692,13 +741,20 @@ bool StringBrowserView::persist_standalone_annotations(const Preferences &prefer
     config->DeleteGroup(wxString::Format("Slot%ld", next_slot));
     const auto slot_path = store + wxString::Format("/Slot%ld", next_slot);
     config->SetPath(slot_path);
-    bool written = config->Write("Version", 1L) &&
+    bool written = config->Write("Version", 2L) &&
         config->Write("Identity", wxString::FromUTF8(*input_fingerprint)) &&
-        config->Write("Count", static_cast<long>(preferences.standalone_comments.size()));
+        config->Write("Count", static_cast<long>(preferences.standalone_comments.size())) &&
+        config->Write("DispositionCount", static_cast<long>(preferences.standalone_dispositions.size()));
     std::size_t index = 0;
     for (const auto &[key, annotation_text] : preferences.standalone_comments) {
         written = config->Write(wxString::Format("Comment%ldKey", static_cast<long>(index)), wxString::FromUTF8(key)) && written;
         written = config->Write(wxString::Format("Comment%ldText", static_cast<long>(index)), annotation_text) && written;
+        ++index;
+    }
+    index = 0;
+    for (const auto &[key, value] : preferences.standalone_dispositions) {
+        written = config->Write(wxString::Format("Disposition%ldKey", static_cast<long>(index)), wxString::FromUTF8(key)) && written;
+        written = config->Write(wxString::Format("Disposition%ldValue", static_cast<long>(index)), static_cast<long>(value)) && written;
         ++index;
     }
     config->SetPath(previous_path);
@@ -832,6 +888,13 @@ void StringBrowserView::save_preferences(wxConfigBase &config, const wxString &g
             config.Write(wxString::Format("StandaloneComment%ldText", static_cast<long>(index)), annotation_text);
             ++index;
         }
+        config.Write("StandaloneDispositionCount", static_cast<long>(saved.standalone_dispositions.size()));
+        index = 0;
+        for (const auto &[key, value] : saved.standalone_dispositions) {
+            config.Write(wxString::Format("StandaloneDisposition%ldKey", static_cast<long>(index)), wxString::FromUTF8(key));
+            config.Write(wxString::Format("StandaloneDisposition%ldValue", static_cast<long>(index)), static_cast<long>(value));
+            ++index;
+        }
     }
     config.SetPath(previous_path);
 }
@@ -896,6 +959,21 @@ void StringBrowserView::restore_preferences(wxConfigBase &config, const wxString
                     return {};
                 total_comment_bytes += encoded_comment.size();
                 serialized_comment_bytes += encoded_key.size() + encoded_comment.size() + 64;
+            }
+            long disposition_count = 0;
+            if (!config.Read("StandaloneDispositionCount", &disposition_count)) disposition_count = 0;
+            if (disposition_count < 0 || static_cast<std::size_t>(disposition_count) > maximum_standalone_dispositions)
+                return {};
+            for (long index = 0; index < disposition_count; ++index) {
+                wxString key;
+                long value = 0;
+                if (!config.Read(wxString::Format("StandaloneDisposition%ldKey", index), &key) || key.empty() ||
+                    key.length() > maximum_preference_token ||
+                    !config.Read(wxString::Format("StandaloneDisposition%ldValue", index), &value) || value < 1 || value > 3)
+                    return {};
+                const auto encoded_key = utf8(key);
+                if (!std::all_of(encoded_key.begin(), encoded_key.end(), token_character) ||
+                    !saved.standalone_dispositions.emplace(encoded_key, static_cast<std::uint8_t>(value)).second) return {};
             }
         }
         saved.match_project_uuid = saved_project;
@@ -996,12 +1074,15 @@ void StringBrowserView::refresh_strings() {
                 auto address = location ? location_text(*location, document_->image.get()) : wxString{};
                 auto encoding_name = encoding_text(records[i].encoding);
                 auto project_comment = comment_for_record(*document_, i);
+                auto disposition = disposition_for_record(*document_, i);
                 preview.MakeLower();
                 address.MakeLower();
                 encoding_name.MakeLower();
                 project_comment.MakeLower();
+                disposition.MakeLower();
                 if (preview.Find(query) == wxNOT_FOUND && address.Find(query) == wxNOT_FOUND &&
-                    encoding_name.Find(query) == wxNOT_FOUND && project_comment.Find(query) == wxNOT_FOUND)
+                    encoding_name.Find(query) == wxNOT_FOUND && project_comment.Find(query) == wxNOT_FOUND &&
+                    disposition.Find(query) == wxNOT_FOUND)
                     continue;
             }
             visible_strings_.push_back(i);
@@ -1038,8 +1119,9 @@ void StringBrowserView::refresh_strings() {
         case 3: return wxString::Format("%llu", static_cast<unsigned long long>(record.byte_length));
         case 4: return wxString::Format("%llu", static_cast<unsigned long long>(record.characters));
         case 5: return record.terminated ? wxString("Yes") : wxString("No");
+        case 6: return comment_for_record(*document_, index);
         default: {
-            return comment_for_record(*document_, index);
+            return disposition_for_record(*document_, index);
         }
         }
     });
@@ -1048,6 +1130,7 @@ void StringBrowserView::refresh_strings() {
     const bool has_selection = document_ && selected_string_ &&
         *selected_string_ < document_->strings().records.size();
     comment_->Enable(has_selection && static_cast<bool>(comment));
+    classify_->Enable(has_selection && standalone_document_);
     copy_->Enable(has_selection);
     copy_text_preview_->Enable(has_selection);
     copy_json_preview_->Enable(has_selection);
@@ -1062,6 +1145,7 @@ void StringBrowserView::refresh_strings() {
         }
         selected_string_.reset();
         comment_->Enable(false);
+        classify_->Enable(false);
         copy_->Enable(false);
         copy_text_preview_->Enable(false);
         copy_json_preview_->Enable(false);
@@ -1590,6 +1674,7 @@ void StringBrowserView::choose_string(std::size_t record_index, bool navigate_to
     selected_string_ = record_index;
     pending_selection_.clear();
     comment_->Enable(static_cast<bool>(comment));
+    classify_->Enable(standalone_document_);
     copy_->Enable(true);
     copy_byte_preview_->Enable(true);
     copy_text_preview_->Enable(true);
@@ -1707,6 +1792,7 @@ void StringBrowserView::clear_selection() {
     references_->clear_selection();
     selected_string_.reset();
     comment_->Enable(false);
+    classify_->Enable(false);
     copy_->Enable(false);
     copy_byte_preview_->Enable(false);
     copy_text_preview_->Enable(false);
@@ -1736,6 +1822,61 @@ wxString StringBrowserView::comment_for_record(const DocumentSnapshot &document,
     const auto key = selection_key(record, *document.project);
     const auto comment_entry = saved->second.standalone_comments.find(key);
     return comment_entry == saved->second.standalone_comments.end() ? wxString{} : comment_entry->second;
+}
+
+wxString StringBrowserView::disposition_for_record(const DocumentSnapshot &document,
+                                                    std::size_t record_index) const {
+    if (record_index >= document.strings().records.size() || !standalone_document_ || !document_ ||
+        document_->id != document.id || !document.project || !document.project->state) return "Unclassified";
+    const auto saved = preferences_.find(document.id.value);
+    if (saved == preferences_.end()) return "Unclassified";
+    const auto identity = preference_identity(*document.project, saved->second.match_project_uuid);
+    if (!identity || *identity != saved->second.identity) return "Unclassified";
+    const auto key = selection_key(document.strings().records[record_index], *document.project);
+    const auto found = saved->second.standalone_dispositions.find(key);
+    if (found == saved->second.standalone_dispositions.end()) return "Unclassified";
+    switch (found->second) {
+    case 1: return "Confirmed string";
+    case 2: return "Not a string";
+    case 3: return "Review";
+    default: return "Unclassified";
+    }
+}
+
+bool StringBrowserView::set_standalone_disposition(Location location, std::uint8_t value) {
+    if (!standalone_document_ || !document_ || !document_->project || !document_->project->state || value > 3) return false;
+    std::optional<std::string> key;
+    for (std::size_t index = 0; index < document_->strings().records.size(); ++index)
+        if (string_location(index) == location) {
+            key = selection_key(document_->strings().records[index], *document_->project);
+            break;
+        }
+    if (!key || key->empty() || key->size() > maximum_preference_token) return false;
+    auto found = preferences_.find(document_->id.value);
+    auto identity = preference_identity(*document_->project, false);
+    if (!identity) return false;
+    Preferences updated;
+    if (found != preferences_.end()) {
+        const auto existing_identity = preference_identity(*document_->project, found->second.match_project_uuid);
+        if (existing_identity && *existing_identity == found->second.identity) updated = found->second;
+    }
+    if (updated.identity.empty()) {
+        if (preferences_.size() >= maximum_string_preferences && found == preferences_.end()) return false;
+        updated.identity = *identity;
+        updated.match_project_uuid = false;
+    }
+    if (value == 0) updated.standalone_dispositions.erase(*key);
+    else {
+        if (!updated.standalone_dispositions.contains(*key) &&
+            updated.standalone_dispositions.size() >= maximum_standalone_dispositions) return false;
+        updated.standalone_dispositions.insert_or_assign(*key, value);
+    }
+    if (!persist_standalone_annotations(updated)) return false;
+    preferences_.insert_or_assign(document_->id.value, std::move(updated));
+    remember_preferences();
+    refresh_strings();
+    action_status_->SetLabel(value == 0 ? "Standalone string disposition cleared" : "Standalone string disposition saved for this input");
+    return true;
 }
 
 std::optional<wxString> StringBrowserView::standalone_comment(Location location) const {
