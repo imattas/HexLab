@@ -36,6 +36,7 @@ class SearchView final : public wxPanel {
   private:
     struct Rows;
     struct FilterWork;
+    std::shared_ptr<Rows> collection_rows_;
     VirtualTable *table_;
     wxStaticText *status_;
     wxButton *more_;
@@ -44,15 +45,25 @@ class SearchView final : public wxPanel {
     std::shared_ptr<const Rows> rows_;
     std::shared_ptr<const std::vector<std::size_t>> visible_;
     std::shared_ptr<FilterWork> filter_work_;
+    struct CollectionWork;
+    std::shared_ptr<CollectionWork> collection_work_;
     wxTimer filter_timer_;
+    wxTimer collection_timer_;
     std::optional<DocumentId> selected_document_;
     std::shared_ptr<const SearchPage> selected_page_;
     std::size_t selected_index_ = 0;
     wxString coverage_;
     std::optional<DocumentId> document_;
+    std::shared_ptr<const Image> collection_image_;
+    std::shared_ptr<const ProjectSnapshot> collection_project_;
+    std::optional<std::size_t> history_selected_index_;
+    std::vector<std::shared_ptr<const SearchPage>> current_pages_;
+    wxString current_reason_;
+    bool current_pending_ = false;
     bool all_documents_ = false;
     void render();
     void poll_filter();
+    void poll_collection();
     void show_preview();
     void step(bool forward);
     wxString export_text() const;

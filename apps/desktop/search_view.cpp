@@ -16,6 +16,7 @@
 #include <array>
 #include <atomic>
 #include <condition_variable>
+#include <deque>
 #include <mutex>
 #include <thread>
 namespace hexlab::desktop {
@@ -324,7 +325,7 @@ struct SearchView::Rows {
         std::array<wxString, 6> cells;
         std::string metadata;
     };
-    std::vector<Item> items;
+    std::deque<Item> items;
     std::vector<std::filesystem::path> protected_paths;
     bool searched = false;
 };
@@ -346,8 +347,24 @@ struct SearchView::FilterWork {
     std::optional<Completion> completion;
     std::jthread worker;
 };
+struct SearchView::CollectionWork {
+    struct Request {
+        std::uint64_t generation = 0;
+        DocumentId document;
+        std::vector<std::shared_ptr<const SearchPage>> pages;
+    };
+    struct Seed { DocumentId document; std::size_t index = 0; SearchMatch match; std::shared_ptr<const SearchPage> page; };
+    struct Batch { std::uint64_t generation = 0; std::vector<Seed> rows; bool done = false; };
+    std::atomic<std::uint64_t> generation{0};
+    std::mutex mutex;
+    std::condition_variable_any ready;
+    std::optional<Request> request;
+    std::optional<Batch> batch;
+    std::jthread worker;
+};
 SearchView::SearchView(wxWindow *parent) : wxPanel(parent), filter_work_(std::make_shared<FilterWork>()),
-                                           filter_timer_(this) {
+                                           collection_work_(std::make_shared<CollectionWork>()),
+                                           filter_timer_(this), collection_timer_(this) {
     SetName("search-view");
     const int pad = FromDIP(4);
     auto *box = new wxBoxSizer(wxVERTICAL);
@@ -418,6 +435,7 @@ SearchView::SearchView(wxWindow *parent) : wxPanel(parent), filter_work_(std::ma
     };
     filter_->Bind(wxEVT_TEXT, [this](wxCommandEvent &) { render(); });
     Bind(wxEVT_TIMER, [this](wxTimerEvent &) { poll_filter(); }, filter_timer_.GetId());
+    Bind(wxEVT_TIMER, [this](wxTimerEvent &) { poll_collection(); }, collection_timer_.GetId());
     clear->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { filter_->SetValue(""); });
     previous_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { step(false); });
     next_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { step(true); });
@@ -482,9 +500,80 @@ SearchView::SearchView(wxWindow *parent) : wxPanel(parent), filter_work_(std::ma
             }
         }
     });
+    auto *collection = collection_work_.get();
+    collection->worker = std::jthread([collection](std::stop_token stop) {
+        while (!stop.stop_requested()) {
+            CollectionWork::Request request;
+            {
+                std::unique_lock lock(collection->mutex);
+                collection->ready.wait(lock, stop, [&] { return collection->request.has_value(); });
+                if (stop.stop_requested()) return;
+                request = std::move(*collection->request);
+                collection->request.reset();
+            }
+            std::size_t index = 0;
+            bool canceled = false;
+            std::vector<CollectionWork::Seed> pending;
+            pending.reserve(256);
+            for (const auto &page : request.pages) {
+                if (!page) continue;
+                for (const auto &match : page->matches) {
+                    if ((index & 255u) == 0 && (stop.stop_requested() ||
+                        collection->generation.load(std::memory_order_acquire) != request.generation)) {
+                        canceled = true;
+                        break;
+                    }
+                    pending.push_back({request.document, index++, match, page});
+                    if (pending.size() == 256) {
+                        CollectionWork::Batch batch{request.generation, std::move(pending), false};
+                        pending.clear();
+                        std::unique_lock lock(collection->mutex);
+                        collection->ready.wait(lock, stop, [&] { return !collection->batch.has_value() ||
+                            collection->generation.load(std::memory_order_acquire) != request.generation; });
+                        if (stop.stop_requested() || collection->generation.load(std::memory_order_acquire) != request.generation) {
+                            canceled = true;
+                            break;
+                        }
+                        collection->batch = std::move(batch);
+                        lock.unlock();
+                        collection->ready.notify_all();
+                    }
+                }
+                if (canceled) break;
+            }
+            if (canceled || stop.stop_requested()) continue;
+            if (!pending.empty()) {
+                CollectionWork::Batch batch{request.generation, std::move(pending), false};
+                std::unique_lock lock(collection->mutex);
+                collection->ready.wait(lock, stop, [&] { return !collection->batch.has_value() ||
+                    collection->generation.load(std::memory_order_acquire) != request.generation; });
+                if (stop.stop_requested()) return;
+                if (collection->generation.load(std::memory_order_acquire) != request.generation) continue;
+                collection->batch = std::move(batch);
+                lock.unlock();
+                collection->ready.notify_all();
+            }
+            // A per-worker scratch vector avoids retaining rows from a canceled request.
+            CollectionWork::Batch done{request.generation, {}, true};
+            std::unique_lock lock(collection->mutex);
+            collection->ready.wait(lock, stop, [&] { return !collection->batch.has_value() ||
+                collection->generation.load(std::memory_order_acquire) != request.generation; });
+            if (stop.stop_requested()) return;
+            if (collection->generation.load(std::memory_order_acquire) == request.generation) {
+                collection->batch = std::move(done);
+                lock.unlock();
+                collection->ready.notify_all();
+            }
+        }
+    });
 }
 SearchView::~SearchView() {
     filter_timer_.Stop();
+    collection_timer_.Stop();
+    if (collection_work_ && collection_work_->worker.joinable()) {
+        collection_work_->worker.request_stop();
+        collection_work_->ready.notify_all();
+    }
     if (filter_work_ && filter_work_->worker.joinable()) {
         filter_work_->worker.request_stop();
         filter_work_->ready.notify_all();
@@ -493,14 +582,170 @@ SearchView::~SearchView() {
 void SearchView::update(std::optional<DocumentId> document, const SearchHistory *history, bool pending,
                         const wxString &reason, std::shared_ptr<const Image> image,
                         std::shared_ptr<const ProjectSnapshot> project) {
+    std::vector<std::shared_ptr<const SearchPage>> pages;
+    if (history) pages.assign(history->pages().begin(), history->pages().end());
+    const auto selected_history_index = history ? history->selected_index() : std::optional<std::size_t>{};
+    if (!all_documents_ && document == document_ && pages == current_pages_ && image == collection_image_ &&
+        project == collection_project_ && reason == current_reason_ && pending == current_pending_) {
+        if (selected_history_index != history_selected_index_) {
+            history_selected_index_ = selected_history_index;
+            if (!collection_rows_ && document && selected_history_index && rows_) {
+                const auto selected = std::find_if(rows_->items.begin(), rows_->items.end(), [&](const auto &item) {
+                    return item.document == *document && item.index == *selected_history_index;
+                });
+                if (selected != rows_->items.end()) {
+                    selected_document_ = selected->document;
+                    selected_index_ = selected->index;
+                    selected_page_ = selected->page;
+                    if (visible_) for (std::size_t row = 0; row < visible_->size(); ++row)
+                        if (rows_->items[(*visible_)[row]].document == selected->document &&
+                            rows_->items[(*visible_)[row]].index == selected->index &&
+                            rows_->items[(*visible_)[row]].page == selected->page) {
+                            table_->select_row(row);
+                            break;
+                        }
+                    show_preview();
+                }
+            }
+        }
+        return;
+    }
     all_documents_ = false;
+    if (!document || (selected_document_ && *selected_document_ != *document)) {
+        selected_document_.reset();
+        selected_page_.reset();
+    }
     document_ = document;
-    std::vector<SearchDocumentView> views;
-    if (document) views.push_back({*document, "Active document", history, pending, reason, std::move(image), std::move(project)});
-    update_all(views);
-    all_documents_ = false;
+    current_pages_ = pages;
+    current_reason_ = reason;
+    current_pending_ = pending;
+    collection_image_ = image;
+    collection_project_ = project;
+    history_selected_index_ = selected_history_index;
+    collection_timer_.Stop();
+    const auto generation = collection_work_->generation.fetch_add(1, std::memory_order_acq_rel) + 1;
+    {
+        std::lock_guard lock(collection_work_->mutex);
+        collection_work_->request.reset();
+        collection_work_->batch.reset();
+    }
+    collection_work_->ready.notify_all();
+    filter_work_->generation.fetch_add(1, std::memory_order_acq_rel);
+    {
+        std::lock_guard lock(filter_work_->mutex);
+        filter_work_->request.reset();
+        filter_work_->completion.reset();
+    }
+    auto rows = std::make_shared<Rows>();
+    rows->searched = pending || (history && history->query().has_value());
+    if (project) rows->protected_paths = project->protected_paths;
+    collection_rows_ = rows;
+    visible_.reset();
+    table_->populate(0, {});
+    previous_->Disable(); next_->Disable(); copy_->Disable(); export_->Disable();
+    std::size_t loaded = 0;
+    if (history) for (const auto &page : history->pages()) if (page) loaded += page->matches.size();
+    coverage_ = document ? wxString("Active document") : wxString("No searchable document");
+    if (pending) coverage_ += "; search pending";
+    if (history && history->pages().size()) {
+        const auto &last = history->pages().back();
+        coverage_ += last->complete ? "; current page complete" : "; more input remains";
+        if (!last->source_complete) coverage_ += "; partial decoded source";
+        if (!last->reason.empty()) coverage_ += "; " + text(last->reason).Left(160);
+    }
+    if (!reason.empty()) coverage_ += "; " + reason.Left(160);
+    more_->Enable(history && history->continuation().has_value() && !pending);
+    if (!document || !history || history->pages().empty()) {
+        rows_ = collection_rows_;
+        collection_rows_.reset();
+        selected_document_.reset(); selected_page_.reset();
+        render();
+        return;
+    }
+    CollectionWork::Request request;
+    request.generation = generation;
+    request.document = *document;
+    request.pages = pages;
+    {
+        std::lock_guard lock(collection_work_->mutex);
+        collection_work_->request = std::move(request);
+    }
+    status_->SetLabel("Collecting " + number(loaded) + " loaded matches in bounded batches...");
+    status_->SetToolTip(coverage_);
+    preview_->ChangeValue("Collecting current-document search results; navigation is paused.");
+    collection_work_->ready.notify_one();
+    collection_timer_.Start(10);
+}
+void SearchView::poll_collection() {
+    if (!collection_work_) return;
+    std::optional<CollectionWork::Batch> batch;
+    {
+        std::lock_guard lock(collection_work_->mutex);
+        if (collection_work_->batch) {
+            batch = std::move(collection_work_->batch);
+            collection_work_->batch.reset();
+        }
+    }
+    collection_work_->ready.notify_all();
+    if (!batch || batch->generation != collection_work_->generation.load(std::memory_order_acquire)) return;
+    if (!batch->rows.empty()) {
+        if (!collection_rows_) return;
+        for (auto &seed : batch->rows) {
+            const auto address = seed.match.instruction_address ? seed.match.instruction_address : seed.match.address;
+            Rows::Item item{seed.document, seed.index, std::move(seed.match), "Active document", {}, {}, seed.page};
+            // Request context is attached to each immutable page batch below by the
+            // active document snapshot; the page remains the source identity anchor.
+            item.image = collection_image_;
+            item.project = collection_project_;
+            item.cells = {item.label, location_text(item.match.offset),
+                          address ? location_text(*address, item.image.get()) : wxString("file only"),
+                          number(item.match.size), item.match.operand_index ? number(*item.match.operand_index) : wxString{},
+                          number(item.index + 1)};
+            wxString metadata;
+            for (const auto &cell : item.cells) metadata += cell + "\n";
+            metadata.MakeLower();
+            const auto encoded = metadata.utf8_string();
+            item.metadata.assign(encoded.data(), encoded.length());
+            collection_rows_->items.push_back(std::move(item));
+        }
+        status_->SetLabel("Collected " + number(collection_rows_->items.size()) + " loaded matches...");
+    }
+    if (!batch->done) return;
+    collection_timer_.Stop();
+    rows_ = collection_rows_;
+    collection_rows_.reset();
+    const bool retained = selected_document_ && std::any_of(rows_->items.begin(), rows_->items.end(), [&](const auto &item) {
+        return item.document == *selected_document_ && item.index == selected_index_ && item.page == selected_page_;
+    });
+    if (!retained) {
+        selected_document_.reset();
+        selected_page_.reset();
+    }
+    if (history_selected_index_ && !retained) {
+        const auto selected = std::find_if(rows_->items.begin(), rows_->items.end(), [&](const auto &item) {
+            return item.index == *history_selected_index_;
+        });
+        if (selected != rows_->items.end()) {
+            selected_document_ = selected->document;
+            selected_index_ = selected->index;
+            selected_page_ = selected->page;
+        }
+    }
+    render();
 }
 void SearchView::update_all(const std::vector<SearchDocumentView> &documents) {
+    collection_rows_.reset();
+    current_pages_.clear();
+    collection_image_.reset(); collection_project_.reset();
+    history_selected_index_.reset(); current_reason_.clear(); current_pending_ = false;
+    collection_timer_.Stop();
+    collection_work_->generation.fetch_add(1, std::memory_order_acq_rel);
+    {
+        std::lock_guard lock(collection_work_->mutex);
+        collection_work_->request.reset();
+        collection_work_->batch.reset();
+    }
+    collection_work_->ready.notify_all();
     all_documents_ = true;
     auto rows = std::make_shared<Rows>();
     std::size_t pending = 0, remaining = 0, partial = 0, complete = 0, no_page = 0;
