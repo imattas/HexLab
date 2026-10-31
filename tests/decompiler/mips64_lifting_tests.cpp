@@ -26,8 +26,6 @@ Instruction decode_word(std::uint32_t word) {
                            std::byte{static_cast<unsigned char>(word >> 24)}};
     auto decoded = decode_instruction({Architecture::mips64, ExecutionMode::mips64, ByteOrder::little},
                                       bytes, Address{{0}, 0x1000});
-    if (decoded.status != DecodeStatus::decoded || !decoded.instruction)
-        std::cerr << "failed literal MIPS64 word 0x" << std::hex << word << ": " << decoded.reason << '\n';
     require(decoded.status == DecodeStatus::decoded && decoded.instruction,
             "literal MIPS64 word instruction decodes");
     return std::move(*decoded.instruction);
@@ -81,7 +79,7 @@ int main() {
     daddi.register_writes = {v0};
     auto daddi_lifted = lift({std::move(daddi)});
     const auto *daddi_effect = std::get_if<Intrinsic>(&daddi_lifted.blocks[0].instructions[0].statement);
-    require(daddi_effect && daddi_effect->name == "mips64_daddi_overflow" &&
+    require(daddi_effect && daddi_effect->name == "mips64_daddi_conditional_trap" &&
                 daddi_effect->register_writes == std::vector<RegisterOperand>{v0},
             "DADDI preserves architecturally trapping overflow behavior");
 
@@ -93,12 +91,12 @@ int main() {
     const auto word_sra = decode_word((4u << 16) | (3u << 11) | (9u << 6) | 0x03u); // SRA v1,a0,9
     const auto word_lui = decode_word((0x0fu << 26) | (2u << 16) | 0x8000u); // LUI v0,0x8000
     const auto *addiu_imm = std::get_if<ImmediateOperand>(&word_addi.operands[2]);
-    require(word_add.opcode == Opcode::mips_addu && word_sub.opcode == Opcode::mips_subu &&
-                word_addi.opcode == Opcode::mips_addiu && addiu_imm && addiu_imm->is_signed &&
-                addiu_imm->effective_width == 64 && addiu_imm->value == UINT64_MAX &&
-                word_sll.opcode == Opcode::mips_sll && word_srl.opcode == Opcode::mips_srl &&
-                word_sra.opcode == Opcode::mips_sra && word_lui.opcode == Opcode::mips_lui &&
-                std::get<RegisterOperand>(word_add.operands[0]).width == 64,
+    require(word_add.opcode == Opcode::mips64_addu && word_sub.opcode == Opcode::mips64_subu &&
+          word_addi.opcode == Opcode::mips64_addiu && addiu_imm && addiu_imm->is_signed &&
+          addiu_imm->effective_width == 64 && addiu_imm->value == UINT64_MAX &&
+          word_sll.opcode == Opcode::mips64_sll && word_srl.opcode == Opcode::mips64_srl &&
+          word_sra.opcode == Opcode::mips64_sra && word_lui.opcode == Opcode::mips_lui &&
+          std::get<RegisterOperand>(word_add.operands[0]).width == 64,
             "literal N64 word instructions retain 64-bit GPRs and signed immediate decoding");
     auto word_ops = lift({word_add, word_sub, word_addi, word_sll, word_srl, word_sra, word_lui});
     const auto &word_statements = word_ops.blocks[0].instructions;
@@ -135,7 +133,8 @@ int main() {
     auto shifts = lift({ins(Opcode::mips64_dsll32, {v0, a0, ImmediateOperand{33, 6, 64, false, {}}}),
                         ins(Opcode::mips64_dsrlv, {v1, a1, a0})});
     const auto shift_text = format_pseudocode(shifts);
-    require(shift_text.find("<<") != std::string::npos && shift_text.find("mips64_dsrlv") != std::string::npos,
+    require(shift_text.find("<< 0x21") != std::string::npos &&
+                shift_text.find(">> (r4 & 0x3f)") != std::string::npos,
             "doubleword shift semantics preserve fixed and variable shift operations");
 
     const MemoryOperand word_memory{32, 64, {}, a0, {}, 1, -8, false, {}, {}};
@@ -202,10 +201,15 @@ int main() {
             "MIPS64 CVT.S.W uses an integer source and floating result type");
     const auto mfc1 = decode_word((0x11u << 26) | (8u << 16) | (9u << 11));
     const auto mfc1_lifted = lift({mfc1});
-    const auto *mfc1_effect = std::get_if<Intrinsic>(&mfc1_lifted.blocks[0].instructions[0].statement);
-    require(mfc1_effect && mfc1_effect->name == "mips64.mfc1.sext32" && mfc1_effect->operands.size() == 2 &&
-                mfc1_effect->operands[0]->type == ValueType{TypeKind::integer, 64, false} &&
-                mfc1_effect->register_writes == std::vector<RegisterOperand>{{RegisterBank::mips_gpr, 8, 64, false}},
+    const auto *mfc1_assign = std::get_if<Assign>(&mfc1_lifted.blocks[0].instructions[0].statement);
+    const auto *mfc1_extend = mfc1_assign ? std::get_if<UnaryValue>(&mfc1_assign->value->value) : nullptr;
+    const auto *mfc1_bitcast = mfc1_extend ? std::get_if<UnaryValue>(&mfc1_extend->operand->value) : nullptr;
+    const auto *mfc1_source = mfc1_bitcast ? std::get_if<RegisterValue>(&mfc1_bitcast->operand->value) : nullptr;
+    require(mfc1_assign && mfc1_assign->destination == RegisterOperand{RegisterBank::mips_gpr, 8, 64, false} &&
+                mfc1_assign->value->type == ValueType{TypeKind::integer, 64, false} &&
+                mfc1_extend && mfc1_extend->operation == "sext" && mfc1_bitcast &&
+                mfc1_bitcast->operation == "bitcast_f32" && mfc1_bitcast->operand->type == ValueType{TypeKind::floating, 32, false} &&
+                mfc1_source && mfc1_source->reg == RegisterOperand{RegisterBank::mips_fpr, 9, 32, false},
             "MIPS64 MFC1 lifting names sign extension and retains its 64-bit GPR effect");
 
     const auto compare = decode_word((0x11u << 26) | (16u << 21) | (6u << 16) | (7u << 11) | 0x3cu);

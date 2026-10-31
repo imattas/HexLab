@@ -3,6 +3,7 @@
 #include "support/checks.hpp"
 
 #include <memory>
+#include <algorithm>
 
 using namespace hexlab;
 using namespace hexlab_test;
@@ -58,7 +59,7 @@ void frame_pointer_and_stack_pointer_aliases() {
     snapshot.blocks = {entry};
     const auto result = analyze_stack_frame(function, snapshot, {});
     check(result && result.value().complete, "stack analyzer accepts a recovered x64 function");
-    check(result && result.value().slots.size() == 1, "frame-pointer and stack-pointer accesses coalesce");
+    check(result && result.value().slots.size() == 2, "local access and saved frame-pointer slots are both retained");
     if (result && !result.value().slots.empty()) {
         const auto &slot = result.value().slots[0];
         check(slot.offset_from_entry_sp == -16 && slot.width == 32,
@@ -106,7 +107,12 @@ void x86_32_argument_offset() {
     auto establish = fact(2, 0x3001, Opcode::mov, {reg32(5), reg32(4)},
                           {OperandAccess::write, OperandAccess::read});
     establish.instruction.context = context;
-    auto load = memory_fact(3, 0x3003, reg32(5), 8, 32, OperandAccess::read);
+    MemoryOperand argument;
+    argument.base = reg32(5);
+    argument.displacement = 8;
+    argument.data_width = 32;
+    argument.address_width = 32;
+    auto load = fact(3, 0x3003, Opcode::mov, {argument}, {OperandAccess::read});
     load.instruction.context = context;
     auto entry = block(1, 0x3000, {push, establish, load});
     FunctionRecord function;
@@ -116,8 +122,11 @@ void x86_32_argument_offset() {
     FunctionSnapshot snapshot;
     snapshot.blocks = {entry};
     const auto result = analyze_stack_frame(function, snapshot, {});
-    check(result && result.value().slots.size() == 1 && result.value().slots[0].offset_from_entry_sp == 4,
-          "x86-32 frame pointer resolves the first stack argument from entry SP");
+    check(result && result.value().complete && result.value().slots.size() == 2 &&
+              result.value().slots[0].offset_from_entry_sp == -4 && result.value().slots[0].width == 32 &&
+              result.value().slots[0].written && result.value().slots[1].offset_from_entry_sp == 4 &&
+              result.value().slots[1].width == 32 && result.value().slots[1].read,
+          "x86-32 frame tracking retains saved EBP and resolves the first stack argument");
 }
 
 void x86_16_argument_offset() {
@@ -129,7 +138,12 @@ void x86_16_argument_offset() {
     auto establish = fact(2, 0x4001, Opcode::mov, {reg16(5), reg16(4)},
                           {OperandAccess::write, OperandAccess::read});
     establish.instruction.context = context;
-    auto load = memory_fact(3, 0x4003, reg16(5), 4, 16, OperandAccess::read);
+    MemoryOperand argument;
+    argument.base = reg16(5);
+    argument.displacement = 4;
+    argument.data_width = 16;
+    argument.address_width = 16;
+    auto load = fact(3, 0x4003, Opcode::mov, {argument}, {OperandAccess::read});
     load.instruction.context = context;
     auto entry = block(1, 0x4000, {push, establish, load});
     FunctionRecord function;
@@ -139,8 +153,11 @@ void x86_16_argument_offset() {
     FunctionSnapshot snapshot;
     snapshot.blocks = {entry};
     const auto result = analyze_stack_frame(function, snapshot, {});
-    check(result && result.value().slots.size() == 1 && result.value().slots[0].offset_from_entry_sp == 2,
-          "x86-16 frame pointer resolves stack arguments in its value width");
+    check(result && result.value().complete && result.value().slots.size() == 2 &&
+              result.value().slots[0].offset_from_entry_sp == -2 && result.value().slots[0].width == 16 &&
+              result.value().slots[0].written && result.value().slots[1].offset_from_entry_sp == 2 &&
+              result.value().slots[1].width == 16 && result.value().slots[1].read,
+          "x86-16 frame tracking retains saved BP and resolves stack arguments in 16-bit units");
 }
 
 InstructionFact decoded_x86_fact(std::uint64_t id, std::uint64_t offset, DecodeContext context,
@@ -174,11 +191,13 @@ void x86_lea_frames_and_address_taken_locals() {
          decoded_x86_fact(3, 0x4103, x16, {0x8d, 0x46, 0xfc}),
          decoded_x86_fact(4, 0x4106, x16, {0x89, 0x46, 0xfc}),
          decoded_x86_fact(5, 0x4109, x16, {0xc3})});
-    check(result16 && result16.value().slots.size() == 1 &&
+    check(result16 && result16.value().slots.size() == 2 &&
               result16.value().slots[0].offset_from_entry_sp == -6 && result16.value().slots[0].width == 16 &&
               result16.value().slots[0].address_taken && result16.value().slots[0].written &&
-              result16.value().slots[0].accesses == std::vector<Address>{{{0}, 0x4103}, {{0}, 0x4106}},
-          "x86-16 LEA of a BP-relative local coalesces address and data uses at an entry-SP offset");
+              result16.value().slots[0].accesses == std::vector<Address>{{{0}, 0x4103}, {{0}, 0x4106}} &&
+              result16.value().slots[1].offset_from_entry_sp == -2 && result16.value().slots[1].width == 16 &&
+              result16.value().slots[1].written,
+          "x86-16 LEA coalesces local uses and retains the saved BP slot");
     check(result16 && result16.value().complete, "x86-16 supported frame flow remains complete");
 
     const DecodeContext x32{Architecture::x86, ExecutionMode::x86_32};
@@ -457,6 +476,7 @@ void arm32_multiple_save_and_thumb_slots() {
     save.instruction.arm = ArmInstructionInfo{};
     save.instruction.arm->multiple_mode = ArmMultipleMode::db;
     save.instruction.arm->writeback = true;
+    save.instruction.memory_write = true;
     auto arm_local = arm32_memory_fact(4, 0x900c, fp, 4, OperandAccess::write);
     std::get<ArmMemoryOperand>(arm_local.instruction.operands[1]).add = false;
     auto thumb_entry = block(1, 0xa000,
@@ -479,10 +499,13 @@ void arm32_multiple_save_and_thumb_slots() {
     check(saved && saved.value().complete && saved.value().slots.size() == 3,
           "A32 STMDB stack saves and local accesses are recovered");
     if (saved && saved.value().slots.size() == 3) {
-        check(saved.value().slots[0].offset_from_entry_sp == -12 &&
-                  saved.value().slots[1].offset_from_entry_sp == -8 &&
-                  saved.value().slots[2].offset_from_entry_sp == -4,
-              "A32 multiple-store registers map to increasing memory offsets");
+        const auto has_written_slot = [&](std::int64_t offset) {
+            return std::any_of(saved.value().slots.begin(), saved.value().slots.end(), [&](const auto &slot) {
+                return slot.offset_from_entry_sp == offset && slot.width == 32 && slot.written;
+            });
+        };
+        check(has_written_slot(-12) && has_written_slot(-8) && has_written_slot(-4),
+              "A32 STMDB saves both listed registers and preserves the local slot");
     }
     snapshot.blocks = {thumb_entry};
     function.entry = {{0}, 0xa000};
@@ -513,12 +536,14 @@ void arm32_arithmetic_frame_pointer_setup() {
     for (const auto &[mode, address] : {std::pair{ExecutionMode::a32, std::uint64_t{0xc000}},
                                          std::pair{ExecutionMode::thumb, std::uint64_t{0xc100}}}) {
         const auto result = make_function(mode, address);
-        check(result && result.value().complete && result.value().slots.size() == 2,
+        check(result && result.value().complete && result.value().slots.size() == 3,
               "A32/Thumb ADD/SUB frame setup keeps local-slot analysis complete");
-        check(result && result.value().slots.size() == 2 &&
+        check(result && result.value().slots.size() == 3 &&
                   result.value().slots[0].offset_from_entry_sp == -12 &&
-                  result.value().slots[1].offset_from_entry_sp == -4,
-              "A32/Thumb arithmetic frame pointers resolve entry-SP-relative local offsets");
+                  result.value().slots[1].offset_from_entry_sp == -8 &&
+                  result.value().slots[1].address_taken &&
+                  result.value().slots[2].offset_from_entry_sp == -4,
+              "A32/Thumb arithmetic frame pointers retain address-taken and data slots at entry-SP offsets");
     }
 }
 void arm32_unknown_sp_effects_are_partial() {

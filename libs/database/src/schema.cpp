@@ -54,6 +54,7 @@ const std::map<std::string,std::vector<std::pair<std::string,std::string>>> shap
     {"project_preferences",{{"key","TEXT"},{"value","TEXT"}}}
 };
 constexpr const char* legacy_type_definitions="CREATE TABLE type_definitions(id BLOB PRIMARY KEY NOT NULL CHECK(length(id)=8),name TEXT UNIQUE NOT NULL CHECK(length(CAST(name AS BLOB)) BETWEEN 1 AND 512),payload BLOB NOT NULL CHECK(length(payload) BETWEEN 1 AND 16777216))";
+constexpr const char* legacy_type_import_diagnostics="CREATE TABLE type_import_diagnostics(ordinal INTEGER PRIMARY KEY CHECK(ordinal>=0),source TEXT NOT NULL CHECK(length(CAST(source AS BLOB)) BETWEEN 1 AND 4096),severity INTEGER NOT NULL CHECK(severity BETWEEN 0 AND 2),location BLOB CHECK(location IS NULL OR length(location)=13),function_entry BLOB CHECK(function_entry IS NULL OR length(function_entry)=13),message TEXT NOT NULL CHECK(length(CAST(message AS BLOB))<=65536))";
 }
 int schema_version(Connection& connection){
     auto app=take(connection.prepare("PRAGMA application_id"));require(take(app->step()) && take(app->integer(0))==0x48584c42,"File is not a HexLab project");app.reset();
@@ -110,8 +111,8 @@ void migrate_schema(Connection& connection){
     if(version==0)take(connection.execute("PRAGMA user_version=1"));
     if(version<2){take(connection.execute(legacy_type_definitions));take(connection.execute(statements[15]));take(connection.execute("PRAGMA user_version=2"));version=2;}
     if(version<3){take(connection.execute(statements[16]));take(connection.execute("PRAGMA user_version=3"));}
-    if(version<4){take(connection.execute(statements[17]));take(connection.execute("PRAGMA user_version=4"));}
-    if(version==4){take(connection.execute("ALTER TABLE debug_variables ADD COLUMN cfa_offset BLOB CHECK(cfa_offset IS NULL OR length(cfa_offset)=8)"));take(connection.execute("PRAGMA user_version=5"));}
+    if(version<4){take(connection.execute(statements[17]));take(connection.execute("PRAGMA user_version=4"));version=4;}
+    if(version==4){bool has_cfa=false;auto columns=take(connection.prepare("PRAGMA table_info(debug_variables)"));while(take(columns->step()))if(take(columns->text(1))=="cfa_offset")has_cfa=true;if(!has_cfa)take(connection.execute("ALTER TABLE debug_variables ADD COLUMN cfa_offset BLOB CHECK(cfa_offset IS NULL OR length(cfa_offset)=8)"));take(connection.execute("PRAGMA user_version=5"));version=5;}
     if(version<4)take(connection.execute("PRAGMA user_version=5"));
     bool has_ranges=false;auto columns=take(connection.prepare("PRAGMA table_info(debug_variables)"));while(take(columns->step()))if(take(columns->text(1))=="location_ranges")has_ranges=true;
     if(!has_ranges)take(connection.execute("ALTER TABLE debug_variables ADD COLUMN location_ranges BLOB NOT NULL DEFAULT X'' CHECK(length(location_ranges)<=1048576)"));
@@ -141,15 +142,15 @@ void migrate_schema(Connection& connection){
         take(connection.execute("ALTER TABLE project_breakpoints ADD COLUMN hit_count BLOB NOT NULL DEFAULT X'0000000000000000' CHECK(length(hit_count)=8)"));
         take(connection.execute("PRAGMA user_version=11"));
     }
-    if(version<12){take(connection.execute(statements[20]));take(connection.execute("PRAGMA user_version=12"));}
-    if(version<13){take(connection.execute(statements[21]));take(connection.execute("PRAGMA user_version=13"));}
-    if(version<14){take(connection.execute(statements[22]));take(connection.execute("PRAGMA user_version=14"));version=14;}
+    if(version<12){take(connection.execute(statements[19]));take(connection.execute("PRAGMA user_version=12"));}
+    if(version<13){take(connection.execute(legacy_type_import_diagnostics));take(connection.execute("PRAGMA user_version=13"));}
+    if(version<14){take(connection.execute(statements[21]));take(connection.execute("PRAGMA user_version=14"));version=14;}
     if(version<15){
         take(connection.execute("ALTER TABLE type_import_diagnostics ADD COLUMN analysis_key BLOB CHECK(analysis_key IS NULL OR length(analysis_key)=120)"));
         take(connection.execute("PRAGMA user_version=15"));
         version=15;
     }
-    if(version<16){take(connection.execute(statements[23]));take(connection.execute("PRAGMA user_version=16"));}
+    if(version<16){take(connection.execute(statements[22]));take(connection.execute("PRAGMA user_version=16"));}
     if(version<17){take(connection.execute("ALTER TABLE project_breakpoints ADD COLUMN one_shot INTEGER NOT NULL DEFAULT 0 CHECK(one_shot IN(0,1))"));take(connection.execute("PRAGMA user_version=17"));}
     if(version<18){
         take(connection.execute("ALTER TABLE history ADD COLUMN created_unix_ms BLOB CHECK(created_unix_ms IS NULL OR length(created_unix_ms)=8)"));

@@ -15,7 +15,7 @@ constexpr std::uint32_t stream_thread_list = 3, stream_module_list = 4,
     stream_misc_info = 15, stream_memory_info = 16, stream_thread_info = 17,
     stream_thread_names = 24, stream_handle_data = 12, stream_thread_ex_list = 8,
     stream_handle_operations = 18, stream_token_info = 19, stream_system_memory_info = 21, stream_process_vm_counters = 22,
-    stream_comment_a = 10, stream_comment_w = 11,
+    stream_comment_a = 10, stream_comment_w = 11, stream_ipt_trace = 23,
     stream_assertion_info = 0x47670002, stream_linux_cpu_info = 0x47670003,
     stream_linux_proc_status = 0x47670004, stream_linux_lsb_release = 0x47670005,
     stream_linux_cmd_line = 0x47670006, stream_linux_environ = 0x47670007,
@@ -25,6 +25,7 @@ constexpr std::uint64_t max_streams = 4096, max_memory_regions = 131072,
     max_metadata_bytes = 64u * 1024u * 1024u;
 constexpr std::uint64_t max_decoded_contexts = 4096;
 constexpr std::size_t max_comment_capture_bytes = 4096;
+constexpr std::size_t max_ipt_trace_capture_bytes = 1024u * 1024u;
 constexpr std::size_t max_handle_object_info_per_handle = 1024;
 constexpr std::uint64_t max_handle_object_info_records = 65536;
 constexpr std::size_t misc_info5_xstate_offset = 832;
@@ -334,7 +335,7 @@ Result<LoadedImage> load_minidump(std::shared_ptr<const ByteStorage> storage, st
                         row.type == stream_thread_info || row.type == stream_thread_names ||
                         row.type == stream_handle_data || row.type == stream_thread_ex_list ||
                         row.type == stream_handle_operations || row.type == stream_token_info || row.type == stream_system_memory_info || row.type == stream_process_vm_counters ||
-                        row.type == stream_comment_a || row.type == stream_comment_w ||
+                        row.type == stream_comment_a || row.type == stream_comment_w || row.type == stream_ipt_trace ||
                         row.type == stream_assertion_info || row.type == stream_linux_cpu_info ||
                         row.type == stream_linux_proc_status || row.type == stream_linux_lsb_release ||
                         row.type == stream_linux_cmd_line || row.type == stream_linux_environ ||
@@ -383,6 +384,25 @@ Result<LoadedImage> load_minidump(std::shared_ptr<const ByteStorage> storage, st
                     metadata.diagnostics.emplace_back("Minidump comment stream prefix retained; payload exceeds 4096-byte capture limit");
                 metadata.comments.push_back(std::move(comment));
             }
+        }
+        if (auto ipt = stream(stream_ipt_trace)) {
+            const auto retained = std::min<std::size_t>(ipt->size, max_ipt_trace_capture_bytes);
+            if (budget > max_metadata_bytes - sizeof(MinidumpIptTrace) ||
+                retained > max_metadata_bytes - budget - sizeof(MinidumpIptTrace))
+                return Error{ErrorCode::resource_limit, "Minidump IPT trace metadata exceeds its byte budget"};
+            budget += sizeof(MinidumpIptTrace) + retained;
+            MinidumpIptTrace parsed;
+            parsed.declared_size = ipt->size;
+            parsed.stream_file_offset = FileOffset{ipt->rva};
+            parsed.truncated = retained < ipt->size;
+            if (retained) {
+                auto bytes = read(*storage, ipt->rva, retained);
+                if (!bytes) return bytes.error();
+                parsed.captured_bytes.assign(bytes.value().bytes.begin(), bytes.value().bytes.end());
+            }
+            if (parsed.truncated)
+                metadata.diagnostics.emplace_back("Minidump IPT trace prefix retained; payload exceeds 1048576-byte capture limit");
+            metadata.ipt_trace = std::move(parsed);
         }
         if (auto proc_status = stream(stream_linux_proc_status)) {
             constexpr std::size_t max_status_capture = 1024u * 1024u;

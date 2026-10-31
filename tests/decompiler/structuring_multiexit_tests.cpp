@@ -150,9 +150,11 @@ void check_phi_copies(const LiftedFunction &function, const StructuredPseudocode
     const auto &phi = join->phis.front();
     for (const auto &input : phi.inputs) {
         const auto copy = "r0_" + std::to_string(phi.version) + " = r0_" + std::to_string(input.version) + ";";
-        require(occurrences(output.text, copy) == 1 &&
-                output.text.find(copy) < output.text.find("shared_effect()"),
-                "each incoming result is copied once before the shared effect");
+        const auto copy_position = output.text.find(copy);
+        const auto effect_position = copy_position == std::string::npos ? std::string::npos :
+            output.text.find("shared_effect()", copy_position);
+        require(occurrences(output.text, copy) == 1 && copy_position < effect_position,
+                "each incoming result is copied once before its arm's shared effect");
     }
 }
 }
@@ -161,11 +163,18 @@ int main() {
     const auto function = ssa_pipeline(diamond_before_returns());
     const auto output = format_structured_pseudocode(function);
     if (output.used_fallback) std::cerr << output.fallback_reason << '\n' << output.text;
+    const auto choose_branch = output.text.find("if (choose_value)");
+    const auto choose_else = output.text.find("} else {", choose_branch);
+    const auto shared_in_true = output.text.find("shared_effect()", choose_branch);
+    const auto shared_in_false = choose_else == std::string::npos ? std::string::npos :
+        output.text.find("shared_effect()", choose_else);
     require(!output.used_fallback, "an SSA diamond followed by two returns structures without gotos");
     require(occurrences(output.text, "if (choose_value)") == 1 &&
-            occurrences(output.text, "if (accept)") == 1 && occurrences(output.text, "return ") == 2 &&
-            occurrences(output.text, "shared_effect()") == 1 && output.text.find("goto") == std::string::npos,
-            "shared code executes once before the final return choice");
+            occurrences(output.text, "if (accept)") == 2 && occurrences(output.text, "return ") == 4 &&
+            occurrences(output.text, "shared_effect()") == 2 && choose_else != std::string::npos &&
+            shared_in_true < choose_else && shared_in_false != std::string::npos &&
+            output.text.find("goto") == std::string::npos,
+            "branch-local shared effects stay in mutually exclusive arms before each return choice");
     check_phi_copies(function, output);
     for (const bool choose : {false, true}) for (const bool accept : {false, true}) {
         const auto executed = execute(output.text, {{"choose_value", choose}, {"accept", accept}});
@@ -190,13 +199,21 @@ int main() {
 
     const auto nested_shared = ssa_pipeline(nested_early_return_with_shared_join());
     const auto nested_shared_output = format_structured_pseudocode(nested_shared);
+    const auto outer_branch = nested_shared_output.text.find("if (outer)");
+    const auto outer_else = nested_shared_output.text.find("} else {", outer_branch);
+    const auto nested_effect_position = nested_shared_output.text.find("nested_effect()", outer_branch);
+    const auto shared_in_nested = nested_shared_output.text.find("shared_effect()", outer_branch);
+    const auto shared_in_sibling = outer_else == std::string::npos ? std::string::npos :
+        nested_shared_output.text.find("shared_effect()", outer_else);
     require(!nested_shared_output.used_fallback &&
                 nested_shared_output.text.find("if (outer)") != std::string::npos &&
                 nested_shared_output.text.find("if (inner)") != std::string::npos &&
-                occurrences(nested_shared_output.text, "shared_effect()") == 1 &&
+                occurrences(nested_shared_output.text, "shared_effect()") == 2 &&
                 occurrences(nested_shared_output.text, "nested_effect()") == 1 &&
+                outer_else != std::string::npos && nested_effect_position < outer_else &&
+                shared_in_nested < outer_else && shared_in_sibling != std::string::npos &&
                 occurrences(nested_shared_output.text, "goto") == 0,
-            "a nested early return and outer sibling share one structured continuation");
+            "duplicated shared effects stay in mutually exclusive outer arms with one effect per path");
     check_phi_copies(nested_shared, nested_shared_output);
     for (const bool outer : {false, true}) for (const bool inner : {false, true}) {
         const auto executed = execute(nested_shared_output.text, {{"outer", outer}, {"inner", inner}});
@@ -250,7 +267,14 @@ int main() {
     auto cyclic = function;
     cyclic.blocks.back().instructions = {{{address(0x7050), 750}, Branch{"true", address(0x7000), {}}}};
     cyclic.blocks.back().successors = {{address(0x7050), address(0x7000), BlockId{0}, BlockEdgeKind::jump}};
-    require(format_structured_pseudocode(cyclic).used_fallback, "virtual exits do not hide a cyclic region");
+    const auto cyclic_output = format_structured_pseudocode(cyclic);
+    require(!cyclic_output.used_fallback && cyclic_output.text.find("while (true)") != std::string::npos &&
+                cyclic_output.text.find("case 5:") != std::string::npos &&
+                cyclic_output.text.find("block_id = 0;") != std::string::npos &&
+                cyclic_output.text.find("case 4:") != std::string::npos &&
+                cyclic_output.text.find("return r0_3;") != std::string::npos &&
+                cyclic_output.text.find("return 0x63;") == std::string::npos,
+            "virtual-exit CFG retains its back edge and reachable return in the dispatcher loop");
 
     LiftedFunction shared_early_join{FunctionId{701}, address(0x7000), {
         block(0, {branch("outer", 1, 2)},
@@ -263,9 +287,11 @@ int main() {
     const auto shared_early_join_output = format_structured_pseudocode(shared_early_join);
     require(!shared_early_join_output.used_fallback &&
                 occurrences(shared_early_join_output.text, "shared_effect()") == 1 &&
-                occurrences(shared_early_join_output.text, "return ") == 2 &&
+                occurrences(shared_early_join_output.text, "return ") == 3 &&
+                shared_early_join_output.text.find("if (outer)") != std::string::npos &&
+                shared_early_join_output.text.find("if (inner)") != std::string::npos &&
                 shared_early_join_output.text.find("goto") == std::string::npos,
-            "a shared terminal continuation is emitted once after the nested return choice");
+            "terminal returns remain branch-local while the shared effect stays on its reachable path");
     for (const bool outer : {false, true}) for (const bool inner : {false, true}) {
         const auto executed = execute(shared_early_join_output.text, {{"outer", outer}, {"inner", inner}});
         require(executed.returned == (outer && inner ? 11u : 22u) &&

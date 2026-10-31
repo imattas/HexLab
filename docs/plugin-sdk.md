@@ -830,6 +830,11 @@ separate from project files. Managers constructed with the legacy one-argument
 constructor, including embedded/test managers, remain in-memory only; hosts can
 opt in by passing a state file path to the two-argument constructor.
 
+The `plugin_sdk` regression test constructs three separate managers against a
+temporary state file. The first writes a value, the second verifies it and
+updates it through an erase tombstone with compare-and-set revisions, and the
+third verifies the updated bytes and revision after another manager restart.
+
 The v1 file is bounded to 80 MiB and uses a versioned binary representation
 with a SHA-256 corruption check. A missing file starts with empty state. Invalid,
 truncated, unsupported, oversized, or unreadable files cause state callbacks to

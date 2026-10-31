@@ -151,6 +151,7 @@ void incremental_tests() {
     if (!p)
         return;
     AnalysisBasis old{image, metadata, {}, {}, {}, key, p.value().functions, p.value().references, p.value().strings};
+    old.metadata_reads_complete = true;
     auto next = image32(bytes({0x48, 0x90, 0xc3}));
     auto revised = key;
     ++revised.byte_revision;
@@ -166,7 +167,10 @@ void incremental_tests() {
     foreign_layout.space.width_bits = 64;
     auto foreign = Image::create(image->storage(), foreign_layout).value();
     auto same = plan_invalidation(old, {}, old.decisions, key, {}).value();
-    check(!reanalyze(old, foreign, metadata, {}, same, key, {}), "unannounced context changes reject reuse");
+    auto unexpected_context = reanalyze(old, foreign, metadata, {}, same, key, {});
+    check(unexpected_context && unexpected_context.value().context == foreign->decode_context() &&
+              unexpected_context.value().counters.reused_instructions == 0,
+          "unannounced mode changes force a fresh analysis without reusing old facts");
     auto fresh_key = key;
     ++fresh_key.byte_revision;
     ReadSet header;
@@ -336,13 +340,6 @@ void continuation_tests() {
             for (auto &edge : block->successors)
                 if (edge.target == Address{{0}, target} && edge.kind == expected_kind)
                     edge_found = true;
-        if (recovered.functions->instructions.size() != count || !edge_found) {
-            std::cerr << "Continuation case from=" << std::hex << from << " target=" << target
-                      << " instructions=" << std::dec << recovered.functions->instructions.size()
-                      << " expected=" << count << " edge=" << edge_found << '\n';
-            for (auto &fact : recovered.functions->instructions)
-                std::cerr << " instruction " << std::hex << fact->instruction.address.offset << '\n';
-        }
         check(recovered.functions->instructions.size() == count && edge_found,
               "legacy rooted CFG reaches the architectural continuation");
         auto encoded = encode_derived(recovered, {}).value();

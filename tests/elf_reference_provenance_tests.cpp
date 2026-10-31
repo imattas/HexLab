@@ -171,9 +171,19 @@ void symbol_namespaces_and_hostile_counts() {
     const auto data_ref = second.rows[0];
     auto one = ReferenceIndex::create({data_ref}, {}, true, {}).value();
     auto payload = encode_reference_index(*one, {}).value();
-    check(payload.size() > 75 + 32 && payload[69] == std::byte{1},
+    // Payload v19 stores producer-graph fields before the ELF provenance
+    // record. The unkeyed, single-record header ends at byte 16 and the
+    // record's fixed fields place the embedded ELF length at bytes 71..74.
+    constexpr std::size_t elf_length_offset = 71;
+    const auto elf_payload_size = payload.size() >= elf_length_offset + 4 + 32
+                                      ? (std::to_integer<std::uint32_t>(payload[elf_length_offset]) << 24) |
+                                            (std::to_integer<std::uint32_t>(payload[elf_length_offset + 1]) << 16) |
+                                            (std::to_integer<std::uint32_t>(payload[elf_length_offset + 2]) << 8) |
+                                            std::to_integer<std::uint32_t>(payload[elf_length_offset + 3])
+                                      : 0;
+    check(elf_payload_size > 0 && payload.size() == elf_length_offset + 4 + elf_payload_size + 32,
           "unkeyed raw ELF provenance record has a bounded length-prefixed origin payload");
-    for (std::size_t i = 71; i < 75; ++i)
+    for (std::size_t i = elf_length_offset; i < elf_length_offset + 4; ++i)
         payload[i] = std::byte{0xff};
     Sha256 hash;
     hash.update(std::span(payload).first(payload.size() - 32)).value();

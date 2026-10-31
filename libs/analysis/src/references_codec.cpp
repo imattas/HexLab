@@ -1029,6 +1029,13 @@ std::vector<std::byte> reference_key(const Reference &value) {
     validate_reference(value);
     Writer out;
     out.record(value, false);
+    // Optional target-mode and producer-chain discriminators were added after
+    // the original identity record. Omit their empty markers so legacy
+    // references keep their stable IDs; nonempty values remain identity data.
+    if (!value.provenance.target_mode && value.provenance.producer_instruction_ids.empty()) {
+        require(out.bytes.size() >= 2, "Reference identity record is truncated");
+        out.bytes.resize(out.bytes.size() - 2);
+    }
     return std::move(out.bytes);
 }
 Sha256Digest checked_hash(std::span<const std::byte> bytes, std::stop_token stop) {

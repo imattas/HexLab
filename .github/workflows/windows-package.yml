@@ -20,6 +20,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+      - name: Provision pinned x86-16 oracle tools
+        shell: pwsh
+        run: ./tests/provision_x86_16_tools.ps1 -Download
       - name: Configure desktop distribution
         run: cmake --preset windows-desktop
       - name: Build Release applications and test targets

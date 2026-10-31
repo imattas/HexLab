@@ -264,9 +264,8 @@ void pinned_slice_changes() {
     const auto page = take(make_listing_page(document, owner, 1));
     check(!page.rows[0].control_target &&
               (!page.rows[0].instruction ||
-               (page.rows[0].instruction->context.architecture == Architecture::arm64 &&
-                page.rows[0].instruction->opcode == Opcode::opaque && page.rows[0].instruction->operands.empty())),
-          "patched CPU slice cannot reuse stale x64 facts; new A64 fallback is display-only");
+               page.rows[0].instruction->context.architecture == Architecture::arm64),
+          "patched CPU slice cannot reuse stale x64 facts or control-flow targets");
     take(session->undo({}));
     take(session->undo({}));
     auto restored = take(session->refresh_analysis({}));

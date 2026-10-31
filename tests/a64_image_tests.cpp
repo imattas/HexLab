@@ -84,8 +84,9 @@ void raw() {
     }
     const auto image = load_raw(std::make_shared<MemoryStorage>(a64_fixture::program()), options, {});
     check(bool(image), "A64 raw input loads");
-    if (image)
+    if (image) {
         facts(image.value(), {}, options.base);
+    }
     auto invalid = options;
     invalid.entry = Address{{7}, 0x1001};
     check(!validate_raw_coordinates(invalid), "explicit A64 raw entry alignment is validated");

@@ -85,7 +85,12 @@ void read_segments(const ByteStorage &storage, MachOMetadata &metadata, Budget &
                 const auto alignment_mask = (std::uint64_t{1} << section.alignment) - 1;
                 require((section.address & alignment_mask) == 0,
                         "Mach-O section address violates its declared alignment");
-                if (!zero_fill(section.flags) && section.size)
+                // Relocatable Mach-O objects emitted by LLVM may place a
+                // section at a file offset that does not mirror its declared
+                // VM alignment (for example, __text offset 408/alignment 4).
+                // The alignment constrains the section address; do not reject
+                // otherwise readable object-file sections on that basis.
+                if (header.file_type != 1 && !zero_fill(section.flags) && section.size)
                     require((section.raw_file_offset & alignment_mask) == 0,
                             "Mach-O section file offset violates its declared alignment");
             }

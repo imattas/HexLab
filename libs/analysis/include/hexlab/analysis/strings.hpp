@@ -50,6 +50,7 @@ struct AnalysisOptions {
     SemanticDecoderReadSet semantic_decoder_read_set;
 };
 HEXLAB_ANALYSIS_EXPORT bool semantic_decoder_read_set_complete(const AnalysisOptions&) noexcept;
+HEXLAB_ANALYSIS_EXPORT std::vector<FileRange> semantic_decoder_image_read_ranges(const AnalysisOptions&) noexcept;
 HEXLAB_ANALYSIS_EXPORT bool semantic_decoder_image_reads_intersect(
     const AnalysisOptions&, std::span<const FileRange> changed_ranges, std::uint64_t image_size) noexcept;
 // Existing values are stable because cached records persist this byte value.

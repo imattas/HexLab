@@ -44,7 +44,9 @@ void roundtrip_tests() {
     Fixture fixture(bytes({0xf0, 0x48, 0x01, 0x18, 0x64, 0x48, 0x8b, 0x00, 0x48, 0x8d, 0x05, 0,    0,   0,
                            0,    0x48, 0xc7, 0xc0, 0xff, 0xff, 0xff, 0xff, 0x75, 2,    0x90, 0xc3, 0xcc}));
     auto payload = encode_derived(fixture.derived, {}).value();
-    auto restored = fixture.decode(payload).value();
+    auto restored_result = fixture.decode(payload);
+    if (!restored_result) throw std::runtime_error("Cache decode: " + restored_result.error().message);
+    auto restored = std::move(restored_result.value());
     check(restored.source_key == fixture.key && restored.functions->key == fixture.key &&
               restored.references->key() == fixture.key,
           "cached derived layers retain one exact source key");
@@ -100,16 +102,16 @@ void context_tests(const std::filesystem::path &legacy_path) {
                   "cache preserves hidden stack and relative target widths");
     }
     // Primary context5, mapping digest32, count4, one id4/context5 domain.
-    constexpr std::size_t context = 126, first_instruction = 209;
+    constexpr std::size_t context = 127, first_instruction = 226;
     check(payload.size() > first_instruction + 3 + 32 &&
               payload[context] == std::byte(static_cast<unsigned>(Architecture::x86_64)) &&
               payload[first_instruction] == payload[context],
           "literal v4 envelope and instruction context positions are canonical");
     check(payload[context + 3] == std::byte{0} && payload[first_instruction + 3] == std::byte{0},
           "explicit stack attribute is present in envelope and instruction records");
-    // Context5 + address12 + absent-ARM-info1 + length1 + bytes5 + opcode2 + operand-count1 +
+    // Context5 + address12 + absent-ARM-info1 + length4 + bytes5 + opcode2 + operand-count1 +
     // operand-tag1 + displacement8 + encoded/effective widths2+2.
-    constexpr auto relative_field = first_instruction + 5 + 12 + 1 + 1 + 5 + 2 + 1 + 1 + 8 + 2 + 2;
+    constexpr auto relative_field = first_instruction + 5 + 12 + 1 + 4 + 5 + 2 + 1 + 1 + 8 + 2 + 2;
     check(payload[relative_field] == std::byte{1} && payload[relative_field + 1] == std::byte{1} &&
               payload[relative_field + 2] == std::byte{4} &&
               std::get<RelativeOperand>(restored.functions->instructions[0]->instruction.operands[0]).encoding ==
@@ -121,13 +123,13 @@ void context_tests(const std::filesystem::path &legacy_path) {
     check(!fixture.decode(field_forgery),
           "checksum-valid operand field forgery cannot replace decoded source coordinates");
     auto forged = payload;
-    forged[131] ^= std::byte{1};
+    forged[132] ^= std::byte{1};
     checksum(forged);
     auto wrong_mapping = fixture.decode(forged);
     check(!wrong_mapping && wrong_mapping.error().message.find("mapping") != std::string::npos,
           "checksum-valid mapping fingerprint forgery is rejected");
     forged = payload;
-    forged[175] = std::byte{1};
+    forged[188] = std::byte(static_cast<unsigned>(Architecture::x86));
     checksum(forged);
     auto wrong_domain = fixture.decode(forged);
     check(!wrong_domain && wrong_domain.error().message.find("domain") != std::string::npos,
@@ -209,10 +211,10 @@ void hostile_tests() {
     auto damaged = payload;
     damaged[10] ^= std::byte{1};
     check(!fixture.decode(damaged), "damaged derived checksum is a cache miss candidate");
-    // Source-bound flat header places completeness at176 and first fact count193.
+    // Source-bound flat header places completeness at193 and first fact count210.
     auto count = payload;
-    check(count.size() > 197 + 32, "cache fixture includes a counted fact table");
-    for (size_t i = 193; i < 197; ++i)
+    check(count.size() > 214 + 32, "cache fixture includes a counted fact table");
+    for (size_t i = 210; i < 214; ++i)
         count[i] = std::byte{0xff};
     checksum(count);
     check(!fixture.decode(count), "checksum-valid hostile fact count is rejected before allocation");
@@ -221,7 +223,7 @@ void hostile_tests() {
     checksum(version);
     check(!fixture.decode(version), "unknown derived payload version rejected");
     auto false_complete = payload;
-    false_complete[176] = std::byte{0};
+    false_complete[193] = std::byte{0};
     checksum(false_complete);
     check(!fixture.decode(false_complete),
           "checksum-valid fabricated completeness cannot pass rooted derivation validation");

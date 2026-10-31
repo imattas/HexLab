@@ -475,6 +475,21 @@ DecodeResult decode_instruction(DecodeContext context, std::span<const std::byte
     const bool riscv_vector_encoding =
         (context.architecture == Architecture::riscv64 || context.architecture == Architecture::riscv32) &&
         bytes.size() >= 4 && (riscv_opcode == 0x57 || riscv_vector_memory_encoding);
+    bool a32_unpredictable_pc_exchange = false;
+    if (context.mode == ExecutionMode::a32 && context.order == ByteOrder::little && bytes.size() >= 4) {
+        const auto word = std::to_integer<std::uint32_t>(bytes[0]) |
+            (std::to_integer<std::uint32_t>(bytes[1]) << 8) |
+            (std::to_integer<std::uint32_t>(bytes[2]) << 16) |
+            (std::to_integer<std::uint32_t>(bytes[3]) << 24);
+        const auto encoding = word & 0x0ffffff0u;
+        a32_unpredictable_pc_exchange = (encoding == 0x012fff10u || encoding == 0x012fff30u) &&
+                                        (word & 15u) == 15u;
+    }
+    // BX/BLX using PC has architecturally constrained behavior. The narrow
+    // decoder rejects it; a permissive fallback must not turn it into a
+    // typed control-flow instruction with guessed link effects.
+    if (a32_unpredictable_pc_exchange)
+        return result;
     if (result.status == DecodeStatus::unsupported && !riscv_vector_encoding &&
         context.architecture != Architecture::wasm && context.architecture != Architecture::dex &&
         context.architecture != Architecture::jvm) {

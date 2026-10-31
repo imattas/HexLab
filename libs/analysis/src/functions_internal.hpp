@@ -80,6 +80,7 @@ class Recovery {
     const ImageMetadata &metadata;
     const AnalysisDecisions &decisions;
     const AnalysisOptions &options;
+    std::vector<FileRange> semantic_decoder_image_ranges;
     std::stop_token stop;
     RelocationResolver relocations;
     std::shared_ptr<FunctionSnapshot> output = std::make_shared<FunctionSnapshot>();
@@ -117,7 +118,8 @@ class Recovery {
     bool discovery_exhausted = false;
     Recovery(const Image &i, const ImageMetadata &m, const AnalysisDecisions &d, const AnalysisOptions &o,
              std::stop_token s)
-        : image(i), metadata(m), decisions(d), options(o), stop(s),
+        : image(i), metadata(m), decisions(d), options(o),
+          semantic_decoder_image_ranges(semantic_decoder_image_read_ranges(o)), stop(s),
           relocations(take(RelocationResolver::create(i, m, s))) {
         for (const auto &symbol : metadata.imports) {
             if (stop.stop_requested())

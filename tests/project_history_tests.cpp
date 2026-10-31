@@ -253,8 +253,8 @@ void type_assignment_rebase_boundary_tests(){
         if (boundary==Boundary::identity) proposed.id=5;
         StateDelta proposal{{TypeAssignmentChange{right,proposed}}};
         if (boundary==Boundary::unsupported_change) {
-            auto renamed=first;renamed.name="Renamed";
-            proposal.changes.emplace_back(TypeDefinitionChange{first,renamed});
+            proposal.changes.emplace_back(ProjectBreakpointChange{{}, ProjectBreakpoint{
+                5, Address{{0},0x5000}, ProjectBreakpointKind::software, true, 1, {}, false, {}}});
         }
         auto submission=peer->submit(1,proposal,0,{}).value();
         const auto after=peer->project()->snapshot().value();

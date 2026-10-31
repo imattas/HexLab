@@ -207,12 +207,13 @@ void other_layouts_and_partial_sources() {
               "negative combined addend overflow stays typed and unresolved");
     }
     auto bytes = chained();
-    put(bytes, chains_at + 24, 1, 4, false);
+    compress_chained_symbol_pool(bytes);
     auto loaded = load(bytes);
     auto resolver = take(MachODyldResolver::create(*loaded.image, loaded.metadata, {}));
     check(take(resolver.data({MachODyldSource::chained, 0}, {})).reason == MachODyldResolutionReason::resolved &&
-              take(resolver.data({MachODyldSource::chained, 1}, {})).reason == MachODyldResolutionReason::unsupported,
-          "compressed import names do not erase an independently complete rebase");
+              take(resolver.data({MachODyldSource::chained, 1}, {})).binding &&
+              take(resolver.data({MachODyldSource::chained, 1}, {})).binding->name == "_ext",
+          "valid compressed import names preserve independent rebase and binding results");
     bytes = chained(true, 6);
     put(bytes, 32 + 24, UINT64_MAX - 8192, 8, false);
     put(bytes, 768, 776 | (UINT64_C(0xff) << 36), 8, false);

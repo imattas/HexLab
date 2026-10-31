@@ -130,12 +130,12 @@ int main() {
     const auto fp_lifted = lift({fadd});
     const auto *fp_intrinsic = std::get_if<Intrinsic>(&fp_lifted.blocks[0].instructions[0].statement);
     require(fp_intrinsic && fp_intrinsic->name == "fadd.s" && fp_intrinsic->register_writes.size() == 2 &&
-                fp_intrinsic->operands.size() == 2 &&
+                fp_intrinsic->operands.size() == 3 && fp_intrinsic->operands.back()->type.bits == 3 &&
                 fp_intrinsic->operands[0]->type.kind == TypeKind::floating &&
                 fp_intrinsic->operands[0]->type.bits == 32,
             "S arithmetic uses 32-bit floating views of the 64-bit physical FPRs");
     auto fp_ssa = to_ssa(fp_lifted);
-    require(fp_ssa && format_pseudocode(fp_ssa.value()).find("fadd.s(f1_0, f2_0) /* writes f3_1, fflags_1 */") != std::string::npos,
+    require(fp_ssa && format_pseudocode(fp_ssa.value()).find("fadd.s(f1_0, f2_0, 0x0) /* writes f3_1, fflags_1 */") != std::string::npos,
             "FPR and floating status writes enter ordinary SSA");
     const RegisterOperand f4{RegisterBank::riscv_fpr, 4, 64, false};
     const auto fmadd_d = lift({instruction(Opcode::rv_fmadd_d, {f4, f1, f2, f3})});

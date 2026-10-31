@@ -35,17 +35,21 @@ static std::vector<std::byte> managed_pe_fixture() {
     u32(0); tables.push_back(std::byte{2}); tables.push_back(std::byte{0}); tables.push_back(std::byte{0}); tables.push_back(std::byte{1});
     u64((1ull << 0) | (1ull << 6)); u64(0); u32(1); u32(1);
     for (int i=0;i<5;++i) u16(0); // Module row
-    u32(0x2500); u16(0); u16(0x16); u16(1); u16(0); u16(1); // MethodDef Run()
+    u32(0x2500); u16(0); u16(0x16); u16(1); u16(1); u16(1); // MethodDef Run(): void()
     std::vector<std::byte> strings{std::byte{0},std::byte{'R'},std::byte{'u'},std::byte{'n'},std::byte{0}};
+    while (strings.size() % 4)
+        strings.push_back(std::byte{0});
+    std::vector<std::byte> blobs{std::byte{0},std::byte{3},std::byte{0},std::byte{0},std::byte{1}}; // void Run()
     std::vector<std::byte> root;
     auto ru16 = [&](std::uint16_t v) { root.push_back(std::byte(v)); root.push_back(std::byte(v >> 8)); };
     auto ru32 = [&](std::uint32_t v) { for (unsigned i=0;i<4;++i) root.push_back(std::byte(v >> (8*i))); };
     auto patch32 = [&](std::size_t p,std::uint32_t v) { for(unsigned i=0;i<4;++i) root[p+i]=std::byte(v>>(8*i)); };
-    ru32(0x424a5342); ru16(1); ru16(1); ru32(0); ru32(4); root.insert(root.end(),{std::byte{'v'},std::byte{'4'},std::byte{0},std::byte{0}}); ru16(0); ru16(2);
+    ru32(0x424a5342); ru16(1); ru16(1); ru32(0); ru32(4); root.insert(root.end(),{std::byte{'v'},std::byte{'4'},std::byte{0},std::byte{0}}); ru16(0); ru16(3);
     const auto table_header=root.size(); ru32(0); ru32(static_cast<std::uint32_t>(tables.size())); root.insert(root.end(),{std::byte{'#'},std::byte{'~'},std::byte{0},std::byte{0}});
     const auto strings_header=root.size(); ru32(0); ru32(static_cast<std::uint32_t>(strings.size())); root.insert(root.end(),{std::byte{'#'},std::byte{'S'},std::byte{'t'},std::byte{'r'},std::byte{'i'},std::byte{'n'},std::byte{'g'},std::byte{'s'},std::byte{0},std::byte{0},std::byte{0},std::byte{0}});
-    const auto tables_offset=static_cast<std::uint32_t>(root.size()); const auto strings_offset=tables_offset+static_cast<std::uint32_t>(tables.size());
-    patch32(table_header,tables_offset); patch32(strings_header,strings_offset); root.insert(root.end(),tables.begin(),tables.end()); root.insert(root.end(),strings.begin(),strings.end());
+    const auto blob_header=root.size(); ru32(0); ru32(static_cast<std::uint32_t>(blobs.size())); root.insert(root.end(),{std::byte{'#'},std::byte{'B'},std::byte{'l'},std::byte{'o'},std::byte{'b'},std::byte{0},std::byte{0},std::byte{0}});
+    const auto tables_offset=static_cast<std::uint32_t>(root.size()); const auto strings_offset=tables_offset+static_cast<std::uint32_t>(tables.size()); const auto blobs_offset=strings_offset+static_cast<std::uint32_t>(strings.size());
+    patch32(table_header,tables_offset); patch32(strings_header,strings_offset); patch32(blob_header,blobs_offset); root.insert(root.end(),tables.begin(),tables.end()); root.insert(root.end(),strings.begin(),strings.end()); root.insert(root.end(),blobs.begin(),blobs.end());
     put(data,0x610,1,4); put(data,0x60c,static_cast<std::uint32_t>(root.size()),4);
     std::copy(root.begin(),root.end(),data.begin()+0x700); data[0x900]=std::byte{0x06}; data[0x901]=std::byte{0x2a};
     return data;

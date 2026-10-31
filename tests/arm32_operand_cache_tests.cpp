@@ -90,7 +90,7 @@ template <class E> void references() {
         if (!index)
             return;
         const auto encoded = encode_reference_index(*index.value(), {});
-        check(encoded && encoded.value()[0] == std::byte{9}, "Thumb expressions advance standalone wire to9");
+        check(encoded && encoded.value()[0] == std::byte{19}, "ARM expressions use standalone reference payload version 19");
         if (!encoded)
             return;
         const auto restored = decode_reference_index(encoded.value(), {});

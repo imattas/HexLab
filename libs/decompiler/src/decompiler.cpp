@@ -1912,7 +1912,8 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
             std::get<RegisterOperand>(instruction.operands.front()).bank == RegisterBank::x87 &&
             std::any_of(instruction.register_writes.begin(), instruction.register_writes.end(),
                 [](RegisterOperand reg) { return reg.bank == RegisterBank::x87 && reg.index == 0; })) {
-            Intrinsic effect{"x87_fld", std::move(typed_operands), IntrinsicMemoryEffect::none};
+            Intrinsic effect{"x87_fld", std::move(typed_operands),
+                             instruction.memory_read ? IntrinsicMemoryEffect::read : IntrinsicMemoryEffect::none};
             effect.register_writes = instruction.register_writes;
             effect.x87_stack_delta = instruction.x87_stack_delta;
             effect.result_type = floating_type(80);
@@ -2003,6 +2004,7 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
                 instruction.memory_read && instruction.memory_write ? IntrinsicMemoryEffect::unknown :
                 instruction.memory_read ? IntrinsicMemoryEffect::read :
                 instruction.memory_write ? IntrinsicMemoryEffect::write : IntrinsicMemoryEffect::none};
+            effect.result_type = floating_type(80);
             effect.register_writes = instruction.register_writes;
             effect.register_output_values.reserve(effect.register_writes.size());
             for (const auto reg : effect.register_writes)
@@ -3557,6 +3559,10 @@ a64_unhandled:
                 }
                 if (converts_from_word && effect.operands.size() > 1)
                     effect.operands[1] = retag_expr(effect.operands[1], integer_type(32));
+                if (op >= Opcode::mips_add_s && op <= Opcode::mips_neg_s)
+                    effect.result_type = floating_type(32);
+                else if (op >= Opcode::mips_add_d && op <= Opcode::mips_neg_d)
+                    effect.result_type = floating_type(64);
                 if (!converts_to_word) {
                     if (op == Opcode::mips_cvt_s_d || op == Opcode::mips_cvt_s_w)
                         effect.result_type = floating_type(32);
@@ -6037,9 +6043,7 @@ a64_unhandled:
             const bool signed_saturating = instruction.opcode == Opcode::paddsb || instruction.opcode == Opcode::paddsw ||
                 instruction.opcode == Opcode::psubsb || instruction.opcode == Opcode::psubsw ||
                 instruction.opcode == Opcode::phaddsw || instruction.opcode == Opcode::phsubsw;
-            const bool signed_result = signed_saturating || instruction.opcode == Opcode::pcmpgtb ||
-                instruction.opcode == Opcode::pcmpgtw || instruction.opcode == Opcode::pcmpgtd ||
-                instruction.opcode == Opcode::pcmpgtq ||
+            const bool signed_result = signed_saturating ||
                 instruction.opcode == Opcode::pmulhw || instruction.opcode == Opcode::pmaddwd ||
                 instruction.opcode == Opcode::pminsw || instruction.opcode == Opcode::pmaxsw ||
                 instruction.opcode == Opcode::phaddw || instruction.opcode == Opcode::phaddd ||

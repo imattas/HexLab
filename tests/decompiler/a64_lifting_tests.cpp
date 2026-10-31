@@ -70,6 +70,8 @@ int main() {
                 ubfx_text.find("& 0xff") != std::string::npos,
             "decoded UBFM/UBFX lifts to a masked logical extraction");
     const auto lsl = decoded(0xd378dc20);
+    require(lsl.opcode == Opcode::a64_ubfm && lsl.operands.size() == 4,
+            "UBFM LSL encoding with immr bit 5 decodes as the typed four-field instruction");
     const auto lsl_text = format_pseudocode(lift(block(entry, {lsl})));
     require(lsl_text.find("<< 0x8") != std::string::npos && lsl_text.find("0xffffffffffffff") != std::string::npos,
             "decoded UBFM/LSL wraps the source bits and applies the encoded destination mask");

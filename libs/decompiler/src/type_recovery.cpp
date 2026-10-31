@@ -3061,6 +3061,8 @@ static Result<TypeRecoveryResult> recover_types_impl(
     TypeRecoveryResult result;
     if (pointer_layout_nonconvergent)
         result.diagnostics.push_back("pointer alias field propagation did not converge; aggregate layouts suppressed");
+    else if (!normalized_ambiguous.empty())
+        result.diagnostics.push_back("inconsistent pointer alias offsets were observed; affected aggregate layouts suppressed");
     if (applied_call_pointee_layout)
         result.diagnostics.push_back("bounded pointee field evidence from compatible call arguments was applied to SSA values");
     if (call_layout_budget_exhausted)

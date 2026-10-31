@@ -297,7 +297,7 @@ int main() {
         decoded_snapshot.blocks.push_back(decoded_block);
         auto lifted_string = lift_function(decoded_record, decoded_snapshot);
         require(lifted_string && format_pseudocode(lifted_string.value()).find(
-                    std::string(string_opcodes[i].second) + "(") != std::string::npos,
+                    std::string("x86_string_") + string_opcodes[i].second + "_") != std::string::npos,
                 "x86 string instructions keep their mnemonic in decompiler fallback output");
     }
     return 0;

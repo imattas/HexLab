@@ -1,6 +1,7 @@
 #include "hexlab/decompiler/decompiler.hpp"
 #include "hexlab/processors/decoder.hpp"
 
+#include <algorithm>
 #include <cstdlib>
 #include <iostream>
 
@@ -130,8 +131,11 @@ int main() {
           scalar_effect.result_type->bits == 128 && scalar_effect.result_type->element_kind == TypeKind::floating &&
           scalar_effect.result_type->element_bits == 32 && scalar_effect.result_type->lanes == 4,
           "ADDSS result retains scalar f32 lanes inside the full 128-bit XMM register");
-    check(scalar_effect.register_writes == std::vector<RegisterOperand>{xmm0},
-          "ADDSS records the full XMM destination register effect");
+    const RegisterOperand mxcsr{RegisterBank::mxcsr, 0, 32, false};
+    check(scalar_effect.register_writes.size() == 2 &&
+              std::find(scalar_effect.register_writes.begin(), scalar_effect.register_writes.end(), xmm0) != scalar_effect.register_writes.end() &&
+              std::find(scalar_effect.register_writes.begin(), scalar_effect.register_writes.end(), mxcsr) != scalar_effect.register_writes.end(),
+          "ADDSS records the full XMM and sticky MXCSR destination effects");
     check(scalar_effect.name == "x86_addss_f32",
           "ADDSS intrinsic identifies its scalar floating width");
     check(format_pseudocode(decoded_addss.value()).find("x86_addss_f32") != std::string::npos,

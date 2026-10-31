@@ -4,6 +4,9 @@ set_target_properties(hexlab_sdk_example PROPERTIES PREFIX "")
 add_library(hexlab_sdk_legacy_example MODULE legacy_plugin.c)
 target_link_libraries(hexlab_sdk_legacy_example PRIVATE hexlab::plugin_sdk)
 set_target_properties(hexlab_sdk_legacy_example PROPERTIES PREFIX "")
+add_library(hexlab_sdk_state_persistence MODULE state_persistence_plugin.c)
+target_link_libraries(hexlab_sdk_state_persistence PRIVATE hexlab::plugin_sdk)
+set_target_properties(hexlab_sdk_state_persistence PROPERTIES PREFIX "")
 foreach(stage IN ITEMS 1 2 3)
   add_library(hexlab_sdk_throw_stage${stage} MODULE throwing_plugin.cpp)
   target_link_libraries(hexlab_sdk_throw_stage${stage} PRIVATE hexlab::plugin_sdk)
@@ -17,6 +20,11 @@ add_dependencies(hexlab_sdk_tests hexlab_sdk_example hexlab_sdk_legacy_example
 add_test(NAME plugin_sdk COMMAND hexlab_sdk_tests "$<TARGET_FILE:hexlab_sdk_example>"
   "$<TARGET_FILE:hexlab_sdk_legacy_example>" "$<TARGET_FILE:hexlab_sdk_throw_stage1>"
   "$<TARGET_FILE:hexlab_sdk_throw_stage2>" "$<TARGET_FILE:hexlab_sdk_throw_stage3>")
+add_executable(hexlab_sdk_state_persistence_tests state_persistence_tests.cpp)
+target_link_libraries(hexlab_sdk_state_persistence_tests PRIVATE hexlab::plugins)
+add_dependencies(hexlab_sdk_state_persistence_tests hexlab_sdk_state_persistence)
+add_test(NAME plugin_state_persistence COMMAND hexlab_sdk_state_persistence_tests
+  "$<TARGET_FILE:hexlab_sdk_state_persistence>")
 if(HEXLAB_PLUGINS_STANDALONE)
   add_custom_command(TARGET hexlab_sdk_tests POST_BUILD
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different "$<TARGET_FILE:hexlab_core>" "$<TARGET_FILE_DIR:hexlab_sdk_tests>"

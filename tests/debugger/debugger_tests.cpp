@@ -407,9 +407,8 @@ void run_tests() {
                            "data breakpoints encode write and access length fields in independent slots");
         hexlab_test::check(!encode_hardware_breakpoints({{0x1001, BreakpointKind::write, 4}}, 8, regs),
                            "unaligned data breakpoint is rejected");
-        hexlab_test::check(encode_hardware_breakpoints({{0x1000, BreakpointKind::read, 1}}, 4, regs) &&
-                           ((regs.dr7 >> 16) & 0xf) == 0x3,
-                           "read breakpoint maps to access encoding on x86 for later read filtering");
+        hexlab_test::check(!encode_hardware_breakpoints({{0x1000, BreakpointKind::read, 1}}, 4, regs),
+                           "x86 rejects read-only hardware breakpoints because DR7 only supports write or access modes");
         hexlab_test::check(!encode_hardware_breakpoints({{0x1000, BreakpointKind::write, 8}}, 4, regs),
                            "x86 rejects unsupported eight-byte hardware breakpoint lengths");
         hexlab_test::check(!encode_hardware_breakpoints({{0x1000, BreakpointKind::execute, 1},

@@ -167,6 +167,8 @@ bool move(State &s, std::uint8_t opcode, bool extended) {
     if (!extended && (opcode == 0xc4 || opcode == 0xc5)) {
         if (s.rules.long_mode())
             invalid("LES/LDS are not valid in long mode; C4/C5 are VEX prefixes");
+        if (!s.rules.default16() && s.position < s.input.size() && (s.peek() & 0xc0u) == 0xc0u)
+            unsupported("VEX prefix in legacy mode is outside the typed x86 subset");
         const auto width = s.width();
         auto m = modrm(s, width, width);
         if (m.mod == 3 || !std::holds_alternative<MemoryOperand>(m.rm))

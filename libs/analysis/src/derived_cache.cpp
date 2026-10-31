@@ -105,7 +105,9 @@ std::vector<std::byte> payload(const DerivedProposal &proposal, std::stop_token 
         if (validate_instructions) {
             if (validations)
                 ++*validations;
-            (void)checked_instruction(encoded, proposal.domain_contexts, nullptr, options, stop);
+            const auto checked = checked_instruction(encoded, proposal.domain_contexts, nullptr, options, stop);
+            require(checked.semantic_decoder_used == fact->semantic_decoder_used,
+                    "Derived instruction semantic-decoder provenance differs from source");
         }
         out.number(encoded.size(), 4);
         out.append(encoded);
@@ -446,7 +448,9 @@ Decoded read_payload(std::span<const std::byte> bytes, const Image &image, const
         auto encoded = in.read(static_cast<size_t>(length));
         auto value = std::make_shared<InstructionFact>();
         value->id = id;
-        value->instruction = checked_instruction(encoded, out.proposal.domain_contexts, &image, options, stop);
+        const auto checked = checked_instruction(encoded, out.proposal.domain_contexts, &image, options, stop);
+        value->instruction = checked.instruction;
+        value->semantic_decoder_used = checked.semantic_decoder_used;
         ++out.proposal.counters.cache_validation_decodes;
         value->reads = in.reads();
         const auto &instruction = value->instruction;
@@ -462,6 +466,9 @@ Decoded read_payload(std::span<const std::byte> bytes, const Image &image, const
             require(actual.bytes.size() == 1 && actual.bytes[0] == instruction.encoded_bytes()[offset],
                     "Cached instruction bytes differ from effective input");
         }
+        if (value->semantic_decoder_used)
+            for (const auto &range : semantic_decoder_image_read_ranges(options))
+                take(expected.include(range.begin, range.size));
         require(same_reads(value->reads, expected), "Cached instruction reads differ from the current mapping");
         out.facts.emplace(id, std::move(value));
     }

@@ -70,7 +70,8 @@ int main() {
             {{"a", integer(8), 0}, {"b", integer(8), 8}, {"c", integer(8), 16}}, 24, 8).value();
         const auto a64_aggregates = classify_abi_signature(CallingConvention::aapcs64,
             *function(big, {pair64, integer(8), integer(8), integer(8), integer(8), integer(8), integer(8), pair64}));
-        check(a64_aggregates.result.indirect && location(a64_aggregates.result).register_name == "X8" &&
+        check(a64_aggregates.result.indirect && a64_aggregates.hidden_result_pointer.indirect &&
+              location(a64_aggregates.hidden_result_pointer).register_name == "X8" &&
               location(a64_aggregates.arguments[0]).register_name == "X0" &&
               location(a64_aggregates.arguments[0], 1).register_name == "X1" &&
               location(a64_aggregates.arguments[1]).register_name == "X2" &&
@@ -116,9 +117,11 @@ int main() {
               "AAPCS64 128-bit integer scalars split across consecutive general registers");
         const auto a64_unsupported = classify_abi_signature(CallingConvention::aapcs64,
             *types::Type::function(types::Type::void_type(), {{"v", a64_vector}}, true).value());
-        check(!a64_unsupported.complete && !a64_unsupported.arguments[0].supported &&
-              a64_unsupported.arguments[0].reason.find("variadic") != std::string::npos,
-              "AAPCS64 rejects variadic forms explicitly");
+        check(a64_unsupported.complete && a64_unsupported.arguments[0].supported &&
+              a64_unsupported.arguments[0].locations.size() == 2 &&
+              location(a64_unsupported.arguments[0]).register_name == "D0" &&
+              location(a64_unsupported.arguments[0], 1).register_name == "D1",
+              "AAPCS64 applies base parameter allocation to a variadic signature's fixed HFA parameter");
         const auto sysv_fn = function(floating(8),
             {integer(8), floating(8), integer(4), floating(4), integer(8), floating(8),
              integer(8), floating(8), integer(8), floating(8), integer(8), floating(8),
@@ -168,22 +171,27 @@ int main() {
             *function(types::Type::void_type(), {aggregate, types::Type::array(integer(4), 4).value()}));
         check(unsupported.arguments[0].supported && location(unsupported.arguments[0]).kind == AbiLocationKind::stack,
               "oversized SysV aggregate is passed in memory");
-        check(unsupported.arguments[1].supported,
-              "arrays are recursively classified as aggregates");
+        check(!unsupported.arguments[1].supported &&
+                  unsupported.arguments[1].reason.find("array parameters") != std::string::npos,
+              "SysV array parameters require the language-level array-to-pointer adjustment");
         const auto unsupported_return = classify_abi_signature(CallingConvention::windows_x64,
             *function(aggregate, {integer(4)}));
         check(unsupported_return.result.supported && unsupported_return.result.indirect &&
-              location(unsupported_return.result).register_name == "RCX" &&
+              location(unsupported_return.hidden_result_pointer).register_name == "RCX" &&
+              location(unsupported_return.result).register_name == "RAX" &&
               location(unsupported_return.arguments[0]).register_name == "EDX",
-              "Windows large aggregate return uses hidden RCX and shifts positional arguments");
+              "Windows large aggregate return uses hidden RCX, returns its address in RAX, and shifts arguments");
         const auto sysv_hidden = classify_abi_signature(CallingConvention::sysv_x86_64,
             *function(aggregate, {integer(8)}));
-        check(sysv_hidden.result.indirect && location(sysv_hidden.result).register_name == "RDI" &&
+        check(sysv_hidden.result.indirect &&
+              location(sysv_hidden.hidden_result_pointer).register_name == "RDI" &&
+              location(sysv_hidden.result).register_name == "RAX" &&
               location(sysv_hidden.arguments[0]).register_name == "RSI",
-              "SysV memory return uses hidden RDI and consumes the first integer argument register");
+              "SysV memory return uses hidden RDI, returns its address in RAX, and consumes the first argument register");
         const auto cdecl_hidden = classify_abi_signature(CallingConvention::x86_32_cdecl,
             *function(aggregate, {integer(4)}));
-        check(cdecl_hidden.result.indirect && location(cdecl_hidden.result).stack_offset == 4 &&
+        check(cdecl_hidden.result.indirect &&
+              location(cdecl_hidden.hidden_result_pointer).stack_offset == 4 &&
               location(cdecl_hidden.arguments[0]).stack_offset == 8,
               "cdecl aggregate return places the hidden result pointer before explicit stack arguments");
         const auto small_win = types::Type::structure("Small", {{"a", integer(4), 0}, {"b", integer(4), 4}}, 8, 4).value();
@@ -225,15 +233,15 @@ int main() {
             {"SysV AMD64 16-byte", CallingConvention::sysv_x86_64, pair64, 0, "RDI", "RSI", AbiLocationKind::register_, false,
              "RAX", "RDX", AbiLocationKind::register_, false, 0},
             {"Microsoft x64 16-byte", CallingConvention::windows_x64, pair64, 0, "RDX", "", AbiLocationKind::register_, true,
-             "RCX", "", AbiLocationKind::register_, true, 0},
+             "RAX", "", AbiLocationKind::register_, true, 0},
             {"x86 cdecl 16-byte", CallingConvention::x86_32_cdecl, pair64, 8, "", "", AbiLocationKind::stack, false,
              "", "", AbiLocationKind::stack, true, 4},
             {"AAPCS64 16-byte", CallingConvention::aapcs64, pair64, 0, "X0", "X1", AbiLocationKind::register_, false,
              "X0", "X1", AbiLocationKind::register_, false, 0},
             {"SysV AMD64 24-byte", CallingConvention::sysv_x86_64, triple64, 8, "", "", AbiLocationKind::stack, false,
-             "RDI", "", AbiLocationKind::register_, true, 0},
+             "RAX", "", AbiLocationKind::register_, true, 0},
             {"Microsoft x64 24-byte", CallingConvention::windows_x64, triple64, 0, "RDX", "", AbiLocationKind::register_, true,
-             "RCX", "", AbiLocationKind::register_, true, 0},
+             "RAX", "", AbiLocationKind::register_, true, 0},
             {"x86 cdecl 24-byte", CallingConvention::x86_32_cdecl, triple64, 8, "", "", AbiLocationKind::stack, false,
              "", "", AbiLocationKind::stack, true, 4},
             {"AAPCS64 24-byte", CallingConvention::aapcs64, triple64, 0, "X0", "", AbiLocationKind::register_, true,
@@ -244,21 +252,39 @@ int main() {
                 *function(expected.aggregate, {expected.aggregate}));
             const auto &argument = classified.arguments[0];
             const auto &result = classified.result;
+            const bool aapcs64_indirect_result = expected.convention == CallingConvention::aapcs64 &&
+                expected.result_first == "X8";
+            const bool no_direct_result = expected.result_indirect &&
+                (expected.convention == CallingConvention::aapcs64 ||
+                 expected.convention == CallingConvention::x86_32_cdecl);
+            const bool hidden_pointer_valid = !expected.result_indirect ||
+                (classified.hidden_result_pointer.indirect &&
+                 (expected.convention == CallingConvention::aapcs64
+                      ? location(classified.hidden_result_pointer).register_name == "X8"
+                      : expected.convention == CallingConvention::sysv_x86_64
+                            ? location(classified.hidden_result_pointer).register_name == "RDI"
+                            : expected.convention == CallingConvention::windows_x64
+                                  ? location(classified.hidden_result_pointer).register_name == "RCX"
+                                  : location(classified.hidden_result_pointer).kind == AbiLocationKind::stack &&
+                                        location(classified.hidden_result_pointer).stack_offset == 4));
             check(classified.complete && argument.supported && result.supported &&
                   argument.indirect == expected.argument_indirect &&
                   result.indirect == expected.result_indirect &&
-                  !argument.locations.empty() && !result.locations.empty() &&
+                  hidden_pointer_valid && !argument.locations.empty() &&
+                  (no_direct_result ? result.locations.empty() : !result.locations.empty()) &&
                   argument.locations[0].kind == expected.argument_kind &&
                   (expected.argument_kind != AbiLocationKind::stack ||
                    argument.locations[0].stack_offset == expected.argument_stack_offset) &&
-                  result.locations[0].kind == expected.result_kind &&
-                  (expected.result_kind != AbiLocationKind::stack ||
-                   result.locations[0].stack_offset == expected.result_stack_offset) &&
+                  (no_direct_result ||
+                   (result.locations[0].kind == expected.result_kind &&
+                    (expected.result_kind != AbiLocationKind::stack ||
+                     result.locations[0].stack_offset == expected.result_stack_offset))) &&
                   (expected.argument_first.empty() || location(argument).register_name == expected.argument_first) &&
                   (expected.argument_second.empty() ||
                    (argument.locations.size() > 1 && location(argument, 1).register_name == expected.argument_second)) &&
-                  (expected.result_first.empty() || location(result).register_name == expected.result_first) &&
-                  (expected.result_second.empty() ||
+                  (expected.result_first.empty() || aapcs64_indirect_result ||
+                   location(result).register_name == expected.result_first) &&
+                  (expected.result_second.empty() || no_direct_result ||
                    (result.locations.size() > 1 && location(result, 1).register_name == expected.result_second)),
                   expected.name);
         }

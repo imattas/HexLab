@@ -268,6 +268,7 @@ std::size_t read_arm64_exception_directory(const Image &image, const Directory &
     functions.insert(functions.end(), parsed.begin(), parsed.end());
     return parsed.size();
 }
+
 } // namespace
 
 Result<std::size_t> read_exception_directory(const Image &image, const Directory &directory,

@@ -44,4 +44,14 @@ inline std::vector<std::byte> chained(bool wide = true, std::uint16_t pointer_fo
     }
     return data;
 }
+inline void compress_chained_symbol_pool(std::vector<std::byte> &data) {
+    // The compressed pool occupies the tail of the declared fixups payload;
+    // the zlib stream expands to the same NUL-terminated `_ext` name.
+    put(data, chains_at + 12, 80, 4, false);
+    put(data, chains_at + 24, 1, 4, false);
+    put(data, dyld_command(true) + 48 + 12, 93, 4, false);
+    constexpr unsigned compressed[]{120, 156, 139, 79, 173, 40, 97, 0, 0, 5, 196, 1, 177};
+    for (std::size_t i = 0; i < sizeof(compressed) / sizeof(compressed[0]); ++i)
+        data[chains_at + 80 + i] = std::byte(compressed[i]);
+}
 } // namespace hexlab_test::macho_fixture

@@ -4,6 +4,7 @@
 #include "hexlab/analysis/functions.hpp"
 #include "hexlab/processors/decoder.hpp"
 #include "hexlab/processors/format.hpp"
+#include "hexlab/processors/ppc_semantics.hpp"
 #include "support/analysis_fixture.hpp"
 #include "support/checks.hpp"
 #include "support/elf_fixture.hpp"
@@ -68,6 +69,58 @@ void arithmetic_and_memory() {
               decoded.instruction->register_writes.back().index == 7,
           "PPC64 LDU preserves DS-form update semantics");
 }
+void exact_scalar_fp_semantics() {
+    const auto add_word = (59u << 26) | (3u << 21) | (1u << 16) | (2u << 11) | (21u << 1) | 1u;
+    const auto add_bytes = encode(add_word, ByteOrder::big);
+    auto decoded = decode_instruction({Architecture::powerpc, ExecutionMode::ppc32, ByteOrder::big},
+                                      add_bytes, {{0}, 0x1000});
+    check(decoded.instruction && decoded.instruction->opcode == Opcode::ppc_fadds,
+          "single-precision record add decodes for semantic execution");
+    if (decoded.instruction) {
+        const auto result = evaluate_ppc_fp_arithmetic_instruction(*decoded.instruction,
+            UINT64_C(0x3ff0000000000000), UINT64_C(0x4000000000000000), 0x60000003u);
+        check(result && result->fpr_bits == UINT64_C(0x4008000000000000) &&
+                  (result->fpscr_after & 0x0007e000u) == 0x00004000u && result->cr1 == 6,
+              "exact fadds widens the single result, updates FPRF and records CR1");
+
+        const auto inexact = evaluate_ppc_fp_arithmetic_instruction(*decoded.instruction,
+            UINT64_C(0x3ff0000000000000), UINT64_C(0x3e70000000000000), 0);
+        check(!inexact, "inexact single result remains outside the exact evaluator");
+
+        auto malformed = *decoded.instruction;
+        malformed.register_reads.pop_back();
+        check(!evaluate_ppc_fp_arithmetic_instruction(malformed,
+            UINT64_C(0x3ff0000000000000), UINT64_C(0x4000000000000000), 0),
+              "arithmetic evaluator rejects missing FPSCR input dependency");
+    }
+
+    const auto mul_word = (59u << 26) | (3u << 21) | (1u << 16) | (4u << 6) | (25u << 1);
+    const auto mul_bytes = encode(mul_word, ByteOrder::big);
+    decoded = decode_instruction({Architecture::powerpc, ExecutionMode::ppc32, ByteOrder::big},
+                                 mul_bytes, {{0}, 0x1000});
+    check(decoded.instruction && decoded.instruction->opcode == Opcode::ppc_fmuls,
+          "single-precision multiply decodes with FRC source");
+    if (decoded.instruction) {
+        const auto result = evaluate_ppc_fp_arithmetic_instruction(*decoded.instruction,
+            UINT64_C(0x3ff8000000000000), UINT64_C(0x4000000000000000), 0);
+        check(result && result->fpr_bits == UINT64_C(0x4008000000000000),
+              "exact fmuls evaluates the architecturally rounded single result");
+    }
+
+    const auto sub_word = (59u << 26) | (3u << 21) | (1u << 16) | (2u << 11) | (20u << 1);
+    const auto sub_bytes = encode(sub_word, ByteOrder::big);
+    decoded = decode_instruction({Architecture::powerpc, ExecutionMode::ppc32, ByteOrder::big},
+                                 sub_bytes, {{0}, 0x1000});
+    if (decoded.instruction) {
+        const auto result = evaluate_ppc_fp_arithmetic_instruction(*decoded.instruction,
+            UINT64_C(0x4008000000000000), UINT64_C(0x3ff0000000000000), 3);
+        check(result && decoded.instruction->opcode == Opcode::ppc_fsubs &&
+                  result->fpr_bits == UINT64_C(0x4000000000000000),
+              "exact fsubs evaluates under the decoded single-precision effects");
+    } else {
+        check(false, "single-precision subtract decodes for semantic execution");
+    }
+}
 void rotate_and_immediate_arithmetic() {
     auto bytes = encode((21u<<26)|(3u<<21)|(4u<<16)|(8u<<11)|(5u<<6)|(20u<<1)|1u,
                         ByteOrder::big); // rlwinm. r3,r4,8,5,20
@@ -127,7 +180,8 @@ void status_and_raw() {
     check(d.status == DecodeStatus::invalid, "reserved PowerPC primary encoding stays invalid");
     const auto fp = encode(63u<<26, ByteOrder::little);
     d = decode_instruction({Architecture::powerpc,ExecutionMode::ppc32,ByteOrder::little}, fp, {{0},0});
-    check(d.status == DecodeStatus::unsupported, "unimplemented floating-point instruction stays unsupported");
+    check(d.status == DecodeStatus::decoded && d.instruction && d.instruction->opcode == Opcode::ppc_fcmpu,
+          "PowerPC floating compare decodes with typed unordered compare identity");
     RawOptions raw{Architecture::powerpc,ExecutionMode::ppc32,{{0},0x1000},true,false,true,{}};
     raw.order = ByteOrder::big;
     auto image = load_raw(std::make_shared<MemoryStorage>(std::vector<std::byte>(reserved.begin(),reserved.end())),raw,{});
@@ -175,12 +229,14 @@ void reachable_function_flow() {
 }
 }
 int main() {
-    decode_basics();
-    arithmetic_and_memory();
-    rotate_and_immediate_arithmetic();
-    control_flow();
-    status_and_raw();
-    elf_contexts();
-    reachable_function_flow();
-    return failures ? 1 : 0;
+    return run([] {
+        decode_basics();
+        arithmetic_and_memory();
+        exact_scalar_fp_semantics();
+        rotate_and_immediate_arithmetic();
+        control_flow();
+        status_and_raw();
+        elf_contexts();
+        reachable_function_flow();
+    });
 }

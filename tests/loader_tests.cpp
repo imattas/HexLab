@@ -2,6 +2,7 @@
 #include "hexlab/loaders/loader.hpp"
 #include "hexlab/loaders/pe.hpp"
 #include "hexlab/loaders/pdb_lines.hpp"
+#include "hexlab/loaders/minidump.hpp"
 #include "support/checks.hpp"
 #include "support/fixture_files.hpp"
 #include "support/pe_fixture.hpp"
@@ -11,6 +12,50 @@
 #include <fstream>
 using namespace hexlab;
 using namespace hexlab_test;
+
+void minidump_ipt_stream_tests() {
+    constexpr std::size_t directory = 32, payload = 44;
+    auto make_dump = [](std::size_t payload_size) {
+        std::vector<std::byte> data(payload + payload_size);
+        put(data, 0, 0x504d444d, 4); // MDMP
+        put(data, 4, 0xa793, 4);
+        put(data, 8, 1, 4);
+        put(data, 12, directory, 4);
+        put(data, directory, 23, 4); // IptTraceStream
+        put(data, directory + 4, payload_size, 4);
+        put(data, directory + 8, payload, 4);
+        return data;
+    };
+    auto data = make_dump(4);
+    data[payload] = std::byte{0x11}; data[payload + 1] = std::byte{0x22};
+    data[payload + 2] = std::byte{0x33}; data[payload + 3] = std::byte{0x44};
+    FixtureFile fixture(data);
+    auto loaded = load_minidump(FileStorage::open(fixture.path).value());
+    check(loaded && loaded.value().metadata.minidump && loaded.value().metadata.minidump->ipt_trace,
+          "IPT trace stream retained as metadata");
+    if (loaded && loaded.value().metadata.minidump && loaded.value().metadata.minidump->ipt_trace) {
+        const auto &trace = *loaded.value().metadata.minidump->ipt_trace;
+        check(trace.declared_size == 4 && trace.stream_file_offset == FileOffset{payload} &&
+              trace.captured_bytes == bytes({0x11, 0x22, 0x33, 0x44}) && !trace.truncated,
+              "IPT trace bytes retain declared size, exact source offset and contents");
+    }
+
+    constexpr std::size_t cap = 1024 * 1024;
+    data = make_dump(cap + 1);
+    FixtureFile large_fixture(data);
+    auto large = load_minidump(FileStorage::open(large_fixture.path).value());
+    check(large && large.value().metadata.minidump && large.value().metadata.minidump->ipt_trace,
+          "oversized IPT trace keeps bounded metadata");
+    if (large && large.value().metadata.minidump && large.value().metadata.minidump->ipt_trace) {
+        const auto &trace = *large.value().metadata.minidump->ipt_trace;
+        check(trace.declared_size == cap + 1 && trace.captured_bytes.size() == cap && trace.truncated,
+              "oversized IPT trace retains only the documented prefix");
+        check(std::any_of(large.value().metadata.minidump->diagnostics.begin(),
+                          large.value().metadata.minidump->diagnostics.end(),
+                          [](const auto &message) { return message.find("IPT trace") != std::string::npos; }),
+              "truncated IPT trace reports a diagnostic");
+    }
+}
 
 void raw_tests() {
     FixtureFile fixture(bytes({0x90,0xc3}));
@@ -198,11 +243,14 @@ void pe_load_configuration_tests() {
         put(data, 0x700, config_size, 4); put(data, 0x704, 0x12345678, 4);
         put(data, 0x708, 2, 2); put(data, 0x70a, 1, 2);
         const auto base = pe64 ? 0x140000000ULL : 0x400000ULL;
+        const auto guard_table_rva = pe64 ? 0x2340u : 0x2360u;
         put(data, 0x700 + cookie_offset, base + 0x20a0, width);
-        put(data, 0x700 + table_offset, base + 0x2340, width);
+        put(data, 0x700 + table_offset, base + guard_table_rva, width);
         put(data, 0x700 + count_offset, 1, width);
         put(data, 0x700 + flags_offset, 0x10000000u | 0x100u, 4); // one metadata byte per function
-        put(data, 0x740, 0x1000, 4); data[0x744] = std::byte{0x5a};
+        const auto guard_table_file_offset = pe64 ? 0x740u : 0x760u;
+        put(data, guard_table_file_offset, 0x1000, 4);
+        data[guard_table_file_offset + 4] = std::byte{0x5a};
         FixtureFile fixture(data);
         const auto loaded = load_pe(FileStorage::open(fixture.path).value(), {}).value();
         check(loaded.metadata_complete && loaded.metadata.pe->load_configuration.has_value(),
@@ -211,13 +259,13 @@ void pe_load_configuration_tests() {
         const auto& config = *loaded.metadata.pe->load_configuration;
         check(config.declared_size == config_size && config.timestamp == 0x12345678 &&
                   config.security_cookie_rva == std::optional<std::uint64_t>{0x20a0} &&
-                  config.guard_function_table_rva == std::optional<std::uint64_t>{0x2340} &&
+                  config.guard_function_table_rva == std::optional<std::uint64_t>{guard_table_rva} &&
                   config.guard_functions.size() == 1 && config.guard_functions[0].rva == 0x1000 &&
                   config.guard_functions[0].metadata == std::vector<std::byte>{std::byte{0x5a}},
               "cookie and versioned Guard CF table fields are normalized and retained");
         check(config.directory_source->spans[0].offset.value == 0x700 &&
                   config.security_cookie_source->spans[0].offset.value == 0x700 + cookie_offset &&
-                  config.guard_functions[0].source.spans[0].offset.value == 0x740,
+                  config.guard_functions[0].source.spans[0].offset.value == guard_table_file_offset,
               "load configuration and Guard CF records retain file provenance");
     }
 }
@@ -655,5 +703,5 @@ void pe_bound_import_tests() {
     for (std::size_t i = 0x730; i < 0x744; ++i) data[i] = std::byte{'X'};
     partial(data, "bound module name must terminate inside directory");
 }
-int main() { return run([] {raw_tests();detection_tests();pe_header_tests();pe_metadata_tests();pe_resource_tests();pe_load_configuration_tests();pe_tls_tests();pe_rebase_tests();pe_delay_import_tests();pe_codeview_tests();pe_pdb_source_line_tests();pe_local_pdb_binding_tests();pe_bound_import_tests();}); }
+int main() { return run([] {minidump_ipt_stream_tests();raw_tests();detection_tests();pe_header_tests();pe_metadata_tests();pe_resource_tests();pe_load_configuration_tests();pe_tls_tests();pe_rebase_tests();pe_delay_import_tests();pe_codeview_tests();pe_pdb_source_line_tests();pe_local_pdb_binding_tests();pe_bound_import_tests();}); }
 

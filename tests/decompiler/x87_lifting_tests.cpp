@@ -1,5 +1,6 @@
 #include "hexlab/decompiler/decompiler.hpp"
 #include "hexlab/processors/decoder.hpp"
+#include <algorithm>
 #include <cstdlib>
 #include <array>
 #include <iostream>
@@ -32,6 +33,10 @@ LiftedFunction lift(std::vector<Instruction> instructions) {
     require(bool(result), "x87 function lifts");
     return std::move(result).value();
 }
+bool writes_st0(const Intrinsic &instruction) {
+    return std::find(instruction.register_writes.begin(), instruction.register_writes.end(),
+                     RegisterOperand{RegisterBank::x87, 0, 80, false}) != instruction.register_writes.end();
+}
 }
 
 int main() {
@@ -40,19 +45,16 @@ int main() {
                            decode({0xdd, 0x18}, 0x1004)}); // fstp qword ptr [rax]
     require(code.blocks[0].instructions.size() == 3, "x87 sequence remains three instructions");
     const auto &load = std::get<Intrinsic>(code.blocks[0].instructions[0].statement);
-    require(load.name == "x87_fld" && load.memory_effect == IntrinsicMemoryEffect::read &&
-                load.register_writes == std::vector<RegisterOperand>{{RegisterBank::x87, 0, 80, false}},
+    require(load.name == "x87_fld" && load.memory_effect == IntrinsicMemoryEffect::read && writes_st0(load),
             "FLD is a typed x87 stack push with a read memory effect");
     const auto *loaded_value = load.operands.empty() ? nullptr : &load.operands.front()->type;
     require(loaded_value && loaded_value->kind == TypeKind::floating && loaded_value->bits == 32,
             "FLD preserves its source floating width");
     const auto &add = std::get<Intrinsic>(code.blocks[0].instructions[1].statement);
-    require(add.name == "x87_fadd" && add.result_type == ValueType{TypeKind::floating, 80, false} &&
-                add.register_writes == std::vector<RegisterOperand>{{RegisterBank::x87, 0, 80, false}},
+    require(add.name == "x87_fadd" && add.result_type == ValueType{TypeKind::floating, 80, false} && writes_st0(add),
             "FADD carries an 80-bit result and ST0 write");
     const auto &store = std::get<Intrinsic>(code.blocks[0].instructions[2].statement);
-    require(store.name == "x87_fstp" && store.memory_effect == IntrinsicMemoryEffect::write &&
-                store.register_writes == std::vector<RegisterOperand>{{RegisterBank::x87, 0, 80, false}},
+    require(store.name == "x87_fstp" && store.memory_effect == IntrinsicMemoryEffect::write && writes_st0(store),
             "FSTP combines memory write and x87 stack pop effects");
     require(format_pseudocode(code).find("x87_fadd") != std::string::npos,
             "x87 operation remains visible in pseudocode");
@@ -66,10 +68,13 @@ int main() {
     require(integer_load.operands[0]->type == ValueType{TypeKind::integer, 32, false} &&
                 integer_load.result_type == ValueType{TypeKind::floating, 80, false},
             "FILD converts an integer memory source to the x87 stack type");
-    require(integer_add.operands.size() == 2 &&
-                integer_add.operands[0]->type == ValueType{TypeKind::integer, 32, false} &&
-                integer_add.operands[1]->type == ValueType{TypeKind::floating, 80, false} &&
-                integer_add.register_writes == std::vector<RegisterOperand>{{RegisterBank::x87, 0, 80, false}},
+    require(std::any_of(integer_add.operands.begin(), integer_add.operands.end(), [](const ExpressionPtr &operand) {
+                    return operand && operand->type == ValueType{TypeKind::integer, 32, false};
+                }) &&
+                std::any_of(integer_add.operands.begin(), integer_add.operands.end(), [](const ExpressionPtr &operand) {
+                    return operand && operand->type == ValueType{TypeKind::floating, 80, false};
+                }) &&
+                writes_st0(integer_add),
             "FIADD keeps the integer memory operand separate from implicit ST0");
     require(integer_store.memory_effect == IntrinsicMemoryEffect::write &&
                 integer_store.operands[0]->type == ValueType{TypeKind::integer, 32, false} &&

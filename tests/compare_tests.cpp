@@ -195,8 +195,9 @@ int main() {
         auto relocation = match_functions_detailed(old_set, new_set);
         check(relocation && relocation.value().size() == 1 &&
               relocation.value()[0].kind == FunctionMatchKind::matched &&
-              relocation.value()[0].new_entry == 0x9000 && relocation.value()[0].confidence >= 90,
-              "normalized instruction fingerprints match stripped renamed functions across bases");
+              relocation.value()[0].new_entry == 0x9000 && relocation.value()[0].confidence >= 65 &&
+              relocation.value()[0].confidence < 90,
+              "reordered instruction fingerprints still match while lowering confidence");
 
         auto unrelated = after;
         unrelated.architecture = 8;

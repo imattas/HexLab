@@ -199,15 +199,20 @@ void orphan_and_recovery() {
     check(!load(orphan), "orphan SHNDX cannot claim valid metadata without a symbol table");
     const auto loaded = load(fixture(true)).value();
     const auto functions = recover_functions(*loaded.image, loaded.metadata, {}, {}, {}).value();
-    check(functions->functions.size() == 3,
-          "local and weak executable FUNC definitions seed recovery without an ELF entry");
+    check(functions->functions.size() == 4,
+          "local and weak executable FUNC definitions plus the IFUNC resolver seed recovery without an ELF entry");
     check(std::all_of(
               functions->functions.begin(), functions->functions.end(),
               [](const auto &f) { return f->seeds.size() == 1 && f->seeds.front().kind == FunctionSeedKind::symbol; }),
           "symbol function seeds have an explicit provenance kind rather than an entry/export disguise");
-    check(std::none_of(functions->functions.begin(), functions->functions.end(),
-                       [](const auto &f) { return f->entry == Address{{1}, 3}; }),
-          "IFUNC resolver metadata never becomes an ordinary FUNC seed");
+    const auto resolver = std::find_if(loaded.metadata.elf->symbols.begin(), loaded.metadata.elf->symbols.end(),
+                                       [](const auto &s) { return s.type == 10; });
+    check(resolver != loaded.metadata.elf->symbols.end() && resolver->address &&
+              std::any_of(functions->functions.begin(), functions->functions.end(), [&](const auto &f) {
+                  return f->entry == *resolver->address && f->seeds.size() == 1 &&
+                         f->seeds.front().kind == FunctionSeedKind::symbol;
+              }),
+          "IFUNC resolver code is seeded from its symbol without inventing an implementation target");
     ProjectSnapshot snapshot;
     snapshot.loaded = std::make_shared<const LoadedImage>(loaded);
     check(presentation_name(snapshot, Address{{1}, 0}) == "same" &&
@@ -253,7 +258,7 @@ void project_names_and_cache() {
     source.reset();
     f.session = take(ProjectSession::attach(f.store, {}, {}));
     auto snapshot = f.session->snapshot();
-    check(snapshot->presentation && snapshot->functions && snapshot->functions->functions.size() == 3 &&
+    check(snapshot->presentation && snapshot->functions && snapshot->functions->functions.size() == 4 &&
               presentation_name(*snapshot, Address{{1}, 0}) == "same" &&
               presentation_name(*snapshot, Address{{2}, 0}) == "same",
           "real ELF project builds indexed section-aware symbol names and recovered functions");
@@ -281,7 +286,7 @@ void project_names_and_cache() {
     const auto wire = take(encode_derived(proposal, {}));
     auto decoded = decode_derived(wire, *redone->loaded->image, redone->loaded->metadata,
                                   redone->state->user->decisions, {}, key, {});
-    check(decoded && decoded.value().functions->functions.size() == 3,
+    check(decoded && decoded.value().functions->functions.size() == 4,
           "canonical cache roundtrips explicit ELF symbol roots");
     auto missing = redone->loaded->metadata;
     missing.elf->symbols.clear();
@@ -310,7 +315,7 @@ void project_names_and_cache() {
     f.store = take(database::ProjectStore::open(f.path, database::ProjectMode::read_only, {}));
     f.session = take(ProjectSession::attach(f.store, {}, {}));
     auto reopened = f.session->snapshot();
-    check(reopened->derived_cache_status == database::CacheStatus::hit && reopened->functions->functions.size() == 3 &&
+    check(reopened->derived_cache_status == database::CacheStatus::hit && reopened->functions->functions.size() == 4 &&
               presentation_name(*reopened, Address{{1}, 0}) == "user_first" &&
               presentation_name(*reopened, Address{{2}, 0}) == "same",
           "source-missing readonly project restores indexed ELF names and validated symbol cache");
@@ -373,8 +378,8 @@ void special_forms() {
                           !result.value().metadata.elf->symbols[3].address &&
                           recover_functions(*result.value().image, result.value().metadata, {}, {}, {})
                                   .value()
-                                  ->functions.size() == 3,
-                      "EXEC/DYN recovery uses valid FUNC roots and does not invent TLS or IFUNC targets");
+                                  ->functions.size() == 4,
+                      "EXEC/DYN recovery uses valid FUNC and IFUNC resolver roots without inventing TLS or implementation targets");
         }
 }
 class CancelStorage final : public ByteStorage {

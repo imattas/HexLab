@@ -759,8 +759,25 @@ void ordinary_identity_tests(const std::filesystem::path &path) {
     check(index->all().size() == 1 && index->all()[0].id.value == UINT64_C(0x824defe0d5a68707),
           "adding ELF origins preserves actual prior stable identity for ordinary decoded references");
     const auto wire = encode_reference_index(*index, {}).value();
-    check(wire.size() == old.bytes.size() && std::equal(wire.begin() + 2, wire.end() - 32, old.bytes.begin() + 2),
-          "ordinary record bytes remain unchanged across the new envelope version");
+    const auto current = decode_reference_index(wire, {});
+    const auto *actual_target = current && current.value()->all().size() == 1
+                                    ? std::get_if<Location>(&current.value()->all()[0].target)
+                                    : nullptr;
+    const auto *expected_target = std::get_if<Location>(&index->all()[0].target);
+    check(wire.size() > old.bytes.size() && wire[0] > old.bytes[0] && current &&
+              current.value()->all().size() == 1 && actual_target && expected_target && *actual_target == *expected_target &&
+              current.value()->all()[0].id == index->all()[0].id &&
+              current.value()->all()[0].source == index->all()[0].source &&
+              current.value()->all()[0].operand_index == index->all()[0].operand_index &&
+              current.value()->all()[0].kind == index->all()[0].kind &&
+              current.value()->all()[0].access == index->all()[0].access &&
+              current.value()->all()[0].provenance.kind == index->all()[0].provenance.kind &&
+              current.value()->all()[0].provenance.instruction_id == index->all()[0].provenance.instruction_id &&
+              current.value()->all()[0].provenance.producer_instruction_ids ==
+                  index->all()[0].provenance.producer_instruction_ids &&
+              current.value()->all()[0].association == index->all()[0].association &&
+              encode_reference_index(*current.value(), {}).value() == wire,
+          "ordinary reference identity and fields roundtrip canonically in the extended envelope");
 }
 int main(int argc, char **argv) {
     if (argc != 2)

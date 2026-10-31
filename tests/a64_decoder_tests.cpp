@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <limits>
+#include <iostream>
 using namespace hexlab;
 using namespace hexlab_test;
 namespace {
@@ -246,12 +247,26 @@ void shifted_register() {
     decoded(0x8a021c20 | (3u << 22), [](const auto &i) {
         check(format_instruction(i) == "and x0, x1, x2, ror #0x7", "logical shifted register supports ROR");
     });
-    for (auto word : {0x0b220020u | (3u << 22), 0x0b220020u | (1u << 31) | (32u << 10),
-                      0x8a220020u | (1u << 31) | (1u << 21), 0x0a220020u | (32u << 10)}) {
+    decoded(0x0be20020, [](const auto &i) {
+        check(i.opcode == Opcode::a64_add && std::get<RegisterOperand>(i.operands[0]).width == 32 &&
+                  std::get<RegisterOperand>(i.operands[2]).width == 32,
+              "extended-register ADD preserves its 32-bit W-register operands");
+    });
+    decoded(0x8b228020, [](const auto &i) {
+        check(i.opcode == Opcode::a64_add && std::get<RegisterOperand>(i.operands[0]).width == 64 &&
+                  std::get<RegisterOperand>(i.operands[2]).width == 32,
+              "extended-register ADD preserves the W-source width in an X-register operation");
+    });
+    decoded(0x8a220020, [](const auto &i) {
+        check(format_instruction(i) == "bic x0, x1, x2" && i.operands.size() == 3,
+              "BIC shifted-register form decodes as a valid logical operation");
+    });
+    for (auto word : {0x0b000020u | (3u << 22), 0x0b000020u | (32u << 10),
+                      0x0a000020u | (32u << 10)}) {
         const auto result = decode_instruction(context, bytes(word), {{7}, 0x1000});
         check((result.status != DecodeStatus::decoded && !result.instruction) ||
                   (result.instruction && result.instruction->opcode == Opcode::opaque && result.instruction->operands.empty()),
-              "reserved/unsupported shifted-register encoding has no fabricated semantic facts");
+              "reserved shift types and oversized shift amounts have no fabricated semantic facts");
     }
 }
 void logical_immediate() {
@@ -311,7 +326,11 @@ void boundaries() {
         check(decode_instruction(bad, source, {{0}, 0}).status == DecodeStatus::unsupported,
               "incompatible context cannot enter A64 decoder");
     }
-    for (auto word : {0xffffffffu, 0xd503233fu, 0x4e284800u, 0x52c00000u}) {
+    decoded(0x4e284800, [](const auto &i) {
+        check(format_instruction(i) == "aese v0.16b, v0.16b" && i.operands.size() == 2,
+              "AES extension instruction retains its vector operands");
+    });
+    for (auto word : {0xffffffffu, 0xd503233fu, 0x52c00000u}) {
         const auto result = decode_instruction(context, bytes(word), {{0}, 0});
         check((result.status != DecodeStatus::decoded && !result.instruction) ||
                   (result.instruction && result.instruction->opcode == Opcode::opaque && result.instruction->operands.empty()),

@@ -1582,6 +1582,14 @@ Result<LiftedFunction> sparse_conditional_constants(const LiftedFunction &input)
             for (std::size_t edge_index = 0; edge_index < block.successors.size(); ++edge_index)
                 if (feasible_edges.contains({block.id, edge_index})) successors.push_back(block.successors[edge_index]);
             block.successors = std::move(successors);
+            if (!block.instructions.empty()) {
+                const auto *branch = std::get_if<Branch>(&block.instructions.back().statement);
+                if (branch && branch->condition == "true" && !branch->false_target &&
+                    block.successors.size() == 1 &&
+                    (block.successors.front().kind == BlockEdgeKind::conditional_true ||
+                     block.successors.front().kind == BlockEdgeKind::conditional_false))
+                    block.successors.front().kind = BlockEdgeKind::jump;
+            }
             auto predecessor_is_feasible = [&](BlockId predecessor) {
                 const auto source_found = block_index.find(predecessor);
                 if (source_found == block_index.end()) return false;

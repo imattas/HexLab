@@ -30,6 +30,14 @@ std::vector<std::byte> exception_fixture() {
     return data;
 }
 
+void set_runtime_function_extent(std::vector<std::byte> &data, std::uint32_t function_size) {
+    const auto first_end = std::uint32_t{0x1000} + function_size;
+    const auto second_end = first_end + function_size;
+    put(data, 0x794, first_end, 4);
+    put(data, 0x79c, first_end, 4);
+    put(data, 0x7a0, second_end, 4);
+}
+
 Result<LoadedImage> load_fixture(const std::vector<std::byte> &data) {
     FixtureFile file(data);
     return load_pe(FileStorage::open(file.path).value(), {});
@@ -315,6 +323,11 @@ void set_unwind_info(std::vector<std::byte> &data, std::uint8_t version_flags,
 
 void parsed_exception_entries_seed_functions() {
     auto data = exception_fixture();
+    // The first function needs to cover the complete five-byte prolog; the
+    // second begins immediately after it.
+    put(data, 0x794, 0x1005, 4);
+    put(data, 0x79c, 0x1005, 4);
+    put(data, 0x7a0, 0x1010, 4);
     // Version 1 unwind header: 5-byte prolog, ALLOC_SMALL 32 bytes at offset
     // 5, then PUSH_NONVOL RBP at offset 1.
     put(data, 0x700, 0x00020501, 4);
@@ -323,7 +336,7 @@ void parsed_exception_entries_seed_functions() {
     check(loaded.metadata_complete, "valid AMD64 exception table is recognized as parsed metadata");
     check(loaded.metadata.pe->exception_functions.size() == 2 &&
               loaded.metadata.pe->exception_functions[0].begin_rva == 0x1000 &&
-              loaded.metadata.pe->exception_functions[0].end_rva == 0x1002 &&
+              loaded.metadata.pe->exception_functions[0].end_rva == 0x1005 &&
               loaded.metadata.pe->exception_functions[0].unwind_info_rva == 0x2300 &&
               loaded.metadata.pe->exception_functions[0].source.spans == std::vector<PeSourceSpan>{{{0x790}, 12}},
           "runtime-function rows preserve code bounds, unwind reference, and table provenance");
@@ -344,7 +357,7 @@ void parsed_exception_entries_seed_functions() {
     std::vector<std::uint64_t> entries;
     for (const auto &function : functions->functions) entries.push_back(function->entry.offset);
     std::sort(entries.begin(), entries.end());
-    check(entries == std::vector<std::uint64_t>{0x140001000ULL, 0x140001002ULL, 0x140001010ULL},
+    check(entries == std::vector<std::uint64_t>{0x140001000ULL, 0x140001005ULL, 0x140001010ULL},
           "AMD64 runtime-function entries establish separate analysis function roots");
 
     FixtureFile file(data);
@@ -353,7 +366,7 @@ void parsed_exception_entries_seed_functions() {
     entries.clear();
     for (const auto &function : functions->functions) entries.push_back(function->entry.offset);
     std::sort(entries.begin(), entries.end());
-    check(entries == std::vector<std::uint64_t>{0x180001000ULL, 0x180001002ULL, 0x180001010ULL},
+    check(entries == std::vector<std::uint64_t>{0x180001000ULL, 0x180001005ULL, 0x180001010ULL},
           "runtime-function RVA seeds are relocated to the loaded PE base");
 }
 
@@ -419,6 +432,7 @@ void unwind_opcode_families_are_decoded() {
     set_unwind_info(data, 1, 11, 10, 0x25,
                     {0x1a0b, 0x500a, 0x3209, 0xc408, 0x0002, 0x6807, 0x0003,
                      0x0306, 0x0105, 0x0004});
+    set_runtime_function_extent(data, 11);
     auto loaded = load_fixture(data).value();
     check(loaded.metadata_complete && loaded.metadata.pe->exception_functions.front().unwind_info &&
               loaded.metadata.pe->exception_functions.front().unwind_info->operations.size() == 7,
@@ -438,6 +452,7 @@ void unwind_opcode_families_are_decoded() {
 
     data = exception_fixture();
     set_unwind_info(data, 1, 4, 3, 0, {0x1104, 0x1000, 0x0000});
+    set_runtime_function_extent(data, 4);
     loaded = load_fixture(data).value();
     check(loaded.metadata_complete && loaded.metadata.pe->exception_functions.front().unwind_info &&
               loaded.metadata.pe->exception_functions.front().unwind_info->operations.front().stack_size == 0x1000,
@@ -445,6 +460,7 @@ void unwind_opcode_families_are_decoded() {
 
     data = exception_fixture();
     set_unwind_info(data, 1, 4, 3, 0, {0xc504, 0x0018, 0x0000});
+    set_runtime_function_extent(data, 4);
     loaded = load_fixture(data).value();
     check(loaded.metadata_complete && loaded.metadata.pe->exception_functions.front().unwind_info &&
               loaded.metadata.pe->exception_functions.front().unwind_info->operations.front().stack_offset == 24,
@@ -452,6 +468,7 @@ void unwind_opcode_families_are_decoded() {
 
     data = exception_fixture();
     set_unwind_info(data, 1, 4, 3, 0, {0x6904, 0x0020, 0x0000});
+    set_runtime_function_extent(data, 4);
     loaded = load_fixture(data).value();
     check(loaded.metadata_complete && loaded.metadata.pe->exception_functions.front().unwind_info &&
               loaded.metadata.pe->exception_functions.front().unwind_info->operations.front().stack_offset == 32,

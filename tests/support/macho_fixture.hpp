@@ -18,8 +18,10 @@ inline std::vector<std::byte> thin(bool wide, bool big) {
     put(data, 16, 2, 4, big);
     put(data, 20, 24, 4, big);
     put(data, 24, 0x80002000, 4, big);
+    // All general Mach-O fixtures represent valid files. Tests for malformed
+    // nonzero mach_header_64 reserved fields set them explicitly.
     if (wide)
-        put(data, 28, 0x12345678, 4, big);
+        put(data, 28, 0, 4, big);
     put(data, header, 0x70000001, 4, big);
     put(data, header + 4, 8, 4, big);
     put(data, header + 8, 0x70000002, 4, big);
@@ -39,7 +41,7 @@ inline std::vector<std::byte> universal(bool wide, bool big) {
         put(data, at + (wide ? 16 : 12), i ? b.size() : a.size(), wide ? 8 : 4, big);
         put(data, at + (wide ? 24 : 16), 8, 4, big);
         if (wide)
-            put(data, at + 28, 0x0badf00d, 4, big);
+            put(data, at + 28, 0, 4, big);
     }
     for (std::size_t i = 0; i < a.size(); ++i)
         data[256 + i] = a[i];
@@ -88,10 +90,6 @@ inline std::vector<std::byte> mapped(bool wide, bool big = false, bool object = 
     auto data = thin(wide, big);
     data.resize(1024);
     const auto header = wide ? 32u : 28u;
-    // thin() deliberately uses a nonzero reserved field for header-validation
-    // tests. Mapped-image fixtures represent valid inputs and clear it.
-    if (wide)
-        put(data, 28, 0, 4, big);
     const auto extent = (wide ? 72 : 56) + 3 * (wide ? 80 : 68);
     put(data, 12, object ? 1 : 2, 4, big);
     put(data, 16, 1, 4, big);

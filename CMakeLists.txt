@@ -118,9 +118,9 @@ if(WIN32)
     DESTINATION "${CMAKE_INSTALL_BINDIR}"
     PRE_EXCLUDE_REGEXES "^api-ms-" "^ext-ms-"
     POST_EXCLUDE_REGEXES
-      ".*[Ww]indows/[Ss]ystem32/.*"
-      ".*[Ww]indows/[Ss]ysWOW64/.*"
-      ".*[Ww]indows/[Ww]in[Ss]x[Ss]/.*")
+      ".*[Ww][Ii][Nn][Dd][Oo][Ww][Ss].*[Ss][Yy][Ss][Tt][Ee][Mm]32.*"
+      ".*[Ww][Ii][Nn][Dd][Oo][Ww][Ss].*[Ss][Yy][Ss][Ww][Oo][Ww]64.*"
+      ".*[Ww][Ii][Nn][Dd][Oo][Ww][Ss].*[Ww][Ii][Nn][Ss][Xx][Ss].*")
 endif()
 install(FILES README.md CHANGELOG.md docs/building.md docs/project-cli.md docs/project-format.md docs/project-analysis-validation.md docs/third-party.md docs/capabilities.csv docs/foundation-validation.md docs/binary-analysis-validation.md docs/x64-coverage.csv docs/x86-32-coverage.csv docs/x86-32-validation.md docs/x86-loop-control-flow.md docs/analysis-large-image-performance.md libs/decompiler/docs/post-tested-loop-exit-paths.md
   docs/x86-profiles.md docs/segmented-analysis-validation.md docs/incremental-metadata-invalidation.md docs/capstone-semantic-fallback.md docs/x86-16-coverage.csv docs/x86-repeated-strings.md

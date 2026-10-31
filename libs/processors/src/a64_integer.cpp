@@ -166,7 +166,7 @@ bool integer(Instruction &i, std::uint32_t word) {
         const unsigned opc = (word >> 29) & 3;
         const unsigned immr = (word >> 16) & 0x3f;
         const unsigned imms = (word >> 10) & 0x3f;
-        if (opc == 3 || (word & 0x00200000u) || immr >= width || imms >= width ||
+        if (opc == 3 || immr >= width || imms >= width ||
             ((word >> 22) & 1) != (width == 64 ? 1u : 0u))
             return false; // Reserved opc, fixed-bit and width encodings have no native semantics.
         i.opcode = opc == 0 ? Opcode::a64_sbfm : opc == 1 ? Opcode::a64_bfm : Opcode::a64_ubfm;

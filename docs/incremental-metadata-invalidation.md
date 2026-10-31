@@ -117,13 +117,15 @@ conservatively require a full rebuild.
 Analysis semantic-decoder callbacks can attach primary-image file ranges to
 each external input in their `SemanticDecoderReadSet` manifest. These ranges
 must describe every image byte range the callback consults while using that
-external input; they are normalized, bounded, and included in the function
-engine fingerprint. If an incremental edit intersects any declared range,
-the planner forces a full semantic-analysis rebuild so callback-produced
-instruction facts and their downstream CFG/references cannot be reused from
-stale source bytes. Edits outside the declared ranges continue through ordinary
-fact dependency invalidation. A missing, malformed, out-of-image, or
-incomplete manifest stays conservative and forces a full rebuild.
+external input; they are normalized and included in the function engine
+fingerprint. Each host-decoded instruction fact records the union of those
+declared image ranges as dependencies. A verified byte edit intersecting a
+declared range therefore invalidates host-decoded instruction facts and their
+downstream CFG/references while retaining unrelated built-in decodes. The
+current manifest is conservatively attributed to every host-decoded fact,
+rather than tracking which individual external input each callback invocation
+consulted. Unverified byte edits with declared callback reads, or a missing,
+malformed, out-of-image, or incomplete manifest, keep the full-rebuild path.
 
 Explicit local PDB bindings and caller-selected DWP packages now contribute a
 content fingerprint to the loaded-image analysis identity. This includes both

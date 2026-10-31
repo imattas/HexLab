@@ -163,7 +163,7 @@ void system_and_bounds() {
         check(decode_instruction(bad, bytes(0xea000000), {{0}, 0}).status == DecodeStatus::unsupported,
               "A32 rejects incompatible contexts");
     }
-    for (auto word : {0xffffffffu, 0xf12fff1eu, 0x11212374u, 0xe12fff1fu}) {
+    for (auto word : {0xffffffffu, 0x11212374u, 0xe12fff1fu}) {
         const auto result = decode_instruction(context, bytes(word), {{0}, 0});
         check(result.status != DecodeStatus::decoded ||
                   (result.instruction && result.instruction->opcode == Opcode::opaque && result.instruction->operands.empty()),

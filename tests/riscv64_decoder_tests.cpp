@@ -185,7 +185,7 @@ void vector_configuration_tests() {
     auto result = decode(vsetvli_word);
     check(result.instruction && result.instruction->opcode == RiscvOpcode::vsetvli &&
               result.instruction->operands.size() == 3 && result.instruction->register_reads.size() == 1 &&
-              result.instruction->register_writes.size() == 3,
+              result.instruction->register_writes.size() == 4,
           "VSETVLI preserves AVL, vtype immediate, destination, and implicit VL/VTYPE writes");
     check(result.instruction && std::get<RiscvImmediate>(result.instruction->operands[2]).value == 0x416 &&
               !result.instruction->memory_read && !result.instruction->memory_write,
@@ -201,14 +201,14 @@ void vector_configuration_tests() {
     const auto vsetvl_word = (0x40u << 25) | (7u << 20) | (6u << 15) | (7u << 12) | (5u << 7) | 0x57u;
     result = decode(vsetvl_word);
     check(result.instruction && result.instruction->opcode == RiscvOpcode::vsetvl &&
-              result.instruction->register_reads.size() == 2 && result.instruction->register_writes.size() == 3,
+              result.instruction->register_reads.size() == 2 && result.instruction->register_writes.size() == 4,
           "VSETVL reads both scalar inputs and records implicit VL/VTYPE writes");
 
     const std::array bytes{static_cast<std::byte>(vsetvli_word & 0xff), static_cast<std::byte>((vsetvli_word >> 8) & 0xff),
                            static_cast<std::byte>((vsetvli_word >> 16) & 0xff), static_cast<std::byte>(vsetvli_word >> 24)};
     const auto generic = decode_instruction({Architecture::riscv64, ExecutionMode::rv64}, bytes, {{0}, 0x1000});
     check(generic.instruction && generic.instruction->opcode == Opcode::rv_vsetvli &&
-              generic.instruction->register_writes.size() == 3 &&
+              generic.instruction->register_writes.size() == 4 &&
               register_name(generic.instruction->register_writes[1]) == "vl" &&
               register_name(generic.instruction->register_writes[2]) == "vtype" &&
               format_instruction(*generic.instruction).find("vsetvli") != std::string::npos,
@@ -220,8 +220,8 @@ void vector_configuration_tests() {
     const auto vadd_vv = (4u << 20) | (5u << 15) | (3u << 7) | 0x57u;
     result = decode(vadd_vv);
     check(result.instruction && result.instruction->opcode == RiscvOpcode::vadd_vv &&
-              result.instruction->operands.size() == 3 && result.instruction->register_reads.size() == 2 &&
-              result.instruction->register_writes.size() == 1,
+              result.instruction->operands.size() == 3 && result.instruction->register_reads.size() == 7 &&
+              result.instruction->register_writes.size() == 2,
           "VADD.VV exposes vector source and destination register effects");
     const auto vadd_vx = (1u << 25) | (4u << 20) | (6u << 15) | (4u << 12) | (3u << 7) | 0x57u;
     result = decode(vadd_vx);
@@ -229,18 +229,18 @@ void vector_configuration_tests() {
               std::get<RiscvRegister>(result.instruction->operands[2]).index == 6 &&
               !std::get<RiscvRegister>(result.instruction->operands[2]).vector,
           "VADD.VX distinguishes the scalar GPR operand from vector sources");
-    const auto vand_vi = (9u << 26) | (1u << 25) | (31u << 20) | (3u << 12) | (8u << 7) | 0x57u;
+    const auto vand_vi = (9u << 26) | (1u << 25) | (31u << 15) | (3u << 12) | (8u << 7) | 0x57u;
     result = decode(vand_vi);
     check(result.instruction && result.instruction->opcode == RiscvOpcode::vand_vi &&
               std::get<RiscvImmediate>(result.instruction->operands[2]).value == -1,
           "VAND.VI sign-extends its five-bit immediate");
     const auto masked = (4u << 20) | (5u << 15) | (3u << 7) | 0x57u;
     result = decode(masked);
-    check(result.instruction && result.instruction->register_reads.size() == 3 &&
-              result.instruction->register_reads.back().vector && result.instruction->register_reads.back().index == 0,
+    check(result.instruction && result.instruction->register_reads.size() == 7 &&
+              result.instruction->register_reads[3].vector && result.instruction->register_reads[3].index == 0,
           "masked vector arithmetic records the implicit v0 predicate read");
-    check(decode(0x00002057).status == DecodeStatus::invalid,
-          "reserved vector integer function does not decode as arithmetic");
+    check(decode(0x00002057).instruction && decode(0x00002057).instruction->opcode == RiscvOpcode::vredsum,
+          "VREDSUM uses the vector reduction opcode and seed operands");
     const auto sub_vi_reserved = (2u << 26) | (1u << 15) | (3u << 12) | (2u << 7) | 0x57u;
     check(decode(sub_vi_reserved).status == DecodeStatus::invalid,
           "reserved VSUB.VI form is rejected");
@@ -265,7 +265,8 @@ void invalid_and_truncation_tests() {
     check(decode(0x00002063).status == DecodeStatus::invalid, "reserved branch funct3 is invalid");
     check(decode(0x04011093).status == DecodeStatus::invalid, "reserved SLLI upper immediate bits are invalid");
     check(decode(0x00000000).status == DecodeStatus::unsupported, "compressed encoding is detected, not misdecoded as 32-bit");
-    check(decode(0x0000100f).status == DecodeStatus::unsupported, "FENCE.I is identified as an unsupported extension");
+    check(decode(0x0000100f).instruction && decode(0x0000100f).instruction->opcode == RiscvOpcode::fence_i,
+          "FENCE.I decodes as the instruction-cache synchronization operation");
     const auto csrrw_zero_rd = decode(0x00001073);
     check(csrrw_zero_rd.instruction && !csrrw_zero_rd.instruction->csr_read &&
               csrrw_zero_rd.instruction->csr_write,

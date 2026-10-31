@@ -61,9 +61,12 @@ records up to the descriptor cap. Existing item/nested output caps still apply.
 This follows the descriptor Length/continuation/termination semantics in
 [UEFI 2.11 UpdateCapsule](https://uefi.org/specs/UEFI/2.11/08_Services_Runtime_Services.html#updatecapsule).
 It is offline inventory, not runtime UpdateCapsule processing or a firmware
-update. Automatic physical-address discovery, live-memory access, signature verification, anti-rollback
-enforcement, and dependency-expression parsing remain unsupported. The caller
-must keep the supplied capture bytes stable for the duration of parsing.
+update. Automatic physical-address discovery, live-memory access, signature
+verification, and anti-rollback enforcement remain unsupported. FMP dependency
+expressions are parsed and can be evaluated separately against an explicit
+caller-supplied version inventory; that result does not authorize or apply an
+update. The caller must keep the supplied capture bytes stable for the duration
+of parsing.
 The parser does not infer OS page size or certify physical page topology and
 alignment requirements; repeated captured ranges remain inspectable under the
 existing offline profile. No signature, freshness or firmware-applicability

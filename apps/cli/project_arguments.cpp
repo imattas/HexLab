@@ -125,10 +125,11 @@ Result<Location> resolve_location(const ProjectSnapshot &project, const Location
     return Location{address.value()};
 }
 std::string cursor_text(const SearchCursor &c) {
-    return "1:" + std::to_string(c.source_key.input.size) + ":" + digest_hex(c.source_key.input.sha256) + ":" +
+    return "2:" + std::to_string(c.source_key.input.size) + ":" + digest_hex(c.source_key.input.sha256) + ":" +
            std::to_string(c.source_key.byte_revision) + ":" + std::to_string(c.source_key.decision_revision) + ":" +
            digest_hex(c.source_key.recipe_fingerprint) + ":" + digest_hex(c.source_key.engine_fingerprint) + ":" +
-           digest_hex(c.query_fingerprint) + ":" + std::to_string(c.next_offset) + ":" +
+           digest_hex(c.query_fingerprint) + ":" + std::to_string(c.end_offset.value_or(c.source_key.input.size)) + ":" +
+           std::to_string(c.next_offset) + ":" +
            std::to_string(c.next_instruction) + ":" + std::to_string(c.next_operand);
 }
 SearchCursor parse_cursor(std::wstring_view text) {
@@ -141,7 +142,9 @@ SearchCursor parse_cursor(std::wstring_view text) {
             break;
         text.remove_prefix(separator + 1);
     }
-    require(fields.size() == 11 && fields[0] == L"1", "Unknown continuation format");
+    const bool legacy = fields.size() == 11 && fields[0] == L"1";
+    const bool current = fields.size() == 12 && fields[0] == L"2";
+    require(legacy || current, "Unknown continuation format");
     SearchCursor c;
     c.source_key.input = {number(fields[1]), digest(fields[2])};
     c.source_key.byte_revision = number(fields[3]);
@@ -149,9 +152,13 @@ SearchCursor parse_cursor(std::wstring_view text) {
     c.source_key.recipe_fingerprint = digest(fields[5]);
     c.source_key.engine_fingerprint = digest(fields[6]);
     c.query_fingerprint = digest(fields[7]);
-    c.next_offset = number(fields[8]);
-    c.next_instruction = number(fields[9]);
-    auto operand = number(fields[10]);
+    // Version 1 tokens were emitted before bounded searches became part of
+    // SearchCursor. Their only supported CLI interpretation is a full-source search.
+    const auto position = current ? std::size_t{9} : std::size_t{8};
+    c.end_offset = current ? number(fields[8]) : c.source_key.input.size;
+    c.next_offset = number(fields[position]);
+    c.next_instruction = number(fields[position + 1]);
+    auto operand = number(fields[position + 2]);
     require(operand <= UINT32_MAX, "Invalid continuation operand");
     c.next_operand = uint32_t(operand);
     return c;

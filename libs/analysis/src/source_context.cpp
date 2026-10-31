@@ -34,12 +34,13 @@ Result<bool> bind_derived_source(DerivedProposal &proposal, const Image &image, 
         if (image.layout().domains.size() + profile_count + 1 > source_detail::domain_limit ||
             image.layout().domains.size() + profile_count + 1 > source_detail::domain_memory_limit / sizeof(DomainContext))
             return Error{ErrorCode::resource_limit, "Derived source domain binding exceeds its memory budget"};
-        std::vector<DomainContext> domains{{image.layout().space.id, image.decode_context()}};
+        const auto primary_space = image.layout().space.id;
+        std::vector<DomainContext> domains{{primary_space, image.decode_context(), {primary_space, 0}, 0}};
         domains.reserve(image.layout().domains.size() + 1);
         for (const auto &d : image.layout().domains) {
             if (stop.stop_requested())
                 return Error{ErrorCode::canceled, "Source binding canceled"};
-            domains.push_back({d.space.id, d.context});
+            domains.push_back({d.space.id, d.context, {d.space.id, 0}, 0});
         }
         if (image.layout().execution_profile)
             for (const auto &range : image.layout().execution_profile->ranges)

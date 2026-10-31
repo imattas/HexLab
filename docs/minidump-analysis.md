@@ -372,3 +372,12 @@ for stack unwinding yet. CLI output shows at most 128 tables and marks omitted
 rows. The field meanings and stream ordering follow Microsoft's
 [`MINIDUMP_FUNCTION_TABLE_STREAM`](https://learn.microsoft.com/windows/win32/api/minidumpapiset/ns-minidumpapiset-minidump_function_table_stream)
 and [`MINIDUMP_FUNCTION_TABLE_DESCRIPTOR`](https://learn.microsoft.com/windows/win32/api/minidumpapiset/ns-minidumpapiset-minidump_function_table_descriptor) definitions.
+
+## Intel Processor Trace stream
+
+The standard `IptTraceStream` (23) is retained as an opaque byte prefix with
+its declared size and original file offset. Capture is capped at 1 MiB under
+the shared metadata budget; larger streams keep the prefix and produce a
+truncation diagnostic. HexLab does not parse Intel PT packets, synchronize
+trace packets to instruction addresses, or reconstruct execution from this
+stream.

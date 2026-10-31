@@ -305,13 +305,16 @@ void vex_avx_forms() {
         {0x68, Opcode::vpunpckhbw}, {0x69, Opcode::vpunpckhwd},
         {0x6a, Opcode::vpunpckhdq}, {0x6d, Opcode::vpunpckhqdq}};
     for (const auto &[opcode_byte, opcode] : evex_unpack) {
-        result = decode(x64, {0x62, 0xf1, 0x7d, 0x48, opcode_byte, 0xc1});
+        result = decode(x64, {0x62, 0xf1, 0x7d, 0x49, opcode_byte, 0xc1});
         check(result.instruction && result.instruction->opcode == opcode &&
                   result.instruction->x86_evex && result.instruction->vector_bits == 512 &&
                   result.instruction->operands.size() == 3 &&
-                  result.instruction->access == std::vector{OperandAccess::write, OperandAccess::read,
-                                                             OperandAccess::read},
-              "EVEX unpack decodes with three-operand ZMM dataflow and destination writemask semantics");
+                  result.instruction->access == std::vector{OperandAccess::read_write, OperandAccess::read,
+                                                             OperandAccess::read} &&
+                  result.instruction->x86_opmask == 1 && !result.instruction->x86_opmask_zeroing &&
+                  std::find(result.instruction->register_reads.begin(), result.instruction->register_reads.end(),
+                            RegisterOperand{RegisterBank::opmask, 1, 64, false}) != result.instruction->register_reads.end(),
+              "EVEX unpack models three-operand ZMM dataflow and merging writemask reads");
     }
 }
 
