@@ -1490,6 +1490,59 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
             return effect;
         }
     }
+    const bool x86_opmask_test = instruction.opcode >= Opcode::ktestb && instruction.opcode <= Opcode::kortestq;
+    if (x86_context && x86_opmask_test && instruction.operands.size() == 2 && operands.size() == 2) {
+        const auto *left_reg = std::get_if<RegisterOperand>(&instruction.operands[0]);
+        const auto *right_reg = std::get_if<RegisterOperand>(&instruction.operands[1]);
+        const auto flags = std::find_if(instruction.register_writes.begin(), instruction.register_writes.end(),
+            [](RegisterOperand reg) { return reg.bank == RegisterBank::flags; });
+        if (left_reg && right_reg && left_reg->bank == RegisterBank::opmask &&
+            right_reg->bank == RegisterBank::opmask && left_reg->width == 64 && right_reg->width == 64 &&
+            operands[0]->type.bits == 64 && operands[1]->type.bits == 64 &&
+            flags != instruction.register_writes.end() &&
+            std::find(instruction.register_reads.begin(), instruction.register_reads.end(), *flags) != instruction.register_reads.end()) {
+            const auto bits = static_cast<unsigned>(instruction.opcode <= Opcode::ktestq
+                ? static_cast<unsigned>(instruction.opcode) - static_cast<unsigned>(Opcode::ktestb)
+                : static_cast<unsigned>(instruction.opcode) - static_cast<unsigned>(Opcode::kortestb));
+            const unsigned width = bits == 0 ? 8 : bits == 1 ? 16 : bits == 2 ? 32 : 64;
+            const auto mask = width == 64 ? UINT64_MAX : (UINT64_C(1) << width) - 1;
+            const auto left = std::make_shared<Expression>(Expression{integer_type(64), BinaryValue{"and", operands[0], constant_expr(mask, 64)}});
+            const auto right = std::make_shared<Expression>(Expression{integer_type(64), BinaryValue{"and", operands[1], constant_expr(mask, 64)}});
+            const bool is_kortest = instruction.opcode >= Opcode::kortestb;
+            const auto both = std::make_shared<Expression>(Expression{integer_type(64),
+                BinaryValue{is_kortest ? "or" : "and", left, right}});
+            const auto zero = boolean_binary("eq", both, constant_expr(0, 64));
+            ExpressionPtr carry;
+            if (is_kortest) carry = boolean_binary("eq", both, constant_expr(mask, 64));
+            else {
+                auto not_right = std::make_shared<Expression>(Expression{integer_type(64),
+                    BinaryValue{"and", std::make_shared<Expression>(Expression{integer_type(64), UnaryValue{"not", right}}), constant_expr(mask, 64)}});
+                auto carry_term = std::make_shared<Expression>(Expression{integer_type(64), BinaryValue{"and", left, not_right}});
+                carry = boolean_binary("eq", carry_term, constant_expr(0, 64));
+            }
+            constexpr std::uint64_t cf = 1, zf = UINT64_C(1) << 6;
+            constexpr std::uint64_t affected = cf | (UINT64_C(1) << 2) | (UINT64_C(1) << 4) | zf |
+                (UINT64_C(1) << 7) | (UINT64_C(1) << 11);
+            auto retained = std::make_shared<Expression>(Expression{integer_type(flags->width),
+                BinaryValue{"and", reg_expr(*flags), constant_expr(~affected, flags->width)}});
+            const auto flag_bit = [&](ExpressionPtr bit, unsigned position) {
+                return std::make_shared<Expression>(Expression{integer_type(flags->width),
+                    BinaryValue{"shl", std::make_shared<Expression>(Expression{integer_type(flags->width), UnaryValue{"zext", std::move(bit)}}),
+                        constant_expr(position, flags->width)}});
+            };
+            auto new_flags = std::make_shared<Expression>(Expression{integer_type(flags->width),
+                BinaryValue{"or", std::make_shared<Expression>(Expression{integer_type(flags->width),
+                    BinaryValue{"or", retained, flag_bit(carry, 0)}}), flag_bit(zero, 6)}});
+            Intrinsic effect{std::string(is_kortest ? "x86_kortest" : "x86_ktest") + std::to_string(width),
+                {left, right, reg_expr(*flags)}, IntrinsicMemoryEffect::none};
+            effect.register_writes = instruction.register_writes;
+            for (const auto written : effect.register_writes) {
+                if (written == *flags) effect.register_output_values.push_back(new_flags);
+                else return Intrinsic{"x86_opmask_test_unmodeled_output", {left, right}, IntrinsicMemoryEffect::unknown};
+            }
+            return effect;
+        }
+    }
     const bool x86_bit_scan = instruction.opcode == Opcode::bsf || instruction.opcode == Opcode::bsr ||
                               instruction.opcode == Opcode::tzcnt || instruction.opcode == Opcode::lzcnt;
     if (x86_context && x86_bit_scan && instruction.operands.size() == 2) {
