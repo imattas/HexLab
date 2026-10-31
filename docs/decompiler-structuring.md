@@ -340,19 +340,22 @@ graphs retain the existing fallback.
 
 An explicit-preheader post-tested loop may also use a bounded nested body-
 dispatch tree whose leaves end in distinct conditional latches. Each latch must
-target the dispatcher header on one edge and the same terminal-return block on
-the other. Internal dispatches and linear arm paths must have exact single-
+target the dispatcher header on one edge and the same terminal exit block on
+the other. The shared exit may be an explicit return or one recognized
+non-returning `throw`, `rethrow_current_exception`, or `exception_unhandled`
+intrinsic. Internal dispatches and linear arm paths must have exact single-
 predecessor links; the complete function must be covered by the preheader,
-header, dispatch tree, latches, and one return block. The tree is limited to 64
+header, dispatch tree, latches, and one exit block. The tree is limited to 64
 latch leaves, 127 branch nodes, and at most 64 nodes along any dispatch path
 (including its latch leaf); each linear path is capped at 64 blocks, and the
 complete function at 128 blocks and 4,096 edges. Header
 register phis must have exactly one initial input from the preheader and one
-recurrent input from every latch. Return-block register phis must match exactly
+recurrent input from every latch. Exit-block register phis must match exactly
 the latch edges. The formatter emits the preheader once, applies initial phi
 copies, then emits each latch's repeat or exit copies before `continue` or
-`break`. Memory phis, shared paths, extra exits, side entries, non-return exits,
-and malformed edge/phi sets retain the existing lossless fallback.
+`break`. Memory phis, shared paths, extra exits, side entries, branched or
+chained non-return exits, and malformed edge/phi sets retain the existing
+lossless fallback.
 
 The acyclic structurer also handles nested regions with multiple explicit
 terminal returns. An analysis-only virtual exit supplies post-dominators for

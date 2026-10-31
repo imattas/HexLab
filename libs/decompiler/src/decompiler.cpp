@@ -10776,7 +10776,7 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
             !shared_exit_address) return {};
         roots = {*true_root, *false_root};
         const auto *exit = find_block(*shared_exit_address);
-        if (!exit || !has_only_terminal_return(*exit) ||
+        if (!exit || (!has_only_terminal_return(*exit) && !has_only_terminal_nonreturn(*exit)) ||
             predecessors[header->id.value] != [&] {
                 auto expected = latch_ids;
                 expected.insert(preheader->id.value);
