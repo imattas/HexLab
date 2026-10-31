@@ -620,6 +620,16 @@ types::TypePtr vector_type_from_value(const ValueType &value) {
     auto created = types::Type::vector(std::move(lane), value.lanes, alignment);
     return created ? created.value() : types::TypePtr{};
 }
+types::TypePtr opaque_vector_storage_type(std::uint16_t bits) {
+    if (!bits || bits % 8) return {};
+    const auto bytes = static_cast<std::uint64_t>(bits / 8);
+    auto lane = types::Type::integer("opaque byte", 1, 1, false);
+    if (!lane) return {};
+    const auto alignment = std::max<std::uint64_t>(1,
+        std::min<std::uint64_t>(64, std::bit_floor(bytes)));
+    auto created = types::Type::vector(lane.value(), bytes, alignment);
+    return created ? created.value() : types::TypePtr{};
+}
 bool merge_vector_fact(Fact &destination, const Fact &source) {
     if (!source.vector_evidence) return false;
     if (destination.reg.bank == RegisterBank::arm64_simd &&
@@ -3428,6 +3438,14 @@ static Result<TypeRecoveryResult> recover_types_impl(
                 continue;
             }
             auto type = make_type(value, abi.pointer_bits, nested_layout_work);
+            if (!type && ret->value->type.kind == TypeKind::vector &&
+                ret->value->type.element_kind == TypeKind::unknown &&
+                ret->value->type.element_bits == 0 && ret->value->type.lanes == 0) {
+                type = opaque_vector_storage_type(value.bits);
+                if (type)
+                    result.diagnostics.push_back(
+                        "vector return lane shape is unknown; exact width is retained as an opaque byte vector");
+            }
             if (!type) { unknown_value_return = true; continue; }
             if (!observed_return_type) observed_return_type = std::move(type);
             else if (observed_return_type->id() != type->id()) return_ambiguous = true;
