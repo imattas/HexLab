@@ -116,6 +116,9 @@ struct ModuleInfo {
     std::string path;
     std::uint64_t base = 0;
     std::uint64_t size = 0;
+    // Non-empty when the remote reported a library entry but its load address
+    // could not be established from valid RSP metadata.
+    std::string diagnostic;
 };
 struct MemoryRegion {
     std::uint64_t start = 0;

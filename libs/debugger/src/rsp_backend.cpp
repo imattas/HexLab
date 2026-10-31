@@ -761,11 +761,20 @@ Result<TargetDescription> parse_target_xml(std::string_view xml, rsp::Client& cl
 Result<std::vector<ModuleInfo>> parse_libraries_xml(std::string_view xml) {
     if (xml.empty() || xml.size() > 1024 * 1024) return Error{ErrorCode::resource_limit, "libraries XML is empty or exceeds 1 MiB"};
     std::vector<ModuleInfo> modules;
+    std::vector<std::string> element_stack;
     std::size_t pos = 0;
     bool in_library = false;
+    bool library_has_base_evidence = false;
+    bool root_seen = false, root_closed = false;
     while (pos < xml.size()) {
         auto open = xml.find('<', pos);
-        if (open == std::string_view::npos) break;
+        if (open == std::string_view::npos) {
+            for (const char c : xml.substr(pos)) if (!std::isspace(static_cast<unsigned char>(c)))
+                return Error{ErrorCode::malformed, "unexpected text after libraries XML element"};
+            break;
+        }
+        for (const char c : xml.substr(pos, open - pos)) if (!std::isspace(static_cast<unsigned char>(c)))
+            return Error{ErrorCode::malformed, "unexpected text in libraries XML"};
         auto close = xml.find('>', open + 1);
         if (close == std::string_view::npos) return Error{ErrorCode::malformed, "unterminated libraries XML tag"};
         auto tag = xml.substr(open + 1, close - open - 1); pos = close + 1;
@@ -779,8 +788,18 @@ Result<std::vector<ModuleInfo>> parse_libraries_xml(std::string_view xml) {
         const auto name = tag.substr(0, n); auto attrs_text = tag.substr(n);
         if (closing) {
             while (!attrs_text.empty() && std::isspace(static_cast<unsigned char>(attrs_text.back()))) attrs_text.remove_suffix(1);
-            if (!attrs_text.empty() || (name == "library" && !in_library)) return Error{ErrorCode::malformed, "mismatched libraries XML closing tag"};
-            if (name == "library") in_library = false;
+            if (!attrs_text.empty() || element_stack.empty() || element_stack.back() != name)
+                return Error{ErrorCode::malformed, "mismatched libraries XML closing tag"};
+            if (name == "library") {
+                if (!library_has_base_evidence && !modules.empty()) {
+                    auto& diagnostic = modules.back().diagnostic;
+                    if (!diagnostic.empty()) diagnostic += "; ";
+                    diagnostic += "library entry has no load-address evidence";
+                }
+                in_library = false;
+            }
+            element_stack.pop_back();
+            if (element_stack.empty()) root_closed = true;
             continue;
         }
         std::map<std::string, std::string, std::less<>> attrs;
@@ -802,26 +821,65 @@ Result<std::vector<ModuleInfo>> parse_libraries_xml(std::string_view xml) {
             if (!attrs.emplace(std::move(key), std::move(decoded.value())).second) return Error{ErrorCode::malformed, "duplicate libraries XML attribute"};
             attrs_text.remove_prefix(end + 1);
         }
+        if (!root_seen) {
+            if (name != "library-list" && name != "library-list-svr4")
+                return Error{ErrorCode::malformed, "libraries XML has an unexpected root element"};
+            root_seen = true;
+            if (!self_closing) element_stack.emplace_back(name);
+            else root_closed = true;
+            continue;
+        }
+        if (root_closed || element_stack.empty())
+            return Error{ErrorCode::malformed, "libraries XML contains content after its root element"};
         if (name == "library") {
+            if (element_stack.size() != 1 ||
+                (element_stack.back() != "library-list" && element_stack.back() != "library-list-svr4"))
+                return Error{ErrorCode::malformed, "library element is outside the library list"};
             if (in_library) return Error{ErrorCode::malformed, "nested libraries XML library element"};
             if (modules.size() >= max_inspection_modules) return Error{ErrorCode::resource_limit, "remote module count exceeds limit"};
-            const auto path = attrs.find("name"); if (path == attrs.end() || path->second.empty()) return Error{ErrorCode::malformed, "library has no name"};
+            const auto path = attrs.find("name");
             auto base = std::uint64_t{};
             const auto text_addr = attrs.find("text_addr");
             const auto load_addr = attrs.find("l_addr");
             const auto address = text_addr != attrs.end() ? text_addr : load_addr;
-            if (address != attrs.end() && !parse_hex_value(address->second, base))
-                return Error{ErrorCode::malformed, "invalid library load address"};
-            auto display = path->second;
+            std::string diagnostic;
+            if (path == attrs.end() || path->second.empty()) diagnostic = "library entry has no name";
+            library_has_base_evidence = address != attrs.end() && parse_hex_value(address->second, base);
+            if (address != attrs.end() && !library_has_base_evidence) {
+                if (!diagnostic.empty()) diagnostic += "; ";
+                diagnostic += "library entry has an invalid load address";
+                base = 0;
+            }
+            const std::string path_value = path == attrs.end() ? std::string{} : path->second;
+            auto display = path_value;
             const auto slash = display.find_last_of("/\\"); if (slash != std::string::npos) display.erase(0, slash + 1);
-            modules.push_back({std::move(display), path->second, base, 0});
+            if (display.empty()) display = "[unreadable library entry]";
+            modules.push_back({std::move(display), path_value, base, 0, std::move(diagnostic)});
             in_library = !self_closing;
+            if (!self_closing) element_stack.emplace_back(name);
+            if (self_closing && !library_has_base_evidence) {
+                auto& entry_diagnostic = modules.back().diagnostic;
+                if (!entry_diagnostic.empty()) entry_diagnostic += "; ";
+                entry_diagnostic += "library entry has no load-address evidence";
+            }
         } else if (name == "segment" && in_library) {
+            if (element_stack.size() != 2 || element_stack.back() != "library")
+                return Error{ErrorCode::malformed, "segment element is outside a library"};
             const auto addr = attrs.find("address");
-            if (addr == attrs.end() || !parse_hex_value(addr->second, modules.back().base)) return Error{ErrorCode::malformed, "invalid library segment address"};
-        }
+            std::uint64_t segment_base = 0;
+            if (addr == attrs.end() || !parse_hex_value(addr->second, segment_base)) {
+                auto& diagnostic = modules.back().diagnostic;
+                if (!diagnostic.empty()) diagnostic += "; ";
+                diagnostic += "library segment has an invalid address";
+            } else if (modules.back().base == 0) {
+                modules.back().base = segment_base;
+                library_has_base_evidence = true;
+            }
+            if (!self_closing) element_stack.emplace_back(name);
+        } else return Error{ErrorCode::unsupported, "unsupported libraries XML element"};
     }
-    if (in_library) return Error{ErrorCode::malformed, "unclosed libraries XML library element"};
+    if (!root_seen || !root_closed || !element_stack.empty() || in_library)
+        return Error{ErrorCode::malformed, "incomplete libraries XML document"};
     return modules;
 }
 

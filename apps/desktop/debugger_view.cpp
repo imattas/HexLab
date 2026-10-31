@@ -4759,7 +4759,8 @@ void DebuggerView::copy_inspection_report() {
         const auto index = visible_module_rows_[i]; if (index >= modules_.size()) continue;
         const auto &module = modules_[index]; comma(i); raw("{"); number_field("base", module.base); raw(",");
         number_field("size", module.size); raw(","); text_field("name", from_utf8(module.name)); raw(",");
-        text_field("path", from_utf8(module.path)); raw("}");
+        text_field("path", from_utf8(module.path)); raw(",");
+        text_field("diagnostic", from_utf8(module.diagnostic)); raw("}");
     }
     raw("]},\"memory_regions\":{"); number_field("visible_count", visible_memory_region_rows_.size()); raw(",");
     number_field("snapshot_count", memory_regions_.size()); raw(","); text_field("filter", memory_region_filter_->GetValue()); raw(",");
@@ -5204,8 +5205,8 @@ void DebuggerView::copy_selected_module() {
     const std::vector<std::string> fields{
         wxString::Format("0x%llX", static_cast<unsigned long long>(module.base)).ToStdString(),
         wxString::Format("0x%llX", static_cast<unsigned long long>(module.size)).ToStdString(),
-        module.name, module.path};
-    std::string text = "Base\tSize\tName\tPath\r\n";
+        module.name, module.path, module.diagnostic};
+    std::string text = "Base\tSize\tName\tPath\tDiagnostic\r\n";
     for (std::size_t index = 0; index < fields.size(); ++index) {
         if (index) text.push_back('\t');
         text += os_data_cell(fields[index]);
@@ -5231,13 +5232,14 @@ void DebuggerView::copy_visible_modules() {
         return;
     }
     constexpr std::size_t max_copy_bytes = 1024 * 1024;
-    std::string output = "Base\tSize\tName\tPath\r\n";
+    std::string output = "Base\tSize\tName\tPath\tDiagnostic\r\n";
     for (const auto index : visible_module_rows_) {
         if (index >= modules_.size()) continue;
         const auto &module = modules_[index];
         const auto line = wxString::Format("0x%llX\t0x%llX\t",
             static_cast<unsigned long long>(module.base), static_cast<unsigned long long>(module.size)).ToStdString() +
-            os_data_cell(module.name) + "\t" + os_data_cell(module.path) + "\r\n";
+            os_data_cell(module.name) + "\t" + os_data_cell(module.path) + "\t" +
+            os_data_cell(module.diagnostic) + "\r\n";
         if (line.size() > max_copy_bytes - std::min(output.size(), max_copy_bytes)) {
             report("Visible module details exceed the 1 MiB clipboard limit.");
             return;
