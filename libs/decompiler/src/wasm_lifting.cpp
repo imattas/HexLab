@@ -244,16 +244,6 @@ ExpressionPtr float_to_integer_trap_condition(std::uint8_t op, const ExpressionP
     // NaN or truncation toward zero would produce a value outside the target range.
     return unary(std::string(info->operation) + "_condition", value, integer(32));
 }
-ExpressionPtr wasm_memory_access_trap_condition(const ExpressionPtr &base,
-                                                std::uint32_t offset,
-                                                unsigned access_bytes) {
-    auto effective_address = unary("zext", base, integer(64));
-    if (offset != 0)
-        effective_address = binary("add", std::move(effective_address),
-                                   constant(offset, integer(64)), integer(64));
-    return unary("wasm_memory_access_out_of_bounds_length_" + std::to_string(access_bytes),
-                 std::move(effective_address), integer(32));
-}
 struct MemoryOpInfo {
     bool store = false;
     ValueType stack_type;
@@ -1786,8 +1776,8 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
                 const auto access_bytes = info->access_type.bits / 8;
                 lifted.trap_edges.push_back({i.address, TrapEdgeKind::may_trap,
                     "WebAssembly memory access out of bounds",
-                    wasm_memory_access_trap_condition(address.value(),
-                        static_cast<std::uint32_t>(args.value().second), access_bytes)});
+                    unary("wasm_memory_access_out_of_bounds_length_" +
+                          std::to_string(access_bytes), effective_address, integer(32))});
 
                 // The common MemoryValue requires a register base. A reserved
                 // Wasm stack pseudo-register carries the exact effective i32
@@ -2058,8 +2048,8 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
                     const auto access_bytes = info->access_bits / 8;
                     lifted.trap_edges.push_back({i.address, TrapEdgeKind::may_trap,
                         "WebAssembly SIMD lane memory access out of bounds",
-                        wasm_memory_access_trap_condition(address.value(),
-                            static_cast<std::uint32_t>(*offset), access_bytes)});
+                        unary("wasm_memory_access_out_of_bounds_length_" + std::to_string(access_bytes),
+                              effective_address, integer(32))});
                     const RegisterOperand address_register{RegisterBank::wasm_stack, 255, 32, false};
                     emit(n, Assign{address_register, effective_address});
                     MemoryValue memory;
@@ -2100,8 +2090,8 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
                 const auto access_bytes = info->access_bits / 8;
                 lifted.trap_edges.push_back({i.address, TrapEdgeKind::may_trap,
                     "WebAssembly SIMD memory access out of bounds",
-                    wasm_memory_access_trap_condition(address.value(),
-                        static_cast<std::uint32_t>(*offset), access_bytes)});
+                    unary("wasm_memory_access_out_of_bounds_length_" + std::to_string(access_bytes),
+                          effective_address, integer(32))});
                 const RegisterOperand address_register{RegisterBank::wasm_stack, 255, 32, false};
                 emit(n, Assign{address_register, effective_address});
                 MemoryValue memory;
