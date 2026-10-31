@@ -11,6 +11,7 @@
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <charconv>
 #include <csignal>
 #include <cstddef>
 #include <cstdio>
@@ -25,6 +26,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #elif defined(__linux__)
+#include <poll.h>
 #include <sys/mman.h>
 #include <unistd.h>
 #include <sys/ptrace.h>
@@ -1291,11 +1293,11 @@ void run_linux_launched_interrupt_test(const std::string& executable) {
     auto interrupted = requested ? session.wait_event(std::chrono::seconds(5))
                                  : Result<DebugEvent>{Error{ErrorCode::busy, "interrupt was not accepted"}};
     linux_debug_wait_error("wait for async interrupt stop", interrupted);
-    if (interrupted && (interrupted.value().kind != EventKind::exception || interrupted.value().message != "interrupt stop"))
+    if (interrupted && (interrupted.value().kind != EventKind::interrupted || interrupted.value().message != "debugger interrupt"))
         std::fprintf(stderr, "Linux debugger diagnostic: interrupt event kind=%u message=%s\n",
                      static_cast<unsigned>(interrupted.value().kind), interrupted.value().message.c_str());
-    const bool stopped = interrupted && interrupted.value().kind == EventKind::exception &&
-                         interrupted.value().message == "interrupt stop";
+    const bool stopped = interrupted && interrupted.value().kind == EventKind::interrupted &&
+                         interrupted.value().message == "debugger interrupt";
     if (!stopped)
         std::fprintf(stderr, "Linux debugger diagnostic: interrupt outcome requested=%d got_event=%d state=%u\n",
                      static_cast<bool>(requested), static_cast<bool>(interrupted), static_cast<unsigned>(session.state()));
@@ -1574,13 +1576,55 @@ void run_linux_write_watchpoint_test() {
 }
 
 void run_linux_multithread_attach_test(const std::string& executable) {
+    int ready_pipe[2]{};
+    int release_pipe[2]{};
+    if (pipe(ready_pipe) != 0) {
+        hexlab_test::check(false, "Linux creates a readiness pipe for multithread attach fixture");
+        return;
+    }
+    if (pipe(release_pipe) != 0) {
+        close(ready_pipe[0]);
+        close(ready_pipe[1]);
+        hexlab_test::check(false, "Linux creates a release pipe for multithread attach fixture");
+        return;
+    }
     const pid_t child = fork();
     hexlab_test::check(child >= 0, "Linux creates a child for multithread ptrace attach");
-    if (child < 0) return;
+    if (child < 0) {
+        close(ready_pipe[0]);
+        close(ready_pipe[1]);
+        close(release_pipe[0]);
+        close(release_pipe[1]);
+        return;
+    }
     if (child == 0) {
-        execl(executable.c_str(), executable.c_str(), "--linux-attach-debuggee", nullptr);
+        close(ready_pipe[0]);
+        close(release_pipe[1]);
+        const auto ready_fd = std::to_string(ready_pipe[1]);
+        const auto release_fd = std::to_string(release_pipe[0]);
+        execl(executable.c_str(), executable.c_str(), "--linux-attach-debuggee", ready_fd.c_str(),
+              release_fd.c_str(), nullptr);
         _exit(127);
     }
+    close(ready_pipe[1]);
+    close(release_pipe[0]);
+    pollfd ready_event{ready_pipe[0], POLLIN, 0};
+    const auto ready_poll = poll(&ready_event, 1, 5000);
+    char ready_byte{};
+    const auto ready_read = ready_poll > 0 && (ready_event.revents & POLLIN)
+        ? read(ready_pipe[0], &ready_byte, 1) : -1;
+    close(ready_pipe[0]);
+    const bool target_threads_ready = ready_read == 1 && ready_byte == 'R';
+    hexlab_test::check(target_threads_ready,
+                       "Linux attach fixture starts both worker threads before parent attach");
+    if (!target_threads_ready) {
+        close(release_pipe[1]);
+        (void)kill(child, SIGKILL);
+        int failed_status{};
+        (void)waitpid(child, &failed_status, 0);
+        return;
+    }
+    {
     DebugSession session(make_native_backend());
     auto attached = session.attach(static_cast<ProcessId>(child));
     linux_debug_error("attach multithread child", attached);
@@ -1648,6 +1692,16 @@ void run_linux_multithread_attach_test(const std::string& executable) {
         linux_debug_error("detach multithread child", detached);
         hexlab_test::check(static_cast<bool>(detached), "Linux detach releases every seized target thread");
     }
+    }
+    const char release_byte = 'Q';
+    ssize_t release_sent;
+    do { release_sent = write(release_pipe[1], &release_byte, 1); }
+    while (release_sent < 0 && errno == EINTR);
+    close(release_pipe[1]);
+    if (release_sent != 1) {
+        std::fprintf(stderr, "Linux debugger diagnostic: could not release attach fixture; errno=%d\n", errno);
+        (void)kill(child, SIGKILL);
+    }
     int status{};
     bool exited = false;
     for (int i = 0; i < 100 && !exited; ++i) {
@@ -1705,14 +1759,34 @@ int main(int argc, char **argv) {
         std::this_thread::sleep_for(std::chrono::seconds(30));
         return 0;
     }
-    if (argc == 2 && std::string_view(argv[1]) == "--linux-attach-debuggee") {
+    if (argc == 4 && std::string_view(argv[1]) == "--linux-attach-debuggee") {
+        int ready_fd = -1, release_fd = -1;
+        const std::string_view ready_arg(argv[2]), release_arg(argv[3]);
+        const auto ready_parsed = std::from_chars(ready_arg.data(), ready_arg.data() + ready_arg.size(), ready_fd);
+        const auto release_parsed = std::from_chars(release_arg.data(), release_arg.data() + release_arg.size(), release_fd);
+        if (ready_parsed.ec != std::errc{} || ready_parsed.ptr != ready_arg.data() + ready_arg.size() || ready_fd < 0 ||
+            release_parsed.ec != std::errc{} || release_parsed.ptr != release_arg.data() + release_arg.size() || release_fd < 0)
+            return 79;
         std::atomic<unsigned> ready{0};
-        auto worker = [&] { ++ready; std::this_thread::sleep_for(std::chrono::seconds(2)); };
+        std::atomic<bool> stop_workers{false};
+        auto worker = [&] {
+            ++ready;
+            while (!stop_workers.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        };
         std::thread first(worker), second(worker);
         while (ready.load() != 2) std::this_thread::yield();
-        std::this_thread::sleep_for(std::chrono::seconds(2));
+        const char marker = 'R';
+        ssize_t sent;
+        do { sent = write(ready_fd, &marker, 1); } while (sent < 0 && errno == EINTR);
+        close(ready_fd);
+        if (sent != 1) stop_workers.store(true);
+        char release{};
+        ssize_t received;
+        do { received = read(release_fd, &release, 1); } while (received < 0 && errno == EINTR);
+        close(release_fd);
+        stop_workers.store(true);
         first.join(); second.join();
-        return 0;
+        return sent == 1 && received == 1 && release == 'Q' ? 0 : 79;
     }
     const std::string executable = argv[0];
     return hexlab_test::run([&] {

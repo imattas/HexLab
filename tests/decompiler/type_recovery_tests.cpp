@@ -367,16 +367,28 @@ int main() {
     assert(inferred_bare_return.value().inferred_prototype);
     assert(inferred_bare_return.value().inferred_prototype->result_type()->kind() == types::Kind::void_type);
 
-    auto win=x86_64_windows_abi();
 #if defined(__APPLE__)
-    mark_test_stage('6');
+    mark_test_stage('A'); // Windows ABI construction and slot checks
 #endif
-    assert(win.integer_argument_registers.size()==4 && win.stack_argument_base && win.stack_argument_offsets.front()==40);
+    auto win=x86_64_windows_abi();
+    assert(win.integer_argument_registers.size()==4 && win.stack_argument_base &&
+           !win.stack_argument_offsets.empty() && win.stack_argument_offsets.front()==40);
+#if defined(__APPLE__)
+    mark_test_stage('B'); // System V ABI construction and slot checks
+#endif
     auto sysv=x86_64_system_v_abi();
-    assert(sysv.integer_argument_registers.size()==6 && sysv.stack_argument_offsets.front()==8);
+    assert(sysv.integer_argument_registers.size()==6 && !sysv.stack_argument_offsets.empty() &&
+           sysv.stack_argument_offsets.front()==8);
+#if defined(__APPLE__)
+    mark_test_stage('C'); // AArch64 ABI construction and slot checks
+#endif
     auto arm=aarch64_abi();
-    assert(arm.integer_argument_registers.size()==8 && arm.stack_argument_base->bank==RegisterBank::arm64_sp);
+    assert(arm.integer_argument_registers.size()==8 && arm.stack_argument_base &&
+           arm.stack_argument_base->bank==RegisterBank::arm64_sp);
 
+#if defined(__APPLE__)
+    mark_test_stage('D'); // Windows ABI stack argument recovery
+#endif
     auto stack_fn=std::make_shared<LiftedFunction>(*fn);
     MemoryValue stack_mem; stack_mem.base=win.stack_argument_base; stack_mem.displacement=40;
     stack_mem.type={TypeKind::integer,32,false};
@@ -387,12 +399,19 @@ int main() {
     // The explicit Windows ABI order has four register slots before stack
     // arguments. This fixture observes only the first register slot, so the
     // stack read must not be promoted past the missing register slots.
+#if defined(__APPLE__)
+    mark_test_stage('E'); // Windows inferred prototype validation
+#endif
+    assert(stack_recovered.value().inferred_prototype);
     assert(stack_recovered.value().inferred_prototype->parameters().size()==1);
     assert(stack_recovered.value().diagnostics.empty());
 
     // Normalize a stack argument access through a stack pointer adjusted by
     // the prologue: current_sp = entry_sp - 40, load [current_sp + 80] is the
     // ABI slot at entry_sp + 40.
+#if defined(__APPLE__)
+    mark_test_stage('F'); // Prologue-adjusted stack argument recovery
+#endif
     const RegisterOperand adjusted_sp{RegisterBank::gpr, 4, 64, false};
     auto forty = std::make_shared<Expression>(Expression{{TypeKind::integer, 64, false},
         ConstantValue{40, {TypeKind::integer, 64, false}}});
@@ -424,18 +443,20 @@ int main() {
     stack_only_abi.stack_argument_offsets = {40};
     stack_only_abi.arguments = {{AbiValueClass::integer, {}, 40}};
     auto adjusted_stack_recovery = recover_types(adjusted_stack_fn, stack_only_abi);
-    assert(adjusted_stack_recovery && adjusted_stack_recovery.value().inferred_prototype);
+    assert(adjusted_stack_recovery);
+    assert(adjusted_stack_recovery.value().inferred_prototype);
     assert(adjusted_stack_recovery.value().inferred_prototype->parameters().size() == 1);
     assert(adjusted_stack_recovery.value().inferred_prototype->parameters().front().type->size() == 4);
 
     auto f64=types::Type::floating("double",8,8); assert(f64);
 #if defined(__APPLE__)
-    mark_test_stage('7');
+    mark_test_stage('G'); // Floating and mixed ABI recovery
 #endif
     auto floating_proto=types::Type::function(f64.value(),{{"x",f64.value()}},false); assert(floating_proto);
     AbiDescription floating_abi; floating_abi.name="test floating"; floating_abi.pointer_bits=64;
     floating_abi.floating_argument_registers={arg}; floating_abi.floating_return_register=result_reg;
     auto floating_constrained=recover_types(*fn,floating_abi,floating_proto.value()); assert(floating_constrained);
+    assert(floating_constrained.value().return_type);
     assert(floating_constrained.value().return_type->kind()==types::Kind::floating);
     bool saw_float=false;
     for(const auto &v:floating_constrained.value().variables) if(v.reg==arg && v.version==0) saw_float=v.type->kind()==types::Kind::floating && v.prototype_constrained;

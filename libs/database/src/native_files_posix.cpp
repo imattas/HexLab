@@ -168,9 +168,11 @@ void publish_file(OwnedFile& source,const std::filesystem::path& destination,Rep
                 sqlite3_stmt* journal_mode=nullptr;
                 const auto prepared=sqlite3_prepare_v2(database,"PRAGMA journal_mode=DELETE",-1,&journal_mode,nullptr);
                 if(prepared!=SQLITE_OK){
+                    const std::string diagnostic=std::string("Cannot prepare SQLite journal-mode recovery (SQLite ")+
+                        std::to_string(sqlite3_extended_errcode(database))+": "+sqlite3_errmsg(database)+")";
                     if(journal_mode)sqlite3_finalize(journal_mode);
                     sqlite3_close(database);
-                    throw Failure{{ErrorCode::busy,"Cannot prepare SQLite journal-mode recovery"}};
+                    throw Failure{{ErrorCode::busy,diagnostic}};
                 }
                 const auto stepped=sqlite3_step(journal_mode);
                 const auto mode=stepped==SQLITE_ROW?sqlite3_column_text(journal_mode,0):nullptr;
