@@ -250,6 +250,8 @@ std::string format(const Instruction &i) {
                     first = false;
                 }
             result += "}";
+            if (i.arm && i.arm->exchange == ArmExchange::saved_status)
+                result += "^";
         } else if (auto thumb_relative = std::get_if<ThumbRelativeOperand>(&operand))
             result += i.direct_target
                           ? hex(i.direct_target->offset)

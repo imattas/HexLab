@@ -9,7 +9,7 @@ void arm_info(Writer &out, const std::optional<ArmInstructionInfo> &value) {
         return;
     const auto &a = *value;
     require(static_cast<unsigned>(a.predicate) <= static_cast<unsigned>(ArmPredicate::unknown_it) &&
-                static_cast<unsigned>(a.exchange) <= static_cast<unsigned>(ArmExchange::forced_thumb) &&
+                static_cast<unsigned>(a.exchange) <= static_cast<unsigned>(ArmExchange::saved_status) &&
                 a.flags_written <= 15 &&
                 static_cast<unsigned>(a.multiple_mode) <= static_cast<unsigned>(ArmMultipleMode::db),
             "Invalid ARM control metadata");
@@ -41,7 +41,7 @@ ThumbITState read_arm_info(Reader &in, DecodeContext context) {
     if (!present)
         return {};
     require(in.number(1) <= static_cast<unsigned>(ArmPredicate::unknown_it), "Invalid ARM predicate");
-    require(in.number(1) <= static_cast<unsigned>(ArmExchange::forced_thumb), "Invalid ARM exchange");
+    require(in.number(1) <= static_cast<unsigned>(ArmExchange::saved_status), "Invalid ARM exchange");
     require(in.number(1) <= 15, "Invalid ARM flags mask");
     in.flag();
     in.flag();

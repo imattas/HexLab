@@ -813,7 +813,7 @@ using Operand =
     std::variant<RegisterOperand, MemoryOperand, ImmediateOperand, RelativeOperand, FarPointerOperand, FarMemoryOperand,
                  ArmShiftedRegisterOperand, ArmMemoryOperand, ArmRegisterListOperand, ThumbRelativeOperand>;
 enum class ArmPredicate { always, condition, unknown_it };
-enum class ArmExchange { none, address_bit0, forced_a32, forced_thumb };
+enum class ArmExchange { none, address_bit0, forced_a32, forced_thumb, saved_status };
 enum class ArmMultipleMode { ia, ib, da, db };
 // Known zero means outside an IT block; unknown must not invent a predicate.
 struct ThumbITState {
