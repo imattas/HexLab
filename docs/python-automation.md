@@ -78,6 +78,33 @@ The runner, bridge, public headers, this document and
 The Python facade is embedded in the executable, so a neighboring `.py` file
 cannot silently replace that API.
 
+## Ordered FLAIR recognition
+
+`Project.recognize_flirt_catalogs()` runs a read-only recovered-function scan
+over an ordered sequence of `(catalog_bytes, provenance)` pairs. Each catalog
+may be FLAIR text, gzip-wrapped `.pat.gz`, or binary IDASGN v5-v10 data. Input
+order and duplicates are retained; result candidates include their zero-based
+`catalog_index`, provenance, symbol kind, name, and matching-pattern count.
+The result reports completeness, candidate/comparison counts, and explicit
+ambiguity. Recognition does not rename functions or persist evidence.
+
+The sequence accepts 1..256 catalogs and at most 64 MiB of aggregate input,
+64 MiB of inflated catalog bodies, and 65,536 patterns. `expected_revision`
+checks the project's edit revision before the scan; any edit or source-byte
+change during the query raises `ProjectChangedDuringQuery`. `cancel` accepts a
+`CancellationToken` and raises `AnalysisCancelled` when requested.
+
+```python
+catalogs = [
+    (open("runtime.pat", "rb").read(), "runtime catalog"),
+    (open("vendor.sig", "rb").read(), "vendor catalog"),
+]
+result = project.recognize_flirt_catalogs(catalogs, cancel=token)
+for function in result["functions"]:
+    for candidate in function["candidates"]:
+        print(function["entry"], candidate["name"], candidate["provenance"])
+```
+
 ## Public API
 
 `hexlab.API_VERSION == 1`. Creation/open methods accept `api_version=1`; unknown

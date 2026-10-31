@@ -174,7 +174,9 @@ embeds architecture and execution mode but does not yet embed compiler, ABI, or
 library-version metadata.
 This is evidence-based byte recognition, not a proof of function identity.
 Absolute-address immediates and loader relocations are not normalized by the
-byte-pattern format. Compiler-version catalogs, binary `.sig` support, and
+byte-pattern format. The version-2 byte-signature catalog does not import
+binary FLAIR `.sig` files; those belong to the separate FLAIR catalog workflow
+below. Compiler-version metadata, calibrated false-positive analysis, and
 automatic library naming remain future work.
 
 ## FLAIR text patterns
