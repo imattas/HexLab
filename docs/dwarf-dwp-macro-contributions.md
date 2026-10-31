@@ -17,10 +17,17 @@ slicing. The byte budget covers ELF metadata, source sections, and returned
 copies; the default and hard maximum is 64 MiB. Cancellation is checked during table
 and index processing.
 
-This API only extracts bytes. HexLab does not yet interpret macro opcodes,
-expand imports, or merge macro tables into `ImportResult`. The caller remains
-responsible for selecting the package and verifying its identity against the
-application; the API never follows a path stored in DWARF. Unsupported
+This low-level API extracts bytes and retains the package identity needed by
+its caller. During a selected DWP split-CU import, HexLab parses the bounded
+macro contribution and merges its raw contribution and supported expanded
+macro units into the skeleton's `ImportResult` only after the split DWO ID has
+been checked against that skeleton. Macro units retain the DWP CU ID, index
+version, source ID, and package section offset. Unsupported macro opcodes or
+`DW_MACRO_import` graphs remain as raw contribution data and add an explicit
+diagnostic; they do not discard valid types, symbols, or variables from the
+split CU. Parse errors outside the unsupported subset still fail the import.
+The caller remains responsible for selecting the package and verifying its
+identity against the application; the API never follows a path stored in DWARF. Unsupported
 relocations into compressed sections, unsupported compression algorithms,
 non-relocatable packages, or absent/empty
 indexed macro contributions fail closed. The package contribution IDs and

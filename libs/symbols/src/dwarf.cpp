@@ -658,6 +658,16 @@ hexlab::Result<ImportResult> import_dwarf(const DwarfSections&sections){
     if(sections.info.size()>256u*1024u*1024u||sections.abbrev.size()>64u*1024u*1024u||sections.strings.size()>256u*1024u*1024u||sections.string_offsets.size()>256u*1024u*1024u||sections.addresses.size()>256u*1024u*1024u||sections.line_strings.size()>256u*1024u*1024u||sections.location_lists.size()>256u*1024u*1024u||sections.locations.size()>256u*1024u*1024u||sections.range_lists.size()>256u*1024u*1024u||sections.ranges.size()>256u*1024u*1024u)return hexlab::Error{hexlab::ErrorCode::resource_limit,"DWARF sections exceed importer limits"};
     ImportResult output;Reader info(sections.info,0,sections.info.size());std::uint64_t die_count=0;
     std::uint64_t supplementary_bytes_used=0;std::uint32_t supplementary_requests=0;
+    constexpr std::uint64_t split_macro_payload_limit = 64u * 1024u * 1024u;
+    constexpr std::size_t split_macro_unit_limit = 65'536;
+    constexpr std::size_t split_macro_record_limit = 1'000'000;
+    std::uint64_t split_macro_contribution_bytes = 0, split_macro_expanded_bytes = 0;
+    std::size_t split_macro_units = 0, split_macro_records = 0;
+    const auto charge_macro_bytes = [](std::uint64_t &used, std::uint64_t amount) {
+        if (used > split_macro_payload_limit || amount > split_macro_payload_limit - used) return false;
+        used += amount;
+        return true;
+    };
     std::vector<DwarfSplitUnitRequest> pending_split_units;
     std::set<std::uint64_t> seen_skeleton_ids;
     struct UnitPosition { std::size_t offset; bool type_unit; std::uint8_t unit_type; std::uint8_t offset_size; };
@@ -1355,12 +1365,51 @@ hexlab::Result<ImportResult> import_dwarf(const DwarfSections&sections){
             if(!split.split_unit||split.split_dwo_id!=request.dwo_id)
                 return malformed("DWARF split-unit resolver returned a mismatched DWO ID");
             const auto merged_count=std::uint64_t{output.symbols.size()}+output.types.size()+output.variables.size()+output.enumerators.size()+
-                split.symbols.size()+split.types.size()+split.variables.size()+split.enumerators.size();
+                output.macro_contributions.size()+output.macro_units.size()+split.symbols.size()+split.types.size()+
+                split.variables.size()+split.enumerators.size()+split.macro_contributions.size()+split.macro_units.size();
             if(merged_count>2'000'000)return hexlab::Error{hexlab::ErrorCode::resource_limit,"Merged DWARF records exceed importer limit"};
+            for (const auto &macro : split.macro_contributions) {
+                if (canceled()) return hexlab::Error{hexlab::ErrorCode::canceled,"DWARF macro merge canceled"};
+                if (!charge_macro_bytes(split_macro_contribution_bytes, sizeof(macro)) ||
+                    !charge_macro_bytes(split_macro_contribution_bytes, macro.source_id.size()) ||
+                    !charge_macro_bytes(split_macro_contribution_bytes, macro.bytes.size()) ||
+                    !charge_macro_bytes(split_macro_contribution_bytes, macro.strings.size()) ||
+                    !charge_macro_bytes(split_macro_contribution_bytes, macro.line_strings.size()) ||
+                    !charge_macro_bytes(split_macro_contribution_bytes, macro.string_offsets.size()))
+                    return hexlab::Error{hexlab::ErrorCode::resource_limit,"Merged DWP macro contributions exceed 64 MiB"};
+            }
+            for (const auto &unit : split.macro_units) {
+                if (canceled()) return hexlab::Error{hexlab::ErrorCode::canceled,"DWARF macro merge canceled"};
+                if (split_macro_units >= split_macro_unit_limit)
+                    return hexlab::Error{hexlab::ErrorCode::resource_limit,"Merged DWARF macro unit count exceeds 65,536"};
+                ++split_macro_units;
+                if (!charge_macro_bytes(split_macro_expanded_bytes, sizeof(unit)) ||
+                    !charge_macro_bytes(split_macro_expanded_bytes, unit.source_id.size()))
+                    return hexlab::Error{hexlab::ErrorCode::resource_limit,"Expanded DWARF macro metadata exceeds 64 MiB"};
+                for (const auto &record : unit.records) {
+                    if (canceled()) return hexlab::Error{hexlab::ErrorCode::canceled,"DWARF macro merge canceled"};
+                    if (split_macro_records >= split_macro_record_limit)
+                        return hexlab::Error{hexlab::ErrorCode::resource_limit,"Merged DWARF macro record count exceeds one million"};
+                    ++split_macro_records;
+                    if (!charge_macro_bytes(split_macro_expanded_bytes, sizeof(record)) ||
+                        !charge_macro_bytes(split_macro_expanded_bytes, record.origin.source_id.size()) ||
+                        !charge_macro_bytes(split_macro_expanded_bytes, record.origin.section.size()) ||
+                        !charge_macro_bytes(split_macro_expanded_bytes, record.file_source_id.size()) ||
+                        !charge_macro_bytes(split_macro_expanded_bytes, record.text.size()) ||
+                        (record.file_name && !charge_macro_bytes(split_macro_expanded_bytes, record.file_name->size())))
+                        return hexlab::Error{hexlab::ErrorCode::resource_limit,"Expanded DWARF macro metadata exceeds 64 MiB"};
+                }
+            }
             output.symbols.insert(output.symbols.end(),std::make_move_iterator(split.symbols.begin()),std::make_move_iterator(split.symbols.end()));
             output.types.insert(output.types.end(),std::make_move_iterator(split.types.begin()),std::make_move_iterator(split.types.end()));
             output.variables.insert(output.variables.end(),std::make_move_iterator(split.variables.begin()),std::make_move_iterator(split.variables.end()));
             output.enumerators.insert(output.enumerators.end(),std::make_move_iterator(split.enumerators.begin()),std::make_move_iterator(split.enumerators.end()));
+            output.macro_contributions.insert(output.macro_contributions.end(),
+                std::make_move_iterator(split.macro_contributions.begin()),
+                std::make_move_iterator(split.macro_contributions.end()));
+            output.macro_units.insert(output.macro_units.end(),
+                std::make_move_iterator(split.macro_units.begin()),
+                std::make_move_iterator(split.macro_units.end()));
             output.diagnostics.insert(output.diagnostics.end(),std::make_move_iterator(split.diagnostics.begin()),std::make_move_iterator(split.diagnostics.end()));
         }
     }
