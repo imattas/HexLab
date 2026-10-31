@@ -341,8 +341,13 @@ Result<CompareInput> make_compare_input(const Image &image, const ImageMetadata 
     if (metadata.elf) {
         for (const auto &relocation : metadata.elf->relocations) {
             if (check_cancel()) return Error{ErrorCode::canceled, "comparison canceled"};
+            const bool decoded_i386_size32 = metadata.elf->header.machine == 3 && relocation.type == 38 &&
+                relocation.kind == ElfRelocationKind::symbol_size && !relocation.explicit_addend &&
+                relocation.field_size == 4 && relocation.file_place && relocation.addend.has_value() &&
+                relocation.symbol_index_validated;
             if (!relocation.field_size || relocation.kind == ElfRelocationKind::unknown ||
-                relocation.kind == ElfRelocationKind::copy || relocation.kind == ElfRelocationKind::symbol_size ||
+                relocation.kind == ElfRelocationKind::copy ||
+                (relocation.kind == ElfRelocationKind::symbol_size && !decoded_i386_size32) ||
                 relocation.kind == ElfRelocationKind::tls || relocation.kind == ElfRelocationKind::ifunc)
                 continue;
             const auto result = relocation.file_place
