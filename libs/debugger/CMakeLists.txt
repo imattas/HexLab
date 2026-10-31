@@ -1,7 +1,5 @@
 if(WIN32)
   set(HEXLAB_DEBUGGER_NATIVE src/native_backend_win.cpp)
-elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
-  set(HEXLAB_DEBUGGER_NATIVE src/native_backend_macos.cpp)
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" HEXLAB_DEBUGGER_PROCESSOR)
   if(HEXLAB_DEBUGGER_PROCESSOR MATCHES "^(aarch64|arm64)$")

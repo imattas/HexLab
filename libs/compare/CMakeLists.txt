@@ -9,7 +9,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   target_compile_features(hexlab_options INTERFACE cxx_std_20)
   target_compile_options(hexlab_options INTERFACE
     $<$<COMPILE_LANG_AND_ID:CXX,MSVC>:/W4;/permissive-;/utf-8>
-    $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic>)
+    $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>:-Wall;-Wextra;-Wpedantic>)
   include("${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/HexLabLibrary.cmake")
 endif()
 hexlab_add_library(compare SOURCES src/compare.cpp src/instruction_diff.cpp src/block_correspondence.cpp src/session.cpp)

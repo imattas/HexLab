@@ -19,7 +19,7 @@
 - â€œHalf-open ranges define ownership; file offsets and virtual addresses are different types.â€
 - â€œValidate all additions, multiplications, indexing and conversions before accessing bytes.â€
 - â€œFile loading never executes the input.â€
-- Windows is the first verified host; Linux and macOS remain required delivery targets in the application scope.
+- At plan approval, Windows was the first verified host and Linux/macOS were required delivery targets. On 2026-10-31, macOS was removed from the supported-host scope; Windows and Linux are the only supported hosts.
 - This plan implements stage 1 only. The full goal remains open through all subsequent stages.
 
 ## Review Focus

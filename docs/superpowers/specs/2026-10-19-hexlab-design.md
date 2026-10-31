@@ -4,7 +4,7 @@
 
 Build an original desktop reverse engineering application in C++ with wxWidgets, with the full functional breadth of IDA Pro as the destination. The scope includes interactive disassembly, analysis databases, types, graphs, decompilation, debugging, automation, processor and loader modules, and extensibility. A working early milestone does not satisfy the full goal.
 
-Status: architecture approved by the user on 2026-10-19. Foundation and binary-analysis stages are implemented; [foundation validation](../../foundation-validation.md) and [binary-analysis validation](../../binary-analysis-validation.md) record evidence and limitations. The full application remains in development. The working name is HexLab, matching the workspace. Windows is the first build host; Linux and macOS remain delivery targets.
+Status: architecture approved by the user on 2026-10-19. Foundation and binary-analysis stages are implemented; [foundation validation](../../foundation-validation.md) and [binary-analysis validation](../../binary-analysis-validation.md) record evidence and limitations. The full application remains in development. The working name is HexLab, matching the workspace. Windows and Linux are the supported build and delivery hosts; macOS is unsupported. Mach-O and Apple-target analysis remains available on supported hosts.
 
 Approved interpretation of “from scratch”: implement the application and its analysis, decoding, lifting, and decompilation engines in this repository. Use wxWidgets for the GUI and ordinary infrastructure libraries where appropriate. Do not substitute an embedded existing reverse engineering application for the engine. Existing tools may be independent test oracles.
 

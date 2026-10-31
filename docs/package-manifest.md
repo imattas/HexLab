@@ -13,8 +13,8 @@ constants in `libs/plugins/include/hexlab/plugins/plugin_abi.h`. Tool entries
 contain package-relative filenames and roles. Runtime target entries are CMake
 target names without platform suffixes; use `runtime_directory` to locate their
 installed shared-library files. On Windows, tools and shared runtime DLLs are in
-`bin`; on Linux and macOS, tools are in `bin` and shared runtime libraries are in
-the configured library directory. The manifest reports the package layout, not
+`bin`; on Linux, tools are in `bin` and shared runtime libraries are in the
+configured library directory. The manifest reports the package layout, not
 every transitive system library required by the host operating system.
 `conditional_host_requirements` describes known prerequisites whose condition
 must be checked against `target`; it does not imply that the prerequisite applies
@@ -58,14 +58,9 @@ same multi-library tree for manual extraction. Optional Python automation uses
 the system CPython shared library when enabled at configure time; it is not a
 bundled interpreter distribution.
 
-The macOS desktop workflow retains the relocatable TGZ and also creates
-`HexLab.app.zip` for Finder installs. The app bundle keeps `hexlab`, `hexlab_cli`,
-and the debug server together in `Contents/MacOS`; the HexLab and wxWidgets
-shared libraries are in `Contents/lib`, where the app's relative install names
-resolve them after the bundle is moved. Headers and documentation are under
-`Contents/Resources`, and the bundled package manifest is rewritten to describe
-that layout. The app bundle is not code signed or notarized by CI, so it is a
-review artifact rather than a ready-to-publish macOS release.
+HexLab packages are produced for Windows and Linux only. Linux packages keep
+the command-line and desktop tools in `bin` and shared runtime libraries in the
+configured library directory; no macOS application bundle is produced.
 
 Plugins are optional, separately built native modules. The manifest identifies
 the host ABI major/minor version and query symbol so a distribution or plugin

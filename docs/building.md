@@ -40,7 +40,7 @@ cmake --install out/build/windows-desktop --config Debug --prefix out/install/Pr
 ./out/install/ProjectAnalysisDebug/bin/hexlab.exe --smoke-test
 ```
 
-The install tree contains `bin/` tools and Windows runtime DLLs, `lib/` engine and wxWidgets runtime/link libraries on Linux/macOS, `include/` development headers and `share/hexlab/` documentation and notices. The desktop executable uses a relative runtime search path to resolve the bundled wxWidgets libraries. Debug builds require the installed Visual C++ Debug runtime and are developer packages. Release archives include the application-owned runtime files; host-provided runtime installation and fresh-machine validation remain separate requirements.
+HexLab supports Windows and Linux hosts. The install tree contains `bin/` tools and Windows runtime DLLs, `lib/` engine and wxWidgets runtime/link libraries on Linux, `include/` development headers and `share/hexlab/` documentation and notices. The desktop executable uses a relative runtime search path to resolve the bundled wxWidgets libraries. Debug builds require the installed Visual C++ Debug runtime and are developer packages. Release archives include the application-owned runtime files; host-provided runtime installation and fresh-machine validation remain separate requirements.
 
 The install tree also contains `share/hexlab/package-manifest.json`. It lists
 the packaged tools, engine runtime targets, relative install directories,
@@ -62,7 +62,7 @@ that directory as its only non-system runtime search path. This verifies the
 CLI without depending on the source or build tree; the test does not launch
 the GUI. Windows systems need
 the matching Microsoft Visual C++ 2022 Redistributable; the package does not
-bundle Microsoft's runtime. Linux/macOS headless builds produce a TGZ with
+bundle Microsoft's runtime. Linux headless builds produce a TGZ with
 their CLI and shared engine libraries. Native GUI packaging and fresh-machine
 validation remain host-specific work.
 
@@ -84,33 +84,28 @@ relocatable install tree available for review without publishing a release or
 changing the local build's package directory.
 
 Linux desktop builds produce both a relocatable TGZ and an installable Debian
-package; macOS desktop builds produce a TGZ. Linux packages include the GUI,
+package. Linux packages include the GUI,
 CLI and debugger server, HexLab engine shared libraries, wxWidgets runtime
 libraries, headers, documentation, third-party notices, and an XDG application
 launcher with a scalable icon. The DEB installs under `/usr` and uses
 `dpkg-shlibdeps` to declare host runtime-library dependencies. To install it on
 Debian or Ubuntu, run `sudo apt install ./HexLab-*-Linux-*.deb`. The TGZ can be
 extracted to a chosen prefix and run from its `bin/` directory; its executables
-use relative runtime paths to find the bundled libraries. The macOS desktop
-preset's arm64 plus x86_64 package is named with the `Darwin-universal2` suffix,
-independent of which CPU architecture runs CMake; single-architecture builds
-retain their architecture-specific suffix.
+use relative runtime paths to find the bundled libraries.
 
 When `HEXLAB_ENABLE_PYTHON_AUTOMATION=ON`, the desktop embeds the system CPython
 runtime instead of bundling a Python distribution. On Linux the DEB dependency
 scanner records the needed host Python shared-library dependency. Python
 automation remains disabled by default.
 
-The cross-platform desktop workflow extracts each native Linux and macOS
-Release TGZ under a fresh runner directory and runs the packaged CLI version
-command from that relocated tree with `LD_LIBRARY_PATH` and
-`DYLD_LIBRARY_PATH` unset. This checks that the CLI resolves its bundled engine
-libraries using the installed runtime paths. The workflow also verifies the
-desktop executable and bundled wxWidgets libraries are present; it does not
-launch the GUI. It uploads each TGZ with a SHA-256 sidecar, plus the Linux DEB
-and its checksum, as 14-day artifacts. Artifact names include runner platform
-and commit SHA. These artifacts are for review and download; the workflow does
-not publish a GitHub release.
+The Linux desktop workflow extracts the Release TGZ under a fresh runner
+directory and runs the packaged CLI version command from that relocated tree
+with `LD_LIBRARY_PATH` unset. This checks that the CLI resolves its bundled
+engine libraries using the installed runtime paths. The workflow also verifies
+the desktop executable and bundled wxWidgets libraries are present; it does not
+launch the GUI. It uploads the TGZ with a SHA-256 sidecar, plus the Linux DEB
+and its checksum, as 14-day artifacts. These artifacts are for review and
+download; the workflow does not publish a GitHub release.
 
 Validate the installed files and both tools with:
 
@@ -131,7 +126,7 @@ ctest --test-dir out/build/headless-offline -C Debug --output-on-failure
 
 For an offline desktop build, obtain a complete wxWidgets checkout at the commit listed in [third-party dependencies](third-party.md), including its submodules. Pass `-DFETCHCONTENT_SOURCE_DIR_WXWIDGETS=C:/path/to/wxWidgets` at configure time. Do not use a GitHub auto-generated source archive without required submodule content. After provisioning, application startup uses no network service.
 
-Linux and macOS headless presets and CI jobs exercise three compiler/configuration pairs: Clang Debug on Ubuntu 24.04 (`linux-headless`), GCC Release on Ubuntu 24.04 (`linux-gcc-headless-release`), and Apple Clang Debug on macOS 14 (`macos-headless`). Each configures without wxWidgets, builds the CLI and test targets, and runs every CTest registered by that preset; tests that require the pinned LLVM oracle executables remain disabled on these hosts. The CLI uses native entry points and strict UTF-8 argument decoding; paths are converted to each host's filesystem representation. Separate `linux-desktop` and `macos-desktop` presets build the complete Release distribution, including wxWidgets and CPack TGZ packaging, on their native CI runners. The macOS desktop preset emits universal `arm64` and `x86_64` slices, and CI checks all three installed tools contain both before generating the Finder `.app` archive. Linux CI installs the GTK/X11/Wayland development dependencies required by wxWidgets. These targets have not been run in this Windows development environment, so successful CI runs are the platform verification gate. Desktop runtime launch and interactive behavior remain unverified on Linux and macOS.
+Linux headless presets and CI jobs exercise Clang Debug (`linux-headless`) and GCC Release (`linux-gcc-headless-release`) on Ubuntu 24.04. They configure without wxWidgets, build the CLI and test targets, and run every CTest registered by the preset; tests that require pinned LLVM oracle executables remain disabled on these hosts. The CLI uses native entry points and strict UTF-8 argument decoding; paths are converted to the host filesystem representation. The `linux-desktop` preset builds the Release distribution with wxWidgets and CPack on Ubuntu. Linux CI installs the GTK/X11/Wayland development dependencies required by wxWidgets, then inspects and relocates the package to verify its runtime paths. Desktop launch and interactive behavior still require validation on a Linux host.
 
 For a native GCC Debug build without the test-only LLVM tools or GUI dependencies:
 

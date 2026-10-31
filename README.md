@@ -35,12 +35,12 @@ ctest --preset windows-headless
 ./out/build/windows-headless/bin/Debug/hexlab_cli.exe project --help
 ```
 
-Linux and macOS headless presets are also provided; each builds the CLI and test suite with the host C++ toolchain:
+Linux headless presets build the CLI and test suite with the host C++ toolchain:
 
 ```sh
-cmake --preset linux-headless # or macos-headless
-cmake --build --preset linux-headless --target hexlab_cli # or macos-headless
-ctest --preset linux-headless # or macos-headless
+cmake --preset linux-headless
+cmake --build --preset linux-headless --target hexlab_cli
+ctest --preset linux-headless
 ```
 
 The desktop provides independent binary/project tabs, Disassembly/Bytes/Graph pages, metadata/reference panes, navigation/history, clipboard actions, Find/Next/Previous, committed names/comments/bookmarks, code/data/function decisions, patches, undo/redo, Save As and checked export. File > Open Project opens saved databases; another editable process produces visible readonly ownership. Dialogs and both tools use shared validated commands. Background work uses per-document actors and a bounded two-worker pool.

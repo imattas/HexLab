@@ -13,8 +13,8 @@ current state and last-event display, reports the backend error in the output
 log, and re-enables the panel. If the target remains running after a failed
 request, event polling resumes.
 
-The current remote RSP backend implements target termination. Native Windows,
-Linux, and macOS backends report it as unsupported; the UI does not treat
+The current remote RSP backend implements target termination. Native Windows
+and Linux backends report it as unsupported; the UI does not treat
 unsupported as detach or pretend the target exited.
 
 Remote RSP connection and the first process enumeration run on the serialized

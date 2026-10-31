@@ -130,8 +130,8 @@ reject unsupported combinations without replacing them with global continue.
 Linux x86/x64 and AArch64 accept one selected thread continuing or stepping, or
 a continue-only subset; breakpoint step-over and deferred-event restrictions
 still apply. Windows accepts event-thread stepping or a continue-only subset
-that includes the event owner. Darwin accepts only a proven single-thread
-target. See [Native thread schedules](../libs/debugger/docs/thread-resume-schedules.md)
+that includes the event owner. Native operating-system scheduling is provided on
+Windows and Linux only; other hosts are unsupported. See [Native thread schedules](../libs/debugger/docs/thread-resume-schedules.md)
 for exact restrictions and failure behavior.
 
 For example, with A owning the stop and C remaining stopped,
@@ -195,5 +195,5 @@ cross-packet atomicity guarantee.
 The thread-schedule integration received source review only; no builds, tests
 or live target/stub interaction were run for this increment. Follow up with
 serial `hexlab_debugger` and `hexlab_debug_server` compilation. Linux x86,
-AArch64, Darwin and Windows ARM64 paths need their respective native builds and
+AArch64 and Windows ARM64 paths need their respective native builds and
 runtime validation; a Windows x64 compile does not validate those paths.

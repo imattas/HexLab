@@ -7,11 +7,10 @@ UTF-8, and reports architecture as unknown when the process cannot be queried.
 On Linux x86-64 it enumerates numeric `/proc` entries, reads the process name
 and ELF architecture where available, and omits processes that disappear during
 inspection. The session rejects oversized results from any backend. Process
-enumeration does not attach to or modify any listed process. macOS uses a
-Mach/ptrace backend with process-wide stopped snapshots and single-thread
-execution restrictions described in
-[Darwin debugger scope](debugger-darwin.md). Other native platforms return
-`unsupported` and can use the remote GDB RSP backend where a server is available.
+enumeration does not attach to or modify any listed process. HexLab runs as a
+host application on Windows and Linux only; other native host operating systems
+are unsupported. The remote GDB RSP backend remains available on supported
+hosts where a server is available.
 
 On Windows, `DebugSession::launch` starts the target with
 `DEBUG_ONLY_THIS_PROCESS`; `DebugSession::attach` uses `DebugActiveProcess` for

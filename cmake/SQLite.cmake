@@ -5,9 +5,7 @@ target_compile_definitions(hexlab_sqlite3 PRIVATE SQLITE_THREADSAFE=1 SQLITE_OMI
 if(WIN32)
   target_compile_definitions(hexlab_sqlite3 PRIVATE "SQLITE_API=__declspec(dllexport)")
 endif()
-if(APPLE)
-  set_target_properties(hexlab_sqlite3 PROPERTIES INSTALL_RPATH "@loader_path")
-elseif(UNIX)
+if(UNIX)
   set_target_properties(hexlab_sqlite3 PROPERTIES INSTALL_RPATH "$ORIGIN")
 endif()
 install(TARGETS hexlab_sqlite3 RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"

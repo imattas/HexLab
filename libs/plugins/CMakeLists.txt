@@ -8,7 +8,7 @@ hexlab_add_library(plugins SOURCES src/plugins.cpp src/plugin_authenticode.cpp s
 if(WIN32)
   target_link_libraries(hexlab_plugins PRIVATE Wintrust)
 endif()
-if(UNIX AND NOT APPLE)
+if(UNIX)
   target_link_libraries(hexlab_plugins PRIVATE ${CMAKE_DL_LIBS})
 endif()
 

@@ -1,4 +1,4 @@
-# Linux and macOS distribution targets
+# Linux distribution targets
 
 The native CMake targets assemble the platform packages in the build tree's
 `packages/` directory. Build a Linux distribution with:
@@ -29,23 +29,7 @@ The RPM uses the standard `/usr` install layout and RPM's automatic shared
 library dependency metadata. The option is Linux-only and off by default;
 Debian and TGZ packaging do not require RPM tooling.
 
-Build a macOS desktop distribution with:
-
-```sh
-cmake --build out/build/macos-desktop --target hexlab_macos_distribution
-```
-
-This target first creates the relocatable TGZ and then wraps that install tree
-as `packages/HexLab.app.zip`. The `.app` contains the desktop executable and
-CLI/debug tools in `Contents/MacOS`, bundled HexLab and wxWidgets libraries in
-`Contents/lib`, and documentation, headers, and notices in `Contents/Resources`.
-Its manifest describes those bundle-relative locations. The TGZ remains
-available alongside the Finder bundle. On a headless macOS configuration, the
-same `hexlab_macos_distribution` target creates only the TGZ.
-
-Linux and macOS shared-library install names remain platform-native: Linux
-uses `$ORIGIN` paths, macOS uses `@loader_path`, and neither package attempts to
-bundle operating-system libraries. Linux system dependencies are declared by
-the Debian package; TGZ users must provide the host libraries required by their
-distribution. The macOS app archive is unsigned and not notarized, so Gatekeeper
-may require the user to approve it before first launch.
+Linux shared libraries use `$ORIGIN` paths, and packages do not bundle
+operating-system libraries. Linux system dependencies are declared by the
+Debian package; TGZ users must provide the host libraries required by their
+distribution. Linux is the only supported Unix host.

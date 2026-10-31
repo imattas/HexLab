@@ -1,6 +1,5 @@
 # macOS native debugger backend
 
-The canonical documentation for the Darwin debugger is
-[debugger-darwin.md](debugger-darwin.md). It describes current process control,
-memory access, x86-64 and Apple-Silicon register state, breakpoint behavior,
-thread limitations, and the validation gaps on non-Darwin hosts.
+HexLab no longer supports building or running as a macOS host. This page is
+retained as a historical pointer to the unshipped Darwin backend design; it does
+not describe a supported HexLab feature. See [supported debugger platforms](debugger-platforms.md).

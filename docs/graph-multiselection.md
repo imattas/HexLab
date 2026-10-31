@@ -3,7 +3,7 @@
 CFG and call graph nodes support a bounded, graph-local multi-selection.
 
 - Click a node to make it the sole graph selection.
-- Ctrl-click (Cmd-click on macOS) toggles a node in the selection.
+- Ctrl-click toggles a node in the selection.
 - Shift-click selects the inclusive range from the last selection anchor in graph navigation order. Ctrl+Shift-click adds that range to the current selection.
 - Selection is capped at 256 nodes. The status line reports the selected count when more than one node is selected.
 

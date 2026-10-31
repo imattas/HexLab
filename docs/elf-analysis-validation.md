@@ -38,7 +38,7 @@ orders; the existing R|X-only fixtures would not expose an accidental R/X swap.
 Unknown symbol counts, CPU/endian contexts, relocations and runtime-dependent
 relationships remain explicit rather than inferred from arbitrary scans or host
 libraries. Full DWARF/types, runtime dynamic linking, core dumps, more machine
-psABIs and Linux/macOS delivery remain future work.
+psABIs and Linux delivery remain future work.
 
 Dynamic string metadata retains bounded `DT_NEEDED`, `DT_SONAME`, `DT_RPATH`,
 `DT_RUNPATH`, `DT_CONFIG`, `DT_DEPAUDIT`, `DT_AUDIT`, `DT_AUXILIARY`, and

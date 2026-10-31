@@ -17,8 +17,7 @@ selection.
 | Windows | Win32 backend | x86/x64 process control and four-slot execution/data hardware breakpoints; exception events expose chance metadata and up to 15 raw `EXCEPTION_RECORD.ExceptionInformation` values; `OutputDebugStringA/W` events read bounded target memory and display their text; x64 stopped-thread register inspection includes AVX-512 ZMM/opmask state when CPU, OS, and XState components support it; native ARM32 builds expose stopped-thread GPR/NEON context edits, ARM/Thumb software breakpoints, bounded sequential-instruction steps and up to eight hardware execute breakpoints; native ARM64 builds support stopped-thread GPR/FPSIMD context access and safe edits, software BRK breakpoints with PSTATE single-step, and up to two execution plus two data hardware breakpoints |
 | Linux x86-64 | x86-64 ptrace backend | x86-64 and compat i386 targets, including register, memory, event, breakpoint, raw pending-event siginfo, and thread-qualified PTRACE_INTERRUPT for one known-running seized thread while peers keep running, as described in [Linux ptrace debugging](linux-ptrace-debugging.md); hardware execute and data breakpoints for both target widths |
 | Linux AArch64 | AArch64 ptrace backend | AArch64 GPR/FPSIMD and conditional SVE state, optional read-only TTBR0 PAC masks, MTE allocation-tag reads when supported by the kernel and mapping, raw pending-event siginfo, thread-qualified PTRACE_INTERRUPT for one known-running seized thread while peers keep running, process lifecycle, memory, software breakpoints, hardware execute/watchpoints, and per-thread run-state |
-| macOS x86-64 / Apple Silicon | Darwin Mach/ptrace backend | Bounded named-thread and process-stop-state snapshots, task-suspended per-thread register inspection/editing, memory and module/region inspection; AArch64 exposes X/W registers, SP/WSP, FP/LR, and NEON state; single-thread execution, stepping, and software breakpoints; x86-64 write/access watchpoint hits map through DR6, and AArch64 precise watchpoint exceptions map through ESR comparator indices to owned breakpoint IDs; read-only data watchpoints and multi-thread stop attribution/stepping remain unsupported; x86-64 supports one-byte hardware execute breakpoints in the same four DR0-DR3 slots, while AArch64 execute comparators remain unsupported |
-| Other OS/architecture combinations | Explicit unsupported backend | Native calls return `unsupported`; the library and RSP backend remain usable |
+| Other target architectures on Windows/Linux | Explicit unsupported native backend | Native calls return `unsupported`; the library and RSP backend remain usable |
 
 Native Windows launch converts the executable, arguments and working directory
 from strict UTF-8. Invalid UTF-8 and embedded NUL characters are rejected before
@@ -26,18 +25,12 @@ calling `CreateProcessW`; the quoted command line is bounded to 32,766 UTF-16
 characters so its terminator fits the Win32 32,767-character limit. This avoids
 silently replacing malformed input or passing a truncated command line.
 
-Darwin selects its Mach/ptrace backend only on macOS. Linux backend selection is
+HexLab host support is limited to Windows and Linux. Linux backend selection is
 explicit. Known x86-64 and AArch64 CMake processor names select their matching
 ptrace implementation. Other Linux processor names select the unsupported
 backend instead of compiling x86-64-only ptrace code and failing later with an
 architecture preprocessor error. This is a build-selection safeguard, not
 native support for those architectures.
-
-On Darwin AArch64, a SIGTRAP is attributed to an owned data watchpoint only
-when the saved ESR identifies a watchpoint exception, marks the comparator
-index valid and precise, and that index names an enabled debugger-owned slot.
-Other traps, invalid or possibly false-positive ESR records, and unowned
-comparator hits remain generic breakpoint events.
 
 The Linux x86-64 ptrace backend uses the x86 debug-register slots for both
 64-bit and compat i386 processes. i386 requests are range-checked to 32-bit
@@ -208,12 +201,13 @@ process stopped and is retried before the event can be acknowledged; conflicting
 external slot edits fail closed. Watchpoints remain enabled during this
 instruction step and can therefore produce their own stop.
 
-This matrix describes the implemented feature boundary. Darwin and Linux
-platform-specific runtime behavior still needs validation on their native
-hosts. Windows ARM32 source has been syntax-checked for `armv7-w64-windows-gnu`
+This matrix describes the implemented feature boundary. Linux
+platform-specific runtime behavior still needs validation on a native host.
+Windows ARM32 source has been syntax-checked for `armv7-w64-windows-gnu`
 against available Windows headers; native runtime behavior remains unverified.
 Windows ARM64 source has been syntax-checked with clang-cl targeting
 `aarch64-pc-windows-msvc` against the installed Windows SDK, but runtime
-behavior still needs validation on a native ARM64 host. See
-[Darwin debugger scope](debugger-darwin.md) for the conservative macOS backend
-limits.
+behavior still needs validation on a native ARM64 host.
+
+The application does not build or run as a macOS host. Apple-target binary
+formats remain available for analysis on Windows and Linux.

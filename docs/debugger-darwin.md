@@ -1,5 +1,9 @@
 # Darwin native debugger backend
 
+> Historical implementation notes only. HexLab host support is Windows and
+> Linux; the Darwin backend is not built or shipped, and this page is not a
+> promise of macOS support.
+
 On macOS, `make_native_backend()` selects a Mach/ptrace implementation for
 x86-64 and AArch64 hosts. It enumerates processes with `sysctl`, reads target
 architecture from the executable's Mach-O header, launches with

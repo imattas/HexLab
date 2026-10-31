@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- HexLab host support is limited to Windows and Linux. Mach-O files and
+  Apple-target binaries remain supported analysis inputs on those hosts.
+
 ## 0.1.1 — 2026-10-31
 
 ### Improved
@@ -39,7 +44,7 @@ engines, wxWidgets desktop application, command-line tools, and debugger server.
 - A conservative typed decompiler, persisted project annotations and history,
   a native plugin SDK, Python automation, native x86-64 debugging, and a GDB
   Remote Serial Protocol client.
-- Relocatable Windows, Linux, and macOS packages with third-party notices and
+- Relocatable Windows and Linux packages with third-party notices and
   SHA-256 sidecars.
 
 ### Known limits
@@ -52,6 +57,6 @@ unsupported semantics explicit or incomplete.
 
 The Windows ZIP includes HexLab and non-system runtime DLLs but requires the
 matching Microsoft Visual C++ 2022 Redistributable. Python automation uses a
-host Python runtime. Linux and macOS packages are built and smoke-checked by
-their native CI runners, but CI does not launch the GUI. The packages are
+host Python runtime. Linux packages are built and smoke-checked by their native
+CI runner, but CI does not launch the GUI. The packages are
 multi-file installations; they are not standalone executables.

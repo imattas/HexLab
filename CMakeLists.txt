@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.24)
 project(HexLab VERSION 0.1.1 LANGUAGES C CXX)
+if(NOT WIN32 AND NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  message(FATAL_ERROR "HexLab supports Windows and Linux hosts only (detected '${CMAKE_SYSTEM_NAME}').")
+endif()
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_BINARY_DIR)
   message(FATAL_ERROR "Use an out-of-source build directory.")
 endif()
@@ -25,26 +28,7 @@ add_library(hexlab_options INTERFACE)
 target_compile_features(hexlab_options INTERFACE cxx_std_20)
 target_compile_options(hexlab_options INTERFACE
   $<$<COMPILE_LANG_AND_ID:CXX,MSVC>:/W4;/permissive-;/utf-8>
-  $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic>)
-if(APPLE AND CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
-  include(CheckCXXSourceCompiles)
-  set(_hexlab_saved_required_flags "${CMAKE_REQUIRED_FLAGS}")
-  set(CMAKE_REQUIRED_FLAGS "${CMAKE_REQUIRED_FLAGS} -std=c++20")
-  check_cxx_source_compiles("#include <stop_token>\nint main() { std::stop_token token; return token.stop_requested() ? 0 : 0; }"
-    HEXLAB_APPLE_LIBCXX_HAS_STANDARD_STOP_TOKEN)
-  if(NOT HEXLAB_APPLE_LIBCXX_HAS_STANDARD_STOP_TOKEN)
-    set(CMAKE_REQUIRED_FLAGS "${CMAKE_REQUIRED_FLAGS} -fexperimental-library")
-    check_cxx_source_compiles("#include <stop_token>\nint main() { std::stop_token token; return token.stop_requested() ? 0 : 0; }"
-      HEXLAB_APPLE_LIBCXX_HAS_EXPERIMENTAL_STOP_TOKEN)
-    if(HEXLAB_APPLE_LIBCXX_HAS_EXPERIMENTAL_STOP_TOKEN)
-      target_compile_options(hexlab_options INTERFACE -fexperimental-library)
-    else()
-      message(FATAL_ERROR "Apple libc++ must provide C++20 std::stop_token (standard or -fexperimental-library)")
-    endif()
-  endif()
-  set(CMAKE_REQUIRED_FLAGS "${_hexlab_saved_required_flags}")
-  unset(_hexlab_saved_required_flags)
-endif()
+  $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>:-Wall;-Wextra;-Wpedantic>)
 include(cmake/SQLite.cmake)
 set(ZYDIS_BUILD_SHARED_LIB OFF CACHE BOOL "" FORCE)
 set(ZYDIS_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
@@ -60,7 +44,7 @@ set(ZYDIS_FEATURE_KNC ON CACHE BOOL "" FORCE)
 add_subdirectory(third_party/zydis EXCLUDE_FROM_ALL)
 # These vendored libraries are static but are linked into HexLab's shared
 # engine libraries on ELF platforms, so their object files must be PIC.
-if(UNIX AND NOT APPLE)
+if(UNIX)
   set_property(TARGET Zydis Zycore PROPERTY POSITION_INDEPENDENT_CODE ON)
 endif()
 add_subdirectory(third_party/miniz EXCLUDE_FROM_ALL)
@@ -89,7 +73,7 @@ foreach(_arch ARM ARM64 MIPS PPC X86 MOS65XX RISCV)
   set(CAPSTONE_${_arch}_SUPPORT ON CACHE BOOL "" FORCE)
 endforeach()
 add_subdirectory(third_party/capstone EXCLUDE_FROM_ALL)
-if(UNIX AND NOT APPLE)
+if(UNIX)
   set_property(TARGET capstone capstone_static PROPERTY POSITION_INDEPENDENT_CODE ON)
 endif()
 if(_hexlab_had_build_shared_libs)
@@ -127,7 +111,7 @@ install(FILES README.md CHANGELOG.md docs/building.md docs/project-cli.md docs/p
   docs/binary-comparison.md docs/binary-comparison-block-instructions.md docs/binary-comparison-relocation-masks.md
   docs/elf-analysis-validation.md docs/elf-runtime-relocations.md docs/elf-debug-frame.md libs/loaders/docs/elf-riscv-runtime-relocations.md docs/elf-core-dumps.md docs/elf-symbol-versions.md docs/elf-rtti.md docs/elf-debug-link-metadata.md docs/macho-analysis-validation.md docs/macho-static-linking.md docs/macho-dyld-environment.md docs/ar-archive-validation.md docs/coff-static-linking.md docs/coff-arm64-static-linking.md
   docs/pdb-validation.md docs/pdb-types-validation.md docs/pdb-ipi-function-identifiers.md docs/pdb-ipi-project-workflow.md docs/switch-analysis-validation.md docs/relocation-backed-switches.md docs/archive-workflow-validation.md apps/cli/plugin-dependency-preflight.md apps/cli/flirt-catalog-sets.md apps/cli/signature-catalog-create.md apps/cli/macho-module-symbol-resolution.md
-  docs/debugger-stepping.md docs/debugger-hardware-breakpoints.md docs/debugger-watchpoints.md docs/debugger-breakpoint-workflow.md docs/debugger-platforms.md libs/debugger/docs/windows-x64-simd-registers.md libs/debugger/docs/darwin-backend.md libs/debugger/docs/linux-aarch64-backend.md libs/debugger/docs/linux-x86-lifecycle.md libs/debugger/docs/elf-aarch64-stack-frames.md libs/debugger/docs/elf-arm-riscv-stack-frames.md libs/debugger/docs/remote-memory-map.md docs/debugger-macos.md docs/debugger-darwin.md docs/debugger-linux-aarch64.md docs/linux-debugger-termination.md docs/debugger-rsp.md docs/rsp-process-selection.md docs/debugger-pdb-inline-locals.md docs/plugin-sdk.md docs/plugin-dependency-management.md docs/plugin-dependency-activation.md docs/collaboration-ui.md docs/plugin-candidate-preflight.md
+  docs/debugger-stepping.md docs/debugger-hardware-breakpoints.md docs/debugger-watchpoints.md docs/debugger-breakpoint-workflow.md docs/debugger-platforms.md libs/debugger/docs/windows-x64-simd-registers.md libs/debugger/docs/linux-aarch64-backend.md libs/debugger/docs/linux-x86-lifecycle.md libs/debugger/docs/elf-aarch64-stack-frames.md libs/debugger/docs/elf-arm-riscv-stack-frames.md libs/debugger/docs/remote-memory-map.md docs/debugger-linux-aarch64.md docs/linux-debugger-termination.md docs/debugger-rsp.md docs/rsp-process-selection.md docs/debugger-pdb-inline-locals.md docs/plugin-sdk.md docs/plugin-dependency-management.md docs/plugin-dependency-activation.md docs/collaboration-ui.md docs/plugin-candidate-preflight.md
   docs/managed-loader-validation.md docs/managed-cil-exception-regions.md docs/managed-cil-user-strings.md docs/managed-cil-call-semantics.md docs/managed-cil-field-references.md docs/managed-cil-function-pointers.md docs/decompiler-type-recovery.md docs/decompiler-stack-type-provenance.md docs/decompiler-cross-abi-calls.md docs/decompiler-cross-abi-stack-arguments.md docs/decompiler-memory-ssa.md docs/decompiler-structuring.md docs/decompiler-control-flow-unflattening.md libs/decompiler/docs/wasm-parameter-reads.md libs/decompiler/docs/jvm-stack-transport.md libs/loaders/docs/macho-build-versions.md apps/desktop/disassembly-page-export.md apps/desktop/source-line-breakpoints.md docs/pseudocode-source-navigation.md
   docs/header-import.md docs/header-non-type-alias-templates.md docs/header-alignment-import.md docs/header-pack-semantics.md docs/header-cpp-declarations.md docs/header-cpp-member-import.md docs/cpp-template-import.md docs/header-non-type-specializations.md docs/header-anonymous-namespaces.md docs/type-authoring.md docs/type-layout.md docs/bitfield-layout.md docs/python-automation.md docs/python-automation-batches.md docs/project-history-audit.md docs/project-history-audit-cli.md docs/desktop-project-history-2026-10-24.md docs/python-history-automation-2026-10-24.md libs/analysis/docs/search-ascii-case-folding.md libs/analysis/docs/riscv-jump-tables.md libs/analysis/docs/windows-1250-string-detection.md
   docs/cil-decoder-validation.md docs/jvm-stack-manipulation.md
@@ -157,7 +141,7 @@ if(NOT CPACK_GENERATOR)
     set(CPACK_GENERATOR ZIP)
   elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND HEXLAB_BUILD_DESKTOP)
     # Linux desktop releases are both a system-installable Debian package and
-    # a relocatable archive for manual installs. Headless and macOS builds keep
+    # a relocatable archive for manual installs. Headless Linux builds keep
     # the portable TGZ format.
     set(CPACK_GENERATOR "TGZ;DEB")
   else()
@@ -211,29 +195,23 @@ if(HEXLAB_BUILD_NSIS_INSTALLER)
   set(CPACK_NSIS_MENU_LINKS
     "share/hexlab/docs/building.md" "Build and usage guide")
 endif()
-if(APPLE AND "arm64" IN_LIST CMAKE_OSX_ARCHITECTURES AND "x86_64" IN_LIST CMAKE_OSX_ARCHITECTURES)
-  # CMAKE_SYSTEM_PROCESSOR describes the configure host for a universal build;
-  # package metadata must describe both slices instead of whichever host ran CMake.
-  set(_hexlab_package_arch universal2)
+set(_hexlab_target_arch "${CMAKE_GENERATOR_PLATFORM}")
+if(NOT _hexlab_target_arch)
+  set(_hexlab_target_arch "${CMAKE_SYSTEM_PROCESSOR}")
+endif()
+string(TOLOWER "${_hexlab_target_arch}" _hexlab_target_arch)
+if(_hexlab_target_arch MATCHES "^(aarch64|arm64)$")
+  set(_hexlab_package_arch arm64)
+elseif(_hexlab_target_arch MATCHES "^(x86_64|amd64|x64)$")
+  set(_hexlab_package_arch x64)
+elseif(_hexlab_target_arch MATCHES "^(i[3-6]86|win32|x86)$")
+  set(_hexlab_package_arch x86)
+elseif(_hexlab_target_arch)
+  string(REGEX REPLACE "[^a-z0-9]+" "_" _hexlab_package_arch "${_hexlab_target_arch}")
+elseif(CMAKE_SIZEOF_VOID_P EQUAL 8)
+  set(_hexlab_package_arch unknown64)
 else()
-  set(_hexlab_target_arch "${CMAKE_GENERATOR_PLATFORM}")
-  if(NOT _hexlab_target_arch)
-    set(_hexlab_target_arch "${CMAKE_SYSTEM_PROCESSOR}")
-  endif()
-  string(TOLOWER "${_hexlab_target_arch}" _hexlab_target_arch)
-  if(_hexlab_target_arch MATCHES "^(aarch64|arm64)$")
-    set(_hexlab_package_arch arm64)
-  elseif(_hexlab_target_arch MATCHES "^(x86_64|amd64|x64)$")
-    set(_hexlab_package_arch x64)
-  elseif(_hexlab_target_arch MATCHES "^(i[3-6]86|win32|x86)$")
-    set(_hexlab_package_arch x86)
-  elseif(_hexlab_target_arch)
-    string(REGEX REPLACE "[^a-z0-9]+" "_" _hexlab_package_arch "${_hexlab_target_arch}")
-  elseif(CMAKE_SIZEOF_VOID_P EQUAL 8)
-    set(_hexlab_package_arch unknown64)
-  else()
-    set(_hexlab_package_arch unknown32)
-  endif()
+  set(_hexlab_package_arch unknown32)
 endif()
 set(_hexlab_package_file_name "HexLab-${PROJECT_VERSION}-${CMAKE_SYSTEM_NAME}-${_hexlab_package_arch}")
 set(CPACK_PACKAGE_FILE_NAME "${_hexlab_package_file_name}")
@@ -351,37 +329,17 @@ if(WIN32)
     VERBATIM)
 endif()
 
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux" OR APPLE)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   set(_hexlab_platform_distribution_dependencies hexlab_cli hexlab_debug_server)
   if(HEXLAB_BUILD_DESKTOP)
     list(APPEND _hexlab_platform_distribution_dependencies hexlab)
   endif()
-  if(APPLE AND HEXLAB_BUILD_DESKTOP)
-    find_package(Python3 3.10 REQUIRED COMPONENTS Interpreter)
-    add_custom_target(hexlab_macos_distribution
-      COMMAND "${CMAKE_CPACK_COMMAND}" --config "${PROJECT_BINARY_DIR}/CPackConfig.cmake" -G TGZ
-      COMMAND "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/packaging/macos/create_app_bundle.py"
-        --archive "${PROJECT_BINARY_DIR}/packages/${CPACK_PACKAGE_FILE_NAME}.tar.gz"
-        --output "${PROJECT_BINARY_DIR}/packages/HexLab.app.zip"
-      DEPENDS ${_hexlab_platform_distribution_dependencies}
-      WORKING_DIRECTORY "${PROJECT_BINARY_DIR}"
-      COMMENT "Assembling the relocatable macOS archive and Finder app bundle"
-      VERBATIM)
-  elseif(APPLE)
-    add_custom_target(hexlab_macos_distribution
-      COMMAND "${CMAKE_CPACK_COMMAND}" --config "${PROJECT_BINARY_DIR}/CPackConfig.cmake" -G TGZ
-      DEPENDS ${_hexlab_platform_distribution_dependencies}
-      WORKING_DIRECTORY "${PROJECT_BINARY_DIR}"
-      COMMENT "Assembling the relocatable macOS headless archive"
-      VERBATIM)
-  else()
-    add_custom_target(hexlab_linux_distribution
-      COMMAND "${CMAKE_CPACK_COMMAND}" --config "${PROJECT_BINARY_DIR}/CPackConfig.cmake"
-      DEPENDS ${_hexlab_platform_distribution_dependencies}
-      WORKING_DIRECTORY "${PROJECT_BINARY_DIR}"
-      COMMENT "Assembling the configured Linux distribution packages"
-      VERBATIM)
-  endif()
+  add_custom_target(hexlab_linux_distribution
+    COMMAND "${CMAKE_CPACK_COMMAND}" --config "${PROJECT_BINARY_DIR}/CPackConfig.cmake"
+    DEPENDS ${_hexlab_platform_distribution_dependencies}
+    WORKING_DIRECTORY "${PROJECT_BINARY_DIR}"
+    COMMENT "Assembling the configured Linux distribution packages"
+    VERBATIM)
 endif()
 
 if(BUILD_TESTING AND WIN32 AND HEXLAB_BUILD_DESKTOP)

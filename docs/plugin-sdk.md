@@ -457,7 +457,7 @@ needs to inspect a separate built-in image through the project service.
 
 ## Enumerating plugin candidates
 
-`PluginManager::scan_directory(path, max_entries)` provides a bounded, side-effect-free way for a host to populate a plugin picker. It inspects only direct children, ignores symlinks and nested directories (except a macOS `.bundle` directory), accepts the native module filename forms for the current platform, converts candidate paths to absolute UTF-8, and returns them in bytewise-sorted order. The default entry limit is 4,096; callers may choose a limit up to 16,384. Scans fail with a resource-limit error instead of returning an order-dependent partial list.
+`PluginManager::scan_directory(path, max_entries)` provides a bounded, side-effect-free way for a host to populate a plugin picker. It inspects only direct children, ignores symlinks and nested directories, accepts the native module filename forms for the current platform, converts candidate paths to absolute UTF-8, and returns them in bytewise-sorted order. The default entry limit is 4,096; callers may choose a limit up to 16,384. Scans fail with a resource-limit error instead of returning an order-dependent partial list.
 
 Each candidate may have an adjacent `<module filename>.hexlab-plugin` sidecar.
 The version-1 data-only format lets a picker display declared identity and
@@ -823,9 +823,8 @@ Older host prefixes are unchanged. The service stores opaque byte values under
 the calling plugin's loaded plugin ID and retains them across unload/reload.
 Desktop and plugin-enabled CLI managers persist them across process restarts in
 the current user's state directory (`%LOCALAPPDATA%\HexLab` on Windows,
-`$XDG_STATE_HOME/hexlab` on non-Windows systems when set, otherwise
-`$HOME/.local/state/hexlab` on Linux or
-`$HOME/Library/Application Support/HexLab` on macOS). The file is host-owned and is
+`$XDG_STATE_HOME/hexlab` on Linux when set, otherwise
+`$HOME/.local/state/hexlab`). The file is host-owned and is
 separate from project files. Managers constructed with the legacy one-argument
 constructor, including embedded/test managers, remain in-memory only; hosts can
 opt in by passing a state file path to the two-argument constructor.

@@ -25,6 +25,6 @@ Actual installed-app captures verified the main window, Functions/Symbols/Output
 
 An independent read-only code review found no critical or important defects in the foundation. Its coverage comment led to the extra floating-pane regression check; dependency naming and capability evidence were corrected during final validation.
 
-This is a developer distribution, with the Visual C++ Debug runtime available on this machine. Fresh-machine installers, Release desktop packaging and Linux/macOS delivery remain unverified. Binary loaders, instruction decoders, persistent projects, types, the decompiler, debugger and extension SDK remain required future stages.
+This is a developer distribution, with the Visual C++ Debug runtime available on this machine. Fresh-machine installers and Release desktop packaging remain unverified; Linux delivery is documented separately. Binary loaders, instruction decoders, persistent projects, types, the decompiler, debugger and extension SDK remain required future stages.
 
 Git commits could not be created because author identity is unset. Source files are preserved on the new `feat/foundation` branch without an invented identity.

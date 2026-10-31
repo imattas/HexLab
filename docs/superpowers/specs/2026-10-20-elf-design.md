@@ -50,6 +50,6 @@ Use RED/GREEN for each implementation contract; rebuild all consumers on public 
 
 ## Scope continuity and references
 
-Full DWARF/type import, runtime dynamic linking, core-dump debugging, all machine psABI variants and Linux/macOS shipping remain subsequent full-goal requirements; metadata containers and unknown states must allow those extensions. This stage must deliver actual ELF frontend/project workflows, not just a magic check or header parser.
+Full DWARF/type import, runtime dynamic linking, core-dump debugging, all machine psABI variants and Linux shipping remain subsequent full-goal requirements; macOS host shipping was removed from scope on 2026-10-31. Metadata containers and unknown states must allow those extensions. This stage must deliver actual ELF frontend/project workflows, not just a magic check or header parser.
 
 Primary references inspected2026-10-20: [gABI ELF header](https://gabi.xinuos.com/elf/02-eheader.html), [sections](https://gabi.xinuos.com/elf/03-sheader.html), [symbols](https://gabi.xinuos.com/elf/05-symtab.html), [relocations](https://gabi.xinuos.com/elf/06-reloc.html), [program loading](https://gabi.xinuos.com/elf/07-pheader.html), [dynamic linking](https://gabi.xinuos.com/elf/08-dynamic.html). Processor-specific relocation semantics require primary psABI references before implementation.
