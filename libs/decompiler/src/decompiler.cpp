@@ -2429,6 +2429,68 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
                 integer_type(width), BinaryValue{std::move(operation), std::move(left), std::move(right)}});
         };
         const auto zero = constant_expr(0, 8);
+        const bool load = instruction.opcode == Opcode::m6502_lda || instruction.opcode == Opcode::m6502_ldx ||
+                          instruction.opcode == Opcode::m6502_ldy;
+        const bool store = instruction.opcode == Opcode::m6502_sta || instruction.opcode == Opcode::m6502_stx ||
+                           instruction.opcode == Opcode::m6502_sty;
+        if ((load || store) && instruction.operands.size() == 1 && operands.size() == 1 && operands.front() &&
+            operands.front()->type == integer_type(8) && instruction.flow == FlowKind::fallthrough) {
+            const auto destination_index = instruction.opcode == Opcode::m6502_ldx ||
+                                           instruction.opcode == Opcode::m6502_stx ? 1u :
+                                           instruction.opcode == Opcode::m6502_ldy ||
+                                           instruction.opcode == Opcode::m6502_sty ? 2u : 0u;
+            const RegisterOperand value_register{RegisterBank::mos6502,
+                static_cast<std::uint8_t>(destination_index), 8, false};
+            const auto valid_memory_index = [&](const MemoryOperand *memory) {
+                if (!memory || !memory->index) return true;
+                if (memory->index->bank != RegisterBank::mos6502 || memory->index->width != 8) return false;
+                if (instruction.opcode == Opcode::m6502_ldx || instruction.opcode == Opcode::m6502_stx)
+                    return memory->index->index == 2;
+                if (instruction.opcode == Opcode::m6502_ldy || instruction.opcode == Opcode::m6502_sty)
+                    return memory->index->index == 1;
+                return memory->index->index == 1 || memory->index->index == 2;
+            };
+            if (load) {
+                const auto *immediate = std::get_if<ImmediateOperand>(&instruction.operands.front());
+                const auto *memory = std::get_if<MemoryOperand>(&instruction.operands.front());
+                const bool immediate_form = immediate && immediate->encoded_width == 8 &&
+                    immediate->effective_width == 8 && !immediate->is_signed && immediate->value <= 0xff &&
+                    !instruction.memory_read;
+                const bool memory_form = memory && memory->data_width == 8 && memory->address_width == 16 &&
+                    instruction.memory_read && !memory->ip_relative && !memory->base &&
+                    valid_memory_index(memory) && std::holds_alternative<MemoryValue>(operands.front()->value);
+                std::vector<RegisterOperand> expected_reads;
+                if (memory && memory->index) expected_reads.push_back(*memory->index);
+                expected_reads.push_back(status);
+                if ((immediate_form || memory_form) && !instruction.memory_write &&
+                    instruction.access == std::vector<OperandAccess>{OperandAccess::read} &&
+                    instruction.register_reads == expected_reads &&
+                    instruction.register_writes == std::vector<RegisterOperand>{value_register, status}) {
+                    auto zero_flag = std::make_shared<Expression>(Expression{integer_type(8), UnaryValue{"zext",
+                        boolean_binary("eq", operands.front(), zero)}});
+                    auto new_status = binary("or", binary("or", binary("and", reg_expr(status),
+                        constant_expr(0x7d, 8)), binary("shl", std::move(zero_flag), constant_expr(1, 8))),
+                        binary("and", operands.front(), constant_expr(0x80, 8)));
+                    Intrinsic effect{"m65c02_load", {operands.front(), reg_expr(status)},
+                        memory_form ? IntrinsicMemoryEffect::read : IntrinsicMemoryEffect::none};
+                    effect.register_writes = {value_register, status};
+                    effect.register_output_values = {operands.front(), std::move(new_status)};
+                    return effect;
+                }
+            } else {
+                const auto *memory = std::get_if<MemoryOperand>(&instruction.operands.front());
+                std::vector<RegisterOperand> expected_reads;
+                if (memory && memory->index) expected_reads.push_back(*memory->index);
+                expected_reads.push_back(value_register);
+                if (memory && memory->data_width == 8 && memory->address_width == 16 &&
+                    !memory->ip_relative && !memory->base && instruction.access ==
+                        std::vector<OperandAccess>{OperandAccess::write} && !instruction.memory_read &&
+                    instruction.memory_write && instruction.register_reads == expected_reads &&
+                    instruction.register_writes.empty() && valid_memory_index(memory) &&
+                    std::holds_alternative<MemoryValue>(operands.front()->value))
+                    return Store{operands.front(), reg_expr(value_register)};
+            }
+        }
         const bool push_index = instruction.opcode == Opcode::m65c02_phx ||
                                 instruction.opcode == Opcode::m65c02_phy;
         const bool pull_index = instruction.opcode == Opcode::m65c02_plx ||
