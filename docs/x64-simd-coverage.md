@@ -11,6 +11,17 @@ registers 8-15 are rejected, and BMI1/BMI2 forms with 64-bit operands remain
 opcodes, including VZEROUPPER, remain outside the typed subset, and x86-16
 VEX recognition is not enabled.
 
+That x86-16 boundary is intentional: `ExecutionMode::x86_16` does not identify
+whether bytes belong to real-address, virtual-8086, or protected code, while
+the raw-profile model supports both real386 and protected386 environments.
+Intel documents VEX for protected/compatibility execution, with VEX causing
+#UD in real and virtual-8086 modes, and defines legacy LES/LDS prefix
+disambiguation constraints. Treating C4/C5 as VEX for every x86-16 context
+could therefore change valid legacy decoding or accept an encoding in an
+environment where AVX is unavailable. A separate protected 16-bit context
+with AVX availability is needed before enabling VEX there (Intel SDM Vol. 2A,
+section 2.3.5; [official manual](https://cdrdv2-public.intel.com/874240/325462-090-sdm-vol-1-2abcd-3abcd-4.pdf)).
+
 The bounded packed-integer and floating-compare evaluators accept these x86-32
 instructions and validate that vector operands name registers 0-7. Matching
 typed decompiler paths now retain x86-32 VEX integer dataflow, lane operations,
