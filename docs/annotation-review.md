@@ -86,3 +86,15 @@ can assign one existing type to selected address rows; defining types and
 inspecting assigned layouts remain in Types & Symbols and the typed-data view.
 CLI project commands and Python `apply_annotations()`/
 `apply_batch()` remain available for scripted rename/comment batches.
+
+For bulk analyst handoff, **File > Import Project Metadata...** accepts a
+bounded `.hxex` exchange bundle. Annotation names, comments, bookmarks, type
+assignments, and the other supported metadata records are validated against
+the opened image before submission. The chooser requires an explicit conflict
+policy (fail, skip, or replace), and the summary must be confirmed. Import is
+one undoable project batch; it is capped at 16 MiB by the desktop reader and at
+4096 commands by the workspace batch API. The dialog captures the project
+snapshot, session, AnalysisKey, and edit revision before review and rejects
+the submission if the active document or snapshot changes. The actor and
+database revision checks also reject an intervening edit, so the reviewed
+conflict decision cannot be applied to a different project state.

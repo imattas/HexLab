@@ -1155,13 +1155,23 @@ void ProjectActions::command(wxCommandEvent &event) {
     if(event.GetId()==exchange_import_id){
         auto actor=controller_.documents().actor(*id);if(!actor || !project)return;
         if(actor->view().pending_operations){controller_.documents().report_error(*id,{ErrorCode::busy,"Wait for pending project operations before importing metadata"});return;}
+        const auto expected_edit = project->state ? project->state->revisions.edit : 0;
+        const auto source_key = project_analysis_key(*project, project->analysis_options);
+        const auto captured_session = actor->view().session;
+        if (!source_key) { controller_.documents().report_error(*id, source_key.error()); return; }
         wxFileDialog dialog(&frame_,"Import project metadata",{}, {},"HexLab exchange files (*.hxex)|*.hxex|All files (*.*)|*.*",wxFD_OPEN|wxFD_FILE_MUST_EXIST);if(dialog.ShowModal()!=wxID_OK)return;
         auto bytes=read_exchange(std::filesystem::path(dialog.GetPath().ToStdWstring()));if(!bytes){controller_.documents().report_error(*id,bytes.error());return;}
         wxArrayString policies;policies.Add("Fail on conflicts (default)");policies.Add("Skip conflicting incoming records");policies.Add("Replace conflicting destination records");wxSingleChoiceDialog choose(&frame_,"Choose how conflicting metadata should be handled.","Import conflict policy",policies);choose.SetSelection(0);if(choose.ShowModal()!=wxID_OK)return;
         auto policy=choose.GetSelection()==1?ExchangeConflictPolicy::skip:choose.GetSelection()==2?ExchangeConflictPolicy::replace:ExchangeConflictPolicy::fail;
         auto planned=import_project_exchange(*project,bytes.value(),policy,max_exchange_bytes);if(!planned){controller_.documents().report_error(*id,planned.error());return;}if(planned.value().commands.empty()){wxMessageBox(import_summary(planned.value()),"Project metadata import",wxOK|wxICON_INFORMATION,&frame_);return;}
         auto summary=import_summary(planned.value());if(wxMessageBox(summary+"\nApply all imported metadata as one project change?","Review project metadata import",wxYES_NO|wxICON_QUESTION,&frame_)!=wxYES)return;
-        auto submitted=actor->execute_batch(std::move(planned.value().commands));if(!submitted){controller_.documents().report_error(*id,submitted.error());return;}auto watched=controller_.documents().watch(*id,std::move(submitted.value()));if(!watched)controller_.documents().report_error(*id,watched.error());return;
+        const auto current_actor = controller_.documents().actor(*id);
+        const auto current = controller_.documents().project(*id);
+        if (controller_.documents().active_document() != std::optional{*id} || current_actor != actor ||
+            !current || current != project || actor->view().session != captured_session || actor->view().snapshot != project) {
+            controller_.documents().report_error(*id,{ErrorCode::conflict,"Project or document changed while reviewing the import; reopen the import against the current project."});return;
+        }
+        auto submitted=actor->execute_batch_at_revision(std::move(planned.value().commands),expected_edit,source_key.value(),project);if(!submitted){controller_.documents().report_error(*id,submitted.error());return;}auto watched=controller_.documents().watch(*id,std::move(submitted.value()));if(!watched)controller_.documents().report_error(*id,watched.error());return;
     }
     auto selection = selection_ ? selection_() : controller_.state().selection();
     auto accepted = [&](auto result) {
