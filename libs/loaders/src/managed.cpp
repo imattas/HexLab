@@ -18,6 +18,8 @@ std::uint16_t u16(std::span<const std::byte> b,std::size_t p){return std::uint16
 std::uint32_t u32(std::span<const std::byte> b,std::size_t p){return std::uint32_t(u16(b,p))|(std::uint32_t(u16(b,p+2))<<16);}
 std::uint64_t u64(std::span<const std::byte> b,std::size_t p){return std::uint64_t(u32(b,p))|(std::uint64_t(u32(b,p+4))<<32);}
 Error malformed(const char* s){return {ErrorCode::malformed,s};}
+Result<bool> managed_assembly_identity_matches(const ManagedAssemblyIdentity&,const ManagedAssemblyIdentity&,
+                                               std::size_t& key_work_bytes);
 bool fits(std::size_t p,std::uint64_t n,std::size_t total){return p<=total && n<=total-p;}
 const std::vector<int>& schema(std::uint8_t id){
   using V=std::vector<int>;static const std::array<V,45> s={
@@ -911,20 +913,9 @@ bool managed_type_is_assignable(const ManagedTypeCatalog& catalog,std::uint32_t 
 }
 
 namespace {
-bool assembly_scope_matches(const ManagedAssemblyIdentity& requested,const ManagedAssemblyIdentity& candidate){
-  const auto equal_folded=[](std::string_view a,std::string_view b){
-    if(a.size()!=b.size())return false;
-    for(std::size_t i=0;i<a.size();++i){auto x=static_cast<unsigned char>(a[i]),y=static_cast<unsigned char>(b[i]);
-      if(x>='A'&&x<='Z')x=static_cast<unsigned char>(x+('a'-'A'));
-      if(y>='A'&&y<='Z')y=static_cast<unsigned char>(y+('a'-'A'));
-      if(x!=y)return false;
-    }
-    return true;
-  };
-  return equal_folded(requested.name,candidate.name)&&equal_folded(requested.culture,candidate.culture)&&
-    requested.major==candidate.major&&requested.minor==candidate.minor&&requested.build==candidate.build&&
-    requested.revision==candidate.revision&&requested.flags==candidate.flags&&
-    requested.public_key_or_token==candidate.public_key_or_token;
+Result<bool> assembly_scope_matches(const ManagedAssemblyIdentity& requested,const ManagedAssemblyIdentity& candidate,
+                                    std::size_t& key_work_bytes){
+  return managed_assembly_identity_matches(requested,candidate,key_work_bytes);
 }
 using ManagedTypeNode=std::pair<std::uint32_t,std::uint32_t>;
 std::optional<ManagedTypeNode> bound_type_node(const ManagedTypeCatalog& catalog,std::uint32_t catalog_index,
@@ -1208,6 +1199,7 @@ Result<bool> bind_managed_type_references(std::span<ManagedTypeCatalog> catalogs
       entry.exported=&exported;
     }
   }
+  std::size_t identity_key_work_bytes=0, identity_comparisons=0;
   for(auto& source:catalogs)for(auto& reference:source.references){
     reference.resolved_catalog_index.reset();reference.resolved_definition_token.reset();
     if(!reference.assembly_scope)continue;
@@ -1218,8 +1210,14 @@ Result<bool> bind_managed_type_references(std::span<ManagedTypeCatalog> catalogs
     for(std::size_t hop=0;hop<=catalogs.size();++hop){
       std::optional<std::uint32_t> target_catalog;std::size_t assembly_matches=0;
       for(std::uint32_t i=0;i<catalogs.size();++i){
+        if(++identity_comparisons>16'000'000)
+          return Error{ErrorCode::resource_limit,"Managed AssemblyRef identity comparisons exceed 16,000,000"};
         const auto& identity=catalogs[i].assembly_identity;
-        if(identity&&assembly_scope_matches(*scope,*identity)){target_catalog=i;++assembly_matches;}
+        if(identity){
+          auto matches=assembly_scope_matches(*scope,*identity,identity_key_work_bytes);
+          if(!matches)return matches.error();
+          if(matches.value()){target_catalog=i;++assembly_matches;}
+        }
       }
       if(assembly_matches!=1){reference.unresolved_scope=assembly_matches?"duplicate assembly identity":"assembly identity not supplied";break;}
       if(!visited_catalogs.insert(*target_catalog).second){reference.unresolved_scope="ExportedType forwarding cycle";break;}
@@ -2512,6 +2510,57 @@ private:
   std::size_t used_=0;
 };
 
+Result<bool> managed_assembly_identity_matches(const ManagedAssemblyIdentity& requested,
+                                              const ManagedAssemblyIdentity& candidate,
+                                              std::size_t& key_work_bytes){
+  const auto equal_folded=[](std::string_view left,std::string_view right){
+    if(left.size()!=right.size())return false;
+    for(std::size_t i=0;i<left.size();++i){
+      auto a=static_cast<unsigned char>(left[i]),b=static_cast<unsigned char>(right[i]);
+      if(a>='A'&&a<='Z')a=static_cast<unsigned char>(a+('a'-'A'));
+      if(b>='A'&&b<='Z')b=static_cast<unsigned char>(b+('a'-'A'));
+      if(a!=b)return false;
+    }
+    return true;
+  };
+  if(!equal_folded(requested.name,candidate.name)||!equal_folded(requested.culture,candidate.culture)||
+     requested.major!=candidate.major||requested.minor!=candidate.minor||requested.build!=candidate.build||
+     requested.revision!=candidate.revision||((requested.flags^candidate.flags)&~std::uint32_t{1})!=0)
+    return false;
+  constexpr std::size_t max_public_key_bytes=1024u*1024u;
+  constexpr std::size_t max_total_identity_key_work=64u*1024u*1024u;
+  if(requested.public_key_or_token.size()>max_public_key_bytes||
+     candidate.public_key_or_token.size()>max_public_key_bytes)
+    return Error{ErrorCode::resource_limit,"Managed public key or token exceeds 1 MiB"};
+  const bool requested_full_key=(requested.flags&1u)!=0,candidate_full_key=(candidate.flags&1u)!=0;
+  if(requested_full_key==candidate_full_key){
+    if(requested.public_key_or_token.size()==candidate.public_key_or_token.size()){
+      const auto compared=requested.public_key_or_token.size();
+      if(compared>max_total_identity_key_work-key_work_bytes)
+        return Error{ErrorCode::resource_limit,"Managed strong-name identity byte work exceeds 64 MiB"};
+      key_work_bytes+=compared;
+    }
+    return requested.public_key_or_token==candidate.public_key_or_token;
+  }
+
+  // A strong-name public-key token is the low eight bytes of SHA-1 in reverse
+  // order. Bound hashing work for caller-supplied catalogs; oversized keys
+  // stay unresolved rather than allocating or hashing unbounded input.
+  const auto& full_key=requested_full_key?requested.public_key_or_token:candidate.public_key_or_token;
+  const auto& token=requested_full_key?candidate.public_key_or_token:requested.public_key_or_token;
+  constexpr std::size_t max_total_hash_bytes=64u*1024u*1024u;
+  if(full_key.empty()||token.size()!=8)return false;
+  if(full_key.size()>max_public_key_bytes)
+    return Error{ErrorCode::resource_limit,"Managed strong-name public key exceeds 1 MiB"};
+  if(full_key.size()>max_total_hash_bytes-key_work_bytes)
+    return Error{ErrorCode::resource_limit,"Managed strong-name identity key processing exceeds 64 MiB"};
+  key_work_bytes+=full_key.size();
+  ManagedSha1 sha1;sha1.update(full_key);const auto digest=sha1.finish();
+  for(unsigned i=0;i<8;++i)
+    if(token[i]!=digest[19-i])return false;
+  return true;
+}
+
 Result<std::vector<std::byte>> managed_resource_hash(const ByteStorage& storage,std::uint32_t algorithm,
                                                       std::stop_token stop){
   if(algorithm==0x800cu){
@@ -2530,32 +2579,10 @@ Result<std::vector<std::byte>> managed_resource_hash(const ByteStorage& storage,
   const auto digest=sha1.finish();return std::vector<std::byte>(digest.begin(),digest.end());
 }
 
-bool managed_resource_assembly_identity_matches(const ManagedAssemblyIdentity& requested,
-                                                const ManagedAssemblyIdentity& candidate){
-  const auto equal_folded=[](std::string_view left,std::string_view right){
-    if(left.size()!=right.size())return false;
-    for(std::size_t i=0;i<left.size();++i){
-      auto a=static_cast<unsigned char>(left[i]),b=static_cast<unsigned char>(right[i]);
-      if(a>='A'&&a<='Z')a=static_cast<unsigned char>(a+('a'-'A'));
-      if(b>='A'&&b<='Z')b=static_cast<unsigned char>(b+('a'-'A'));
-      if(a!=b)return false;
-    }
-    return true;
-  };
-  if(!equal_folded(requested.name,candidate.name)||!equal_folded(requested.culture,candidate.culture)||
-     requested.major!=candidate.major||requested.minor!=candidate.minor||requested.build!=candidate.build||
-     requested.revision!=candidate.revision||((requested.flags^candidate.flags)&~std::uint32_t{1})!=0)
-    return false;
-  const bool requested_full_key=(requested.flags&1u)!=0,candidate_full_key=(candidate.flags&1u)!=0;
-  if(requested_full_key)return candidate_full_key&&requested.public_key_or_token==candidate.public_key_or_token;
-  if(candidate_full_key){
-    ManagedSha1 sha1;sha1.update(candidate.public_key_or_token);const auto digest=sha1.finish();
-    std::array<std::byte,8> token{};
-    for(unsigned i=0;i<8;++i)token[i]=digest[19-i];
-    return requested.public_key_or_token.size()==token.size()&&
-      std::equal(token.begin(),token.end(),requested.public_key_or_token.begin());
-  }
-  return requested.public_key_or_token==candidate.public_key_or_token;
+Result<bool> managed_resource_assembly_identity_matches(const ManagedAssemblyIdentity& requested,
+                                                        const ManagedAssemblyIdentity& candidate,
+                                                        std::size_t& key_work_bytes){
+  return managed_assembly_identity_matches(requested,candidate,key_work_bytes);
 }
 }
 
@@ -2604,6 +2631,7 @@ Result<std::vector<ManagedResource>> inspect_managed_resources(const LoadedImage
 namespace {
 struct ManagedResourceBindingTraversal {
   std::size_t provider_visits=0;
+  std::size_t public_key_work_bytes=0, assembly_identity_comparisons=0;
   std::vector<std::size_t> active_provider_inputs;
   std::uint64_t copied_payload_bytes=0;
 };
@@ -2784,9 +2812,15 @@ Result<std::vector<ManagedResource>> inspect_managed_resources_recursive(
       }
       for(std::size_t i=0;i<candidates.size();++i){
         if(stop.stop_requested())return Error{ErrorCode::canceled,"CLR AssemblyRef resource binding canceled"};
+        if(++traversal.assembly_identity_comparisons>16'000'000)
+          return Error{ErrorCode::resource_limit,"CLR AssemblyRef identity comparisons exceed 16,000,000"};
         auto& candidate=candidates[i];
         const auto identity=candidate_identity(candidate);
-        if(!identity||!managed_resource_assembly_identity_matches(wanted,*identity))continue;
+        if(!identity)continue;
+        auto identity_match=managed_resource_assembly_identity_matches(
+            wanted,*identity,traversal.public_key_work_bytes);
+        if(!identity_match)return identity_match.error();
+        if(!identity_match.value())continue;
         if(resource.implementation_hash.empty()){matches.push_back(i);continue;}
         if(const auto found=candidate.hashes.find(resource.implementation_hash_algorithm);found!=candidate.hashes.end()){
           if(found->second==resource.implementation_hash)matches.push_back(i);else saw_hash_mismatch=true;
