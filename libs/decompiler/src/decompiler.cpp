@@ -619,6 +619,13 @@ std::string operation_name(Opcode opcode) {
     case Opcode::m6502_plp: return "PLP"; case Opcode::m6502_jmp: return "JMP";
     case Opcode::m6502_jsr: return "JSR"; case Opcode::m6502_rts: return "RTS";
     case Opcode::m6502_rti: return "RTI"; case Opcode::m6502_brk: return "BRK";
+    case Opcode::m65c02_bra: return "BRA"; case Opcode::m65c02_stz: return "STZ";
+    case Opcode::m65c02_phx: return "PHX"; case Opcode::m65c02_plx: return "PLX";
+    case Opcode::m65c02_phy: return "PHY"; case Opcode::m65c02_ply: return "PLY";
+    case Opcode::m65c02_tsb: return "TSB"; case Opcode::m65c02_trb: return "TRB";
+    case Opcode::m65c02_rmb: return "RMB"; case Opcode::m65c02_smb: return "SMB";
+    case Opcode::m65c02_bbr: return "BBR"; case Opcode::m65c02_bbs: return "BBS";
+    case Opcode::m65c02_wai: return "WAI"; case Opcode::m65c02_stp: return "STP";
     case Opcode::m6502_bpl: return "BPL"; case Opcode::m6502_bmi: return "BMI";
     case Opcode::m6502_bvc: return "BVC"; case Opcode::m6502_bvs: return "BVS";
     case Opcode::m6502_bcc: return "BCC"; case Opcode::m6502_bcs: return "BCS";
@@ -4716,6 +4723,23 @@ a64_unhandled:
         Branch branch{condition, instruction.direct_target, {}};
         if (instruction.flow == FlowKind::jump && !instruction.direct_target && !operands.empty())
             branch.indirect_target = operands.front();
+        if (m65c02 && (instruction.opcode == Opcode::m65c02_bbr || instruction.opcode == Opcode::m65c02_bbs) &&
+            instruction.condition < 8 && instruction.operands.size() == 2 && operands.size() == 2 &&
+            operands.front() && operands.front()->type == integer_type(8) &&
+            std::holds_alternative<MemoryValue>(operands.front()->value)) {
+            const auto *memory = std::get_if<MemoryOperand>(&instruction.operands.front());
+            if (memory && memory->data_width == 8 && memory->address_width == 16 &&
+                !memory->base && !memory->index && !memory->ip_relative &&
+                instruction.access == std::vector<OperandAccess>{OperandAccess::read, OperandAccess::address} &&
+                instruction.memory_read && !instruction.memory_write && instruction.direct_target) {
+                const auto mask = std::uint64_t{1} << instruction.condition;
+                const auto selected = std::make_shared<Expression>(Expression{integer_type(8),
+                    BinaryValue{"and", operands.front(), constant_expr(mask, 8)}});
+                branch.predicate = boolean_binary(instruction.opcode == Opcode::m65c02_bbs ? "ne" : "eq",
+                    selected, constant_expr(0, 8));
+                branch.condition = "predicate";
+            }
+        }
         if (a64 && instruction.opcode == Opcode::a64_b_cond && instruction.condition < 14) {
             branch.predicate = a64_nzcv_predicate(instruction.condition,
                 reg_expr({RegisterBank::arm_flags, 0, 4, false}));
