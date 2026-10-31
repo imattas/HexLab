@@ -10,10 +10,11 @@ directed rounding, and signed range limits deterministically.
 NaNs, infinities, and rounded values outside the signed-word range raise
 Invalid and use the MIPS32 default result `0x7fffffff` when Invalid is not
 enabled. Finite discarded fractional bits raise Inexact. The result replaces
-FCSR.Cause for Invalid and Inexact, and the corresponding sticky FCSR.Flags are
-set even when an enabled exception is taken. An enabled Invalid or Inexact
-exception suppresses the destination write. With FCSR.FS set, subnormal inputs
-are treated as same-sign zero and raise Inexact.
+FCSR.Cause for Invalid and Inexact. If no enabled exception is taken, the
+corresponding sticky FCSR.Flags are accrued; when an enabled exception is
+taken, Flag bits are not updated. An enabled Invalid or Inexact exception
+suppresses the destination write. With FCSR.FS set, subnormal inputs are
+treated as same-sign zero and raise Inexact.
 
 `evaluate_mips32_word_conversion_instruction` binds the evaluator to decoded
 instructions and checks architecture/mode, opcode, operand count and access,

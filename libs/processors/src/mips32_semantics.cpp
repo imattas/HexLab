@@ -1032,9 +1032,10 @@ std::optional<Mips32WordConversionResult> evaluate_mips32_word_conversion(
         result.exception_taken = (result.exception_bits & enabled) != 0;
         result.writes_destination = !result.exception_taken;
         result.fcsr_after = (fcsr & ~cause_mask) |
-            (static_cast<std::uint32_t>(result.exception_bits) << 12) |
-            (fcsr & flag_mask) |
-            (static_cast<std::uint32_t>(result.exception_bits) << 2);
+            (static_cast<std::uint32_t>(result.exception_bits) << 12);
+        if (!result.exception_taken)
+            result.fcsr_after = (result.fcsr_after & ~flag_mask) |
+                ((fcsr & flag_mask) | (static_cast<std::uint32_t>(result.exception_bits) << 2));
     };
 
     if (exponent == exponent_mask) {
