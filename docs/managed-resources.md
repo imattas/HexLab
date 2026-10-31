@@ -46,7 +46,11 @@ and defaults to a 64 MiB aggregate resolved-payload budget. The project CLI
 accepts an explicit UTF-8 path list with one caller-selected input per line:
 `hexlab_cli project managed-resources <project> --inputs-list <paths.txt>`.
 Relative entries are resolved only against the list file's directory. No
-search paths are inferred. `--json` emits each resource's resolution state,
+search paths are inferred. Resolved external resources retain the zero-based
+index of the exact caller-supplied input selected by the resolver; the index
+refers to input order after blank and comment lines are discarded. Text output
+prints `resolved-input-index`, and JSON emits `resolved_input_index`. This is
+an input index, not a path. `--json` emits each resource's resolution state,
 diagnostic, and (when present) implementation hash algorithm, full hash byte
 count, and at most the first 32 hash bytes in hexadecimal. Text output uses
 the same bounded hash prefix. For decoded `.resources` payloads, both text and JSON output

@@ -792,6 +792,7 @@ int print_derived(std::ostream &out, const Arguments &args, const ProjectSnapsho
                    <<",\"resolution\":"<<search_json_string(resolution_name(resource.resolution))
                    <<",\"payload_bytes\":"<<resource.payload.size()
                    <<",\"records\":"<<resource.records.size();
+                if(resource.resolution_input_index)out<<",\"resolved_input_index\":"<<*resource.resolution_input_index;
                 if(!resource.implementation_hash.empty()){
                     constexpr std::size_t hash_prefix_bytes=32;
                     const auto hash_prefix=std::min(resource.implementation_hash.size(),hash_prefix_bytes);
@@ -854,6 +855,7 @@ int print_derived(std::ostream &out, const Arguments &args, const ProjectSnapsho
                 if(hash_prefix<resource.implementation_hash.size())out<<"...";
             }
             out << " resolution=" << resolution_name(resource.resolution);
+            if(resource.resolution_input_index)out<<" resolved-input-index="<<*resource.resolution_input_index;
             if (resource.payload.size()||resource.data_size)
                 out << " payload-bytes=" << resource.payload.size() << " records=" << resource.records.size();
             out << '\n';
