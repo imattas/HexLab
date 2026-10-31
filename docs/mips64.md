@@ -72,6 +72,16 @@ a value only when every incoming path agrees, and propagation stops at fixed
 graph and iteration budgets. Indirect control targets must be aligned and lie
 in executable segments.
 
+MIPS64 signed-relative switch dispatch can also use a code base established
+before the dispatch block when every bounded predecessor path agrees. The
+proof tracks only exact `LUI`, `ORI`, `DADDIU`, and `DADDU` constants, rejects
+relocation-covered immediates, ambiguous or alternate entries, unresolved CFG
+paths and cycles, and is capped at 128 function blocks, 1,024 snapshot blocks,
+4,096 graph nodes, 8,192 edges, and 32,768 proof steps. Instructions with
+classic delay slots are not traversed as ordinary constant-transfer nodes, so
+such paths retain the existing conservative fallback. Same-block switch
+recognition and signed `LW` entry interpretation remain unchanged.
+
 MIPS HI16/LO16 and any other unsupported, incomplete, or ambiguous instruction
 relocations remain opaque. A relocation-covered instruction is never used as
 an immediate source for static address reconstruction, so the encoded halfword
