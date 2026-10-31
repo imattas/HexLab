@@ -197,17 +197,53 @@ Result<std::vector<ElfLibraryResolution>> resolve_elf_needed_libraries(
             value = *entry.string_value;
         }
     }
-    if (!has_rpath && !has_runpath)
-        return base; // No encoded search policy: retain exact-name manifest behavior.
-
-    auto importer = normalize_elf_path(context.importer_path, context.max_path_bytes, true);
-    if (!importer) return importer.error();
-    const auto slash = importer.value().find_last_of('/');
-    const auto origin = slash == 0 ? std::string("/") : importer.value().substr(0, slash);
-    const auto &selected = has_runpath ? *runpath : *rpath;
-    auto directories = elf_search_directories(selected, origin, context);
-    if (!directories) return directories.error();
-    const auto source = has_runpath ? ElfLibrarySearchSource::runpath : ElfLibrarySearchSource::rpath;
+    // Search order follows the loader's direct-dependency precedence for the
+    // supplied sources: legacy RPATH (when RUNPATH is absent), caller-provided
+    // LD_LIBRARY_PATH, then RUNPATH. System cache/default/hwcaps sources are
+    // intentionally outside this offline manifest model.
+    using SearchList = std::pair<ElfLibrarySearchSource, std::vector<std::string>>;
+    std::vector<SearchList> search_lists;
+    if (has_rpath && !has_runpath) {
+        auto importer = normalize_elf_path(context.importer_path, context.max_path_bytes, true);
+        if (!importer) return importer.error();
+        const auto slash = importer.value().find_last_of('/');
+        const auto origin = slash == 0 ? std::string("/") : importer.value().substr(0, slash);
+        auto directories = elf_search_directories(*rpath, origin, context);
+        if (!directories) return directories.error();
+        search_lists.emplace_back(ElfLibrarySearchSource::rpath, std::move(directories.value()));
+    }
+    if (context.environment_search_paths.size() > context.max_search_entries)
+        return Error{ErrorCode::resource_limit, "ELF environment search path exceeds entry limit"};
+    if (!context.environment_search_paths.empty()) {
+        std::vector<std::string> directories;
+        directories.reserve(context.environment_search_paths.size());
+        for (const auto &path : context.environment_search_paths) {
+            if (stop.stop_requested())
+                return Error{ErrorCode::canceled, "ELF dependency resolution canceled"};
+            auto normalized = normalize_elf_path(path, context.max_path_bytes, true);
+            if (!normalized) return normalized.error();
+            directories.push_back(std::move(normalized.value()));
+        }
+        search_lists.emplace_back(ElfLibrarySearchSource::environment, std::move(directories));
+    }
+    if (has_runpath) {
+        auto importer = normalize_elf_path(context.importer_path, context.max_path_bytes, true);
+        if (!importer) return importer.error();
+        const auto slash = importer.value().find_last_of('/');
+        const auto origin = slash == 0 ? std::string("/") : importer.value().substr(0, slash);
+        auto directories = elf_search_directories(*runpath, origin, context);
+        if (!directories) return directories.error();
+        search_lists.emplace_back(ElfLibrarySearchSource::runpath, std::move(directories.value()));
+    }
+    std::size_t total_search_entries = 0;
+    for (const auto &[source, directories] : search_lists) {
+        (void)source;
+        if (directories.size() > context.max_search_entries - total_search_entries)
+            return Error{ErrorCode::resource_limit, "ELF combined search paths exceed entry limit"};
+        total_search_entries += directories.size();
+    }
+    if (search_lists.empty())
+        return base; // No supplied search policy: retain exact-name behavior.
 
     std::vector<std::optional<std::string>> candidate_paths;
     candidate_paths.reserve(manifest.size());
@@ -232,27 +268,30 @@ Result<std::vector<ElfLibraryResolution>> resolve_elf_needed_libraries(
         resolution.state = ElfLibraryResolutionState::missing;
         resolution.manifest_index.reset();
         resolution.candidates.clear();
-        resolution.source = source;
-        for (const auto &directory : directories.value()) {
-            std::vector<std::size_t> matches;
-            for (const auto index : original) {
-                if (stop.stop_requested()) return Error{ErrorCode::canceled, "ELF dependency resolution canceled"};
-                if (!candidate_paths[index]) continue;
-                const auto candidate_slash = candidate_paths[index]->find_last_of('/');
-                const auto candidate_directory = candidate_slash == 0 ? std::string("/") : candidate_paths[index]->substr(0, candidate_slash);
-                if (candidate_directory == directory) matches.push_back(index);
-            }
-            if (!matches.empty()) {
-                resolution.matched_directory = directory;
-                resolution.candidates = std::move(matches);
-                if (resolution.candidates.size() == 1) {
-                    resolution.state = ElfLibraryResolutionState::resolved;
-                    resolution.manifest_index = resolution.candidates.front();
-                } else {
-                    resolution.state = ElfLibraryResolutionState::ambiguous;
+        for (const auto &[source, directories] : search_lists) {
+            resolution.source = source;
+            for (const auto &directory : directories) {
+                std::vector<std::size_t> matches;
+                for (const auto index : original) {
+                    if (stop.stop_requested()) return Error{ErrorCode::canceled, "ELF dependency resolution canceled"};
+                    if (!candidate_paths[index]) continue;
+                    const auto candidate_slash = candidate_paths[index]->find_last_of('/');
+                    const auto candidate_directory = candidate_slash == 0 ? std::string("/") : candidate_paths[index]->substr(0, candidate_slash);
+                    if (candidate_directory == directory) matches.push_back(index);
                 }
-                break;
+                if (!matches.empty()) {
+                    resolution.matched_directory = directory;
+                    resolution.candidates = std::move(matches);
+                    if (resolution.candidates.size() == 1) {
+                        resolution.state = ElfLibraryResolutionState::resolved;
+                        resolution.manifest_index = resolution.candidates.front();
+                    } else {
+                        resolution.state = ElfLibraryResolutionState::ambiguous;
+                    }
+                    break;
+                }
             }
+            if (resolution.state != ElfLibraryResolutionState::missing) break;
         }
     }
     return std::move(base.value());
