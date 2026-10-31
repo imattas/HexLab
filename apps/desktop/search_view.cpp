@@ -630,6 +630,7 @@ void SearchView::update(std::optional<DocumentId> document, const SearchHistory 
         collection_work_->batch.reset();
     }
     collection_work_->ready.notify_all();
+    filter_timer_.Stop();
     filter_work_->generation.fetch_add(1, std::memory_order_acq_rel);
     {
         std::lock_guard lock(filter_work_->mutex);
@@ -823,6 +824,17 @@ void SearchView::update_all(const std::vector<SearchDocumentView> &documents) {
 }
 void SearchView::render() {
     if (!filter_work_) return;
+    if (collection_rows_) {
+        visible_.reset();
+        table_->populate(0, {});
+        previous_->Disable(); next_->Disable(); copy_->Disable(); export_->Disable();
+        const auto status = wxString("Collecting ") + number(collection_rows_->items.size()) +
+                            " loaded search results...";
+        status_->SetLabel(status);
+        status_->SetToolTip(coverage_);
+        preview_->ChangeValue("Collecting current-document search results; navigation is paused.");
+        return;
+    }
     const auto generation = filter_work_->generation.fetch_add(1, std::memory_order_acq_rel) + 1;
     const auto needle = filter_->GetValue().Lower().utf8_string();
     {
@@ -847,6 +859,16 @@ void SearchView::render() {
 }
 void SearchView::poll_filter() {
     if (!filter_work_) return;
+    if (collection_rows_) {
+        filter_timer_.Stop();
+        {
+            std::lock_guard lock(filter_work_->mutex);
+            filter_work_->completion.reset();
+            filter_work_->request.reset();
+        }
+        render();
+        return;
+    }
     std::optional<FilterWork::Completion> completion;
     {
         std::lock_guard lock(filter_work_->mutex);
