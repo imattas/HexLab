@@ -221,8 +221,12 @@ struct ElfRuntimeSymbolBinding {
 struct ElfLibraryManifestEntry {
     std::string library_name;
     std::vector<std::string> aliases;
+    // Optional caller-supplied target path. The resolver treats this as an
+    // opaque ELF namespace path and performs lexical comparisons only.
+    std::optional<std::string> path;
 };
 enum class ElfLibraryResolutionState { resolved, missing, ambiguous };
+enum class ElfLibrarySearchSource { manifest_name, rpath, runpath };
 struct ElfLibraryResolution {
     std::string needed_name;
     ElfLibraryResolutionState state = ElfLibraryResolutionState::missing;
@@ -230,6 +234,8 @@ struct ElfLibraryResolution {
     std::optional<std::size_t> manifest_index;
     // Sorted manifest indexes, retained to explain ambiguous matches.
     std::vector<std::size_t> candidates;
+    ElfLibrarySearchSource source = ElfLibrarySearchSource::manifest_name;
+    std::optional<std::string> matched_directory;
 };
 struct ElfLibraryResolutionLimits {
     std::size_t max_needed = 4096;
@@ -243,6 +249,20 @@ struct ElfLibraryResolutionLimits {
 HEXLAB_LOADERS_EXPORT Result<std::vector<ElfLibraryResolution>> resolve_elf_needed_libraries(
     const LoadedImage &, std::span<const ElfLibraryManifestEntry>, std::stop_token = {},
     ElfLibraryResolutionLimits = {});
+struct ElfLibrarySearchContext {
+    // Explicit importer path in the target ELF namespace; must be absolute.
+    // It is used only to expand $ORIGIN/${ORIGIN}; no environment is read.
+    std::string importer_path;
+    std::size_t max_search_entries = 1024;
+    std::size_t max_path_bytes = 4096;
+};
+// Applies DT_RUNPATH, or DT_RPATH only when DT_RUNPATH is absent, to the
+// caller-owned manifest's optional candidate paths. Directory order is
+// preserved; the first directory with candidates wins, and duplicates there
+// remain ambiguous. This remains a metadata-only operation with no file I/O.
+HEXLAB_LOADERS_EXPORT Result<std::vector<ElfLibraryResolution>> resolve_elf_needed_libraries(
+    const LoadedImage &, std::span<const ElfLibraryManifestEntry>, const ElfLibrarySearchContext &,
+    std::stop_token = {}, ElfLibraryResolutionLimits = {});
 struct ElfRuntimeDependencyImage {
     std::string needed_name;
     std::vector<std::string> aliases;
