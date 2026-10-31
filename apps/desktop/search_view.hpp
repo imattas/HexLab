@@ -3,6 +3,7 @@
 #include "hexlab/workspace/search.hpp"
 #include <wx/button.h>
 #include <wx/stattext.h>
+#include <wx/timer.h>
 #include <wx/textctrl.h>
 namespace hexlab::desktop {
 struct FindRequest {
@@ -24,6 +25,7 @@ struct SearchDocumentView {
 class SearchView final : public wxPanel {
   public:
     explicit SearchView(wxWindow *);
+    ~SearchView() override;
     void update(std::optional<DocumentId>, const SearchHistory *, bool pending, const wxString &reason,
                 std::shared_ptr<const Image> = {}, std::shared_ptr<const ProjectSnapshot> = {});
     void update_all(const std::vector<SearchDocumentView> &);
@@ -33,6 +35,7 @@ class SearchView final : public wxPanel {
 
   private:
     struct Rows;
+    struct FilterWork;
     VirtualTable *table_;
     wxStaticText *status_;
     wxButton *more_;
@@ -40,6 +43,8 @@ class SearchView final : public wxPanel {
     wxButton *previous_, *next_, *copy_, *export_;
     std::shared_ptr<const Rows> rows_;
     std::shared_ptr<const std::vector<std::size_t>> visible_;
+    std::shared_ptr<FilterWork> filter_work_;
+    wxTimer filter_timer_;
     std::optional<DocumentId> selected_document_;
     std::shared_ptr<const SearchPage> selected_page_;
     std::size_t selected_index_ = 0;
@@ -47,6 +52,7 @@ class SearchView final : public wxPanel {
     std::optional<DocumentId> document_;
     bool all_documents_ = false;
     void render();
+    void poll_filter();
     void show_preview();
     void step(bool forward);
     wxString export_text() const;

@@ -150,6 +150,18 @@ current-document names only; it does not add a persistent index, background
 source collection, or searches of unopened projects. Fuzzy ranking remains
 bounded to its first 4,096 destinations and does not expose additional pages.
 
+## Find result filtering
+
+The Find results metadata filter runs against the loaded result snapshot on a
+background worker. Typing replaces any queued request; the active scan checks
+cancellation periodically, and the view accepts only a result matching the
+latest filter generation and exact captured row snapshot. While filtering, the
+old projection is cleared and navigation is disabled, preventing stale results
+from being followed. The table is repopulated only after a current projection
+is ready; selection is restored by its document, page, and result identity when
+that result remains visible. Filtering narrows only results already loaded by
+the selected Find scope; it does not broaden a current-document search or load
+additional result pages.
 ## Search names across open documents
 
 Choose **Navigate > Search Names in Open Documents...** (`Ctrl+Shift+G`) to
