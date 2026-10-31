@@ -9929,6 +9929,7 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
             Address target{};
             std::vector<std::uint64_t> values;
             bool is_default = false;
+            bool terminates_function = false;
             std::vector<const LiftedBlock *> body;
         };
         struct LoopSwitchBody {
@@ -10529,6 +10530,7 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                 }
                 LoopSwitchBody region;
                 std::vector<std::vector<const LiftedBlock *>> traces;
+                std::vector<bool> return_arms;
                 std::vector<Address> unique_targets;
                 for (const auto &[space, offset] : targets) {
                     const Address target{{static_cast<std::uint32_t>(space)}, offset};
@@ -10547,16 +10549,41 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                         trace.push_back(current);
                         current = find_block(*current->successors.front().target);
                     }
-                    if (!current || trace.empty() || current == body || current == exit_block ||
-                        current->phis.size() || current->switch_dispatch || current->id == body->id) valid = false;
+                    bool returns = false;
+                    if (current && has_only_terminal_return(*current) && current->phis.empty() &&
+                        !current->memory_phi && current->memory_partition_phis.empty()) {
+                        const std::set<std::uint64_t> expected_predecessor{
+                            trace.empty() ? body->id.value : trace.back()->id.value};
+                        if (diamond_predecessors[current->id.value] != expected_predecessor) valid = false;
+                        else {
+                            trace.push_back(current);
+                            returns = true;
+                        }
+                    }
+                    if (returns) {
+                        for (std::size_t path_index = 0; path_index < trace.size(); ++path_index) {
+                            const auto predecessor = path_index == 0 ? body->id.value : trace[path_index - 1]->id.value;
+                            if (trace[path_index]->memory_phi || !trace[path_index]->memory_partition_phis.empty() ||
+                                diamond_predecessors[trace[path_index]->id.value] !=
+                                std::set<std::uint64_t>{predecessor}) valid = false;
+                        }
+                    }
+                    if (!current || (trace.empty() && !returns) || current == body || current == exit_block ||
+                        (current != trace.back() && (current->phis.size() || current->switch_dispatch)) ||
+                        current->id == body->id) valid = false;
                     traces.push_back(std::move(trace));
+                    return_arms.push_back(returns);
                 }
                 const LiftedBlock *join = nullptr;
-                if (valid && !traces.empty()) {
-                    for (const auto *candidate : traces.front()) {
-                        const bool common = std::all_of(traces.begin() + 1, traces.end(), [&](const auto &trace) {
-                            return std::find(trace.begin(), trace.end(), candidate) != trace.end();
-                        });
+                const auto first_continuing = std::find(return_arms.begin(), return_arms.end(), false);
+                if (valid && first_continuing != return_arms.end()) {
+                    const auto first_index = static_cast<std::size_t>(first_continuing - return_arms.begin());
+                    for (const auto *candidate : traces[first_index]) {
+                        bool common = true;
+                        for (std::size_t trace_index = 0; trace_index < traces.size(); ++trace_index)
+                            if (!return_arms[trace_index] &&
+                                std::find(traces[trace_index].begin(), traces[trace_index].end(), candidate) ==
+                                    traces[trace_index].end()) common = false;
                         if (common) { join = candidate; break; }
                     }
                 }
@@ -10564,9 +10591,11 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                 if (valid) {
                     for (std::size_t i = 0; i < traces.size(); ++i) {
                         auto &trace = traces[i];
-                        const auto at_join = std::find(trace.begin(), trace.end(), join);
-                        if (at_join == trace.end()) { valid = false; break; }
-                        trace.erase(at_join, trace.end());
+                        if (!return_arms[i]) {
+                            const auto at_join = std::find(trace.begin(), trace.end(), join);
+                            if (at_join == trace.end()) { valid = false; break; }
+                            trace.erase(at_join, trace.end());
+                        }
                         for (const auto *arm_block : trace) {
                             if (!loop_body_ids.insert(arm_block->id.value).second) valid = false;
                         }
@@ -10576,6 +10605,7 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                         for (const auto &item : dispatch.cases)
                             if (item.target == target) arm.values.push_back(item.value);
                         arm.is_default = *dispatch.default_target == target;
+                        arm.terminates_function = return_arms[i];
                         arm.body = trace;
                         region.arms.push_back(std::move(arm));
                     }
@@ -11406,7 +11436,7 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                             out << "        case 0x" << std::hex << value << std::dec << ":\n";
                         if (arm.is_default) out << "        default:\n";
                         for (const auto *arm_block : arm.body) emit_block(*arm_block, 12, true);
-                        out << "            break;\n";
+                        if (!arm.terminates_function) out << "            break;\n";
                     }
                     out << "        }\n";
                     continue;
