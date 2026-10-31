@@ -160,7 +160,7 @@ std::string register_name(const RegisterOperand &r) {
                                               "status", "cause", "epc", "prid", "config", "lladdr", "watchlo",
                                               "watchhi", "xcontext", "?c0r21", "?c0r22", "debug", "depc",
                                               "?c0r25", "?c0r26", "?c0r27", "taglo", "taghi", "errorepc", "desave"};
-        if (r.index >= 32 || r.width != 32) return "?mips-cp0-register";
+        if (r.index >= 32 || (r.width != 32 && r.width != 64)) return "?mips-cp0-register";
         const auto name = names[r.index];
         return name[0] == '?' ? "c0r" + std::to_string(r.index) : name;
     }
@@ -377,6 +377,8 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
     case Opcode::mips64_mthi: return "mthi";
     case Opcode::mips64_mtlo: return "mtlo";
     case Opcode::mips64_daddi: return "daddi";
+    case Opcode::mips64_dmfc0: return "dmfc0";
+    case Opcode::mips64_dmtc0: return "dmtc0";
     case Opcode::mips64_mfc1: return "mfc1";
     case Opcode::mips64_dmfc1: return "dmfc1";
     case Opcode::mips64_cfc1: return "cfc1";

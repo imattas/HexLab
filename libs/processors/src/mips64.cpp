@@ -55,7 +55,31 @@ DecodeResult decode_mips64(std::span<const std::byte> bytes, Address at, ByteOrd
     const RegisterOperand hi{RegisterBank::mips_hilo, 0, 64, false};
     const RegisterOperand lo{RegisterBank::mips_hilo, 1, 64, false};
     if (op == 0x10) {
-        // ERET is the sole CP0 instruction currently modeled by this slice.
+        // MFC0/MTC0 and their MIPS64 doubleword counterparts support only
+        // select zero. Other selects remain distinct unsupported encodings.
+        if (rs == 0 || rs == 1 || rs == 4 || rs == 5) {
+            if ((word & 0x7f8u) != 0)
+                return {DecodeStatus::unsupported, {}, "MIPS64 CP0 register selects are not implemented"};
+            const bool from_cp0 = rs == 0 || rs == 1;
+            const bool doubleword = rs == 1 || rs == 5;
+            const RegisterOperand general = reg(rt);
+            const RegisterOperand coprocessor{RegisterBank::mips_cp0,
+                static_cast<std::uint8_t>(rd), static_cast<std::uint16_t>(doubleword ? 64 : 32), false};
+            i.opcode = rs == 0 ? Opcode::mips_mfc0 : rs == 1 ? Opcode::mips64_dmfc0 :
+                       rs == 4 ? Opcode::mips_mtc0 : Opcode::mips64_dmtc0;
+            i.operands = {general, coprocessor};
+            i.access = from_cp0 ? std::vector<OperandAccess>{OperandAccess::write, OperandAccess::read}
+                                : std::vector<OperandAccess>{OperandAccess::read, OperandAccess::write};
+            if (from_cp0) {
+                i.register_reads = {coprocessor};
+                if (rt) i.register_writes = {general};
+            } else {
+                if (rt) i.register_reads = {general};
+                i.register_writes = {coprocessor};
+            }
+            return {DecodeStatus::decoded, std::move(i), {}};
+        }
+        // ERET handles the control-transfer subset with no delay slot.
         // Validate the entire fixed-field encoding so neighboring encodings
         // cannot be mistaken for a return.
         if (rs == 16 && rt == 0 && rd == 0 && shamt == 0 && funct == 0x18) {
