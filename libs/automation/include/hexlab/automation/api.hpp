@@ -8,6 +8,7 @@
 #include "hexlab/analysis/graph.hpp"
 #include "hexlab/analysis/references.hpp"
 #include "hexlab/analysis/flirt.hpp"
+#include "hexlab/analysis/signatures.hpp"
 #include "hexlab/loaders/ar.hpp"
 #include <thread>
 
@@ -256,6 +257,16 @@ public:
     HEXLAB_AUTOMATION_EXPORT Result<std::vector<std::byte>> read(Location, std::size_t, std::stop_token={}) const;
     HEXLAB_AUTOMATION_EXPORT Result<Address> logical(X86LogicalAddress) const;
     HEXLAB_AUTOMATION_EXPORT Result<std::vector<FunctionRecord>> functions(std::size_t start=0, std::size_t count=256) const;
+    // Bounded, revision-pinned signature and normalized-fingerprint workflows
+    // are available to native SDK clients as well as the Python facade.
+    HEXLAB_AUTOMATION_EXPORT Result<FunctionFingerprintCatalog> function_fingerprint_catalog(
+        const std::vector<FunctionId>&, std::string provenance, FunctionFingerprintOptions = {},
+        std::optional<std::uint64_t> expected_revision={}, std::stop_token={}) const;
+    HEXLAB_AUTOMATION_EXPORT Result<SignatureCatalog> function_signature_catalog(
+        const std::vector<FunctionId>&, std::string provenance, FunctionSignatureOptions = {},
+        std::optional<std::uint64_t> expected_revision={}, std::stop_token={}) const;
+    HEXLAB_AUTOMATION_EXPORT Result<FunctionSignatureRecognition> recognize_function_signatures(
+        std::string_view catalog, std::optional<std::uint64_t> expected_revision={}, std::stop_token={}) const;
     // Read-only recovered-function recognition over caller-supplied ordered
     // FLAIR catalogs. Catalog order and duplicate inputs are preserved.
     HEXLAB_AUTOMATION_EXPORT Result<FlirtRecognition> recognize_flirt_catalogs(

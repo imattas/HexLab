@@ -1172,21 +1172,10 @@ PyObject* call_project(PyObject*,PyObject* args){return guarded([&]()->PyObject*
             std::optional<std::uint64_t>{strict_unsigned(argument(values,5),"expected_revision must be an unsigned integer, not bool")};
         const auto stop=argument(values,6)==Py_None?std::stop_token{}:stop_source(argument(values,6)).get_token();
         auto serialized=take(without_gil([&]()->Result<std::string>{
-            auto source=p.snapshot();if(!source)return source.error();
-            const auto snapshot=source.value();
-            if(expected_revision&&*expected_revision!=snapshot->state->revisions.edit)
-                return Error{ErrorCode::conflict,"Fingerprint selection expected a different project edit revision"};
-            if(!snapshot->loaded||!snapshot->functions||!snapshot->effective)
-                return Error{ErrorCode::invalid_argument,"Fingerprint catalog requires a loaded image and recovered functions"};
-            auto catalog=create_function_fingerprint_catalog(*snapshot->loaded->image,
-                *snapshot->effective,*snapshot->functions,ids,provenance,options,stop);
+            auto catalog=p.function_fingerprint_catalog(ids,provenance,options,expected_revision,stop);
             if(!catalog)return catalog.error();
             auto output=serialize_function_fingerprint_catalog(catalog.value());
             if(!output)return output.error();
-            auto current=p.snapshot();if(!current)return current.error();
-            if(current.value()->state->revisions.edit!=snapshot->state->revisions.edit||
-               current.value()->state->revisions.bytes!=snapshot->state->revisions.bytes)
-                return Error{ErrorCode::conflict,"Project changed while fingerprint catalog was being created"};
             return output.value();
         }));
         return string(serialized);
@@ -1210,21 +1199,10 @@ PyObject* call_project(PyObject*,PyObject* args){return guarded([&]()->PyObject*
             std::optional<std::uint64_t>{strict_unsigned(argument(values,4),"expected_revision must be an unsigned integer, not bool")};
         const auto stop=argument(values,5)==Py_None?std::stop_token{}:stop_source(argument(values,5)).get_token();
         auto serialized=take(without_gil([&]()->Result<std::string>{
-            auto source=p.snapshot();if(!source)return source.error();
-            const auto snapshot=source.value();
-            if(expected_revision&&*expected_revision!=snapshot->state->revisions.edit)
-                return Error{ErrorCode::conflict,"Signature selection expected a different project edit revision"};
-            if(!snapshot->loaded||!snapshot->functions||!snapshot->effective)
-                return Error{ErrorCode::invalid_argument,"Signature catalog requires a loaded image and recovered functions"};
-            auto catalog=create_function_signature_catalog(*snapshot->loaded->image,
-                *snapshot->effective,*snapshot->functions,ids,provenance,options,stop);
+            auto catalog=p.function_signature_catalog(ids,provenance,options,expected_revision,stop);
             if(!catalog)return catalog.error();
             auto output=serialize_signature_catalog(catalog.value());
             if(!output)return output.error();
-            auto current=p.snapshot();if(!current)return current.error();
-            if(current.value()->state->revisions.edit!=snapshot->state->revisions.edit||
-               current.value()->state->revisions.bytes!=snapshot->state->revisions.bytes)
-                return Error{ErrorCode::conflict,"Project changed while signature catalog was being created"};
             return output.value();
         }));
         return string(serialized);
@@ -1236,23 +1214,8 @@ PyObject* call_project(PyObject*,PyObject* args){return guarded([&]()->PyObject*
             std::optional<std::uint64_t>{strict_unsigned(argument(values,1),"expected_revision must be an unsigned integer, not bool")};
         const auto stop=argument(values,2)==Py_None?std::stop_token{}:stop_source(argument(values,2)).get_token();
         if(encoded.size()>64u*1024u*1024u)invalid("signature catalog exceeds 64 MiB");
-        auto recognition=take(without_gil([&]()->Result<FunctionSignatureRecognition>{
-            auto source=p.snapshot();if(!source)return source.error();
-            const auto snapshot=source.value();
-            if(expected_revision&&*expected_revision!=snapshot->state->revisions.edit)
-                return Error{ErrorCode::conflict,"Signature query expected a different project edit revision"};
-            if(!snapshot->loaded||!snapshot->functions||!snapshot->effective)
-                return Error{ErrorCode::invalid_argument,"Signature recognition requires a loaded image and recovered functions"};
-            auto catalog=parse_signature_catalog(encoded);if(!catalog)return catalog.error();
-            SignatureLimits limits;limits.max_results=4096;
-            auto result=recognize_function_signatures(*snapshot->loaded->image,*snapshot->effective,
-                *snapshot->functions,catalog.value(),limits,stop);
-            if(!result)return result.error();
-            auto current=p.snapshot();if(!current)return current.error();
-            if(current.value()->state->revisions.edit!=snapshot->state->revisions.edit||
-               current.value()->state->revisions.bytes!=snapshot->state->revisions.bytes)
-                return Error{ErrorCode::conflict,"Project changed during signature recognition"};
-            return result.value();
+        auto recognition=take(without_gil([&] {
+            return p.recognize_function_signatures(encoded,expected_revision,stop);
         }));
         Object output(PyDict_New()),functions(PyList_New(0));
         set(output,"complete",PyBool_FromLong(recognition.complete));

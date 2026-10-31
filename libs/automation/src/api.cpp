@@ -178,6 +178,78 @@ Result<std::vector<FunctionRecord>> Project::functions(std::size_t start,std::si
     for(auto i=std::min(start,rows.size()),end=i+std::min(count,rows.size()-i);i<end;++i)output.push_back(*rows[i]);
     return output;
 }
+Result<FunctionFingerprintCatalog> Project::function_fingerprint_catalog(
+    const std::vector<FunctionId>& ids, std::string provenance, FunctionFingerprintOptions options,
+    std::optional<std::uint64_t> expected_revision, std::stop_token stop) const {
+    if (ids.empty() || ids.size() > 4096)
+        return Error{ErrorCode::resource_limit,"Fingerprint selection must contain 1 through 4,096 functions"};
+    if (provenance.size() > 256)
+        return Error{ErrorCode::resource_limit,"Fingerprint catalog provenance exceeds 256 bytes"};
+    if (stop.stop_requested()) return Error{ErrorCode::canceled,"Fingerprint catalog creation canceled"};
+    auto source = snapshot(); if (!source) return source.error();
+    const auto pinned = source.value();
+    if (expected_revision && *expected_revision != pinned->state->revisions.edit)
+        return Error{ErrorCode::conflict,"Fingerprint selection expected a different project edit revision"};
+    if (!pinned->loaded || !pinned->loaded->image || !pinned->functions || !pinned->effective)
+        return Error{ErrorCode::invalid_argument,"Fingerprint catalog requires a loaded image and recovered functions"};
+    auto result = create_function_fingerprint_catalog(*pinned->loaded->image, *pinned->effective,
+        *pinned->functions, ids, std::move(provenance), options, stop);
+    if (!result) return result.error();
+    if (stop.stop_requested()) return Error{ErrorCode::canceled,"Fingerprint catalog creation canceled"};
+    auto current = snapshot(); if (!current) return current.error();
+    if (current.value()->state->revisions.edit != pinned->state->revisions.edit ||
+        current.value()->state->revisions.bytes != pinned->state->revisions.bytes)
+        return Error{ErrorCode::conflict,"Project changed while fingerprint catalog was being created"};
+    return result.value();
+}
+Result<SignatureCatalog> Project::function_signature_catalog(
+    const std::vector<FunctionId>& ids, std::string provenance, FunctionSignatureOptions options,
+    std::optional<std::uint64_t> expected_revision, std::stop_token stop) const {
+    if (ids.empty() || ids.size() > 4096)
+        return Error{ErrorCode::resource_limit,"Signature selection must contain 1 through 4,096 functions"};
+    if (provenance.size() > 256)
+        return Error{ErrorCode::resource_limit,"Signature catalog provenance exceeds 256 bytes"};
+    if (stop.stop_requested()) return Error{ErrorCode::canceled,"Signature catalog creation canceled"};
+    auto source = snapshot(); if (!source) return source.error();
+    const auto pinned = source.value();
+    if (expected_revision && *expected_revision != pinned->state->revisions.edit)
+        return Error{ErrorCode::conflict,"Signature selection expected a different project edit revision"};
+    if (!pinned->loaded || !pinned->loaded->image || !pinned->functions || !pinned->effective)
+        return Error{ErrorCode::invalid_argument,"Signature catalog requires a loaded image and recovered functions"};
+    auto result = create_function_signature_catalog(*pinned->loaded->image, *pinned->effective,
+        *pinned->functions, ids, std::move(provenance), options, stop);
+    if (!result) return result.error();
+    if (stop.stop_requested()) return Error{ErrorCode::canceled,"Signature catalog creation canceled"};
+    auto current = snapshot(); if (!current) return current.error();
+    if (current.value()->state->revisions.edit != pinned->state->revisions.edit ||
+        current.value()->state->revisions.bytes != pinned->state->revisions.bytes)
+        return Error{ErrorCode::conflict,"Project changed while signature catalog was being created"};
+    return result.value();
+}
+Result<FunctionSignatureRecognition> Project::recognize_function_signatures(
+    std::string_view encoded, std::optional<std::uint64_t> expected_revision, std::stop_token stop) const {
+    constexpr std::size_t maximum_catalog_bytes = 64u * 1024u * 1024u;
+    if (encoded.size() > maximum_catalog_bytes)
+        return Error{ErrorCode::resource_limit,"Signature catalog exceeds 64 MiB"};
+    if (stop.stop_requested()) return Error{ErrorCode::canceled,"Signature recognition canceled"};
+    auto source = snapshot(); if (!source) return source.error();
+    const auto pinned = source.value();
+    if (expected_revision && *expected_revision != pinned->state->revisions.edit)
+        return Error{ErrorCode::conflict,"Signature query expected a different project edit revision"};
+    if (!pinned->loaded || !pinned->loaded->image || !pinned->functions || !pinned->effective)
+        return Error{ErrorCode::invalid_argument,"Signature recognition requires a loaded image and recovered functions"};
+    auto catalog = parse_signature_catalog(encoded); if (!catalog) return catalog.error();
+    SignatureLimits limits; limits.max_results = 4096;
+    auto result = hexlab::recognize_function_signatures(*pinned->loaded->image, *pinned->effective,
+        *pinned->functions, catalog.value(), limits, stop);
+    if (!result) return result.error();
+    if (stop.stop_requested()) return Error{ErrorCode::canceled,"Signature recognition canceled"};
+    auto current = snapshot(); if (!current) return current.error();
+    if (current.value()->state->revisions.edit != pinned->state->revisions.edit ||
+        current.value()->state->revisions.bytes != pinned->state->revisions.bytes)
+        return Error{ErrorCode::conflict,"Project changed during signature recognition"};
+    return result.value();
+}
 Result<FlirtRecognition> Project::recognize_flirt_catalogs(
     const std::vector<FlirtCatalogInput>& inputs,
     std::optional<std::uint64_t> expected_revision, std::stop_token stop) const {
