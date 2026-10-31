@@ -1490,7 +1490,7 @@ int print_derived(std::ostream &out, const Arguments &args, const ProjectSnapsho
                     if (i) out << ',';
                     const auto &argument = slot.outgoing_call_arguments[i];
                     const auto source_kind = argument.source_kind == StackCallArgumentSourceKind::x86_push ? "push@" :
-                        argument.source_kind == StackCallArgumentSourceKind::windows_x64_shadow_store ? "win64-shadow@" :
+                        argument.source_kind == StackCallArgumentSourceKind::windows_x64_outgoing_store ? "win64-store@" :
                         argument.source_kind == StackCallArgumentSourceKind::riscv_store ? "riscv-store@" :
                         argument.source_kind == StackCallArgumentSourceKind::powerpc_store ? "ppc-store@" :
                         argument.source_kind == StackCallArgumentSourceKind::mips_store ? "mips-store@" :

@@ -834,7 +834,7 @@ Decoded read_payload(std::span<const std::byte> bytes, const Image &image, const
                         : version >= 70 ? StackCallArgumentSourceKind::mips_store
                         : version >= 69 ? StackCallArgumentSourceKind::powerpc_store
                         : version >= 67 ? StackCallArgumentSourceKind::riscv_store
-                        : version >= 63 ? StackCallArgumentSourceKind::windows_x64_shadow_store
+                        : version >= 63 ? StackCallArgumentSourceKind::windows_x64_outgoing_store
                         : StackCallArgumentSourceKind::aarch64_store;
                     require(raw_kind <= static_cast<std::uint8_t>(maximum_source_kind),
                             "Cached stack call-argument source kind is invalid");

@@ -40,7 +40,7 @@ struct StackSlotAccess {
 };
 
 enum class StackCallArgumentSourceKind : std::uint8_t {
-    x86_push, aarch64_store, windows_x64_shadow_store, riscv_store, powerpc_store, mips_store, aapcs32_store
+    x86_push, aarch64_store, windows_x64_outgoing_store, riscv_store, powerpc_store, mips_store, aapcs32_store
 };
 struct StackSlotCallArgument {
     Address source_instruction;
@@ -63,8 +63,9 @@ struct StackSlot {
     // location list used by existing consumers; this records which locations
     // read, write, or take the slot's address.
     std::vector<StackSlotAccess> access_details;
-    // Caller-side argument/home-area evidence. Each row links the source
-    // stack operation to its immediately following call boundary.
+    // Caller-side outgoing-area evidence. Each row links the source stack
+    // operation to its immediately following call boundary; it does not infer
+    // the value's identity or prove that the callee consumes it.
     std::vector<StackSlotCallArgument> outgoing_call_arguments;
     // x86-32 cdecl/stdcall-compatible incoming stack argument location. The
     // return-address cell at entry-SP+0 is intentionally excluded.
