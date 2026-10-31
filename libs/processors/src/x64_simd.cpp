@@ -587,6 +587,8 @@ bool vex_simd(State &state, std::uint8_t opcode, unsigned map, unsigned pp, unsi
         if (bmi1) {
             if (l)
                 invalid("BMI1 integer forms require VEX.L=0");
+            if (w && !state.rules.long_mode())
+                invalid("64-bit BMI1 forms require 64-bit mode");
             const std::uint16_t width = w ? 64 : 32;
             auto decoded = modrm(state, width, width);
             const auto vreg = gpr(static_cast<std::uint8_t>(vvvv), width);
@@ -622,6 +624,8 @@ bool vex_simd(State &state, std::uint8_t opcode, unsigned map, unsigned pp, unsi
         if (bmi2_map2 || bmi2_rorx) {
             if (l)
                 invalid("BMI2 integer forms require VEX.L=0");
+            if (w && !state.rules.long_mode())
+                invalid("64-bit BMI2 forms require 64-bit mode");
         }
         const std::uint16_t width = w ? 64 : 32;
         if (bmi2_map2) {
