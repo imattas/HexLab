@@ -17,8 +17,12 @@ reject memory and extended-register encodings. KADD wraps at its element width;
 KSHIFT returns zero when the immediate count is at least the operation width;
 KUNPCK interleaves the low half of each source into the result. The value
 evaluator validates decoded operand/access/register facts before returning the
-zero-extended destination value. HexLab does not yet lower this family into
-source-level decompiler expressions.
+zero-extended destination value. The decompiler lowers each instruction to a
+typed intrinsic whose register output is an explicit i64 expression: KADD
+masks modulo-width addition, KSHIFT masks its source and yields zero when the
+immediate is at least the operation width, and KUNPCK explicitly extracts and
+interleaves the low source bytes. Unsupported operand/access/register facts
+retain the normal conservative fallback.
 
 References: Intel SDM Volume 2A, KSHIFTL/KSHIFTR entries,
 https://www.intel.com/content/dam/www/public/us/en/documents/manuals/64-ia-32-architectures-software-developer-vol-2a-manual.pdf;
