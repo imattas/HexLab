@@ -53,6 +53,112 @@ std::string symbol_name(std::span<const std::byte> row, std::span<const std::byt
 }
 }
 
+Result<ArMemberSymbols> summarize_xcoff32_ar_member(const ByteStorage &storage,
+                                                    std::size_t member_index,
+                                                    std::stop_token stop,
+                                                    ArObjectLimits limits) {
+    try {
+        require(limits.max_metadata_bytes > 0 && limits.max_sections > 0 &&
+                    limits.max_symbols > 0 && limits.max_name_bytes > 0,
+                "XCOFF32 archive object limits must be positive", ErrorCode::invalid_argument);
+        require(!stop.stop_requested(), "XCOFF32 archive member scan canceled", ErrorCode::canceled);
+        require(storage.size() >= 20, "Truncated XCOFF32 file header");
+        std::uint64_t budget = 0;
+        const auto header = read(storage, 0, 20, budget, limits, stop);
+        require(be(header, 0, 2) == 0x01df, "Invalid XCOFF32 magic");
+        const auto section_count = be(header, 2, 2);
+        const auto symbol_offset = be(header, 8, 4);
+        const auto symbol_count = be(header, 12, 4);
+        const auto optional_size = be(header, 16, 2);
+        require((be(header, 18, 2) & 0x0002u) == 0,
+                "XCOFF32 archive member is an F_EXEC image", ErrorCode::unsupported);
+        require(optional_size == 0,
+                "XCOFF32 archive member must be a relocatable object without an auxiliary header",
+                ErrorCode::unsupported);
+        require(section_count <= limits.max_sections,
+                "XCOFF32 archive section count limit exceeded", ErrorCode::resource_limit);
+        require(symbol_count <= limits.max_symbols,
+                "XCOFF32 archive symbol count limit exceeded", ErrorCode::resource_limit);
+        constexpr std::uint64_t file_header_size = 20;
+        constexpr std::uint64_t section_header_size = 40;
+        require(section_count <= (UINT64_MAX - file_header_size) / section_header_size,
+                "XCOFF32 section table extent overflows", ErrorCode::overflow);
+        const auto section_end = file_header_size + section_count * section_header_size;
+        require(section_end <= storage.size(), "XCOFF32 section table exceeds member extent");
+        (void)read(storage, file_header_size, section_count * section_header_size, budget, limits, stop);
+
+        ArMemberSymbols result;
+        result.member_index = member_index;
+        if (symbol_count == 0) return result;
+        constexpr std::uint64_t symbol_size = 18;
+        require(symbol_offset >= section_end, "XCOFF32 symbol table overlaps headers");
+        require(symbol_count <= (UINT64_MAX - symbol_offset) / symbol_size,
+                "XCOFF32 symbol table extent overflows", ErrorCode::overflow);
+        const auto symbol_bytes = symbol_count * symbol_size;
+        const auto strings_offset = symbol_offset + symbol_bytes;
+        const auto string_header = read(storage, strings_offset, 4, budget, limits, stop);
+        const auto string_size = be(string_header, 0, 4);
+        require(string_size >= 4, "XCOFF32 string table size is smaller than its header");
+        const auto strings = string_size == 4 ? string_header :
+            read(storage, strings_offset, string_size, budget, limits, stop);
+        const auto symbols = read(storage, symbol_offset, symbol_bytes, budget, limits, stop);
+
+        constexpr std::uint8_t c_ext = 2;
+        std::unordered_set<std::string> definitions, undefined;
+        for (std::uint64_t i = 0; i < symbol_count;) {
+            require(!stop.stop_requested(), "XCOFF32 archive member scan canceled", ErrorCode::canceled);
+            const auto row = std::span<const std::byte>(symbols).subspan(
+                static_cast<std::size_t>(i * symbol_size), static_cast<std::size_t>(symbol_size));
+            const auto value = be(row, 8, 4);
+            const auto section = static_cast<std::int16_t>(be(row, 12, 2));
+            const auto storage_class = static_cast<std::uint8_t>(be(row, 16, 1));
+            const auto aux_count = be(row, 17, 1);
+            require(aux_count <= symbol_count - i - 1,
+                    "XCOFF32 auxiliary symbol count exceeds table");
+            require(section >= -2 && (section <= 0 || static_cast<std::uint16_t>(section) <= section_count),
+                    "XCOFF32 symbol section number is invalid");
+            if (storage_class == c_ext) {
+                const auto zeroes = be(row, 0, 4);
+                const auto name_offset = be(row, 4, 4);
+                std::size_t begin = 0, end = 8;
+                if (zeroes == 0) {
+                    require(name_offset >= 4 && name_offset < strings.size(),
+                            "XCOFF32 symbol name offset is outside string table");
+                    begin = static_cast<std::size_t>(name_offset);
+                    end = strings.size();
+                }
+                auto terminator = begin;
+                while (terminator < end && (zeroes == 0 ? strings[terminator] : row[terminator]) != std::byte{0})
+                    ++terminator;
+                require(zeroes != 0 || terminator < end, "Unterminated XCOFF32 symbol name");
+                const auto length = terminator - begin;
+                require(length <= limits.max_name_bytes,
+                        "XCOFF32 symbol name exceeds limit", ErrorCode::resource_limit);
+                require(length <= limits.max_metadata_bytes - budget,
+                        "XCOFF32 decoded symbol names exceed metadata budget", ErrorCode::resource_limit);
+                budget += length;
+                if (length != 0) {
+                    const auto *data = zeroes == 0 ? strings.data() + begin : row.data() + begin;
+                    std::string name(reinterpret_cast<const char *>(data), length);
+                    if (section > 0 || section == -1 || (section == 0 && value != 0)) {
+                        if (definitions.emplace(name).second) result.definitions.push_back(std::move(name));
+                    } else if (section == 0 && undefined.emplace(name).second) {
+                        result.undefined.push_back(std::move(name));
+                    }
+                }
+            }
+            i += 1 + aux_count;
+        }
+        result.undefined.erase(std::remove_if(result.undefined.begin(), result.undefined.end(),
+            [&](const auto &name) { return definitions.contains(name); }), result.undefined.end());
+        return result;
+    } catch (const Failure &failure) {
+        return failure.error;
+    } catch (const std::bad_alloc &) {
+        return Error{ErrorCode::resource_limit, "Cannot allocate XCOFF32 archive symbol summary"};
+    }
+}
+
 Result<ArMemberSymbols> summarize_xcoff64_ar_member(const ByteStorage &storage,
                                                     std::size_t member_index,
                                                     std::stop_token stop,
