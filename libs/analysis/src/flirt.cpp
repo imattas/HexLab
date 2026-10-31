@@ -739,6 +739,45 @@ Result<FlirtRecognition> recognize_flirt_catalogs(const Image &image, const Byte
             match.ambiguous = distinct_names.size() > 1;
             result.functions.push_back(std::move(match));
         }
+
+        // Rank catalog support only after reference grounding and candidate
+        // consolidation. A raw pattern hit is not library evidence by itself.
+        result.libraries.reserve(catalogs.size());
+        for (std::size_t catalog_index = 0; catalog_index < catalogs.size(); ++catalog_index) {
+            const auto &catalog = catalogs[catalog_index];
+            result.libraries.push_back({catalog_index,
+                catalog.library_name_bytes.empty() ? catalog.provenance : catalog.library_name_bytes,
+                catalog.provenance, 0, 0, 0, 0});
+        }
+        for (const auto &function : result.functions) {
+            check_stop(stop);
+            std::set<std::size_t> sources;
+            std::set<std::string> names;
+            for (const auto &candidate : function.candidates) {
+                require(candidate.catalog_index < result.libraries.size(),
+                        "FLIRT candidate has an invalid catalog index");
+                sources.insert(candidate.catalog_index);
+                names.insert(candidate.name);
+            }
+            for (const auto catalog_index : sources) {
+                auto &summary = result.libraries[catalog_index];
+                ++summary.matched_functions;
+                const bool catalog_ambiguous = function.ambiguous || sources.size() != 1 || names.size() != 1;
+                if (catalog_ambiguous) ++summary.ambiguous_functions;
+                else ++summary.uniquely_attributed_functions;
+            }
+            for (const auto &candidate : function.candidates) {
+                auto &summary = result.libraries[candidate.catalog_index];
+                require(candidate.matching_patterns <= UINT64_MAX - summary.supporting_patterns,
+                        "FLIRT catalog pattern-support count overflow", ErrorCode::overflow);
+                summary.supporting_patterns += candidate.matching_patterns;
+            }
+        }
+        std::stable_sort(result.libraries.begin(), result.libraries.end(), [](const auto &left, const auto &right) {
+            if (left.uniquely_attributed_functions != right.uniquely_attributed_functions)
+                return left.uniquely_attributed_functions > right.uniquely_attributed_functions;
+            return left.matched_functions > right.matched_functions;
+        });
         return result;
     });
 }

@@ -200,6 +200,19 @@ the dialog. Recognition evidence is stored in the project's analysis cache;
 the scan can be repeated after changing catalogs or project analysis. The
 desktop workflow does not rename functions.
 
+The `recognize_flirt_catalogs` API also returns per-catalog support summaries,
+including catalogs with zero matches. Summaries are ranked by uniquely
+attributed functions and then by all matched functions, with ties retaining
+input catalog order. A function contributes as uniquely attributed only when
+its grounded candidates come from one catalog and agree on one name; duplicate
+matching patterns do not inflate this function count. Embedded `.sig`
+library-name bytes are used as the summary identity when present, otherwise
+the caller-supplied provenance is used. These counts are comparative evidence,
+not a calibrated confidence or a claim that the catalog's library is present:
+common code, compiler variation, and catalogs sharing signatures can all
+produce misleading support. Summaries do not change per-function ambiguity or
+rename eligibility.
+
 The analysis API also imports the human-readable FLAIR `.pat` format with
 `parse_flirt_pat`. The caller supplies the architecture, execution mode, and
 catalog provenance because `.pat` lines do not carry those fields. Each
