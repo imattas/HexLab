@@ -207,7 +207,11 @@ live X snapshot, including its adjusted value, when the resulting depth remains
 in range. Other indexed page-one bases such as `$0101,X` or `$0101,Y` can cross
 into page two for some S values, so they remain unresolved and make stack
 analysis partial. The analyzer does not infer arbitrary index values or
-indirect stack addresses.
+indirect stack addresses. Immediate `ADC`/`SBC` preserves a tracked stack alias
+only after `CLD` proves binary mode; entry state, `SED`, and decimal state
+restored by `PLP`/`RTI` remain unknown or decimal and therefore invalidate that
+arithmetic alias. A call also invalidates the known decimal state because the
+callee may change it.
 
 Entry-relative NMOS 6502 stack slots are emitted only while their net byte
 offset is in `[-127,127]`. Although the hardware stack wraps within page one,
