@@ -14,9 +14,10 @@ The MOS6502 fallback also supplements Capstone's implicit-register read/write
 sets for common base instructions. Instruction IDs identify A/X/Y/SP dataflow,
 status-register updates and branch-condition reads for arithmetic, logic,
 loads/stores, compares, shifts, increments, transfers, stack operations and
-conditional branches. Since the status register is represented as one byte,
-instructions that change only selected flags report both a status read and
-write. These access facts do not provide flag formulas or executable semantics.
+conditional branches. This includes the 65C02 PHX/PHY/PLX/PLY stack operations.
+Since the status register is represented as one byte, instructions that change
+only selected flags report both a status read and write. These access facts do
+not provide flag formulas or executable semantics.
 
 The `hexlab_cli disassemble --json` instruction rows include `flow`, `memory_read`, `memory_write`, and `operand_access` alongside address, bytes, and formatted text. `operand_access` preserves the decoded operand order and reports `read`, `write`, `read_write`, or `address`, making conservative fallback facts inspectable without interpreting display text. Capstone detail may omit access information in diet builds; access-dependent operands are omitted in that case. Unsupported register names and operand types are omitted. No opcode semantics, exact stack addresses or widths, branch-likely annul rules, precise condition expressions, or architecture-specific state transitions are inferred here.
 

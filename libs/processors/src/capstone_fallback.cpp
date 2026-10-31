@@ -692,8 +692,12 @@ void apply_capstone_detail(csh handle, const cs_insn& insn, Instruction& out, Ar
         case MOS65XX_INS_TSX: read_reg(4); write_reg(1); update_status(); break;
         case MOS65XX_INS_TXS: read_reg(1); write_reg(4); break;
         case MOS65XX_INS_PHA: read_reg(0); break;
+        case MOS65XX_INS_PHX: read_reg(1); break;
+        case MOS65XX_INS_PHY: read_reg(2); break;
         case MOS65XX_INS_PHP: read_status(); break;
         case MOS65XX_INS_PLA: write_reg(0); update_status(); break;
+        case MOS65XX_INS_PLX: write_reg(1); update_status(); break;
+        case MOS65XX_INS_PLY: write_reg(2); update_status(); break;
         case MOS65XX_INS_PLP: case MOS65XX_INS_RTI: write_status(); break;
         case MOS65XX_INS_BRK: read_status(); break;
         default: break;
@@ -701,9 +705,11 @@ void apply_capstone_detail(csh handle, const cs_insn& insn, Instruction& out, Ar
         bool stack_read = false, stack_write = false;
         switch (insn.id) {
         case MOS65XX_INS_PHA: case MOS65XX_INS_PHP:
+        case MOS65XX_INS_PHX: case MOS65XX_INS_PHY:
         case MOS65XX_INS_JSR: case MOS65XX_INS_BRK:
             stack_write = true; break;
-        case MOS65XX_INS_PLA: case MOS65XX_INS_PLP:
+        case MOS65XX_INS_PLA: case MOS65XX_INS_PLX: case MOS65XX_INS_PLY:
+        case MOS65XX_INS_PLP:
         case MOS65XX_INS_RTS: case MOS65XX_INS_RTI:
             stack_read = true; break;
         default: break;
