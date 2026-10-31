@@ -8,17 +8,21 @@ event-sequence contract.
 The desktop Debugger view exposes this operation as **Step** beside Continue.
 It requires a pending stop event, resumes one instruction, and restarts the
 event poller so the next stop refreshes thread/register state and locals. The
-**Step** operation is instruction-level. **Step over** is also instruction-level:
-for a decoded call at the stopped PC it plants a one-shot software breakpoint
-at the fall-through instruction and continues; for other or unavailable
-instruction facts it performs one instruction step. A call-return breakpoint
-requires a fresh loaded image mapping, executable mapped fall-through bytes,
-and a free address with no existing breakpoint. Unsupported or ambiguous cases
-are reported or use the single-instruction fallback. Any intervening stop,
-thread change, or process change cancels the temporary run. Call-over continues
-only the thread that owns the pending event, leaving peers stopped. The
-Debugger view also offers a conservative source-level **Step out** operation,
-described below. Source-level step-over remains unsupported.
+**Step** is instruction-level. **Step over** first tries to stop at the next
+distinct source line within the same complete recovered function. It scans at
+most 16,384 instruction facts and performs at most 256 source-location
+lookups, requires unambiguous source locations and a fresh loaded-image
+mapping, and plants a one-shot software breakpoint at the next line. Functions
+with incomplete recovery, ambiguous or missing line
+records, or no later line use the instruction-level behavior: for a decoded
+call at the stopped PC it plants a one-shot breakpoint at the fall-through
+instruction; other or unavailable instruction facts perform one instruction
+step. A source-line or call-return breakpoint requires a free address with no
+existing breakpoint. A scan that reaches either bound reports the limit and
+leaves the target stopped. Any intervening stop, thread change, or process
+change cancels the temporary run. Step-over continues only the thread that
+owns the pending event, leaving peers stopped. The Debugger view also offers a
+conservative source-level **Step out** operation, described below.
 
 ## Source step-out
 
@@ -44,8 +48,7 @@ The implementation does not guess when frames are stale or unavailable,
 source-line records are absent or ambiguous, the caller crosses into another
 module, an existing breakpoint occupies the return address, or the target
 architecture is outside the recovered x86/x64/AArch64 frame path. In those
-cases it reports why source step-out cannot proceed. This does not establish
-source-level step-over support.
+cases it reports why source step-out cannot proceed.
 
 On Windows, when the pending event is an `INT3` at a software breakpoint owned
 by the backend, stepping temporarily restores the byte saved when that

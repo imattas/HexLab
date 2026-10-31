@@ -40,6 +40,7 @@
 #include <deque>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <tuple>
 #include <thread>
 #include <atomic>
@@ -2296,21 +2297,25 @@ void DebuggerView::poll_event() {
         if (!cleanup_error || !same_process || received.kind == debugger::EventKind::process_exited)
             source_step_out_target_.reset();
         if (breakpoint_hit) {
-            source_step_out_status = target.instruction_step_over
-                ? "Step over reached the instruction after the call."
-                : "Source step-out reached " + target.source_location + ".";
+            source_step_out_status = target.source_step_over
+                ? "Source step-over reached " + target.source_location + "."
+                : target.instruction_step_over ? "Step over reached the instruction after the call."
+                                               : "Source step-out reached " + target.source_location + ".";
         } else if (!same_process || received.kind == debugger::EventKind::process_exited) {
-            source_step_out_status = target.instruction_step_over
-                ? "Step over canceled because its process exited or changed."
-                : "Source step-out canceled because its process exited or changed.";
+            source_step_out_status = target.source_step_over
+                ? "Source step-over canceled because its process exited or changed."
+                : target.instruction_step_over ? "Step over canceled because its process exited or changed."
+                                               : "Source step-out canceled because its process exited or changed.";
         } else if (received.thread != target.thread) {
-            source_step_out_status = target.instruction_step_over
-                ? "Step over canceled by a stop in a different thread."
-                : "Source step-out canceled by a stop in a different thread.";
+            source_step_out_status = target.source_step_over
+                ? "Source step-over canceled by a stop in a different thread."
+                : target.instruction_step_over ? "Step over canceled by a stop in a different thread."
+                                               : "Source step-out canceled by a stop in a different thread.";
         } else {
-            source_step_out_status = target.instruction_step_over
-                ? "Step over canceled by an intervening target stop."
-                : "Source step-out canceled by an intervening target stop.";
+            source_step_out_status = target.source_step_over
+                ? "Source step-over canceled by an intervening target stop."
+                : target.instruction_step_over ? "Step over canceled by an intervening target stop."
+                                               : "Source step-out canceled by an intervening target stop.";
         }
         if (cleanup_error) *source_step_out_status += " Temporary breakpoint cleanup failed: " + cleanup_error->message;
         if (same_process && received.kind != debugger::EventKind::process_exited) refresh_breakpoints();
@@ -2600,8 +2605,8 @@ void DebuggerView::step_event() {
 
 void DebuggerView::step_out_event() {
     if (source_step_out_target_) {
-        report(source_step_out_target_->instruction_step_over
-            ? "A step-over is already waiting for the call to return or another stop event."
+        report(source_step_out_target_->source_step_over || source_step_out_target_->instruction_step_over
+            ? "A step-over is already waiting for its destination or another stop event."
             : "A source step-out is already waiting for its caller location or another stop event.");
         return;
     }
@@ -2734,8 +2739,8 @@ void DebuggerView::step_out_event() {
 
 void DebuggerView::step_over_event() {
     if (source_step_out_target_) {
-        report(source_step_out_target_->instruction_step_over
-            ? "A step-over is already waiting for the call to return or another stop event."
+        report(source_step_out_target_->source_step_over || source_step_out_target_->instruction_step_over
+            ? "A step-over is already waiting for its destination or another stop event."
             : "A source step-out is already waiting for its caller location or another stop event.");
         return;
     }
@@ -2783,6 +2788,128 @@ void DebuggerView::step_over_event() {
     if (!image_pc) {
         step_event();
         return;
+    }
+    // Prefer a source-level stop at the next distinct line in the same
+    // recovered function. The scan is deliberately capped; if source facts
+    // are absent, ambiguous, or too large, the instruction-level path below
+    // remains available.
+    const auto current_source = symbolize_debugger_address(*document->project, image,
+        last_event_snapshot_->address, mapping->runtime_base, mapping->size);
+    if (current_source && current_source->function_entry && current_source->source_location) {
+        const auto line_key = [](std::string_view location) {
+            constexpr std::string_view inline_suffix = " (inline)";
+            if (location.ends_with(inline_suffix)) location.remove_suffix(inline_suffix.size());
+            const auto last = location.rfind(':');
+            if (last == std::string_view::npos) return std::string(location);
+            std::uint64_t column = 0;
+            const auto column_text = location.substr(last + 1);
+            const auto column_parse = std::from_chars(column_text.data(), column_text.data() + column_text.size(), column);
+            if (column_text.empty() || column_parse.ec != std::errc{} || column_parse.ptr != column_text.data() + column_text.size())
+                return std::string(location);
+            const auto previous = location.rfind(':', last - 1);
+            if (previous == std::string_view::npos) return std::string(location);
+            std::uint64_t line = 0;
+            const auto line_text = location.substr(previous + 1, last - previous - 1);
+            const auto line_parse = std::from_chars(line_text.data(), line_text.data() + line_text.size(), line);
+            if (line_text.empty() || line_parse.ec != std::errc{} || line_parse.ptr != line_text.data() + line_text.size())
+                return std::string(location);
+            return std::string(location.substr(0, last));
+        };
+        const auto current_line = line_key(*current_source->source_location);
+        const auto function = std::find_if(document->project->functions->functions.begin(),
+            document->project->functions->functions.end(), [&](const auto &candidate) {
+                return candidate && candidate->entry == *current_source->function_entry;
+            });
+        if (function != document->project->functions->functions.end() && (*function)->complete &&
+            (*function)->blocks.size() <= 4096) {
+            std::unordered_map<std::uint64_t, std::shared_ptr<const BasicBlock>> blocks;
+            blocks.reserve(document->project->functions->blocks.size());
+            for (const auto &block : document->project->functions->blocks)
+                if (block) blocks.emplace(block->id.value, block);
+            std::optional<std::pair<Address, std::string>> next_source;
+            std::size_t inspected = 0, line_lookups = 0;
+            bool exhausted = false;
+            for (const auto block_id : (*function)->blocks) {
+                const auto found_block = blocks.find(block_id.value);
+                if (found_block == blocks.end()) continue;
+                for (const auto &candidate : found_block->second->instructions) {
+                    if (++inspected > 16384) { exhausted = true; break; }
+                    if (!candidate || candidate->instruction.address.space != image_pc->space ||
+                        candidate->instruction.address.offset <= image_pc->offset) continue;
+                    if (next_source && candidate->instruction.address.offset >= next_source->first.offset) continue;
+                    if (++line_lookups > 256) { exhausted = true; break; }
+                    const auto runtime = mapping->to_runtime(image, candidate->instruction.address);
+                    if (!runtime) continue;
+                    const auto symbol = symbolize_debugger_address(*document->project, image, *runtime,
+                        mapping->runtime_base, mapping->size);
+                    if (!symbol || symbol->function_entry != current_source->function_entry || !symbol->source_location ||
+                        line_key(*symbol->source_location) == current_line) continue;
+                    next_source = std::pair{candidate->instruction.address, *symbol->source_location};
+                }
+                if (exhausted) break;
+            }
+            if (exhausted) {
+                report("Source step-over stopped at its 16,384-instruction or 256-source-location lookup bound; use instruction stepping for this function.");
+                return;
+            }
+            if (next_source) {
+                const auto runtime = mapping->to_runtime(image, next_source->first);
+                if (!runtime || *runtime <= last_event_snapshot_->address) {
+                    report("Source step-over destination does not round-trip through the current module mapping.");
+                    return;
+                }
+                if (std::any_of(existing_breakpoints.begin(), existing_breakpoints.end(), [&](const auto &breakpoint) {
+                        return breakpoint.address == *runtime;
+                    })) {
+                    report("Source step-over cannot reuse a user breakpoint at the next source line.");
+                    return;
+                }
+                auto added = [&] {
+                    std::lock_guard lock(inspection_state_->backend_mutex);
+                    return session_->add_breakpoint(*runtime, debugger::BreakpointKind::software);
+                }();
+                if (!added) {
+                    report("Could not arm source step-over at the next source line: " +
+                        wxString::FromUTF8(added.error().message));
+                    return;
+                }
+                auto one_shot = [&] {
+                    std::lock_guard lock(inspection_state_->backend_mutex);
+                    return session_->set_breakpoint_one_shot(added.value().id, true);
+                }();
+                if (!one_shot) {
+                    std::lock_guard lock(inspection_state_->backend_mutex);
+                    (void)session_->remove_breakpoint(added.value().id);
+                    report("Could not configure the next-line breakpoint as one-shot: " +
+                        wxString::FromUTF8(one_shot.error().message));
+                    return;
+                }
+                auto continued = [&] {
+                    std::lock_guard lock(inspection_state_->backend_mutex);
+                    return session_->continue_thread_execution(*pending_event_, *pending_event_thread_,
+                        debugger::ContinueStatus::handled);
+                }();
+                if (!continued) {
+                    std::lock_guard lock(inspection_state_->backend_mutex);
+                    (void)session_->remove_breakpoint(added.value().id);
+                    report("Could not continue to the next source line: " + wxString::FromUTF8(continued.error().message));
+                    return;
+                }
+                source_step_out_target_ = SourceStepOutTarget{added.value().id, process->id, *pending_event_thread_,
+                    document->id, document->revision, *runtime, next_source->second, false, true};
+                pending_event_.reset();
+                pending_event_thread_.reset();
+                invalidate_frames();
+                ++register_request_;
+                refresh_state();
+                refresh_breakpoints();
+                refresh_threads(selected_register_thread_);
+                poll_timer_.Start(100);
+                report("Source step-over armed for " + wxString::FromUTF8(next_source->second) +
+                    "; another stop event cancels the operation.");
+                return;
+            }
+        }
     }
     const auto &facts = document->project->functions->instructions;
     const auto fact = std::find_if(facts.begin(), facts.end(), [&](const auto &candidate) {
@@ -2878,7 +3005,7 @@ bool DebuggerView::cancel_source_step_out() {
         }
     }
     if (cleanup_error) {
-        report((target.instruction_step_over
+        report((target.source_step_over || target.instruction_step_over
             ? "Could not remove the temporary step-over breakpoint: "
             : "Could not remove the temporary source step-out breakpoint: ") +
             wxString::FromUTF8(cleanup_error->message));
