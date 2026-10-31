@@ -1525,8 +1525,105 @@ void Recovery::seed_roots() {
                 load_base = segment.begin.offset;
                 break;
             }
-        for (const auto &function : metadata.pe->arm64_exception_functions) {
+        const auto &arm64_functions = metadata.pe->arm64_exception_functions;
+        std::vector<bool> linked_jump_islands(arm64_functions.size(), false);
+        // ARM64 pdata links describe jump islands that inherit unwind state
+        // from a parent function. Keep those islands as chunks of the parent
+        // instead of inventing separate function roots for linker veneers.
+        for (std::size_t index = 0; index < arm64_functions.size(); ++index) {
             canceled();
+            const auto &fragment = arm64_functions[index];
+            if (fragment.kind != PeArm64UnwindKind::pdata_link) continue;
+            std::array<std::size_t, 32> visited{};
+            std::size_t visited_count = 0;
+            const PeArm64RuntimeFunction *parent = &fragment;
+            bool valid_parent = true;
+            for (std::size_t depth = 0; parent->kind == PeArm64UnwindKind::pdata_link; ++depth) {
+                if (depth >= 32 || !parent->linked_record_index ||
+                    *parent->linked_record_index >= arm64_functions.size()) {
+                    valid_parent = false;
+                    break;
+                }
+                const auto parent_index = *parent->linked_record_index;
+                const auto visited_end = visited.begin() + visited_count;
+                if (std::find(visited.begin(), visited_end, parent_index) != visited_end) {
+                    valid_parent = false;
+                    break;
+                }
+                visited[visited_count++] = parent_index;
+                parent = &arm64_functions[parent_index];
+            }
+            const auto fragment_offset = checked_add(load_base, fragment.begin_rva);
+            if (!valid_parent || !fragment_offset || parent == &fragment) {
+                output->complete = false;
+                linked_jump_islands[index] = true;
+                continue;
+            }
+            const auto parent_offset = checked_add(load_base, parent->begin_rva);
+            if (!parent_offset || parent_offset.value() == fragment_offset.value()) {
+                output->complete = false;
+                linked_jump_islands[index] = true;
+                continue;
+            }
+            // A pdata link does not carry an extent. Its source-backed extent
+            // is the interval up to the next strictly sorted runtime-function
+            // row, matching the interval used by the PE unwinder. An unbounded
+            // final row cannot be safely assigned to the parent.
+            if (index + 1 >= arm64_functions.size() ||
+                arm64_functions[index + 1].begin_rva <= fragment.begin_rva) {
+                output->complete = false;
+                linked_jump_islands[index] = true;
+                continue;
+            }
+            const auto fragment_size = std::uint64_t{arm64_functions[index + 1].begin_rva} - fragment.begin_rva;
+            const Address fragment_entry{image.layout().space.id, fragment_offset.value()};
+            const Address parent_entry{image.layout().space.id, parent_offset.value()};
+            const auto *segment = image.segment_at(fragment_entry);
+            if (!segment || !segment->executable || (fragment_entry.offset & 3u) != 0 ||
+                (fragment_size & 3u) != 0 || fragment_entry.offset < segment->begin.offset) {
+                output->complete = false;
+                linked_jump_islands[index] = true;
+                continue;
+            }
+            const auto relative = fragment_entry.offset - segment->begin.offset;
+            if (relative >= segment->file_size || fragment_size > segment->file_size - relative ||
+                relative >= segment->size || fragment_size > segment->size - relative ||
+                image.code_window(fragment_entry, fragment_size) != fragment_size ||
+                image.segment_at(Address{fragment_entry.space, fragment_entry.offset + fragment_size - 1}) != segment) {
+                output->complete = false;
+                linked_jump_islands[index] = true;
+                continue;
+            }
+            std::uint64_t source_size = 0;
+            std::optional<std::uint64_t> next_source_offset;
+            bool source_valid = !fragment.source.spans.empty();
+            for (const auto &span : fragment.source.spans) {
+                if (span.size == 0 || span.size > std::numeric_limits<std::uint64_t>::max() - span.offset.value ||
+                    span.size > std::numeric_limits<std::uint64_t>::max() - source_size ||
+                    (next_source_offset && span.offset.value != *next_source_offset)) {
+                    source_valid = false;
+                    break;
+                }
+                source_size += span.size;
+                next_source_offset = span.offset.value + span.size;
+            }
+            if (!source_valid || source_size != 8) {
+                output->complete = false;
+                linked_jump_islands[index] = true;
+                continue;
+            }
+            metadata_chunks[parent_entry].push_back({fragment_entry, fragment_size, {}});
+            FunctionSeed link_evidence{FunctionSeedKind::unwind, parent_entry, {}, {}};
+            link_evidence.unwind_evidence = FunctionSeedUnwindEvidence{
+                fragment.source.index, fragment.source.spans.front().offset.value, source_size};
+            root(std::move(link_evidence), false);
+            linked_jump_islands[index] = true;
+        }
+        for (std::size_t index = 0; index < arm64_functions.size(); ++index) {
+            canceled();
+            const auto &function = arm64_functions[index];
+            if (linked_jump_islands[index])
+                continue;
             const auto offset = checked_add(load_base, function.begin_rva);
             if (!offset) continue;
             const Address entry{image.layout().space.id, offset.value()};
