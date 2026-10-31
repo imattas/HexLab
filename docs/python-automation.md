@@ -89,10 +89,12 @@ The result reports completeness, candidate/comparison counts, and explicit
 ambiguity. Recognition does not rename functions or persist evidence.
 
 The sequence accepts 1..256 catalogs and at most 64 MiB of aggregate input,
-64 MiB of inflated catalog bodies, and 65,536 patterns. `expected_revision`
-checks the project's edit revision before the scan; any edit or source-byte
-change during the query raises `ProjectChangedDuringQuery`. `cancel` accepts a
-`CancellationToken` and raises `AnalysisCancelled` when requested.
+64 MiB of inflated catalog bodies, and 65,536 patterns. Candidate, comparison,
+reference-resolution, function, and result limits apply to the whole scan.
+`expected_revision` checks the project's edit revision before the scan; any
+edit or source-byte change during the query raises `ProjectChangedDuringQuery`.
+`cancel` accepts a `CancellationToken` and raises `AnalysisCancelled` without
+returning partial rows when requested.
 
 ```python
 catalogs = [

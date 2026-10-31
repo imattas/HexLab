@@ -1104,8 +1104,7 @@ PyObject* call_project(PyObject*,PyObject* args){return guarded([&]()->PyObject*
         if(!PyList_Check(selection)&&!PyTuple_Check(selection))invalid("catalogs must be a list or tuple");
         const auto selected_count=PySequence_Size(selection);
         if(selected_count<1||selected_count>256)invalid("catalogs must contain 1 through 256 entries");
-        struct CatalogInput { std::vector<std::byte> bytes; std::string provenance; };
-        std::vector<CatalogInput> inputs;inputs.reserve(static_cast<std::size_t>(selected_count));
+        std::vector<FlirtCatalogInput> inputs;inputs.reserve(static_cast<std::size_t>(selected_count));
         std::uint64_t aggregate_bytes=0;
         constexpr std::uint64_t max_catalog_bytes=64u*1024u*1024u;
         for(Py_ssize_t index=0;index<selected_count;++index){
@@ -1119,7 +1118,7 @@ PyObject* call_project(PyObject*,PyObject* args){return guarded([&]()->PyObject*
                 invalid("aggregate catalog bytes exceed 64 MiB");
             auto provenance=text(provenance_object);
             if(provenance.size()>256)invalid("catalog provenance exceeds 256 UTF-8 bytes");
-            CatalogInput input;input.bytes.resize(static_cast<std::size_t>(raw_size));
+            FlirtCatalogInput input;input.bytes.resize(static_cast<std::size_t>(raw_size));
             if(raw_size)std::memcpy(input.bytes.data(),raw,static_cast<std::size_t>(raw_size));
             input.provenance=std::move(provenance);aggregate_bytes+=static_cast<std::uint64_t>(raw_size);
             inputs.push_back(std::move(input));
@@ -1127,53 +1126,8 @@ PyObject* call_project(PyObject*,PyObject* args){return guarded([&]()->PyObject*
         const auto expected_revision=argument(values,1)==Py_None?std::optional<std::uint64_t>{}:
             std::optional<std::uint64_t>{strict_unsigned(argument(values,1),"expected_revision must be an unsigned integer, not bool")};
         const auto stop=argument(values,2)==Py_None?std::stop_token{}:stop_source(argument(values,2)).get_token();
-        auto recognition=take(without_gil([&]()->Result<FlirtRecognition>{
-            auto initial=p.snapshot();if(!initial)return initial.error();
-            const auto snapshot=initial.value();
-            if(expected_revision&&*expected_revision!=snapshot->state->revisions.edit)
-                return Error{ErrorCode::conflict,"FLAIR query expected a different project edit revision"};
-            if(!snapshot->loaded||!snapshot->loaded->image||!snapshot->effective||!snapshot->functions)
-                return Error{ErrorCode::invalid_argument,"FLAIR recognition requires a loaded image and recovered functions"};
-            std::vector<FlirtCatalog> catalogs;catalogs.reserve(inputs.size());
-            FlirtRecognitionLimits recognition_limits;
-            std::uint64_t inflated_bytes=0,pattern_count=0;
-            const auto &image=*snapshot->loaded->image;
-            for(const auto &input:inputs){
-                if(stop.stop_requested())return Error{ErrorCode::canceled,"FLAIR recognition canceled"};
-                FlirtCatalogLimits catalog_limits;
-                catalog_limits.max_inflated_bytes=static_cast<std::size_t>(
-                    std::max<std::uint64_t>(1,catalog_limits.max_inflated_bytes-inflated_bytes));
-                catalog_limits.max_patterns=static_cast<std::size_t>(std::min<std::uint64_t>(
-                    catalog_limits.max_patterns,recognition_limits.max_patterns-pattern_count));
-                const auto bytes=std::span<const std::byte>(input.bytes);
-                const auto data=std::string_view(input.bytes.empty()?"":reinterpret_cast<const char*>(input.bytes.data()),
-                                                 input.bytes.size());
-                Result<FlirtCatalog> parsed=Error{ErrorCode::unsupported,"Unsupported FLAIR catalog format"};
-                if(data.size()>=6&&data.substr(0,6)=="IDASGN")
-                    parsed=parse_flirt_sig(bytes,input.provenance,catalog_limits,stop);
-                else if(bytes.size()>=2&&bytes[0]==std::byte{0x1f}&&bytes[1]==std::byte{0x8b})
-                    parsed=parse_flirt_pat_gz(bytes,image.layout().architecture,image.layout().mode,
-                                               input.provenance,catalog_limits,stop);
-                else
-                    parsed=parse_flirt_pat(data,image.layout().architecture,image.layout().mode,
-                                            input.provenance,catalog_limits,stop);
-                if(!parsed)return parsed.error();
-                if(parsed.value().inflated_body_bytes>catalog_limits.max_inflated_bytes)
-                    return Error{ErrorCode::resource_limit,"FLAIR catalogs exceed aggregate inflated-byte limit"};
-                if(parsed.value().patterns.size()>recognition_limits.max_patterns-pattern_count)
-                    return Error{ErrorCode::resource_limit,"FLAIR catalogs exceed aggregate pattern limit"};
-                inflated_bytes+=parsed.value().inflated_body_bytes;
-                pattern_count+=parsed.value().patterns.size();
-                catalogs.push_back(std::move(parsed.value()));
-            }
-            auto result=recognize_flirt_catalogs(image,*snapshot->effective,*snapshot->functions,
-                                                  catalogs,recognition_limits,stop);
-            if(!result)return result.error();
-            auto current=p.snapshot();if(!current)return current.error();
-            if(current.value()->state->revisions.edit!=snapshot->state->revisions.edit||
-               current.value()->state->revisions.bytes!=snapshot->state->revisions.bytes)
-                return Error{ErrorCode::conflict,"Project changed during FLAIR recognition"};
-            return result.value();
+        auto recognition=take(without_gil([&] {
+            return p.recognize_flirt_catalogs(inputs,expected_revision,stop);
         }));
         Object output(PyDict_New()),functions(PyList_New(0));
         set(output,"complete",PyBool_FromLong(recognition.complete));

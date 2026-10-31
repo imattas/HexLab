@@ -32,8 +32,12 @@ The existing `recognize_flirt_catalog` overload remains available and behaves
 like a one-catalog set with index zero. There is no combined catalog file
 format; callers parse each `.pat`, `.pat.gz`, or `.sig` independently. The CLI
 accepts one catalog with `--definitions` or an ordered catalog list with
-`--definitions-list`. The desktop **Scan FLAIR Catalogs and Browse Results...**
-command also accepts an ordered multi-file selection and stores one evidence
-result for the entire set. Candidate `catalog_index` values refer to selection
-order, starting at zero. Neither the API nor desktop scan automatically renames
-functions; applying labels remains an explicit operation.
+`--definitions-list`; both commands share aggregate input, pattern, candidate,
+comparison, and result limits. The desktop **Scan FLAIR Catalogs and Browse
+Results...** command also accepts an ordered multi-file selection and stores
+one evidence result for the entire set. The Python automation API accepts
+ordered `(bytes, provenance)` pairs through `Project.recognize_flirt_catalogs()`
+and returns detached candidates without persisting evidence. Candidate
+`catalog_index` values refer to input order, starting at zero. Neither the
+read-only APIs nor desktop scan automatically rename functions; applying
+labels remains an explicit operation.

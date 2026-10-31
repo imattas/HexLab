@@ -313,7 +313,8 @@ matches against a representative third-party library corpus. Specificity and
 ambiguity are evidence only, so false-positive rates remain unmeasured.
 
 The project CLI exposes this recognition path without applying names or
-comments:
+comments. Use `--definitions` for one catalog or `--definitions-list` for an
+ordered set of catalog paths:
 
 ```text
 hexlab_cli project flirt target.hxproj --definitions library.pat --provenance "vendor SDK 1.2"
@@ -340,7 +341,8 @@ at 1,000,000 each, candidate and reference work at 67,108,864 each, and byte
 comparisons at 268,435,456. Lower per-invocation limits can be selected with
 the corresponding budget options.
 
-The desktop Analysis menu scan is available for a saved, writable project with
+The desktop Analysis menu scan accepts an ordered multi-file selection of
+`.pat`, `.pat.gz`, and `.sig` catalogs for a saved, writable project with
 current recovered functions. It parses and recognizes on a cancellable worker,
 stores source-bound evidence without renaming functions or editing comments,
 and opens the browsable results dialog when the scanned project is still

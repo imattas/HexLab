@@ -178,6 +178,77 @@ Result<std::vector<FunctionRecord>> Project::functions(std::size_t start,std::si
     for(auto i=std::min(start,rows.size()),end=i+std::min(count,rows.size()-i);i<end;++i)output.push_back(*rows[i]);
     return output;
 }
+Result<FlirtRecognition> Project::recognize_flirt_catalogs(
+    const std::vector<FlirtCatalogInput>& inputs,
+    std::optional<std::uint64_t> expected_revision, std::stop_token stop) const {
+    constexpr std::uint64_t max_input_bytes = 64u * 1024u * 1024u;
+    if (inputs.empty() || inputs.size() > 256)
+        return Error{ErrorCode::resource_limit,"FLAIR catalogs must contain 1 through 256 entries"};
+    std::uint64_t input_bytes = 0;
+    for (const auto& input : inputs) {
+        if (input.bytes.size() > max_input_bytes - input_bytes)
+            return Error{ErrorCode::resource_limit,"FLAIR catalog inputs exceed 64 MiB"};
+        if (input.provenance.size() > 256)
+            return Error{ErrorCode::resource_limit,"FLAIR catalog provenance exceeds 256 bytes"};
+        input_bytes += input.bytes.size();
+    }
+    if (stop.stop_requested()) return Error{ErrorCode::canceled,"FLAIR recognition canceled"};
+    auto initial = snapshot();
+    if (!initial) return initial.error();
+    const auto pinned = initial.value();
+    if (expected_revision && *expected_revision != pinned->state->revisions.edit)
+        return Error{ErrorCode::conflict,"FLAIR query expected a different project edit revision"};
+    auto valid = derived_ok(*pinned);
+    if (!valid) return valid.error();
+    if (!pinned->loaded || !pinned->loaded->image || !pinned->effective || !pinned->functions)
+        return Error{ErrorCode::invalid_argument,"FLAIR recognition requires a loaded image and recovered functions"};
+
+    const auto& image = *pinned->loaded->image;
+    FlirtRecognitionLimits recognition_limits;
+    std::vector<FlirtCatalog> catalogs;
+    catalogs.reserve(inputs.size());
+    std::uint64_t inflated_bytes = 0, pattern_count = 0, consumed_input_bytes = 0;
+    for (const auto& input : inputs) {
+        if (stop.stop_requested()) return Error{ErrorCode::canceled,"FLAIR recognition canceled"};
+        FlirtCatalogLimits limits;
+        limits.max_bytes = static_cast<std::size_t>(max_input_bytes - consumed_input_bytes);
+        limits.max_inflated_bytes = static_cast<std::size_t>(std::max<std::uint64_t>(
+            1, limits.max_inflated_bytes - inflated_bytes));
+        limits.max_patterns = static_cast<std::size_t>(std::min<std::uint64_t>(
+            limits.max_patterns, recognition_limits.max_patterns - pattern_count));
+        const auto bytes = std::span<const std::byte>(input.bytes);
+        const auto data = std::string_view(input.bytes.empty() ? "" :
+            reinterpret_cast<const char*>(input.bytes.data()), input.bytes.size());
+        Result<FlirtCatalog> parsed = Error{ErrorCode::unsupported,"Unsupported FLAIR catalog format"};
+        if (data.size() >= 6 && data.substr(0,6) == "IDASGN")
+            parsed = parse_flirt_sig(bytes,input.provenance,limits,stop);
+        else if (bytes.size() >= 2 && bytes[0] == std::byte{0x1f} && bytes[1] == std::byte{0x8b})
+            parsed = parse_flirt_pat_gz(bytes,image.layout().architecture,image.layout().mode,
+                                        input.provenance,limits,stop);
+        else
+            parsed = parse_flirt_pat(data,image.layout().architecture,image.layout().mode,
+                                     input.provenance,limits,stop);
+        if (!parsed) return parsed.error();
+        if (parsed.value().inflated_body_bytes > limits.max_inflated_bytes)
+            return Error{ErrorCode::resource_limit,"FLAIR catalogs exceed aggregate inflated-byte limit"};
+        if (parsed.value().patterns.size() > recognition_limits.max_patterns - pattern_count)
+            return Error{ErrorCode::resource_limit,"FLAIR catalogs exceed aggregate pattern limit"};
+        inflated_bytes += parsed.value().inflated_body_bytes;
+        pattern_count += parsed.value().patterns.size();
+        consumed_input_bytes += input.bytes.size();
+        catalogs.push_back(std::move(parsed.value()));
+    }
+    auto result = hexlab::recognize_flirt_catalogs(image,*pinned->effective,*pinned->functions,
+                                                   catalogs,recognition_limits,stop);
+    if (!result) return result.error();
+    if (stop.stop_requested()) return Error{ErrorCode::canceled,"FLAIR recognition canceled"};
+    auto current = snapshot();
+    if (!current) return current.error();
+    if (current.value()->state->revisions.edit != pinned->state->revisions.edit ||
+        current.value()->state->revisions.bytes != pinned->state->revisions.bytes)
+        return Error{ErrorCode::conflict,"Project changed during FLAIR recognition"};
+    return result.value();
+}
 Result<std::optional<FunctionRecord>> Project::function_at(Address address) const {
     auto s=snapshot();if(!s)return s.error();auto valid=derived_ok(*s.value());if(!valid)return valid.error();
     if(!s.value()->functions)return std::optional<FunctionRecord>{};

@@ -7,6 +7,7 @@
 #include "hexlab/workspace/search.hpp"
 #include "hexlab/analysis/graph.hpp"
 #include "hexlab/analysis/references.hpp"
+#include "hexlab/analysis/flirt.hpp"
 #include "hexlab/loaders/ar.hpp"
 #include <thread>
 
@@ -146,6 +147,11 @@ struct BackupListInfo {
     std::vector<BackupInfo> backups;
     bool complete = true;
 };
+// Caller-owned FLAIR bytes and provenance for a read-only ordered recognition query.
+struct FlirtCatalogInput {
+    std::vector<std::byte> bytes;
+    std::string provenance;
+};
 enum class DebugImportKind { symbols, dwarf };
 // Dry-run counts come from the same workspace validator used by the commit.
 // A read-only owner can preview; importing still requires a writable owner.
@@ -250,6 +256,11 @@ public:
     HEXLAB_AUTOMATION_EXPORT Result<std::vector<std::byte>> read(Location, std::size_t, std::stop_token={}) const;
     HEXLAB_AUTOMATION_EXPORT Result<Address> logical(X86LogicalAddress) const;
     HEXLAB_AUTOMATION_EXPORT Result<std::vector<FunctionRecord>> functions(std::size_t start=0, std::size_t count=256) const;
+    // Read-only recovered-function recognition over caller-supplied ordered
+    // FLAIR catalogs. Catalog order and duplicate inputs are preserved.
+    HEXLAB_AUTOMATION_EXPORT Result<FlirtRecognition> recognize_flirt_catalogs(
+        const std::vector<FlirtCatalogInput>&, std::optional<std::uint64_t> expected_revision={},
+        std::stop_token={}) const;
     HEXLAB_AUTOMATION_EXPORT Result<std::optional<FunctionRecord>> function_at(Address) const;
     HEXLAB_AUTOMATION_EXPORT Result<std::vector<FunctionOwnerCandidate>> function_owners(Address) const;
     // Build a bounded, detached direct-call neighborhood for the unique
