@@ -10901,6 +10901,13 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
             std::vector<const LiftedBlock *> yes_break_path;
             std::vector<const LiftedBlock *> no_break_path;
         };
+        struct NestedLatchTreeNode {
+            std::vector<const LiftedBlock *> path;
+            const Branch *condition = nullptr;
+            const LiftedBlock *tail = nullptr;
+            std::size_t true_child = 0;
+            std::size_t false_child = 0;
+        };
         struct NestedLoopBody {
             const LiftedBlock *header = nullptr;
             const LiftedBlock *exit = nullptr;
@@ -10918,6 +10925,13 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
             std::vector<LoopConditionalReturn> conditional_returns;
             std::vector<std::pair<const LiftedBlock *, bool>> conditional_continues;
             std::map<std::uint64_t, std::vector<const LiftedBlock *>> conditional_continue_paths;
+            // A final child-body decision tree may end at several distinct
+            // unconditional backedges instead of one linear-spine latch.
+            std::vector<NestedLatchTreeNode> latch_tree;
+            std::size_t latch_tree_root = 0;
+            std::set<std::uint64_t> latch_tree_blocks;
+            std::set<std::uint64_t> latch_tree_tails;
+            std::size_t latch_tree_join_phi_inputs = 0;
         };
         struct LoopSwitchArm {
             Address target{};
@@ -11976,6 +11990,120 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                                             continue;
                                         }
                                     }
+                                    // A child loop may finish with a decision
+                                    // tree whose disjoint arms all return to its
+                                    // header. Prove each leaf separately so its
+                                    // loop-carried phi copies stay on that edge.
+                                    const bool tree_root_is_join = std::any_of(candidate.conditional_joins.begin(),
+                                        candidate.conditional_joins.end(), [&](const auto &previous) {
+                                            return inner_current == previous.join;
+                                        });
+                                    const auto tree_root_predecessor = candidate.body.empty() ? body->id.value :
+                                        candidate.body.back()->id.value;
+                                    std::size_t tree_root_phi_inputs = 0;
+                                    std::set<std::string> tree_root_destinations;
+                                    bool tree_root_phis_valid = inner_current->phis.size() <= 4096 &&
+                                        (inner_current->phis.empty() || tree_root_is_join);
+                                    for (const auto &phi : inner_current->phis) {
+                                        if (!tree_root_phis_valid) break;
+                                        const auto &expected = diamond_predecessors[inner_current->id.value];
+                                        if (phi.inputs.size() != expected.size() ||
+                                            phi.inputs.size() > 65536 - tree_root_phi_inputs ||
+                                            !tree_root_destinations.insert(register_name(phi.destination, phi.version)).second) {
+                                            tree_root_phis_valid = false;
+                                            break;
+                                        }
+                                        tree_root_phi_inputs += phi.inputs.size();
+                                        std::set<std::uint64_t> seen;
+                                        for (const auto &input : phi.inputs)
+                                            if (!expected.contains(input.predecessor.value) ||
+                                                !seen.insert(input.predecessor.value).second)
+                                                tree_root_phis_valid = false;
+                                        if (seen != expected) tree_root_phis_valid = false;
+                                    }
+                                    if (diamond_cfg_valid && tree_root_phis_valid &&
+                                        (tree_root_is_join || diamond_predecessors[inner_current->id.value] ==
+                                            std::set<std::uint64_t>{tree_root_predecessor})) {
+                                        std::vector<NestedLatchTreeNode> tree;
+                                        std::set<std::uint64_t> tree_blocks, tree_tails;
+                                        std::function<std::optional<std::size_t>(Address, const LiftedBlock *, unsigned)> trace_tree;
+                                        trace_tree = [&](Address start, const LiftedBlock *predecessor,
+                                                         unsigned depth) -> std::optional<std::size_t> {
+                                            if (depth >= max_loop_child_depth || tree.size() >= 127) return {};
+                                            NestedLatchTreeNode node;
+                                            if (start == body->begin) {
+                                                if (!predecessor || tree_tails.size() >= 64 ||
+                                                    !tree_tails.insert(predecessor->id.value).second) return {};
+                                                node.tail = predecessor;
+                                                const auto index = tree.size();
+                                                tree.push_back(std::move(node));
+                                                return index;
+                                            }
+                                            auto *cursor = find_block(start);
+                                            while (cursor && node.path.size() < 64) {
+                                                if (cursor == body || cursor == candidate.exit || cursor == entry ||
+                                                    cursor == header || cursor == exit_block ||
+                                                    loop_body_ids.contains(cursor->id.value) ||
+                                                    inner_ids.contains(cursor->id.value) ||
+                                                    (cursor != inner_current && (!predecessor ||
+                                                        diamond_predecessors[cursor->id.value] !=
+                                                            std::set<std::uint64_t>{predecessor->id.value})) ||
+                                                    (!cursor->phis.empty() && cursor != inner_current) ||
+                                                    cursor->memory_phi || !cursor->memory_partition_phis.empty() ||
+                                                    cursor->switch_dispatch || contains_return(*cursor) ||
+                                                    !has_only_simple_statements(*cursor) ||
+                                                    !tree_blocks.insert(cursor->id.value).second) return {};
+                                                node.path.push_back(cursor);
+                                                if (const auto *test = terminal_conditional(*cursor)) {
+                                                    if (!test->true_target || !test->false_target ||
+                                                        *test->true_target == *test->false_target ||
+                                                        cursor->successors.size() != 2 ||
+                                                        !conditional_edges_match_targets(*cursor, *test)) return {};
+                                                    node.condition = test;
+                                                    const auto index = tree.size();
+                                                    tree.push_back(std::move(node));
+                                                    const auto yes = trace_tree(*test->true_target, cursor, depth + 1);
+                                                    const auto no = yes ? trace_tree(*test->false_target, cursor, depth + 1) :
+                                                        std::optional<std::size_t>{};
+                                                    if (!yes || !no) return {};
+                                                    tree[index].true_child = *yes;
+                                                    tree[index].false_child = *no;
+                                                    return index;
+                                                }
+                                                if (cursor->successors.size() != 1 || !cursor->successors.front().target ||
+                                                    (cursor->successors.front().kind != BlockEdgeKind::jump &&
+                                                     cursor->successors.front().kind != BlockEdgeKind::fallthrough) ||
+                                                    !has_unconditional_edge(*cursor, *cursor->successors.front().target)) return {};
+                                                const auto next = *cursor->successors.front().target;
+                                                if (next == body->begin) {
+                                                    if (tree_tails.size() >= 64 ||
+                                                        !tree_tails.insert(cursor->id.value).second) return {};
+                                                    node.tail = cursor;
+                                                    const auto index = tree.size();
+                                                    tree.push_back(std::move(node));
+                                                    return index;
+                                                }
+                                                predecessor = cursor;
+                                                cursor = find_block(next);
+                                            }
+                                            return {};
+                                        };
+                                        const auto tree_root = trace_tree(inner_current->begin, nullptr, 0);
+                                        if (tree_root && tree_tails.size() >= 2 && tree_tails.size() <= 64) {
+                                            for (const auto &node : tree)
+                                                for (const auto *tree_block : node.path) {
+                                                    candidate.body.push_back(tree_block);
+                                                    inner_ids.insert(tree_block->id.value);
+                                                }
+                                            candidate.latch_tree = std::move(tree);
+                                            candidate.latch_tree_root = *tree_root;
+                                            candidate.latch_tree_blocks = std::move(tree_blocks);
+                                            candidate.latch_tree_tails = std::move(tree_tails);
+                                            candidate.latch_tree_join_phi_inputs = tree_root_phi_inputs;
+                                            inner_current = body;
+                                            break;
+                                        }
+                                    }
                                     // Trace disjoint multi-block arms to their first
                                     // shared continuation, leaving that join in the
                                     // child chain so its effects execute once.
@@ -12039,8 +12167,10 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                                 inner_current = find_block(next);
                             }
                             const auto *inner_latch = candidate.body.empty() ? nullptr : candidate.body.back();
-                            candidate_valid = candidate_valid && inner_latch && inner_latch->successors.size() == 1 &&
-                                edge_targets(inner_latch->successors.front(), body->begin) &&
+                            const bool has_latch_tree = !candidate.latch_tree.empty();
+                            candidate_valid = candidate_valid && inner_latch &&
+                                (has_latch_tree || (inner_latch->successors.size() == 1 &&
+                                    edge_targets(inner_latch->successors.front(), body->begin))) &&
                                 candidate.exit->successors.size() == 1 && candidate.exit->successors.front().target &&
                                 *candidate.exit->successors.front().target != body->begin &&
                                 candidate.exit != inner_latch &&
@@ -12050,7 +12180,7 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                             if (candidate_valid && (!candidate.conditional_joins.empty() ||
                                 !candidate.conditional_breaks.empty() ||
                                 !candidate.conditional_returns.empty() ||
-                                !candidate.conditional_continues.empty())) {
+                                !candidate.conditional_continues.empty() || has_latch_tree)) {
                                 // Arm ownership alone is insufficient if an outside
                                 // edge can enter another block of the child body.
                                 // The sole entry is the child header's body edge.
@@ -12077,11 +12207,12 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                                         if (edge_targets(edge, candidate.exit->begin)) exit_predecessors.insert(source.id.value);
                                     }
                                 }
-                                // The header has one preheader and one latch. The
+                                // The header has one preheader and every proven
+                                // ordinary, continue-cleanup, or tree latch. The
                                 // exit has its failed header condition and any
                                 // explicitly recognized conditional-break edges.
-                                const bool has_latch_predecessor = header_predecessors.contains(inner_latch->id.value);
-                                std::set<std::uint64_t> child_backedges{inner_latch->id.value};
+                                auto child_backedges = candidate.latch_tree_tails;
+                                if (!has_latch_tree) child_backedges.insert(inner_latch->id.value);
                                 for (const auto &[branch, _] : candidate.conditional_continues)
                                 {
                                     const auto path = candidate.conditional_continue_paths.find(branch->id.value);
@@ -12098,11 +12229,24 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                                         path->second.empty() ? branch : path->second.back();
                                     expected_exit_predecessors.insert(tail->id.value);
                                 }
-                                if (!has_latch_predecessor || !has_all_backedges || header_predecessors.size() != 1 ||
+                                if (child_backedges.empty() || (has_latch_tree && child_backedges.size() > 64) ||
+                                    !has_all_backedges ||
+                                    header_predecessors.size() != 1 ||
                                     exit_predecessors != expected_exit_predecessors) candidate_valid = false;
                                 const auto preheader_id = header_predecessors.empty() ? 0 : *header_predecessors.begin();
+                                std::size_t child_phi_inputs = candidate.latch_tree_join_phi_inputs;
+                                std::set<std::string> child_phi_destinations;
+                                if (has_latch_tree && (body->phis.size() > 4096 || candidate.exit->phis.size() > 4096))
+                                    candidate_valid = false;
                                 for (const auto &phi : body->phis) {
+                                    if (!candidate_valid) break;
                                     if (phi.inputs.size() != child_backedges.size() + 1) { candidate_valid = false; break; }
+                                    if (has_latch_tree && (phi.inputs.size() > 65536 - child_phi_inputs ||
+                                        !child_phi_destinations.insert(register_name(phi.destination, phi.version)).second)) {
+                                        candidate_valid = false;
+                                        break;
+                                    }
+                                    if (has_latch_tree) child_phi_inputs += phi.inputs.size();
                                     const auto initial = std::find_if(phi.inputs.begin(), phi.inputs.end(), [&](const auto &input) {
                                         return input.predecessor.value == preheader_id;
                                     });
@@ -12127,10 +12271,18 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                                         break;
                                     }
                                 }
+                                child_phi_destinations.clear();
                                 for (const auto &phi : candidate.exit->phis) {
+                                    if (!candidate_valid) break;
                                     if (phi.inputs.size() != exit_predecessors.size()) {
                                         candidate_valid = false; break;
                                     }
+                                    if (has_latch_tree && (phi.inputs.size() > 65536 - child_phi_inputs ||
+                                        !child_phi_destinations.insert(register_name(phi.destination, phi.version)).second)) {
+                                        candidate_valid = false;
+                                        break;
+                                    }
+                                    if (has_latch_tree) child_phi_inputs += phi.inputs.size();
                                     std::set<std::uint64_t> seen_inputs;
                                     for (const auto &input : phi.inputs) {
                                         if (!exit_predecessors.contains(input.predecessor.value) ||
@@ -12452,6 +12604,30 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                     out << "                break;\n"
                         << "            }\n";
                     for (const auto *inner_block : region.body) {
+                        if (region.latch_tree_blocks.contains(inner_block->id.value)) {
+                            const auto &root = region.latch_tree[region.latch_tree_root];
+                            if (root.path.empty() || root.path.front() != inner_block) continue;
+                            const auto emit_latch_tree = [&](const auto &self, std::size_t index,
+                                                             unsigned indent) -> void {
+                                const auto &node = region.latch_tree[index];
+                                for (const auto *tree_block : node.path) emit_block(*tree_block, indent, true);
+                                if (!node.condition) {
+                                    if (const auto copies = region.backedge_phi_copies.find(node.tail->id.value);
+                                        copies != region.backedge_phi_copies.end())
+                                        emit_parallel_copies(out, copies->second, indent);
+                                    out << std::string(indent, ' ') << "continue;\n";
+                                    return;
+                                }
+                                const std::string prefix(indent, ' ');
+                                out << prefix << "if (" << branch_condition_text(*node.condition) << ") {\n";
+                                self(self, node.true_child, indent + 4);
+                                out << prefix << "} else {\n";
+                                self(self, node.false_child, indent + 4);
+                                out << prefix << "}\n";
+                            };
+                            emit_latch_tree(emit_latch_tree, region.latch_tree_root, 12);
+                            continue;
+                        }
                         const auto conditional = std::find_if(region.conditional_joins.begin(),
                             region.conditional_joins.end(), [&](const auto &candidate) {
                                 return candidate.branch == inner_block;
@@ -12538,9 +12714,10 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                         }
                         emit_block(*inner_block, 12, true);
                     }
-                    if (const auto copies = region.backedge_phi_copies.find(region.body.back()->id.value);
-                        copies != region.backedge_phi_copies.end())
-                        emit_parallel_copies(out, copies->second, 12);
+                    if (region.latch_tree.empty())
+                        if (const auto copies = region.backedge_phi_copies.find(region.body.back()->id.value);
+                            copies != region.backedge_phi_copies.end())
+                            emit_parallel_copies(out, copies->second, 12);
                     out << "        }\n";
                     continue;
                 }

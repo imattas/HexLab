@@ -36,6 +36,29 @@ arithmetic and arithmetic with unknown carry discard the accumulator copy.
 These rules preserve the relative slot identity without claiming to know the
 incoming hardware S value.
 
+In W65C02 mode, `PHX`/`PHY` and `PLX`/`PLY` participate in the same one-byte
+stack-depth and implicit-slot model as `PHA` and `PLA`. Pushes write the cell
+at the current S before decrementing S; pulls increment S before reading.
+Each access keeps the exact instruction address as its slot provenance.
+The native mode, register effects, and memory direction must agree before an
+index-stack opcode is used as evidence. A malformed or mismatched fact leaves
+the depth unknown and the analysis incomplete. Pulling X or Y discards that
+register's TSX-derived alias because stack byte values are not tracked; other
+register aliases survive. No matching push/pull value is assumed.
+
+W65C02 accumulator `INC A` and `DEC A` advance a TSX-derived accumulator copy
+by one while it stays inside the signed displacement window. Memory INC/DEC
+forms do not change the accumulator alias. Any other unmodeled explicit write
+to hardware S invalidates the current depth, so later implicit accesses cannot
+reuse a stale depth. A subsequent proven `TXS` may reestablish depth from an
+intact X snapshot, while the unsupported operation remains reported as partial.
+The combined entry-relative offset of a TSX-indexed slot must also fit the
+signed window; separately bounded frame and register deltas cannot justify a
+larger ambiguous slot offset.
+
+These CMOS operations follow the register-stack operations in the
+[WDC W65C02S datasheet](https://www.westerndesigncenter.com/documentation/w65c02s.pdf).
+
 This recovers balanced save/restore sequences without guessing the incoming
 hardware S value. It does not model cycle timing, interrupt interleavings, or
 stack-page wrapping across an unknown entry S value.

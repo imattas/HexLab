@@ -2080,6 +2080,8 @@ RegisterReferenceFacts non_x86_producer_facts(
                 }
             const bool a64_wide_move = architecture == Architecture::arm64 &&
                 (instruction.opcode == Opcode::a64_movz || instruction.opcode == Opcode::a64_movk);
+            const bool a64_division = architecture == Architecture::arm64 &&
+                (instruction.opcode == Opcode::a64_udiv || instruction.opcode == Opcode::a64_sdiv);
             const bool a64_wide_move_valid = !a64_wide_move ||
                 evaluate_a64_wide_move_instruction(instruction).has_value();
             const bool a64_wide_move_source_valid = !a64_wide_move ||
@@ -2101,9 +2103,9 @@ RegisterReferenceFacts non_x86_producer_facts(
                         definitions[register_key(destination)] = chain;
                     // A W write zero-extends into X; an X definition also
                     // determines its low W view. Keep both typed keys so a
-                    // subsequent wide move can consume only the matching
+                    // subsequent transform can consume only the matching
                     // architectural view without losing causal provenance.
-                    if (a64_wide_move) {
+                    if (a64_wide_move || (a64_division && address_definition)) {
                         const auto *destination = instruction.operands.empty() ? nullptr :
                             std::get_if<RegisterOperand>(&instruction.operands[0]);
                         if (destination && destination->bank == RegisterBank::arm64_gpr &&
@@ -2169,7 +2171,15 @@ RegisterReferenceFacts non_x86_producer_facts(
                 }
             }
 
-            for (const auto &reg : writes) state.erase(register_key(reg));
+            for (const auto &reg : writes) {
+                state.erase(register_key(reg));
+                if (a64_division && reg.bank == RegisterBank::arm64_gpr && reg.index < 31 &&
+                    (reg.width == 32 || reg.width == 64)) {
+                    const RegisterOperand alias{reg.bank, reg.index,
+                        static_cast<std::uint16_t>(reg.width == 32 ? 64 : 32), false};
+                    state.erase(register_key(alias));
+                }
+            }
             // A redefinition replaces the old chain rather than retaining it.
             for (const auto &[key, chain] : definitions) state[key] = chain;
         }
@@ -2878,6 +2888,33 @@ RegisterReferenceFacts riscv_reference_facts(const Image *image, const ElfMetada
     propagate_cfg_register_values<RegisterState>(functions, stop, result, process_block);
     return result;
 }
+bool a64_logical_instruction_valid(const Instruction &instruction, const RelocationCoverage &relocations) {
+    if (instruction.context != DecodeContext{Architecture::arm64, ExecutionMode::a64, ByteOrder::little} ||
+        instruction.length != 4 || !instruction.extended_bytes.empty() ||
+        instruction.flow != FlowKind::fallthrough || instruction.memory_read || instruction.memory_write ||
+        relocations.overlaps(instruction.address, instruction.length)) return false;
+    const auto decoded = decode_a64(std::span(instruction.bytes).first(4), instruction.address);
+    const auto *canonical = decoded.instruction ? &*decoded.instruction : nullptr;
+    if (!canonical || canonical->opcode != instruction.opcode ||
+        (canonical->operands.size() != 3 && canonical->operands.size() != 4) ||
+        instruction.operands.size() != canonical->operands.size() ||
+        instruction.access != canonical->access || instruction.register_reads != canonical->register_reads ||
+        instruction.register_writes != canonical->register_writes ||
+        instruction.direct_target != canonical->direct_target || instruction.condition != canonical->condition ||
+        instruction.delay_slots != canonical->delay_slots) return false;
+    for (std::size_t index = 0; index < canonical->operands.size(); ++index) {
+        if (const auto *expected = std::get_if<RegisterOperand>(&canonical->operands[index])) {
+            const auto *actual = std::get_if<RegisterOperand>(&instruction.operands[index]);
+            if (!actual || *actual != *expected) return false;
+        } else if (const auto *expected = std::get_if<ImmediateOperand>(&canonical->operands[index])) {
+            const auto *actual = std::get_if<ImmediateOperand>(&instruction.operands[index]);
+            if (!actual || actual->value != expected->value || actual->encoded_width != expected->encoded_width ||
+                actual->effective_width != expected->effective_width || actual->is_signed != expected->is_signed ||
+                actual->encoding != expected->encoding) return false;
+        } else return false;
+    }
+    return true;
+}
 RegisterReferenceFacts a64_reference_facts(const Image *image, const RelocationCoverage &relocations,
                                            const RelocationResolver &resolver,
                                            const FunctionSnapshot &functions, std::stop_token stop) {
@@ -2993,45 +3030,20 @@ RegisterReferenceFacts a64_reference_facts(const Image *image, const RelocationC
                     else nzcv.reset();
                 } else nzcv.reset();
                 nzcv_updated = true;
-            } else if ((instruction.opcode == Opcode::a64_ands || instruction.opcode == Opcode::a64_bics) &&
-                       (instruction.operands.size() == 3 || instruction.operands.size() == 4)) {
-                const auto *left = std::get_if<RegisterOperand>(&instruction.operands[1]);
-                const auto *right_reg = std::get_if<RegisterOperand>(&instruction.operands[2]);
+            } else if (instruction.opcode == Opcode::a64_ands || instruction.opcode == Opcode::a64_bics) {
+                // Reject the complete record before using its inputs or shift
+                // to establish flags for a subsequent conditional select.
+                const bool valid_logical = a64_logical_instruction_valid(instruction, relocations);
+                const auto *left = valid_logical ? std::get_if<RegisterOperand>(&instruction.operands[1]) : nullptr;
+                const auto *right_reg = valid_logical ? std::get_if<RegisterOperand>(&instruction.operands[2]) : nullptr;
                 const auto width = left ? left->width : 0;
                 const auto lhs = read_flag_operand(left, width);
-                auto rhs = immediate_value(instruction, 2);
+                auto rhs = valid_logical ? immediate_value(instruction, 2) : std::nullopt;
                 if (!rhs) rhs = read_flag_operand(right_reg, width);
-                bool valid_bics = instruction.opcode != Opcode::a64_bics;
-                if (instruction.opcode == Opcode::a64_bics &&
-                    (instruction.operands.size() == 3 || instruction.operands.size() == 4) &&
-                    analysis_detail::a64_packed_operand(instruction, 2)) {
-                    const auto *destination = std::get_if<RegisterOperand>(&instruction.operands[0]);
-                    const auto valid_reg = [&](const RegisterOperand *reg) {
-                        return reg && reg->width == width &&
-                            ((reg->bank == RegisterBank::arm64_gpr && reg->index < 31) ||
-                             (reg->bank == RegisterBank::arm64_zero && reg->index == 31));
-                    };
-                    std::vector<OperandAccess> expected_access{OperandAccess::write, OperandAccess::read,
-                        OperandAccess::read};
-                    if (instruction.operands.size() == 4) expected_access.push_back(OperandAccess::read);
-                    std::vector<RegisterOperand> expected_reads;
-                    for (const auto *reg : {left, right_reg})
-                        if (reg && reg->bank == RegisterBank::arm64_gpr) expected_reads.push_back(*reg);
-                    std::vector<RegisterOperand> expected_writes;
-                    if (destination && destination->bank == RegisterBank::arm64_gpr) expected_writes.push_back(*destination);
-                    expected_writes.push_back(RegisterOperand{RegisterBank::arm_flags, 0, 4, false});
-                    valid_bics = destination && valid_reg(destination) && valid_reg(left) && valid_reg(right_reg) &&
-                        (width == 32 || width == 64) && instruction.access == expected_access &&
-                        instruction.register_reads == expected_reads && instruction.register_writes == expected_writes;
-                    if (instruction.operands.size() == 4) {
-                        const auto *amount = std::get_if<ImmediateOperand>(&instruction.operands[3]);
-                        valid_bics = valid_bics && amount && amount->encoded_width == 6 &&
-                            amount->effective_width == width && !amount->is_signed && amount->value < width;
-                    }
-                }
                 if (rhs && right_reg && instruction.operands.size() == 4 && (width == 32 || width == 64)) {
                     const auto amount = immediate_value(instruction, 3);
-                    if (!amount || *amount >= width || instruction.bytes.size() != 4) rhs.reset();
+                    if (!amount || *amount >= width || instruction.length != 4 ||
+                        !instruction.extended_bytes.empty()) rhs.reset();
                     else {
                         std::uint32_t word = 0;
                         for (unsigned byte = 0; byte < 4; ++byte)
@@ -3048,7 +3060,7 @@ RegisterReferenceFacts a64_reference_facts(const Image *image, const RelocationC
                         else *rhs = shift ? ((*rhs >> shift) | (*rhs << (width - shift))) & mask : *rhs;
                     }
                 }
-                if (valid_bics && lhs && rhs && (width == 32 || width == 64)) {
+                if (valid_logical && lhs && rhs && (width == 32 || width == 64)) {
                     const auto mask = width == 32 ? UINT64_C(0xffffffff) : UINT64_MAX;
                     const auto value = instruction.opcode == Opcode::a64_bics
                         ? (*lhs & ~*rhs) & mask : (*lhs & *rhs) & mask;
@@ -3148,6 +3160,68 @@ RegisterReferenceFacts a64_reference_facts(const Image *image, const RelocationC
                 erase_written();
                 if (valid && value)
                     registers[destination->index] = Address{instruction.address.space, *value};
+                propagated = true;
+            } else if (instruction.opcode == Opcode::a64_udiv || instruction.opcode == Opcode::a64_sdiv) {
+                const auto *destination = instruction.operands.empty() ? nullptr :
+                    std::get_if<RegisterOperand>(&instruction.operands[0]);
+                std::optional<std::uint64_t> value;
+                if (instruction.context == DecodeContext{Architecture::arm64, ExecutionMode::a64, ByteOrder::little} &&
+                    instruction.length == 4 && instruction.extended_bytes.empty() &&
+                    instruction.flow == FlowKind::fallthrough && !instruction.memory_read && !instruction.memory_write &&
+                    !relocations.overlaps(instruction.address, instruction.length)) {
+                    // Division has no immediate form. Re-decode the bytes so
+                    // width, zero registers, and implicit W-to-X writes agree
+                    // with the operand/effect record before evaluating it.
+                    const auto decoded = decode_a64(std::span(instruction.bytes).first(4), instruction.address);
+                    const auto *canonical = decoded.instruction ? &*decoded.instruction : nullptr;
+                    bool valid = canonical && canonical->opcode == instruction.opcode &&
+                        instruction.operands.size() == 3 && canonical->operands.size() == 3 &&
+                        instruction.access == canonical->access &&
+                        instruction.register_reads == canonical->register_reads &&
+                        instruction.register_writes == canonical->register_writes &&
+                        instruction.direct_target == canonical->direct_target &&
+                        instruction.condition == canonical->condition && instruction.delay_slots == canonical->delay_slots;
+                    for (std::size_t index = 0; valid && index < 3; ++index) {
+                        const auto *actual = std::get_if<RegisterOperand>(&instruction.operands[index]);
+                        const auto *expected = std::get_if<RegisterOperand>(&canonical->operands[index]);
+                        valid = actual && expected && *actual == *expected;
+                    }
+                    if (valid && destination && destination->bank == RegisterBank::arm64_gpr && destination->index < 31) {
+                        const auto width = destination->width;
+                        const auto lhs = read_flag_operand(std::get_if<RegisterOperand>(&instruction.operands[1]), width);
+                        const auto rhs = read_flag_operand(std::get_if<RegisterOperand>(&instruction.operands[2]), width);
+                        if ((rhs && !*rhs) || (lhs && !*lhs)) {
+                            value = UINT64_C(0); // Both A64 division operations return zero for a zero divisor.
+                        } else if (lhs && rhs) {
+                            if (instruction.opcode == Opcode::a64_udiv) value = *lhs / *rhs;
+                            else if (width == 32) {
+                                const auto signed_lhs = static_cast<std::int64_t>(
+                                    std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(*lhs)));
+                                const auto signed_rhs = static_cast<std::int64_t>(
+                                    std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(*rhs)));
+                                value = static_cast<std::uint32_t>(signed_lhs / signed_rhs);
+                            } else {
+                                const auto signed_lhs = std::bit_cast<std::int64_t>(*lhs);
+                                const auto signed_rhs = std::bit_cast<std::int64_t>(*rhs);
+                                // The architectural overflow result is the
+                                // minimum signed value, rather than C++ UB.
+                                value = signed_lhs == std::numeric_limits<std::int64_t>::min() && signed_rhs == -1
+                                    ? *lhs : static_cast<std::uint64_t>(signed_lhs / signed_rhs);
+                            }
+                        }
+                    }
+                }
+                erase_written();
+                if (destination && destination->bank == RegisterBank::arm64_gpr && destination->index < 31) {
+                    registers.erase(destination->index);
+                    if (value) {
+                        const Address target{instruction.address.space, *value};
+                        registers[destination->index] = target;
+                        result.address_definitions.insert(fact->id);
+                        if (riscv_target_segment(*image, target, OperandAccess::address))
+                            result.immediate_targets[{fact->id, 2}] = target;
+                    }
+                }
                 propagated = true;
             }
             if ((instruction.opcode == Opcode::a64_csel || instruction.opcode == Opcode::a64_csinc ||
@@ -3423,18 +3497,20 @@ RegisterReferenceFacts a64_reference_facts(const Image *image, const RelocationC
                     ? std::get_if<ImmediateOperand>(&instruction.operands[3]) : nullptr;
                 const bool logical_flags = instruction.opcode == Opcode::a64_ands || instruction.opcode == Opcode::a64_bics;
                 const bool destination_valid = destination &&
+                    !destination->high_byte &&
                     (destination->width == 32 || destination->width == 64) &&
                     ((destination->bank == RegisterBank::arm64_gpr && destination->index < 31) ||
                      (destination->bank == RegisterBank::arm64_zero && destination->index == 31));
                 const auto logical_register_valid = [](const RegisterOperand *r, std::uint16_t width) {
-                    return r && r->width == width &&
+                    return r && !r->high_byte && r->width == width &&
                         ((r->bank == RegisterBank::arm64_gpr && r->index < 31) ||
                          (r->bank == RegisterBank::arm64_zero && r->index == 31));
                 };
                 const auto logical_operation = [&] {
                     if (!destination_valid || !logical_register_valid(source, destination->width) ||
+                        instruction.context != DecodeContext{Architecture::arm64, ExecutionMode::a64, ByteOrder::little} ||
                         instruction.flow != FlowKind::fallthrough || instruction.length != 4 ||
-                        instruction.bytes.size() != 4 || instruction.memory_read || instruction.memory_write ||
+                        !instruction.extended_bytes.empty() || instruction.memory_read || instruction.memory_write ||
                         relocations.overlaps(instruction.address, instruction.length)) return false;
                     std::uint32_t word = 0;
                     for (unsigned byte = 0; byte < 4; ++byte)
@@ -3480,7 +3556,8 @@ RegisterReferenceFacts a64_reference_facts(const Image *image, const RelocationC
                             expected_mask |= element << bit;
                         return third_immediate->value == expected_mask;
                     }
-                    if (!register_form || !logical_register_valid(third_register, destination->width))
+                    if (!register_form || !logical_register_valid(third_register, destination->width) ||
+                        ((word >> 16) & 31u) != third_register->index)
                         return false;
                     const unsigned shift_kind = (word >> 22) & 3u;
                     const unsigned amount = (word >> 10) & 63u;
@@ -3505,7 +3582,8 @@ RegisterReferenceFacts a64_reference_facts(const Image *image, const RelocationC
                 if (destination && destination->bank == RegisterBank::arm64_gpr)
                     expected_writes.push_back(*destination);
                 if (logical_flags) expected_writes.push_back(RegisterOperand{RegisterBank::arm_flags, 0, 4, false});
-                const bool valid_effects = valid_encoding && instruction.access == expected_access &&
+                const bool valid_effects = valid_encoding && a64_logical_instruction_valid(instruction, relocations) &&
+                    instruction.access == expected_access &&
                     instruction.register_reads == expected_reads && instruction.register_writes == expected_writes;
                 std::optional<std::uint64_t> lhs, rhs;
                 const auto get_value = [&](const RegisterOperand *r) -> std::optional<std::uint64_t> {
@@ -3561,6 +3639,8 @@ RegisterReferenceFacts a64_reference_facts(const Image *image, const RelocationC
                     target = Address{instruction.address.space, value};
                 }
                 erase_written();
+                if (destination && destination->bank == RegisterBank::arm64_gpr && destination->index < 31)
+                    registers.erase(destination->index);
                 if (valid_effects && destination && destination->bank == RegisterBank::arm64_gpr &&
                     destination->index < 31 && target) {
                     registers[destination->index] = *target;

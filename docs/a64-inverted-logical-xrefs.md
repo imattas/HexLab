@@ -18,3 +18,7 @@ The decoder preserves the four operations as distinct opcode identities.
 Logical-immediate encodings remain `AND`/`ORR`/`EOR`/`ANDS`; inversion here is
 specific to the shifted-register encoding. No SIMD/FP form, SP operand, unknown
 register input, or memory effect is inferred.
+
+Validation uses the instruction's four-byte encoded extent and checks the
+encoded Rm field as well as Rd/Rn, register widths, and effect lists. The fixed
+native byte buffer's capacity does not determine the instruction length.

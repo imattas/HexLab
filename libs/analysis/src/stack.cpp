@@ -4,6 +4,7 @@
 #include <array>
 #include <bit>
 #include <deque>
+#include <initializer_list>
 #include <map>
 #include <set>
 #include <tuple>
@@ -71,6 +72,39 @@ bool m6502_slot_offset_unambiguous(std::int64_t offset) noexcept {
     // this range, the 8-bit stack/index arithmetic can wrap to a cell already
     // represented by a different linear offset.
     return offset >= -127 && offset <= 127;
+}
+
+struct M6502IndexStackOperation {
+    bool push = false;
+    std::uint8_t index = 0;
+};
+
+std::optional<M6502IndexStackOperation> m6502_index_stack_operation(Opcode opcode) noexcept {
+    switch (opcode) {
+    case Opcode::m65c02_phx: return M6502IndexStackOperation{true, 1};
+    case Opcode::m65c02_phy: return M6502IndexStackOperation{true, 2};
+    case Opcode::m65c02_plx: return M6502IndexStackOperation{false, 1};
+    case Opcode::m65c02_ply: return M6502IndexStackOperation{false, 2};
+    default: return {};
+    }
+}
+
+bool m6502_index_stack_facts_valid(const Instruction &instruction, M6502IndexStackOperation operation) {
+    const RegisterOperand value{RegisterBank::mos6502, operation.index, 8, false};
+    const RegisterOperand status{RegisterBank::mos6502, 3, 8, false};
+    const RegisterOperand stack{RegisterBank::mos6502, 4, 8, false};
+    const auto exact_set = [](const auto &registers, std::initializer_list<RegisterOperand> expected) {
+        return registers.size() == expected.size() && std::all_of(expected.begin(), expected.end(),
+            [&](const auto &reg) { return std::count(registers.begin(), registers.end(), reg) == 1; });
+    };
+    return instruction.context.architecture == Architecture::mos6502 &&
+        instruction.context.mode == ExecutionMode::m65c02 && instruction.flow == FlowKind::fallthrough &&
+        instruction.operands.empty() && instruction.access.empty() &&
+        instruction.memory_write == operation.push && instruction.memory_read != operation.push &&
+        (operation.push ? exact_set(instruction.register_reads, {value, stack}) &&
+                          exact_set(instruction.register_writes, {stack})
+                        : exact_set(instruction.register_reads, {stack, status}) &&
+                          exact_set(instruction.register_writes, {value, stack, status}));
 }
 
 bool add(FlowValue &value, std::int64_t delta) {
@@ -632,6 +666,9 @@ bool transfer(const Instruction &instruction, FlowState &state) {
         case Opcode::m6502_rti:
             state.m6502_decimal_known = false;
             return true;
+        case Opcode::m6502_brk:
+            // Its three implicit pushes are modeled at the observation site.
+            return true;
         case Opcode::m6502_tsx: {
             // TSX gives X a stable, byte-wide snapshot of the hardware stack
             // pointer. Keep its entry-relative depth as a frame base until X
@@ -709,6 +746,35 @@ bool transfer(const Instruction &instruction, FlowState &state) {
                 state.supported = false;
                 return true;
             }
+        case Opcode::m6502_inc:
+        case Opcode::m6502_dec:
+            // W65C02 accumulator INC/DEC changes a copied TSX byte by one.
+            // The memory forms have no accumulator destination and continue
+            // through the ordinary memory-effect handling below.
+            if (first && first->bank == RegisterBank::mos6502 && first->index == 0) {
+                auto &alias = state.m6502_stack_alias_deltas[0];
+                if (instruction.context.mode != ExecutionMode::m65c02 ||
+                    *first != RegisterOperand{RegisterBank::mos6502, 0, 8, false} ||
+                    instruction.flow != FlowKind::fallthrough || instruction.operands.size() != 1 ||
+                    instruction.access.size() != 1 || instruction.access[0] != OperandAccess::read_write ||
+                    instruction.memory_read || instruction.memory_write ||
+                    instruction.register_reads.size() != 2 || instruction.register_writes.size() != 2 ||
+                    !has_register(instruction.register_reads, 0) || !has_register(instruction.register_reads, 3) ||
+                    !has_register(instruction.register_writes, 0) || !has_register(instruction.register_writes, 3)) {
+                    alias = {};
+                    state.m6502_decimal_known = false;
+                    state.supported = false;
+                    break; // Let unexpected register writes invalidate their state too.
+                }
+                if (alias.known && (!add_checked(alias.value,
+                        instruction.opcode == Opcode::m6502_inc ? 1 : -1, alias.value) ||
+                        !m6502_slot_offset_unambiguous(alias.value))) {
+                    alias = {};
+                    state.supported = false;
+                }
+                return true;
+            }
+            break;
         case Opcode::m6502_tax:
         case Opcode::m6502_tay:
         case Opcode::m6502_txa:
@@ -748,6 +814,24 @@ bool transfer(const Instruction &instruction, FlowState &state) {
         case Opcode::m6502_plp:
             state.m6502_decimal_known = false;
             return add(state.stack_depth, -1);
+        case Opcode::m65c02_phx:
+        case Opcode::m65c02_phy:
+        case Opcode::m65c02_plx:
+        case Opcode::m65c02_ply: {
+            const auto operation = *m6502_index_stack_operation(instruction.opcode);
+            if (!m6502_index_stack_facts_valid(instruction, operation)) {
+                state.stack_depth = {};
+                state.m6502_stack_alias_deltas = {};
+                state.m6502_carry_known = false;
+                state.m6502_decimal_known = false;
+                state.supported = false;
+                return true;
+            }
+            // Pulls overwrite the index with an unknown byte. No stack-value
+            // provenance is inferred from a preceding push, even if balanced.
+            if (!operation.push) state.m6502_stack_alias_deltas[operation.index] = {};
+            return add(state.stack_depth, operation.push ? 1 : -1);
+        }
         default:
             break;
         }
@@ -1522,6 +1606,9 @@ bool transfer(const Instruction &instruction, FlowState &state) {
         if (instruction.context.architecture == Architecture::mos6502 &&
             reg.bank == RegisterBank::mos6502 && reg.index < state.m6502_stack_alias_deltas.size())
             state.m6502_stack_alias_deltas[reg.index] = {};
+        if (instruction.context.architecture == Architecture::mos6502 &&
+            reg.bank == RegisterBank::mos6502 && reg.index == 4)
+            wrote_stack = true;
     }
     for (std::size_t i = 0; i < instruction.operands.size(); ++i) {
         if (i >= instruction.access.size() ||
@@ -1555,6 +1642,9 @@ bool transfer(const Instruction &instruction, FlowState &state) {
         if (instruction.context.architecture == Architecture::mos6502 && reg &&
             reg->bank == RegisterBank::mos6502 && reg->index < state.m6502_stack_alias_deltas.size())
             state.m6502_stack_alias_deltas[reg->index] = {};
+        if (instruction.context.architecture == Architecture::mos6502 && reg &&
+            reg->bank == RegisterBank::mos6502 && reg->index == 4)
+            wrote_stack = true;
     }
     if (wrote_stack) {
         state.stack_depth = {};
@@ -2498,17 +2588,22 @@ Result<StackFrameAnalysis> analyze_stack_frame(const FunctionRecord &function, c
                     }
                 }
             }
-            // NMOS 6502 pushes write at the current page-one stack address and
+            // 6502 pushes write at the current page-one stack address and
             // then decrement S; pulls increment S before reading. Map both
-            // sides to the same entry-SP-relative cell for balanced pairs.
+            // sides to the same entry-SP-relative cell for balanced pairs,
+            // including W65C02 index-register pushes and pulls.
+            const auto index_stack_operation = m6502_index_stack_operation(instruction.opcode);
             if (instruction.context.architecture == Architecture::mos6502 &&
                 (instruction.opcode == Opcode::m6502_pha || instruction.opcode == Opcode::m6502_php ||
-                 instruction.opcode == Opcode::m6502_pla || instruction.opcode == Opcode::m6502_plp)) {
-                if (!state.stack_depth.known) {
+                 instruction.opcode == Opcode::m6502_pla || instruction.opcode == Opcode::m6502_plp ||
+                 index_stack_operation)) {
+                if (!state.stack_depth.known || (index_stack_operation &&
+                    !m6502_index_stack_facts_valid(instruction, *index_stack_operation))) {
                     result.complete = false;
                 } else {
                     const bool push = instruction.opcode == Opcode::m6502_pha ||
-                                      instruction.opcode == Opcode::m6502_php;
+                                      instruction.opcode == Opcode::m6502_php ||
+                                      (index_stack_operation && index_stack_operation->push);
                     std::int64_t cell_depth = state.stack_depth.value;
                     if (!push && !add_checked(cell_depth, -1, cell_depth)) {
                         result.complete = false;
@@ -2595,7 +2690,8 @@ Result<StackFrameAnalysis> analyze_stack_frame(const FunctionRecord &function, c
                         continue;
                     }
                     std::int64_t offset = 0;
-                    if (!subtract_checked(delta.value, state.frame_depth.value, offset)) {
+                    if (!subtract_checked(delta.value, state.frame_depth.value, offset) ||
+                        !m6502_slot_offset_unambiguous(offset)) {
                         result.complete = false;
                         continue;
                     }

@@ -90,10 +90,11 @@ execute on the corresponding continue edge or at the normal latch. This keeps
 multiple recognized backedges distinct. When an edge supplies multiple phi
 values, temporary values capture every source before any destination is
 assigned, preserving simultaneous SSA updates such as loop-carried swaps.
-The nested-loop recognizer requires a single child latch and a unique
-preheader edge into the child header. Child-header phis are lowered as
-parallel initial copies on that preheader and parallel recurrent copies at the
-latch. Child-exit phis are supported when the only incoming edges are the
+The nested-loop recognizer accepts an ordinary child latch or a bounded final
+decision tree with distinct child latch tails, and requires a unique preheader
+edge into the child header. Child-header phis are lowered as parallel initial
+copies on that preheader and parallel recurrent copies at each latch.
+Child-exit phis are supported when the only incoming edges are the
 child header's condition-failure edge and recognized conditional-break edges.
 Each phi must have exactly one input for every such predecessor. The formatter
 emits those copies on the corresponding `break` edge, using parallel copies
@@ -113,7 +114,8 @@ next sequential diamond. Joins without register phis are accepted as well;
 tracing cuts both arms at their first shared block rather than requiring a phi
 or another branch to mark the continuation. A child region has one entry from
 its header and cannot absorb blocks already owned by its parent. Nested or
-overlapping child conditionals, side entries, empty arms, extra latches, or
+overlapping child conditionals, side entries, empty arms outside the final
+latch decision tree, unrecognized latches, or
 ambiguous join shapes use the state-machine/goto fallback. A conditional child
 `break` is accepted when exactly one explicit branch edge targets that child's
 exit and the other edge continues the traced child-body chain. The break block
@@ -129,7 +131,26 @@ input for every recognized continue edge and the ordinary latch edge; each
 back-edge copy is emitted immediately before its corresponding `continue` or
 the latch transfer. Conditional continues nested inside child diamonds,
 continue paths through side blocks, and other unrecognized back edges retain
-the fallback. A guarded return path from a pre-tested parent loop may end in a
+the fallback.
+
+A nested child's final body region may be a conditional decision tree whose
+leaves all transfer back to that child's header. Each arm follows a disjoint,
+phi-free straight-line path; it may also transfer directly from a conditional
+branch to the header. Every non-root tree block has exactly its traced predecessor, and
+the root must follow the proven child-body spine or a previously lowered child
+join. At most 64 distinct backedge tails, 127 tree nodes, 64 blocks per linear
+path, and 64 tree levels are accepted within the enclosing 1,024-block CFG
+budget. The complete child-header predecessor set must equal its unique
+preheader plus every ordinary continue edge and tree tail. Header, lowered
+root-join, and child-exit phis are limited to 4,096 each and 65,536 combined
+inputs for this shape; each
+phi must have exactly one input per proven incoming edge and a unique
+destination. Each leaf emits its own simultaneous header-phi copies before
+`continue`. Shared paths or tails, extra side entries or exits, return or
+nonreturn leaves, tree-block memory phis, and exhausted budgets retain the
+explicit fallback.
+
+A guarded return path from a pre-tested parent loop may end in a
 terminal return block with register phis when that return has exactly one CFG
 predecessor: the previous cleanup block or the guarded branch for a direct
 return. Every phi must have exactly one input from that predecessor, and the
