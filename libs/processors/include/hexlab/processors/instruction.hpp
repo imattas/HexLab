@@ -887,6 +887,10 @@ struct Instruction {
     std::vector<Operand> operands;
     std::vector<OperandAccess> access;
     std::vector<RegisterOperand> register_reads, register_writes;
+    // Optional x86 RFLAGS bit dependencies for instructions whose effects are
+    // narrower than the architectural FLAGS register. Unset means legacy
+    // whole-register facts remain the only available description.
+    std::optional<std::uint64_t> x86_flags_read_mask, x86_flags_write_mask;
     FlowKind flow = FlowKind::fallthrough;
     std::optional<Address> direct_target;
     std::optional<DexSwitchTable> dex_switch;

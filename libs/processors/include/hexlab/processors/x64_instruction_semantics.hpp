@@ -285,7 +285,9 @@ inline std::optional<X86AdxResult> evaluate_x86_adx_instruction(
         [](RegisterOperand reg) { return reg.bank == RegisterBank::flags; });
     const bool writes_flags = std::any_of(instruction.register_writes.begin(), instruction.register_writes.end(),
         [](RegisterOperand reg) { return reg.bank == RegisterBank::flags; });
-    if (!reads_flags || !writes_flags) return std::nullopt;
+    const std::uint64_t chain_flag = instruction.opcode == Opcode::adcx ? UINT64_C(1) : UINT64_C(1) << 11;
+    if (!reads_flags || !writes_flags || instruction.x86_flags_read_mask != chain_flag ||
+        instruction.x86_flags_write_mask != chain_flag) return std::nullopt;
     return evaluate_x86_adx(instruction.opcode == Opcode::adcx ? X86Adx::carry : X86Adx::overflow,
                             destination, source, incoming, destination_operand->width);
 }

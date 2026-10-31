@@ -149,5 +149,7 @@ void finish(State &s, std::string &reason) {
         add_register(s.i.register_reads, {RegisterBank::flags, 0, s.rules.pointer_width(), false});
     if (s.flags_write)
         add_register(s.i.register_writes, {RegisterBank::flags, 0, s.rules.pointer_width(), false});
+    s.i.x86_flags_read_mask = s.flags_read_mask;
+    s.i.x86_flags_write_mask = s.flags_write_mask;
 }
 } // namespace hexlab::x64_detail

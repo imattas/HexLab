@@ -56,6 +56,7 @@ struct State {
     std::uint8_t rex = 0, group1 = 0;
     bool operand_override = false, address_override = false, flags_read = false, flags_write = false,
          lock_allowed = false;
+    std::optional<std::uint64_t> flags_read_mask, flags_write_mask;
     std::optional<RegisterOperand> segment;
     Instruction i;
     explicit State(std::span<const std::byte> bytes, Address address, DecodeContext context)
