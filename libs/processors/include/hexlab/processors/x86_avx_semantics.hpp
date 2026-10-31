@@ -1241,6 +1241,72 @@ inline std::optional<X86OpmaskBooleanResult> evaluate_x86_opmask_boolean(
     return X86OpmaskBooleanResult{value & mask, static_cast<std::uint8_t>(width)};
 }
 
+// Value semantics for KADD, KSHIFT, and KUNPCK. Inputs are the decoded K
+// register values; KSHIFT's immediate is passed separately.
+inline std::optional<X86OpmaskBooleanResult> evaluate_x86_opmask_arithmetic(
+    const Instruction &instruction, std::uint64_t source1,
+    std::optional<std::uint64_t> source2 = std::nullopt,
+    std::optional<std::uint8_t> shift = std::nullopt) noexcept {
+    unsigned width = 0;
+    enum class Operation : std::uint8_t { add, left, right, unpack } operation{};
+    switch (instruction.opcode) {
+#define HEXLAB_KARITH_WIDTHS(prefix, op) \
+    case Opcode::prefix##b: width = 8; operation = Operation::op; break; \
+    case Opcode::prefix##w: width = 16; operation = Operation::op; break; \
+    case Opcode::prefix##d: width = 32; operation = Operation::op; break; \
+    case Opcode::prefix##q: width = 64; operation = Operation::op; break
+    HEXLAB_KARITH_WIDTHS(kadd, add);
+    case Opcode::kshiftlb: width = 8; operation = Operation::left; break;
+    case Opcode::kshiftlw: width = 16; operation = Operation::left; break;
+    case Opcode::kshiftld: width = 32; operation = Operation::left; break;
+    case Opcode::kshiftlq: width = 64; operation = Operation::left; break;
+    case Opcode::kshiftrb: width = 8; operation = Operation::right; break;
+    case Opcode::kshiftrw: width = 16; operation = Operation::right; break;
+    case Opcode::kshiftrd: width = 32; operation = Operation::right; break;
+    case Opcode::kshiftrq: width = 64; operation = Operation::right; break;
+#undef HEXLAB_KARITH_WIDTHS
+    case Opcode::kunpckbw: width = 16; operation = Operation::unpack; break;
+    case Opcode::kunpckwd: width = 32; operation = Operation::unpack; break;
+    case Opcode::kunpckdq: width = 64; operation = Operation::unpack; break;
+    default: return std::nullopt;
+    }
+    const bool unary = operation == Operation::left || operation == Operation::right;
+    if (instruction.context.architecture != Architecture::x86_64 ||
+        instruction.context.mode != ExecutionMode::x86_64 || instruction.flow != FlowKind::fallthrough ||
+        instruction.x86_evex || instruction.x86_opmask || instruction.x86_opmask_zeroing ||
+        instruction.memory_read || instruction.memory_write || instruction.operands.size() != 3 ||
+        instruction.access.size() != 3 || instruction.access[0] != OperandAccess::write ||
+        instruction.access[1] != OperandAccess::read || instruction.access[2] != OperandAccess::read ||
+        (!unary && !source2) || (unary != shift.has_value())) return std::nullopt;
+    const auto *destination = std::get_if<RegisterOperand>(&instruction.operands[0]);
+    const auto *first = std::get_if<RegisterOperand>(&instruction.operands[1]);
+    const auto *second = unary ? nullptr : std::get_if<RegisterOperand>(&instruction.operands[2]);
+    const auto *immediate = unary ? std::get_if<ImmediateOperand>(&instruction.operands[2]) : nullptr;
+    const auto valid_register = [](const RegisterOperand *reg) {
+        return reg && reg->bank == RegisterBank::opmask && reg->index < 8 && reg->width == 64 && !reg->high_byte;
+    };
+    if (!valid_register(destination) || !valid_register(first) ||
+        (unary && (!immediate || immediate->value != *shift || immediate->encoded_width != 8)) ||
+        (!unary && !valid_register(second)) ||
+        instruction.register_writes.size() != 1 || instruction.register_writes[0].bank != RegisterBank::opmask ||
+        instruction.register_writes[0].index != destination->index || instruction.register_writes[0].width != 64 ||
+        instruction.register_reads.size() != (unary ? 1u : 2u) || instruction.register_reads[0] != *first ||
+        (!unary && instruction.register_reads[1] != *second)) return std::nullopt;
+    const auto mask = width == 64 ? UINT64_MAX : (UINT64_C(1) << width) - 1;
+    std::uint64_t value = 0;
+    if (operation == Operation::add) value = (source1 + *source2) & mask;
+    else if (operation == Operation::left) value = *shift >= width ? 0 : (source1 & mask) << *shift;
+    else if (operation == Operation::right) value = *shift >= width ? 0 : (source1 & mask) >> *shift;
+    else {
+        const unsigned half_bytes = width / 16;
+        for (unsigned i = 0; i < half_bytes; ++i) {
+            value |= ((source1 >> (8 * i)) & 0xff) << (16 * i);
+            value |= ((*source2 >> (8 * i)) & 0xff) << (16 * i + 8);
+        }
+    }
+    return X86OpmaskBooleanResult{value & mask, static_cast<std::uint8_t>(width)};
+}
+
 inline std::optional<X86EvexIntegerResult> evaluate_x86_evex_popcount(
     const Instruction &instruction, const std::array<std::byte, 64> &source,
     const std::array<std::byte, 64> *old_destination = nullptr,

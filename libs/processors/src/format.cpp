@@ -470,6 +470,12 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
             "kortestb", "kortestw", "kortestd", "kortestq"};
         return names[static_cast<std::size_t>(op) - static_cast<std::size_t>(Opcode::ktestb)];
     }
+    if (op >= Opcode::kaddb && op <= Opcode::kunpckdq) {
+        static constexpr const char *names[]{"kaddb", "kaddw", "kaddd", "kaddq",
+            "kshiftlb", "kshiftlw", "kshiftld", "kshiftlq", "kshiftrb", "kshiftrw",
+            "kshiftrd", "kshiftrq", "kunpckbw", "kunpckwd", "kunpckdq"};
+        return names[static_cast<std::size_t>(op) - static_cast<std::size_t>(Opcode::kaddb)];
+    }
     if (op >= Opcode::movdqa && op <= Opcode::divsd) {
         static constexpr const char *names[]{"movdqa", "movdqu", "paddd", "paddq", "psubd", "psubq", "pand", "por",
             "pxor", "movss", "movsd", "addss", "addsd", "subss", "subsd", "mulss", "mulsd", "divss", "divsd"};
