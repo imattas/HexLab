@@ -1676,7 +1676,7 @@ evaluate_riscv_vector_floating_operation(RiscvOpcode opcode, const RiscvVectorIn
             int out_e = 3 * bias - 1 - e;
             out_e = out_e >= 0 ? out_e / 2 : -((-out_e + 1) / 2);
             const auto index = ((e & 1) << 6) | static_cast<unsigned>(normalized_frac >> (frac_bits - 6));
-            const auto out_frac = static_cast<std::uint64_t>(detail::vfrsqrt7_table[index]) << (frac_bits - 7);
+            const auto out_frac = static_cast<std::uint64_t>(processors::detail::vfrsqrt7_table[index]) << (frac_bits - 7);
             const auto out_exp = static_cast<std::uint64_t>(out_e);
             return sign | (out_exp << frac_bits) | out_frac;
         }
@@ -1690,7 +1690,7 @@ evaluate_riscv_vector_floating_operation(RiscvOpcode opcode, const RiscvVectorIn
             return sign | ((static_cast<std::uint64_t>(max_exp_field - 1) << frac_bits) | fraction_mask);
         }
         const unsigned idx = static_cast<unsigned>(normalized_frac >> (frac_bits - 7));
-        const auto out_frac = static_cast<std::uint64_t>(detail::vfrec7_table[idx]) << (frac_bits - 7);
+        const auto out_frac = static_cast<std::uint64_t>(processors::detail::vfrec7_table[idx]) << (frac_bits - 7);
         if (out_e == 0 || out_e == -1) {
             const auto sig = (UINT64_C(1) << frac_bits) | out_frac;
             const unsigned shift = static_cast<unsigned>(1 - out_e);
