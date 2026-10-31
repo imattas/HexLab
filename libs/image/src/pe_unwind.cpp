@@ -147,7 +147,7 @@ Result<PeRegisterContext> unwind_amd64(const PeMetadata &metadata, std::uint64_t
     PeRegisterContext out = input;
     const auto function_offset = static_cast<std::uint64_t>(rva - match->begin_rva);
     const auto completed_prolog = function_offset < match->unwind_info->size_of_prolog
-                                      ? std::optional<std::uint8_t>(static_cast<std::uint8_t>(function_offset))
+                                      ? std::optional<std::uint16_t>(static_cast<std::uint16_t>(function_offset))
                                       : std::nullopt;
     auto applied = restore_amd64_info(*match->unwind_info, out, memory, 0, completed_prolog);
     if (!applied) return applied.error();

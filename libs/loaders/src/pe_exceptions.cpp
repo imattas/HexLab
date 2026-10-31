@@ -324,8 +324,8 @@ Result<std::size_t> read_exception_directory(const Image &image, const Directory
             const auto codes_rva = std::uint64_t{unwind_rva} + 4;
             std::uint64_t tail_rva = 0;
             if (info.version == 3) {
-                require((info.flags & ~7u) == 0,
-                        "AMD64 UNWIND_INFO_V3 uses reserved or unsupported large-prolog flags",
+                require((info.flags & ~0x0fu) == 0,
+                        "AMD64 UNWIND_INFO_V3 uses reserved flags",
                         ErrorCode::unsupported);
                 require((info.flags & 4u) == 0 || (info.flags & 3u) == 0,
                         "AMD64 UNWIND_INFO_V3 flags combine chain and handler modes");
@@ -334,26 +334,41 @@ Result<std::size_t> read_exception_directory(const Image &image, const Directory
                 const auto epilog_count = static_cast<std::uint8_t>(operation_count_and_epilogs >> 5);
                 require(epilog_count == 0,
                         "AMD64 UNWIND_INFO_V3 epilog descriptors are unsupported", ErrorCode::unsupported);
-                require(function_begin < function_end &&
-                            info.size_of_prolog <= function_end - function_begin,
-                        "AMD64 UNWIND_INFO_V3 prolog exceeds its runtime-function extent");
                 const auto payload_words = std::to_integer<std::uint8_t>(header[2]);
                 const auto payload_size = std::uint64_t{payload_words} * 2;
                 const auto payload_end = codes_rva + payload_size;
                 if (payload_size) reader.array(codes_rva, 1, payload_size);
-                require(operation_count <= payload_size,
+                const bool large_prolog = (info.flags & 8u) != 0;
+                const std::uint64_t ip_offset_width = large_prolog ? 2 : 1;
+                std::uint64_t offsets_rva = codes_rva;
+                if (large_prolog) {
+                    require(payload_size >= 1,
+                            "AMD64 UNWIND_INFO_V3 large-prolog extension is truncated");
+                    const auto high_byte = reader.integer<std::uint8_t>(codes_rva);
+                    info.size_of_prolog = static_cast<std::uint16_t>(
+                        (static_cast<std::uint16_t>(high_byte) << 8) | info.size_of_prolog);
+                    offsets_rva += 1;
+                }
+                require(function_begin < function_end &&
+                            info.size_of_prolog <= function_end - function_begin,
+                        "AMD64 UNWIND_INFO_V3 prolog exceeds its runtime-function extent");
+                require(operation_count <= (payload_size - (large_prolog ? 1u : 0u)) / ip_offset_width,
                         "AMD64 UNWIND_INFO_V3 prolog IP-offset array exceeds its payload");
-                std::vector<std::uint8_t> code_offsets;
+                const auto offset_bytes = std::uint64_t{operation_count} * ip_offset_width;
+                std::vector<std::uint16_t> code_offsets;
                 code_offsets.reserve(operation_count);
-                std::uint8_t previous_offset = 0xff;
+                std::uint16_t previous_offset = std::numeric_limits<std::uint16_t>::max();
                 for (std::uint8_t i = 0; i < operation_count; ++i) {
-                    const auto offset = reader.integer<std::uint8_t>(codes_rva + i);
+                    const auto offset_rva = offsets_rva + std::uint64_t{i} * ip_offset_width;
+                    const auto offset = large_prolog
+                        ? reader.integer<std::uint16_t>(offset_rva)
+                        : reader.integer<std::uint8_t>(offset_rva);
                     require(offset <= info.size_of_prolog && offset <= previous_offset,
                             "AMD64 UNWIND_INFO_V3 prolog IP offsets are invalid or out of order");
                     previous_offset = offset;
                     code_offsets.push_back(offset);
                 }
-                auto wod_cursor = codes_rva + operation_count;
+                auto wod_cursor = offsets_rva + offset_bytes;
                 const auto wod_end = payload_end;
                 bool has_frame_pointer_operation = false;
                 for (std::uint8_t i = 0; i < operation_count; ++i) {
@@ -457,7 +472,8 @@ Result<std::size_t> read_exception_directory(const Image &image, const Directory
                             decoded.stack_offset = std::uint32_t{reader.integer<std::uint16_t>(wod_cursor + 1)} * 16u;
                         }
                     }
-                    auto sources = reader.sources(codes_rva + i, 1);
+                    auto sources = reader.sources(offsets_rva + std::uint64_t{i} * ip_offset_width,
+                                                  static_cast<std::size_t>(ip_offset_width));
                     auto wod_sources = reader.sources(wod_start, wod_size);
                     sources.insert(sources.end(), wod_sources.begin(), wod_sources.end());
                     decoded.source = {i, std::move(sources)};
