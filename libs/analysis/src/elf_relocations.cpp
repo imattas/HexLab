@@ -382,8 +382,14 @@ Result<ElfOperandResolution> ElfRelocationResolver::operand(const Instruction &i
                 const auto target = solved.address->offset;
                 const auto range = row.type == 279 ? (UINT64_C(1) << 15)
                     : row.type == 280 ? (UINT64_C(1) << 20) : (UINT64_C(1) << 27);
-                if (solved.address->space != instruction.address.space || (target & 3) ||
-                    (target >= place ? target - place >= range : place - target > range)) {
+                // ET_REL section domains do not have a common loaded base.
+                // The relocation still proves S+A in the target section, but
+                // its eventual branch displacement is a linker decision.
+                const bool independent_sections = state_->metadata->header.object_type == 1 &&
+                    solved.address->space != instruction.address.space;
+                if ((target & 3) || (!independent_sections &&
+                    (solved.address->space != instruction.address.space ||
+                     (target >= place ? target - place >= range : place - target > range)))) {
                     solved.address.reset();
                     solved.reason = ElfResolutionReason::overflow;
                 }

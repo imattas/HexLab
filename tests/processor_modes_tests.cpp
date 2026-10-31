@@ -175,12 +175,13 @@ void m6502_tests() {
           "STA indirect-indexed preserves pointer read, indexed register dependency and memory write");
     decoded = decode_instruction(mode, bytes({0x0a}), {{3}, 0x1000});
     check(decoded.instruction && decoded.instruction->register_reads ==
-              std::vector<RegisterOperand>{{RegisterBank::mos6502, 0, 8, false}} &&
+              std::vector<RegisterOperand>{{RegisterBank::mos6502, 0, 8, false},
+                                           {RegisterBank::mos6502, 3, 8, false}} &&
               decoded.instruction->register_writes ==
               std::vector<RegisterOperand>{{RegisterBank::mos6502, 0, 8, false},
                                            {RegisterBank::mos6502, 3, 8, false}} &&
               format_instruction(*decoded.instruction) == "asl a",
-          "accumulator shift records A and processor-status effects");
+          "accumulator shift records A and preserves unaffected processor-status bits");
     decoded = decode_instruction(mode, bytes({0x6c, 0x34, 0x12}), {{3}, 0x1000});
     check(decoded.instruction && decoded.instruction->flow == FlowKind::jump &&
               !decoded.instruction->direct_target && decoded.instruction->memory_read &&

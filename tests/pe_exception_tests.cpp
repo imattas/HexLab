@@ -171,22 +171,29 @@ void arm64_exception_directory_is_supported() {
           "ARM64 pdata links resolve to validated directory rows");
 
     auto functions = recover_functions(*linked_loaded.image, linked_loaded.metadata, {}, {}, {}).value();
+    bool found_parent_root = false;
     bool found_link_root = false;
     for (const auto &entry : functions->functions) {
-        if (entry->entry.offset != 0x140001010ULL) continue;
-        for (const auto &seed : entry->seeds)
-            if (seed.kind == FunctionSeedKind::unwind && seed.unwind_evidence ==
-                    FunctionSeedUnwindEvidence{1, 0x798, 8})
+        for (const auto &seed : entry->seeds) {
+            if (entry->entry.offset == 0x140001000ULL && seed.kind == FunctionSeedKind::unwind &&
+                seed.unwind_evidence == FunctionSeedUnwindEvidence{0, 0x790, 8})
+                found_parent_root = true;
+            if (entry->entry.offset == 0x140001010ULL && seed.kind == FunctionSeedKind::unwind)
                 found_link_root = true;
+        }
     }
-    check(found_link_root,
-          "ARM64 linked pdata starts become unwind roots with exact row provenance");
+    check(found_parent_root && !found_link_root && !functions->complete,
+          "an unbounded final ARM64 pdata link leaves the proven parent root and marks recovery partial");
 
     FixtureFile file(linked);
     const auto rebased = load_pe_at_base(FileStorage::open(file.path).value(), 0x180000000ULL, {}).value();
     functions = recover_functions(*rebased.image, rebased.metadata, {}, {}, {}).value();
     check(std::any_of(functions->functions.begin(), functions->functions.end(), [](const auto &entry) {
-              return entry->entry.offset == 0x180001010ULL;
+              return entry->entry.offset == 0x180001000ULL &&
+                  std::any_of(entry->seeds.begin(), entry->seeds.end(), [](const auto &seed) {
+                      return seed.kind == FunctionSeedKind::unwind &&
+                          seed.unwind_evidence == FunctionSeedUnwindEvidence{0, 0x790, 8};
+                  });
           }), "ARM64 pdata roots use the actual rebased image base");
 }
 

@@ -110,9 +110,13 @@ void shifts() {
         check(reads(i, reg(15)) && format_instruction(i) == "add r0, pc, #0x4",
               "PC source remains explicit for architectural PC+8 semantics");
     });
-    for (auto w : {0xe1b0f00eu, 0xe1810291u, 0xe1a00f11u, 0xe10f0000u, 0xe3000000u})
-        check(decode_a32(bytes(w), {{0}, 0}).status != DecodeStatus::decoded,
-              "exception return, multiply, forbidden PC shifts, status and MOVW do not masquerade as regular ALU");
+    for (auto w : {0xe1b0f00eu, 0xe1810291u, 0xe1a00f11u, 0xe10f0000u, 0xe3000000u}) {
+        const auto result = decode_a32(bytes(w), {{0}, 0});
+        check(w == 0xe10f0000u ? result.status == DecodeStatus::decoded && result.instruction &&
+                                   result.instruction->opcode == Opcode::a32_mrs
+                             : result.status != DecodeStatus::decoded,
+              "MRS uses its status opcode while the remaining excluded encoding forms stay unsupported");
+    }
 }
 } // namespace
 int main() {

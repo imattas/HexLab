@@ -110,9 +110,17 @@ void multiples() {
 }
 void negatives() {
     for (auto w : {0xe5b11004u, 0xe7910012u, 0xe5bf0004u, 0xe4b10004u, 0xe5d1f004u, 0xe8910000u, 0xe8b10002u,
-                   0xe8fd8001u, 0xe1c100d2u})
-        check(decode_a32(bytes(w), {{0}, 0}).status != DecodeStatus::decoded,
-              "unprivileged/overlap/status/malformed/doubleword forms cannot fabricate scalar memory effects");
+                   0xe8fd8001u, 0xe1c100d2u}) {
+        const auto result = decode_a32(bytes(w), {{0}, 0});
+        check(w == 0xe8fd8001u ? result.status == DecodeStatus::decoded && result.instruction &&
+                                   result.instruction->opcode == Opcode::a32_ldm && result.instruction->arm &&
+                                   result.instruction->arm->exchange == ArmExchange::saved_status &&
+                                   result.instruction->arm->flags_written == 15 &&
+                                   !result.instruction->arm->flags_known && result.instruction->memory_read &&
+                                   result.instruction->flow == FlowKind::ret
+                             : result.status != DecodeStatus::decoded,
+              "LDM exception return restores saved status while unsupported scalar memory forms remain rejected");
+    }
 }
 } // namespace
 int main() {

@@ -28,8 +28,12 @@ LDR/STR low-12, literal loads, and the supported direct branch relocation
 families. ADRP seeds the symbol-plus-addend page into register propagation;
 ADD low-12 relocations supply only the relocated low bits to the source
 register's arithmetic. Memory low-12 references require a proven base and use
-that base plus the relocated low bits. Branch destinations are range- and
-alignment-checked.
+that base plus the relocated low bits. Branch destinations are alignment-checked;
+their displacement is range-checked when source and target share an address
+domain. For ET_REL branches into another section, the symbol-plus-addend target
+retains that section's domain because the final displacement is unknown until
+linking. The relocation expressions and permitted linker veneers follow
+[AAELF64](https://github.com/ARM-software/abi-aa/blob/main/aaelf64/aaelf64.rst#577call-and-jump-relocations).
 REL entries, duplicate/overlapping relocations, undefined or preemptible
 symbols, unsupported instruction/relocation combinations, and unresolved
 symbols remain opaque; encoded addend bits are not used as a fallback when a

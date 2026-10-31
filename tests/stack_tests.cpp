@@ -572,6 +572,18 @@ void mips32_stack_and_frame_pointer_slots() {
                                    std::vector<Operand> operands, std::vector<OperandAccess> access) {
             Instruction i; i.context = {Architecture::mips32, ExecutionMode::mips32};
             i.address = {{0}, at}; i.opcode = op; i.operands = std::move(operands); i.access = std::move(access);
+            // Mirror native decoder facts: stack-derived aliases require
+            // both typed operand access and explicit register effects.
+            for (std::size_t index = 0; index < i.operands.size(); ++index) {
+                if (const auto *r = std::get_if<RegisterOperand>(&i.operands[index])) {
+                    if (i.access[index] != OperandAccess::write) i.register_reads.push_back(*r);
+                    if (i.access[index] != OperandAccess::read && r->index != 0) i.register_writes.push_back(*r);
+                } else if (const auto *m = std::get_if<MemoryOperand>(&i.operands[index])) {
+                    if (m->base) i.register_reads.push_back(*m->base);
+                    i.memory_read = i.access[index] != OperandAccess::write;
+                    i.memory_write = i.access[index] != OperandAccess::read;
+                }
+            }
             return InstructionFact{id, std::move(i), {}};
         };
         auto entry = block(1, address, {

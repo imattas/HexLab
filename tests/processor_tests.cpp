@@ -950,8 +950,9 @@ void mips32_tests() {
     const auto nonzero_compare = decode_mips32(ByteOrder::little, nonzero_compare_cc, {{0},0x1000});
     check(nonzero_compare.instruction && nonzero_compare.instruction->condition == 0x12 &&
               nonzero_compare.instruction->register_writes ==
-                  std::vector<RegisterOperand>{{RegisterBank::mips_fcsr,2,32,false}},
-          "COP1 compare selects FCC1 and writes its condition-code register");
+                  std::vector<RegisterOperand>{{RegisterBank::mips_fcsr,2,32,false},
+                                               {RegisterBank::mips_fcsr,0,32,false}},
+          "COP1 compare selects FCC1 and updates aggregate FCSR exception state");
     const auto reserved_compare_bits = bytes({0x72,0x08,0x02,0x46});
     check(decode_mips32(ByteOrder::little, reserved_compare_bits, {{0},0x1000}).status == DecodeStatus::invalid,
           "COP1 compare rejects reserved condition-code bits");
@@ -978,8 +979,10 @@ void mips32_tests() {
     result = cop1(17, 4, 2, 0, 0x32); // c.eq.d f2,f4
     check(result.instruction && result.instruction->opcode == Opcode::mips64_c_cond_d &&
               result.instruction->condition == 2 &&
-              result.instruction->register_writes == std::vector<RegisterOperand>{{RegisterBank::mips_fcsr,1,32,false}},
-          "MIPS32 COP1 double compare writes FCC0");
+              result.instruction->register_writes ==
+                  std::vector<RegisterOperand>{{RegisterBank::mips_fcsr,1,32,false},
+                                               {RegisterBank::mips_fcsr,0,32,false}},
+          "MIPS32 COP1 double compare writes FCC0 and aggregate FCSR exception state");
     result = cop1(17, 0, 2, 6, 0x20); // cvt.s.d f6,f2
     check(result.instruction && result.instruction->opcode == Opcode::mips_cvt_s_d &&
               format_instruction(*result.instruction) == "cvt.s.d f6, f2",
@@ -1131,12 +1134,16 @@ void mips32_tests() {
               register_name(zero_mtc0.instruction->register_reads.front()) == "zero",
           "MIPS32 MTC0 observes the architectural zero-register value");
     const auto likely = decode({0x02,0x00,0x13,0x04});
-    check(likely.instruction && likely.instruction->opcode == Opcode::opaque &&
+    check(likely.instruction && likely.instruction->opcode == Opcode::mips_bgezall &&
               likely.instruction->length == 4 &&
-              likely.instruction->mnemonic_override.find("bgezall") != std::string::npos &&
-              likely.instruction->flow == FlowKind::fallthrough && !likely.instruction->direct_target &&
-              likely.instruction->delay_slots == 0,
-          "unimplemented BGEZALL remains a bounded opaque instruction without invented control flow");
+              likely.instruction->flow == FlowKind::conditional_branch &&
+              likely.instruction->direct_target == Address{{0},0x100c} &&
+              likely.instruction->register_reads ==
+                  std::vector<RegisterOperand>{{RegisterBank::mips_gpr,0,32,false}} &&
+              likely.instruction->register_writes ==
+                  std::vector<RegisterOperand>{{RegisterBank::mips_gpr,31,32,false}} &&
+              likely.instruction->delay_slots == 1,
+          "BGEZALL records its likely conditional transfer, link and delay slot");
     check(decode({0x00,0x00,0x00,0x00}, 0x1001).status == DecodeStatus::invalid &&
               decode({0x00,0x00,0x00,0x00}, 0x100000000ULL).status == DecodeStatus::invalid,
           "MIPS32 unaligned and out-of-domain addresses are invalid");

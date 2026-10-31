@@ -13934,7 +13934,16 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
         out << "}\n";
         return StructuredPseudocode{out.str(), false, {}};
     };
-    if (auto return_tree = try_return_tree()) return *return_tree;
+    // Keep ordinary local joins in the output when the function has one exit,
+    // or its entry is a direct early-return guard. Expanding those graphs as a
+    // return tree would copy their shared continuation into each diamond arm.
+    // Retain return-tree expansion as a fallback for graphs beyond the bounded
+    // acyclic-region recognizer, rather than dropping its larger/deeper cases.
+    const bool prefer_local_joins = std::count_if(function.blocks.begin(), function.blocks.end(),
+        [](const auto &block) { return block.successors.empty(); }) <= 1 ||
+        (branch && (has_only_terminal_return(*true_start) != has_only_terminal_return(*false_start)));
+    if (!prefer_local_joins)
+        if (auto return_tree = try_return_tree()) return *return_tree;
 
     auto try_nested_early_return_with_shared_join = [&]() -> std::optional<StructuredPseudocode> {
         if (!branch || function.blocks.size() < 4 || function.blocks.size() > 1024) return {};
@@ -14375,6 +14384,8 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
         return StructuredPseudocode{out.str(), false, {}};
     };
     if (auto structured = try_acyclic_regions()) return *structured;
+    if (prefer_local_joins)
+        if (auto return_tree = try_return_tree()) return *return_tree;
 
     // Irreducible and cross-region-sharing CFGs cannot always be expressed as
     // nested if/loop regions without duplicating effects. Preserve their

@@ -8,6 +8,11 @@ as each region's join. It lowers SSA phi values into edge-specific assignments
 and follows multi-block straight-line arms. A simple conditional early return
 is also structured, including the case where the return is on the branch's
 false edge.
+Single-exit functions and direct entry early-return guards try this local-join
+structuring before return-tree expansion. This keeps a nested diamond's shared
+continuation and its effects together instead of duplicating them into each
+arm. If the bounded region recognizer cannot handle the graph, the larger
+return-tree recognizer remains available.
 Decision trees whose leaves return are structured without requiring a common
 post-dominator. The same recognizer accepts explicit CIL `throw`, `rethrow`, and
 unhandled-exception terminal transfers as non-returning leaves. It does not
