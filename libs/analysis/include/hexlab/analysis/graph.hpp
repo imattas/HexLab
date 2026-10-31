@@ -10,7 +10,8 @@ enum class GraphEdgeKind {fallthrough,conditional_true,conditional_false,jump,ca
 struct GraphOptions {
     std::size_t node_budget=1000,edge_budget=10000,preview_lines=16;
     // Function call neighborhoods expand callers and callees by this many
-    // resolved function-to-function hops. Image-wide call graphs ignore it.
+    // resolved function-to-function hops, bounded to 32. Image-wide call
+    // graphs ignore it.
     std::size_t call_depth=1;
     double node_width=280,line_height=18,rank_gap=100,node_gap=40,edge_gap=16;
 };

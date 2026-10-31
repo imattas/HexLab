@@ -8,8 +8,17 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cerrno>
 #include <fstream>
+#include <map>
+#include <mutex>
 #include <string>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <sys/file.h>
+#include <sys/stat.h>
+#endif
 #if defined(__linux__)
 #include <fcntl.h>
 #include <sys/syscall.h>
@@ -19,6 +28,124 @@
 #endif
 namespace hexlab::database {
 namespace {
+std::shared_ptr<std::mutex> backup_generation_mutex(const std::filesystem::path& base){
+    static std::mutex registry_mutex;
+    static std::map<std::filesystem::path::string_type,std::weak_ptr<std::mutex>> registry;
+    std::lock_guard guard(registry_mutex);
+    for(auto it=registry.begin();it!=registry.end();)
+        if(it->second.expired())it=registry.erase(it);else ++it;
+    const auto key=base.lexically_normal().native();
+    if(auto existing=registry[key].lock())return existing;
+    auto created=std::make_shared<std::mutex>();registry[key]=created;return created;
+}
+class BackupGenerationLock {
+    std::shared_ptr<std::mutex> process_mutex_;
+    std::unique_lock<std::mutex> process_lock_;
+#ifdef _WIN32
+    HANDLE handle_=INVALID_HANDLE_VALUE;
+    OVERLAPPED overlapped_{};
+#else
+    int fd_=-1;
+#endif
+public:
+    BackupGenerationLock(const std::filesystem::path& base,std::stop_token stop)
+        :process_mutex_(backup_generation_mutex(base)),process_lock_(*process_mutex_,std::try_to_lock){
+        if(!process_lock_.owns_lock())
+            throw detail::Failure{{ErrorCode::busy,"Backup generations are already being modified in this process"}};
+        if(stop.stop_requested())throw detail::Failure{{ErrorCode::canceled,"Backup generation operation canceled"}};
+        auto lock_path=base;lock_path+=L".hexlab-generation.lock";
+#ifdef _WIN32
+        handle_=CreateFileW(lock_path.c_str(),GENERIC_READ|GENERIC_WRITE,FILE_SHARE_READ|FILE_SHARE_WRITE,
+                            nullptr,OPEN_ALWAYS,FILE_ATTRIBUTE_NORMAL|FILE_FLAG_OPEN_REPARSE_POINT,nullptr);
+        if(handle_==INVALID_HANDLE_VALUE)throw detail::Failure{detail::native_error("Cannot open backup generation lock")};
+        BY_HANDLE_FILE_INFORMATION info{};
+        if(!GetFileInformationByHandle(handle_,&info)){
+            const auto error=detail::native_error("Cannot inspect backup generation lock");
+            CloseHandle(handle_);handle_=INVALID_HANDLE_VALUE;throw detail::Failure{error};
+        }
+        if((info.dwFileAttributes&FILE_ATTRIBUTE_REPARSE_POINT)!=0 ||
+           (info.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY)!=0){
+            CloseHandle(handle_);handle_=INVALID_HANDLE_VALUE;
+            throw detail::Failure{{ErrorCode::invalid_argument,"Backup generation lock must be a regular file"}};
+        }
+        if(!LockFileEx(handle_,LOCKFILE_EXCLUSIVE_LOCK|LOCKFILE_FAIL_IMMEDIATELY,0,1,0,&overlapped_)){
+            const auto error=GetLastError();CloseHandle(handle_);handle_=INVALID_HANDLE_VALUE;
+            if(error==ERROR_LOCK_VIOLATION || error==ERROR_IO_PENDING)
+                throw detail::Failure{{ErrorCode::busy,"Another process is modifying these backup generations"}};
+            SetLastError(error);
+            throw detail::Failure{detail::native_error("Cannot lock backup generations")};
+        }
+#else
+        fd_=::open(lock_path.c_str(),O_CREAT|O_RDWR|O_CLOEXEC
+#ifdef O_NOFOLLOW
+                   |O_NOFOLLOW
+#endif
+                   ,0600);
+        if(fd_<0)throw detail::Failure{detail::native_error("Cannot open backup generation lock")};
+        struct stat info{};
+        if(::fstat(fd_,&info)!=0){
+            const auto error=errno;::close(fd_);fd_=-1;
+            errno=error;throw detail::Failure{detail::native_error("Cannot inspect backup generation lock")};
+        }
+        if(!S_ISREG(info.st_mode)){
+            ::close(fd_);fd_=-1;
+            throw detail::Failure{{ErrorCode::invalid_argument,"Backup generation lock must be a regular file"}};
+        }
+        if(::flock(fd_,LOCK_EX|LOCK_NB)!=0){
+            const auto error=errno;::close(fd_);fd_=-1;
+            if(error==EWOULDBLOCK||error==EAGAIN)
+                throw detail::Failure{{ErrorCode::busy,"Another process is modifying these backup generations"}};
+            throw detail::Failure{detail::native_error("Cannot lock backup generations")};
+        }
+#endif
+    }
+    BackupGenerationLock(const BackupGenerationLock&)=delete;
+    BackupGenerationLock& operator=(const BackupGenerationLock&)=delete;
+    ~BackupGenerationLock(){
+#ifdef _WIN32
+        if(handle_!=INVALID_HANDLE_VALUE){UnlockFileEx(handle_,0,1,0,&overlapped_);CloseHandle(handle_);}
+#else
+        if(fd_>=0){(void)::flock(fd_,LOCK_UN);(void)::close(fd_);}
+#endif
+    }
+};
+Result<std::uint64_t> latest_generation_timestamp(const std::filesystem::path& base,
+        std::string_view marker,std::stop_token stop){
+    if(stop.stop_requested())return Error{ErrorCode::canceled,"Backup generation scan canceled"};
+    const auto prefix=base.stem().native()+std::filesystem::path(marker).native();
+    const auto extension=base.extension().native();
+    std::error_code error;
+    std::filesystem::directory_iterator it(base.parent_path(),error),end;
+    if(error)return Error{ErrorCode::io,"Cannot scan backup generation directory: "+error.message()};
+    std::uint64_t latest=0;
+    std::size_t visited=0;
+    constexpr std::size_t entry_limit=8192;
+    for(;it!=end;it.increment(error)){
+        if(stop.stop_requested())return Error{ErrorCode::canceled,"Backup generation scan canceled"};
+        if(++visited>entry_limit)return Error{ErrorCode::resource_limit,"Backup generation directory exceeds the 8192-entry coordination limit"};
+        if(error)return Error{ErrorCode::io,"Cannot continue backup generation scan: "+error.message()};
+        const auto name=it->path().filename().native();
+        if(!name.starts_with(prefix)||!name.ends_with(extension)||
+           name.size()!=prefix.size()+13+1+32+extension.size())continue;
+        const auto stamp=name.substr(prefix.size(),13);
+        if(name[prefix.size()+13]!=static_cast<std::filesystem::path::value_type>('-')||
+           !std::all_of(stamp.begin(),stamp.end(),[](auto ch){
+                return ch>=static_cast<std::filesystem::path::value_type>('0')&&
+                       ch<=static_cast<std::filesystem::path::value_type>('9');}))continue;
+        bool token=true;
+        for(std::size_t i=prefix.size()+14;i<prefix.size()+14+32;++i){
+            const auto ch=name[i];
+            token=token&&((ch>=static_cast<std::filesystem::path::value_type>('0')&&ch<=static_cast<std::filesystem::path::value_type>('9'))||
+                          (ch>=static_cast<std::filesystem::path::value_type>('a')&&ch<=static_cast<std::filesystem::path::value_type>('f')));
+        }
+        if(!token)continue;
+        std::uint64_t value=0;
+        for(const auto ch:stamp)value=value*10+static_cast<unsigned>(ch-'0');
+        latest=std::max(latest,value);
+    }
+    if(error)return Error{ErrorCode::io,"Cannot finish backup generation scan: "+error.message()};
+    return latest;
+}
 constexpr std::uint64_t project_bundle_byte_limit=UINT64_C(8)*1024*1024*1024;
 void require_history_verified(const std::filesystem::path& path,std::stop_token stop){
     constexpr std::size_t history_steps=65536;
@@ -672,10 +799,8 @@ Result<SourceArchiveRotationResult> ProjectStore::archive_external_source_rotati
             return Error{ErrorCode::invalid_argument,"Source archive rotation directory does not exist"};
         if(detail::same_file(impl_->path,normalized))
             return Error{ErrorCode::invalid_argument,"Source archive rotation base aliases the open project"};
-        std::uint64_t prior_timestamp=0;
-        const auto prior=list_rotated_source_archives(normalized,options.max_bytes,stop);
-        if(prior&&prior.value().complete&&!prior.value().archives.empty())
-            prior_timestamp=prior.value().archives.front().created_unix_ms;
+        BackupGenerationLock generation_lock(normalized,stop);
+        const auto prior_timestamp=detail::take(latest_generation_timestamp(normalized,".source-archive-",stop));
         const auto clock_millis=std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
         if(clock_millis<0)return Error{ErrorCode::io,"System clock is before the Unix epoch"};
@@ -702,11 +827,28 @@ Result<SourceArchiveRotationResult> ProjectStore::archive_external_source_rotati
             return detail::same_file(row.archive.path,latest);
         });
         if(newest==listing.value().archives.end()){result.retention_satisfied=false;return result;}
-        // The listing is newest-first by timestamp. Keep the just-created
-        // generation first even when the wall clock ties an earlier archive.
-        const auto prune=detail::take(prune_rotated_source_archives(normalized,retain,options.max_bytes,stop));
-        result.removed_generations=prune.removed;
-        result.retention_satisfied=prune.retention_satisfied;
+        // Prune from the exact complete listing made while holding the
+        // generation lock, then revalidate each file immediately before unlink.
+        const auto& candidates=listing.value().archives;
+        for(std::size_t i=retain;i<candidates.size();++i){
+            if(stop.stop_requested()){result.retention_satisfied=false;break;}
+            const auto& candidate=candidates[i].archive;
+            auto checked=verify_source_archive(candidate.path,options.max_bytes,stop);
+            if(!checked||checked.value().input!=candidate.input||
+               checked.value().project_uuid!=candidate.project_uuid){
+                result.retention_satisfied=false;break;
+            }
+            std::error_code error;
+            const auto status=std::filesystem::symlink_status(candidate.path,error);
+            if(error||!std::filesystem::is_regular_file(status)||
+               std::filesystem::file_size(candidate.path,error)!=candidate.bytes_verified||error){
+                result.retention_satisfied=false;break;
+            }
+            if(std::filesystem::remove(candidate.path,error))++result.removed_generations;
+            else {result.retention_satisfied=false;break;}
+        }
+        if(candidates.size()-std::min(candidates.size(),result.removed_generations)>retain)
+            result.retention_satisfied=false;
         return result;
     });
 }
@@ -760,6 +902,9 @@ Result<SourceArchivePruneResult> ProjectStore::prune_rotated_source_archives(
         const std::filesystem::path& base,std::size_t retain,std::uint64_t max_bytes,std::stop_token stop){
     return detail::guarded([&]()->Result<SourceArchivePruneResult>{
         if(retain==0||retain>32)return Error{ErrorCode::invalid_argument,"Source archive retention must be 1 through 32"};
+        if(base.empty())return Error{ErrorCode::invalid_argument,"Source archive pruning requires a base path"};
+        const auto normalized=std::filesystem::absolute(base).lexically_normal();
+        BackupGenerationLock generation_lock(normalized,stop);
         auto listing=detail::take(list_rotated_source_archives(base,max_bytes,stop));
         SourceArchivePruneResult result{listing.archives.size(),0,listing.complete};
         if(!listing.complete)return result;
@@ -797,10 +942,16 @@ Result<BackupRotationResult> ProjectStore::backup_to_rotating(const std::filesys
             return Error{ErrorCode::invalid_argument,"Backup rotation directory does not exist"};
         if(detail::same_file(impl_->path,normalized))
             return Error{ErrorCode::invalid_argument,"Backup rotation base aliases the open project"};
+        BackupGenerationLock generation_lock(normalized,stop);
+        const auto prior_timestamp=detail::take(latest_generation_timestamp(normalized,".backup-",stop));
 
-        const auto millis=std::chrono::duration_cast<std::chrono::milliseconds>(
+        const auto clock_millis=std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
-        if(millis<0)return Error{ErrorCode::io,"System clock is before the Unix epoch"};
+        if(clock_millis<0)return Error{ErrorCode::io,"System clock is before the Unix epoch"};
+        constexpr std::uint64_t max_generation_timestamp=UINT64_C(9999999999999);
+        if(prior_timestamp>=max_generation_timestamp)
+            return Error{ErrorCode::resource_limit,"Existing backup generation timestamp leaves no fixed-width successor"};
+        const auto millis=std::max<std::uint64_t>(static_cast<std::uint64_t>(clock_millis),prior_timestamp+1);
         const auto token=detail::new_uuid();
         constexpr char digits[]="0123456789abcdef";
         auto name=normalized.stem().native();
@@ -809,6 +960,7 @@ Result<BackupRotationResult> ProjectStore::backup_to_rotating(const std::filesys
         };
         append_ascii(".backup-");
         auto timestamp=std::to_string(millis);
+        if(timestamp.size()>13)return Error{ErrorCode::resource_limit,"Backup timestamp exceeds fixed generation-name width"};
         if(timestamp.size()<13)timestamp.insert(0,13-timestamp.size(),'0');
         append_ascii(timestamp);append_ascii("-");
         for(const auto byte:token){const auto value=std::to_integer<unsigned>(byte);name.push_back(static_cast<std::filesystem::path::value_type>(digits[value>>4]));name.push_back(static_cast<std::filesystem::path::value_type>(digits[value&15]));}
@@ -917,6 +1069,9 @@ Result<BackupListing> ProjectStore::list_rotated_backups(const std::filesystem::
 Result<BackupPruneResult> ProjectStore::prune_rotated_backups(const std::filesystem::path& base,std::size_t retain,std::stop_token stop) {
     return detail::guarded([&]()->Result<BackupPruneResult>{
         if(retain==0||retain>32)return Error{ErrorCode::invalid_argument,"Backup retention must be 1 through 32"};
+        if(base.empty())return Error{ErrorCode::invalid_argument,"Backup pruning requires a base path"};
+        const auto normalized=std::filesystem::absolute(base).lexically_normal();
+        BackupGenerationLock generation_lock(normalized,stop);
         auto listing=detail::take(list_rotated_backups(base,stop));
         BackupPruneResult result;result.remaining=listing.backups.size();result.retention_satisfied=listing.complete;
         if(!listing.complete)return result; // Never delete from a partial view.

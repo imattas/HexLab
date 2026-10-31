@@ -63,11 +63,21 @@ hexlab_cli project backup prune sample.hxproj --base backups/sample.hxproj --ret
 ```
 
 Rotation publishes the new backup, fully validates the bounded candidate set,
-then prunes older entries. This keeps the just-created generation even when
-its timestamp ties an existing generation. If candidate validation, directory
+then prunes older entries. A per-base OS file lock serializes project-backup
+and source-archive rotation/pruning across HexLab threads and processes;
+concurrent mutation returns `busy`, and the lock is released automatically if
+a process exits or crashes. The small `.hexlab-generation.lock` sidecar is
+retained so all processes keep locking the same file identity. Under that
+lock, a bounded scan of up to 8,192 directory entries finds the greatest
+timestamp among syntactically generated names, and the next timestamp is
+greater even if the wall clock moves backward. File contents are still
+validated separately before retention pruning. This keeps the just-created
+generation first when applying retention. If candidate validation, directory
 scanning, or deletion is incomplete, extra backups may remain and the command
-returns exit code 3. Listing returns exit 3 when the bounded scan or history
-audit is incomplete.
+returns exit code 3. A crash after the new backup is published but before
+pruning can also leave extra generations; the next successful rotation can
+prune them. Listing returns exit 3 when its bounded scan or history audit is
+incomplete.
 
 Restore into an existing project in place with:
 

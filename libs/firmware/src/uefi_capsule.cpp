@@ -395,6 +395,76 @@ Result<UefiCapsule> parse_fmp_impl(std::span<const std::byte> bytes, UefiCapsule
     std::size_t embedded_sections_used = 0;
     std::size_t embedded_scans_used = 0;
     std::uint64_t embedded_decompressed_used = 0;
+    const auto scan_embedded_volume_payload = [&](UefiCapsuleItem &item,
+                                                   std::uint64_t payload_offset,
+                                                   std::uint64_t payload_size) -> std::optional<Error> {
+        if (!scan_embedded_volumes || payload_size < 56) return std::nullopt;
+        if (embedded_scans_used >= options.max_embedded_payload_scans ||
+            embedded_volumes_used >= options.max_embedded_volumes ||
+            embedded_files_used >= options.max_embedded_files ||
+            embedded_sections_used >= options.max_embedded_sections ||
+            embedded_decompressed_used >= options.max_embedded_decompressed_bytes) {
+            item.embedded_volume_scan_complete = false;
+            item.embedded_volume_diagnostic = embedded_scans_used >= options.max_embedded_payload_scans
+                ? "embedded firmware-volume payload scan count limit reached"
+                : "embedded firmware-volume inventory budget exhausted";
+            return std::nullopt;
+        }
+        const auto scan_limit = options.max_embedded_decompressed_bytes / options.max_embedded_payload_scans;
+        const auto payload = bytes.subspan(static_cast<std::size_t>(payload_offset),
+                                           static_cast<std::size_t>(payload_size));
+        UefiVolumeParseOptions volume_options;
+        volume_options.max_input_bytes = options.max_input_bytes;
+        volume_options.max_volumes = options.max_embedded_volumes - embedded_volumes_used;
+        volume_options.max_files = options.max_embedded_files - embedded_files_used;
+        volume_options.max_sections = options.max_embedded_sections - embedded_sections_used;
+        volume_options.max_total_decompressed_bytes = std::min(
+            scan_limit, options.max_embedded_decompressed_bytes - embedded_decompressed_used);
+        ++embedded_scans_used;
+        item.embedded_volume_scan_attempted = true;
+        auto volumes = parse_uefi_firmware_volumes(payload, volume_options, stop);
+        if (!volumes) {
+            if (volumes.error().code == ErrorCode::canceled) return volumes.error();
+            if (volumes.error().code != ErrorCode::unsupported) {
+                item.embedded_volume_scan_complete = false;
+                item.embedded_volume_diagnostic = volumes.error().message;
+            }
+            return std::nullopt;
+        }
+        for (const auto &volume : volumes.value()) {
+            std::size_t sections = 0;
+            std::uint64_t decompressed_bytes = 0;
+            for (const auto &file : volume.files) {
+                sections += file.sections.size();
+                for (const auto &section : file.sections)
+                    if (section.decompression_succeeded && section.uncompressed_size)
+                        decompressed_bytes += *section.uncompressed_size;
+            }
+            if (embedded_volumes_used == options.max_embedded_volumes ||
+                volume.files.size() > options.max_embedded_files - embedded_files_used ||
+                sections > options.max_embedded_sections - embedded_sections_used ||
+                decompressed_bytes > options.max_embedded_decompressed_bytes - embedded_decompressed_used) {
+                item.embedded_volume_scan_complete = false;
+                item.embedded_volume_diagnostic = "embedded firmware-volume inventory budget exceeded";
+                break;
+            }
+            UefiCapsuleEmbeddedVolume embedded;
+            embedded.file_offset = payload_offset + volume.file_offset;
+            embedded.size = volume.length;
+            embedded.file_system_guid = volume.file_system_guid;
+            embedded.revision = volume.revision;
+            embedded.file_count = volume.files.size();
+            embedded.section_count = sections;
+            embedded.decompressed_bytes = decompressed_bytes;
+            embedded.header_checksum_valid = volume.header_checksum_valid;
+            item.embedded_volumes.push_back(embedded);
+            ++embedded_volumes_used;
+            embedded_files_used += volume.files.size();
+            embedded_sections_used += sections;
+            embedded_decompressed_used += decompressed_bytes;
+        }
+        return std::nullopt;
+    };
     for (std::size_t i = 0; i < count; ++i) {
         if (stop.stop_requested()) return Error{ErrorCode::canceled, "UEFI capsule parsing canceled"};
         const std::uint64_t item_start = offsets[i];
@@ -404,6 +474,8 @@ Result<UefiCapsule> parse_fmp_impl(std::span<const std::byte> bytes, UefiCapsule
         item.size = item_end - item_start;
         if (i < result.embedded_driver_count) {
             item.kind = UefiCapsuleItemKind::embedded_driver;
+            auto scan = scan_embedded_volume_payload(item, item.file_offset, item.size);
+            if (scan) return *scan;
         } else {
             item.kind = UefiCapsuleItemKind::fmp_payload;
             if (item.size < 32) return malformed("FMP image header is truncated");
@@ -507,71 +579,8 @@ Result<UefiCapsule> parse_fmp_impl(std::span<const std::byte> bytes, UefiCapsule
             }
 
             const auto image_payload_size = image_data_size - item.fmp_payload_header_size;
-            if (scan_embedded_volumes && image_payload_size >= 56 && embedded_scans_used < options.max_embedded_payload_scans &&
-                embedded_volumes_used < options.max_embedded_volumes &&
-                embedded_files_used < options.max_embedded_files &&
-                embedded_sections_used < options.max_embedded_sections &&
-                embedded_decompressed_used < options.max_embedded_decompressed_bytes) {
-                const auto scan_limit = options.max_embedded_decompressed_bytes / options.max_embedded_payload_scans;
-                const auto payload = bytes.subspan(static_cast<std::size_t>(item.firmware_image_offset),
-                                                   static_cast<std::size_t>(image_payload_size));
-                UefiVolumeParseOptions volume_options;
-                volume_options.max_input_bytes = options.max_input_bytes;
-                volume_options.max_volumes = options.max_embedded_volumes - embedded_volumes_used;
-                volume_options.max_files = options.max_embedded_files - embedded_files_used;
-                volume_options.max_sections = options.max_embedded_sections - embedded_sections_used;
-                volume_options.max_total_decompressed_bytes = std::min(
-                    scan_limit, options.max_embedded_decompressed_bytes - embedded_decompressed_used);
-                ++embedded_scans_used;
-                item.embedded_volume_scan_attempted = true;
-                auto volumes = parse_uefi_firmware_volumes(payload, volume_options, stop);
-                if (!volumes) {
-                    if (volumes.error().code == ErrorCode::canceled) return volumes.error();
-                    if (volumes.error().code != ErrorCode::unsupported) {
-                        item.embedded_volume_scan_complete = false;
-                        item.embedded_volume_diagnostic = volumes.error().message;
-                    }
-                } else {
-                    for (const auto &volume : volumes.value()) {
-                        std::size_t sections = 0;
-                        std::uint64_t decompressed_bytes = 0;
-                        for (const auto &file : volume.files) {
-                            sections += file.sections.size();
-                            for (const auto &section : file.sections) {
-                                if (section.decompression_succeeded && section.uncompressed_size)
-                                    decompressed_bytes += *section.uncompressed_size;
-                            }
-                        }
-                        if (embedded_volumes_used == options.max_embedded_volumes ||
-                            volume.files.size() > options.max_embedded_files - embedded_files_used ||
-                            sections > options.max_embedded_sections - embedded_sections_used ||
-                            decompressed_bytes > options.max_embedded_decompressed_bytes - embedded_decompressed_used) {
-                            item.embedded_volume_scan_complete = false;
-                            item.embedded_volume_diagnostic = "embedded firmware-volume inventory budget exceeded";
-                            break;
-                        }
-                        UefiCapsuleEmbeddedVolume embedded;
-                        embedded.file_offset = item.firmware_image_offset + volume.file_offset;
-                        embedded.size = volume.length;
-                        embedded.file_system_guid = volume.file_system_guid;
-                        embedded.revision = volume.revision;
-                        embedded.file_count = volume.files.size();
-                        embedded.section_count = sections;
-                        embedded.decompressed_bytes = decompressed_bytes;
-                        embedded.header_checksum_valid = volume.header_checksum_valid;
-                        item.embedded_volumes.push_back(embedded);
-                        ++embedded_volumes_used;
-                        embedded_files_used += volume.files.size();
-                        embedded_sections_used += sections;
-                        embedded_decompressed_used += decompressed_bytes;
-                    }
-                }
-            } else if (scan_embedded_volumes && image_payload_size >= 56) {
-                item.embedded_volume_scan_complete = false;
-                item.embedded_volume_diagnostic = embedded_scans_used >= options.max_embedded_payload_scans
-                    ? "embedded firmware-volume payload scan count limit reached"
-                    : "embedded firmware-volume inventory budget exhausted";
-            }
+            auto scan = scan_embedded_volume_payload(item, item.firmware_image_offset, image_payload_size);
+            if (scan) return *scan;
         }
         const auto nested_offset = item.kind == UefiCapsuleItemKind::fmp_payload
             ? item.firmware_image_offset - item.file_offset : 0;

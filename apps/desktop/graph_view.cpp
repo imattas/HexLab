@@ -6,7 +6,20 @@
 #include <wx/sizer.h>
 #include "hexlab/loaders/loaded_image.hpp"
 #include <algorithm>
+#include <array>
 namespace hexlab::desktop {
+namespace {
+constexpr std::array<std::size_t, 7> call_depth_values{1, 2, 3, 4, 8, 16, 32};
+int call_depth_selection(std::size_t depth) {
+    const auto found = std::lower_bound(call_depth_values.begin(), call_depth_values.end(), depth);
+    if (found == call_depth_values.begin()) return 0;
+    if (found == call_depth_values.end()) return static_cast<int>(call_depth_values.size() - 1);
+    const auto upper = static_cast<std::size_t>(found - call_depth_values.begin());
+    const auto lower = upper - 1;
+    return static_cast<int>(depth - call_depth_values[lower] <= call_depth_values[upper] - depth
+        ? lower : upper);
+}
+}
 GraphView::GraphView(wxWindow *parent) : wxPanel(parent) {
     SetName("graph-view");
     const int pad = FromDIP(4);
@@ -21,9 +34,8 @@ GraphView::GraphView(wxWindow *parent) : wxPanel(parent) {
     kind_->SetSelection(0);
     bar->Add(kind_, 0, wxALL, pad);
     wxArrayString depths;
-    depths.Add("Call depth 1");
-    depths.Add("Call depth 2");
-    depths.Add("Call depth 3");
+    for (const auto depth : call_depth_values)
+        depths.Add(wxString::Format("Call depth %zu", depth));
     call_depth_ = new wxChoice(this, wxID_ANY, wxDefaultPosition, wxDefaultSize, depths);
     call_depth_->SetName("graph-call-depth");
     call_depth_->SetSelection(0);
@@ -169,11 +181,13 @@ GraphView::GraphView(wxWindow *parent) : wxPanel(parent) {
         if (kind_changed)
             kind_changed(kind_->GetSelection() == 0 ? GraphKind::function_cfg
                           : kind_->GetSelection() == 1 ? GraphKind::image_calls : GraphKind::function_calls,
-                          static_cast<std::size_t>(call_depth_->GetSelection() + 1));
+                          call_depth_values[static_cast<std::size_t>(std::clamp(call_depth_->GetSelection(), 0,
+                              static_cast<int>(call_depth_values.size() - 1)))]);
     });
     call_depth_->Bind(wxEVT_CHOICE, [this](wxCommandEvent &) {
         if (kind_changed && kind_->GetSelection() == 2)
-            kind_changed(GraphKind::function_calls, static_cast<std::size_t>(call_depth_->GetSelection() + 1));
+            kind_changed(GraphKind::function_calls, call_depth_values[static_cast<std::size_t>(std::clamp(
+                call_depth_->GetSelection(), 0, static_cast<int>(call_depth_values.size() - 1)))]);
     });
 }
 void GraphView::show_items() {
@@ -333,7 +347,7 @@ void GraphView::update(const ProjectSnapshot *project, std::optional<Location> s
                        std::size_t call_depth,
                        std::shared_ptr<const ProjectGraph> graph, bool pending, const wxString &reason) {
     kind_->SetSelection(kind == GraphKind::function_cfg ? 0 : kind == GraphKind::image_calls ? 1 : 2);
-    call_depth_->SetSelection(static_cast<int>(std::clamp<std::size_t>(call_depth, 1, 3) - 1));
+    call_depth_->SetSelection(call_depth_selection(std::clamp<std::size_t>(call_depth, 1, 32)));
     kind_->Enable(project != nullptr);
     call_depth_->Enable(project != nullptr && kind == GraphKind::function_calls);
     if (!project || (graph && !project_graph_current(*project, *graph)))

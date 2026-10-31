@@ -116,6 +116,8 @@ option(HEXLAB_BUILD_AUTOMATION_EXAMPLES "Build native automation SDK examples" O
 if(HEXLAB_BUILD_AUTOMATION_EXAMPLES)
   add_executable(hexlab_resume_inventory examples/resume_inventory.cpp)
   target_link_libraries(hexlab_resume_inventory PRIVATE hexlab::automation)
+  add_executable(hexlab_archive_inspect examples/archive_inspect.cpp)
+  target_link_libraries(hexlab_archive_inspect PRIVATE hexlab::automation)
 endif()
 
 if(BUILD_TESTING)
@@ -139,8 +141,10 @@ install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/../../docs/python-automation.md"
               "${CMAKE_CURRENT_SOURCE_DIR}/../../docs/python-stack-analysis.md"
               "${CMAKE_CURRENT_SOURCE_DIR}/../../docs/python-debug-information.md"
   DESTINATION "${CMAKE_INSTALL_DATADIR}/hexlab/docs")
+install(FILES README-archive-inspection.md DESTINATION "${CMAKE_INSTALL_DATADIR}/hexlab/docs")
 install(DIRECTORY examples/ DESTINATION "${CMAKE_INSTALL_DATADIR}/hexlab/examples/python"
   PATTERN "*.cpp" EXCLUDE)
 install(FILES examples/resume_inventory.cpp DESTINATION "${CMAKE_INSTALL_DATADIR}/hexlab/examples/native")
+install(FILES examples/archive_inspect.cpp DESTINATION "${CMAKE_INSTALL_DATADIR}/hexlab/examples/native")
 install(FILES README-workflow-state.md DESTINATION "${CMAKE_INSTALL_DATADIR}/hexlab/docs")
 install(FILES README-annotation-import.md DESTINATION "${CMAKE_INSTALL_DATADIR}/hexlab/docs")

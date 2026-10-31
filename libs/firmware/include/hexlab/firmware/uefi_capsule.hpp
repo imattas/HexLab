@@ -72,7 +72,8 @@ struct UefiCapsuleItem {
     // reject a capsule based on firmware-specific update policy.
     bool capsule_support_authentication_mismatch = false;
     std::string capsule_support_authentication_diagnostic;
-    // Bounded PI firmware volumes discovered inside the update image payload.
+    // Bounded PI firmware volumes discovered inside an embedded driver item or
+    // the update image payload. Offsets address the containing capsule buffer.
     std::vector<UefiCapsuleEmbeddedVolume> embedded_volumes;
     bool embedded_volume_scan_attempted = false;
     bool embedded_volume_scan_complete = true;

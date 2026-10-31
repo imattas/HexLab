@@ -4,7 +4,7 @@ The Graph view offers a **Function callers and callees** mode alongside a
 function's control-flow graph and the image-wide call graph. Select any
 instruction owned by a recovered function and the view centers that function,
 then includes its known callers and callees up to the selected call depth (1,
-2, or 3). The depth control rebuilds the neighborhood without changing the
+2, 3, 4, 8, 16, or 32). The depth control rebuilds the neighborhood without changing the
 selected function. It keeps calls and tail
 transfer candidates incident to the selected function, including external
 import nodes and unresolved indirect-call nodes. Other image functions are
@@ -32,12 +32,12 @@ The same neighborhood is available from the project CLI:
 ```
 
 The selected address may be any instruction owned by a recovered function.
-Depth is bounded to 1 through 4, while node and edge budgets cap large output;
+Depth is bounded to 1 through 32, while node and edge budgets cap large output;
 the JSON/DOT graph model reports omitted nodes or edges when a cap is reached.
 `--kind call` continues to mean the image-wide call graph.
 
 The analysis API uses `GraphKind::function_calls` with the selected
-`FunctionId` and `GraphOptions::call_depth` (bounded to 1–4). The project graph
+`FunctionId` and `GraphOptions::call_depth` (bounded to 1–32). The project graph
 service resolves a selected virtual address to its owner before building the
 model. JSON exports report `function_calls` as the graph kind.
 
