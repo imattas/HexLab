@@ -65,6 +65,13 @@ std::string register_token(RegisterOperand reg, std::optional<std::uint32_t> ver
     return result;
 }
 
+std::string phi_identity(const decompiler::LiftedBlock::Phi &phi, Address block_entry) {
+    return "phi_" + std::to_string(block_entry.space.value) + "_" +
+           std::to_string(block_entry.offset) + "_" +
+           std::to_string(static_cast<unsigned>(phi.destination.bank)) + "_" +
+           std::to_string(phi.destination.index);
+}
+
 std::pair<std::uint32_t, std::uint64_t> address_identity(Address address) {
     return {address.space.value, address.offset};
 }
@@ -743,6 +750,8 @@ std::string render_user_variables(const decompiler::LiftedFunction &function, st
                                   const std::map<std::string, std::string> &local_names,
                                   const std::map<std::string, std::string> &local_comments) {
     std::map<std::string, Address> definitions;
+    std::map<std::string, std::string> stable_identities;
+    std::set<std::string> read_only;
     std::map<std::string, std::vector<Address>> uses;
     std::set<std::string> ambiguous;
     const auto define = [&](RegisterOperand reg, std::optional<std::uint32_t> version, Address at) {
@@ -750,38 +759,47 @@ std::string render_user_variables(const decompiler::LiftedFunction &function, st
         const auto token = register_token(reg, version);
         if (!definitions.emplace(token, at).second) ambiguous.insert(token);
     };
-    for (const auto &block : function.blocks) for (const auto &instruction : block.instructions) {
-        std::visit([&](const auto &statement) {
-            using T = std::decay_t<decltype(statement)>;
-            if constexpr (std::is_same_v<T, decompiler::Assign>) {
-                define(statement.destination, statement.destination_version, instruction.origin.address);
-                collect_register_uses(statement.value, uses, instruction.origin.address);
-            } else if constexpr (std::is_same_v<T, decompiler::Store>) {
-                collect_register_uses(statement.address, uses, instruction.origin.address);
-                collect_register_uses(statement.value, uses, instruction.origin.address);
-            } else if constexpr (std::is_same_v<T, decompiler::Call>) {
-                collect_register_uses(statement.indirect_target, uses, instruction.origin.address);
-                for (const auto &input : statement.register_inputs)
-                    if (input.version) uses[register_token(input.reg, input.version)].push_back(instruction.origin.address);
-                for (std::size_t i = 0; i < statement.register_output_versions.size() && i < statement.register_writes.size(); ++i)
-                    define(statement.register_writes[i], statement.register_output_versions[i], instruction.origin.address);
-                if (statement.return_register &&
-                    std::find(statement.register_writes.begin(), statement.register_writes.end(),
-                              *statement.return_register) == statement.register_writes.end())
-                    define(*statement.return_register, statement.return_version, instruction.origin.address);
-            } else if constexpr (std::is_same_v<T, decompiler::Branch>) {
-                collect_register_uses(statement.predicate, uses, instruction.origin.address);
-                collect_register_uses(statement.indirect_target, uses, instruction.origin.address);
-            } else if constexpr (std::is_same_v<T, decompiler::Return>) {
-                collect_register_uses(statement.value, uses, instruction.origin.address);
-            } else if constexpr (std::is_same_v<T, decompiler::Intrinsic>) {
-                for (const auto &operand : statement.operands)
-                    collect_register_uses(operand, uses, instruction.origin.address);
-                if (statement.register_writes.size() == statement.register_output_versions.size())
-                    for (std::size_t i = 0; i < statement.register_writes.size(); ++i)
+    for (const auto &block : function.blocks) {
+        for (const auto &phi : block.phis) {
+            if (!phi.version) continue;
+            const auto token = register_token(phi.destination, phi.version);
+            if (!definitions.emplace(token, block.begin).second) ambiguous.insert(token);
+            stable_identities.emplace(token, phi_identity(phi, block.begin));
+            read_only.insert(token);
+        }
+        for (const auto &instruction : block.instructions) {
+            std::visit([&](const auto &statement) {
+                using T = std::decay_t<decltype(statement)>;
+                if constexpr (std::is_same_v<T, decompiler::Assign>) {
+                    define(statement.destination, statement.destination_version, instruction.origin.address);
+                    collect_register_uses(statement.value, uses, instruction.origin.address);
+                } else if constexpr (std::is_same_v<T, decompiler::Store>) {
+                    collect_register_uses(statement.address, uses, instruction.origin.address);
+                    collect_register_uses(statement.value, uses, instruction.origin.address);
+                } else if constexpr (std::is_same_v<T, decompiler::Call>) {
+                    collect_register_uses(statement.indirect_target, uses, instruction.origin.address);
+                    for (const auto &input : statement.register_inputs)
+                        if (input.version) uses[register_token(input.reg, input.version)].push_back(instruction.origin.address);
+                    for (std::size_t i = 0; i < statement.register_output_versions.size() && i < statement.register_writes.size(); ++i)
                         define(statement.register_writes[i], statement.register_output_versions[i], instruction.origin.address);
-            }
-        }, instruction.statement);
+                    if (statement.return_register &&
+                        std::find(statement.register_writes.begin(), statement.register_writes.end(),
+                                  *statement.return_register) == statement.register_writes.end())
+                        define(*statement.return_register, statement.return_version, instruction.origin.address);
+                } else if constexpr (std::is_same_v<T, decompiler::Branch>) {
+                    collect_register_uses(statement.predicate, uses, instruction.origin.address);
+                    collect_register_uses(statement.indirect_target, uses, instruction.origin.address);
+                } else if constexpr (std::is_same_v<T, decompiler::Return>) {
+                    collect_register_uses(statement.value, uses, instruction.origin.address);
+                } else if constexpr (std::is_same_v<T, decompiler::Intrinsic>) {
+                    for (const auto &operand : statement.operands)
+                        collect_register_uses(operand, uses, instruction.origin.address);
+                    if (statement.register_writes.size() == statement.register_output_versions.size())
+                        for (std::size_t i = 0; i < statement.register_writes.size(); ++i)
+                            define(statement.register_writes[i], statement.register_output_versions[i], instruction.origin.address);
+                }
+            }, instruction.statement);
+        }
     }
     for (const auto &token : ambiguous) definitions.erase(token);
     std::map<std::string, std::string> replacements;
@@ -796,15 +814,18 @@ std::string render_user_variables(const decompiler::LiftedFunction &function, st
         // Keep larger identities visible, but disable edits rather than applying
         // a partial rename/type assignment.
         const bool safely_editable = access_sites.size() <= 4096;
-        const auto *annotation = project ? annotation_at(*project, address) : nullptr;
-        const auto *assignment = project ? type_assignment(*project, address) : nullptr;
+        const bool is_phi = read_only.contains(token);
+        const auto identity = stable_identities.contains(token) ? stable_identities.at(token) : token;
+        const auto *annotation = project && !is_phi ? annotation_at(*project, address) : nullptr;
+        const auto *assignment = project && !is_phi ? type_assignment(*project, address) : nullptr;
         const auto *definition = assignment ? type_definition(*project, assignment->type_id) : nullptr;
-        std::string display = annotation && !annotation->name.empty() ? annotation->name : token;
+        std::string display = annotation && !annotation->name.empty() ? annotation->name : identity;
         if (definition) display += " /* " + (definition->type->name().empty()
                                                    ? types::format(*definition->type) : definition->type->name()) + " */";
         replacements.emplace(token, display);
-        variables.push_back({token, address, annotation && !annotation->name.empty() ? annotation->name : token,
-                             safely_editable, false, safely_editable ? std::move(access_sites) : std::vector<Address>{}});
+        variables.push_back({identity, address, annotation && !annotation->name.empty() ? annotation->name : identity,
+                             !is_phi && safely_editable, false,
+                             !is_phi && safely_editable ? std::move(access_sites) : std::vector<Address>{}});
     }
     for (const auto &[token, display] : replacements) {
         std::size_t position = 0;
@@ -2170,7 +2191,10 @@ void PseudocodeView::remember_source() {
     if (!model_ready_ || !document_ || !rendered_function_) return;
     const auto found = source_states_.find(document_->value);
     if (found == source_states_.end()) return; // A closed document must not recreate its state.
-    SourceState state{*rendered_function_};
+    SourceState state;
+    state.function = *rendered_function_;
+    state.analysis_key = rendered_snapshot_ ? rendered_snapshot_->key : std::nullopt;
+    state.snapshot = rendered_snapshot_;
     source_->GetSelection(&state.begin, &state.end);
     if (selected_variable_ && *selected_variable_ < variable_links_.size())
         state.variable = variable_links_[*selected_variable_].token;
@@ -2183,8 +2207,12 @@ void PseudocodeView::restore_source() {
     if (!document_ || !rendered_function_) return;
     const auto found = source_states_.find(document_->value);
     if (found == source_states_.end()) return;
-    const auto state = std::find_if(found->second.begin(), found->second.end(),
-        [&](const auto &saved) { return saved.function == *rendered_function_; });
+    const auto state = std::find_if(found->second.begin(), found->second.end(), [&](const auto &saved) {
+        if (saved.function != *rendered_function_) return false;
+        if (saved.analysis_key || (rendered_snapshot_ && rendered_snapshot_->key))
+            return saved.analysis_key == (rendered_snapshot_ ? rendered_snapshot_->key : std::nullopt);
+        return saved.snapshot == rendered_snapshot_;
+    });
     if (state == found->second.end()) return;
     const auto length = source_->GetLastPosition();
     source_->SetSelection(std::clamp(state->begin, 0L, length), std::clamp(state->end, 0L, length));
