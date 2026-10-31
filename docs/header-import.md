@@ -370,8 +370,20 @@ operands may be object-like macro expansions such as `#define API_HEADER
 passed to the resolver without expanding identifiers inside the name. The
 compiler extension `#pragma once` is honored using the resolver's stable header
 ID, so repeated and recursive includes after the pragma are skipped even when
-they use different spellings. The
-preprocessor supports C++20 `__VA_OPT__(tokens)` inside variadic macro
+they use different spellings.
+
+The desktop Import C Header command resolves quoted includes relative to the
+including header and angled includes relative to the selected header's folder.
+It follows nested includes only when their canonical targets remain inside
+that folder tree, and reads only regular files no larger than the per-file
+input limit. The parser's configured include count, depth, and expanded-byte
+budgets apply across the full include graph; included file bytes also have a
+cumulative cap equal to the expanded-byte limit. Include paths outside the
+selected folder, unresolved names, and unreadable or oversized files fail the
+import;
+the desktop importer does not search system include directories.
+
+The preprocessor supports C++20 `__VA_OPT__(tokens)` inside variadic macro
 replacements. It includes the parenthesized token sequence when the expanded
 variadic arguments contain tokens and removes the complete construct when
 they are empty; nested `__VA_OPT__` constructs are bounded by the configured
