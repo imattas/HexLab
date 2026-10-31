@@ -18,6 +18,25 @@ struct M6502LoadResult {
 HEXLAB_PROCESSORS_EXPORT std::optional<M6502LoadResult>
 evaluate_m6502_load(Opcode opcode, std::uint8_t operand, std::uint8_t status) noexcept;
 
+struct M6502LogicalResult {
+    std::uint8_t accumulator = 0;
+    std::uint8_t status = 0;
+    bool operator==(const M6502LogicalResult &) const = default;
+};
+
+// Evaluate official AND/ORA/EOR after the caller fetches the operand byte.
+// Only A and P.N/Z change; decimal mode does not affect the byte operation.
+HEXLAB_PROCESSORS_EXPORT std::optional<M6502LogicalResult>
+evaluate_m6502_logical(Opcode opcode, std::uint8_t accumulator,
+                       std::uint8_t operand, std::uint8_t status) noexcept;
+// Accept only the 24 official NMOS encodings with matching byte-operand,
+// register-effect and fallthrough facts. Immediate operand values must match
+// the supplied operand. Memory access and committing A/P remain caller-owned.
+HEXLAB_PROCESSORS_EXPORT std::optional<M6502LogicalResult>
+evaluate_m6502_logical_instruction(const Instruction &instruction,
+                                   std::uint8_t accumulator,
+                                   std::uint8_t operand, std::uint8_t status) noexcept;
+
 struct M6502BinaryArithmeticResult {
     std::uint8_t accumulator = 0;
     std::uint8_t status = 0;

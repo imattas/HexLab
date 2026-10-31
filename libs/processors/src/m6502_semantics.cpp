@@ -14,6 +14,82 @@ evaluate_m6502_load(Opcode opcode, std::uint8_t operand, std::uint8_t status) no
     return M6502LoadResult{operand, updated};
 }
 
+std::optional<M6502LogicalResult>
+evaluate_m6502_logical(Opcode opcode, std::uint8_t accumulator,
+                       std::uint8_t operand, std::uint8_t status) noexcept {
+    std::uint8_t result = 0;
+    switch (opcode) {
+    case Opcode::m6502_and: result = accumulator & operand; break;
+    case Opcode::m6502_ora: result = accumulator | operand; break;
+    case Opcode::m6502_eor: result = accumulator ^ operand; break;
+    default: return {};
+    }
+    const auto updated = static_cast<std::uint8_t>((status & 0x7du) |
+        (result == 0 ? 0x02u : 0u) | (result & 0x80u));
+    return M6502LogicalResult{result, updated};
+}
+
+std::optional<M6502LogicalResult>
+evaluate_m6502_logical_instruction(const Instruction &instruction,
+                                   std::uint8_t accumulator,
+                                   std::uint8_t operand, std::uint8_t status) noexcept {
+    if (instruction.context.architecture != Architecture::mos6502 ||
+        instruction.context.mode != ExecutionMode::m6502 ||
+        instruction.flow != FlowKind::fallthrough || instruction.direct_target ||
+        instruction.operands.size() != 1 || instruction.access.size() != 1 ||
+        instruction.access[0] != OperandAccess::read || instruction.memory_write)
+        return {};
+    const auto encoded = std::to_integer<std::uint8_t>(instruction.bytes[0]);
+    // Group-one operations 0/1/2 are ORA/AND/EOR; all eight modes are legal.
+    if ((encoded & 3u) != 1u || (encoded >> 5) > 2u) return {};
+    constexpr Opcode operations[]{Opcode::m6502_ora, Opcode::m6502_and, Opcode::m6502_eor};
+    if (instruction.opcode != operations[encoded >> 5]) return {};
+    const unsigned mode = (encoded >> 2) & 7u;
+    const unsigned length = mode == 3 || mode == 6 || mode == 7 ? 3u : 2u;
+    if (instruction.length != length) return {};
+
+    const RegisterOperand a{RegisterBank::mos6502, 0, 8, false};
+    const RegisterOperand x{RegisterBank::mos6502, 1, 8, false};
+    const RegisterOperand y{RegisterBank::mos6502, 2, 8, false};
+    const RegisterOperand p{RegisterBank::mos6502, 3, 8, false};
+    const auto contains = [](const auto &registers, RegisterOperand reg) {
+        return std::find(registers.begin(), registers.end(), reg) != registers.end();
+    };
+    const bool indexed = mode == 0 || mode == 4 || mode == 5 || mode == 6 || mode == 7;
+    const auto index = mode == 4 || mode == 6 ? y : x;
+    if (instruction.register_reads.size() != (indexed ? 3u : 2u) ||
+        instruction.register_writes.size() != 2 ||
+        !contains(instruction.register_reads, a) || !contains(instruction.register_reads, p) ||
+        !contains(instruction.register_writes, a) || !contains(instruction.register_writes, p) ||
+        (indexed && !contains(instruction.register_reads, index)))
+        return {};
+
+    const auto low = std::to_integer<std::uint8_t>(instruction.bytes[1]);
+    if (mode == 2) {
+        const auto *immediate = std::get_if<ImmediateOperand>(&instruction.operands[0]);
+        if (!immediate || immediate->encoded_width != 8 || immediate->effective_width != 8 ||
+            immediate->is_signed || immediate->value != low || operand != low ||
+            immediate->encoding != EncodedField{1, 1} || instruction.memory_read)
+            return {};
+    } else {
+        const auto *memory = std::get_if<MemoryOperand>(&instruction.operands[0]);
+        const unsigned address = length == 3
+            ? low | (unsigned(std::to_integer<std::uint8_t>(instruction.bytes[2])) << 8) : low;
+        if (!memory || !instruction.memory_read || memory->data_width != 8 ||
+            memory->address_width != 16 || memory->segment || memory->base ||
+            memory->scale != 1 || memory->displacement != address || memory->ip_relative ||
+            memory->writeback || memory->post_index || memory->writeback_displacement != 0 ||
+            !memory->index_extend.empty() || memory->index_shift_amount != 0 ||
+            memory->displacement_encoding != EncodedField{1, static_cast<std::uint8_t>(length - 1)} ||
+            (indexed ? memory->index != index : memory->index.has_value()))
+            return {};
+        if (memory->resolved_address && (indexed ||
+            memory->resolved_address != Address{instruction.address.space, address}))
+            return {};
+    }
+    return evaluate_m6502_logical(instruction.opcode, accumulator, operand, status);
+}
+
 static std::optional<M6502BinaryArithmeticResult>
 evaluate_binary_arithmetic(Opcode opcode, std::uint8_t accumulator,
                            std::uint8_t operand, std::uint8_t status, bool cmos) noexcept {
