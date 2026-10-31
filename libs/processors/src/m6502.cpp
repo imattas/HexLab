@@ -45,6 +45,33 @@ constexpr std::array<std::uint8_t, 256> documented_cycles{
     2,6,0,0,3,3,5,0,2,2,2,0,4,4,6,0,
     // f0-ff
     2,5,0,0,0,4,6,0,2,4,2,0,0,4,7,0};
+
+bool w65c02_reserved_nop(unsigned opcode, std::uint8_t &length,
+                         std::uint8_t &cycles) noexcept {
+    // WDC W65C02S datasheet, Table 7-1. These opcodes are reserved NOPs on
+    // this silicon; their byte lengths and cycle counts differ by encoding.
+    if ((opcode & 0x0fu) == 0x03u ||
+        ((opcode & 0x0fu) == 0x0bu && (opcode <= 0xbbu || opcode >= 0xebu))) {
+        length = 1;
+        cycles = 1;
+        return true;
+    }
+    switch (opcode) {
+    case 0x02: case 0x22: case 0x42: case 0x62: case 0x82:
+    case 0xc2: case 0xe2:
+        length = 2; cycles = 2; return true;
+    case 0x44:
+        length = 2; cycles = 3; return true;
+    case 0x54: case 0xd4: case 0xf4:
+        length = 2; cycles = 4; return true;
+    case 0x5c:
+        length = 3; cycles = 8; return true;
+    case 0xdc: case 0xfc:
+        length = 3; cycles = 4; return true;
+    default:
+        return false;
+    }
+}
 }
 
 static DecodeResult decode_m6502_impl(std::span<const std::byte> bytes, Address at, bool cmos) {
@@ -64,6 +91,10 @@ static DecodeResult decode_m6502_impl(std::span<const std::byte> bytes, Address 
             M6502Timing timing;
             timing.base_cycles = base_cycles;
             if (cmos) {
+                [[maybe_unused]] std::uint8_t nop_length = 0;
+                std::uint8_t nop_cycles = 0;
+                if (w65c02_reserved_nop(op, nop_length, nop_cycles))
+                    timing.base_cycles = nop_cycles;
                 // W65C02S differs from the NMOS base table for indirect JMP,
                 // absolute-X read/modify/write, and its extension opcodes.
                 if (op == 0x6c) timing.base_cycles = 6;
@@ -300,6 +331,15 @@ static DecodeResult decode_m6502_impl(std::span<const std::byte> bytes, Address 
         i.memory_read = true;
         i.flow = FlowKind::jump;
         return finish(3);
+    }
+    if (cmos) {
+        std::uint8_t length = 0;
+        std::uint8_t cycles = 0;
+        if (w65c02_reserved_nop(op, length, cycles)) {
+            if (!begin(Opcode::nop, length))
+                return bad(DecodeStatus::truncated, "W65C02 reserved NOP operand bytes are truncated");
+            return finish(length);
+        }
     }
     // Do not let the NMOS unofficial-opcode table reinterpret bytes in the
     // CMOS profile. The supported CMOS additions above have explicit cases;
