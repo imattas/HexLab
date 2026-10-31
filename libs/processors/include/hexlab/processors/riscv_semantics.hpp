@@ -365,7 +365,8 @@ evaluate_riscv_vector_configuration(const RiscvInstruction &instruction,
 // elements. The evaluator models vstart, vl, and v0 masking; inactive, slide-up
 // preserved, and tail lanes are retained from the old destination. Integer
 // reductions use vs1[0] as their initial accumulator, skip masked-off lanes,
-// and require vstart=0.
+// and require vstart=0. Widening sums return double-SEW results and are
+// supported through SEW=32 (64-to-128-bit results are not representable).
 HEXLAB_PROCESSORS_EXPORT std::optional<RiscvVectorIntegerResult>
 evaluate_riscv_vector_integer_operation(RiscvOpcode opcode, const RiscvVectorIntegerConfig &config,
                                        const RiscvVectorIntegerOperands &operands);

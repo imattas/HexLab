@@ -8,6 +8,12 @@ increasing lane order. Addition wraps to SEW, and signed min/max compare the
 SEW-width two's-complement lane values. `vstart` must be zero, matching the
 reduction restart restriction. With `vl=0`, the seed is returned unchanged.
 
+The same evaluator supports `vwredsum[u]` for SEW=8, 16, or 32, producing a
+double-SEW accumulator and result. Signed reduction sign-extends each source
+lane before wrapping the sum to 2*SEW; unsigned reduction zero-extends it.
+The 64-to-128-bit forms decode and format but are not evaluated because result
+lanes use 64-bit storage.
+
 Only destination lane zero is updated; other lanes preserve the caller's old
 destination because this configuration does not carry tail-agnostic policy.
 The evaluator supports caller-supplied predicate bytes for masked reductions,
