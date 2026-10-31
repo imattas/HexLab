@@ -811,6 +811,9 @@ std::optional<X87CompareResult> evaluate_x87_compare(const X87CompareRequest &re
 
     if (invalid) result.status_word |= fsw_invalid;
     if (invalid && !masked) {
+        // Invalid-operation is higher priority than the denormal operand
+        // exception. An unmasked invalid operand suspends this comparison
+        // before DE is reported or any relation flags are committed.
         result.status_word |= fsw_error_summary | fsw_busy;
         result.completed = false;
         if (request.kind == X87CompareKind::fcomi || request.kind == X87CompareKind::fucomi)

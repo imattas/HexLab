@@ -30,9 +30,11 @@ For FCOMI/FUCOMI, AF/SF/OF are still cleared on that unmasked exception while
 ZF/PF/CF retain their incoming values. Pseudo-denormals are not treated as
 denormal operands. This handling is limited to the value evaluator; stack-tag
 fault interaction remains caller-owned.
-When an unmasked invalid operand and a denormal operand occur together, this
-helper prioritizes invalid and does not currently report DE; that combined
-exception case remains unsupported.
+When an unmasked invalid operand and a denormal operand occur together, the
+helper reports the higher-priority invalid-operation exception (IE), ES, and
+B, and does not report DE because comparison processing is suspended before
+the lower-priority denormal exception is handled. If invalid is masked, the
+comparison continues to denormal handling and can report both sticky flags.
 
 `evaluate_x87_test` evaluates decoded `FTST` using the same ordered
 comparison rules with positive binary80 zero as the right operand. It returns
@@ -43,11 +45,11 @@ responsible for stack-underflow handling and any subsequent exception
 delivery.
 
 The evaluator does not convert m32fp/m64fp values, perform arithmetic, model
-exception delivery, track the physical x87 register stack/TOP/tag word, or apply
-the pop side effects of FCOMP/FCOMIP/FUCOMIP. The caller must apply stack changes
-only when the returned comparison completed. Arithmetic and conversion remain
-symbolic in the decompiler until exact extended-precision arithmetic semantics
-are available.
+exception delivery, or track the physical x87 register stack/TOP/tag word. The
+caller remains responsible for stack-underflow fault interaction and applying
+the pop side effects of FCOMP/FCOMIP/FUCOMIP only when the comparison completed.
+Arithmetic and conversion remain symbolic in the decompiler until exact
+extended-precision arithmetic semantics are available.
 
 The comparison behavior follows Intel's instruction reference for [FCOM and
 FCOMP](https://www.intel.com/content/dam/www/public/us/en/documents/manuals/64-ia-32-architectures-software-developer-manual-volume-2a.pdf)
