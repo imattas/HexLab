@@ -684,6 +684,102 @@ MachOObjCTypeImportPlan macho_objc_type_import_plan(
         add_definition(std::move(type_name), with_class.value(), section, category.categorylist_index,
                        category.address->offset, 1);
     }
+    // Protocol declarations have contracts but no object storage. Preserve
+    // parsed required and optional signatures in an incomplete aggregate so
+    // project callers can reuse the types without inventing a layout.
+    std::unordered_map<std::string, std::size_t> protocol_name_counts;
+    for (const auto &protocol : scan.protocols)
+        if (protocol.name && protocol.name_status == "resolved")
+            ++protocol_name_counts[*protocol.name];
+    for (const auto &protocol : scan.protocols) {
+        if (!protocol.complete || !protocol.address ||
+            !protocol.name || protocol.name_status != "resolved" || protocol_name_counts[*protocol.name] != 1) {
+            plan.skipped.push_back("Protocol record #" + std::to_string(protocol.protolist_index) +
+                                   " lacks a unique complete record and resolved name/address");
+            continue;
+        }
+        const auto type_name = "ObjC2.Protocol." + objc_type_component(*protocol.name);
+        std::vector<types::Method> methods;
+        const auto append_protocol_methods = [&](const MachOObjCList &list, bool is_static) {
+            for (const auto &method : list.methods) {
+                if (!method.selector || !method.signature || method.signature_status != "parsed")
+                    continue;
+                const auto duplicate = std::find_if(methods.begin(), methods.end(), [&](const auto &prior) {
+                    return prior.name == *method.selector && prior.is_static == is_static;
+                });
+                if (duplicate != methods.end()) continue;
+                if (methods.size() == 100000) return false;
+                methods.push_back({*method.selector, method.signature, types::MemberAccess::unknown,
+                                   types::MemberDispatch::unknown, 0, is_static});
+            }
+            return true;
+        };
+        if (!append_protocol_methods(protocol.required_instance_methods, false) ||
+            !append_protocol_methods(protocol.optional_instance_methods, false) ||
+            !append_protocol_methods(protocol.required_class_methods, true) ||
+            !append_protocol_methods(protocol.optional_class_methods, true)) {
+            plan.skipped.push_back("Protocol " + *protocol.name + " exceeds the persistent method limit");
+            continue;
+        }
+        const auto id_type = types::Type::pointer(types::Type::void_type(), scan.pointer_bytes, scan.pointer_bytes);
+        const auto selector_type = id_type;
+        const auto add_property_accessors = [&](const MachOObjCList &list, bool is_static) {
+            for (const auto &property : list.properties) {
+                if (!property.name || property.name_status != "resolved" || !property.type ||
+                    property.type_status != "parsed" ||
+                    (property.attribute_semantics_status != "parsed" &&
+                     property.attribute_semantics_status != "parsed-with-unknown-attributes"))
+                    continue;
+                const auto add_accessor = [&](std::string selector, types::TypePtr result,
+                                              const types::TypePtr &argument) {
+                    if (selector.empty() || std::any_of(methods.begin(), methods.end(), [&](const auto &method) {
+                            return method.name == selector && method.is_static == is_static;
+                        })) return true;
+                    if (methods.size() >= 100000 || !id_type || !selector_type || !result) return false;
+                    std::vector<types::Parameter> parameters{{"self", id_type.value()},
+                                                              {"_cmd", selector_type.value()}};
+                    if (argument) parameters.push_back({"value", argument});
+                    auto signature = types::Type::function(std::move(result), std::move(parameters), false);
+                    if (!signature) return false;
+                    methods.push_back({std::move(selector), signature.value(), types::MemberAccess::unknown,
+                                       types::MemberDispatch::unknown, 0, is_static});
+                    return true;
+                };
+                const auto getter = property.custom_getter.value_or(*property.name);
+                if (!add_accessor(getter, property.type, {})) {
+                    plan.skipped.push_back("Protocol " + *protocol.name + " property " + *property.name +
+                                           " getter could not be represented");
+                    continue;
+                }
+                if (property.readonly) continue;
+                std::string default_setter = "set" + *property.name;
+                if (default_setter.size() > 3 && default_setter[3] >= 'a' && default_setter[3] <= 'z')
+                    default_setter[3] = static_cast<char>(default_setter[3] - 'a' + 'A');
+                default_setter.push_back(':');
+                if (!add_accessor(property.custom_setter.value_or(std::move(default_setter)),
+                                  types::Type::void_type(), property.type))
+                    plan.skipped.push_back("Protocol " + *protocol.name + " property " + *property.name +
+                                           " setter could not be represented");
+            }
+        };
+        add_property_accessors(protocol.instance_properties, false);
+        add_property_accessors(protocol.class_properties, true);
+        if (methods.empty()) {
+            plan.skipped.push_back("Protocol " + *protocol.name + " has no parsed method signatures");
+            continue;
+        }
+        auto incomplete = types::Type::incomplete_aggregate(types::Kind::structure, type_name);
+        auto with_methods = incomplete
+            ? types::Type::with_methods(incomplete.value(), std::move(methods))
+            : hexlab::Result<types::TypePtr>(incomplete.error());
+        if (!with_methods) {
+            plan.skipped.push_back("Protocol " + *protocol.name + " methods cannot form a project type");
+            continue;
+        }
+        const auto section = "protolist section #" + std::to_string(protocol.protolist_section);
+        add_definition(type_name, with_methods.value(), section, protocol.protolist_index,
+                       protocol.address->offset, protocol.runtime_size.value_or(1));
+    }
     return plan;
 }
 

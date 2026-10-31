@@ -104,6 +104,14 @@ the validated methods of scanned categories attached to it. Each requirement
 reports its selector, implementation entry, and status in the Binary Metadata
 protocol-reference row. Missing selectors are reported only when the overall
 scan and relevant method lists are complete; otherwise the result is explicitly
-unverified. This does not follow inherited protocol adoption, prove runtime
-conformance across dynamically loaded libraries, or import protocol
-requirements into project types.
+unverified. This does not follow inherited protocol adoption or prove runtime
+conformance across dynamically loaded libraries. The type-import action creates
+an incomplete `ObjC2.Protocol.<name>` aggregate for each uniquely named,
+address-validated protocol record. It retains parsed required and optional
+instance/class method signatures, plus accessor signatures for parsed protocol
+properties. Protocol declarations carry the protolist section, index, metadata
+address, and runtime record size when known as project provenance. Duplicate protocol
+names, unresolved records, and protocols without parsed signatures are skipped.
+The type system has no required-versus-optional method marker, so imported
+signatures do not retain that distinction. Adopted-protocol inheritance and
+runtime conformance are not encoded as storage or inheritance relationships.
