@@ -29,6 +29,8 @@ struct FlowState {
     // or another tracked temporary. Each value is entry-SP depth (not an
     // absolute address), so direct memory operands can reuse the slot model.
     std::array<FlowValue, 32> riscv_stack_alias_depths{};
+    // MIPS32 temporary bases derived from the entry-relative $sp/$fp value.
+    std::array<FlowValue, 32> mips32_stack_alias_depths{};
     // Equivalent fixed-width relation for AArch64 temporary base registers.
     std::array<FlowValue, 31> arm64_stack_alias_depths{};
     // Independently tracked NMOS 6502 copies of a TSX snapshot in A, X, or Y.
@@ -196,6 +198,18 @@ bool merge(FlowState &current, const FlowState &incoming) {
             current.ambiguous = true;
         }
     }
+    bool mips32_alias_changed = false;
+    for (std::size_t index = 1; index < current.mips32_stack_alias_depths.size(); ++index) {
+        auto &alias = current.mips32_stack_alias_depths[index];
+        const auto incoming_alias = incoming.mips32_stack_alias_depths[index];
+        if (!alias.known && incoming_alias.known) {
+            current.ambiguous = true;
+        } else if (alias.known && (!incoming_alias.known || alias.value != incoming_alias.value)) {
+            alias = {};
+            mips32_alias_changed = true;
+            current.ambiguous = true;
+        }
+    }
     bool arm64_alias_changed = false;
     for (std::size_t index = 0; index < current.arm64_stack_alias_depths.size(); ++index) {
         auto &alias = current.arm64_stack_alias_depths[index];
@@ -230,7 +244,7 @@ bool merge(FlowState &current, const FlowState &incoming) {
     return stack_changed || frame_changed || previously_supported != current.supported ||
            previously_ambiguous != current.ambiguous || previous_frame_register != current.frame_register ||
            previous_arm64_frame_pointer != current.arm64_frame_pointer || frame_register_delta_changed ||
-           riscv_alias_changed || arm64_alias_changed || m6502_alias_changed || m6502_carry_changed ||
+           riscv_alias_changed || mips32_alias_changed || arm64_alias_changed || m6502_alias_changed || m6502_carry_changed ||
            m6502_decimal_changed;
 }
 
@@ -894,14 +908,54 @@ bool transfer(const Instruction &instruction, FlowState &state) {
         state.stack_depth = state.frame_depth;
         return true;
     }
-    if (mips_stack_adjust(instruction) &&
-        instruction.operands.size() >= 3) {
+    if (mips_stack_adjust(instruction) && instruction.operands.size() >= 3) {
         const auto immediate = immediate_value(instruction, 2);
         const bool dst_stack = mips_register(first, 29);
         const bool dst_frame = mips_register(first, 30);
         const bool src_stack = mips_register(second, 29);
         const bool src_frame = mips_register(second, 30);
-        if (immediate && ((dst_stack && (src_stack || src_frame)) || (dst_frame && (src_stack || src_frame)))) {
+        const bool mips32_form = instruction.context.architecture == Architecture::mips32 &&
+            instruction.context.mode == ExecutionMode::mips32 && instruction.operands.size() == 3 &&
+            first && second && first->bank == RegisterBank::mips_gpr && second->bank == RegisterBank::mips_gpr &&
+            first->index < 32 && second->index < 32 && first->width == 32 && second->width == 32 &&
+            instruction.access == std::vector<OperandAccess>{OperandAccess::write, OperandAccess::read,
+                                                              OperandAccess::read} &&
+            instruction.flow == FlowKind::fallthrough && !instruction.delay_slots &&
+            !instruction.memory_read && !instruction.memory_write &&
+            std::find(instruction.register_writes.begin(), instruction.register_writes.end(), *first) !=
+                instruction.register_writes.end() &&
+            std::find(instruction.register_reads.begin(), instruction.register_reads.end(), *second) !=
+                instruction.register_reads.end();
+        if (mips32_form && immediate) {
+            FlowValue base;
+            bool stack_derived = false;
+            if (src_stack) { base = state.stack_depth; stack_derived = true; }
+            else if (src_frame && state.frame_register == 30) { base = state.frame_depth; stack_derived = true; }
+            else if (second->index != 0 && state.mips32_stack_alias_depths[second->index].known) {
+                base = state.mips32_stack_alias_depths[second->index];
+                stack_derived = true;
+            }
+            auto relation = base;
+            if (relation.known && !subtract_checked(relation.value, *immediate, relation.value)) return false;
+            if (dst_stack) {
+                state.stack_depth = stack_derived ? relation : FlowValue{};
+                if (!stack_derived || !relation.known) state.supported = false;
+                return true;
+            }
+            if (dst_frame) {
+                state.frame_depth = stack_derived ? relation : FlowValue{};
+                state.frame_register = 30;
+                if (!stack_derived || !relation.known) state.supported = false;
+                return true;
+            }
+            if (first->index != 0) {
+                state.mips32_stack_alias_depths[first->index] = stack_derived ? relation : FlowValue{};
+                if (stack_derived && !relation.known) state.supported = false;
+                return true;
+            }
+        }
+        if (instruction.context.architecture == Architecture::mips64 && immediate &&
+            ((dst_stack && (src_stack || src_frame)) || (dst_frame && (src_stack || src_frame)))) {
             FlowValue relation = src_stack ? state.stack_depth : state.frame_depth;
             if (!subtract_checked(relation.value, *immediate, relation.value)) return false;
             if (!relation.known) state.supported = false;
@@ -909,6 +963,9 @@ bool transfer(const Instruction &instruction, FlowState &state) {
             else { state.frame_depth = relation; state.frame_register = 30; }
             return true;
         }
+        if (instruction.context.architecture == Architecture::mips32 && first &&
+            first->bank == RegisterBank::mips_gpr && first->index != 0 && first->index < 32)
+            state.mips32_stack_alias_depths[first->index] = {};
     }
     if ((instruction.context.architecture == Architecture::riscv32 ||
          instruction.context.architecture == Architecture::riscv64) &&
@@ -1101,13 +1158,36 @@ bool transfer(const Instruction &instruction, FlowState &state) {
         instruction.operands.size() >= 3 &&
         (mips_register(second, 0) || mips_register(register_at(instruction, 2), 0))) {
         const auto source = mips_register(second, 0) ? register_at(instruction, 2) : second;
-        if (mips_register(first, 29) && mips_register(source, 30) && state.frame_register == 30) {
+        const bool exact_mips32_copy = instruction.context.architecture == Architecture::mips32 &&
+            instruction.context.mode == ExecutionMode::mips32 && instruction.operands.size() == 3 &&
+            first && source && first->bank == RegisterBank::mips_gpr && source->bank == RegisterBank::mips_gpr &&
+            first->index < 32 && source->index < 32 && first->width == 32 && source->width == 32 &&
+            instruction.access == std::vector<OperandAccess>{OperandAccess::write, OperandAccess::read,
+                                                              OperandAccess::read} &&
+            instruction.flow == FlowKind::fallthrough && !instruction.delay_slots &&
+            !instruction.memory_read && !instruction.memory_write &&
+            std::find(instruction.register_writes.begin(), instruction.register_writes.end(), *first) !=
+                instruction.register_writes.end() &&
+            std::find(instruction.register_reads.begin(), instruction.register_reads.end(), *source) !=
+                instruction.register_reads.end() &&
+            std::find(instruction.register_reads.begin(), instruction.register_reads.end(),
+                      RegisterOperand{RegisterBank::mips_gpr, 0, 32, false}) != instruction.register_reads.end();
+        const bool recognized_mips32 = instruction.context.architecture != Architecture::mips32 || exact_mips32_copy;
+        if (recognized_mips32 && mips_register(first, 29) && mips_register(source, 30) && state.frame_register == 30) {
             state.stack_depth = state.frame_depth;
             return true;
         }
-        if (mips_register(first, 30) && mips_register(source, 29)) {
+        if (recognized_mips32 && mips_register(first, 30) && mips_register(source, 29)) {
             state.frame_depth = state.stack_depth;
             state.frame_register = 30;
+            return true;
+        }
+        if (exact_mips32_copy && first->index != 0 && first->index != 29 && first->index != 30) {
+            FlowValue relation;
+            if (mips_register(source, 29)) relation = state.stack_depth;
+            else if (mips_register(source, 30) && state.frame_register == 30) relation = state.frame_depth;
+            else if (source->index != 0) relation = state.mips32_stack_alias_depths[source->index];
+            state.mips32_stack_alias_depths[first->index] = relation;
             return true;
         }
     }
@@ -1376,6 +1456,25 @@ bool transfer(const Instruction &instruction, FlowState &state) {
                 if (reg && instruction.access[index] != OperandAccess::read &&
                     reg->bank == RegisterBank::arm64_gpr && reg->index < state.arm64_stack_alias_depths.size())
                     state.arm64_stack_alias_depths[reg->index] = {};
+            }
+        }
+    }
+
+    if (instruction.context.architecture == Architecture::mips32 &&
+        instruction.context.mode == ExecutionMode::mips32) {
+        if (instruction.flow == FlowKind::call) {
+            for (auto &alias : state.mips32_stack_alias_depths) alias = {};
+        } else {
+            const auto invalidate_alias = [&](const RegisterOperand &reg) {
+                if (reg.bank == RegisterBank::mips_gpr && reg.index != 0 && reg.index < 32)
+                    state.mips32_stack_alias_depths[reg.index] = {};
+            };
+            for (const auto &reg : instruction.register_writes) invalidate_alias(reg);
+            for (std::size_t index = 0; index < instruction.operands.size() && index < instruction.access.size(); ++index) {
+                if (instruction.access[index] == OperandAccess::write ||
+                    instruction.access[index] == OperandAccess::read_write) {
+                    if (const auto reg = register_at(instruction, index)) invalidate_alias(*reg);
+                }
             }
         }
     }
@@ -2531,6 +2630,12 @@ Result<StackFrameAnalysis> analyze_stack_frame(const FunctionRecord &function, c
                 const bool mips_frame = (instruction.context.architecture == Architecture::mips32 ||
                                          instruction.context.architecture == Architecture::mips64) &&
                                         memory->base->bank == RegisterBank::mips_gpr && memory->base->index == 30;
+                const bool mips32_alias = instruction.context.architecture == Architecture::mips32 &&
+                                          instruction.context.mode == ExecutionMode::mips32 &&
+                                          memory->base->bank == RegisterBank::mips_gpr &&
+                                          memory->base->index != 0 && memory->base->index != 29 &&
+                                          memory->base->index != 30 && memory->base->index < 32 &&
+                                          state.mips32_stack_alias_depths[memory->base->index].known;
                 const bool riscv_stack = (instruction.context.architecture == Architecture::riscv32 ||
                                           instruction.context.architecture == Architecture::riscv64) &&
                                          memory->base->bank == RegisterBank::riscv_gpr && memory->base->index == 2;
@@ -2548,6 +2653,7 @@ Result<StackFrameAnalysis> analyze_stack_frame(const FunctionRecord &function, c
                 const bool ppc_frame = instruction.context.architecture == Architecture::powerpc &&
                                        memory->base->bank == RegisterBank::ppc_gpr && memory->base->index == 31;
                 if (!arm64_stack && !arm64_frame && !arm64_alias && !x86_stack && !mips_stack && !mips_frame &&
+                    !mips32_alias &&
                     !riscv_stack && !riscv_frame && !riscv_alias && !ppc_stack && !ppc_frame)
                     continue;
                 const bool from_frame = arm64_frame || mips_frame || riscv_frame ||
@@ -2562,6 +2668,7 @@ Result<StackFrameAnalysis> analyze_stack_frame(const FunctionRecord &function, c
                     continue;
                 }
                 const auto base = arm64_alias ? state.arm64_stack_alias_depths[memory->base->index]
+                    : mips32_alias ? state.mips32_stack_alias_depths[memory->base->index]
                     : riscv_alias ? state.riscv_stack_alias_depths[memory->base->index]
                     : from_frame ? state.frame_depth : state.stack_depth;
                 const bool access_address = instruction.access[i] == OperandAccess::address;
