@@ -1104,6 +1104,47 @@ struct X86OpmaskBooleanResult {
     bool operator==(const X86OpmaskBooleanResult &) const = default;
 };
 
+// Defined RFLAGS bit-vector update for KTEST/KORTEST. Bits outside
+// written_mask are preserved by callers; architectural RFLAGS positions are used.
+struct X86OpmaskTestResult {
+    std::uint64_t flags_value = 0;
+    std::uint64_t written_mask = 0;
+    std::uint8_t width = 0;
+    bool operator==(const X86OpmaskTestResult &) const = default;
+};
+
+inline std::optional<X86OpmaskTestResult> evaluate_x86_opmask_test(
+    const Instruction &instruction, std::uint64_t destination, std::uint64_t source) noexcept {
+    unsigned width = 0; bool use_or = false;
+    switch (instruction.opcode) {
+#define HEXLAB_KTEST_CASE(op, bits, is_or) case Opcode::op: width = bits; use_or = is_or; break
+    HEXLAB_KTEST_CASE(ktestb,8,false); HEXLAB_KTEST_CASE(ktestw,16,false);
+    HEXLAB_KTEST_CASE(ktestd,32,false); HEXLAB_KTEST_CASE(ktestq,64,false);
+    HEXLAB_KTEST_CASE(kortestb,8,true); HEXLAB_KTEST_CASE(kortestw,16,true);
+    HEXLAB_KTEST_CASE(kortestd,32,true); HEXLAB_KTEST_CASE(kortestq,64,true);
+#undef HEXLAB_KTEST_CASE
+    default: return std::nullopt;
+    }
+    if (instruction.context.architecture != Architecture::x86_64 ||
+        instruction.context.mode != ExecutionMode::x86_64 || instruction.flow != FlowKind::fallthrough ||
+        instruction.x86_evex || instruction.operands.size() != 2 || instruction.access.size() != 2 ||
+        instruction.access[0] != OperandAccess::read || instruction.access[1] != OperandAccess::read ||
+        instruction.memory_read || instruction.memory_write || instruction.register_reads.size() != 2 ||
+        !instruction.register_writes.empty()) return std::nullopt;
+    for (const auto &operand : instruction.operands) {
+        const auto *reg = std::get_if<RegisterOperand>(&operand);
+        if (!reg || reg->bank != RegisterBank::opmask || reg->index >= 8 || reg->width != 64 || reg->high_byte)
+            return std::nullopt;
+    }
+    const auto mask = width == 64 ? UINT64_MAX : (UINT64_C(1) << width) - 1;
+    destination &= mask; source &= mask;
+    const bool cf = use_or ? ((destination | source) == mask) : ((destination & ~source & mask) == 0);
+    const bool zf = use_or ? ((destination | source) == 0) : ((destination & source) == 0);
+    constexpr std::uint64_t CF = 1, PF = 1u << 2, AF = 1u << 4, ZF = 1u << 6, SF = 1u << 7, OF = 1u << 11;
+    constexpr std::uint64_t written = CF | PF | AF | ZF | SF | OF;
+    return X86OpmaskTestResult{(cf ? CF : 0) | (zf ? ZF : 0), written, static_cast<std::uint8_t>(width)};
+}
+
 inline std::optional<X86OpmaskBooleanResult> evaluate_x86_opmask_boolean(
     const Instruction &instruction, std::uint64_t source1,
     std::optional<std::uint64_t> source2 = std::nullopt) noexcept {
