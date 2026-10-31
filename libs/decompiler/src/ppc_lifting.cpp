@@ -166,6 +166,24 @@ ExpressionPtr ppc_fpscr_after_mcrfs(ExpressionPtr fpscr, unsigned field) {
     auto vx = binary("shl", unary("zext", ppc_fpscr_vx(cleared), 32), constant(29, 32), 32);
     return binary("or", binary("or", std::move(base), std::move(fex), 32), std::move(vx), 32);
 }
+ExpressionPtr ppc_fpscr_after_mtfsb(ExpressionPtr fpscr, unsigned bit, bool set) {
+    // FPSCR bit numbering is most-significant-first. FEX and VX are derived
+    // summaries, so mtfsb0/mtfsb1 cannot explicitly write them.
+    const auto mask = bit < 32 ? (UINT32_C(1) << (31u - bit)) : 0;
+    ExpressionPtr updated = std::move(fpscr);
+    if (bit != 1 && bit != 2 && mask != 0) {
+        if (set) {
+            updated = binary("or", std::move(updated), constant(mask, 32), 32);
+        } else {
+            updated = binary("and", std::move(updated), constant(UINT32_MAX ^ mask, 32), 32);
+        }
+    }
+    auto base = binary("and", updated,
+                       constant(UINT32_MAX ^ ((1u << 30) | (1u << 29)), 32), 32);
+    auto fex = binary("shl", unary("zext", ppc_fpscr_fex(updated), 32), constant(30, 32), 32);
+    auto vx = binary("shl", unary("zext", ppc_fpscr_vx(updated), 32), constant(29, 32), 32);
+    return binary("or", binary("or", std::move(base), std::move(fex), 32), std::move(vx), 32);
+}
 ExpressionPtr ppc_record_cr0(ExpressionPtr result, std::uint16_t bits) {
     const auto zero = constant(0, bits);
     auto lt = predicate("slt", result, zero);
@@ -569,6 +587,22 @@ std::optional<Statement> lift_ppc_instruction(const Instruction &i, std::vector<
                                  i.register_reads.end();
         if (i.register_writes != expected_writes || !status_read)
             return effect(i, "ppc_malformed_mtfs_effects");
+        if ((i.opcode == Opcode::ppc_mtfsb0 || i.opcode == Opcode::ppc_mtfsb1) && ops.size() == 1) {
+            const auto *bit = std::get_if<ImmediateOperand>(&ops[0]);
+            const auto bit_value = bit ? bit->value : UINT64_MAX;
+            if (!bit || bit->encoded_width != 5 || bit->effective_width != 5 || bit->is_signed ||
+                bit_value >= 32 || i.operands.size() != 1 ||
+                i.access != std::vector<OperandAccess>{OperandAccess::read} ||
+                i.register_reads != std::vector<R>{status} ||
+                i.register_writes != (writes_record ? std::vector<R>{status, record} : std::vector<R>{status}))
+                return effect(i, "ppc_malformed_mtfsb_effects");
+            const char *name = i.opcode == Opcode::ppc_mtfsb0 ? "ppc_mtfsb0" : "ppc_mtfsb1";
+            auto next_status = ppc_fpscr_after_mtfsb(reg(status), static_cast<unsigned>(bit_value),
+                                                      i.opcode == Opcode::ppc_mtfsb1);
+            std::vector<ExpressionPtr> outputs{next_status};
+            if (writes_record) outputs.push_back(ppc_fpscr_record_cr1(next_status));
+            return effect_with_outputs(i, name, std::move(outputs));
+        }
         const char *name = i.opcode == Opcode::ppc_mtfsb0 ? "ppc_mtfsb0" :
                            i.opcode == Opcode::ppc_mtfsb1 ? "ppc_mtfsb1" :
                            i.opcode == Opcode::ppc_mtfsfi ? "ppc_mtfsfi" : "ppc_mtfsf";
