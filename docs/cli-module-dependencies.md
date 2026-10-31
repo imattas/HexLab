@@ -52,9 +52,40 @@ to the importing object's canonical directory. Candidate paths are
 canonicalized and considered only when they remain below the supplied sysroot
 and exactly identify another supplied file. A declared search path takes
 precedence over basename matching; without one, existing supplied-basename
-behavior applies. Other dynamic-loader tokens, environment variables, default
-system directories, inherited RPATH lookup, and filesystem discovery are not
-implemented. This is a partial path-resolution aid, not full loader precedence.
+behavior applies. Other dynamic-loader tokens, environment variables,
+inherited RPATH lookup, and filesystem discovery are not implemented by this
+supplied-file path mode. This is a partial path-resolution aid, not full loader
+precedence.
+
+Add `--glibc-system-search` to explicitly include the target sysroot's glibc
+cache and standard default directories in filesystem discovery:
+
+```text
+hexlab_cli modules --sysroot ./rootfs --discover --glibc-system-search --graph ./rootfs/bin/app
+```
+
+The cache reader opens only `<sysroot>/etc/ld.so.cache`, after canonicalizing
+the sysroot and verifying the cache itself stays beneath it. The cache snapshot
+is reused for the graph walk. This opt-in never reads the host cache or process
+environment. Cache size and entry count are bounded. The new glibc cache
+format 1.1 is supported; old and compatibility layouts, unknown byte order,
+malformed entries, nonzero required OS versions, and hardware-capability
+entries are reported as unsupported and cannot supply candidates. Cache ABI
+flags are matched conservatively against the importer's ELF machine and class;
+unknown machine-specific variants remain unsupported. Every cache path is
+interpreted below the explicit sysroot and must canonicalize to a regular file
+inside it.
+
+The same opt-in searches `/lib` and `/usr/lib`, plus recognized multiarch
+default directories for x86, AArch64, ARM, RISC-V, s390x, and PPC64, all below
+the sysroot. Candidate rows retain whether they came from the cache or a
+default directory. This is still an offline inventory: it does not apply glibc
+hardware-capability precedence, secure-execution policy, `-z nodefaultlib`,
+or establish which duplicate file a real process would load. The CLI loads
+candidate metadata without execution and rejects ELF class, byte-order,
+machine, OSABI, or supported machine-ABI mismatches before adding graph nodes.
+Without `--glibc-system-search`, the cache and standard directories are not
+read or searched.
 
 Examples:
 

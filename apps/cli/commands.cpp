@@ -346,7 +346,7 @@ void usage(std::ostream &out) {
            "       hexlab_cli functions <path> [options] [--limit <count>] [--json]\n\n"
            "       hexlab_cli decompile <path> [options]\n\n"
            "       hexlab_cli compare <old-image> <new-image> [--window <bytes>] [--anchor <bytes>] [--limit <runs>] [--functions]\n\n"
-           "       hexlab_cli modules [--sysroot <dir>] [--discover] [--search-dir <dir>] [--target-cwd <dir>] [--lib-token <value>] [--platform-token <value>] [--graph] <binary>...\n\n"
+           "       hexlab_cli modules [--sysroot <dir>] [--discover] [--glibc-system-search] [--search-dir <dir>] [--target-cwd <dir>] [--lib-token <value>] [--platform-token <value>] [--graph] <binary>...\n\n"
            "       hexlab_cli pe-deps --sysroot <dir> [--search-dir <dir>] [--windows-defaults] <PE image>\n\n"
            "       hexlab_cli project --help  (persistent projects and editing)\n\n"
            "       hexlab_cli plugins scan|dependencies <directory> [--json] [--strict]  (data-only native plugin discovery)\n\n"
@@ -586,13 +586,14 @@ int modules_command(std::span<const std::wstring_view> arguments, std::ostream &
     std::optional<std::filesystem::path> target_working_directory;
     std::string lib_token, platform_token;
     std::vector<std::filesystem::path> discovery_directories;
-    bool graph_mode = false, discover = false;
+    bool graph_mode = false, discover = false, glibc_system_search = false;
     std::size_t option_count = 0;
     while (option_count < arguments.size()) {
         const auto option = arguments[option_count];
         if (option == L"--") { ++option_count; break; }
         if (option == L"--graph") graph_mode = true;
         else if (option == L"--discover") discover = true;
+        else if (option == L"--glibc-system-search") glibc_system_search = true;
         else if (option == L"--sysroot" || option == L"--search-dir" || option == L"--target-cwd" ||
                  option == L"--lib-token" || option == L"--platform-token") {
             if (++option_count == arguments.size()) {
@@ -620,14 +621,14 @@ int modules_command(std::span<const std::wstring_view> arguments, std::ostream &
     }
     const auto inputs = arguments.subspan(option_count);
     if ((graph_mode && inputs.empty()) || (!graph_mode && inputs.size() < 2)) {
-        err << "Usage: hexlab_cli modules [--sysroot <directory>] [--discover] [--search-dir <directory>] [--target-cwd <directory>] [--lib-token <value>] [--platform-token <value>] [--graph] <binary>...\n"
+        err << "Usage: hexlab_cli modules [--sysroot <directory>] [--discover] [--glibc-system-search] [--search-dir <directory>] [--target-cwd <directory>] [--lib-token <value>] [--platform-token <value>] [--graph] <binary>...\n"
                "       Graph mode starts at the first binary. Discovery requires --graph and --sysroot.\n";
         return 2;
     }
     if ((sysroot && !graph_mode) || (discover && (!graph_mode || !sysroot)) ||
         (!discovery_directories.empty() && !discover) ||
-        ((target_working_directory || !lib_token.empty() || !platform_token.empty()) && !discover)) {
-        err << "--discover requires --graph and --sysroot; --search-dir and target path substitutions require --discover.\n";
+        ((target_working_directory || !lib_token.empty() || !platform_token.empty() || glibc_system_search) && !discover)) {
+        err << "--discover requires --graph and --sysroot; --search-dir, target path substitutions and --glibc-system-search require --discover.\n";
         return 2;
     }
     constexpr std::size_t max_graph_modules = 4096;
@@ -647,6 +648,10 @@ int modules_command(std::span<const std::wstring_view> arguments, std::ostream &
         auto loaded = load_document(request, {{i}, 1}, {});
         if (!loaded) { err << path_text(request.path) << ": " << loaded.error().message << '\n'; return 1; }
         modules.push_back({request.path, loaded.value()});
+    }
+    if (glibc_system_search && (modules.empty() || !modules.front().document->metadata.elf)) {
+        err << "--glibc-system-search requires an ELF graph root.\n";
+        return 2;
     }
     auto leaf = [](std::string value) {
         const auto slash = value.find_last_of("/\\");
@@ -702,6 +707,13 @@ int modules_command(std::span<const std::wstring_view> arguments, std::ostream &
     path_context.target_working_directory = target_working_directory;
     path_context.lib_token = lib_token;
     path_context.platform_token = platform_token;
+    path_context.use_glibc_ld_so_cache = glibc_system_search;
+    path_context.use_standard_default_directories = glibc_system_search;
+    if (glibc_system_search && canonical_sysroot) {
+        auto cache = read_elf_glibc_cache(*canonical_sysroot);
+        if (!cache) { err << cache.error().message << '\n'; return 1; }
+        path_context.glibc_cache = std::move(cache.value());
+    }
     auto is_under_root = [](const std::filesystem::path &candidate, const std::filesystem::path &root) {
         auto c = candidate.begin(), r = root.begin();
         for (; r != root.end(); ++r, ++c) {
@@ -780,6 +792,13 @@ int modules_command(std::span<const std::wstring_view> arguments, std::ostream &
                 *canonical_sysroot, discovery_directories, remaining, {}, current_path_context);
             if (!found) { err << path_text(modules[source].path) << ": " << found.error().message << '\n'; return 1; }
             const auto &report = found.value();
+            if (glibc_system_search) {
+                out << "  glibc cache evidence: " << report.glibc_cache_bytes << " bytes, "
+                    << report.glibc_cache_entries << " entries, "
+                    << report.unsupported_cache_formats << " unsupported format(s), "
+                    << report.unsupported_cache_entries << " unsupported cache entries, "
+                    << report.cache_filesystem_errors << " cache filesystem error(s)\n";
+            }
             remaining.dependency_rows -= report.raw_dependency_rows;
             remaining.metadata_entries -= report.metadata_entries;
             remaining.name_bytes -= report.name_bytes;
@@ -841,6 +860,8 @@ int modules_command(std::span<const std::wstring_view> arguments, std::ostream &
                         candidate.source == ElfDependencyPathSource::runpath ? "DT_RUNPATH" :
                         candidate.source == ElfDependencyPathSource::rpath ? "DT_RPATH" :
                         candidate.source == ElfDependencyPathSource::inherited_rpath ? "inherited DT_RPATH" :
+                        candidate.source == ElfDependencyPathSource::glibc_cache ? "glibc ld.so.cache" :
+                        candidate.source == ElfDependencyPathSource::default_directory ? "glibc default directory" :
                         "--search-dir";
                     out << "    [" << id->second << "] " << path_text(candidate.path) << " via " << via;
                     if (candidate.search_entry_file_offset) out << " @file:" << hex(*candidate.search_entry_file_offset);

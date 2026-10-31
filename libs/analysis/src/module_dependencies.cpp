@@ -1,8 +1,11 @@
 #include "hexlab/analysis/module_dependencies.hpp"
 #include <algorithm>
+#include <cstddef>
 #include <cwctype>
+#include <fstream>
 #include <limits>
 #include <set>
+#include <span>
 #include <string_view>
 
 namespace hexlab {
@@ -37,6 +40,261 @@ std::string identity(const std::filesystem::path &path) {
 #endif
     return result;
 }
+std::uint64_t cache_integer(std::span<const std::byte> bytes, std::size_t offset,
+                            std::size_t width, bool little_endian) {
+    std::uint64_t value = 0;
+    for (std::size_t i = 0; i < width; ++i) {
+        const auto byte = std::to_integer<std::uint8_t>(bytes[offset + i]);
+        const auto shift = little_endian ? i * 8 : (width - 1 - i) * 8;
+        value |= std::uint64_t{byte} << shift;
+    }
+    return value;
+}
+enum class CacheAbiMatch { compatible, incompatible, unsupported };
+CacheAbiMatch cache_abi_match(std::uint32_t flags, const ElfHeader &header) {
+    constexpr std::uint32_t type_mask = 0x00ff, required_mask = 0xff00;
+    if ((flags & type_mask) != 3 || (flags & ~(type_mask | required_mask)) != 0)
+        return CacheAbiMatch::unsupported;
+    const auto required = flags & required_mask;
+    if (required == 0) {
+        switch (header.machine) {
+        case 3: case 20: case 22: case 2:
+            return header.is_64 ? CacheAbiMatch::incompatible : CacheAbiMatch::compatible;
+        case 8: {
+            constexpr std::uint32_t mips_abi2 = 0x20, mips_abi_mask = 0xf000, mips_nan2008 = 0x400;
+            const auto abi = header.flags & mips_abi_mask;
+            return !header.is_64 && !(header.flags & (mips_abi2 | mips_nan2008)) &&
+                           (abi == 0 || abi == 0x1000)
+                       ? CacheAbiMatch::compatible : CacheAbiMatch::unsupported;
+        }
+        case 40:
+            if (header.is_64 || (header.flags & 0x600) == 0x600) return CacheAbiMatch::unsupported;
+            return CacheAbiMatch::compatible;
+        default: return CacheAbiMatch::unsupported;
+        }
+    }
+    switch (header.machine) {
+    case 62: // EM_X86_64: x86-64 or x32 cache ABI.
+        if (required == 0x0300) return header.is_64 ? CacheAbiMatch::compatible : CacheAbiMatch::incompatible;
+        if (required == 0x0800) return !header.is_64 ? CacheAbiMatch::compatible : CacheAbiMatch::incompatible;
+        break;
+    case 3: // EM_386.
+        if (required == 0x0300 || required == 0x0800) return CacheAbiMatch::incompatible;
+        break;
+    case 43: // EM_SPARCV9.
+        if (required == 0x0100) return header.is_64 ? CacheAbiMatch::compatible : CacheAbiMatch::incompatible;
+        break;
+    case 22: // EM_S390.
+        if (required == 0x0400) return header.is_64 ? CacheAbiMatch::compatible : CacheAbiMatch::incompatible;
+        break;
+    case 21: // EM_PPC64.
+        if (required == 0x0500) return header.is_64 ? CacheAbiMatch::compatible : CacheAbiMatch::incompatible;
+        break;
+    case 8: // EM_MIPS: N32/N64 and nan2008 require more e_flags detail than this inventory exposes.
+        if (required == 0x0600)
+            return !header.is_64 && (header.flags & 0x20) ? CacheAbiMatch::compatible : CacheAbiMatch::incompatible;
+        if (required == 0x0700)
+            return header.is_64 && !(header.flags & 0x20) ? CacheAbiMatch::compatible : CacheAbiMatch::incompatible;
+        if (required == 0x0c00)
+            return !header.is_64 && !(header.flags & 0x20) && (header.flags & 0x400)
+                ? CacheAbiMatch::compatible : CacheAbiMatch::incompatible;
+        if (required == 0x0d00)
+            return !header.is_64 && (header.flags & 0x20) && (header.flags & 0x400)
+                ? CacheAbiMatch::compatible : CacheAbiMatch::incompatible;
+        if (required == 0x0e00)
+            return header.is_64 && !(header.flags & 0x20) && (header.flags & 0x400)
+                ? CacheAbiMatch::compatible : CacheAbiMatch::incompatible;
+        break;
+    case 40: // EM_ARM.
+        if (required == 0x0900) {
+            if (header.is_64 || (header.flags & 0x600) == 0) return CacheAbiMatch::unsupported;
+            return (header.flags & 0x600) == 0x400 ? CacheAbiMatch::compatible : CacheAbiMatch::incompatible;
+        }
+        if (required == 0x0b00) {
+            if (header.is_64 || (header.flags & 0x600) == 0) return CacheAbiMatch::unsupported;
+            return (header.flags & 0x600) == 0x200 ? CacheAbiMatch::compatible : CacheAbiMatch::incompatible;
+        }
+        break;
+    case 183: // EM_AARCH64.
+        if (required == 0x0a00) return header.is_64 ? CacheAbiMatch::compatible : CacheAbiMatch::incompatible;
+        break;
+    case 243: // EM_RISCV: cache flags distinguish soft and double-float ABIs.
+        if (required == 0x0f00) return header.is_64 && (header.flags & 0x6) == 0 ? CacheAbiMatch::compatible : CacheAbiMatch::incompatible;
+        if (required == 0x1000) return header.is_64 && (header.flags & 0x6) == 4 ? CacheAbiMatch::compatible : CacheAbiMatch::incompatible;
+        break;
+    case 258: // EM_LOONGARCH.
+        if (required == 0x1100) return header.is_64 && (header.flags & 0x3) == 1 ? CacheAbiMatch::compatible : CacheAbiMatch::incompatible;
+        if (required == 0x1200) return header.is_64 && (header.flags & 0x3) == 3 ? CacheAbiMatch::compatible : CacheAbiMatch::incompatible;
+        break;
+    default: break;
+    }
+    return CacheAbiMatch::unsupported;
+}
+ElfGlibcCacheSnapshot load_glibc_cache(const std::filesystem::path &root,
+                                      std::size_t byte_limit, std::size_t entry_limit,
+                                      std::size_t string_byte_limit,
+                                      std::stop_token stop) {
+    ElfGlibcCacheSnapshot result;
+    result.sysroot = root;
+    std::error_code ec;
+    const auto cache_path = std::filesystem::canonical(root / "etc" / "ld.so.cache", ec);
+    if (ec) { result.filesystem_errors = 1; return result; }
+    if (!contained(cache_path, root) || !std::filesystem::is_regular_file(cache_path, ec) || ec) {
+        result.filesystem_errors = 1;
+        return result;
+    }
+    const auto file_size = std::filesystem::file_size(cache_path, ec);
+    if (ec || file_size > byte_limit || file_size > std::numeric_limits<std::size_t>::max() ||
+        file_size > static_cast<std::uintmax_t>((std::numeric_limits<std::streamsize>::max)())) {
+        result.unsupported_formats = 1;
+        return result;
+    }
+    result.bytes = static_cast<std::size_t>(file_size);
+    std::vector<std::byte> bytes(result.bytes);
+    std::ifstream input(cache_path, std::ios::binary);
+    if (!input || (result.bytes && !input.read(reinterpret_cast<char *>(bytes.data()),
+                                               static_cast<std::streamsize>(result.bytes)))) {
+        result.filesystem_errors = 1;
+        return result;
+    }
+    constexpr std::string_view magic = "glibc-ld.so.cache1.1";
+    if (bytes.size() < 48 || bytes.size() < magic.size() ||
+        !std::equal(magic.begin(), magic.end(), bytes.begin(), [](char left, std::byte right) {
+            return static_cast<unsigned char>(left) == std::to_integer<unsigned char>(right);
+        })) {
+        result.unsupported_formats = 1;
+        return result;
+    }
+    const auto format_flags = std::to_integer<std::uint8_t>(bytes[28]);
+    const auto endian_tag = format_flags & 3;
+    if (endian_tag == 1 || endian_tag == 0 || endian_tag > 3) {
+        result.unsupported_formats = 1;
+        return result;
+    }
+    const bool little = endian_tag == 2;
+    result.order = little ? ByteOrder::little : ByteOrder::big;
+    const auto count = static_cast<std::size_t>(cache_integer(bytes, 20, 4, little));
+    const auto string_size = static_cast<std::size_t>(cache_integer(bytes, 24, 4, little));
+    const auto extension_offset = static_cast<std::size_t>(cache_integer(bytes, 32, 4, little));
+    constexpr std::size_t header_size = 48, entry_size = 24;
+    if (count > entry_limit || count > (bytes.size() - header_size) / entry_size) {
+        result.unsupported_formats = 1;
+        return result;
+    }
+    const auto string_base = header_size + count * entry_size;
+    if (string_size > bytes.size() - string_base ||
+        (extension_offset && (extension_offset % 4 || extension_offset >= bytes.size() ||
+                             extension_offset < string_base + string_size))) {
+        result.unsupported_formats = 1;
+        return result;
+    }
+    struct RawEntry {
+        std::uint32_t flags = 0, key = 0, value = 0, os_version = 0;
+        std::uint64_t hwcap = 0;
+    };
+    std::vector<RawEntry> raw_entries;
+    raw_entries.reserve(count);
+    std::set<std::uint32_t> requested_strings;
+    for (std::size_t i = 0; i < count; ++i) {
+        if ((i & 255u) == 0 && stop.stop_requested()) return result;
+        const auto at = header_size + i * entry_size;
+        RawEntry entry;
+        entry.flags = static_cast<std::uint32_t>(cache_integer(bytes, at, 4, little));
+        entry.key = static_cast<std::uint32_t>(cache_integer(bytes, at + 4, 4, little));
+        entry.value = static_cast<std::uint32_t>(cache_integer(bytes, at + 8, 4, little));
+        entry.os_version = static_cast<std::uint32_t>(cache_integer(bytes, at + 12, 4, little));
+        entry.hwcap = cache_integer(bytes, at + 16, 8, little);
+        requested_strings.insert(entry.key);
+        requested_strings.insert(entry.value);
+        raw_entries.push_back(entry);
+    }
+    std::map<std::uint32_t, std::string> decoded_strings;
+    const auto string_end = string_base + string_size;
+    for (std::size_t position = string_base; position < string_end;) {
+        if (((position - string_base) & 4095u) == 0 && stop.stop_requested()) return result;
+        auto end = position;
+        while (end < string_end && bytes[end] != std::byte{}) ++end;
+        if (end == string_end) break;
+        if (requested_strings.contains(static_cast<std::uint32_t>(position))) {
+            if (end - position <= 32768) {
+                std::string value;
+                value.reserve(end - position);
+                for (auto i = position; i < end; ++i)
+                    value.push_back(static_cast<char>(std::to_integer<unsigned char>(bytes[i])));
+                decoded_strings.emplace(static_cast<std::uint32_t>(position), std::move(value));
+            }
+        }
+        position = end + 1;
+    }
+    for (std::size_t i = 0; i < raw_entries.size(); ++i) {
+        if ((i & 255u) == 0 && stop.stop_requested()) return result;
+        const auto &entry = raw_entries[i];
+        const auto name_it = decoded_strings.find(entry.key);
+        const auto path_it = decoded_strings.find(entry.value);
+        if (name_it == decoded_strings.end() || path_it == decoded_strings.end()) {
+            ++result.unsupported_entries;
+            continue;
+        }
+        const auto &name = name_it->second;
+        const auto &path = path_it->second;
+        if (name.empty() || path.empty() || path.front() != '/' || result.string_bytes > string_byte_limit ||
+            name.size() > string_byte_limit - result.string_bytes ||
+            path.size() > string_byte_limit - result.string_bytes - name.size()) {
+            ++result.unsupported_entries;
+            continue;
+        }
+        result.string_bytes += name.size() + path.size();
+        const auto index = result.entries.size();
+        result.entries.push_back({name, utf8_path(path), entry.flags, entry.os_version, entry.hwcap});
+        result.entry_indices_by_name[name].push_back(index);
+    }
+    return result;
+}
+std::vector<std::string> standard_default_dirs(const ElfHeader &header) {
+    std::vector<std::string> dirs{"/lib", "/usr/lib"};
+    const auto add = [&](std::string_view base, std::string_view triplet) {
+        dirs.push_back(std::string(base) + "/" + std::string(triplet));
+        dirs.push_back(std::string(base == "/lib" ? "/usr/lib" : base) + "/" + std::string(triplet));
+    };
+    if (header.is_64)
+        dirs.insert(dirs.begin(), {"/lib64", "/usr/lib64"});
+    if (header.machine == 62 && header.is_64) {
+        add("/lib", "x86_64-linux-gnu");
+    } else if (header.machine == 62 && !header.is_64) {
+        dirs.insert(dirs.begin(), {"/libx32", "/usr/libx32"});
+    } else if (header.machine == 3 && !header.is_64) add("/lib", "i386-linux-gnu");
+    else if (header.machine == 183 && header.is_64) add("/lib", "aarch64-linux-gnu");
+    else if (header.machine == 40 && !header.is_64)
+        add("/lib", (header.flags & 0x400) ? "arm-linux-gnueabihf" : "arm-linux-gnueabi");
+    else if (header.machine == 243 && header.is_64) add("/lib", "riscv64-linux-gnu");
+    else if (header.machine == 22 && header.is_64) add("/lib", "s390x-linux-gnu");
+    else if (header.machine == 22 && !header.is_64) add("/lib", "s390-linux-gnu");
+    else if (header.machine == 21 && header.is_64)
+        add("/lib", header.order == ByteOrder::little ? "powerpc64le-linux-gnu" : "powerpc64-linux-gnu");
+    else if (header.machine == 20 && !header.is_64)
+        add("/lib", header.order == ByteOrder::little ? "powerpcle-linux-gnu" : "powerpc-linux-gnu");
+    return dirs;
+}
+}
+Result<std::shared_ptr<const ElfGlibcCacheSnapshot>> read_elf_glibc_cache(
+    const std::filesystem::path &sysroot, const ElfDependencyDiscoveryLimits &limits, std::stop_token stop) {
+    try {
+        if (!limits.glibc_cache_bytes || !limits.glibc_cache_entries || !limits.glibc_cache_string_bytes)
+            return Error{ErrorCode::invalid_argument, "ELF glibc cache limits must be positive"};
+        if (stop.stop_requested()) return Error{ErrorCode::canceled, "ELF glibc cache read canceled"};
+        std::error_code ec;
+        const auto root = std::filesystem::canonical(sysroot, ec);
+        if (ec || !std::filesystem::is_directory(root, ec))
+            return Error{ErrorCode::invalid_argument, "ELF cache sysroot must be an existing directory"};
+        auto snapshot = load_glibc_cache(root, limits.glibc_cache_bytes, limits.glibc_cache_entries,
+                                         limits.glibc_cache_string_bytes, stop);
+        if (stop.stop_requested()) return Error{ErrorCode::canceled, "ELF glibc cache read canceled"};
+        return std::make_shared<const ElfGlibcCacheSnapshot>(std::move(snapshot));
+    } catch (const std::filesystem::filesystem_error &error) {
+        return Error{ErrorCode::io, std::string("ELF glibc cache filesystem error: ") + error.what()};
+    } catch (const std::bad_alloc &) {
+        return Error{ErrorCode::resource_limit, "Cannot allocate bounded ELF glibc cache snapshot"};
+    }
 }
 Result<ElfDependencyFileReport> discover_elf_dependency_files(
     const ElfMetadata &metadata, const std::filesystem::path &importer,
@@ -45,6 +303,10 @@ Result<ElfDependencyFileReport> discover_elf_dependency_files(
     const ElfDependencyPathContext &context) {
     try {
         if (stop.stop_requested()) return Error{ErrorCode::canceled, "ELF dependency discovery canceled"};
+        if ((context.use_glibc_ld_so_cache && (!limits.glibc_cache_bytes || !limits.glibc_cache_entries ||
+                                               !limits.glibc_cache_string_bytes)) ||
+            (context.use_standard_default_directories && !limits.search_directories))
+            return Error{ErrorCode::invalid_argument, "ELF system dependency limits must be positive"};
         if (explicit_directories.size() > limits.search_directories)
             return Error{ErrorCode::resource_limit, "ELF dependency search-directory limit exceeded"};
         std::error_code ec;
@@ -227,6 +489,42 @@ Result<ElfDependencyFileReport> discover_elf_dependency_files(
                 return Error{ErrorCode::invalid_argument, "Explicit dependency search directory is outside sysroot or missing"};
             search.push_back({canonical, ElfDependencyPathSource::explicit_directory, {}});
         }
+        std::shared_ptr<const ElfGlibcCacheSnapshot> glibc_cache;
+        if (context.use_glibc_ld_so_cache) {
+            glibc_cache = context.glibc_cache;
+            if (glibc_cache && glibc_cache->sysroot != root)
+                return Error{ErrorCode::invalid_argument, "ELF cache snapshot belongs to another sysroot"};
+            if (glibc_cache && (glibc_cache->bytes > limits.glibc_cache_bytes ||
+                                glibc_cache->entries.size() > limits.glibc_cache_entries ||
+                                glibc_cache->string_bytes > limits.glibc_cache_string_bytes))
+                return Error{ErrorCode::resource_limit, "ELF cache snapshot exceeds configured limits"};
+            if (glibc_cache && glibc_cache->entry_indices_by_name.size() > limits.glibc_cache_entries)
+                return Error{ErrorCode::resource_limit, "ELF cache name index exceeds configured limits"};
+            if (!glibc_cache) {
+                auto loaded_cache = read_elf_glibc_cache(root, limits, stop);
+                if (!loaded_cache) return loaded_cache.error();
+                glibc_cache = std::move(loaded_cache.value());
+            }
+            report.glibc_cache_bytes = glibc_cache->bytes;
+            report.glibc_cache_entries = glibc_cache->entries.size();
+            report.unsupported_cache_formats = glibc_cache->unsupported_formats;
+            report.unsupported_cache_entries = glibc_cache->unsupported_entries;
+            report.cache_filesystem_errors = glibc_cache->filesystem_errors;
+            if (!report.unsupported_cache_formats && glibc_cache->order != metadata.header.order)
+                ++report.unsupported_cache_formats;
+        }
+        std::vector<SearchPath> default_search;
+        if (context.use_standard_default_directories) {
+            auto defaults = standard_default_dirs(metadata.header);
+            if (defaults.size() > limits.search_directories)
+                return Error{ErrorCode::resource_limit, "ELF default-directory limit exceeded"};
+            default_search.reserve(defaults.size());
+            for (auto &path : defaults)
+                default_search.push_back({root / utf8_path(path).relative_path(),
+                                          ElfDependencyPathSource::default_directory, {}});
+            if (search.size() + default_search.size() > limits.search_directories)
+                return Error{ErrorCode::resource_limit, "ELF combined default-directory limit exceeded"};
+        }
         for (auto &row : report.rows) {
             const bool uses_search_path = !row.name.empty() &&
                 row.name.find('/') == std::string::npos && row.name.find('$') == std::string::npos;
@@ -248,6 +546,51 @@ Result<ElfDependencyFileReport> discover_elf_dependency_files(
                     auto candidate = directory;
                     candidate.path /= utf8_path(row.name);
                     paths.push_back(std::move(candidate));
+                }
+                if (context.use_glibc_ld_so_cache) {
+                    if (report.unsupported_cache_formats) ++row.unsupported_paths;
+                    const auto cached = report.unsupported_cache_formats
+                        ? glibc_cache->entry_indices_by_name.end()
+                        : glibc_cache->entry_indices_by_name.find(row.name);
+                    if (cached != glibc_cache->entry_indices_by_name.end() &&
+                        cached->second.size() > limits.glibc_cache_entries)
+                        return Error{ErrorCode::resource_limit, "ELF cache name index row exceeds configured limits"};
+                    if (cached != glibc_cache->entry_indices_by_name.end()) for (const auto index : cached->second) {
+                        if (report.probes++ >= limits.probes)
+                            return Error{ErrorCode::resource_limit, "ELF dependency path-probe limit exceeded"};
+                        if ((index & 255u) == 0 && stop.stop_requested())
+                            return Error{ErrorCode::canceled, "ELF dependency discovery canceled"};
+                        if (index >= glibc_cache->entries.size()) {
+                            ++row.unsupported_paths;
+                            ++report.unsupported_cache_entries;
+                            continue;
+                        }
+                        const auto &entry = glibc_cache->entries[index];
+                        if (entry.name != row.name) {
+                            ++row.unsupported_paths;
+                            ++report.unsupported_cache_entries;
+                            continue;
+                        }
+                        const auto entry_path = entry.path.generic_u8string();
+                        if (entry.name.empty() || entry.name.size() > 32768 || entry_path.size() > 32768) {
+                            ++row.unsupported_paths;
+                            ++report.unsupported_cache_entries;
+                            continue;
+                        }
+                        const auto abi = cache_abi_match(entry.flags, metadata.header);
+                        if (abi == CacheAbiMatch::incompatible) continue;
+                        if (abi == CacheAbiMatch::unsupported || entry.os_version != 0 || entry.hwcap != 0) {
+                            ++row.unsupported_paths;
+                            ++report.unsupported_cache_entries;
+                            continue;
+                        }
+                        paths.push_back({root / entry.path.relative_path(), ElfDependencyPathSource::glibc_cache,
+                                         {}});
+                    }
+                }
+                paths.insert(paths.end(), default_search.begin(), default_search.end());
+                for (std::size_t i = paths.size() - default_search.size(); i < paths.size(); ++i) {
+                    if (!default_search.empty()) paths[i].path /= utf8_path(row.name);
                 }
             }
             std::set<std::string> seen;
