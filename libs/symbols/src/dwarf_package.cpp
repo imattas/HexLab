@@ -299,15 +299,17 @@ hexlab::Result<ImportResult> import_dwarf_package_unit(
     dwarf.line_strings = line_strings;
     dwarf.stop = stop;
     dwarf.expected_split_dwo_id = dwo_id;
+    dwarf.expected_split_address_size = address_size;
     dwarf.type_signature_resolver = std::move(type_signature_resolver);
     dwarf.cross_contribution_die_resolver = std::move(cross_contribution_die_resolver);
     std::uint64_t info_section_offset = 0;
     std::span<const std::uint8_t> line_contribution;
+    std::uint64_t line_section_offset = 0;
     for (const auto &section : contribution.value().sections) {
         switch (section.section_id) {
         case 1: dwarf.info = section.bytes; info_section_offset = section.section_offset; break; // DW_SECT_INFO
         case 3: dwarf.abbrev = section.bytes; break;         // DW_SECT_ABBREV
-        case 4: line_contribution = section.bytes; break;    // DW_SECT_LINE
+        case 4: line_contribution = section.bytes; line_section_offset = section.section_offset; break; // DW_SECT_LINE
         case 5: if(index.version==2) dwarf.locations = section.bytes; else dwarf.location_lists = section.bytes; break;
         case 6: dwarf.string_offsets = section.bytes; break; // DW_SECT_STR_OFFSETS
         case 8: if(index.version==5) dwarf.range_lists = section.bytes; break;
@@ -323,7 +325,9 @@ hexlab::Result<ImportResult> import_dwarf_package_unit(
     if (!imported) return imported.error();
     if (!line_contribution.empty()) {
         DwarfLineSections line;
-        line.source_id = "DWARF v5 DWP line contribution";
+        line.source_id = "DWARF v" + std::to_string(index.version) + " DWP CU " +
+            std::to_string(dwo_id) + " .debug_line.dwo";
+        line.section_offset = line_section_offset;
         line.line = line_contribution;
         line.address_size = address_size;
         line.little_endian = little_endian;

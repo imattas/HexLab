@@ -16,10 +16,13 @@ covers metadata, source sections, shared strings, and returned copies; the
 default and hard maximum is 64 MiB. Cancellation is checked during table and
 index processing and relocation application.
 
-This API extracts bytes only. It does not parse line programs, associate a
-contribution with a compile unit, resolve file paths, or merge source rows into
-`ImportResult`. The caller selects the package and verifies its identity; the
-API never follows a path stored in DWARF. Unsupported relocations,
+This API extracts bytes only. Separately, the DWP split-CU importer selects
+the indexed line contribution alongside the CU, parses its line program, and
+retains the CU DWO ID in each line unit's `source_id` and the absolute offset
+of each line unit within the package's `.debug_line.dwo` section. It also
+checks the split CU's address size against the ELF class before import. It
+does not resolve source file paths. The caller selects the package and
+verifies its identity; the API never follows a path stored in DWARF. Unsupported relocations,
 non-relocatable packages, or absent/empty indexed line contributions fail
 closed. Package contribution IDs and offsets follow
 [DWARF 5 package file section identifiers](https://dwarfstd.org/doc/DWARF5.pdf).
