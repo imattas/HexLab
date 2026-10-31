@@ -219,6 +219,59 @@ inline void dex_description(std::ostream &out, const ImageMetadata &metadata) {
             << " name=string#" << method.name_index << " \"" << name(method.name_index) << "\" id-offset=0x"
             << std::hex << method.file_offset << std::dec << '\n';
     }
+    out << "DEX dynamic linkage: method-handles=" << dex.method_handles.size()
+        << " call-sites=" << dex.call_sites.size() << '\n';
+    constexpr std::size_t max_linkage_rows = 128;
+    constexpr const char *handle_kinds[] = {"static-put", "static-get", "instance-put", "instance-get",
+        "invoke-static", "invoke-instance", "invoke-constructor", "invoke-direct", "invoke-interface"};
+    for (std::size_t i = 0; i < std::min(dex.method_handles.size(), max_linkage_rows); ++i) {
+        const auto &handle = dex.method_handles[i];
+        out << "  method-handle#" << i << " kind="
+            << (handle.kind < std::size(handle_kinds) ? handle_kinds[handle.kind] : "unknown")
+            << " target=";
+        if (handle.kind <= 3) {
+            out << "field#" << handle.member_index;
+            if (handle.member_index < dex.field_identifiers.size()) {
+                const auto &field = dex.field_identifiers[handle.member_index];
+                out << ' ' << name(field.name_index);
+            }
+        } else {
+            out << "method#" << handle.member_index;
+            if (handle.member_index < dex.method_identifiers.size()) {
+                const auto &method = dex.method_identifiers[handle.member_index];
+                out << ' ' << name(method.name_index);
+            }
+        }
+        out << " file=0x" << std::hex << handle.file_offset << std::dec << '\n';
+    }
+    if (dex.method_handles.size() > max_linkage_rows)
+        out << "  method-handle rows omitted=" << dex.method_handles.size() - max_linkage_rows << '\n';
+    std::size_t shown_call_site_values = 0, omitted_call_site_values = 0;
+    for (std::size_t i = 0; i < std::min(dex.call_sites.size(), max_linkage_rows); ++i) {
+        const auto &site = dex.call_sites[i];
+        out << "  call-site#" << i << " file=0x" << std::hex << site.file_offset << std::dec
+            << " values=" << site.values.size();
+        if (site.values.size() >= 3) {
+            const auto &bootstrap = site.values[0];
+            const auto &method_name = site.values[1];
+            const auto &method_type = site.values[2];
+            out << " bootstrap-handle#" << bootstrap.payload
+                << " name=string#" << method_name.payload << " \"" << name(static_cast<std::uint32_t>(method_name.payload)) << '\"'
+                << " proto#" << method_type.payload;
+        }
+        out << '\n';
+        const auto argument_count = site.values.size() > 3 ? site.values.size() - 3 : 0;
+        const auto shown = shown_call_site_values < 512
+            ? std::min({argument_count, std::size_t{8}, std::size_t{512} - shown_call_site_values})
+            : std::size_t{0};
+        for (std::size_t j = 0; j < shown; ++j)
+            dex_static_value_tree(out, dex, site.values[j + 3], 1, shown_call_site_values, omitted_call_site_values);
+        omitted_call_site_values += argument_count - shown;
+    }
+    if (dex.call_sites.size() > max_linkage_rows)
+        out << "  call-site rows omitted=" << dex.call_sites.size() - max_linkage_rows << '\n';
+    if (omitted_call_site_values)
+        out << "  call-site argument values omitted=" << omitted_call_site_values << '\n';
     if (dex.strings.size() > max_identifier_rows || dex.field_identifiers.size() > max_identifier_rows ||
         dex.method_identifiers.size() > max_identifier_rows)
         out << "  identifier rows omitted: strings=" << (dex.strings.size() - std::min(dex.strings.size(), max_identifier_rows))
