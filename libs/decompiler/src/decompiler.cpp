@@ -13934,14 +13934,68 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
         out << "}\n";
         return StructuredPseudocode{out.str(), false, {}};
     };
-    // Keep ordinary local joins in the output when the function has one exit,
-    // or its entry is a direct early-return guard. Expanding those graphs as a
-    // return tree would copy their shared continuation into each diamond arm.
+    // Prefer local joins when expansion would duplicate a guarded local join
+    // or a single incoming terminal-phi edge. A direct return arm by itself
+    // does not establish either shape, so retain return-tree handling for it.
+    const auto has_shared_local_join = [&]() {
+        const bool direct_return_guard = branch &&
+            (has_only_terminal_return(*true_start) != has_only_terminal_return(*false_start));
+        const bool has_terminal_phi = std::any_of(function.blocks.begin(), function.blocks.end(),
+            [&](const auto &block) { return !block.phis.empty() && has_only_terminal_return(block); });
+        const auto count = function.blocks.size();
+        if ((!direct_return_guard && !has_terminal_phi) || count > 1024) return false;
+        std::map<std::pair<std::uint32_t, std::uint64_t>, std::size_t> by_address;
+        std::set<std::uint64_t> ids;
+        for (std::size_t i = 0; i < count; ++i)
+            if (!by_address.emplace(std::pair{function.blocks[i].begin.space.value,
+                    function.blocks[i].begin.offset}, i).second ||
+                !ids.insert(function.blocks[i].id.value).second) return false;
+        const auto root = by_address.find({function.entry.space.value, function.entry.offset});
+        if (root == by_address.end()) return false;
+        std::vector<std::vector<std::size_t>> successors(count);
+        std::vector<std::size_t> predecessor_count(count, 0);
+        std::size_t edges = 0;
+        for (std::size_t i = 0; i < count; ++i) {
+            std::set<std::size_t> unique_targets;
+            for (const auto &edge : function.blocks[i].successors) {
+                if (++edges > 4096 || !edge.target) return false;
+                const auto target = by_address.find({edge.target->space.value, edge.target->offset});
+                if (target == by_address.end() || !unique_targets.insert(target->second).second ||
+                    (edge.block && edge.block != function.blocks[target->second].id)) return false;
+                successors[i].push_back(target->second);
+                ++predecessor_count[target->second];
+            }
+        }
+        auto remaining = predecessor_count;
+        std::vector<std::size_t> work, paths(count, 0);
+        paths[root->second] = 1;
+        for (std::size_t i = 0; i < count; ++i)
+            if (!remaining[i]) work.push_back(i);
+        std::size_t visited = 0;
+        while (!work.empty()) {
+            const auto current = work.back();
+            work.pop_back();
+            ++visited;
+            for (const auto next : successors[current]) {
+                paths[next] = std::min<std::size_t>(2, paths[next] + paths[current]);
+                if (--remaining[next] == 0) work.push_back(next);
+            }
+        }
+        if (visited != count) return false;
+        for (std::size_t i = 0; i < count; ++i) {
+            if (paths[i] < 2) continue;
+            const auto &block = function.blocks[i];
+            if ((direct_return_guard && !successors[i].empty()) ||
+                (!block.phis.empty() && predecessor_count[i] == 1 && has_only_terminal_return(block)))
+                return true;
+        }
+        return false;
+    };
     // Retain return-tree expansion as a fallback for graphs beyond the bounded
     // acyclic-region recognizer, rather than dropping its larger/deeper cases.
     const bool prefer_local_joins = std::count_if(function.blocks.begin(), function.blocks.end(),
         [](const auto &block) { return block.successors.empty(); }) <= 1 ||
-        (branch && (has_only_terminal_return(*true_start) != has_only_terminal_return(*false_start)));
+        has_shared_local_join();
     if (!prefer_local_joins)
         if (auto return_tree = try_return_tree()) return *return_tree;
 

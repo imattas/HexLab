@@ -76,7 +76,7 @@ void backend_tests() {
     check(f.store->load_derived_cache(f.key, *f.image, f.metadata, f.options, {}).value().status == CacheStatus::hit,
           "annotation revision keeps complete cache source current");
     auto sql = Connection::open(f.path, OpenMode::read_write, {}).value();
-    check(bool(sql->execute("UPDATE derived_cache SET engine_version=99 WHERE kind=2")),
+    check(bool(sql->execute("UPDATE derived_cache SET engine_version=100 WHERE kind=2")),
           "incompatible full cache fixture created");
     sql.reset();
     check(f.store->load_derived_cache(f.key, *f.image, f.metadata, f.options, {}).value().status ==

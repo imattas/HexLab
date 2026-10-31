@@ -219,7 +219,7 @@ void hostile_tests() {
     checksum(count);
     check(!fixture.decode(count), "checksum-valid hostile fact count is rejected before allocation");
     auto version = payload;
-    version[5] = std::byte{99};
+    version[5] = std::byte{100};
     checksum(version);
     check(!fixture.decode(version), "unknown derived payload version rejected");
     auto false_complete = payload;

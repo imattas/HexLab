@@ -8,10 +8,14 @@ as each region's join. It lowers SSA phi values into edge-specific assignments
 and follows multi-block straight-line arms. A simple conditional early return
 is also structured, including the case where the return is on the branch's
 false edge.
-Single-exit functions and direct entry early-return guards try this local-join
-structuring before return-tree expansion. This keeps a nested diamond's shared
-continuation and its effects together instead of duplicating them into each
-arm. If the bounded region recognizer cannot handle the graph, the larger
+Single-exit functions try this local-join structuring before return-tree
+expansion. Direct entry early-return guards also prefer it when a bounded
+acyclic path analysis proves a shared nonterminal join in the continuation.
+A terminal return with a single-predecessor register phi prefers local joins
+when multiple acyclic paths reach that incoming edge, so its edge copy is
+emitted once before the return. This keeps local continuations and their
+effects together while preserving return-tree handling for simple guards.
+If the bounded region recognizer cannot handle the graph, the larger
 return-tree recognizer remains available.
 Decision trees whose leaves return are structured without requiring a common
 post-dominator. The same recognizer accepts explicit CIL `throw`, `rethrow`, and
