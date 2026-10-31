@@ -290,18 +290,20 @@ A bounded function-entry post-tested form accepts disjoint body arms ending in
 their own conditional latches. Two-arm and three-arm dispatches retain their
 specific recognizers; a general conditional decision tree now handles four to
 64 latch leaves. Each latch must branch directly to the function-entry loop
-header or to one shared phi-free terminal return. The header and return
-predecessor sets must exactly equal the distinct latch blocks, and every
-function block must belong to the dispatch tree, one latch path, or the return.
+header or to one shared phi-free exit chain ending in a terminal return. The
+exit chain may contain at most 64 single-predecessor straight-line blocks; its
+first block's predecessor set and the header predecessor set must exactly equal
+the distinct latch blocks. Every function block must belong to the dispatch
+tree, one latch path, or that exit chain.
 Every tree and arm edge is checked against its recorded CFG predecessor and
 successor, each non-latch block must have one predecessor, and paths cannot
 share blocks. Each arm path is limited to 64 blocks including its latch, tree
 depth is below 64, and the whole function is limited to 128 blocks and 4,096
 edges. The formatter emits the decision tree inside `do { ... } while (true)`
 and lowers each latch condition to `continue` or `break`. Register and memory
-phis, side entries, additional exits, non-return exits, overlapping arms,
-malformed edges, incomplete block coverage, and larger graphs retain the
-existing fallback.
+phis in the exit chain, side entries, additional exits, non-return exits,
+overlapping arms, malformed edges, incomplete block coverage, and larger
+graphs retain the existing fallback.
 
 The acyclic structurer also handles nested regions with multiple explicit
 terminal returns. An analysis-only virtual exit supplies post-dominators for
