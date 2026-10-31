@@ -5,6 +5,7 @@
 #include "a64_fields.hpp"
 #include "hexlab/analysis/relocations.hpp"
 #include "hexlab/processors/arm32_semantics.hpp"
+#include "hexlab/processors/a64_wide_move_semantics.hpp"
 #include "hexlab/processors/mips32_semantics.hpp"
 #include "hexlab/processors/mips64_semantics.hpp"
 #include "hexlab/processors/ppc_semantics.hpp"
@@ -2051,19 +2052,42 @@ RegisterReferenceFacts non_x86_producer_facts(
                     address_definition = true;
                     break;
                 }
+            const bool a64_wide_move = architecture == Architecture::arm64 &&
+                (instruction.opcode == Opcode::a64_movz || instruction.opcode == Opcode::a64_movk);
+            const bool a64_wide_move_valid = !a64_wide_move ||
+                evaluate_a64_wide_move_instruction(instruction).has_value();
+            const bool a64_wide_move_source_valid = !a64_wide_move ||
+                instruction.opcode != Opcode::a64_movk || !parents.empty();
             const bool one_source_transform = reads.size() == 1 && writes.size() == 1 &&
                                               !instruction.memory_read && !instruction.memory_write &&
-                                              instruction.flow == FlowKind::fallthrough;
+                                              instruction.flow == FlowKind::fallthrough &&
+                                              a64_wide_move_valid && a64_wide_move_source_valid;
             std::map<ProducerRegisterKey, std::vector<std::uint64_t>> definitions;
             const bool independent_definition = reads.empty() && writes.size() == 1 &&
                 (architecture != Architecture::mos6502 || instruction.register_reads.empty());
-            if (address_definition || one_source_transform || independent_definition) {
+            if ((address_definition && a64_wide_move_valid && a64_wide_move_source_valid) ||
+                one_source_transform || (independent_definition && a64_wide_move_valid)) {
                 auto chain = parents;
                 if (std::find(chain.begin(), chain.end(), fact->id) == chain.end() && chain.size() < 32)
                     chain.push_back(fact->id);
-                if (!chain.empty())
+                if (!chain.empty()) {
                     for (const auto &destination : writes)
                         definitions[register_key(destination)] = chain;
+                    // A W write zero-extends into X; an X definition also
+                    // determines its low W view. Keep both typed keys so a
+                    // subsequent wide move can consume only the matching
+                    // architectural view without losing causal provenance.
+                    if (a64_wide_move) {
+                        const auto *destination = instruction.operands.empty() ? nullptr :
+                            std::get_if<RegisterOperand>(&instruction.operands[0]);
+                        if (destination && destination->bank == RegisterBank::arm64_gpr &&
+                            destination->index < 31 && (destination->width == 32 || destination->width == 64)) {
+                            const RegisterOperand alias{RegisterBank::arm64_gpr, destination->index,
+                                static_cast<std::uint16_t>(destination->width == 32 ? 64 : 32), false};
+                            definitions[register_key(alias)] = chain;
+                        }
+                    }
+                }
             }
 
             // Full-width static pointer loads produce another address value.
@@ -3141,25 +3165,19 @@ RegisterReferenceFacts a64_reference_facts(const Image *image, const RelocationC
             if (move_wide) {
                 const auto *destination = instruction.operands.empty() ? nullptr :
                     std::get_if<RegisterOperand>(&instruction.operands[0]);
-                const auto immediate = immediate_value(instruction, 1);
-                const auto shift = instruction.operands.size() >= 3 ? immediate_value(instruction, 2) :
-                    std::optional<std::uint64_t>{0};
-                const bool width_valid = destination && destination->bank == RegisterBank::arm64_gpr &&
-                    (destination->width == 32 || destination->width == 64) && destination->index != 31;
+                std::optional<std::uint64_t> previous;
+                if (destination && instruction.opcode == Opcode::a64_movk) {
+                    const auto found = registers.find(destination->index);
+                    if (found != registers.end() && found->second.space == instruction.address.space)
+                        previous = found->second.offset;
+                }
                 std::optional<Address> value;
-                if (width_valid && immediate && shift && *shift < destination->width && (*shift % 16) == 0) {
-                    const auto width_mask = destination->width == 32 ? UINT64_C(0xffffffff) : UINT64_MAX;
-                    const auto lane = (UINT64_C(0xffff) << *shift) & width_mask;
-                    const auto part = ((*immediate & UINT64_C(0xffff)) << *shift) & width_mask;
-                    if (instruction.opcode == Opcode::a64_movz) {
-                        value = Address{instruction.address.space, part};
-                    } else if (instruction.opcode == Opcode::a64_movn) {
-                        value = Address{instruction.address.space, (~part) & width_mask};
-                    } else if (const auto previous = registers.find(destination->index);
-                               previous != registers.end() && previous->second.space == instruction.address.space) {
-                        value = Address{instruction.address.space,
-                            ((previous->second.offset & ~lane) | part) & width_mask};
-                    }
+                if (const auto evaluated = evaluate_a64_wide_move_instruction(
+                        instruction, previous.value_or(0));
+                    evaluated && evaluated->writes_destination && destination &&
+                    destination->bank == RegisterBank::arm64_gpr && destination->index != 31 &&
+                    (instruction.opcode != Opcode::a64_movk || previous)) {
+                    value = Address{instruction.address.space, evaluated->value};
                 }
                 erase_written();
                 if (value) {
