@@ -134,8 +134,17 @@ The chooser remembers its source scope and match mode in the per-user desktop
 configuration. If Jump opens without an explicit query, it also restores the
 last query. **Reset search** clears the query and restores **All name sources**
 and **Contains**; closing the chooser saves those values for the next opening.
-Very large name collections are still searched from captured sources rather
-than a persistent background index.
+Current-document literal name results are loaded in pages of at most 256.
+**More results** continues from the next stable position in the same
+case-insensitively sorted, deduplicated result set; each page is searched on
+the existing background worker. A literal search examines at most 200,000
+source records per request and labels partial results if that bound is reached.
+Changing the query, scope, or mode cancels pending work and discards stale
+pages. Source vectors are still collected synchronously when Jump opens, so a
+very large document can pause during collection. Paging covers captured
+current-document names only; it does not add a persistent index, background
+source collection, or searches of unopened projects. Fuzzy ranking remains
+bounded to its first 4,096 destinations and does not expose additional pages.
 
 ## Search names across open documents
 

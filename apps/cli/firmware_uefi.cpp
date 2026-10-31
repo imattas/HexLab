@@ -20,6 +20,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace hexlab::cli {
@@ -28,6 +29,27 @@ std::string hex_value(std::uint64_t value) {
     std::ostringstream out;
     out << "0x" << std::hex << std::uppercase << value;
     return out.str();
+}
+std::string json_string(std::string_view value) {
+    std::string result = "\"";
+    for (const unsigned char ch : value) {
+        switch (ch) {
+        case '"': result += "\\\""; break;
+        case '\\': result += "\\\\"; break;
+        case '\n': result += "\\n"; break;
+        case '\r': result += "\\r"; break;
+        case '\t': result += "\\t"; break;
+        default:
+            if (ch < 0x20) {
+                constexpr char digits[] = "0123456789abcdef";
+                result += "\\u00";
+                result += digits[ch >> 4];
+                result += digits[ch & 0x0f];
+            } else result += static_cast<char>(ch);
+        }
+    }
+    result += '"';
+    return result;
 }
 std::string capsule_flag_names(std::uint32_t flags) {
     std::string names;
@@ -588,7 +610,9 @@ int run_uefi_capsule_cli(std::span<const std::wstring_view> args, std::ostream &
         return -1;
     try {
         std::vector<std::wstring_view> inputs;
+        std::vector<std::pair<std::uint64_t, std::wstring_view>> sparse_region_args;
         std::optional<std::uint64_t> scatter_base, scatter_head;
+        bool json_output = false;
         std::vector<firmware::UefiFmpInstalledImage> installed_images;
         std::vector<firmware::UefiFmpImageVersion> dependency_versions;
         std::optional<std::size_t> extract_item;
@@ -637,6 +661,23 @@ int run_uefi_capsule_cli(std::span<const std::wstring_view> args, std::ostream &
             } else if (args[index] == L"--fmp-inventory-complete") {
                 inventory_complete = true;
                 report_anti_rollback = true;
+            } else if (args[index] == L"--capsule-sg-region") {
+                if (index + 1 >= args.size() - 2) {
+                    err << "UEFI capsule: --capsule-sg-region requires BASE=FILE\n"; return 1;
+                }
+                const auto specification = args[++index];
+                const auto equal = specification.find(L'=');
+                if (equal == std::wstring_view::npos || equal == 0 || equal + 1 >= specification.size()) {
+                    err << "UEFI capsule: --capsule-sg-region requires BASE=FILE\n"; return 1;
+                }
+                auto base = parse_address(specification.substr(0, equal));
+                if (!base) { err << "UEFI capsule: invalid sparse-region base: " << base.error().message << '\n'; return 1; }
+                sparse_region_args.emplace_back(base.value(), specification.substr(equal + 1));
+                if (sparse_region_args.size() > 255) {
+                    err << "UEFI capsule: sparse region count exceeds 256 total regions\n"; return 1;
+                }
+            } else if (args[index] == L"--json") {
+                json_output = true;
             } else
             if (args[index] == L"--capsule-sg-base" || args[index] == L"--capsule-sg-head") {
                 auto &option = args[index] == L"--capsule-sg-base" ? scatter_base : scatter_head;
@@ -655,9 +696,12 @@ int run_uefi_capsule_cli(std::span<const std::wstring_view> args, std::ostream &
         }
         const auto input_count = inputs.size();
         if (input_count == 0 || scatter_base.has_value() != scatter_head.has_value() ||
-            (scatter_head && input_count != 1)) {
-            err << "UEFI capsule: scatter/gather requires one capture and both --capsule-sg-base and --capsule-sg-head\n"; return 1;
+            ((scatter_head || !sparse_region_args.empty()) && input_count != 1) ||
+            (!sparse_region_args.empty() && !scatter_head)) {
+            err << "UEFI capsule: scatter/gather requires one primary capture, --capsule-sg-base and --capsule-sg-head; sparse regions require scatter/gather\n"; return 1;
         }
+        if (sparse_region_args.size() + 1 > 256) { err << "UEFI capsule: sparse region count exceeds 256 total regions\n"; return 1; }
+        if (json_output && sparse_region_args.empty()) { err << "UEFI capsule: --json is supported only with multi-region scatter/gather inventory\n"; return 1; }
         if (input_count > 256) {
             err << "UEFI capsule: input count exceeds 256 capsule limit\n"; return 1;
         }
@@ -685,9 +729,9 @@ int run_uefi_capsule_cli(std::span<const std::wstring_view> args, std::ostream &
         std::vector<std::shared_ptr<const FileStorage>> files;
         std::vector<ByteView> views;
         std::vector<std::span<const std::byte>> buffers;
-        files.reserve(input_count);
-        views.reserve(input_count);
-        buffers.reserve(input_count);
+        files.reserve(input_count + sparse_region_args.size());
+        views.reserve(input_count + sparse_region_args.size());
+        buffers.reserve(input_count + sparse_region_args.size());
         std::uint64_t total_size = 0;
         for (std::size_t i = 0; i < input_count; ++i) {
             auto opened = FileStorage::open(path_from_wide(inputs[i]));
@@ -704,10 +748,112 @@ int run_uefi_capsule_cli(std::span<const std::wstring_view> args, std::ostream &
             views.push_back(std::move(read.value()));
             buffers.push_back(views.back().bytes);
         }
+        std::vector<std::uint64_t> loaded_region_bases;
+        std::vector<std::wstring_view> loaded_region_paths;
         if (scatter_head) {
-            auto parsed = firmware::parse_uefi_fmp_scatter_gather_list(buffers.front(), *scatter_base, *scatter_head);
+            loaded_region_bases.push_back(*scatter_base);
+            loaded_region_paths.push_back(inputs.front());
+            for (const auto &[base, path] : sparse_region_args) {
+                if (std::find(loaded_region_bases.begin(), loaded_region_bases.end(), base) != loaded_region_bases.end()) {
+                    err << "UEFI capsule: duplicate sparse-region physical base " << hex_value(base) << '\n'; return 1;
+                }
+                auto opened = FileStorage::open(path_from_wide(path));
+                if (!opened) { err << "UEFI capsule: sparse region " << wide_to_utf8(path) << ": " << opened.error().message << '\n'; return 1; }
+                auto file = opened.value();
+                if (file->size() > 512ull * 1024 * 1024 - total_size ||
+                    file->size() > (std::numeric_limits<std::size_t>::max)()) {
+                    err << "UEFI capsule: captures exceed cumulative 512 MiB inspection limit\n"; return 1;
+                }
+                total_size += file->size();
+                auto read = file->read_at({0}, static_cast<std::size_t>(file->size()));
+                if (!read) { err << "UEFI capsule: " << read.error().message << '\n'; return 1; }
+                loaded_region_bases.push_back(base);
+                loaded_region_paths.push_back(path);
+                files.push_back(std::move(file));
+                views.push_back(std::move(read.value()));
+                buffers.push_back(views.back().bytes);
+            }
+        }
+        if (scatter_head) {
+            std::vector<firmware::UefiCapsuleCaptureRegion> capture_regions;
+            capture_regions.reserve(loaded_region_bases.size());
+            for (std::size_t i = 0; i < loaded_region_bases.size(); ++i)
+                capture_regions.push_back({loaded_region_bases[i], buffers[i]});
+            auto parsed = firmware::parse_uefi_fmp_scatter_gather_regions(capture_regions, *scatter_head);
             if (!parsed) { err << "UEFI capsule: " << parsed.error().message << '\n'; return 1; }
             const auto &gathered = parsed.value();
+            if (!sparse_region_args.empty()) {
+                if (json_output) {
+                    out << "{\"schema\":\"hexlab.uefi-capsule-sg.v1\",\"status\":\"complete\",\"physical_base\":"
+                        << json_string(hex_value(gathered.capture_physical_base)) << ",\"descriptor_head\":"
+                        << json_string(hex_value(gathered.descriptor_head)) << ",\"gathered_bytes\":"
+                        << gathered.payload_bytes << ",\"capsule_count\":" << gathered.inventory.capsules.size()
+                        << ",\"regions\":[";
+                    const auto region_limit = std::min<std::size_t>(loaded_region_bases.size(), 256);
+                    for (std::size_t i = 0; i < region_limit; ++i) {
+                        if (i) out << ',';
+                        out << "{\"base\":" << json_string(hex_value(loaded_region_bases[i]))
+                            << ",\"path\":" << json_string(wide_to_utf8(loaded_region_paths[i]))
+                            << ",\"size\":" << buffers[i].size() << '}';
+                    }
+                    out << "],\"omitted_regions\":" << loaded_region_bases.size() - region_limit << ",\"capsules\":[";
+                    for (std::size_t i = 0; i < gathered.inventory.capsules.size(); ++i) {
+                        if (i) out << ',';
+                        out << "{\"stream_offset\":" << json_string(hex_value(gathered.capsule_logical_offsets[i]))
+                            << ",\"image_size\":" << gathered.inventory.capsules[i].image_size << '}';
+                    }
+                    out << "]}\n";
+                    return 0;
+                }
+                out << "Format: UEFI FMP scatter/gather capsule list (sparse physical captures)\n"
+                    << "Capture: descriptor-head=" << hex_value(gathered.descriptor_head)
+                    << " descriptors=" << gathered.blocks.size() << " gathered-bytes=" << gathered.payload_bytes
+                    << " capsules=" << gathered.inventory.capsules.size() << '\n';
+                constexpr std::size_t region_output_limit = 256;
+                for (std::size_t i = 0; i < std::min(loaded_region_bases.size(), region_output_limit); ++i)
+                    out << "Region[" << i << "]: physical-base=" << hex_value(loaded_region_bases[i])
+                        << " path=" << wide_to_utf8(loaded_region_paths[i]) << " size=" << buffers[i].size() << '\n';
+                if (loaded_region_bases.size() > region_output_limit)
+                    out << "Regions omitted: " << loaded_region_bases.size() - region_output_limit << '\n';
+                constexpr std::size_t descriptor_output_limit = 256;
+                for (std::size_t i = 0; i < std::min(gathered.blocks.size(), descriptor_output_limit); ++i) {
+                    const auto &block = gathered.blocks[i];
+                    out << "Block[" << i << "]: kind="
+                        << (block.kind == firmware::UefiCapsuleBlockKind::data ? "data" :
+                            block.kind == firmware::UefiCapsuleBlockKind::continuation ? "continuation" : "terminator")
+                        << " descriptor-region=" << block.descriptor_region_index
+                        << " descriptor-offset=" << hex_value(block.descriptor_capture_offset)
+                        << " physical=" << hex_value(block.descriptor_physical_address)
+                        << " target=" << hex_value(block.target_physical_address)
+                        << " length=" << hex_value(block.length);
+                    if (block.kind == firmware::UefiCapsuleBlockKind::data)
+                        out << " data-region=" << block.data_region_index
+                            << " data-offset=" << hex_value(block.data_capture_offset)
+                            << " logical-offset=" << hex_value(block.logical_offset);
+                    out << '\n';
+                }
+                if (gathered.blocks.size() > descriptor_output_limit)
+                    out << "Descriptor rows omitted: " << gathered.blocks.size() - descriptor_output_limit << '\n';
+                CapsuleOutputBudget sparse_budget;
+                for (std::size_t i = 0; i < gathered.inventory.capsules.size(); ++i) {
+                    const auto &capsule = gathered.inventory.capsules[i];
+                    ++sparse_budget.capsules;
+                    out << "Capsule[" << i << "]: logical-stream-offset=" << hex_value(gathered.capsule_logical_offsets[i])
+                        << " guid=" << firmware::uefi_guid_string(capsule.capsule_guid)
+                        << " image-size=" << hex_value(capsule.image_size) << " payloads=" << capsule.payload_count << '\n';
+                    for (std::size_t j = 0; j < capsule.items.size(); ++j)
+                        write_capsule_item(out, capsule.items[j], "  ",
+                            "Capsule[" + std::to_string(i) + "] Item[" + std::to_string(j) + "]",
+                            false, sparse_budget, true);
+                    if (report_anti_rollback)
+                        for (std::size_t j = 0; j < capsule.items.size(); ++j)
+                            write_anti_rollback(out, capsule.items[j], installed_images, inventory_complete,
+                                "Capsule[" + std::to_string(i) + "] Item[" + std::to_string(j) + "]");
+                }
+                write_capsule_output_limits(out, sparse_budget);
+                out << "Physical addresses were resolved only inside supplied regions; no firmware was updated.\n";
+                return 0;
+            }
             out << "Format: UEFI FMP scatter/gather capsule list (offline little-endian physical capture)\n"
                 << "Capture: physical-base=" << hex_value(gathered.capture_physical_base)
                 << " descriptor-head=" << hex_value(gathered.descriptor_head)

@@ -265,6 +265,21 @@ struct SimdLaneOpInfo {
     ValueType scalar_type;
     std::string_view name;
 };
+struct SimdSplatOpInfo {
+    ValueType scalar_type;
+    std::string_view name;
+};
+std::optional<SimdSplatOpInfo> simd_splat_op(std::uint32_t subopcode) {
+    switch (subopcode) {
+    case 0x0f: return SimdSplatOpInfo{integer(32), "wasm_i8x16_splat"};
+    case 0x10: return SimdSplatOpInfo{integer(32), "wasm_i16x8_splat"};
+    case 0x11: return SimdSplatOpInfo{integer(32), "wasm_i32x4_splat"};
+    case 0x12: return SimdSplatOpInfo{integer(64), "wasm_i64x2_splat"};
+    case 0x13: return SimdSplatOpInfo{floating(32), "wasm_f32x4_splat"};
+    case 0x14: return SimdSplatOpInfo{floating(64), "wasm_f64x2_splat"};
+    default: return {};
+    }
+}
 std::optional<SimdLaneOpInfo> simd_lane_op(std::uint32_t subopcode) {
     const auto i32 = integer(32), i64 = integer(64), f32 = floating(32), f64 = floating(64);
     switch (subopcode) {
@@ -809,6 +824,13 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
             }
             if (op == 0xfd) {
                 const auto subopcode = simd_subopcode(code[n]->instruction);
+                const auto splat = subopcode ? simd_splat_op(*subopcode) : std::optional<SimdSplatOpInfo>{};
+                if (splat) {
+                    auto scalar = shape_pop(stack, splat->scalar_type);
+                    if (!scalar) return scalar.error();
+                    stack.push_back(vector(128));
+                    continue;
+                }
                 const auto lane = subopcode ? simd_lane_op(*subopcode) : std::optional<SimdLaneOpInfo>{};
                 if (lane) {
                     const auto lane_index = immediate(code[n]->instruction, 0);
@@ -1596,6 +1618,13 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
             }
             if (op == 0xfd) {
                 const auto subopcode = simd_subopcode(i);
+                const auto splat = subopcode ? simd_splat_op(*subopcode) : std::optional<SimdSplatOpInfo>{};
+                if (splat) {
+                    auto scalar = pop(splat->scalar_type);
+                    if (!scalar) return scalar.error();
+                    stack.push_back(unary(std::string(splat->name), scalar.value(), vector(128)));
+                    continue;
+                }
                 const auto lane = subopcode ? simd_lane_op(*subopcode) : std::optional<SimdLaneOpInfo>{};
                 if (lane) {
                     const auto lane_index = immediate(i, 0);

@@ -1812,13 +1812,21 @@ int plugin_command(std::span<const std::wstring_view> args, std::ostream &out, s
     }
 }
 int firmware_command(std::span<const std::wstring_view> args, std::ostream &out, std::ostream &err) {
+    const bool has_capsule_sg_option = std::find(args.begin(), args.end(), L"--capsule-sg-base") != args.end() ||
+        std::find(args.begin(), args.end(), L"--capsule-sg-head") != args.end() ||
+        std::find(args.begin(), args.end(), L"--capsule-sg-region") != args.end();
+    const bool is_capsule_format = args.size() >= 2 && args[args.size() - 2] == L"--format" && args.back() == L"uefi-capsule";
+    if (has_capsule_sg_option && !is_capsule_format) {
+        err << "Firmware: --capsule-sg-* options require --format uefi-capsule\n";
+        return 1;
+    }
     if (args.size() == 2 && args[1] == L"--help") {
         out << "Usage: hexlab_cli firmware inspect <path> --format ihex|srec|uefi|uefi-capsule\n"
             << "       Intel FIT: hexlab_cli firmware inspect <path> --fit-offset <file-offset> --format fit\n"
             << "       Intel microcode: hexlab_cli firmware inspect <path> --microcode-offset <file-offset> --format intel-microcode\n"
             << "       UEFI capsule lists: hexlab_cli firmware inspect <path> [<path> ...] --format uefi-capsule\n"
             << "       Extract FMP image: hexlab_cli firmware inspect <path> --extract-item <index> --output <file> [--replace] --format uefi-capsule\n"
-            << "       FMP scatter/gather: hexlab_cli firmware inspect <capture> --capsule-sg-base <physical-base> --capsule-sg-head <physical-address> --format uefi-capsule\n";
+            << "       FMP scatter/gather: hexlab_cli firmware inspect <capture> --capsule-sg-base <physical-base> --capsule-sg-head <physical-address> [--capsule-sg-region <base=file> ...] [--json] --format uefi-capsule\n";
         return 0;
     }
     if (args.size() == 6 && args[0] == L"inspect" && args[2] == L"--fit-offset" &&

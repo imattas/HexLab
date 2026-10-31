@@ -1,10 +1,14 @@
 # Firmware record formats
 
-FMP capsule inspection also accepts one explicitly based physical-memory
-capture containing a bounded little-endian scatter/gather descriptor chain:
+FMP capsule inspection accepts an explicitly based primary physical-memory
+capture and optional sparse captures containing a bounded little-endian
+scatter/gather descriptor chain:
 `firmware inspect memory.bin --capsule-sg-base 0x100000 --capsule-sg-head 0x101000 --format uefi-capsule`.
-This offline form gathers exactly one persistent FMP capsule and retains both
-logical offsets and descriptor/data capture provenance. See
+Add repeated `--capsule-sg-region 0x200000=memory-part.bin` options for other
+non-overlapping physical ranges. Multi-region reports include bounded base,
+path, and byte-size provenance for each supplied capture; `--json` emits a
+`hexlab.uefi-capsule-sg.v1` inventory. The offline parser retains logical
+offsets and descriptor/data capture provenance. See
 [UEFI FMP capsule metadata](../libs/firmware/docs/uefi-fmp-capsule.md#offline-scattergather-capture)
 for validation rules and limits.
 
