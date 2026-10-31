@@ -702,7 +702,9 @@ enum class Opcode {
     ppc_vminub, ppc_vminuh, ppc_vminuw, ppc_vminsb, ppc_vminsh, ppc_vminsw,
     // AVX-512 opmask arithmetic, shifts, and unpack; appended for stable IDs.
     kaddb, kaddw, kaddd, kaddq, kshiftlb, kshiftlw, kshiftld, kshiftlq,
-    kshiftrb, kshiftrw, kshiftrd, kshiftrq, kunpckbw, kunpckwd, kunpckdq
+    kshiftrb, kshiftrw, kshiftrd, kshiftrq, kunpckbw, kunpckwd, kunpckdq,
+    // A32 byte reversal and bit-reversal operations; appended for cache stability.
+    a32_rev, a32_rev16, a32_revsh, a32_rbit
 };
 enum class OperandAccess { read, write, read_write, address };
 // The encoded x86 group-one repeat prefix is retained separately from the

@@ -25,6 +25,14 @@ std::string shifted_text(const ArmShiftedRegisterOperand &value) {
 }
 } // namespace
 std::string mnemonic(Opcode opcode, std::uint8_t condition) {
+    const char *reverse_name = opcode == Opcode::a32_rev ? "rev" :
+        opcode == Opcode::a32_rev16 ? "rev16" : opcode == Opcode::a32_revsh ? "revsh" :
+        opcode == Opcode::a32_rbit ? "rbit" : nullptr;
+    if (reverse_name) {
+        static constexpr const char *conditions[]{"eq", "ne", "hs", "lo", "mi", "pl", "vs", "vc",
+                                                   "hi", "ls", "ge", "lt", "gt", "le", "", "?"};
+        return std::string(reverse_name) + conditions[condition & 15];
+    }
     if (opcode == Opcode::a32_mrs || opcode == Opcode::a32_msr) {
         static constexpr const char *conditions[]{"eq", "ne", "hs", "lo", "mi", "pl", "vs", "vc", "hi", "ls", "ge", "lt", "gt", "le", "", "?"};
         return std::string(opcode == Opcode::a32_mrs ? "mrs" : "msr") + conditions[condition & 15];
