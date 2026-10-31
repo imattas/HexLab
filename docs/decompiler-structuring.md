@@ -170,6 +170,16 @@ Each case path stays inside the loop, emits once, and ends with a switch
 once after the switch. Incomplete metadata, unresolved or extra CFG edges,
 conditional/cyclic case paths, and paths that leave the loop use the explicit
 label/goto path.
+One or more case arms may instead end in a terminal return while the remaining
+arms converge on that shared loop-body continuation. The returning arm may
+start at its case target and contain a phi-free straight-line chain followed
+by one terminal return. Every block on that arm, including the return block,
+must have exactly its preceding arm block as its only predecessor (the switch
+dispatch is the predecessor of the first block). Return arms are emitted
+inside their case without a switch `break`; continuing cases retain the normal
+switch break. A switch with only returning arms, shared return blocks, phis in
+the return path, or a return path with another predecessor keeps the existing
+state-machine or label/goto fallback.
 Post-tested loops can also contain a sequence of one-level conditional diamonds
 before the latch. Each branch arm must be a disjoint phi-free straight-line
 chain, both arms must reach the same block, and the join must have exactly the
