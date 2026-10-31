@@ -642,6 +642,62 @@ void apply_capstone_detail(csh handle, const cs_insn& insn, Instruction& out, Ar
         if(complete) { out.register_reads=std::move(rr); out.register_writes=std::move(rw); }
     }
     if (architecture == Architecture::mos6502) {
+        const auto reg = [](std::uint8_t index) {
+            return RegisterOperand{RegisterBank::mos6502, index, 8, false};
+        };
+        const auto read_reg = [&](std::uint8_t index) { add_unique(out.register_reads, reg(index)); };
+        const auto write_reg = [&](std::uint8_t index) { add_unique(out.register_writes, reg(index)); };
+        const auto read_status = [&] { read_reg(3); };
+        const auto write_status = [&] { write_reg(3); };
+        const auto update_status = [&] { read_status(); write_status(); };
+        switch (insn.id) {
+        case MOS65XX_INS_ADC: case MOS65XX_INS_SBC:
+            read_reg(0); update_status(); write_reg(0); break;
+        case MOS65XX_INS_AND: case MOS65XX_INS_EOR: case MOS65XX_INS_ORA:
+            read_reg(0); write_reg(0); update_status(); break;
+        case MOS65XX_INS_BIT: case MOS65XX_INS_TSB: case MOS65XX_INS_TRB:
+            read_reg(0); update_status(); break;
+        case MOS65XX_INS_CMP: read_reg(0); update_status(); break;
+        case MOS65XX_INS_CPX: read_reg(1); update_status(); break;
+        case MOS65XX_INS_CPY: read_reg(2); update_status(); break;
+        case MOS65XX_INS_LDA: write_reg(0); update_status(); break;
+        case MOS65XX_INS_LDX: write_reg(1); update_status(); break;
+        case MOS65XX_INS_LDY: write_reg(2); update_status(); break;
+        case MOS65XX_INS_STA: read_reg(0); break;
+        case MOS65XX_INS_STX: read_reg(1); break;
+        case MOS65XX_INS_STY: read_reg(2); break;
+        case MOS65XX_INS_ASL: case MOS65XX_INS_LSR:
+        case MOS65XX_INS_ROL: case MOS65XX_INS_ROR:
+            if (d->mos65xx.am == MOS65XX_AM_ACC) { read_reg(0); write_reg(0); }
+            update_status(); break;
+        case MOS65XX_INS_INC: case MOS65XX_INS_DEC:
+            if (d->mos65xx.am == MOS65XX_AM_ACC) { read_reg(0); write_reg(0); }
+            update_status(); break;
+        case MOS65XX_INS_INX: case MOS65XX_INS_DEX:
+            read_reg(1); write_reg(1); update_status(); break;
+        case MOS65XX_INS_INY: case MOS65XX_INS_DEY:
+            read_reg(2); write_reg(2); update_status(); break;
+        case MOS65XX_INS_BCC: case MOS65XX_INS_BCS: case MOS65XX_INS_BEQ:
+        case MOS65XX_INS_BMI: case MOS65XX_INS_BNE: case MOS65XX_INS_BPL:
+        case MOS65XX_INS_BVC: case MOS65XX_INS_BVS:
+            read_status(); break;
+        case MOS65XX_INS_CLC: case MOS65XX_INS_CLD: case MOS65XX_INS_CLI:
+        case MOS65XX_INS_CLV: case MOS65XX_INS_SEC: case MOS65XX_INS_SED:
+        case MOS65XX_INS_SEI:
+            update_status(); break;
+        case MOS65XX_INS_TAX: read_reg(0); write_reg(1); update_status(); break;
+        case MOS65XX_INS_TAY: read_reg(0); write_reg(2); update_status(); break;
+        case MOS65XX_INS_TXA: read_reg(1); write_reg(0); update_status(); break;
+        case MOS65XX_INS_TYA: read_reg(2); write_reg(0); update_status(); break;
+        case MOS65XX_INS_TSX: read_reg(4); write_reg(1); update_status(); break;
+        case MOS65XX_INS_TXS: read_reg(1); write_reg(4); break;
+        case MOS65XX_INS_PHA: read_reg(0); break;
+        case MOS65XX_INS_PHP: read_status(); break;
+        case MOS65XX_INS_PLA: write_reg(0); update_status(); break;
+        case MOS65XX_INS_PLP: case MOS65XX_INS_RTI: write_status(); break;
+        case MOS65XX_INS_BRK: read_status(); break;
+        default: break;
+        }
         bool stack_read = false, stack_write = false;
         switch (insn.id) {
         case MOS65XX_INS_PHA: case MOS65XX_INS_PHP:
