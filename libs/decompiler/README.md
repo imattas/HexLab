@@ -233,15 +233,22 @@ requires image analysis and is not part of `lift_function`'s current inputs.
 The formatter also handles two reducible loop shapes: a pre-tested `while`
 with one condition header, a single-successor chain of straight-line body
 blocks, and one terminal exit; and a post-tested `do ... while` whose latch
-branches back to its body or exits.
+branches back to its body or exits. A bounded post-tested form also handles
+one initial conditional dispatch into two disjoint, straight-line arms, each
+ending in a distinct latch with the same repeat destination and terminal
+return exit. The dispatch, both latch back edges, and the exit predecessor
+sets must match exactly; the recognized region is limited to 128 blocks and
+64 blocks per arm.
 For a post-tested loop with the back edge on the false branch, it inverts the
 rendered condition. The `while` form lowers header phis with exactly one
 preheader input and one back-edge input into assignments before and at the end
 of the loop body. For a multi-block body, the recurrent phi value is selected
-from the final latch block regardless of block storage order. Other loop
-phis, multiple latches, side exits, internal branches, and nested loop bodies
+from the final latch block regardless of block storage order. The two-arm
+post-tested form is phi-free. Multiple latch forms outside that exact shape,
+unsupported loop phis, side exits, internal branches, and nested loop bodies
 remain on the explicit label/goto path until their edge copies can be
-represented faithfully.
+represented faithfully. Nested-loop regions may have multiple proven
+continue edges; their register-phi copies are emitted per original back edge.
 
 Every unsupported shape returns `format_pseudocode` output with
 `used_fallback == true` and a reason. Switch destinations without complete
