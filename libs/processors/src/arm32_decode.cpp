@@ -1,5 +1,6 @@
 #include "arm32_internal.hpp"
 #include <algorithm>
+#include <bit>
 #include <limits>
 namespace hexlab {
 namespace {
@@ -58,7 +59,48 @@ DecodeResult decode_a32(std::span<const std::byte> bytes, Address at) {
         i.arm->predicate = ArmPredicate::condition;
         i.register_reads.push_back({RegisterBank::arm_flags, 0, 4, false});
     }
-    if (immediate_exchange || (word & 0x0e000000) == 0x0a000000) {
+    // A32 MRS and the flag-byte MSR subset. Other MSR field masks modify
+    // privileged control/extension state that this decoder does not model.
+    const auto mrs_key = word & 0x0f8f0fffu;
+    if (mrs_key == 0x010f0000u) {
+        const auto rd = (word >> 12) & 15;
+        if (rd == 15)
+            return {DecodeStatus::unsupported, {}, "A32 MRS to PC is unpredictable"};
+        const RegisterOperand status{(word & 0x00400000u) ? RegisterBank::arm_saved_flags : RegisterBank::arm_flags,
+                                      0, 32, false};
+        i.opcode = Opcode::a32_mrs;
+        i.operands = {gpr(rd), status};
+        i.access = {OperandAccess::write, OperandAccess::read};
+        i.register_writes.push_back(gpr(rd));
+        i.register_reads.push_back(status);
+    } else {
+        const bool msr_register = (word & 0x0f30fff0u) == 0x0120f000u;
+        const bool msr_immediate = (word & 0x0f30f000u) == 0x0320f000u;
+        if ((msr_register || msr_immediate) && ((word >> 16) & 15) == 8) {
+            const RegisterOperand status{(word & 0x00400000u) ? RegisterBank::arm_saved_flags : RegisterBank::arm_flags,
+                                          0, 32, false};
+            i.opcode = Opcode::a32_msr;
+            i.operands.push_back(status);
+            i.access.push_back(OperandAccess::write);
+            if (msr_register) {
+                const auto rm = word & 15;
+                if (rm == 15)
+                    return {DecodeStatus::unsupported, {}, "A32 MSR PC source is unpredictable"};
+                i.operands.emplace_back(gpr(rm));
+                i.access.push_back(OperandAccess::read);
+                i.register_reads.push_back(gpr(rm));
+            } else {
+                const auto rotation = ((word >> 8) & 15) * 2;
+                const auto value = std::rotr(static_cast<std::uint32_t>(word & 255), static_cast<int>(rotation));
+                i.operands.emplace_back(ImmediateOperand{value, 12, 32, false, {}});
+                i.access.push_back(OperandAccess::read);
+            }
+            i.register_writes.push_back(status);
+            if (status.bank == RegisterBank::arm_flags) {
+                i.arm->flags_written = 15;
+                i.arm->flags_known = false;
+            }
+        } else if (immediate_exchange || (word & 0x0e000000) == 0x0a000000) {
         branch(i, word, immediate_exchange);
     } else if ((word & 0x0ffffff0) == 0x012fff10 || (word & 0x0ffffff0) == 0x012fff30) {
         const auto rm = word & 15;
@@ -88,6 +130,7 @@ DecodeResult decode_a32(std::span<const std::byte> bytes, Address at) {
         i.access.push_back(OperandAccess::read);
     } else if (!arm32_detail::memory(i, word) && !arm32_detail::data(i, word)) {
         return {DecodeStatus::unsupported, {}, "A32 encoding has no enabled decoder"};
+    }
     }
     if (i.arm->writes_pc && i.flow == FlowKind::jump && i.condition < 14)
         i.flow = FlowKind::conditional_branch;
