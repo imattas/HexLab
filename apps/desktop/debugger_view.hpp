@@ -55,6 +55,7 @@ class DebuggerView final : public wxPanel {
         std::uint64_t document_revision = 0;
         std::uint64_t runtime_address = 0;
         std::string source_location;
+        bool instruction_step_over = false;
     };
     std::shared_ptr<debugger::DebugSession> session_;
     std::shared_ptr<TerminationState> termination_state_;
@@ -295,6 +296,7 @@ class DebuggerView final : public wxPanel {
     void thread_context_action(debugger::ThreadResumeKind action);
     void interrupt_selected_thread();
     void step_event();
+    void step_over_event();
     void step_out_event();
     bool cancel_source_step_out();
     void add_breakpoint();

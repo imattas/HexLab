@@ -8,9 +8,17 @@ event-sequence contract.
 The desktop Debugger view exposes this operation as **Step** beside Continue.
 It requires a pending stop event, resumes one instruction, and restarts the
 event poller so the next stop refreshes thread/register state and locals. The
-**Step** operation is instruction-level. The Debugger view also offers a
-conservative source-level **Step out** operation, described below. Source-level
-step-over remains unsupported.
+**Step** operation is instruction-level. **Step over** is also instruction-level:
+for a decoded call at the stopped PC it plants a one-shot software breakpoint
+at the fall-through instruction and continues; for other or unavailable
+instruction facts it performs one instruction step. A call-return breakpoint
+requires a fresh loaded image mapping, executable mapped fall-through bytes,
+and a free address with no existing breakpoint. Unsupported or ambiguous cases
+are reported or use the single-instruction fallback. Any intervening stop,
+thread change, or process change cancels the temporary run. Call-over continues
+only the thread that owns the pending event, leaving peers stopped. The
+Debugger view also offers a conservative source-level **Step out** operation,
+described below. Source-level step-over remains unsupported.
 
 ## Source step-out
 
@@ -90,8 +98,8 @@ retry before acknowledging an event or detaching. The event message reports a
 release failure, and continuing that event returns the retry error while keeping
 the event pending. This cannot make OS thread suspension atomic, and a failed
 Windows resume operation can leave a peer suspended until a later retry or
-backend teardown. Hardware/data breakpoints and source-level step-over are not
-implemented.
+backend teardown. Source-level step-over and hardware/data breakpoint
+step-over are not implemented by this operation.
 
 Over GDB Remote Serial Protocol, the backend checks `vContSupported` and then
 queries `vCont?` for the actions the stub actually implements. It uses
