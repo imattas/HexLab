@@ -19,10 +19,12 @@
 #include <sys/file.h>
 #include <sys/stat.h>
 #endif
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
 #include <fcntl.h>
-#include <sys/syscall.h>
 #include <unistd.h>
+#endif
+#if defined(__linux__)
+#include <sys/syscall.h>
 #elif defined(__APPLE__)
 #include <stdio.h>
 #endif
