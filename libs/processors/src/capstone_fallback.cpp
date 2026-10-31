@@ -316,6 +316,9 @@ void apply_capstone_detail(csh handle, const cs_insn& insn, Instruction& out, Ar
     // Some backends attach both JUMP and CALL/RET groups. A later group must
     // not overwrite the more specific control-transfer class.
     out.flow=trap?FlowKind::trap:ret?FlowKind::ret:call?FlowKind::call:jump?FlowKind::jump:FlowKind::fallthrough;
+    if (architecture == Architecture::mos6502 &&
+        (insn.id == MOS65XX_INS_BRK || insn.id == MOS65XX_INS_COP || insn.id == MOS65XX_INS_STP))
+        out.flow = FlowKind::trap;
     const bool may_be_conditional_branch = out.flow != FlowKind::call && out.flow != FlowKind::ret &&
                                             out.flow != FlowKind::trap;
     if(architecture==Architecture::arm64 && may_be_conditional_branch) {
