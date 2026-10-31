@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <new>
 #include <string>
@@ -1181,11 +1182,12 @@ void run_linux_native_lifecycle_test(const std::string& executable) {
             if (ip != registers.value().end()) {
                 std::uint64_t address = 0;
                 std::memcpy(&address, ip->bytes.data(), sizeof(address));
+                auto original = session.read_memory(address, 1);
+                linux_debug_error("read original breakpoint byte", original);
+                const bool original_captured_before_install = static_cast<bool>(original);
                 auto breakpoint = session.add_breakpoint(address, BreakpointKind::software);
                 linux_debug_error("add software breakpoint", breakpoint);
                 const std::byte replacement{0x90}, trap{0xcc};
-                auto original = session.read_memory(address, 1);
-                linux_debug_error("read original breakpoint byte", original);
                 auto disabled = breakpoint ? session.set_breakpoint_enabled(breakpoint.value().id, false)
                                            : Status{breakpoint.error()};
                 linux_debug_error("disable software breakpoint", disabled);
@@ -1206,10 +1208,14 @@ void run_linux_native_lifecycle_test(const std::string& executable) {
                 linux_debug_error("remove software breakpoint", removed);
                 auto restored = session.read_memory(address, 1);
                 linux_debug_error("read restored breakpoint byte", restored);
-                breakpoint_write_ok = breakpoint && original && disabled && disabled_byte &&
+                const auto restore_original = removed && original
+                    ? session.write_memory(address, original.value())
+                    : Status{Error{ErrorCode::busy, "cannot restore the original instruction byte"}};
+                linux_debug_error("restore executable instruction byte", restore_original);
+                breakpoint_write_ok = breakpoint && original_captured_before_install && original && disabled && disabled_byte &&
                     disabled_byte.value()[0] == original.value()[0] && enabled && enabled_byte &&
                     enabled_byte.value()[0] == trap && write && visible && visible.value()[0] == trap && removed &&
-                    restored && restored.value()[0] == replacement;
+                    restored && restored.value()[0] == replacement && restore_original;
                 if (!breakpoint_write_ok)
                     std::fprintf(stderr, "Linux debugger diagnostic: software breakpoint transaction add=%d original=%d disable=%d disabled_byte=%d enable=%d enabled_byte=%d write=%d visible=%d remove=%d restored=%d byte_values=%d/%d/%d/%d/%d\n",
                         static_cast<bool>(breakpoint), static_cast<bool>(original), static_cast<bool>(disabled),
@@ -1489,6 +1495,7 @@ void run_linux_write_watchpoint_test() {
     bool observed_owned_hit = false;
     bool observed_write = false;
     bool exited = false;
+    std::uint32_t observed_exit_code = std::numeric_limits<std::uint32_t>::max();
     if (attached) {
         auto initial = session.wait_event(std::chrono::milliseconds(50));
         linux_debug_wait_error("wait for watchpoint child initial stop", initial);
@@ -1519,6 +1526,7 @@ void run_linux_write_watchpoint_test() {
                     hexlab_test::check(static_cast<bool>(removed), "Linux removes the hit write watchpoint while stopped");
                 }
                 exited = event.value().kind == EventKind::process_exited;
+                if (exited) observed_exit_code = event.value().code;
                 (void)session.continue_execution(event.value().sequence, ContinueStatus::handled);
             }
         } else if (initial) {
@@ -1536,7 +1544,11 @@ void run_linux_write_watchpoint_test() {
     hexlab_test::check(exited, "Linux write-watchpoint target exits after its stop is acknowledged");
     if (session.state() == SessionState::exited) (void)session.detach();
     int status{};
-    bool reaped = false;
+    // A ptrace wait for the process-exit event has already consumed this
+    // direct child’s wait status. In that case the original parent correctly
+    // gets ECHILD and must not signal a potentially reused PID.
+    bool reaped_by_tracer = exited && observed_exit_code == 0;
+    bool reaped = reaped_by_tracer;
     pid_t last_waited = -1;
     int last_wait_errno = 0;
     for (int i = 0; i < 100 && !reaped; ++i) {
@@ -1547,14 +1559,16 @@ void run_linux_write_watchpoint_test() {
         reaped = waited == child;
         if (!reaped) std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
-    if (!reaped) { (void)kill(child, SIGKILL); (void)waitpid(child, &status, 0); }
+    if (!reaped && !exited) { (void)kill(child, SIGKILL); (void)waitpid(child, &status, 0); }
+    if (!reaped_by_tracer && reaped && WIFEXITED(status) && WEXITSTATUS(status) == 0)
+        reaped = true;
     if (!reaped) {
         std::fprintf(stderr, "Linux debugger diagnostic: watchpoint child was not reaped before forced cleanup; pid=%ld status=0x%x\n",
                      static_cast<long>(child), status);
         std::fprintf(stderr, "Linux debugger diagnostic: last watchpoint waitpid=%ld errno=%d\n",
                      static_cast<long>(last_waited), last_wait_errno);
     }
-    hexlab_test::check(reaped && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+    hexlab_test::check(reaped && (reaped_by_tracer || (WIFEXITED(status) && WEXITSTATUS(status) == 0)),
                        "Linux watchpoint child is reaped cleanly");
     (void)munmap(storage, sizeof(SharedTarget));
 }

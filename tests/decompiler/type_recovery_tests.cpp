@@ -17,14 +17,23 @@ using namespace hexlab::decompiler;
 
 #if defined(__APPLE__)
 namespace {
+volatile sig_atomic_t current_test_stage = '0';
+
 void print_segv_backtrace(int signal_number) {
     void *frames[64];
     const int frame_count = ::backtrace(frames, static_cast<int>(sizeof(frames) / sizeof(frames[0])));
-    constexpr char message[] = "decompiler_type_recovery: SIGSEGV backtrace follows\n";
+    constexpr char message[] = "decompiler_type_recovery: SIGSEGV at test stage ";
     (void)::write(STDERR_FILENO, message, sizeof(message) - 1);
+    const char stage = static_cast<char>(current_test_stage);
+    (void)::write(STDERR_FILENO, &stage, 1);
+    constexpr char newline[] = "\n";
+    (void)::write(STDERR_FILENO, newline, sizeof(newline) - 1);
+    constexpr char backtrace_message[] = "decompiler_type_recovery: backtrace follows\n";
+    (void)::write(STDERR_FILENO, backtrace_message, sizeof(backtrace_message) - 1);
     if (frame_count > 0) ::backtrace_symbols_fd(frames, frame_count, STDERR_FILENO);
     ::_exit(128 + signal_number);
 }
+void mark_test_stage(char stage) { current_test_stage = stage; }
 }
 #endif
 
@@ -35,6 +44,7 @@ int main() {
     sigemptyset(&action.sa_mask);
     action.sa_flags = 0;
     (void)sigaction(SIGSEGV, &action, nullptr);
+    mark_test_stage('1');
 #endif
 #if defined(_MSC_VER)
     _CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
@@ -96,6 +106,9 @@ int main() {
 
     // Three observed adjacent words are a sufficiently strong shape signal
     // to recover an array member; a later gap must start a separate field.
+#if defined(__APPLE__)
+    mark_test_stage('2');
+#endif
     LiftedFunction array_fn;
     array_fn.entry = {{0}, 0x1100};
     LiftedBlock array_block{BlockId{11}, array_fn.entry};
@@ -178,6 +191,9 @@ int main() {
 
     const RegisterOperand frame{RegisterBank::gpr, 5, 64, false};
     MemoryValue local_memory;
+#if defined(__APPLE__)
+    mark_test_stage('3');
+#endif
     local_memory.base = frame;
     local_memory.base_version = 0;
     local_memory.displacement = -8;
@@ -246,6 +262,9 @@ int main() {
     // Accesses through an interior pointer should contribute to the enclosing
     // object's field layout while retaining offsets relative to the interior
     // pointer's own view.
+#if defined(__APPLE__)
+    mark_test_stage('4');
+#endif
     const RegisterOperand interior{RegisterBank::gpr, 6, 64, false};
     const RegisterOperand interior_load{RegisterBank::gpr, 7, 32, false};
     LiftedFunction interior_fn;
@@ -329,6 +348,9 @@ int main() {
     assert(overlap_base->type->element()->kind() == types::Kind::integer);
 
     auto i32=types::Type::integer("int",4,4,true); assert(i32);
+#if defined(__APPLE__)
+    mark_test_stage('5');
+#endif
     auto proto=types::Type::function(i32.value(),{{"x",i32.value()}},false); assert(proto);
     auto constrained=recover_types(*fn,abi,proto.value()); assert(constrained);
     bool constrained_arg=false;
@@ -346,6 +368,9 @@ int main() {
     assert(inferred_bare_return.value().inferred_prototype->result_type()->kind() == types::Kind::void_type);
 
     auto win=x86_64_windows_abi();
+#if defined(__APPLE__)
+    mark_test_stage('6');
+#endif
     assert(win.integer_argument_registers.size()==4 && win.stack_argument_base && win.stack_argument_offsets.front()==40);
     auto sysv=x86_64_system_v_abi();
     assert(sysv.integer_argument_registers.size()==6 && sysv.stack_argument_offsets.front()==8);
@@ -404,6 +429,9 @@ int main() {
     assert(adjusted_stack_recovery.value().inferred_prototype->parameters().front().type->size() == 4);
 
     auto f64=types::Type::floating("double",8,8); assert(f64);
+#if defined(__APPLE__)
+    mark_test_stage('7');
+#endif
     auto floating_proto=types::Type::function(f64.value(),{{"x",f64.value()}},false); assert(floating_proto);
     AbiDescription floating_abi; floating_abi.name="test floating"; floating_abi.pointer_bits=64;
     floating_abi.floating_argument_registers={arg}; floating_abi.floating_return_register=result_reg;
@@ -467,6 +495,9 @@ int main() {
     // A phi is pointer-valued only when every incoming value carries pointer
     // evidence. One pointer arm must not turn an integer/pointer join into a
     // pointer type.
+#if defined(__APPLE__)
+    mark_test_stage('8');
+#endif
     const RegisterOperand joined{RegisterBank::gpr, 10, 64, false};
     const RegisterOperand observed{RegisterBank::gpr, 12, 32, false};
     LiftedFunction mixed_phi;
@@ -505,6 +536,9 @@ int main() {
 
     // Typed vector lane metadata in the IR should survive register recovery,
     // the explicit vector ABI slot, return inference, and prototype building.
+#if defined(__APPLE__)
+    mark_test_stage('9');
+#endif
     const RegisterOperand vector_arg{RegisterBank::xmm, 0, 128, false};
     const ValueType vector_value{TypeKind::vector, 128, false, TypeKind::integer, 32, 4};
     auto vector_expression = std::make_shared<Expression>(Expression{

@@ -152,9 +152,35 @@ void publish_file(OwnedFile& source,const std::filesystem::path& destination,Rep
                 sqlite3_close(database);
                 throw Failure{{ErrorCode::conflict,"Destination path changed while SQLite opened it"}};
             }
+            // A checkpoint can truncate the WAL without removing a stale
+            // wal-index file (for example when persistent-WAL mode is set).
+            // Disable persistence and ask SQLite to leave WAL mode so SQLite's
+            // own locking and VFS code retires both sidecars safely.
+            int persistent_wal=0;
+            if(sqlite3_file_control(database,"main",SQLITE_FCNTL_PERSIST_WAL,&persistent_wal)!=SQLITE_OK || persistent_wal!=0){
+                sqlite3_close(database);
+                throw Failure{{ErrorCode::busy,"Cannot disable persistent SQLite WAL mode for destination recovery"}};
+            }
             int log_frames=-1,checkpointed_frames=-1;
             const auto checkpoint=sqlite3_wal_checkpoint_v2(database,"main",SQLITE_CHECKPOINT_TRUNCATE,
                                                               &log_frames,&checkpointed_frames);
+            if(checkpoint==SQLITE_OK && log_frames==checkpointed_frames){
+                sqlite3_stmt* journal_mode=nullptr;
+                const auto prepared=sqlite3_prepare_v2(database,"PRAGMA journal_mode=DELETE",-1,&journal_mode,nullptr);
+                if(prepared!=SQLITE_OK){
+                    if(journal_mode)sqlite3_finalize(journal_mode);
+                    sqlite3_close(database);
+                    throw Failure{{ErrorCode::busy,"Cannot prepare SQLite journal-mode recovery"}};
+                }
+                const auto stepped=sqlite3_step(journal_mode);
+                const auto mode=stepped==SQLITE_ROW?sqlite3_column_text(journal_mode,0):nullptr;
+                const bool switched=mode && sqlite3_stricmp(reinterpret_cast<const char*>(mode),"delete")==0;
+                sqlite3_finalize(journal_mode);
+                if(!switched){
+                    sqlite3_close(database);
+                    throw Failure{{ErrorCode::busy,"Destination SQLite journal mode is still in use"}};
+                }
+            }
             const auto closed=sqlite3_close(database);
             if(checkpoint!=SQLITE_OK || closed!=SQLITE_OK || log_frames!=checkpointed_frames)
                 throw Failure{{ErrorCode::busy,"Destination SQLite journal companions are still in use"}};

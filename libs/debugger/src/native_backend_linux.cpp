@@ -672,6 +672,12 @@ public:
                 if (waited < 0 && errno != ECHILD && errno != EINTR) return sys_error("waitpid");
             }
             if (tid > 0) {
+                // waitpid has now consumed the ptrace status that satisfied a
+                // previously issued PTRACE_INTERRUPT. Clear the outstanding
+                // marker before stop_all_threads() sees this event; otherwise
+                // it mistakes the already-stopped task for an interrupt still
+                // in flight and waits until the operation deadline expires.
+                interrupting_.erase(tid);
                 if (WIFSTOPPED(status)) stopped_.insert(tid);
                 bool displaced_user_step = false;
                 std::string resume_failure;
@@ -1470,6 +1476,12 @@ public:
                 auto fp_status = detail::write_x86_fxsave_registers(
                     std::span<std::byte>(xstate->data(), detail::x86_fxsave_size), fp_writes);
                 if (!fp_status) return fp_status.error();
+                // Linux treats an XSAVE component whose XSTATE_BV bit is clear
+                // as the architectural init state, even when the corresponding
+                // bytes in the buffer are nonzero. Mark x87/SSE present when
+                // writing FXSAVE fields (including XMM registers).
+                if (!fp_writes.empty())
+                    detail::x86_set_xstate_bv(*xstate, detail::x86_xstate_bv(*xstate) | 0x3u);
                 auto ymm_status = detail::write_x86_xstate_ymm_upper_registers(*xstate, *xstate_layout, ymm_writes);
                 if (!ymm_status) return ymm_status.error();
                 if (!avx512_writes.empty()) {
