@@ -292,7 +292,7 @@ enum class PeUnwindOperationKind : std::uint8_t {
 };
 struct PeUnwindOperation {
     PeUnwindOperationKind kind = PeUnwindOperationKind::push_nonvolatile;
-    std::uint8_t code_offset = 0;
+    std::uint16_t code_offset = 0;
     std::uint8_t register_number = 0;
     std::uint32_t stack_size = 0;
     std::uint32_t stack_offset = 0;
@@ -505,7 +505,8 @@ struct PeChainedRuntimeFunction {
     }
 };
 struct PeUnwindInfo {
-    std::uint8_t version = 0, flags = 0, size_of_prolog = 0;
+    std::uint8_t version = 0, flags = 0;
+    std::uint16_t size_of_prolog = 0;
     std::uint8_t frame_register = 0, frame_offset = 0;
     std::vector<PeUnwindOperation> operations;
     std::optional<std::uint32_t> handler_rva;
