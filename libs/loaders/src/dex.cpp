@@ -1864,6 +1864,17 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
                                 return expect_wide(reg, expected == RegType::wide_float_low);
                             return expected == RegType::unknown || expect_type(reg, expected);
                         };
+                        const auto expect_assignable_reference = [&](std::uint32_t reg,
+                                                                       std::string_view descriptor) {
+                            if (descriptor.empty() ||
+                                (descriptor.front() != 'L' && descriptor.front() != '[') ||
+                                reg >= before.size() || before[reg] != RegType::reference ||
+                                before.references[reg] >= types.size())
+                                return true;
+                            const auto expected = type_id_for(descriptor);
+                            if (expected == UINT32_MAX) return true;
+                            return reference_assignability(before.references[reg], expected) != Assignability::no;
+                        };
                         const auto set_descriptor = [&](std::uint32_t reg, std::string_view descriptor) {
                             const auto type = descriptor_type(descriptor);
                             if (type == RegType::wide_int_low || type == RegType::wide_float_low) {
@@ -2048,12 +2059,16 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
                             } else if (!known_array && (wide ? !expect_any_wide(value) :
                                        !expect_type(value, object ? RegType::reference : RegType::int32))) {
                                 return Error{ErrorCode::malformed, "DEX array store value has an incompatible type"};
-                            } else if (known_array && object && !expect_type(value, RegType::reference)) {
+                            } else if (known_array && object &&
+                                       (!expect_type(value, RegType::reference) ||
+                                        !expect_assignable_reference(value, component))) {
                                 std::ostringstream provenance;
-                                provenance << "DEX aput-object value is not a reference"
+                                provenance << "DEX aput-object value is not assignable to the known component"
                                     << " (method_idx=" << method_idx
                                     << ", code_item_file_offset=0x" << std::hex << code_off
                                     << ", instruction_code_unit_offset=0x" << (offset / 2)
+                                    << ", opcode=0x" << static_cast<unsigned>(opcode)
+                                    << ", component_descriptor=" << component
                                     << ", array_descriptor=" << array_descriptor << ')';
                                 return Error{ErrorCode::malformed, provenance.str()};
                             }
@@ -2084,7 +2099,8 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
                                 }
                                 const auto &field_type = types[fields[field_index].type];
                                 if (get) set_descriptor(value, field_type);
-                                else if (!expect_descriptor(value, field_type))
+                                else if (!expect_descriptor(value, field_type) ||
+                                         !expect_assignable_reference(value, field_type))
                                     return Error{ErrorCode::malformed, "DEX field store value disagrees with the field descriptor"};
                             }
                         } else if (opcode >= 0x7b && opcode <= 0x8f) {
@@ -2217,7 +2233,8 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
                                 for (const auto parameter_type : protos[*proto_index].parameters) {
                                     const auto &descriptor = types[parameter_type];
                                     const auto reg = argument_reg(word_index);
-                                    if (!expect_descriptor(reg, descriptor))
+                                    if (!expect_descriptor(reg, descriptor) ||
+                                        !expect_assignable_reference(reg, descriptor))
                                         return Error{ErrorCode::malformed, "DEX invoke argument disagrees with its prototype"};
                                     word_index += descriptor == "J" || descriptor == "D" ? 2u : 1u;
                                 }
@@ -2286,7 +2303,8 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
                                 const bool return_form_matches = opcode == 0x11
                                     ? expected == RegType::reference
                                     : (expected == RegType::int32 || expected == RegType::float32);
-                                if (!return_form_matches || !expect_type(reg8, required))
+                                if (!return_form_matches || !expect_type(reg8, required) ||
+                                    (opcode == 0x11 && !expect_assignable_reference(reg8, return_descriptor)))
                                     return Error{ErrorCode::malformed, "DEX return register type disagrees with its method prototype"};
                             }
                         }

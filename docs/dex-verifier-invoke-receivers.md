@@ -12,3 +12,8 @@ prototype continues to determine argument and result types. The verifier does
 not impose this method-owner check on `invoke-custom`, whose call site has no
 receiver. These checks preserve the existing verifier worklist bounds,
 cancellation, and instruction/method provenance on malformed results.
+
+Known reference values are also checked against object field-store, invocation
+parameter, and method return descriptors. The bounded in-image hierarchy and
+array rules reject only a proven incompatible assignment; unknown values,
+null, and unresolved external hierarchy relationships remain conservative.
