@@ -112,6 +112,9 @@ instance/class method signatures, plus accessor signatures for parsed protocol
 properties. Protocol declarations carry the protolist section, index, metadata
 address, and runtime record size when known as project provenance. Duplicate protocol
 names, unresolved records, and protocols without parsed signatures are skipped.
+If the same instance or class selector has differing parsed method/property
+signatures, the protocol is not imported and the conflict is reported with the
+selector name; identical repeated signatures are coalesced.
 The type system has no required-versus-optional method marker, so imported
 signatures do not retain that distinction. Adopted-protocol inheritance and
 runtime conformance are not encoded as storage or inheritance relationships.

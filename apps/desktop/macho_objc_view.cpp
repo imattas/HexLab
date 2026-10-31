@@ -700,17 +700,29 @@ MachOObjCTypeImportPlan macho_objc_type_import_plan(
         }
         const auto type_name = "ObjC2.Protocol." + objc_type_component(*protocol.name);
         std::vector<types::Method> methods;
+        std::optional<std::string> conflicting_selector;
+        const auto append_signature = [&](std::string selector, types::TypePtr signature,
+                                          bool is_static) {
+            const auto duplicate = std::find_if(methods.begin(), methods.end(), [&](const auto &prior) {
+                return prior.name == selector && prior.is_static == is_static;
+            });
+            if (duplicate != methods.end()) {
+                const auto prior_encoding = types::encode(*duplicate->signature);
+                const auto candidate_encoding = types::encode(*signature);
+                if (!prior_encoding || !candidate_encoding || prior_encoding.value() != candidate_encoding.value())
+                    conflicting_selector = std::move(selector);
+                return !conflicting_selector.has_value();
+            }
+            if (methods.size() == 100000) return false;
+            methods.push_back({std::move(selector), std::move(signature), types::MemberAccess::unknown,
+                               types::MemberDispatch::unknown, 0, is_static});
+            return true;
+        };
         const auto append_protocol_methods = [&](const MachOObjCList &list, bool is_static) {
             for (const auto &method : list.methods) {
                 if (!method.selector || !method.signature || method.signature_status != "parsed")
                     continue;
-                const auto duplicate = std::find_if(methods.begin(), methods.end(), [&](const auto &prior) {
-                    return prior.name == *method.selector && prior.is_static == is_static;
-                });
-                if (duplicate != methods.end()) continue;
-                if (methods.size() == 100000) return false;
-                methods.push_back({*method.selector, method.signature, types::MemberAccess::unknown,
-                                   types::MemberDispatch::unknown, 0, is_static});
+                if (!append_signature(*method.selector, method.signature, is_static)) return false;
             }
             return true;
         };
@@ -718,6 +730,11 @@ MachOObjCTypeImportPlan macho_objc_type_import_plan(
             !append_protocol_methods(protocol.optional_instance_methods, false) ||
             !append_protocol_methods(protocol.required_class_methods, true) ||
             !append_protocol_methods(protocol.optional_class_methods, true)) {
+            if (conflicting_selector) {
+                plan.conflicts.push_back("Protocol " + *protocol.name +
+                    " has conflicting declarations for selector " + *conflicting_selector);
+                continue;
+            }
             plan.skipped.push_back("Protocol " + *protocol.name + " exceeds the persistent method limit");
             continue;
         }
@@ -732,18 +749,14 @@ MachOObjCTypeImportPlan macho_objc_type_import_plan(
                     continue;
                 const auto add_accessor = [&](std::string selector, types::TypePtr result,
                                               const types::TypePtr &argument) {
-                    if (selector.empty() || std::any_of(methods.begin(), methods.end(), [&](const auto &method) {
-                            return method.name == selector && method.is_static == is_static;
-                        })) return true;
-                    if (methods.size() >= 100000 || !id_type || !selector_type || !result) return false;
+                    if (selector.empty()) return false;
+                    if (!id_type || !selector_type || !result) return false;
                     std::vector<types::Parameter> parameters{{"self", id_type.value()},
                                                               {"_cmd", selector_type.value()}};
                     if (argument) parameters.push_back({"value", argument});
                     auto signature = types::Type::function(std::move(result), std::move(parameters), false);
                     if (!signature) return false;
-                    methods.push_back({std::move(selector), signature.value(), types::MemberAccess::unknown,
-                                       types::MemberDispatch::unknown, 0, is_static});
-                    return true;
+                    return append_signature(std::move(selector), signature.value(), is_static);
                 };
                 const auto getter = property.custom_getter.value_or(*property.name);
                 if (!add_accessor(getter, property.type, {})) {
@@ -764,6 +777,11 @@ MachOObjCTypeImportPlan macho_objc_type_import_plan(
         };
         add_property_accessors(protocol.instance_properties, false);
         add_property_accessors(protocol.class_properties, true);
+        if (conflicting_selector) {
+            plan.conflicts.push_back("Protocol " + *protocol.name +
+                " has conflicting declarations for selector " + *conflicting_selector);
+            continue;
+        }
         if (methods.empty()) {
             plan.skipped.push_back("Protocol " + *protocol.name + " has no parsed method signatures");
             continue;
