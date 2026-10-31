@@ -10163,6 +10163,184 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
     };
     if (auto structured = try_ssa_post_tested_loop()) return *structured;
 
+    // A post-tested loop may begin at a conditional body dispatcher after a
+    // straight-line function-entry/preheader chain. Its disjoint arms can
+    // finish at separate conditional latches which either repeat at the
+    // dispatcher or leave through one shared return. Keep this recognizer
+    // deliberately narrower than the general loop path: it requires two
+    // exact latch edges and rejects memory SSA rather than guessing copies.
+    auto try_explicit_preheader_two_latch_loop = [&]() -> std::optional<StructuredPseudocode> {
+        if (function.blocks.size() < 5 || function.blocks.size() > 128) return {};
+        std::map<std::uint64_t, std::set<std::uint64_t>> predecessors;
+        std::set<std::uint64_t> ids;
+        std::set<std::pair<std::uint32_t, std::uint64_t>> addresses;
+        std::size_t edge_count = 0;
+        for (const auto &block : function.blocks) {
+            if (!ids.insert(block.id.value).second ||
+                !addresses.emplace(block.begin.space.value, block.begin.offset).second ||
+                block.switch_dispatch || block.memory_phi || !block.memory_partition_phis.empty() ||
+                !has_only_simple_statements(block)) return {};
+            std::set<std::uint64_t> targets;
+            for (const auto &edge : block.successors) {
+                if (++edge_count > 4096 || !edge.target) return {};
+                const auto *target = find_block(*edge.target);
+                if (!target || !edge_targets(edge, target->begin) ||
+                    !targets.insert(target->id.value).second) return {};
+                predecessors[target->id.value].insert(block.id.value);
+            }
+        }
+        if (!predecessors[entry->id.value].empty()) return {};
+
+        std::vector<const LiftedBlock *> preheader_path;
+        auto *header = entry;
+        while (header && !terminal_conditional(*header) && preheader_path.size() < 64) {
+            if (!header->phis.empty() || contains_return(*header) ||
+                header->successors.size() != 1 || !header->successors.front().target ||
+                !has_unconditional_edge(*header, *header->successors.front().target)) return {};
+            preheader_path.push_back(header);
+            const auto predecessor = preheader_path.size() == 1 ? std::set<std::uint64_t>{} :
+                std::set<std::uint64_t>{preheader_path[preheader_path.size() - 2]->id.value};
+            if (predecessors[header->id.value] != predecessor) return {};
+            header = find_block(*header->successors.front().target);
+        }
+        if (!header || preheader_path.empty() || !terminal_conditional(*header) ||
+            header->successors.size() != 2 || !conditional_edges_match_targets(*header, *terminal_conditional(*header)))
+            return {};
+        const auto *dispatch = terminal_conditional(*header);
+        const auto *preheader = preheader_path.back();
+        if (!preheader || !has_unconditional_edge(*preheader, header->begin) ||
+            predecessors[header->id.value].size() != 3) return {};
+
+        struct LatchArm {
+            std::vector<const LiftedBlock *> body;
+            const LiftedBlock *latch = nullptr;
+            const Branch *condition = nullptr;
+            bool repeat_on_true = false;
+            const LiftedBlock *exit = nullptr;
+        };
+        const auto trace_arm = [&](Address start) -> std::optional<LatchArm> {
+            LatchArm arm;
+            auto *current = find_block(start);
+            auto predecessor = header->id.value;
+            std::set<std::uint64_t> seen;
+            while (current && current != header && arm.body.size() < 64 &&
+                   seen.insert(current->id.value).second &&
+                   predecessors[current->id.value] == std::set<std::uint64_t>{predecessor}) {
+                if (!current->phis.empty() || current->switch_dispatch || contains_return(*current) ||
+                    current->memory_phi || !current->memory_partition_phis.empty() ||
+                    !has_only_simple_statements(*current)) return {};
+                const auto *test = terminal_conditional(*current);
+                if (test) {
+                    if (!conditional_edges_match_targets(*current, *test) || current->successors.size() != 2 ||
+                        !test->true_target || !test->false_target ||
+                        (*test->true_target == header->begin) == (*test->false_target == header->begin)) return {};
+                    const auto exit_address = *test->true_target == header->begin
+                        ? *test->false_target : *test->true_target;
+                    const auto *exit = find_block(exit_address);
+                    if (!exit || exit == header || exit == preheader || current == preheader) return {};
+                    arm.latch = current;
+                    arm.condition = test;
+                    arm.repeat_on_true = *test->true_target == header->begin;
+                    arm.exit = exit;
+                    return arm;
+                }
+                if (current->successors.size() != 1 || !current->successors.front().target ||
+                    !has_unconditional_edge(*current, *current->successors.front().target)) return {};
+                arm.body.push_back(current);
+                predecessor = current->id.value;
+                current = find_block(*current->successors.front().target);
+            }
+            return {};
+        };
+        auto true_arm = trace_arm(*dispatch->true_target);
+        auto false_arm = trace_arm(*dispatch->false_target);
+        if (!true_arm || !false_arm || !true_arm->latch || !false_arm->latch ||
+            true_arm->latch == false_arm->latch || true_arm->exit != false_arm->exit) return {};
+        const auto *exit = true_arm->exit;
+        const std::set<std::uint64_t> latches{true_arm->latch->id.value, false_arm->latch->id.value};
+        if (predecessors[header->id.value] !=
+                std::set<std::uint64_t>{preheader->id.value, true_arm->latch->id.value, false_arm->latch->id.value} ||
+            predecessors[exit->id.value] != latches || !has_only_terminal_return(*exit)) return {};
+
+        std::set<std::uint64_t> covered;
+        for (const auto *block : preheader_path)
+            if (!covered.insert(block->id.value).second) return {};
+        if (!covered.insert(header->id.value).second) return {};
+        for (const auto *block : true_arm->body)
+            if (!covered.insert(block->id.value).second) return {};
+        for (const auto *block : false_arm->body)
+            if (!covered.insert(block->id.value).second) return {};
+        if (!covered.insert(true_arm->latch->id.value).second ||
+            !covered.insert(false_arm->latch->id.value).second ||
+            !covered.insert(exit->id.value).second || covered.size() != function.blocks.size()) return {};
+
+        std::size_t phi_input_count = 0;
+        const auto build_copies = [&](const LiftedBlock &target, const std::set<std::uint64_t> &expected,
+                                      std::map<std::uint64_t, std::vector<std::pair<std::string, std::string>>> &copies)
+            -> bool {
+            if (target.phis.size() > 4096) return false;
+            std::set<std::string> destinations;
+            for (const auto &phi : target.phis) {
+                if (phi.inputs.size() != expected.size() || phi.inputs.size() > 65536 - phi_input_count)
+                    return false;
+                phi_input_count += phi.inputs.size();
+                std::set<std::uint64_t> seen;
+                const auto destination = register_name(phi.destination, phi.version);
+                if (!destinations.insert(destination).second) return false;
+                for (const auto &input : phi.inputs) {
+                    if (!expected.contains(input.predecessor.value) ||
+                        !seen.insert(input.predecessor.value).second) return false;
+                    copies[input.predecessor.value].emplace_back(
+                        destination, register_name(phi.destination, input.version));
+                }
+                if (seen != expected) return false;
+            }
+            return true;
+        };
+        std::map<std::uint64_t, std::vector<std::pair<std::string, std::string>>> header_copies, exit_copies;
+        const std::set<std::uint64_t> header_predecessors{
+            preheader->id.value, true_arm->latch->id.value, false_arm->latch->id.value};
+        if (!build_copies(*header, header_predecessors, header_copies) ||
+            !build_copies(*exit, latches, exit_copies)) return {};
+        if (exit->successors.size() != 0) return {};
+
+        const auto emit_latch = [&](const LatchArm &arm, unsigned indent) {
+            const std::string spaces(indent, ' ');
+            emit_block(*arm.latch, indent, true);
+            const auto condition = branch_condition_text(*arm.condition);
+            const auto emit_repeat = [&]() {
+                emit_parallel_copies(out, header_copies[arm.latch->id.value], indent + 4);
+                out << std::string(indent + 4, ' ') << "continue;\n";
+            };
+            const auto emit_exit = [&]() {
+                emit_parallel_copies(out, exit_copies[arm.latch->id.value], indent + 4);
+                out << std::string(indent + 4, ' ') << "break;\n";
+            };
+            out << spaces << "if (" << condition << ") {\n";
+            if (arm.repeat_on_true) emit_repeat(); else emit_exit();
+            out << spaces << "} else {\n";
+            if (arm.repeat_on_true) emit_exit(); else emit_repeat();
+            out << spaces << "}\n";
+        };
+
+        out << "function " << address_label(function.entry) << "() {\n";
+        for (const auto *block : preheader_path) emit_block(*block, 4, true);
+        emit_parallel_copies(out, header_copies[preheader->id.value], 4);
+        out << "    while (true) {\n";
+        emit_block(*header, 8, true);
+        out << "        if (" << branch_condition_text(*dispatch) << ") {\n";
+        for (const auto *block : true_arm->body) emit_block(*block, 12, true);
+        emit_latch(*true_arm, 12);
+        out << "        } else {\n";
+        for (const auto *block : false_arm->body) emit_block(*block, 12, true);
+        emit_latch(*false_arm, 12);
+        out << "        }\n    }\n";
+        emit_block(*exit, 4, false);
+        out << "}\n";
+        return StructuredPseudocode{out.str(), false, {}};
+    };
+    if (auto structured = try_explicit_preheader_two_latch_loop()) return *structured;
+
     if (function.blocks.size() >= 4 && has_only_simple_statements(*entry) && entry->phis.empty() &&
         entry->successors.size() == 1 && entry->successors.front().target) {
         const auto *header = find_block(*entry->successors.front().target);
