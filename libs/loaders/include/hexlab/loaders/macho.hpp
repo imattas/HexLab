@@ -27,14 +27,16 @@ struct MachOCodeDirectoryHashLimits {
 };
 struct MachOCodeDirectoryHashVerification {
     std::uint32_t signature_index = 0, blob_index = 0;
-    std::uint32_t code_limit = 0, page_size = 0, code_slots = 0, verified_slots = 0;
+    std::uint64_t code_limit = 0;
+    std::uint32_t page_size = 0, code_slots = 0, verified_slots = 0;
     std::uint8_t hash_type = 0, hash_size = 0;
     std::uint64_t mismatch_count = 0;
     std::vector<std::uint32_t> mismatch_slots;
     bool matches = false;
 };
-// Verifies SHA-256 or truncated SHA-256 CodeDirectory code-page hashes for one
-// selected Mach-O CodeDirectory blob. CMS signatures and trust are not checked.
+// Verifies contiguous SHA-256 or truncated SHA-256 CodeDirectory code-page
+// hashes for versions through 0x20300, including nonzero codeLimit64. Scatter
+// layouts, CMS signatures and trust are not checked.
 HEXLAB_LOADERS_EXPORT Result<MachOCodeDirectoryHashVerification> verify_macho_code_directory_hashes(
     const Image &, const ImageMetadata &, std::uint32_t signature_index, std::uint32_t blob_index,
     std::stop_token = {}, MachOCodeDirectoryHashLimits = {});

@@ -410,6 +410,93 @@ bool simd_0f3a(State &state, std::uint8_t opcode) {
 }
 
 bool vex_simd(State &state, std::uint8_t opcode, unsigned map, unsigned pp, unsigned vvvv, bool l, bool w) {
+    if (map == 1 && opcode >= 0x90 && opcode <= 0x93) {
+        if (l || vvvv != 0)
+            invalid("VEX KMOV requires L=0 and the reserved vvvv encoding");
+
+        std::uint16_t width = 0;
+        Opcode operation{};
+        if (opcode == 0x90 || opcode == 0x91) {
+            if (pp > 1)
+                invalid("KMOV K/m forms require pp=none or 66");
+            width = pp ? (w ? 32 : 8) : (w ? 64 : 16);
+        } else {
+            if (pp == 0 && !w) width = 16;
+            else if (pp == 1 && !w) width = 8;
+            else if (pp == 3) width = w ? 64 : 32;
+            else invalid("KMOV register forms have a reserved prefix/width combination");
+            if (width == 64 && !state.rules.long_mode())
+                invalid("KMOVQ to/from a GPR requires 64-bit mode");
+        }
+        operation = width == 8 ? Opcode::kmovb : width == 16 ? Opcode::kmovw :
+                    width == 32 ? Opcode::kmovd : Opcode::kmovq;
+
+        if (opcode == 0x90 || opcode == 0x91) {
+            auto decoded = modrm(state, width, 64);
+            if (decoded.reg.index > 7 || (state.rex & 4))
+                invalid("KMOV K operand must encode K0-K7");
+            auto mask_register = decoded.reg;
+            mask_register.bank = RegisterBank::opmask;
+            mask_register.width = opcode == 0x90 ? 64 : width;
+            mask_register.high_byte = false;
+            if (opcode == 0x90) {
+                Operand source = std::move(decoded.rm);
+                if (auto *mask = std::get_if<RegisterOperand>(&source)) {
+                    if ((state.rex & 1) || mask->index > 7)
+                        invalid("KMOV K source must encode K0-K7");
+                    mask->bank = RegisterBank::opmask;
+                    mask->width = width;
+                    mask->high_byte = false;
+                } else if (auto *memory = std::get_if<MemoryOperand>(&source)) {
+                    memory->data_width = width;
+                }
+                state.i.opcode = operation;
+                state.operand(mask_register, OperandAccess::write);
+                state.operand(std::move(source), OperandAccess::read);
+            } else {
+                if (decoded.mod == 3)
+                    invalid("KMOV store requires a memory destination");
+                if (auto *memory = std::get_if<MemoryOperand>(&decoded.rm))
+                    memory->data_width = width;
+                state.i.opcode = operation;
+                state.operand(std::move(decoded.rm), OperandAccess::write);
+                state.operand(mask_register, OperandAccess::read);
+            }
+            return true;
+        }
+
+        const std::uint16_t gpr_width = width == 64 ? 64 : 32;
+        if (opcode == 0x92) {
+            auto decoded = modrm(state, gpr_width, 64);
+            if (decoded.mod != 3 || decoded.reg.index > 7 || (state.rex & 4))
+                invalid("KMOV GPR-to-K form requires a direct GPR source and K0-K7 destination");
+            auto destination = decoded.reg;
+            destination.bank = RegisterBank::opmask;
+            destination.width = 64;
+            destination.high_byte = false;
+            auto source = std::get<RegisterOperand>(decoded.rm);
+            if (!state.rules.long_mode() && source.index > 7)
+                invalid("KMOV GPR source extension is unavailable outside 64-bit mode");
+            state.i.opcode = operation;
+            state.operand(destination, OperandAccess::write);
+            state.operand(source, OperandAccess::read);
+        } else {
+            auto decoded = modrm(state, 64, gpr_width);
+            if (decoded.mod != 3 || (state.rex & 1) ||
+                std::get<RegisterOperand>(decoded.rm).index > 7)
+                invalid("KMOV K-to-GPR form requires K0-K7 and a direct GPR destination");
+            auto source = std::get<RegisterOperand>(decoded.rm);
+            source.bank = RegisterBank::opmask;
+            source.width = width;
+            source.high_byte = false;
+            if (!state.rules.long_mode() && decoded.reg.index > 7)
+                invalid("KMOV GPR destination extension is unavailable outside 64-bit mode");
+            state.i.opcode = operation;
+            state.operand(decoded.reg, OperandAccess::write);
+            state.operand(source, OperandAccess::read);
+        }
+        return true;
+    }
     if (map == 1 && (opcode == 0x41 || opcode == 0x42 || opcode == 0x44 ||
                      opcode == 0x45 || opcode == 0x46 || opcode == 0x47)) {
         if (pp > 1)

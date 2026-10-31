@@ -17,3 +17,12 @@ block once in sequence. It omits only the terminal unconditional transfers
 between those adjacent blocks; the return remains attached to its original
 terminal block. Register phis, memory phis, conditional exits, and shared exit
 continuations remain unsupported by this recognizer.
+
+The exit cleanup may instead end in one conditional whose true and false arms
+each follow a bounded phi-free straight-line path to a terminal return. The
+paths may share only that final return block. Its complete predecessor set must
+be exactly the two arm tails (or the conditional itself for a direct arm), and
+the return block must have no register or memory phis. The formatter duplicates
+the shared terminal return into both guarded arms, keeping each path's
+statements and return under its original predicate. Other shared blocks, side
+entries, and incomplete predecessor sets retain the existing fallback.

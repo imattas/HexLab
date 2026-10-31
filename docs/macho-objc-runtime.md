@@ -151,6 +151,10 @@ no representable method or property accessor signatures are skipped. The
 source origin records the category-list section ordinal, list index, and
 category record address, so the imported type can be traced to the metadata
 that supplied it.
+The same conservative accessor projection applies to validated class property
+records: their getter/setter signatures are attached to `ObjC2.Class.<name>`
+when that class type is imported, with explicit class method encodings taking
+precedence. Property declarations do not rename ivars or establish storage.
 Class-property metadata is scanned, displayed, and projected into synthesized
 category class accessor methods when its type and attributes are validated.
 Those methods describe declarations only; no metaclass layout or runtime

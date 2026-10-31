@@ -43,14 +43,23 @@ Result<MachOCodeDirectoryHashVerification> verify_macho_code_directory_hashes(
     if (directory.size() != blob->size || be32(directory, 0) != 0xfade0c02 || be32(directory, 4) != blob->size)
         return Error{ErrorCode::malformed, "Mach-O CodeDirectory header or length is inconsistent"};
     const auto version = be32(directory, 8);
-    if (version < 0x20001 || version > 0x20100)
+    if (version < 0x20001 || version > 0x20300)
         return Error{ErrorCode::unsupported, "Mach-O CodeDirectory version uses unsupported extended fields"};
-    if (version >= 0x20100 && blob->size < 52)
-        return Error{ErrorCode::malformed, "Mach-O CodeDirectory is truncated before teamOffset"};
+    std::size_t fixed_header_size = 44;
+    if (version >= 0x20100) fixed_header_size = 48;
+    if (version >= 0x20200) fixed_header_size = 52;
+    if (version >= 0x20300) fixed_header_size = 64;
+    if (blob->size < fixed_header_size)
+        return Error{ErrorCode::malformed, "Mach-O CodeDirectory is truncated before its versioned fields"};
+    if (version >= 0x20100 && be32(directory, 44) != 0)
+        return Error{ErrorCode::unsupported, "Mach-O CodeDirectory scatter layouts are not verified"};
     const auto hash_offset = be32(directory, 16);
     const auto special_slots = be32(directory, 24);
     const auto code_slots = be32(directory, 28);
-    const auto code_limit = be32(directory, 32);
+    const auto code_limit_32 = be32(directory, 32);
+    const auto code_limit_64 = version >= 0x20300 ?
+        ((std::uint64_t(be32(directory, 56)) << 32) | be32(directory, 60)) : 0;
+    const std::uint64_t code_limit = code_limit_64 ? code_limit_64 : code_limit_32;
     const auto hash_size = std::to_integer<std::uint8_t>(directory[36]);
     const auto hash_type = std::to_integer<std::uint8_t>(directory[37]);
     const auto page_exponent = std::to_integer<std::uint8_t>(directory[39]);
@@ -63,12 +72,12 @@ Result<MachOCodeDirectoryHashVerification> verify_macho_code_directory_hashes(
         return Error{ErrorCode::resource_limit, "Mach-O CodeDirectory page exceeds 16 MiB"};
     if (code_limit > limits.max_code_bytes)
         return Error{ErrorCode::resource_limit, "Mach-O CodeDirectory code range exceeds configured byte limit"};
-    const auto expected_slots = code_limit == 0 ? 0 : (std::uint64_t(code_limit) + page_size - 1) / page_size;
+    const auto expected_slots = code_limit / page_size + static_cast<std::uint64_t>(code_limit % page_size != 0);
     if (expected_slots != code_slots || code_slots > limits.max_code_slots)
         return Error{ErrorCode::malformed, "Mach-O CodeDirectory code-slot count does not match its page range"};
     const auto special_bytes = std::uint64_t(special_slots) * hash_size;
     const auto code_hash_bytes = std::uint64_t(code_slots) * hash_size;
-    if (hash_offset < special_bytes || hash_offset - special_bytes < (version >= 0x20100 ? 52u : 44u) ||
+    if (hash_offset < special_bytes || hash_offset - special_bytes < fixed_header_size ||
         hash_offset > directory.size() || code_hash_bytes > directory.size() - hash_offset)
         return Error{ErrorCode::malformed, "Mach-O CodeDirectory hash arrays exceed the blob"};
     const auto &slice = macho.container.slices[macho.selected_slice];

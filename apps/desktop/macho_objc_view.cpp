@@ -1,4 +1,4 @@
-#include "macho_objc_view.hpp"
+﻿#include "macho_objc_view.hpp"
 
 #include "project_view.hpp"
 #include "hexlab/analysis/macho_objc_types.hpp"
@@ -305,6 +305,59 @@ MachOObjCTypeImportPlan macho_objc_type_import_plan(
         }
         return methods;
     };
+    const auto add_instance_property_accessors = [&](const MachOObjCList &properties,
+                                                       const std::string &class_type_name,
+                                                       std::vector<types::Method> &methods,
+                                                       const std::string &owner_name) {
+        const auto class_reference = types::Type::named_reference(class_type_name);
+        const auto self_type = class_reference
+            ? types::Type::pointer(class_reference.value(), scan.pointer_bytes, scan.pointer_bytes)
+            : hexlab::Result<types::TypePtr>(class_reference.error());
+        const auto selector_type = types::Type::pointer(types::Type::void_type(),
+                                                        scan.pointer_bytes, scan.pointer_bytes);
+        const auto accessor = [&](std::string selector, types::TypePtr return_type,
+                                  const types::TypePtr &argument) -> bool {
+            if (selector.empty()) return false;
+            const auto already_declared = std::any_of(methods.begin(), methods.end(),
+                [&](const auto &method) { return method.name == selector; });
+            // Explicit method encodings are authoritative over synthesized
+            // property declarations.
+            if (already_declared) return true;
+            if (methods.size() >= 100000 || !self_type || !selector_type || !return_type)
+                return false;
+            std::vector<types::Parameter> parameters;
+            parameters.push_back({"self", self_type.value()});
+            parameters.push_back({"_cmd", selector_type.value()});
+            if (argument) parameters.push_back({"value", argument});
+            auto signature = types::Type::function(std::move(return_type), std::move(parameters), false);
+            if (!signature) return false;
+            methods.push_back({std::move(selector), signature.value(), types::MemberAccess::unknown,
+                               types::MemberDispatch::unknown, 0, false});
+            return true;
+        };
+        for (const auto &property : properties.properties) {
+            if (!property.name || property.name_status != "resolved" || !property.type ||
+                property.type_status != "parsed" ||
+                (property.attribute_semantics_status != "parsed" &&
+                 property.attribute_semantics_status != "parsed-with-unknown-attributes"))
+                continue;
+            const auto getter = property.custom_getter.value_or(*property.name);
+            if (!accessor(getter, property.type, {})) {
+                plan.skipped.push_back(owner_name + " property " + *property.name +
+                                       " getter could not be represented as a method signature");
+                continue;
+            }
+            if (property.readonly) continue;
+            std::string default_setter = "set" + *property.name;
+            if (default_setter.size() > 3 && default_setter[3] >= 'a' && default_setter[3] <= 'z')
+                default_setter[3] = static_cast<char>(default_setter[3] - 'a' + 'A');
+            default_setter.push_back(':');
+            const auto setter = property.custom_setter.value_or(std::move(default_setter));
+            if (!accessor(setter, types::Type::void_type(), property.type))
+                plan.skipped.push_back(owner_name + " property " + *property.name +
+                                       " setter could not be represented as a method signature");
+        }
+    };
     // Build storage independently of class-list order. The base is embedded as
     // a concrete, method-free aggregate, so later same-name project conflicts
     // cannot silently change the child's inherited storage.
@@ -431,7 +484,10 @@ MachOObjCTypeImportPlan macho_objc_type_import_plan(
         }
         const auto class_type_name = "ObjC2.Class." + objc_type_component(*row.name);
         const auto meta_type_name = "ObjC2.Meta." + objc_type_component(*row.name);
-        const auto instance_methods = make_methods(row.methods, false);
+        auto instance_methods = make_methods(row.methods, false);
+        if (instance_methods)
+            add_instance_property_accessors(row.properties, class_type_name, *instance_methods,
+                                            "Class " + *row.name);
         const auto import_instance_methods_without_layout = [&] {
             auto methods = *instance_methods;
             if (methods.empty()) return;

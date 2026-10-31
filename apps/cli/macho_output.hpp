@@ -480,15 +480,19 @@ inline void macho_description(std::ostream &out, const ImageMetadata &metadata, 
             << " slot=" << macho_hex(row.slot_type) << " magic=" << macho_hex(row.magic)
             << " relative=" << macho_hex(row.raw_offset) << " record=file:" << macho_hex(row.record_file_offset)
             << " size=" << row.size;
-        if (row.code_directory)
+        if (row.code_directory) {
             out << " CodeDirectory-version=" << macho_hex(row.code_directory_version.value_or(0))
                 << " flags=" << macho_hex(row.code_directory_flags.value_or(0))
                 << " code-limit=" << macho_hex(row.code_limit.value_or(0))
                 << " code-slots=" << row.code_slots.value_or(0) << " hash-size=" << unsigned(row.hash_size)
                 << " hash-type=" << unsigned(row.hash_type) << " platform=" << unsigned(row.platform)
                 << " page-size-exp=" << unsigned(row.page_size_exponent);
-        else
+            if (row.code_limit64)
+                out << " code-limit64=" << macho_hex(*row.code_limit64)
+                    << " effective-code-limit=" << macho_hex(*row.code_limit64 ? *row.code_limit64 : row.code_limit.value_or(0));
+        } else {
             out << " kind=uninterpreted";
+        }
         if (image && row.code_directory && code_directory_checks < max_code_directory_checks && code_hash_budget) {
             MachOCodeDirectoryHashLimits limits;
             limits.max_code_bytes = code_hash_budget;

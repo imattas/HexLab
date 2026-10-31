@@ -480,6 +480,7 @@ struct MachOCodeSignatureBlob {
     std::uint32_t signature = 0, index = 0, slot_type = 0, magic = 0, size = 0;
     std::uint64_t raw_offset = 0, record_file_offset = 0;
     std::optional<std::uint32_t> code_directory_version, code_directory_flags, code_limit, code_slots;
+    std::optional<std::uint64_t> code_limit64;
     std::uint8_t hash_size = 0, hash_type = 0, platform = 0, page_size_exponent = 0;
     bool code_directory = false;
     bool operator==(const MachOCodeSignatureBlob &) const = default;

@@ -62,10 +62,13 @@ arms remain supported. Each arm path is capped at 64 blocks, phi-free (including
 memory-partition phis), and every block must have exactly its preceding cleanup
 block as its CFG predecessor. The loop exit must enter the cleanup chain
 uniquely; the conditional must have exactly the two validated arm edges, and the
-arm paths cannot share blocks. The formatter emits the cleanup chain once after
-the `do ... while`, then emits the conditional and each return path. Additional
-cleanup branches, shared return blocks, cleanup joins, side entries, and
-non-return leaves retain the existing fallback.
+arm paths cannot share blocks, except that they may converge on one terminal
+return block. That shared block must have exactly the two arm tails as
+predecessors and no register or memory phis; it is duplicated into each guarded
+arm. The formatter emits the cleanup chain once after the `do ... while`, then
+emits the conditional and each return path. Additional cleanup branches, other
+shared blocks, cleanup joins, side entries, and non-return leaves retain the
+existing fallback.
 
 Pre-tested loop-header SSA phis are lowered from the unique preheader and every
 recognized backedge. Initial copies execute before the loop; recurrent copies

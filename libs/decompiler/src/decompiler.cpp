@@ -12029,7 +12029,8 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                                cursor->phis.empty() && !cursor->memory_phi &&
                                cursor->memory_partition_phis.empty() &&
                                has_only_simple_statements(*cursor) &&
-                               predecessors[cursor->id.value] == std::set<std::uint64_t>{predecessor}) {
+                               (predecessors[cursor->id.value] == std::set<std::uint64_t>{predecessor} ||
+                                has_only_terminal_return(*cursor))) {
                             path.push_back(cursor);
                             if (has_only_terminal_return(*cursor)) return path;
                             if (contains_return(*cursor) || cursor->successors.size() != 1 ||
@@ -12046,11 +12047,30 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                     auto true_path = trace_cleanup_return(*candidate->true_target);
                     auto false_path = trace_cleanup_return(*candidate->false_target);
                     std::set<std::uint64_t> arm_ids;
-                    const auto disjoint_path = [&](const auto &path) {
-                        for (const auto *block : path)
+                    const auto disjoint_path = [&](const auto &path, const auto *shared_return) {
+                        for (std::size_t i = 0; i < path.size(); ++i) {
+                            const auto *block = path[i];
+                            if (block == shared_return && i + 1 == path.size()) continue;
                             if (!arm_ids.insert(block->id.value).second) return false;
+                        }
                         return true;
                     };
+                    const auto *shared_return = !true_path.empty() && !false_path.empty() &&
+                        true_path.back() == false_path.back() && has_only_terminal_return(*true_path.back())
+                        ? true_path.back() : nullptr;
+                    const auto path_tail = [&](const auto &path) {
+                        return path.size() > 1 ? path[path.size() - 2]->id.value : exit_cursor->id.value;
+                    };
+                    const bool shared_return_predecessors_valid = !shared_return ||
+                        predecessors[shared_return->id.value] ==
+                            std::set<std::uint64_t>{path_tail(true_path), path_tail(false_path)};
+                    const bool terminal_predecessors_valid =
+                        (!true_path.empty() && (true_path.back() == shared_return ||
+                            predecessors[true_path.back()->id.value] ==
+                                std::set<std::uint64_t>{path_tail(true_path)})) &&
+                        (!false_path.empty() && (false_path.back() == shared_return ||
+                            predecessors[false_path.back()->id.value] ==
+                                std::set<std::uint64_t>{path_tail(false_path)}));
                     const bool exact_edges = exit_cursor->successors.size() == 2 &&
                         std::count_if(exit_cursor->successors.begin(), exit_cursor->successors.end(), [&](const auto &edge) {
                             return edge_targets(edge, *candidate->true_target);
@@ -12059,7 +12079,9 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                             return edge_targets(edge, *candidate->false_target);
                         }) == 1;
                     if (!true_path.empty() && !false_path.empty() && exact_edges &&
-                        disjoint_path(true_path) && disjoint_path(false_path)) {
+                        shared_return_predecessors_valid && terminal_predecessors_valid &&
+                        disjoint_path(true_path, shared_return) &&
+                        disjoint_path(false_path, shared_return)) {
                         cleanup_branch = exit_cursor;
                         cleanup_condition = candidate;
                         cleanup_true_path = std::move(true_path);
