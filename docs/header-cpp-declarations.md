@@ -28,10 +28,14 @@ commas in a default argument are outside the supported skip grammar.
 The non-layout standard attributes `[[maybe_unused]]`, `[[nodiscard]]`, and
 `[[deprecated]]` are accepted and discarded; `nodiscard` and `deprecated` may
 carry one string-literal reason/message. Attribute metadata is not retained.
-In instantiated class templates, method prototypes accept a direct type-pack
-parameter expansion (`Ts... values`) capped at 32 concrete parameters; empty
-packs contribute none. Compound pack patterns and non-type/template-name packs
-in parameter lists remain unsupported.
+In instantiated class templates, method prototypes accept a bound type-pack
+parameter expansion (`Ts... values`, `const Ts*... values`, or
+`Wrapper<Ts>... values`). Signatures containing an expansion are capped at 32
+concrete parameters, including ordinary parameters; empty type packs contribute
+none. Expanded names use `values__packN` in source order. Integral/template-name
+packs, multiple packs in one pattern, nested ellipses, defaults on expanded
+parameters, and reference/parenthesized/array pack declarators remain unsupported.
+See [compound template pack expansion](header-compound-pack-expansions.md).
 Class-template bodies also accept the direct type-pack data-member form
 `Ts... members;`, expanded into complete object fields named
 `members__packN` (zero-based), with at most 32 fields. Empty packs add no

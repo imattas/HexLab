@@ -114,8 +114,14 @@ of the same pack in a pattern uses the same element for that expansion.
 Empty packs contribute no arguments. See
 [compound pack expansion](header-compound-pack-expansions.md) for examples,
 destination validation, and limits. Multiple distinct packs in one pattern,
-nested ellipses inside a pattern, member declarations, method parameter
-expansions, and base packs remain unsupported. Fold expressions and
+nested ellipses inside a pattern, compound data-member declarations, and base
+packs remain unsupported. Function and method prototype parameters support
+`type-pattern... name` over one bound type pack, including `const Types*...`
+and `Box<Types>...`, with synthetic `name__packN` names in source order.
+Signatures containing parameter expansion are capped at 32 concrete parameters;
+empty type packs contribute none. Integral/template-name packs, defaults on
+expanded parameters, references, and parenthesized/array pack declarators are
+unsupported. Fold expressions and
 general `sizeof` expressions remain unsupported; only `sizeof...(Pack)` is
 recognized as a bounded integer expression.
 A trailing pack can be declared without using it in the body. Explicit and

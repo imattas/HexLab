@@ -43,15 +43,23 @@ attribute metadata. Other standard attributes, attribute namespaces such as
 `[[gnu::...]]`, and arguments other than the optional single string literal
 for `nodiscard` or `deprecated` are rejected explicitly.
 
-During class-template instantiation, a function prototype parameter may expand
-one bound type pack using the direct spelling `Ts... values`. Each type in the
-pack becomes one parameter in the imported function signature, with a
-deterministic synthetic parameter name. Empty packs produce no parameters;
-expansions are capped at 32 parameters. This supports direct type packs only:
-compound patterns, integral/template-name packs, default arguments on an
-expanded pack, and parameter-pack expansions in function definitions are not
-supported. The shared type model retains the resulting signature, not pack
-source metadata.
+During template instantiation, a function or method prototype parameter may
+expand one bound type pack with `Ts... values`, `const Ts*... values`, or
+`Wrapper<Ts>... values`. Each element is substituted into the type pattern and
+parsed using the existing type and function rules, in source pack order.
+Repeated occurrences of the same pack use the same element. Expanded parameter
+names are `values__pack0`, `values__pack1`, and so on. Empty type packs produce
+no parameters. Signatures containing an expansion are capped at 32 concrete
+parameters, including ordinary parameters before and after expansions.
+Integral/template-name packs (including empty ones), multiple distinct packs
+in a pattern, nested ellipses, default arguments on an expanded pack,
+reference/parenthesized/array pack declarators, suffixes after the pack name,
+and parameter-pack expansions in function definitions are unsupported.
+Supported aliases can still supply array/callback types, with ordinary array
+parameter adjustment and function-type checks. See
+[compound template pack expansion](header-compound-pack-expansions.md) for
+examples and bounds. The shared type model retains the resulting signature,
+not pack source metadata.
 
 Class-template bodies also accept the direct data-member pack declaration
 `Ts... members;`. Each bound type creates one laid-out data member, with names
@@ -195,7 +203,7 @@ retained in the shared type model, but does not affect imported offsets or size.
 Template-template parameters are supported in class-template specializations
 when they are matched as a direct template name or parameter. Parameter packs
 cannot be used in specializations; multiple distinct packs in one argument pattern,
-nested ellipses, member/parameter pack expansions,
+nested ellipses, compound data-member pack expansions,
 function-template
 specializations, explicit alias-template specializations, forward-declared
 templates, and nested class-template definitions are unsupported. Type

@@ -1,4 +1,4 @@
-# Compound template-argument pack expansion
+# Compound template pack expansion
 
 The bounded header importer can expand a compound template argument containing
 one already bound type, integral, or template-name parameter pack. It substitutes
@@ -94,10 +94,49 @@ input, tokens, and fixed array extents retain their existing limits. A compound
 pattern is instantiated only when its enclosing declaration is referenced;
 an empty pack does not parse hypothetical element types.
 
+Function and method prototype parameter lists can also expand a single bound
+**type** pack inside a type pattern, including pointers and nested templates:
+
+```cpp
+template <typename... Types>
+struct Visitor {
+    void pointers(unsigned first, const Types*... values);
+    void boxes(Box<Types>... values, unsigned last);
+    void pairs(Pair<Types, Types>... values);
+};
+using Visitors = Visitor<int, short>;
+
+// The same parameter expansion works in an instantiated function-pointer alias.
+template <typename... Types>
+using BoxCallback = void (*)(Box<Types>... values);
+using Callback = BoxCallback<int, short>;
+```
+
+`Visitors::boxes` has `Box<int>` and `Box<short>` parameters, followed by the
+ordinary `unsigned` parameter. Expanded names are `values__pack0`,
+`values__pack1`, and so on. Repeated occurrences of the type pack in one
+pattern use the same element, as in `pairs`. The importer uses its ordinary
+type parser, target ABI options, function calling-convention rules, array-to-
+pointer parameter adjustment, and function-type validation. It records concrete
+signatures without retaining pack source metadata or adding object members.
+
+The accepted parameter spelling is `type-pattern... name`; the name is required.
+Direct `Types... name` remains supported. A signature containing an expansion is
+capped at 32 total concrete parameters, including ordinary parameters before
+and after every expansion. Empty type packs contribute no parameters and do not
+parse hypothetical element types. Pack kind is checked even for empty packs:
+integral and template-name packs are unsupported in parameter expansions.
+Default arguments, references, parenthesized/array pack declarators, suffixes
+after the pack name, nested ellipses, and function definitions remain unsupported.
+A nested supported alias may still supply an array or callback type, subject to
+the ordinary parameter rules. Source/token/input limits and configured parser
+and template nesting bounds remain in force; substitution binds types rather
+than generating additional source text.
+
 Each pattern must reference exactly one distinct bound pack. Repeated use of
 that same pack is supported; zipping two different packs, nested ellipses in
-one pattern, base/member declaration expansions, function/method parameter
-pack expansions, specialization pack deduction, and general C++ template
+one pattern, compound base/data-member declaration expansions, specialization
+pack deduction outside the documented subset, and general C++ template
 deduction remain unsupported. Reference declarators and other type syntax
 outside the ordinary importer subset do not become supported merely by
 appearing in an expansion. This feature keeps the overall C/C++ importer
