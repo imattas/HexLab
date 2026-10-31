@@ -40,12 +40,13 @@
 #include <deque>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <thread>
 #include <atomic>
 
 namespace hexlab::desktop {
 namespace {
-enum : int { browse_executable_id = wxID_HIGHEST + 220, browse_working_directory_id, launch_id, attach_id, detach_id, terminate_id, wait_id, continue_id, step_id, pass_id,
+enum : int { browse_executable_id = wxID_HIGHEST + 220, browse_working_directory_id, launch_id, attach_id, detach_id, terminate_id, wait_id, continue_id, step_id, source_step_out_id, pass_id,
             add_bp_id, remove_bp_id, apply_project_bp_id, save_breakpoint_rule_id, load_breakpoint_rule_id, poll_id, read_memory_id, remote_connect_id, continue_thread_id,
             thread_context_continue_id, thread_context_step_id, thread_context_stop_id, thread_context_interrupt_id,
             continue_stopped_peers_id,
@@ -696,6 +697,7 @@ DebuggerView::DebuggerView(wxWindow *parent, std::unique_ptr<debugger::Backend> 
     actions->Add(make_button(this, "debug-continue", "Continue", continue_id), 0, wxRIGHT, FromDIP(4));
     actions->Add(make_button(this, "debug-continue-thread", "Continue selected thread", continue_thread_id), 0, wxRIGHT, FromDIP(4));
     actions->Add(make_button(this, "debug-step", "Step", step_id), 0, wxRIGHT, FromDIP(4));
+    actions->Add(make_button(this, "debug-step-out", "Step out", source_step_out_id), 0, wxRIGHT, FromDIP(4));
     actions->Add(make_button(this, "debug-pass-event", "Pass Exception", pass_id), 0);
     actions->Add(make_button(this, "debug-show-thread-pc", "Show thread PC", navigate_pc_id), 0, wxLEFT, FromDIP(4));
     actions->Add(make_button(this, "debug-show-frame-pc", "Show frame PC", navigate_frame_id), 0, wxLEFT, FromDIP(4));
@@ -1358,6 +1360,7 @@ DebuggerView::DebuggerView(wxWindow *parent, std::unique_ptr<debugger::Backend> 
     Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { continue_selected_thread(); }, continue_thread_id);
     Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { continue_stopped_peers(); }, continue_stopped_peers_id);
     Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { step_event(); }, step_id);
+    Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { step_out_event(); }, source_step_out_id);
     Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { continue_event(debugger::ContinueStatus::not_handled); }, pass_id);
     Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { add_breakpoint(); }, add_bp_id);
     breakpoint_address_->Bind(wxEVT_TEXT_ENTER, [this](wxCommandEvent &) { add_breakpoint(); });
@@ -1856,6 +1859,7 @@ void DebuggerView::launch() {
     }
     if (target.executable.empty()) { report("Choose an executable to launch."); return; }
     save_remote_configuration();
+    if (!cancel_source_step_out()) return;
     auto result = [&] { std::lock_guard lock(inspection_state_->backend_mutex); return session_->launch(target); }();
     if (!result) { report(wxString::FromUTF8(result.error().message)); return; }
     remote_session_active_ = false;
@@ -1882,6 +1886,7 @@ void DebuggerView::attach() {
     if (id == 0) {
         report("Enter a valid process ID (decimal or 0x-prefixed hexadecimal)."); return;
     }
+    if (!cancel_source_step_out()) return;
     auto result = [&] {
         std::lock_guard lock(inspection_state_->backend_mutex);
         return remote_session_active_ ? session_->attach_remote_process(id) : session_->attach(id);
@@ -2033,6 +2038,7 @@ void DebuggerView::detach_remote_process() {
 }
 
 void DebuggerView::connect_remote() {
+    if (!cancel_source_step_out()) return;
     if (remote_connecting_) return;
     const auto host = narrow(remote_host_->GetValue());
     std::uint64_t port = 0;
@@ -2148,6 +2154,7 @@ void DebuggerView::finish_remote_connect(std::uint64_t request,
 
 void DebuggerView::detach() {
     poll_timer_.Stop();
+    if (!cancel_source_step_out()) return;
     auto result = [&] { std::lock_guard lock(inspection_state_->backend_mutex); return session_->detach(); }();
     if (!result) { report(wxString::FromUTF8(result.error().message)); return; }
     remote_session_active_ = false;
@@ -2265,6 +2272,42 @@ void DebuggerView::poll_event() {
             return;
         }
     }
+    std::optional<std::string> source_step_out_status;
+    if (source_step_out_target_) {
+        const auto target = *source_step_out_target_;
+        const bool breakpoint_hit = received.process == target.process && received.thread == target.thread &&
+            received.address == target.runtime_address &&
+            std::find(received.breakpoint_ids.begin(), received.breakpoint_ids.end(), target.breakpoint) !=
+                received.breakpoint_ids.end();
+        bool same_process = false;
+        std::optional<Error> cleanup_error;
+        {
+            std::lock_guard lock(inspection_state_->backend_mutex);
+            const auto process = session_->process();
+            same_process = process && process->id == target.process;
+            if (same_process && received.kind != debugger::EventKind::process_exited) {
+                const auto removed = session_->remove_breakpoint(target.breakpoint);
+                if (!removed) cleanup_error = removed.error();
+            }
+        }
+        if (!cleanup_error || !same_process || received.kind == debugger::EventKind::process_exited)
+            source_step_out_target_.reset();
+        if (breakpoint_hit) {
+            source_step_out_status = "Source step-out reached " + target.source_location + ".";
+        } else if (!same_process || received.kind == debugger::EventKind::process_exited) {
+            source_step_out_status = "Source step-out canceled because its process exited or changed.";
+        } else if (received.thread != target.thread) {
+            source_step_out_status = "Source step-out canceled by a stop in a different thread.";
+        } else {
+            source_step_out_status = "Source step-out canceled by an intervening target stop.";
+        }
+        if (cleanup_error) *source_step_out_status += " Temporary breakpoint cleanup failed: " + cleanup_error->message;
+        if (same_process && received.kind != debugger::EventKind::process_exited) refresh_breakpoints();
+        const auto current_document_snapshot = document_ ? document_() : nullptr;
+        if (current_document_snapshot && (current_document_snapshot->id != target.document ||
+            current_document_snapshot->revision != target.document_revision))
+            *source_step_out_status += " The source document changed while the target was running.";
+    }
     inspection_state_->stop_generation.fetch_add(1, std::memory_order_acq_rel);
     invalidate_frames();
     ++signal_info_request_;
@@ -2319,6 +2362,7 @@ void DebuggerView::poll_event() {
         }
     }
     else poll_timer_.Stop();
+    if (source_step_out_status) report(wxString::FromUTF8(*source_step_out_status));
 }
 
 void DebuggerView::continue_event(debugger::ContinueStatus status) {
@@ -2541,6 +2585,161 @@ void DebuggerView::step_event() {
     refresh_state(); refresh_threads(selected_register_thread_);
     poll_timer_.Start(100);
     report("Stepped one instruction; waiting for the next target event.");
+}
+
+void DebuggerView::step_out_event() {
+    if (source_step_out_target_) {
+        report("A source step-out is already waiting for its caller location or another stop event.");
+        return;
+    }
+    if (!pending_event_ || !pending_event_thread_ || session_->state() != debugger::SessionState::stopped) {
+        report("Source step-out requires a stopped event with an identifiable owner thread.");
+        return;
+    }
+    if (selected_register_thread_ != pending_event_thread_) {
+        report("Select the thread that owns the pending event before stepping out.");
+        return;
+    }
+    if (!frames_stop_ || frames_stop_ != pending_event_ || locals_stack_frames_.size() < 2 ||
+        !frames_mapping_ || !current_document(inspection_document_)) {
+        refresh_locals();
+        report("Source step-out needs current caller frames; they are being refreshed. Try again when Frame 1 appears.");
+        return;
+    }
+
+    const auto document = document_ ? document_() : nullptr;
+    if (!document || !current_document(document) || !document->project || !document->project->loaded ||
+        !document->project->loaded->image) {
+        report("Source step-out requires the same open project image used to inspect the current stop.");
+        return;
+    }
+    const auto &loaded = *document->project->loaded;
+    const auto &image = *loaded.image;
+    auto target = [&] {
+        std::lock_guard lock(inspection_state_->backend_mutex);
+        return std::tuple{session_->modules(), session_->process(), session_->breakpoints()};
+    }();
+    auto &modules = std::get<0>(target);
+    const auto &process = std::get<1>(target);
+    const auto &existing_breakpoints = std::get<2>(target);
+    if (!process || process->id == 0 || !modules) {
+        report("Source step-out cannot refresh the active process and module identity.");
+        return;
+    }
+    if (process->architecture != Architecture::x86 && process->architecture != Architecture::x86_64 &&
+        process->architecture != Architecture::arm64) {
+        report("Source step-out currently requires an x86, x64, or AArch64 target with recovered caller frames.");
+        return;
+    }
+    std::string mapping_reason;
+    const auto mapping = debugger_image_mapping(*document, modules.value(), process->architecture, mapping_reason);
+    if (!mapping || mapping != frames_mapping_) {
+        if (mapping)
+            report("Source step-out stopped because the loaded-module mapping changed; refresh caller frames.");
+        else
+            report(wxString::FromUTF8(mapping_reason));
+        invalidate_frames();
+        return;
+    }
+    const auto &current_frame = locals_stack_frames_[0];
+    const auto &caller_frame = locals_stack_frames_[1];
+    const auto current_address = mapping->to_image(image, current_frame.runtime_pc);
+    const auto caller_address = mapping->to_image(image, caller_frame.runtime_pc);
+    if (!current_address || !caller_address || caller_frame.runtime_pc == 0) {
+        report("Source step-out cannot map both the stopped frame and caller return address into the same loaded image.");
+        return;
+    }
+    const auto *caller_segment = image.segment_at(*caller_address);
+    if (!caller_segment || !caller_segment->executable) {
+        report("Source step-out caller return address is outside initialized executable image data.");
+        return;
+    }
+    const auto current_symbol = symbolize_debugger_address(*document->project, image, current_frame.runtime_pc,
+        mapping->runtime_base, mapping->size);
+    const auto caller_symbol = symbolize_debugger_address(*document->project, image, caller_frame.runtime_pc,
+        mapping->runtime_base, mapping->size);
+    if (!current_symbol || !current_symbol->source_location ||
+        !caller_symbol || !caller_symbol->source_location) {
+        report("Source step-out needs unambiguous source-line records for both the current frame and caller return address.");
+        return;
+    }
+    const auto runtime_return = mapping->to_runtime(image, *caller_address);
+    if (!runtime_return || *runtime_return != caller_frame.runtime_pc) {
+        report("Source step-out caller address does not round-trip through the current module mapping.");
+        return;
+    }
+    if (std::any_of(existing_breakpoints.begin(), existing_breakpoints.end(), [&](const auto &breakpoint) {
+            return breakpoint.address == caller_frame.runtime_pc;
+        })) {
+        report("Source step-out cannot reuse a user breakpoint at the caller return address.");
+        return;
+    }
+
+    auto added = [&] {
+        std::lock_guard lock(inspection_state_->backend_mutex);
+        return session_->add_breakpoint(caller_frame.runtime_pc, debugger::BreakpointKind::software);
+    }();
+    if (!added) {
+        report("Could not arm source step-out at the caller return address: " + wxString::FromUTF8(added.error().message));
+        return;
+    }
+    auto one_shot = [&] {
+        std::lock_guard lock(inspection_state_->backend_mutex);
+        return session_->set_breakpoint_one_shot(added.value().id, true);
+    }();
+    if (!one_shot) {
+        std::lock_guard lock(inspection_state_->backend_mutex);
+        (void)session_->remove_breakpoint(added.value().id);
+        report("Could not configure the caller breakpoint as one-shot: " + wxString::FromUTF8(one_shot.error().message));
+        return;
+    }
+    auto continued = [&] {
+        std::lock_guard lock(inspection_state_->backend_mutex);
+        return session_->continue_execution(*pending_event_, debugger::ContinueStatus::handled);
+    }();
+    if (!continued) {
+        std::lock_guard lock(inspection_state_->backend_mutex);
+        (void)session_->remove_breakpoint(added.value().id);
+        report("Could not continue toward the caller return address: " + wxString::FromUTF8(continued.error().message));
+        return;
+    }
+
+    source_step_out_target_ = SourceStepOutTarget{added.value().id, process->id, *pending_event_thread_,
+        document->id, document->revision, caller_frame.runtime_pc, *caller_symbol->source_location};
+    pending_event_.reset();
+    pending_event_thread_.reset();
+    invalidate_frames();
+    ++register_request_;
+    refresh_state();
+    refresh_breakpoints();
+    refresh_threads(selected_register_thread_);
+    poll_timer_.Start(100);
+    report("Source step-out armed for " + wxString::FromUTF8(*caller_symbol->source_location) +
+        "; waiting for the caller return address. Other stop events cancel it.");
+}
+
+bool DebuggerView::cancel_source_step_out() {
+    if (!source_step_out_target_) return true;
+    const auto target = *source_step_out_target_;
+    std::optional<Error> cleanup_error;
+    {
+        std::lock_guard lock(inspection_state_->backend_mutex);
+        const auto process = session_->process();
+        const auto state = session_->state();
+        if (process && process->id == target.process &&
+            (state == debugger::SessionState::running || state == debugger::SessionState::stopped)) {
+            const auto removed = session_->remove_breakpoint(target.breakpoint);
+            if (!removed) cleanup_error = removed.error();
+        }
+    }
+    if (cleanup_error) {
+        report("Could not remove the temporary source step-out breakpoint: " +
+            wxString::FromUTF8(cleanup_error->message));
+        return false;
+    }
+    source_step_out_target_.reset();
+    refresh_breakpoints();
+    return true;
 }
 
 void DebuggerView::refresh_breakpoints() {
@@ -2880,11 +3079,13 @@ void DebuggerView::remove_breakpoint() {
     }
     const auto source_row = visible_breakpoint_rows_[static_cast<std::size_t>(row)];
     const auto breakpoint = breakpoints_[source_row];
+    const bool source_step_out = source_step_out_target_ && source_step_out_target_->breakpoint == breakpoint.id;
     auto result = [&] { std::lock_guard lock(inspection_state_->backend_mutex); return session_->remove_breakpoint(breakpoint.id); }();
     if (!result) { report(wxString::FromUTF8(result.error().message)); return; }
+    if (source_step_out) source_step_out_target_.reset();
     breakpoints_.erase(breakpoints_.begin() + static_cast<std::ptrdiff_t>(source_row));
     render_breakpoints();
-    if (submit_ && document_) {
+    if (!source_step_out && submit_ && document_) {
         auto current=document_();
         if(current && current->project && current->project->loaded && current->project->loaded->image && current->project->state) {
             auto target=[&]{std::lock_guard lock(inspection_state_->backend_mutex);return std::pair{session_->modules(),session_->process()};}();
@@ -2903,6 +3104,11 @@ void DebuggerView::toggle_breakpoint_enabled() {
         report("Select a breakpoint to enable or disable."); return;
     }
     auto breakpoint = breakpoints_[visible_breakpoint_rows_[static_cast<std::size_t>(row)]];
+    const bool source_step_out = source_step_out_target_ && source_step_out_target_->breakpoint == breakpoint.id;
+    if (source_step_out) {
+        report("Remove the temporary source step-out breakpoint to cancel it; its one-shot behavior cannot be changed.");
+        return;
+    }
     const bool enabled = !breakpoint.enabled;
     auto result = [&] {
         std::lock_guard lock(inspection_state_->backend_mutex);
@@ -6236,6 +6442,7 @@ void DebuggerView::move_watch_expression(int direction) {
 
 void DebuggerView::clear_inspection() {
     invalidate_frames();
+    cancel_source_step_out();
     thread_schedule_snapshot_event_.reset();
     inspection_document_.reset();
     ++session_generation_;
