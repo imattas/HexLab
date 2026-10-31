@@ -133,6 +133,13 @@ For MIPS32 O32 functions, reads from tracked entry-SP-relative slots at offset
 argument home words. Reads in the home area and write-only slots are not
 classified as overflow arguments. The analysis reports observed slots and
 does not infer argument types, paired 64-bit values, or the complete signature.
+MIPS32 mode also tracks exact 32-bit stack-derived temporary bases formed with
+`ADDIU`/`ADDI` and zero-register `ADDU`/`ADD`/`OR` copy forms. Direct,
+nonindexed accesses through those bases reuse entry-SP slot coordinates,
+including O32 argument classification. A temporary relation is discarded
+when its register is overwritten or across calls, and CFG joins retain it only
+when every incoming path has the same known offset. Unknown arithmetic,
+indexed accesses, and dynamic `$sp` changes remain unresolved.
 
 For ELF64 MIPS N64 functions, reads from tracked entry-SP-relative slots at
 offset zero or above are tagged as incoming overflow arguments after the eight
@@ -146,6 +153,8 @@ Derived-cache version **88** and function-engine fingerprint suffixes
 `aapcs32-stack-argument-slots-v1/mips-o32-stack-argument-slots-v1/mips-n64-stack-argument-slots-v1` invalidate older derived results so frames
 and instruction-site provenance are recomputed. The stack record layout is
 unchanged; this invalidation covers newly recovered semantics.
+The function-engine fingerprint suffix `mips32-derived-stack-aliases-v1`
+invalidates function-derived records after MIPS32 stack-alias recovery changes.
 
 Project analysis derives and retains one `StackFrameAnalysis` per recovered
 function in the source-keyed derived cache. The cache format validates these
