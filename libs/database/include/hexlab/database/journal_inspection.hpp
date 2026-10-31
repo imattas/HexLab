@@ -19,11 +19,12 @@ struct JournalInspection {
     std::uint64_t file_bytes = 0, inspected_bytes = 0, records_claimed = 0;
     std::uint64_t complete_records = 0, valid_records = 0, checksum_failures = 0;
     std::uint64_t trailing_bytes = 0;
+    std::uint32_t segments_seen = 0, segments_complete = 0;
     std::uint32_t initial_database_pages = 0, sector_size = 0, page_size = 0;
     bool header_valid = false, record_count_to_end = false, scan_complete = false;
     std::string stop_reason, diagnostic;
 };
-// Diagnostic only: reads one rollback-journal segment without opening SQLite,
+// Diagnostic only: reads bounded rollback-journal segments without opening SQLite,
 // replaying pages, associating a base database, or publishing a project.
 HEXLAB_DATABASE_EXPORT Result<JournalInspection> inspect_rollback_journal(
     const std::filesystem::path&, JournalInspectionLimits = {}, std::stop_token = {});
