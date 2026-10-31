@@ -1545,7 +1545,9 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
     }
     const bool x86_opmask_arithmetic = instruction.opcode >= Opcode::kaddb &&
                                        instruction.opcode <= Opcode::kunpckdq;
-    if (x86_context && x86_opmask_arithmetic && instruction.operands.size() == 3 && operands.size() == 3 &&
+    if (x86_context && instruction.context.architecture == Architecture::x86_64 &&
+        instruction.context.mode == ExecutionMode::x86_64 && instruction.flow == FlowKind::fallthrough &&
+        x86_opmask_arithmetic && instruction.operands.size() == 3 && operands.size() == 3 &&
         instruction.access.size() == 3 && instruction.access[0] == OperandAccess::write &&
         instruction.access[1] == OperandAccess::read && instruction.access[2] == OperandAccess::read &&
         !instruction.x86_evex && !instruction.x86_opmask && !instruction.x86_opmask_zeroing &&
