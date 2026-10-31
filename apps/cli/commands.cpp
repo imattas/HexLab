@@ -23,6 +23,7 @@
 #include "hexlab/workspace/project_actor.hpp"
 #include "hexlab/database/project_state.hpp"
 #include "hexlab/loaders/ar.hpp"
+#include "hexlab/loaders/xcoff32.hpp"
 #include "hexlab/loaders/xcoff64.hpp"
 #include "hexlab/loaders/jar.hpp"
 #include "hexlab/loaders/jvm_module_path.hpp"
@@ -354,7 +355,7 @@ void usage(std::ostream &out) {
            "  project --help                            Persistent projects and editing\n"
            "  plugins scan|dependencies <dir> [options] Inspect native plugins\n"
            "  processors [--json]                      List decoder variants\n"
-           "  archive, jar, dex, jvm, macho, firmware   Format-specific commands\n\n"
+           "  archive, jar, dex, jvm, macho, firmware, xcoff32 Format-specific commands\n\n"
            "Hex dump options:\n"
            "  --offset <bytes>   Start at this file offset (default 0)\n"
            "  --length <bytes>   Number of bytes to print (default: to end of file)\n"
@@ -2976,6 +2977,57 @@ int hexdump_command(std::span<const std::wstring_view> args, std::ostream &out, 
         return 1;
     }
 }
+
+int xcoff32_command(std::span<const std::wstring_view> args, std::ostream &out, std::ostream &err) {
+    using project_detail::Failure;
+    using project_detail::take;
+    if (args.size() == 2 && args[1] == L"--help") {
+        out << "Usage: hexlab_cli xcoff32 inspect <object>\n"
+               "Show the bounded structural inventory of a big-endian XCOFF32 relocatable object.\n"
+               "Relocation and line-number rows are reported by extent only; they are not decoded or applied.\n";
+        return 0;
+    }
+    if (args.size() != 2 || args[0] != L"inspect") {
+        err << "Usage: hexlab_cli xcoff32 inspect <object>\n";
+        return 2;
+    }
+    try {
+        auto storage = take(FileStorage::open(path_from_wide(args[1])));
+        const auto object = take(inspect_xcoff32_object(*storage));
+        out << "Format: XCOFF32 relocatable\n"
+            << "Timestamp: " << object.timestamp << "\n"
+            << "Flags: 0x" << std::hex << object.file_flags << std::dec << "\n"
+            << "Sections: " << object.sections.size() << "\n"
+            << "Symbol slots: " << object.symbol_count << "\n"
+            << "Symbol table offset: 0x" << std::hex << object.symbol_table_file_offset << std::dec << "\n"
+            << "String table bytes: " << object.string_table_size << '\n';
+        for (const auto &section : object.sections) {
+            out << "Section " << section.index << ": " << safe_text(section.name)
+                << " address=0x" << std::hex << section.virtual_address
+                << " size=0x" << section.size
+                << " data=0x" << section.data_file_offset
+                << " reloc=0x" << section.relocation_file_offset
+                << " lines=0x" << section.line_number_file_offset
+                << std::dec << " relocations=" << section.relocation_count
+                << " line-rows=" << section.line_number_count
+                << " flags=0x" << std::hex << section.flags << std::dec << '\n';
+        }
+        for (const auto &symbol : object.symbols) {
+            out << "Symbol slot=" << symbol.index << " name=" << safe_text(symbol.name)
+                << " value=0x" << std::hex << symbol.value << std::dec
+                << " section=" << symbol.section_number
+                << " type=0x" << std::hex << symbol.type << std::dec
+                << " storage-class=" << static_cast<unsigned>(symbol.storage_class)
+                << " auxiliary-slots=" << static_cast<unsigned>(symbol.auxiliary_count) << '\n';
+        }
+        out << "Note: relocation and line-number rows are structurally bounded but uninterpreted; linking is unsupported.\n";
+        return 0;
+    } catch (const Failure &failure) {
+        err << "XCOFF32: " << failure.error.message << '\n';
+        return failure.error.code == ErrorCode::invalid_argument ? 2 : 1;
+    } catch (const ArgumentError &error) { err << error.message << '\n'; return 2; }
+      catch (const std::exception &error) { err << "XCOFF32: " << error.what() << '\n'; return 1; }
+}
 std::string_view string_encoding_label(StringEncoding encoding) {
     switch (encoding) {
     case StringEncoding::ascii: return "ASCII";
@@ -3546,6 +3598,8 @@ int run_cli(std::span<const std::wstring_view> arguments, std::ostream &out, std
         return macho_chained_targets_command(arguments.subspan(1), out, err);
     if (arguments[0] == L"firmware")
         return firmware_command(arguments.subspan(1), out, err);
+    if (arguments[0] == L"xcoff32")
+        return xcoff32_command(arguments.subspan(1), out, err);
     if (arguments[0] == L"compare")
         return run_compare_cli(arguments.subspan(1), out, err);
     if (arguments[0] == L"hexdump")
