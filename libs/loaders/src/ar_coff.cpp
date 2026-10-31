@@ -7,6 +7,8 @@
 namespace hexlab {
 Result<ArMemberSymbols> summarize_xcoff64_ar_member(const ByteStorage &, std::size_t,
                                                     std::stop_token, ArObjectLimits);
+Result<ArMemberSymbols> summarize_xcoff32_ar_member(const ByteStorage &, std::size_t,
+                                                    std::stop_token, ArObjectLimits);
 namespace {
 struct Failure { Error error; };
 void require(bool ok, const char *message, ErrorCode code = ErrorCode::malformed) {
@@ -125,7 +127,7 @@ Result<ArMemberSymbols> summarize_coff_ar_member(const ByteStorage &storage, std
         if (header[0] == std::byte{0x01} && header[1] == std::byte{0xf7})
             return summarize_xcoff64_ar_member(storage, member_index, stop, limits);
         if (header[0] == std::byte{0x01} && header[1] == std::byte{0xdf})
-            return Error{ErrorCode::unsupported, "XCOFF32 archive symbol summaries are not supported"};
+            return summarize_xcoff32_ar_member(storage, member_index, stop, limits);
         const bool anon = le(header, 0, 2) == 0 && le(header, 2, 2) == 0xffff;
         if (anon && header.size() >= 6 && le(header, 4, 2) >= 2) {
             require(storage.size() >= 56, "Truncated bigobj COFF header");

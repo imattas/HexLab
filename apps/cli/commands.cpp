@@ -353,7 +353,7 @@ void usage(std::ostream &out) {
            "       hexlab_cli processors [--json]  (supported decoder variants)\n\n"
            "       hexlab_cli archive list <archive> [--thin-root <directory>]\n"
            "       hexlab_cli archive index-audit <archive> [--thin-root <directory>]\n"
-           "       hexlab_cli archive link-select <archive> --root-object <ET_REL|XCOFF64>\n"
+           "       hexlab_cli archive link-select <archive> --root-object <ET_REL|XCOFF32|XCOFF64>\n"
            "       hexlab_cli archive link-audit <archive> --root-object <ET_REL|XCOFF64>\n"
            "       hexlab_cli archive link-exec <archive> --root-object <ET_REL> --entry <symbol> --output <ET_EXEC>\n"
            "       hexlab_cli archive link-pe <archive> --root-object <COFF .obj> --entry <symbol> --output <PE .exe>\n"
@@ -1892,7 +1892,7 @@ int archive_command(std::span<const std::wstring_view> args, std::ostream &out, 
     if (args.size() < 2 || (args.size() == 2 && args[1] == L"--help")) {
         out << "Usage: hexlab_cli archive list <archive> [--thin-root <directory>]\n"
                "       hexlab_cli archive index-audit <archive> [--thin-root <directory>]\n"
-               "       hexlab_cli archive link-select <archive> --root-object <ET_REL|XCOFF64>\n"
+               "       hexlab_cli archive link-select <archive> --root-object <ET_REL|XCOFF32|XCOFF64>\n"
                "       hexlab_cli archive link-audit <archive> --root-object <ET_REL|XCOFF64>\n"
                "       hexlab_cli archive link <archive> --root-object <ET_REL> --output <ET_REL>\n"
                "       hexlab_cli archive link-exec <archive> --root-object <ET_REL> --entry <symbol> --output <ET_EXEC>\n"
@@ -2092,6 +2092,12 @@ int archive_command(std::span<const std::wstring_view> args, std::ostream &out, 
                 return prefix.bytes.size() == 2 && prefix.bytes[0] == std::byte{0x01} &&
                     prefix.bytes[1] == std::byte{0xf7};
             };
+            const auto is_xcoff32 = [&](const ByteStorage &object) {
+                if (object.size() < 2) return false;
+                const auto prefix = take(object.read_at({0}, 2));
+                return prefix.bytes.size() == 2 && prefix.bytes[0] == std::byte{0x01} &&
+                    prefix.bytes[1] == std::byte{0xdf};
+            };
             if ((action == L"link-select" || action == L"link-audit") && is_xcoff64(*root_storage)) {
                 const auto root = take(summarize_xcoff64_ar_member(*root_storage, 0));
                 std::vector<ArMemberSymbols> summaries;
@@ -2225,8 +2231,42 @@ int archive_command(std::span<const std::wstring_view> args, std::ostream &out, 
                 out << "XCOFF64 link output is unsupported; no output was written.\n";
                 return 0;
             }
-            if (is_xcoff64(*root_storage))
-                argument_error("XCOFF64 archive link output is unsupported; use link-select or link-audit");
+            if ((action == L"link-select" || action == L"link-audit") && is_xcoff32(*root_storage)) {
+                if (action == L"link-audit")
+                    argument_error("XCOFF32 structural link audit is unsupported; use link-select");
+                const auto root = take(summarize_xcoff32_ar_member(*root_storage, 0));
+                std::vector<ArMemberSymbols> summaries;
+                summaries.reserve(archive.members.size());
+                for (std::size_t i = 0; i < archive.members.size(); ++i) {
+                    const auto &member = archive.members[i];
+                    if (member.kind != ArMemberKind::regular && member.kind != ArMemberKind::thin_external) continue;
+                    auto member_storage = take(open_member(member));
+                    if (!is_xcoff32(*member_storage)) continue;
+                    summaries.push_back(take(summarize_xcoff32_ar_member(*member_storage, i)));
+                }
+                std::vector<std::string_view> roots, definitions;
+                roots.reserve(root.undefined.size());
+                definitions.reserve(root.definitions.size());
+                for (const auto &name : root.undefined) roots.emplace_back(name);
+                for (const auto &name : root.definitions) definitions.emplace_back(name);
+                const auto selected = take(select_ar_members_fixed_point(archive, summaries, roots, definitions));
+                out << "Archive object format: XCOFF32 (fixed-point member selection only)\n";
+                for (const auto &entry : selected.members) {
+                    out << "Selected: member=" << entry.member_index << " name="
+                        << safe_text(archive.members[entry.member_index].name) << " triggered-by=";
+                    for (std::size_t i = 0; i < entry.selected_for.size(); ++i) {
+                        if (i) out << ',';
+                        out << safe_text(entry.selected_for[i]);
+                    }
+                    out << '\n';
+                }
+                for (const auto &name : selected.unresolved_symbols)
+                    out << "Unresolved: " << safe_text(name) << '\n';
+                out << "XCOFF32 link output and structural relocation audit are unsupported; no output was written.\n";
+                return 0;
+            }
+            if (is_xcoff64(*root_storage) || is_xcoff32(*root_storage))
+                argument_error("XCOFF archive link output is unsupported; use link-select");
             const auto root = take(summarize_elf_ar_member(*root_storage, 0));
             std::vector<ArMemberSymbols> summaries;
             summaries.reserve(archive.members.size());

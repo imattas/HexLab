@@ -155,7 +155,11 @@ HEXLAB_LOADERS_EXPORT Result<ArMemberSymbols> summarize_elf_ar_member(
 // selection. It does not link XCOFF objects or interpret relocations.
 HEXLAB_LOADERS_EXPORT Result<ArMemberSymbols> summarize_xcoff64_ar_member(
     const ByteStorage &, std::size_t member_index, std::stop_token = {}, ArObjectLimits = {});
-// Summarizes ordinary COFF (including ARM64), bigobj and bounded XCOFF64
+// Summarizes bounded big-endian XCOFF32 relocatable members for archive
+// selection. It does not link XCOFF objects or interpret relocations.
+HEXLAB_LOADERS_EXPORT Result<ArMemberSymbols> summarize_xcoff32_ar_member(
+    const ByteStorage &, std::size_t member_index, std::stop_token = {}, ArObjectLimits = {});
+// Summarizes ordinary COFF (including ARM64), bigobj, and bounded XCOFF32/64
 // relocatable symbol tables for
 // fixed-point archive selection. Linking callers must filter by machine before
 // selection; a symbol name alone does not establish architecture compatibility.

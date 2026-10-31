@@ -14,13 +14,13 @@ symbol names. Both tables share the archive's 256 MiB symbol-index budget and
 the configured symbol/name limits. Entries are resolved through the validated
 member-header chain; unknown offsets and special-table references leave the
 index incomplete while valid rows remain available. `lookup_ar_member_by_symbol`
-and the desktop/CLI symbol inventory can use these rows. A bounded XCOFF64
-relocatable-object summarizer validates big-endian file, section, symbol, and
-string-table extents and extracts external definitions and strong undefined
-symbols. `archive link-select <archive> --root-object <XCOFF64>` uses those
-summaries for fixed-point member selection from AIX big and other ar archives,
-reporting trigger and unresolved symbols. This is selection evidence only: XCOFF
-linking, relocation application, optional-header objects, and XCOFF32 remain
+and the desktop/CLI symbol inventory can use these rows. Bounded XCOFF64 and
+XCOFF32 relocatable-object summarizers validate big-endian file, section,
+symbol, and string-table extents and extract external definitions and strong
+undefined symbols. `archive link-select <archive> --root-object <XCOFF>` uses
+these summaries for fixed-point member selection from AIX big and other ar
+archives, reporting trigger and unresolved symbols. This is selection evidence
+only: XCOFF linking, relocation application, and optional-header objects remain
 unsupported.
 
 `archive link-audit <archive> --root-object <XCOFF64>` adds a bounded structural
