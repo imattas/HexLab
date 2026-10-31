@@ -694,7 +694,10 @@ enum class Opcode {
     // AVX2 immediate dword blend; appended to preserve serialized IDs.
     vpblendd,
     // x86 timestamp and performance-counter reads; append for stable IDs.
-    rdtsc, rdtscp, rdpmc
+    rdtsc, rdtscp, rdpmc,
+    // PowerPC VMX signed/unsigned lane-wise min/max; appended for cache stability.
+    ppc_vmaxub, ppc_vmaxuh, ppc_vmaxuw, ppc_vmaxsb, ppc_vmaxsh, ppc_vmaxsw,
+    ppc_vminub, ppc_vminuh, ppc_vminuw, ppc_vminsb, ppc_vminsh, ppc_vminsw
 };
 enum class OperandAccess { read, write, read_write, address };
 // The encoded x86 group-one repeat prefix is retained separately from the

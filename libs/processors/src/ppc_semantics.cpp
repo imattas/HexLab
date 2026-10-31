@@ -394,7 +394,7 @@ std::optional<PpcVectorBits> evaluate_ppc_vmx_integer_operation(Opcode opcode,
     }
 
     unsigned lane_bits = 0;
-    bool subtract = false;
+    bool subtract = false, min_max = false, signed_lanes = false, maximum = false;
     switch (opcode) {
     case Opcode::ppc_vaddubm: lane_bits = 8; break;
     case Opcode::ppc_vadduhm: lane_bits = 16; break;
@@ -402,6 +402,18 @@ std::optional<PpcVectorBits> evaluate_ppc_vmx_integer_operation(Opcode opcode,
     case Opcode::ppc_vsububm: lane_bits = 8; subtract = true; break;
     case Opcode::ppc_vsubuhm: lane_bits = 16; subtract = true; break;
     case Opcode::ppc_vsubuwm: lane_bits = 32; subtract = true; break;
+    case Opcode::ppc_vmaxub: lane_bits = 8; min_max = maximum = true; break;
+    case Opcode::ppc_vmaxuh: lane_bits = 16; min_max = maximum = true; break;
+    case Opcode::ppc_vmaxuw: lane_bits = 32; min_max = maximum = true; break;
+    case Opcode::ppc_vmaxsb: lane_bits = 8; min_max = signed_lanes = maximum = true; break;
+    case Opcode::ppc_vmaxsh: lane_bits = 16; min_max = signed_lanes = maximum = true; break;
+    case Opcode::ppc_vmaxsw: lane_bits = 32; min_max = signed_lanes = maximum = true; break;
+    case Opcode::ppc_vminub: lane_bits = 8; min_max = true; break;
+    case Opcode::ppc_vminuh: lane_bits = 16; min_max = true; break;
+    case Opcode::ppc_vminuw: lane_bits = 32; min_max = true; break;
+    case Opcode::ppc_vminsb: lane_bits = 8; min_max = signed_lanes = true; break;
+    case Opcode::ppc_vminsh: lane_bits = 16; min_max = signed_lanes = true; break;
+    case Opcode::ppc_vminsw: lane_bits = 32; min_max = signed_lanes = true; break;
     default: return {};
     }
 
@@ -414,7 +426,26 @@ std::optional<PpcVectorBits> evaluate_ppc_vmx_integer_operation(Opcode opcode,
             a = (a << 8) | va[offset + byte];
             b = (b << 8) | vb[offset + byte];
         }
-        const auto lane = (subtract ? a - b : a + b) & mask;
+        std::uint64_t lane = 0;
+        if (min_max) {
+            bool a_is_better = false;
+            if (signed_lanes) {
+                const auto signed_value = [lane_bits](std::uint64_t value) -> std::int64_t {
+                    if (lane_bits == 8)
+                        return std::bit_cast<std::int8_t>(static_cast<std::uint8_t>(value));
+                    if (lane_bits == 16)
+                        return std::bit_cast<std::int16_t>(static_cast<std::uint16_t>(value));
+                    return std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(value));
+                };
+                a_is_better = maximum ? signed_value(a) >= signed_value(b)
+                                      : signed_value(a) <= signed_value(b);
+            } else {
+                a_is_better = maximum ? a >= b : a <= b;
+            }
+            lane = a_is_better ? a : b;
+        } else {
+            lane = (subtract ? a - b : a + b) & mask;
+        }
         for (unsigned byte = 0; byte < lane_bytes; ++byte)
             result[offset + lane_bytes - 1 - byte] = static_cast<std::uint8_t>(lane >> (byte * 8));
     }

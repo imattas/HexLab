@@ -895,6 +895,18 @@ DecodeResult decode_powerpc(DecodeContext context, std::span<const std::byte> by
         case 1156: i.opcode = Opcode::ppc_vor; break;
         case 1220: i.opcode = Opcode::ppc_vxor; break;
         case 1284: i.opcode = Opcode::ppc_vnor; break;
+        case 2:    i.opcode = Opcode::ppc_vmaxub; element_bits = 8; break;
+        case 66:   i.opcode = Opcode::ppc_vmaxuh; element_bits = 16; break;
+        case 130:  i.opcode = Opcode::ppc_vmaxuw; element_bits = 32; break;
+        case 258:  i.opcode = Opcode::ppc_vmaxsb; element_bits = 8; break;
+        case 322:  i.opcode = Opcode::ppc_vmaxsh; element_bits = 16; break;
+        case 386:  i.opcode = Opcode::ppc_vmaxsw; element_bits = 32; break;
+        case 514:  i.opcode = Opcode::ppc_vminub; element_bits = 8; break;
+        case 578:  i.opcode = Opcode::ppc_vminuh; element_bits = 16; break;
+        case 642:  i.opcode = Opcode::ppc_vminuw; element_bits = 32; break;
+        case 770:  i.opcode = Opcode::ppc_vminsb; element_bits = 8; break;
+        case 834:  i.opcode = Opcode::ppc_vminsh; element_bits = 16; break;
+        case 898:  i.opcode = Opcode::ppc_vminsw; element_bits = 32; break;
         default: return fail(DecodeStatus::unsupported, "PowerPC opcode-4 form is outside the enabled VMX integer subset");
         }
         const auto destination = vr(rt), left = vr(ra), right = vr(rb);
