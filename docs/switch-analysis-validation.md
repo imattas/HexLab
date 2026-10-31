@@ -471,6 +471,19 @@ file-backed and relocation-free, and targets must decode as executable
 MIPS32 code. Other sign-extension sequences and shifted-base forms remain
 unsupported.
 
+O32 also recognizes one-byte signed-relative entries loaded with `LB` or the
+exact `LBU; SLL target,target,24; SRA target,target,24` sign-extension
+sequence, followed by `ADDU target,codeBase,target; JR target`. The narrow
+load, optional shifts, code-base addition, and dispatch must be contiguous and
+match the same 32-bit GPR. Byte entries use an unscaled selector added directly
+to the table base, or an exact `SLL selector,source,0` when present. In the
+unscaled form, the selector must be an untouched block-entry register; values
+produced by unsupported arithmetic are not accepted. Entries are signed
+8-bit displacements from the proven code base. Each one-byte slot must be
+file-backed and relocation-free, and each resulting target must decode as
+executable MIPS32 code. Guarded counts and the 4096-entry verified-prefix cap
+remain in force; other narrow-width transforms remain unsupported.
+
 PPC32 recognizes a straight-line indexed absolute-pointer form ending in
 `LWZX target, tableBase, scaledIndex; MTCTR target; BCTR`. The index must come
 from `MULLI scaledIndex, selector, 4` or the exact `RLWINM` `SLWI selector, 2`
