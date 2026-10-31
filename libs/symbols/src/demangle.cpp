@@ -542,6 +542,17 @@ class Itanium {
     std::string expression(std::size_t d) {
         depth(d); component();
         if (peek() == 'L') return literal(d + 1);
+        if (take("T")) {
+            std::size_t index = 0;
+            if (!take("_")) {
+                const auto encoded = number('_');
+                if (!take("_")) malformed();
+                if (encoded == std::numeric_limits<std::size_t>::max()) limit();
+                index = encoded + 1;
+            }
+            if (index >= template_arguments_.size()) unsupported();
+            return template_arguments_[index].text;
+        }
         if (take("cv")) {
             const auto target = render(parse_type_node(d + 1));
             const auto value = expression(d + 1);
