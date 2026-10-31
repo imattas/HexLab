@@ -57,8 +57,8 @@ because IEEE exception and rounding execution is not modeled in the decompiler.
 Their intrinsic operands include the decoded FPR values and incoming FCSR, so
 rounding-mode and status dependencies remain visible. S/D/W conversions and W
 rounding forms likewise define the correct typed FPR result and an explicit
-unknown FCSR result. The sign/move family has exact bit-preserving lowering as
-described below.
+unknown FCSR result in the general case. The sign/move family has exact
+bit-preserving lowering as described below.
 For all 16 classic S/D `C.<cond>` predicates, the intrinsic retains the
 predicate and incoming aggregate FCSR dependency. The selected FCC output is
 expressed as symbolic SSA from ordered equal/less/less-equal and unordered
@@ -77,9 +77,14 @@ doubleword transfer forms are not decoded in this MIPS32 mode.
 The decoder records one delay slot; MIPS analysis owns and orders the slot
 through its explicit CFG edge. COP1 operations remain symbolic in decompiled
 functions; standalone processor semantic helpers evaluate binary32 `DIV.S`
-and S/D-to-word rounding operations with their supported FCSR effects. They
-are not yet connected to per-function execution. Other IEEE arithmetic and
-conversion results and exact FCSR outputs remain abstract. See the evaluator
+and S/D-to-word rounding operations with their supported FCSR effects.
+Constant S/D-to-word conversions are folded during call-summary constant
+propagation when both the source bit pattern and incoming FCSR are known. The
+fold applies `CVT.W`'s FCSR rounding mode or the opcode-fixed mode and carries
+the resulting Cause/Flag state. If an enabled exception suppresses the
+destination write, the output remains explicitly unknown while the FCSR
+output is retained. Nonconstant inputs remain opaque. Other IEEE arithmetic
+and conversion results and exact FCSR outputs remain abstract. See evaluator
 limits in
 [`mips32.md`](mips32.md).
 
