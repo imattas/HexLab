@@ -351,7 +351,19 @@ silently ignored. Servers without reset support retain default-environment
 launches but reject nonempty changes. Native launch rejects this remote-only
 field before starting a process.
 
-This is a sequence of server settings, not an atomic remote transaction. If a
+Peers may optionally advertise HexLab's `QHexLabLaunchSettingsTransaction+`
+and `qXfer:launch-settings:read+` extensions. The transaction packet carries a
+bounded complete environment patch and working directory and must apply both
+atomically, replying exactly `OK` only after commit. Readback returns a bounded
+`HLS1` binary snapshot in qXfer chunks. HexLab reads the prior snapshot before
+writing when readback is available. If the transaction reply is lost, it reads
+back to determine whether the requested snapshot committed; otherwise it
+restores the prior snapshot when known. Failed or ambiguous recovery clears the
+connection-local cache and reports unknown remote state. These are private
+optional extensions; ordinary GDB RSP peers continue through the standard
+multi-packet path below.
+
+For standard peers, this is a sequence of server settings, not an atomic remote transaction. If a
 set/unset packet fails or the caller cancels mid-batch, the client resets the
 environment and reapplies the last acknowledged change set when this client
 knows it. On a fresh connection the prior environment is not queryable, so it

@@ -85,6 +85,64 @@ Result<std::vector<std::byte>> decode_hex(std::string_view data) {
     }
     return result;
 }
+void append_u32(std::string& out, std::uint32_t value) {
+    for (unsigned shift = 0; shift < 32; shift += 8) out.push_back(static_cast<char>(value >> shift));
+}
+std::uint32_t read_u32(std::string_view data, std::size_t at) {
+    std::uint32_t value = 0;
+    for (unsigned i = 0; i < 4; ++i) value |= static_cast<std::uint32_t>(static_cast<unsigned char>(data[at + i])) << (8 * i);
+    return value;
+}
+Result<std::string> encode_launch_settings(std::span<const RemoteEnvironmentChange> changes, std::string_view cwd) {
+    if (changes.size() > 256 || cwd.size() > 16 * 1024 || cwd.find('\0') != std::string_view::npos)
+        return Error{ErrorCode::resource_limit, "launch settings exceed bounded limits"};
+    std::set<std::string_view, std::less<>> names;
+    std::size_t total = 0;
+    std::string out = "HLS1";
+    append_u32(out, static_cast<std::uint32_t>(changes.size()));
+    append_u32(out, static_cast<std::uint32_t>(cwd.size()));
+    out.append(cwd);
+    for (const auto& change : changes) {
+        if (change.name.empty() || change.name.size() > 4096 || change.name.find('=') != std::string::npos || change.name.find('\0') != std::string::npos ||
+            (change.value && (change.value->size() > 16 * 1024 || change.value->find('\0') != std::string::npos)) ||
+            !names.insert(change.name).second)
+            return Error{ErrorCode::invalid_argument, "invalid or duplicate launch environment entry"};
+        const auto cost = change.name.size() + (change.value ? change.value->size() : 0);
+        if (cost > 64 * 1024 - total) return Error{ErrorCode::resource_limit, "launch environment exceeds 64 KiB"};
+        total += cost;
+        append_u32(out, static_cast<std::uint32_t>(change.name.size()));
+        append_u32(out, change.value ? static_cast<std::uint32_t>(change.value->size()) : UINT32_MAX);
+        out += change.name;
+        if (change.value) out += *change.value;
+    }
+    return out;
+}
+Result<RemoteLaunchSettings> decode_launch_settings(std::string_view data) {
+    if (data.size() < 12 || data.substr(0, 4) != "HLS1") return Error{ErrorCode::malformed, "invalid launch-settings snapshot"};
+    const auto count = read_u32(data, 4), cwd_size = read_u32(data, 8);
+    if (count > 256 || cwd_size > 16 * 1024 || cwd_size > data.size() - 12) return Error{ErrorCode::malformed, "launch-settings snapshot exceeds limits"};
+    RemoteLaunchSettings result;
+    result.working_directory.assign(data.substr(12, cwd_size));
+    if (result.working_directory.find('\0') != std::string::npos) return Error{ErrorCode::malformed, "NUL in launch working directory"};
+    std::size_t at = 12 + cwd_size, total = 0;
+    std::set<std::string, std::less<>> names;
+    for (std::uint32_t i = 0; i < count; ++i) {
+        if (data.size() - at < 8) return Error{ErrorCode::malformed, "truncated launch-settings entry"};
+        const auto n = read_u32(data, at), v = read_u32(data, at + 4); at += 8;
+        if (!n || n > 4096 || n > data.size() - at || (v != UINT32_MAX && (v > 16 * 1024 || v > data.size() - at - n)))
+            return Error{ErrorCode::malformed, "invalid launch-settings entry length"};
+        RemoteEnvironmentChange item;
+        item.name.assign(data.substr(at, n)); at += n;
+        if (item.name.find('=') != std::string::npos || item.name.find('\0') != std::string::npos || !names.insert(item.name).second)
+            return Error{ErrorCode::malformed, "invalid launch-settings variable name"};
+        if (v != UINT32_MAX) { item.value = std::string(data.substr(at, v)); at += v; }
+        const auto cost = n + (v == UINT32_MAX ? 0 : v);
+        if (cost > 64 * 1024 - total) return Error{ErrorCode::malformed, "launch-settings snapshot exceeds byte limit"};
+        total += cost; result.environment.push_back(std::move(item));
+    }
+    if (at != data.size()) return Error{ErrorCode::malformed, "trailing launch-settings snapshot bytes"};
+    return result;
+}
 struct FileIoReply {
     std::int64_t result = 0;
     std::optional<std::uint64_t> error_number;
@@ -460,7 +518,7 @@ Result<Capabilities> Client::negotiate(std::stop_token stop) {
 }
 Result<Capabilities> Client::negotiate(std::stop_token stop, bool request_no_ack) {
     memory_tagging_supported_ = false;
-    auto supported = transact("qSupported:multiprocess+;swbreak+;hwbreak+;vContSupported+;QThreadEvents+;QPassSignals+;memory-tagging+", stop);
+    auto supported = transact("qSupported:multiprocess+;swbreak+;hwbreak+;vContSupported+;QThreadEvents+;QPassSignals+;memory-tagging+;QHexLabLaunchSettingsTransaction+;qXfer:launch-settings:read+", stop);
     if (!supported) return supported.error();
     Capabilities result;
     std::string_view rest = supported.value();
@@ -487,7 +545,8 @@ Result<Capabilities> Client::negotiate(std::stop_token stop, bool request_no_ack
         if ((name == "QNonStop" || name == "QThreadEvents" || name == "QPassSignals" || name == "QStartNoAckMode" ||
              name == "memory-tagging" ||
              name == "QSetWorkingDir" || name == "QEnvironmentReset" ||
-             name == "QEnvironmentHexEncoded" || name == "QEnvironmentUnset") && !boolean_feature)
+             name == "QEnvironmentHexEncoded" || name == "QEnvironmentUnset" ||
+             name == "QHexLabLaunchSettingsTransaction" || name == "qXfer:launch-settings:read") && !boolean_feature)
             return Error{ErrorCode::malformed, "qSupported boolean feature has no support marker"};
         if (name == "PacketSize") {
             std::size_t advertised = 0;
@@ -518,6 +577,10 @@ Result<Capabilities> Client::negotiate(std::stop_token stop, bool request_no_ack
     environment_reset_supported_ = feature_enabled("QEnvironmentReset");
     environment_set_supported_ = feature_enabled("QEnvironmentHexEncoded");
     environment_unset_supported_ = feature_enabled("QEnvironmentUnset");
+    launch_settings_transaction_supported_ = feature_enabled("QHexLabLaunchSettingsTransaction");
+    launch_settings_readback_supported_ = feature_enabled("qXfer:launch-settings:read");
+    result.launch_settings_transaction_supported = launch_settings_transaction_supported_;
+    result.launch_settings_readback_supported = launch_settings_readback_supported_;
     peer_packet_size_ = std::min<std::size_t>(max_packet_, 4096);
     if (const auto feature = result.features.find("PacketSize"); feature != result.features.end()) {
         std::size_t advertised = 0;
@@ -1033,6 +1096,51 @@ Status Client::set_environment(std::span<const RemoteEnvironmentChange> changes,
 }
 Status Client::configure_launch_settings(std::span<const RemoteEnvironmentChange> changes,
     std::string_view working_directory, std::stop_token stop) {
+    if (launch_settings_transaction_supported_) {
+        auto payload = encode_launch_settings(changes, working_directory);
+        if (!payload) return payload.error();
+        constexpr std::string_view prefix = "QHexLabLaunchSettings:";
+        if (prefix.size() > peer_packet_size_ || payload.value().size() > (peer_packet_size_ - prefix.size()) / 2)
+            return Error{ErrorCode::resource_limit, "atomic launch-settings transaction exceeds negotiated PacketSize"};
+        std::optional<RemoteLaunchSettings> previous;
+        if (launch_settings_readback_supported_) {
+            auto snapshot = read_launch_settings(stop);
+            if (!snapshot) return snapshot.error();
+            previous = std::move(snapshot.value());
+        } else if (known_environment_changes_ && known_working_directory_) {
+            previous = RemoteLaunchSettings{*known_environment_changes_, *known_working_directory_};
+        }
+        auto response = transact(std::string(prefix) + encode_hex(std::as_bytes(std::span(payload.value().data(), payload.value().size()))), stop);
+        if (response && response.value() == "OK") {
+            known_environment_changes_ = std::vector<RemoteEnvironmentChange>(changes.begin(), changes.end());
+            known_working_directory_ = std::string(working_directory);
+            return std::monostate{};
+        }
+        const auto original = response ? Error{response.value().empty() ? ErrorCode::unsupported : ErrorCode::io,
+            response.value().empty() ? "peer rejected HexLab launch-settings extension" : "peer rejected atomic launch-settings transaction"} : response.error();
+        if (!response) {
+            if (launch_settings_readback_supported_) {
+                auto current = read_launch_settings({});
+                if (current && current.value() && current.value()->environment == std::vector<RemoteEnvironmentChange>(changes.begin(), changes.end()) && current.value()->working_directory == working_directory) {
+                    known_environment_changes_ = current.value()->environment; known_working_directory_ = current.value()->working_directory;
+                    return std::monostate{};
+                }
+            }
+            if (previous) {
+                auto rollback_payload = encode_launch_settings(previous->environment, previous->working_directory);
+                if (rollback_payload && prefix.size() + rollback_payload.value().size() * 2 <= peer_packet_size_) {
+                    auto rollback = transact(std::string(prefix) + encode_hex(std::as_bytes(std::span(rollback_payload.value().data(), rollback_payload.value().size()))), {});
+                    if (rollback && rollback.value() == "OK") {
+                        known_environment_changes_ = previous->environment; known_working_directory_ = previous->working_directory;
+                        return Error{original.code, original.message + "; prior settings restored"};
+                    }
+                }
+            }
+            known_environment_changes_.reset(); known_working_directory_.reset();
+            return Error{original.code, original.message + "; remote launch-settings state is unknown"};
+        }
+        return original;
+    }
     if (!working_directory.empty() && !working_directory_supported_)
         return Error{ErrorCode::unsupported, "remote did not advertise working-directory support for inferior launch"};
     if (working_directory.find('\0') != std::string_view::npos || working_directory.size() > 16 * 1024)
@@ -1988,6 +2096,33 @@ Status Client::write_memory(std::uint64_t address, std::span<const std::byte> by
         offset += count;
     }
     return std::monostate{};
+}
+Result<std::optional<RemoteLaunchSettings>> Client::read_launch_settings(std::stop_token stop) {
+    if (!launch_settings_readback_supported_) return std::optional<RemoteLaunchSettings>{};
+    std::string data;
+    constexpr std::size_t maximum = 256 * (4096 + 16 * 1024 + 8) + 16 * 1024 + 12;
+    const auto packet_limit = std::min(max_packet_, peer_packet_size_);
+    const std::size_t chunk = packet_limit > 1 ? (packet_limit - 1) / 2 : 0;
+    if (!chunk) return Error{ErrorCode::resource_limit, "PacketSize too small for launch-settings readback"};
+    for (std::size_t offset = 0; offset <= maximum;) {
+        const auto command = "qXfer:launch-settings:read::" + hex_u64(offset) + "," + hex_u64(chunk);
+        auto response = transact(command, stop);
+        if (!response) return response.error();
+        if (response.value().empty()) return Error{ErrorCode::unsupported, "peer advertised but does not implement launch-settings readback"};
+        if (response.value().front() != 'm' && response.value().front() != 'l') return Error{ErrorCode::malformed, "invalid launch-settings qXfer marker"};
+        const bool last = response.value().front() == 'l';
+        const auto bytes = std::string_view(response.value()).substr(1);
+        if (bytes.size() > chunk || bytes.size() > maximum - std::min(maximum, data.size())) return Error{ErrorCode::resource_limit, "launch-settings readback exceeds limit"};
+        data.append(bytes);
+        if (last) break;
+        if (bytes.empty() || offset > maximum - bytes.size()) return Error{ErrorCode::malformed, "launch-settings readback made no progress"};
+        offset += bytes.size();
+    }
+    auto parsed = decode_launch_settings(data);
+    if (!parsed) return parsed.error();
+    known_environment_changes_ = parsed.value().environment;
+    known_working_directory_ = parsed.value().working_directory;
+    return std::optional<RemoteLaunchSettings>{std::move(parsed.value())};
 }
 Status Client::program_flash(std::uint64_t address, std::span<const std::byte> bytes, std::stop_token stop) {
     constexpr std::size_t maximum_flash_bytes = 256 * 1024 * 1024;

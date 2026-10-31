@@ -190,7 +190,14 @@ or resets environment and working directory to target defaults when no prior
 value was known. Recovery requests are best-effort and may also fail or have an
 ambiguous outcome. This cannot restore settings changed outside this
 connection, and neither a successful reply nor rollback provides a
-cross-packet atomicity guarantee.
+cross-packet atomicity guarantee. Peers may advertise HexLab's optional
+`QHexLabLaunchSettingsTransaction+` and `qXfer:launch-settings:read+` extensions
+to provide atomic complete-setting replacement and bounded current-state
+readback. HexLab reconciles a lost transaction reply through readback and
+attempts to restore a known pre-transaction snapshot when the result remains
+uncertain. The bundled debug server currently does not advertise or implement
+these extensions; it starts the inferior through its own CLI instead of
+accepting launch settings from an RSP client.
 
 The thread-schedule integration received source review only; no builds, tests
 or live target/stub interaction were run for this increment. Follow up with

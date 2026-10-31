@@ -47,6 +47,8 @@ struct Capabilities {
     bool non_stop_supported = false;
     bool thread_events_supported = false;
     bool pass_signals_supported = false;
+    bool launch_settings_transaction_supported = false;
+    bool launch_settings_readback_supported = false;
 };
 struct RemoteFileStat {
     std::uint32_t device = 0, inode = 0, mode = 0, link_count = 0;
@@ -111,13 +113,18 @@ public:
     // established it; otherwise it resets to target defaults and reports that
     // the prior state could not be queried. A failed batch never launches.
     Status set_environment(std::span<const RemoteEnvironmentChange>, std::stop_token = {});
-    // Applies the per-launch environment and working directory as a
-    // best-effort transaction. Previously acknowledged values on this Client
-    // are restored on failure; otherwise target defaults are used and the
-    // error states that the original remote values were not queryable. RSP
-    // has no atomic settings transaction or standard setting readback.
+    // Applies the per-launch environment and working directory as one target
+    // transaction when the peer advertises HexLab's atomic extension;
+    // readback reconciles ambiguous transport failures when available.
+    // Otherwise standard RSP packets retain best-effort rollback semantics.
     Status configure_launch_settings(std::span<const RemoteEnvironmentChange>,
         std::string_view working_directory, std::stop_token = {});
+    bool supports_launch_settings_transaction() const noexcept { return launch_settings_transaction_supported_; }
+    bool supports_launch_settings_readback() const noexcept { return launch_settings_readback_supported_; }
+    // Reads a complete target-side settings snapshot when the peer advertises
+    // qXfer:launch-settings:read+. The reply is bounded by negotiated packet
+    // size and does not mutate launch state.
+    Result<std::optional<RemoteLaunchSettings>> read_launch_settings(std::stop_token = {});
     bool supports_environment_reset() const noexcept { return environment_reset_supported_; }
     // Detaches one process without closing the multiprocess RSP connection.
     Status detach_process(std::uint64_t process, std::stop_token = {});
@@ -260,6 +267,8 @@ private:
     bool environment_reset_supported_ = false;
     bool environment_set_supported_ = false;
     bool environment_unset_supported_ = false;
+    bool launch_settings_transaction_supported_ = false;
+    bool launch_settings_readback_supported_ = false;
     // RSP has no standard readback for these launch settings. Keep exact state
     // only after acknowledgements from this Client; nullopt means unknown.
     std::optional<std::vector<RemoteEnvironmentChange>> known_environment_changes_;
