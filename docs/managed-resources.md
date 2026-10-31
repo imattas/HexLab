@@ -42,7 +42,9 @@ input set; each edge repeats the exact identity/name/hash checks. A resource
 that reaches a provider already on the active chain remains unresolved with a
 cycle diagnostic. Provider traversal is capped at 16 nested levels and 4,096
 provider visits by default, with configurable hard caps of 64 levels and
-65,536 visits. Copied external payloads remain bounded by `max_payload_bytes`.
+65,536 visits. Retained parsed-provider catalogs and copied external payloads
+each share the same traversal-wide `max_payload_bytes` ceiling, so nesting does
+not multiply either payload budget.
 Missing, ambiguous, unsupported-hash, and mismatched-hash cases retain an
 explicit resolution state and diagnostic without discarding metadata.
 
