@@ -1632,13 +1632,13 @@ Result<StackFrameAnalysis> analyze_stack_frame(const FunctionRecord &function, c
             Address instruction;
         };
         std::vector<PendingArm32Store> pending_arm32_stores;
-        struct PendingWindowsShadowStore {
+        struct PendingWindowsOutgoingStore {
             std::int64_t offset = 0;
             std::int64_t stack_depth = 0;
             std::uint16_t width = 0;
             Address instruction;
         };
-        std::vector<PendingWindowsShadowStore> pending_windows_shadow_stores;
+        std::vector<PendingWindowsOutgoingStore> pending_windows_outgoing_stores;
         for (std::size_t instruction_index = 0;
              instruction_index < block->second->instructions.size(); ++instruction_index) {
             if (stop.stop_requested())
@@ -1652,7 +1652,7 @@ Result<StackFrameAnalysis> analyze_stack_frame(const FunctionRecord &function, c
                 pending_powerpc_stores.clear();
                 pending_mips_stores.clear();
                 pending_arm32_stores.clear();
-                pending_windows_shadow_stores.clear();
+                pending_windows_outgoing_stores.clear();
                 continue;
             }
             const auto &instruction = fact->instruction;
@@ -1661,27 +1661,27 @@ Result<StackFrameAnalysis> analyze_stack_frame(const FunctionRecord &function, c
                 instruction.context.mode == ExecutionMode::x86_64 && image_default_convention &&
                 *image_default_convention == CallingConvention::windows_x64;
             if (windows_x64_abi && instruction.flow == FlowKind::call) {
-                for (const auto &store : pending_windows_shadow_stores) {
+                for (const auto &store : pending_windows_outgoing_stores) {
                     if (!state.stack_depth.known || store.stack_depth != state.stack_depth.value) continue;
                     const auto slot = std::find_if(result.slots.begin(), result.slots.end(), [&](const auto &candidate) {
                         return candidate.offset_from_entry_sp == store.offset && candidate.width == store.width;
                     });
                     if (slot == result.slots.end()) continue;
                     const StackSlotCallArgument provenance{store.instruction, instruction.address,
-                        StackCallArgumentSourceKind::windows_x64_shadow_store};
+                        StackCallArgumentSourceKind::windows_x64_outgoing_store};
                     if (std::find(slot->outgoing_call_arguments.begin(), slot->outgoing_call_arguments.end(),
                                   provenance) != slot->outgoing_call_arguments.end()) continue;
                     if (stack_call_argument_detail_count >= 1'000'000) { result.complete = false; break; }
                     slot->outgoing_call_arguments.push_back(provenance);
                     ++stack_call_argument_detail_count;
                 }
-                pending_windows_shadow_stores.clear();
+                pending_windows_outgoing_stores.clear();
             } else if (!windows_x64_abi || instruction.flow != FlowKind::fallthrough) {
-                pending_windows_shadow_stores.clear();
+                pending_windows_outgoing_stores.clear();
             } else {
                 if (std::any_of(instruction.register_writes.begin(), instruction.register_writes.end(),
                     [](const auto &reg) { return reg.bank == RegisterBank::gpr && reg.index == 4 && reg.width == 64; }))
-                    pending_windows_shadow_stores.clear();
+                    pending_windows_outgoing_stores.clear();
                 bool captured_store = false;
                 if (instruction.memory_write && state.stack_depth.known && state.stack_depth.value >= 32) {
                     for (std::size_t operand_index = 0; operand_index < instruction.operands.size(); ++operand_index) {
@@ -1691,30 +1691,35 @@ Result<StackFrameAnalysis> analyze_stack_frame(const FunctionRecord &function, c
                             memory->base->bank != RegisterBank::gpr || memory->base->index != 4 ||
                             memory->base->width != 64 || memory->address_width != 64 || memory->index ||
                             memory->ip_relative || memory->writeback || memory->post_index ||
-                            memory->displacement < 0 || memory->displacement >= 32 ||
+                            memory->displacement < 0 || memory->displacement > 4096 ||
                             !memory->data_width || memory->data_width > 64 || memory->data_width % 8) continue;
                         const auto width_bytes = static_cast<std::int64_t>(memory->data_width / 8);
-                        if (memory->displacement + width_bytes > 32) continue;
+                        const auto store_end = memory->displacement + width_bytes;
+                        const bool shadow_store = memory->displacement < 32 && store_end <= 32;
+                        const bool stack_argument_store = memory->displacement >= 32 &&
+                            memory->displacement % 8 == 0 && width_bytes <= 8 &&
+                            store_end <= state.stack_depth.value;
+                        if (!shadow_store && !stack_argument_store) continue;
                         std::int64_t offset = 0;
                         if (!subtract_checked(memory->displacement, state.stack_depth.value, offset)) continue;
-                        if (pending_windows_shadow_stores.size() >= 1024) {
-                            pending_windows_shadow_stores.clear();
+                        if (pending_windows_outgoing_stores.size() >= 1024) {
+                            pending_windows_outgoing_stores.clear();
                             break;
                         }
                         std::int64_t end = 0;
                         if (!add_checked(offset, width_bytes, end)) continue;
-                        std::erase_if(pending_windows_shadow_stores, [&](const auto &previous) {
+                        std::erase_if(pending_windows_outgoing_stores, [&](const auto &previous) {
                             std::int64_t previous_end = 0;
                             if (!add_checked(previous.offset, previous.width / 8, previous_end)) return true;
                             return offset < previous_end && previous.offset < end;
                         });
-                        pending_windows_shadow_stores.push_back({offset, state.stack_depth.value,
+                        pending_windows_outgoing_stores.push_back({offset, state.stack_depth.value,
                             memory->data_width, instruction.address});
                         captured_store = true;
                     }
                 }
                 if (!captured_store && (instruction.memory_write || instruction.memory_read))
-                    pending_windows_shadow_stores.clear();
+                    pending_windows_outgoing_stores.clear();
             }
             if (instruction.context.architecture == Architecture::arm64 &&
                 instruction.opcode == Opcode::a64_bl && instruction.flow == FlowKind::call) {

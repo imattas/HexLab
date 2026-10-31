@@ -1375,7 +1375,7 @@ PyObject* call_project(PyObject*,PyObject* args){return guarded([&]()->PyObject*
             set(item,"call_instruction",encode(row.call_instruction));
             set(item,"source_instruction",encode(row.source_instruction));
             const char *source_kind = row.source_kind==StackCallArgumentSourceKind::x86_push ? "x86-push" :
-                row.source_kind==StackCallArgumentSourceKind::windows_x64_shadow_store ? "windows-x64-shadow-store" :
+                row.source_kind==StackCallArgumentSourceKind::windows_x64_outgoing_store ? "windows-x64-outgoing-store" :
                 row.source_kind==StackCallArgumentSourceKind::riscv_store ? "riscv-store" :
                 row.source_kind==StackCallArgumentSourceKind::powerpc_store ? "powerpc-store" :
                 row.source_kind==StackCallArgumentSourceKind::mips_store ? "mips-store" :

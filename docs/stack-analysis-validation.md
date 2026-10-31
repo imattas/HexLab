@@ -341,13 +341,20 @@ slots prepared for a direct call; it does not infer register arguments or
 classify arbitrary frame stores as ABI arguments.
 
 For a PE-selected Windows x64 ABI, direct write-only stores through RSP into
-the 32-byte shadow area are linked to a following same-block call when the
-stack depth is known, at least 32 bytes, and unchanged between the store and
-call. Stores must fit wholly in the shadow area; unrelated memory traffic,
+the 32-byte shadow area or the allocated outgoing stack-argument area are
+linked to a following same-block call when stack depth is known and unchanged.
+Stack arguments are restricted to aligned offsets from RSP+32 through RSP+4096,
+stores no wider than eight bytes, and ranges wholly inside the known allocation.
+Stores must fit wholly in the shadow area or meet those stack-argument bounds;
+indexed, indirect, and unaligned stores are excluded. Unrelated memory traffic,
 RSP writes, and control-flow boundaries discard pending evidence. The CLI
-labels these `win64-shadow@` stores separately. This records caller home-area
-use, not a recovered argument value or proof that the store was initialized
-for the callee.
+labels these `win64-store@` stores. This records caller outgoing-area use, not
+a recovered argument value, ordinal, or proof that the stored value reaches
+the callee unchanged. Confidence is high for this bounded structural
+store-to-call relationship; value identity and ABI argument ordinal remain
+unknown. Register arguments, indexed or unaligned stores, stores wider than
+eight bytes in the argument area, uncertain stack depth, and interleaved
+memory activity are unsupported.
 
 RISC-V outgoing stack-store provenance links a same-block, full-XLEN `SW`/`SD`
 through `0(sp)` or a positive SP displacement to the next call. The stack
