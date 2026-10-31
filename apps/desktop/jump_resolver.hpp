@@ -71,16 +71,19 @@ inline std::optional<NamedLocationExpression> parse_named_location_expression(co
     return {};
 }
 
-inline std::vector<std::pair<wxString, Location>> image_symbol_locations(const ImageMetadata &metadata) {
+inline std::vector<std::pair<wxString, Location>> image_symbol_locations(
+    const ImageMetadata &metadata, const std::atomic_bool *cancelled = nullptr) {
     std::vector<std::pair<wxString, Location>> entries;
     const auto append = [&](std::string_view name, Address address) {
-        if (name.empty()) return;
+        if (name.empty() || entries.size() >= 200000 ||
+            (cancelled && cancelled->load(std::memory_order_relaxed))) return;
         entries.emplace_back(wxString::FromUTF8(name.data(), name.size()), Location{address});
         const auto rendered = symbols::demangle_cpp_name(name);
         if (rendered.status == symbols::DemangleStatus::demangled && rendered.text != name)
             entries.emplace_back(wxString::FromUTF8(rendered.text.data(), rendered.text.size()), Location{address});
     };
     for (const auto &symbol : metadata.exports) {
+        if (cancelled && cancelled->load(std::memory_order_relaxed)) return entries;
         if (symbol.address) {
             if (symbol.name)
                 append(*symbol.name, *symbol.address);
@@ -89,25 +92,30 @@ inline std::vector<std::pair<wxString, Location>> image_symbol_locations(const I
         }
     }
     for (const auto &symbol : metadata.imports) {
+        if (cancelled && cancelled->load(std::memory_order_relaxed)) return entries;
         if (symbol.name)
             append(*symbol.name, symbol.iat);
         else if (symbol.ordinal)
             append("ordinal " + std::to_string(*symbol.ordinal), symbol.iat);
     }
     if (metadata.elf) {
-        for (const auto &symbol : metadata.elf->symbols)
+        for (const auto &symbol : metadata.elf->symbols) {
+            if (cancelled && cancelled->load(std::memory_order_relaxed)) return entries;
             if (symbol.state == ElfSymbolState::defined && symbol.address)
                 append(symbol.name, *symbol.address);
+        }
         // Keep DWARF-only subprogram names available even when the ELF symbol
         // table is stripped. Imported subprograms retain exact code ranges;
         // require that range provenance so declarations without code do not
         // become jumps to a fabricated zero address.
         if (metadata.elf->dwarf_info)
-            for (const auto &symbol : metadata.elf->dwarf_info->symbols)
+            for (const auto &symbol : metadata.elf->dwarf_info->symbols) {
+                if (cancelled && cancelled->load(std::memory_order_relaxed)) return entries;
                 if (symbol.kind == symbols::SymbolKind::entry_point)
                     append(symbol.name, Address{AddressSpaceId{}, symbol.address});
                 else if (symbol.kind == symbols::SymbolKind::function && !symbol.ranges.empty())
                     append(symbol.name, Address{AddressSpaceId{}, symbol.ranges.front().begin});
+            }
     }
     if (metadata.macho) {
         for (const auto &symbol : metadata.macho->symbols)

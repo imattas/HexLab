@@ -40,13 +40,17 @@ and displacement expressions keep their normal parsing priority. Named
 locations and numeric addresses also accept a checked signed displacement,
 for example `entry+0x20`, `0x401000+0x20`, or `bookmark-4`.
 Current-document and cross-document refinement run on background workers, so
-searching large captured name sets does not hold the wx event loop. Current
-document Jump captures its symbols, annotations, bookmarks, recovered functions,
-and sections as immutable search inputs before the chooser opens; the worker
-retains those inputs even if the dialog closes. While a query is being scanned,
+searching large captured name sets does not hold the wx event loop. Current-
+document Jump opens its chooser before collecting symbols, annotations,
+bookmarks, recovered functions, and sections; the worker collects these from
+the captured document and project snapshots, checking cancellation between
+records. The resulting source snapshot is reused for refinements and remains
+owned by the worker if the dialog closes. While a query is being scanned,
 the old result list is cleared and navigation is disabled. Rapid refinements
 are coalesced to the newest query; completed results are accepted only for their
-matching query generation. Cross-document workers likewise own immutable
+matching query generation. Navigation also verifies the current document id,
+revision, project snapshot, and displayed snapshot before following a result.
+Cross-document workers likewise own immutable
 captured project snapshots, and every chosen destination is checked against the
 live document session and project snapshot before navigation. Search caps still
 apply, so large source sets can report partial results and benefit from a
