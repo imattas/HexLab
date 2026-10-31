@@ -2039,6 +2039,21 @@ bool validate_body(const FunctionBody &body, std::span<const std::byte> module,
         } else if (op == 0xfd) {
             std::uint32_t subopcode = 0;
             if (!code.uleb(subopcode)) return fail("invalid SIMD subopcode");
+            if (subopcode >= 0x100 && subopcode <= 0x113) {
+                // Relaxed SIMD operations have implementation-dependent
+                // choices, but their validator stack types are fixed. Keep
+                // the complete v128 operand shape here; the lifter preserves
+                // the named operation as an opaque intrinsic.
+                const unsigned inputs = subopcode == 0x101 || subopcode == 0x102 ||
+                    subopcode == 0x103 || subopcode == 0x104 ? 1u :
+                    subopcode == 0x105 || subopcode == 0x106 ||
+                    subopcode == 0x107 || subopcode == 0x108 ||
+                    (subopcode >= 0x109 && subopcode <= 0x10c) || subopcode == 0x113 ? 3u : 2u;
+                for (unsigned operand = 0; operand < inputs; ++operand)
+                    if (!pop(0x7b)) return fail("relaxed SIMD operation requires v128 operands");
+                if (!push(0x7b)) return fail("operand stack limit exceeded");
+                continue;
+            }
             if (subopcode == 12) {
                 if (!code.skip(16)) return fail("truncated v128.const immediate");
                 if (!push(0x7b)) return fail("operand stack limit exceeded");

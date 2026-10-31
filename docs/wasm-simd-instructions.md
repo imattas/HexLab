@@ -37,7 +37,10 @@ multiply, and the two relaxed dot-product forms. The reserved range after
 `0x113` remains unsupported. These instructions have no extra binary
 immediates. Their names identify operations whose results may be
 implementation-defined under the proposal; decoding does not claim a specific
-runtime result, and the typed lifter does not yet execute these operations.
+runtime result. The loader now validates their v128 operand stack shapes, and
+the typed lifter preserves each exact operation and its ordered operands as an
+opaque typed intrinsic. This retains data flow without choosing one of the
+proposal's permitted runtime results.
 
 This also corrects lane-opcode numbering: SIMD subopcodes are unsigned LEB128
 values, and the lane operations occupy `0x15` through `0x22`; the preceding

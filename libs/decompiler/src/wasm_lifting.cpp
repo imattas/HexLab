@@ -269,6 +269,35 @@ struct SimdSplatOpInfo {
     ValueType scalar_type;
     std::string_view name;
 };
+struct SimdRelaxedOpInfo {
+    std::string_view name;
+    unsigned input_count = 0;
+};
+std::optional<SimdRelaxedOpInfo> simd_relaxed_op(std::uint32_t subopcode) {
+    static constexpr std::array<std::string_view, 20> names{
+        "i8x16.relaxed_swizzle",
+        "i32x4.relaxed_trunc_f32x4_s", "i32x4.relaxed_trunc_f32x4_u",
+        "i32x4.relaxed_trunc_f64x2_s_zero", "i32x4.relaxed_trunc_f64x2_u_zero",
+        "f32x4.relaxed_madd", "f32x4.relaxed_nmadd",
+        "f64x2.relaxed_madd", "f64x2.relaxed_nmadd",
+        "i8x16.relaxed_laneselect", "i16x8.relaxed_laneselect",
+        "i32x4.relaxed_laneselect", "i64x2.relaxed_laneselect",
+        "f32x4.relaxed_min", "f32x4.relaxed_max",
+        "f64x2.relaxed_min", "f64x2.relaxed_max",
+        "i16x8.relaxed_q15mulr_s", "i16x8.relaxed_dot_i8x16_i7x16_s",
+        "i32x4.relaxed_dot_i8x16_i7x16_add_s"};
+    if (subopcode < 0x100 || subopcode > 0x113) return {};
+    const auto index = static_cast<std::size_t>(subopcode - 0x100);
+    const unsigned inputs = ((index >= 5 && index <= 12) || index == 19) ? 3u
+        : index >= 1 && index <= 4 ? 1u : 2u;
+    return SimdRelaxedOpInfo{names[index], inputs};
+}
+std::string simd_relaxed_intrinsic_name(std::string_view mnemonic) {
+    std::string name = "wasm_";
+    name.reserve(name.size() + mnemonic.size());
+    for (const char ch : mnemonic) name.push_back(ch == '.' ? '_' : ch);
+    return name;
+}
 std::optional<SimdSplatOpInfo> simd_splat_op(std::uint32_t subopcode) {
     switch (subopcode) {
     case 0x0f: return SimdSplatOpInfo{integer(32), "wasm_i8x16_splat"};
@@ -904,6 +933,18 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
             }
             if (op == 0xfd) {
                 const auto subopcode = simd_subopcode(code[n]->instruction);
+                const auto relaxed = subopcode ? simd_relaxed_op(*subopcode) : std::optional<SimdRelaxedOpInfo>{};
+                if (relaxed) {
+                    const auto &instruction = code[n]->instruction;
+                    if (!instruction.operands.empty() || instruction.mnemonic_override != relaxed->name)
+                        return unsupported("relaxed SIMD opcode metadata is inconsistent");
+                    for (unsigned operand = 0; operand < relaxed->input_count; ++operand) {
+                        auto value = shape_pop(stack, vector(128));
+                        if (!value) return value.error();
+                    }
+                    stack.push_back(vector(128));
+                    continue;
+                }
                 const auto float_unary = subopcode ? simd_float_unary(*subopcode) : std::optional<std::string_view>{};
                 if (float_unary) {
                     const auto &instruction = code[n]->instruction;
@@ -1767,6 +1808,29 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
             }
             if (op == 0xfd) {
                 const auto subopcode = simd_subopcode(i);
+                const auto relaxed = subopcode ? simd_relaxed_op(*subopcode) : std::optional<SimdRelaxedOpInfo>{};
+                if (relaxed) {
+                    if (!i.operands.empty() || i.mnemonic_override != relaxed->name)
+                        return unsupported("relaxed SIMD opcode metadata is inconsistent");
+                    std::vector<ExpressionPtr> arguments(relaxed->input_count);
+                    for (std::size_t operand = arguments.size(); operand > 0; --operand) {
+                        auto value = pop(vector(128));
+                        if (!value) return value.error();
+                        arguments[operand - 1] = value.value();
+                    }
+                    if (stack.size() >= max_stack)
+                        return Error{ErrorCode::resource_limit, "WebAssembly operand stack exceeds 128 values"};
+                    const auto slot = stack.size();
+                    const RegisterOperand result_register{RegisterBank::wasm_stack,
+                        static_cast<std::uint8_t>(slot), 128, false};
+                    Intrinsic operation{simd_relaxed_intrinsic_name(relaxed->name), std::move(arguments),
+                                        IntrinsicMemoryEffect::none};
+                    operation.register_writes.push_back(result_register);
+                    stack.push_back(std::make_shared<Expression>(Expression{
+                        vector(128), RegisterValue{result_register, 0}}));
+                    emit(n, std::move(operation));
+                    continue;
+                }
                 const auto integer_unary = subopcode ? simd_integer_unary(*subopcode) : std::optional<SimdIntegerUnaryInfo>{};
                 if (integer_unary) {
                     auto value = pop(vector(128));
