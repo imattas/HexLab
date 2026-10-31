@@ -110,8 +110,26 @@ struct FunctionFlirtMatch {
     bool ambiguous = false;
 };
 
+// Per-catalog support calculated only from grounded function matches. This is
+// evidence for comparing catalogs, not a calibrated probability that a
+// library was used by the analyzed program.
+struct FlirtLibrarySummary {
+    std::size_t catalog_index = 0;
+    std::string identity; // Embedded .sig library name, or caller provenance.
+    std::string provenance;
+    std::size_t matched_functions = 0;
+    // Functions whose grounded candidates all point to this one catalog and
+    // agree on one name. Duplicate patterns do not inflate this count.
+    std::size_t uniquely_attributed_functions = 0;
+    std::size_t ambiguous_functions = 0;
+    std::uint64_t supporting_patterns = 0;
+};
+
 struct FlirtRecognition {
     std::vector<FunctionFlirtMatch> functions;
+    // Sorted by uniquely attributed functions, then total matched functions;
+    // ties retain the caller's catalog order.
+    std::vector<FlirtLibrarySummary> libraries;
     std::uint64_t pattern_candidates = 0;
     std::uint64_t comparisons = 0;
     bool complete = true;
