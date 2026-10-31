@@ -1956,6 +1956,8 @@ class Project:
         Input is bounded to 16 MiB and 4096 rows. Duplicate JSON keys and
         unknown fields are rejected. Unless overridden, the native batch pins
         the target project's current edit revision before it validates changes.
+        A JSON ``null`` bookmark removes the bookmark at that location; empty
+        name and comment strings clear their fields.
         """
         if cancel is None:
             cancel = globals().get("_hexlab_console_cancellation_token")
@@ -2019,8 +2021,12 @@ class Project:
             for field in ("name", "comment", "bookmark"):
                 if field in row:
                     value = row[field]
+                    if field == "bookmark" and value is None:
+                        item[field] = None
+                        continue
                     if not isinstance(value, str):
-                        raise ValueError("annotation manifest " + field + " must be text")
+                        raise ValueError("annotation manifest " + field + " must be text" +
+                                         (" or null" if field == "bookmark" else ""))
                     try:
                         value.encode("utf-8")
                     except UnicodeEncodeError as error:

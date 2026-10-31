@@ -81,8 +81,9 @@ hexlab_python import_annotations.py sample.hxproj labels.csv --format csv --merg
 ```
 
 CSV blank annotation cells omit fields; JSON/native rows can express clearing
-and bookmark removal. The example rejects contradictory duplicate manifest
-fields before importing and reports native applied/skipped counts. File parsing
+and bookmark removal (`"bookmark": null` removes a bookmark, while empty
+name/comment strings clear those fields). The example rejects contradictory
+duplicate manifest fields before importing and reports native applied/skipped counts. File parsing
 and native planning finish before the single project commit. Cancellation is
 cooperative before that commit; cancellation arriving after a successful commit
 cannot roll it back.

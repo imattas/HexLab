@@ -8,15 +8,31 @@ One bounded `EFI_CAPSULE_BLOCK_DESCRIPTOR` form is supported explicitly:
 hexlab_cli firmware inspect memory.bin --capsule-sg-base 0x100000 --capsule-sg-head 0x101000 --format uefi-capsule
 ```
 
-The input is one flat physical-memory capture. Its physical base and the physical
-address of the first descriptor must both be supplied; addresses are never
-guessed to be file offsets or dereferenced in live memory. Both options accept
-the CLI's usual checked numeric-address syntax, may appear before the final
-format option, and must occur exactly once as a pair. Multiple capture files
-cannot be combined in this form.
+The positional file is the primary physical-memory capture. Its physical base
+and the physical address of the first descriptor must both be supplied;
+addresses are never guessed to be file offsets or dereferenced in live memory.
+Both options accept the CLI's usual checked numeric-address syntax and must
+occur exactly once as a pair. Additional sparse captures use repeated
+`--capsule-sg-region BASE=FILE` options, for example:
+
+```text
+hexlab_cli firmware inspect primary.bin --capsule-sg-base 0x100000 --capsule-sg-head 0x101000 --capsule-sg-region 0x200000=payload.bin --format uefi-capsule
+```
+
+Each base must be unique, including the primary base. At most 256 total
+regions and 512 MiB of cumulative capture bytes are accepted. Every descriptor
+and data range must fit wholly inside one supplied region; overlapping physical
+ranges are rejected by the parser. Text output lists each region's base, path,
+and byte size. `--json` emits a bounded `hexlab.uefi-capsule-sg.v1` inventory
+with region provenance and capsule stream offsets. These options are valid only
+for `--format uefi-capsule`; JSON mode requires at least one additional region.
+The original single-capture command retains its existing output.
 
 `parse_uefi_fmp_scatter_gather_list(capture, physical_base, descriptor_head,
 options, stop)` reads little-endian 64-bit Length/physical-address descriptor pairs.
+The multi-region CLI form uses `parse_uefi_fmp_scatter_gather_regions` with the
+same bounded parser options; returned descriptor records retain region indexes
+and offsets for descriptor and payload provenance.
 Nonzero Length contributes that data range to the logical capsule stream.
 Zero Length with a nonzero target follows a continuation list; zero Length and
 zero target terminates the chain. The selected offline profile requires a

@@ -27,17 +27,18 @@ namespace hexlab::desktop {
 class JumpSuggestionsDialog final : public wxDialog {
 public:
     using Search = std::function<NamedLocationSearch(const wxString &, NamedLocationScope, NamedLocationSearchMode,
-                                                      const std::atomic_bool &)>;
+                                                      const std::atomic_bool &, std::size_t, std::size_t)>;
     using Describe = std::function<wxString(const NamedLocationCandidate &)>;
     JumpSuggestionsDialog(wxWindow *parent, const wxString &query, Search search, Describe describe,
                           NamedLocationSearchMode initial_mode = NamedLocationSearchMode::contains,
                           const wxString &title = "Jump name suggestions",
                           const wxString &instructions = "Search this document's captured names, then choose a destination:",
-                          bool allow_fuzzy = true, bool background_search = false)
+                          bool allow_fuzzy = true, bool background_search = false, bool allow_paging = false)
         : wxDialog(parent, wxID_ANY, title, wxDefaultPosition, wxDefaultSize,
                    wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER),
           search_(std::move(search)), describe_(std::move(describe)), timer_(this),
-          poll_timer_(this), background_search_(background_search), async_state_(std::make_shared<AsyncState>()) {
+          poll_timer_(this), background_search_(background_search), allow_paging_(allow_paging),
+          async_state_(std::make_shared<AsyncState>()) {
         auto *layout = new wxBoxSizer(wxVERTICAL);
         auto *instructions_label = new wxStaticText(this, wxID_ANY, instructions);
         instructions_label->Wrap(FromDIP(640));
@@ -80,6 +81,10 @@ public:
         copy_selected_->Enable(false);
         buttons->Add(copy_selected_, 0, wxRIGHT, FromDIP(8));
         buttons->AddStretchSpacer();
+        more_ = new wxButton(this, wxID_ANY, "More results");
+        more_->SetName("jump-name-more-results");
+        more_->Enable(false);
+        buttons->Add(more_, 0, wxRIGHT, FromDIP(8));
         buttons->Add(new wxButton(this, wxID_CANCEL, "Cancel"), 0, wxRIGHT, FromDIP(8));
         accept_ = new wxButton(this, wxID_OK, "Go to selected");
         accept_->Enable(false);
@@ -108,6 +113,7 @@ public:
             query_->SetFocus();
         });
         copy_selected_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { copy_selected_destination(); });
+        more_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { request_next_page(); });
         Bind(wxEVT_TIMER, [this](wxTimerEvent &) { refresh(); }, timer_.GetId());
         Bind(wxEVT_TIMER, [this](wxTimerEvent &) { poll_background_search(); }, poll_timer_.GetId());
         list_->Bind(wxEVT_LISTBOX, [this](wxCommandEvent &) { update_accept(); });
@@ -161,11 +167,13 @@ private:
         wxString query;
         NamedLocationScope scope = NamedLocationScope::all;
         NamedLocationSearchMode mode = NamedLocationSearchMode::contains;
+        std::size_t offset = 0;
         std::shared_ptr<std::atomic_bool> cancelled = std::make_shared<std::atomic_bool>(false);
     };
     struct AsyncResult {
         std::uint64_t generation = 0;
         NamedLocationSearch search;
+        std::size_t offset = 0;
     };
     struct AsyncState {
         std::mutex mutex;
@@ -180,7 +188,8 @@ private:
             std::thread([state, search = std::move(search), request = std::move(request)]() mutable {
                 NamedLocationSearch result;
                 try {
-                    result = search(request.query, request.scope, request.mode, *request.cancelled);
+                    result = search(request.query, request.scope, request.mode, *request.cancelled,
+                                    request.offset, page_size_);
                 } catch (...) {
                     result.truncated = true;
                     result.limitation = "background name search failed";
@@ -190,7 +199,7 @@ private:
                     std::lock_guard lock(state->mutex);
                     state->running = false;
                     if (state->closing) return;
-                    state->completed = AsyncResult{request.generation, std::move(result)};
+                    state->completed = AsyncResult{request.generation, std::move(result), request.offset};
                     if (state->queued) {
                         next = std::move(state->queued);
                         state->queued.reset();
@@ -208,14 +217,18 @@ private:
             result.limitation = "background name search could not start";
             std::lock_guard lock(state->mutex);
             state->running = false;
-            if (!state->closing) state->completed = AsyncResult{request.generation, std::move(result)};
+            if (!state->closing) state->completed = AsyncResult{request.generation, std::move(result), request.offset};
         }
     }
     void request_background_search() {
+        page_offset_ = 0;
+        more_available_ = false;
+        searching_ = true;
+        more_->Enable(false);
+        candidates_.clear();
         AsyncRequest request{++generation_, query_->GetValue(),
             static_cast<NamedLocationScope>(scope_->GetSelection()),
-            static_cast<NamedLocationSearchMode>(mode_->GetSelection())};
-        candidates_.clear();
+            static_cast<NamedLocationSearchMode>(mode_->GetSelection()), 0};
         list_->Clear();
         update_accept();
         status_->SetLabel("Searching captured names in the background...");
@@ -233,6 +246,18 @@ private:
         }
         launch_async(async_state_, search_, std::move(request));
     }
+    void request_next_page() {
+        if (!background_search_ || !allow_paging_ || searching_ || !more_available_) return;
+        AsyncRequest request{++generation_, query_->GetValue(),
+            static_cast<NamedLocationScope>(scope_->GetSelection()),
+            static_cast<NamedLocationSearchMode>(mode_->GetSelection()), page_offset_};
+        searching_ = true; more_->Enable(false);
+        status_->SetLabel("Loading more captured names in the background...");
+        { std::lock_guard lock(async_state_->mutex);
+          if (async_state_->closing) return;
+          async_state_->running = true; async_state_->active_cancel = request.cancelled; }
+        launch_async(async_state_, search_, std::move(request));
+    }
     void poll_background_search() {
         if (!background_search_) return;
         std::optional<AsyncResult> completed;
@@ -242,7 +267,7 @@ private:
             async_state_->completed.reset();
         }
         if (completed && completed->generation == generation_)
-            show_result(std::move(completed->search));
+            show_result(std::move(completed->search), completed->offset);
     }
     void load_preferences(const wxString &initial_query) {
         auto *config = wxConfigBase::Get(false);
@@ -276,11 +301,19 @@ private:
         }
         const std::atomic_bool not_cancelled{false};
         show_result(search_(query_->GetValue(), static_cast<NamedLocationScope>(scope_->GetSelection()),
-                            static_cast<NamedLocationSearchMode>(mode_->GetSelection()), not_cancelled));
+                            static_cast<NamedLocationSearchMode>(mode_->GetSelection()), not_cancelled, 0, page_size_), 0);
     }
-    void show_result(NamedLocationSearch result) {
+    void show_result(NamedLocationSearch result, std::size_t offset) {
         const auto selected = selected_candidate();
-        candidates_ = std::move(result.candidates);
+        const auto page_count = result.candidates.size();
+        if (offset == 0) candidates_.clear();
+        page_offset_ = offset + page_count;
+        candidates_.insert(candidates_.end(), std::make_move_iterator(result.candidates.begin()),
+                           std::make_move_iterator(result.candidates.end()));
+        more_available_ = result.truncated && page_count != 0 &&
+            mode_->GetSelection() != static_cast<int>(NamedLocationSearchMode::fuzzy);
+        searching_ = false;
+        more_->Enable(allow_paging_ && more_available_);
         wxArrayString rows;
         int preserved = 0;
         for (std::size_t i = 0; i < candidates_.size(); ++i) {
@@ -296,7 +329,7 @@ private:
             ? wxString("Enter at least two characters, or one character for Exact name.")
             : wxString::Format("%zu destination(s)", candidates_.size()) +
                 (!result.limitation.empty() ? "; " + result.limitation : result.truncated
-                ? wxString("; result limit reached. Refine to search the captured sources again.") : wxString{}));
+                ? wxString("; more results are available, or the bounded source scan was incomplete.") : wxString{}));
         status_->Wrap(FromDIP(640));
         update_accept();
         Layout();
@@ -336,9 +369,14 @@ private:
     wxStaticText *status_ = nullptr;
     wxButton *accept_ = nullptr;
     wxButton *copy_selected_ = nullptr;
+    wxButton *more_ = nullptr;
     wxTimer timer_;
     wxTimer poll_timer_;
     bool background_search_ = false;
+    bool allow_paging_ = false;
+    bool more_available_ = false, searching_ = false;
+    std::size_t page_offset_ = 0;
+    static constexpr std::size_t page_size_ = 256;
     std::uint64_t generation_ = 0;
     std::shared_ptr<AsyncState> async_state_;
 };

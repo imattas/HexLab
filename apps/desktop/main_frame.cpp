@@ -3812,7 +3812,7 @@ struct MainFrame::Impl {
         }
         JumpSuggestionsDialog chooser(&frame, {},
             [sources, omitted_documents](const wxString &query, NamedLocationScope scope, NamedLocationSearchMode mode,
-                                        const std::atomic_bool &cancelled) {
+                                        const std::atomic_bool &cancelled, std::size_t, std::size_t) {
                 auto result = search_cross_document_names(sources, query, scope, mode, &cancelled);
                 if (omitted_documents) {
                     result.truncated = true;
@@ -3969,7 +3969,7 @@ struct MainFrame::Impl {
                     std::move(bookmark_entries), std::move(function_entries), std::move(bounded_entries), {}, {}});
                 JumpSuggestionsDialog chooser(&frame, requested,
                     [search_sources](const wxString &query, NamedLocationScope scope, NamedLocationSearchMode mode,
-                                     const std::atomic_bool &) {
+                                     const std::atomic_bool &cancelled, std::size_t offset, std::size_t page_size) {
                         const auto *selected_entries = &search_sources->all;
                         const auto *selected_bounds = &search_sources->sections;
                         switch (scope) {
@@ -3981,13 +3981,14 @@ struct MainFrame::Impl {
                         case NamedLocationScope::sections:
                             selected_entries = &search_sources->empty_entries; selected_bounds = &search_sources->sections; break;
                         }
-                        return search_named_locations(*selected_entries, *selected_bounds, query, 4096, mode);
+                        return search_named_locations(*selected_entries, *selected_bounds, query, 200000, mode,
+                                                      offset, page_size, &cancelled);
                     },
                     [source_document](const NamedLocationCandidate &candidate) {
                         return candidate.name + " - " + location_text(candidate.location, source_document->image.get());
                     }, requested.length() == 1 ? NamedLocationSearchMode::exact : NamedLocationSearchMode::contains,
                     "Jump name suggestions", "Search this document's captured names, then choose a destination:",
-                    true, true);
+                    true, true, true);
                 if (chooser.ShowModal() == wxID_OK)
                     if (const auto selected = chooser.selected_candidate())
                         navigate_from_source(selected->location);

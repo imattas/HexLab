@@ -173,6 +173,25 @@ with the peer's current selection instead of sending an all-thread `vCont;s`.
 Target architecture and register availability depend on the native debugger
 backend on the host.
 
+When HexLab acts as an RSP client, launch environment and working-directory
+settings are configured with the peer's advertised `QEnvironmentReset`,
+`QEnvironmentHexEncoded`, `QEnvironmentUnset`, and `QSetWorkingDir` packets.
+The environment is replaced by a reset followed by individual set/unset
+requests; each acknowledged packet updates only HexLab's connection-local
+record. The standard packet set provides no environment or working-directory
+readback and no atomic multi-setting transaction. Repeating a value already
+acknowledged on the same connection is skipped. An explicit rejection of a
+working-directory request preserves its last acknowledged value as the
+rollback baseline; if its transport fails after sending, that setting's state
+is unknown. Environment configuration attempts a reset before applying
+changes; if a later packet fails, it attempts a cleanup reset. On a
+launch-setting failure HexLab restores prior values known on that connection,
+or resets environment and working directory to target defaults when no prior
+value was known. Recovery requests are best-effort and may also fail or have an
+ambiguous outcome. This cannot restore settings changed outside this
+connection, and neither a successful reply nor rollback provides a
+cross-packet atomicity guarantee.
+
 The thread-schedule integration received source review only; no builds, tests
 or live target/stub interaction were run for this increment. Follow up with
 serial `hexlab_debugger` and `hexlab_debug_server` compilation. Linux x86,

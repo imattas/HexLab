@@ -101,6 +101,8 @@ public:
     // Configures the next extended-mode launch using advertised QSetWorkingDir.
     // Empty restores the server's default. Paths are opaque target bytes,
     // contain no NUL, and are bounded to 16 KiB and the negotiated PacketSize.
+    // Same-connection acknowledged values are cached; there is no standard
+    // target-side query, and a transport failure invalidates that cache.
     Status set_working_directory(std::string_view directory, std::stop_token = {});
     bool supports_working_directory() const noexcept { return working_directory_supported_; }
     // Extended mode only. Validates the full bounded batch and negotiated
@@ -112,7 +114,8 @@ public:
     // Applies the per-launch environment and working directory as a
     // best-effort transaction. Previously acknowledged values on this Client
     // are restored on failure; otherwise target defaults are used and the
-    // error states that the original remote values were not queryable.
+    // error states that the original remote values were not queryable. RSP
+    // has no atomic settings transaction or standard setting readback.
     Status configure_launch_settings(std::span<const RemoteEnvironmentChange>,
         std::string_view working_directory, std::stop_token = {});
     bool supports_environment_reset() const noexcept { return environment_reset_supported_; }

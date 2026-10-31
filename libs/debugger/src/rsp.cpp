@@ -884,11 +884,19 @@ Status Client::set_working_directory(std::string_view directory, std::stop_token
     if (directory.size() > 16 * 1024 || prefix.size() > peer_packet_size_ ||
         directory.size() > (peer_packet_size_ - prefix.size()) / 2)
         return Error{ErrorCode::resource_limit, "RSP working directory exceeds the path or negotiated packet limit"};
+    // Avoid disturbing a state this connection has already established. RSP
+    // has no standard working-directory readback, and even a successful
+    // redundant write creates another point where a lost reply is ambiguous.
+    if (known_working_directory_ && *known_working_directory_ == directory)
+        return std::monostate{};
     auto response = transact(std::string(prefix) + encode_hex(std::as_bytes(std::span(directory.data(), directory.size()))), stop);
-    // There is no standard query for the active target directory. If the
-    // reply is lost, the setting may have changed even though we cannot prove it.
-    known_working_directory_.reset();
-    if (!response) return response.error();
+    // There is no standard query for the active target directory. A transport
+    // failure leaves the result indeterminate; explicit peer replies do not
+    // change the last value this Client knows it successfully established.
+    if (!response) {
+        known_working_directory_.reset();
+        return response.error();
+    }
     if (response.value() == "OK") {
         known_working_directory_ = std::string(directory);
         return std::monostate{};
@@ -995,6 +1003,8 @@ Status Client::apply_environment_batch(std::span<const RemoteEnvironmentChange> 
 }
 Status Client::set_environment(std::span<const RemoteEnvironmentChange> changes, std::stop_token stop) {
     const auto previous = known_environment_changes_;
+    if (previous && std::equal(previous->begin(), previous->end(), changes.begin(), changes.end()))
+        return std::monostate{};
     auto configured = apply_environment_batch(changes, stop);
     if (configured) return std::monostate{};
 

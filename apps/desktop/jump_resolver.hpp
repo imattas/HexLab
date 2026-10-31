@@ -6,6 +6,7 @@
 #include "hexlab/symbols/demangle.hpp"
 #include "hexlab/workspace/navigation.hpp"
 #include <algorithm>
+#include <atomic>
 #include <set>
 #include <map>
 #include <iterator>
@@ -295,7 +296,8 @@ inline NamedLocationSearch search_named_locations(
     const std::vector<std::pair<wxString, Location>> &entries,
     const std::vector<NamedLocationCandidate> &bounded_entries,
     const wxString &requested, std::size_t limit = 128,
-    NamedLocationSearchMode mode = NamedLocationSearchMode::contains) {
+    NamedLocationSearchMode mode = NamedLocationSearchMode::contains,
+    std::size_t offset = 0, std::size_t page_size = 256, const std::atomic_bool *cancelled = nullptr) {
     if (mode == NamedLocationSearchMode::fuzzy)
         return search_ranked_named_locations(entries, bounded_entries, requested, limit);
     NamedLocationSearch result;
@@ -314,22 +316,23 @@ inline NamedLocationSearch search_named_locations(
         }
         return std::get<FileOffset>(left).value < std::get<FileOffset>(right).value;
     };
+    page_size = std::clamp<std::size_t>(page_size, 1, 256);
+    limit = std::min<std::size_t>(limit, 200000);
     std::set<Location, decltype(less_location)> destinations(less_location);
+    std::vector<NamedLocationCandidate> ordered_matches;
+    std::size_t examined = 0;
 
     const auto add = [&](const wxString &name, const Location &location) {
-        if (name.empty()) return;
+        if (cancelled && cancelled->load(std::memory_order_relaxed)) { result.truncated = true; return; }
+        if (name.empty() || ++examined > limit) { if (examined > limit) result.truncated = true; return; }
         wxString folded = name;
         folded.MakeLower();
-        const bool matches = mode == NamedLocationSearchMode::exact ? folded == needle
+        const bool matched = mode == NamedLocationSearchMode::exact ? folded == needle
             : mode == NamedLocationSearchMode::prefix ? folded.StartsWith(needle)
             : folded.Find(needle) != wxNOT_FOUND;
-        if (!matches || destinations.contains(location)) return;
-        if (result.candidates.size() == limit) {
-            result.truncated = true;
-            return;
-        }
+        if (!matched || destinations.contains(location)) return;
         destinations.insert(location);
-        result.candidates.push_back({name, location, {}});
+        ordered_matches.push_back({name, location, {}});
     };
     for (const auto &[name, location] : entries) {
         add(name, location);
@@ -340,7 +343,7 @@ inline NamedLocationSearch search_named_locations(
             add(candidate.name, candidate.location);
             if (result.truncated) break;
         }
-    std::sort(result.candidates.begin(), result.candidates.end(), [](const auto &left, const auto &right) {
+    std::sort(ordered_matches.begin(), ordered_matches.end(), [](const auto &left, const auto &right) {
         wxString left_folded = left.name, right_folded = right.name;
         left_folded.MakeLower(); right_folded.MakeLower();
         if (left_folded != right_folded) return left_folded < right_folded;
@@ -353,6 +356,11 @@ inline NamedLocationSearch search_named_locations(
         }
         return std::get<FileOffset>(left.location).value < std::get<FileOffset>(right.location).value;
     });
+    const auto begin = std::min(offset, ordered_matches.size());
+    const auto end = std::min(ordered_matches.size(), begin + page_size);
+    result.truncated = end < ordered_matches.size() || result.truncated;
+    result.candidates.assign(ordered_matches.begin() + static_cast<std::ptrdiff_t>(begin),
+                             ordered_matches.begin() + static_cast<std::ptrdiff_t>(end));
     return result;
 }
 } // namespace hexlab::desktop
