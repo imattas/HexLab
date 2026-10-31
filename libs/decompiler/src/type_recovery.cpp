@@ -3536,13 +3536,13 @@ static Result<TypeRecoveryResult> recover_types_impl(
             // recoverable prefix because later observed slots cannot prove
             // the omitted parameter's type.
             const auto count = std::min<std::size_t>(4, abi.integer_argument_registers.size());
-            const auto later_windows_argument = [&](std::size_t index) {
+            const auto later_windows_register_argument = [&](std::size_t index) {
                 for (std::size_t later = index + 1; later < count; ++later) {
                     if (incoming_register_fact(abi.integer_argument_registers[later])) return true;
                     if (later < abi.floating_argument_registers.size() &&
                         incoming_register_fact(abi.floating_argument_registers[later])) return true;
                 }
-                return !stack_arguments.empty();
+                return false;
             };
             bool register_prefix_complete = count == 0;
             for (std::size_t index = 0; index < count; ++index) {
@@ -3556,7 +3556,16 @@ static Result<TypeRecoveryResult> recover_types_impl(
                     break;
                 }
                 if (!integer_fact && !floating_fact) {
-                    if (later_windows_argument(index)) {
+                    const bool later_register = later_windows_register_argument(index);
+                    const bool later_stack = !stack_arguments.empty();
+                    if (later_register || later_stack) {
+                        // A known contiguous register prefix remains a valid
+                        // partial candidate when only a later stack slot is
+                        // observed. Stop at the gap and omit that stack value;
+                        // without any known prefix, the stack read cannot
+                        // establish the missing positional register arguments.
+                        if (later_stack && !later_register && !inferred_parameters.empty())
+                            break;
                         unresolved_argument_order = true;
                         inferred_parameters.clear();
                         result.diagnostics.push_back("Windows x64 argument evidence has a positional gap");

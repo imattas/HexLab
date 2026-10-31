@@ -144,8 +144,16 @@ void publish_file(OwnedFile& source,const std::filesystem::path& destination,Rep
                before_sqlite.st_dev!=guarded_identity.st_dev || before_sqlite.st_ino!=guarded_identity.st_ino)
                 throw Failure{{ErrorCode::conflict,"Destination path changed before SQLite journal recovery"}};
             const auto opened=sqlite3_open_v2(path.c_str(),&database,
-                SQLITE_OPEN_READWRITE|SQLITE_OPEN_FULLMUTEX|SQLITE_OPEN_NOFOLLOW,nullptr);
+                SQLITE_OPEN_READWRITE|SQLITE_OPEN_FULLMUTEX|SQLITE_OPEN_PRIVATECACHE|
+                    SQLITE_OPEN_EXRESCODE|SQLITE_OPEN_NOFOLLOW,nullptr);
             if(opened!=SQLITE_OK){if(database)sqlite3_close(database);throw Failure{{ErrorCode::busy,"Cannot safely recover destination SQLite journal companions"}};}
+            // Match the application's normal connection policy. Preparing a
+            // journal-mode change can briefly contend with SQLite's schema or
+            // WAL locks even when no long-lived reader remains.
+            if(sqlite3_busy_timeout(database,2000)!=SQLITE_OK){
+                sqlite3_close(database);
+                throw Failure{{ErrorCode::busy,"Cannot configure SQLite recovery lock timeout"}};
+            }
             struct stat opened_path{};
             if(::lstat(destination.c_str(),&opened_path)!=0 || !S_ISREG(opened_path.st_mode) ||
                opened_path.st_dev!=guarded_identity.st_dev || opened_path.st_ino!=guarded_identity.st_ino){
