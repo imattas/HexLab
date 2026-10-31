@@ -274,10 +274,9 @@ struct DwarfLineUnit {
     bool operator==(const DwarfLineUnit &) const = default;
 };
 
-// Opaque macro data attached to the split unit selected by a DWP package
-// index. The bytes are one bounded DW_SECT_MACRO contribution; strings remain
-// the package's shared tables so consumers can interpret indexed operands
-// without losing the original contribution provenance.
+// Macro data attached to the split unit selected by a DWP package index. The
+// bytes are one bounded DW_SECT_MACRO contribution; shared strings and the
+// exact string-offset table/base preserve indexed-string identity.
 struct DwarfMacroContribution {
     std::string source_id;
     DwarfPackageIndexKind index_kind = DwarfPackageIndexKind::compile_units;
@@ -288,6 +287,8 @@ struct DwarfMacroContribution {
     std::vector<std::uint8_t> bytes;
     std::vector<std::uint8_t> strings;
     std::vector<std::uint8_t> line_strings;
+    std::vector<std::uint8_t> string_offsets;
+    std::optional<std::uint64_t> string_offsets_base;
     bool operator==(const DwarfMacroContribution &) const = default;
 };
 struct DwarfLineSections {
@@ -350,9 +351,12 @@ struct DwarfMacroSections {
     std::size_t max_records = 1'000'000;
     std::size_t max_text_bytes = 64u * 1024u * 1024u;
     std::stop_token stop;
+    std::span<const std::uint8_t> string_offsets;
+    std::optional<std::uint64_t> string_offsets_base;
 };
-// Parses bounded DWARF v5 macro units for inline/strp define and undef records
-// plus start_file/end_file scope records. Supplementary, indexed-string, and
+// Parses bounded DWARF v5 macro units for inline/strp/strx define and undef
+// records plus start_file/end_file scope records. Indexed strings require the
+// exact split-unit table and DW_AT_str_offsets_base. Supplementary and
 // imported macro units fail explicitly as unsupported.
 HEXLAB_SYMBOLS_EXPORT hexlab::Result<std::vector<DwarfMacroUnit>> import_dwarf_macro_v5(
     const DwarfMacroSections &sections);
@@ -532,6 +536,9 @@ struct ImportResult {
     bool split_unit = false;
     std::optional<std::uint64_t> split_dwo_id;
     std::vector<std::string> diagnostics;
+    // Exact DW_AT_str_offsets_base of the imported split compile unit, when
+    // present. DWP macro strx operands use this same contribution identity.
+    std::optional<std::uint64_t> split_string_offsets_base;
     bool operator==(const ImportResult &) const = default;
 };
 

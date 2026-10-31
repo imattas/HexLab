@@ -331,8 +331,9 @@ hexlab::Result<ImportResult> import_dwarf_package_unit(
         std::size_t macro_payload_size = macro_contribution->bytes.size();
         if (!checked_add(macro_payload_size, strings.size(), macro_payload_size) ||
             !checked_add(macro_payload_size, line_strings.size(), macro_payload_size) ||
+            !checked_add(macro_payload_size, dwarf.string_offsets.size(), macro_payload_size) ||
             macro_payload_size > macro_payload_limit)
-            return too_large("DWP macro contribution and shared strings exceed the 64 MiB import limit");
+            return too_large("DWP macro contribution and indexed string tables exceed the 64 MiB import limit");
         DwarfMacroContribution macro;
         macro.source_id = "DWARF v" + std::to_string(index.version) + " DWP CU " +
             std::to_string(dwo_id) + " macro contribution";
@@ -344,6 +345,8 @@ hexlab::Result<ImportResult> import_dwarf_package_unit(
         macro.bytes.assign(macro_contribution->bytes.begin(), macro_contribution->bytes.end());
         macro.strings.assign(strings.begin(), strings.end());
         macro.line_strings.assign(line_strings.begin(), line_strings.end());
+        macro.string_offsets.assign(dwarf.string_offsets.begin(), dwarf.string_offsets.end());
+        macro.string_offsets_base = imported.value().split_string_offsets_base;
         imported.value().macro_contributions.push_back(std::move(macro));
     }
     if (!line_contribution.empty()) {
@@ -369,6 +372,8 @@ hexlab::Result<ImportResult> import_dwarf_package_unit(
         macro.macro = macro_data.bytes;
         macro.strings = macro_data.strings;
         macro.line_units = imported.value().line_units;
+        macro.string_offsets = macro_data.string_offsets;
+        macro.string_offsets_base = macro_data.string_offsets_base;
         macro.section_offset = macro_data.section_offset;
         macro.little_endian = little_endian;
         macro.stop = stop;
