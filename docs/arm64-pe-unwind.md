@@ -8,6 +8,16 @@ Unpacked records decode version-zero `.xdata`: function length, exception-handle
 
 Every accepted start must point to initialized executable bytes, and known packed/xdata function extents must remain inside one initialized executable segment. The loader builds the entire directory in temporary metadata and publishes it only after every row, xdata record, and link validates. Malformed directories mark PE metadata incomplete and add a diagnostic while preserving otherwise usable image bytes.
 
-Each validated ARM64 `.pdata` start becomes a `FunctionSeedKind::unwind` root only when its source spans provide exactly eight nonempty bytes without extent overflow. Its seed evidence retains the pdata row index, first source file offset, and eight-byte record extent. A normalized row missing that provenance is skipped and marks function recovery incomplete; its function range is not applied as an ownership bound. Root addresses are computed using the image's loaded base, so rebasing is reflected in recovered functions. The validated function length bounds control-flow recovery unless an explicit user chunk definition overrides the metadata. Functions omitted from `.pdata` (such as leaf functions) are not inferred by this feature.
+Each validated non-link ARM64 `.pdata` start becomes a `FunctionSeedKind::unwind` root only when its source spans provide exactly eight nonempty bytes without extent overflow. Its seed evidence retains the pdata row index, first source file offset, and eight-byte record extent. A normalized row missing that provenance is skipped and marks function recovery incomplete; its function range is not applied as an ownership bound. Root addresses are computed using the image's loaded base, so rebasing is reflected in recovered functions. The validated function length bounds control-flow recovery unless an explicit user chunk definition overrides the metadata. Functions omitted from `.pdata` (such as leaf functions) are not inferred by this feature.
+
+Flag-3 link rows describe jump islands, not independent functions. Function
+recovery follows each validated parent-link chain and adds the island's mapped
+executable interval to the parent function's chunks. The interval ends at the
+next strictly ordered `.pdata` start, matching the interval used by the PE
+unwinder. Recovery requires the complete interval to be aligned, initialized,
+executable, and contained in one image segment. A final link row without a
+source-backed end remains unassigned and marks analysis incomplete. The link
+row's file provenance is retained as an additional unwind seed on the parent
+function. See Microsoft's [Arm64 pdata link format](https://learn.microsoft.com/en-us/cpp/build/arm64-exception-handling?view=msvc-170#pdata-record-links).
 
 The metadata reader preserves decoded operations for the debugger-independent live evaluator documented in [PE live-context unwinding](pe-live-unwind.md). That evaluator handles common register/stack recovery, but does not implement exception dispatch or interpret handler-specific payloads. The record layouts and unwind-code sizes follow [Microsoft's ARM64 exception handling documentation](https://learn.microsoft.com/en-us/cpp/build/arm64-exception-handling?view=msvc-170).
