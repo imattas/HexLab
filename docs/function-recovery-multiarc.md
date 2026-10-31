@@ -2,7 +2,7 @@
 
 Function recovery uses shared typed instruction facts for instruction length,
 flow kind, direct targets, mode changes, and bounded ownership. Current slices
-cover x86-16/32/64, AArch64, RV32, RV64 (including RV64C), NMOS 6502, MIPS32,
+cover x86-16/32/64, AArch64, RV32, RV64 (including RV64C), NMOS 6502/WDC 65C02, MIPS32,
 ARM A32, and Thumb. Roots come from image entries, source-backed ARM A32/Thumb
 profile roots, exports, defined function symbols (including verified PE/PDB procedure
 records), Mach-O function starts, explicit user
@@ -13,9 +13,9 @@ manual code-region roots are admitted before metadata-derived roots. Omitted
 automatic roots remain ownership boundaries, so the cap cannot make their
 bytes silently merge into another function.
 
-For flat NMOS 6502 images, the NMI, reset, and IRQ/BRK vector words at
+For flat NMOS 6502 and WDC 65C02 images, the NMI, reset, and IRQ/BRK vector words at
 `$FFFA`, `$FFFC`, and `$FFFE` can seed function entries. A vector is used only
-when its two little-endian bytes are readable in a mapped 6502 context and its
+when its two little-endian bytes are readable in a mapped 6502-family context and its
 nonzero target has that same architecture/mode; the vector slot is retained as
 the seed source. Ordinary executable-byte, root conflict, and budget checks
 still apply. This does not model cartridge banking, mirrored vector windows,
