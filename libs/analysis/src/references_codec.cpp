@@ -673,7 +673,7 @@ void validate_dyld_reference(const Reference &value) {
     }
     require(value.operand_index.has_value(), "Decoded dyld use lacks operand index");
     const bool control = value.kind == ReferenceKind::call || value.kind == ReferenceKind::jump ||
-                         value.kind == ReferenceKind::conditional_jump;
+                         value.kind == ReferenceKind::conditional_jump || value.kind == ReferenceKind::conditional_call;
     const bool memory = value.kind == ReferenceKind::memory_read || value.kind == ReferenceKind::memory_write ||
                         value.kind == ReferenceKind::memory_read_write || value.kind == ReferenceKind::memory_address;
     if (p.use == MachODyldUse::memory_slot) {
@@ -716,7 +716,7 @@ void validate_dyld_reference(const Reference &value) {
 }
 void validate_reference(const Reference &value) {
     require(!value.target.valueless_by_exception() &&
-                static_cast<unsigned>(value.kind) <= static_cast<unsigned>(ReferenceKind::dyld_fixup) &&
+                static_cast<unsigned>(value.kind) <= static_cast<unsigned>(ReferenceKind::conditional_call) &&
                 static_cast<unsigned>(value.access) <= static_cast<unsigned>(OperandAccess::address) &&
                 static_cast<unsigned>(value.provenance.kind) <=
                     static_cast<unsigned>(ReferenceProvenanceKind::elf_vtable_slot),
@@ -727,7 +727,7 @@ void validate_reference(const Reference &value) {
                  *value.provenance.target_mode == ExecutionMode::thumb) && target &&
                     std::holds_alternative<Address>(*target) &&
                     (value.kind == ReferenceKind::call || value.kind == ReferenceKind::jump ||
-                     value.kind == ReferenceKind::conditional_jump),
+                     value.kind == ReferenceKind::conditional_jump || value.kind == ReferenceKind::conditional_call),
                 "ARM target mode requires a resolved control-flow address");
     }
     require(value.provenance.producer_instruction_ids.size() <= 32,
@@ -773,7 +773,7 @@ void validate_reference(const Reference &value) {
     require(!value.operand_index || *value.operand_index < 16, "Reference operand index exceeds model bounds");
     const bool imported = value.kind == ReferenceKind::imported_call || value.kind == ReferenceKind::imported_jump;
     const bool control = imported || value.kind == ReferenceKind::call || value.kind == ReferenceKind::jump ||
-                         value.kind == ReferenceKind::conditional_jump;
+                         value.kind == ReferenceKind::conditional_jump || value.kind == ReferenceKind::conditional_call;
     const bool memory_kind = value.kind == ReferenceKind::memory_read || value.kind == ReferenceKind::memory_write ||
                              value.kind == ReferenceKind::memory_read_write ||
                              value.kind == ReferenceKind::memory_address;
@@ -893,7 +893,7 @@ void validate_reference(const Reference &value) {
     if (value.kind == ReferenceKind::memory_read_write)
         require(value.access == OperandAccess::read_write, "Memory read-write access mismatch");
     if (value.kind == ReferenceKind::memory_address || imported || value.kind == ReferenceKind::call ||
-        value.kind == ReferenceKind::jump || value.kind == ReferenceKind::conditional_jump)
+        value.kind == ReferenceKind::jump || value.kind == ReferenceKind::conditional_jump || value.kind == ReferenceKind::conditional_call)
         require(value.access == OperandAccess::address, "Control/address access mismatch");
     if (imported) {
         require(external_target && value.operand_index, "Import reference needs external identity and source operand");

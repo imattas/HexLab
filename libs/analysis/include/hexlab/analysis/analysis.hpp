@@ -5,7 +5,7 @@
 namespace hexlab {
 enum class StopReason { ret, trap, unsupported, invalid, truncated, unmapped, non_executable, uninitialized, indirect, budget, target_overflow, no_entry, elf_relocation, macho_relocation, macho_dyld, image_exclusion };
 struct AnalysisStop {Address address;StopReason reason;std::string detail;};
-enum class EdgeKind { fallthrough, branch, call, unresolved_call, unresolved_jump, delay_slot };
+enum class EdgeKind { fallthrough, branch, call, unresolved_call, unresolved_jump, delay_slot, conditional_call };
 struct CodeEdge {Address from;std::optional<Address> to;EdgeKind kind;};
 struct AnalysisSnapshot {
     std::vector<Instruction> instructions;

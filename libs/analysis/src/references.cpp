@@ -1,4 +1,5 @@
 #include "references_internal.hpp"
+#include "instruction_flow.hpp"
 #include "control_target.hpp"
 #include "mips64_reference_helpers.hpp"
 #include "a64_fields.hpp"
@@ -6546,7 +6547,8 @@ derive_reference_values(const Image *image, const FunctionSnapshot &functions, c
             if (instruction.flow != FlowKind::call && instruction.flow != FlowKind::jump &&
                 instruction.flow != FlowKind::conditional_branch)
                 continue;
-            const auto kind = instruction.flow == FlowKind::call   ? ReferenceKind::call
+            const auto kind = analysis_detail::is_mips_conditional_link_branch(instruction) ? ReferenceKind::conditional_call
+                              : instruction.flow == FlowKind::call   ? ReferenceKind::call
                               : instruction.flow == FlowKind::jump ? ReferenceKind::jump
                                                                    : ReferenceKind::conditional_jump;
             auto control_index = instruction.opcode == Opcode::rv_jalr && instruction.operands.size() > 1
