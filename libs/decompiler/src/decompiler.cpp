@@ -619,6 +619,13 @@ std::string operation_name(Opcode opcode) {
     case Opcode::m6502_plp: return "PLP"; case Opcode::m6502_jmp: return "JMP";
     case Opcode::m6502_jsr: return "JSR"; case Opcode::m6502_rts: return "RTS";
     case Opcode::m6502_rti: return "RTI"; case Opcode::m6502_brk: return "BRK";
+    case Opcode::m65c02_bra: return "BRA"; case Opcode::m65c02_stz: return "STZ";
+    case Opcode::m65c02_phx: return "PHX"; case Opcode::m65c02_plx: return "PLX";
+    case Opcode::m65c02_phy: return "PHY"; case Opcode::m65c02_ply: return "PLY";
+    case Opcode::m65c02_tsb: return "TSB"; case Opcode::m65c02_trb: return "TRB";
+    case Opcode::m65c02_rmb: return "RMB"; case Opcode::m65c02_smb: return "SMB";
+    case Opcode::m65c02_bbr: return "BBR"; case Opcode::m65c02_bbs: return "BBS";
+    case Opcode::m65c02_wai: return "WAI"; case Opcode::m65c02_stp: return "STP";
     case Opcode::m6502_bpl: return "BPL"; case Opcode::m6502_bmi: return "BMI";
     case Opcode::m6502_bvc: return "BVC"; case Opcode::m6502_bvs: return "BVS";
     case Opcode::m6502_bcc: return "BCC"; case Opcode::m6502_bcs: return "BCS";
@@ -2410,8 +2417,373 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
         return effect;
     }
 
+    const bool m65c02 = instruction.context.architecture == Architecture::mos6502 &&
+                        instruction.context.mode == ExecutionMode::m65c02;
+    if (m65c02) {
+        const RegisterOperand accumulator{RegisterBank::mos6502, 0, 8, false};
+        const RegisterOperand status{RegisterBank::mos6502, 3, 8, false};
+        const RegisterOperand stack_pointer{RegisterBank::mos6502, 4, 8, false};
+        const auto binary = [](std::string operation, ExpressionPtr left, ExpressionPtr right,
+                               std::uint16_t width = 8) -> ExpressionPtr {
+            return std::make_shared<Expression>(Expression{
+                integer_type(width), BinaryValue{std::move(operation), std::move(left), std::move(right)}});
+        };
+        const auto zero = constant_expr(0, 8);
+        const auto update_nz = [&](ExpressionPtr value, ExpressionPtr old_status) {
+            auto zero_flag = std::make_shared<Expression>(Expression{integer_type(8), UnaryValue{"zext",
+                boolean_binary("eq", value, zero)}});
+            return binary("or", binary("or", binary("and", std::move(old_status), constant_expr(0x7d, 8)),
+                binary("shl", std::move(zero_flag), constant_expr(1, 8))),
+                binary("and", std::move(value), constant_expr(0x80, 8)));
+        };
+        const bool load = instruction.opcode == Opcode::m6502_lda || instruction.opcode == Opcode::m6502_ldx ||
+                          instruction.opcode == Opcode::m6502_ldy;
+        const bool store = instruction.opcode == Opcode::m6502_sta || instruction.opcode == Opcode::m6502_stx ||
+                           instruction.opcode == Opcode::m6502_sty;
+        if ((load || store) && instruction.operands.size() == 1 && operands.size() == 1 && operands.front() &&
+            operands.front()->type == integer_type(8) && instruction.flow == FlowKind::fallthrough) {
+            const auto destination_index = instruction.opcode == Opcode::m6502_ldx ||
+                                           instruction.opcode == Opcode::m6502_stx ? 1u :
+                                           instruction.opcode == Opcode::m6502_ldy ||
+                                           instruction.opcode == Opcode::m6502_sty ? 2u : 0u;
+            const RegisterOperand value_register{RegisterBank::mos6502,
+                static_cast<std::uint8_t>(destination_index), 8, false};
+            const auto valid_memory_index = [&](const MemoryOperand *memory) {
+                if (!memory || !memory->index) return true;
+                if (memory->index->bank != RegisterBank::mos6502 || memory->index->width != 8) return false;
+                if (instruction.opcode == Opcode::m6502_ldx || instruction.opcode == Opcode::m6502_stx)
+                    return memory->index->index == 2;
+                if (instruction.opcode == Opcode::m6502_ldy || instruction.opcode == Opcode::m6502_sty)
+                    return memory->index->index == 1;
+                return memory->index->index == 1 || memory->index->index == 2;
+            };
+            if (load) {
+                const auto *immediate = std::get_if<ImmediateOperand>(&instruction.operands.front());
+                const auto *memory = std::get_if<MemoryOperand>(&instruction.operands.front());
+                const bool immediate_form = immediate && immediate->encoded_width == 8 &&
+                    immediate->effective_width == 8 && !immediate->is_signed && immediate->value <= 0xff &&
+                    !instruction.memory_read;
+                const bool memory_form = memory && memory->data_width == 8 && memory->address_width == 16 &&
+                    instruction.memory_read && !memory->ip_relative && !memory->base &&
+                    valid_memory_index(memory) && std::holds_alternative<MemoryValue>(operands.front()->value);
+                std::vector<RegisterOperand> expected_reads;
+                if (memory && memory->index) expected_reads.push_back(*memory->index);
+                expected_reads.push_back(status);
+                if ((immediate_form || memory_form) && !instruction.memory_write &&
+                    instruction.access == std::vector<OperandAccess>{OperandAccess::read} &&
+                    instruction.register_reads == expected_reads &&
+                    instruction.register_writes == std::vector<RegisterOperand>{value_register, status}) {
+                    auto zero_flag = std::make_shared<Expression>(Expression{integer_type(8), UnaryValue{"zext",
+                        boolean_binary("eq", operands.front(), zero)}});
+                    auto new_status = binary("or", binary("or", binary("and", reg_expr(status),
+                        constant_expr(0x7d, 8)), binary("shl", std::move(zero_flag), constant_expr(1, 8))),
+                        binary("and", operands.front(), constant_expr(0x80, 8)));
+                    Intrinsic effect{"m65c02_load", {operands.front(), reg_expr(status)},
+                        memory_form ? IntrinsicMemoryEffect::read : IntrinsicMemoryEffect::none};
+                    effect.register_writes = {value_register, status};
+                    effect.register_output_values = {operands.front(), std::move(new_status)};
+                    return effect;
+                }
+            } else {
+                const auto *memory = std::get_if<MemoryOperand>(&instruction.operands.front());
+                std::vector<RegisterOperand> expected_reads;
+                if (memory && memory->index) expected_reads.push_back(*memory->index);
+                expected_reads.push_back(value_register);
+                if (memory && memory->data_width == 8 && memory->address_width == 16 &&
+                    !memory->ip_relative && !memory->base && instruction.access ==
+                        std::vector<OperandAccess>{OperandAccess::write} && !instruction.memory_read &&
+                    instruction.memory_write && instruction.register_reads == expected_reads &&
+                    instruction.register_writes.empty() && valid_memory_index(memory) &&
+                    std::holds_alternative<MemoryValue>(operands.front()->value))
+                    return Store{operands.front(), reg_expr(value_register)};
+            }
+        }
+        const bool logical = instruction.opcode == Opcode::m6502_and || instruction.opcode == Opcode::m6502_ora ||
+                             instruction.opcode == Opcode::m6502_eor;
+        if (logical && instruction.operands.size() == 1 && operands.size() == 1 && operands.front() &&
+            operands.front()->type == integer_type(8) && instruction.flow == FlowKind::fallthrough &&
+            instruction.access == std::vector<OperandAccess>{OperandAccess::read} && !instruction.memory_write &&
+            instruction.register_writes == std::vector<RegisterOperand>{accumulator, status}) {
+            const auto *immediate = std::get_if<ImmediateOperand>(&instruction.operands.front());
+            const auto *memory = std::get_if<MemoryOperand>(&instruction.operands.front());
+            const bool immediate_form = immediate && immediate->encoded_width == 8 && immediate->effective_width == 8 &&
+                !immediate->is_signed && immediate->value <= 0xff && !instruction.memory_read;
+            const bool valid_memory_index = !memory || !memory->index ||
+                (memory->index->bank == RegisterBank::mos6502 && memory->index->width == 8 &&
+                 (memory->index->index == 1 || memory->index->index == 2));
+            const bool memory_form = memory && memory->data_width == 8 && memory->address_width == 16 &&
+                instruction.memory_read && !memory->base && !memory->ip_relative && valid_memory_index &&
+                std::holds_alternative<MemoryValue>(operands.front()->value);
+            std::vector<RegisterOperand> expected_reads;
+            if (memory && memory->index) expected_reads.push_back(*memory->index);
+            expected_reads.push_back(accumulator);
+            expected_reads.push_back(status);
+            if ((immediate_form || memory_form) && instruction.register_reads == expected_reads) {
+                const auto operation = instruction.opcode == Opcode::m6502_and ? "and" :
+                                       instruction.opcode == Opcode::m6502_ora ? "or" : "xor";
+                const auto result = binary(operation, reg_expr(accumulator), operands.front());
+                Intrinsic effect{instruction.opcode == Opcode::m6502_and ? "m65c02_and" :
+                                 instruction.opcode == Opcode::m6502_ora ? "m65c02_ora" : "m65c02_eor",
+                    {reg_expr(accumulator), operands.front(), reg_expr(status)},
+                    memory_form ? IntrinsicMemoryEffect::read : IntrinsicMemoryEffect::none};
+                effect.register_writes = {accumulator, status};
+                effect.register_output_values = {result, update_nz(result, reg_expr(status))};
+                return effect;
+            }
+        }
+        const bool compare = instruction.opcode == Opcode::m6502_cmp || instruction.opcode == Opcode::m6502_cpx ||
+                             instruction.opcode == Opcode::m6502_cpy;
+        if (compare && instruction.operands.size() == 1 && operands.size() == 1 && operands.front() &&
+            operands.front()->type == integer_type(8) && instruction.flow == FlowKind::fallthrough &&
+            instruction.access == std::vector<OperandAccess>{OperandAccess::read} && !instruction.memory_write &&
+            instruction.register_writes == std::vector<RegisterOperand>{status}) {
+            const auto compared_index = instruction.opcode == Opcode::m6502_cpx ? 1u :
+                                        instruction.opcode == Opcode::m6502_cpy ? 2u : 0u;
+            const RegisterOperand compared{RegisterBank::mos6502, static_cast<std::uint8_t>(compared_index), 8, false};
+            const auto *immediate = std::get_if<ImmediateOperand>(&instruction.operands.front());
+            const auto *memory = std::get_if<MemoryOperand>(&instruction.operands.front());
+            const bool immediate_form = immediate && immediate->encoded_width == 8 && immediate->effective_width == 8 &&
+                !immediate->is_signed && immediate->value <= 0xff && !instruction.memory_read;
+            const bool valid_memory_index = !memory || !memory->index ||
+                (memory->index->bank == RegisterBank::mos6502 && memory->index->width == 8 &&
+                 (memory->index->index == 1 || memory->index->index == 2));
+            const bool memory_form = memory && memory->data_width == 8 && memory->address_width == 16 &&
+                instruction.memory_read && !memory->base && !memory->ip_relative && valid_memory_index &&
+                std::holds_alternative<MemoryValue>(operands.front()->value);
+            std::vector<RegisterOperand> expected_reads;
+            if (memory && memory->index) expected_reads.push_back(*memory->index);
+            expected_reads.push_back(compared);
+            expected_reads.push_back(status);
+            if ((immediate_form || memory_form) && instruction.register_reads == expected_reads) {
+                const auto difference = binary("and", binary("sub", reg_expr(compared), operands.front()),
+                    constant_expr(0xff, 8));
+                const auto carry = boolean_binary("uge", reg_expr(compared), operands.front());
+                const auto equal = boolean_binary("eq", reg_expr(compared), operands.front());
+                const auto negative = boolean_binary("bit_extract", difference, constant_expr(7, 8));
+                auto carry_flag = std::make_shared<Expression>(Expression{integer_type(8), UnaryValue{"zext", carry}});
+                auto zero_flag = std::make_shared<Expression>(Expression{integer_type(8), UnaryValue{"zext", equal}});
+                auto negative_flag = std::make_shared<Expression>(Expression{integer_type(8), UnaryValue{"zext", negative}});
+                auto updated_status = binary("or", binary("or", binary("or",
+                    binary("and", reg_expr(status), constant_expr(0x7c, 8)), std::move(carry_flag)),
+                    binary("shl", std::move(zero_flag), constant_expr(1, 8))),
+                    binary("shl", std::move(negative_flag), constant_expr(7, 8)));
+                Intrinsic effect{instruction.opcode == Opcode::m6502_cmp ? "m65c02_cmp" :
+                                 instruction.opcode == Opcode::m6502_cpx ? "m65c02_cpx" : "m65c02_cpy",
+                    {reg_expr(compared), operands.front(), reg_expr(status)},
+                    memory_form ? IntrinsicMemoryEffect::read : IntrinsicMemoryEffect::none};
+                effect.register_writes = {status};
+                effect.register_output_values = {std::move(updated_status)};
+                return effect;
+            }
+        }
+        const auto opcode = instruction.opcode;
+        const bool accumulator_adjust = opcode == Opcode::m6502_inc || opcode == Opcode::m6502_dec;
+        const bool index_adjust = opcode == Opcode::m6502_inx || opcode == Opcode::m6502_dex ||
+                                  opcode == Opcode::m6502_iny || opcode == Opcode::m6502_dey;
+        if ((accumulator_adjust || index_adjust) && instruction.flow == FlowKind::fallthrough) {
+            const bool increment = opcode == Opcode::m6502_inc || opcode == Opcode::m6502_inx ||
+                                   opcode == Opcode::m6502_iny;
+            const RegisterOperand target{RegisterBank::mos6502,
+                static_cast<std::uint8_t>(opcode == Opcode::m6502_inx || opcode == Opcode::m6502_dex ? 1 :
+                                          opcode == Opcode::m6502_iny || opcode == Opcode::m6502_dey ? 2 : 0), 8, false};
+            const bool accumulator_form = accumulator_adjust && instruction.operands.size() == 1 &&
+                operands.size() == 1 && std::get_if<RegisterOperand>(&instruction.operands.front()) &&
+                std::get<RegisterOperand>(instruction.operands.front()) == target &&
+                instruction.access == std::vector<OperandAccess>{OperandAccess::read_write} &&
+                !instruction.memory_read && !instruction.memory_write &&
+                instruction.register_reads == std::vector<RegisterOperand>{target, status} &&
+                instruction.register_writes == std::vector<RegisterOperand>{target, status};
+            const bool index_form = index_adjust && instruction.operands.empty() && operands.empty() &&
+                instruction.access.empty() && !instruction.memory_read && !instruction.memory_write &&
+                instruction.register_reads == std::vector<RegisterOperand>{target, status} &&
+                instruction.register_writes == std::vector<RegisterOperand>{target, status};
+            const auto *memory = accumulator_adjust && instruction.operands.size() == 1
+                ? std::get_if<MemoryOperand>(&instruction.operands.front()) : nullptr;
+            std::vector<RegisterOperand> memory_reads;
+            if (memory && memory->index) memory_reads.push_back(*memory->index);
+            memory_reads.push_back(status);
+            const bool memory_form = memory && operands.size() == 1 && operands.front() &&
+                operands.front()->type == integer_type(8) && std::holds_alternative<MemoryValue>(operands.front()->value) &&
+                memory->data_width == 8 && memory->address_width == 16 && !memory->base && !memory->ip_relative &&
+                (!memory->index || (memory->index->bank == RegisterBank::mos6502 && memory->index->width == 8 &&
+                    memory->index->index == 1)) &&
+                instruction.access == std::vector<OperandAccess>{OperandAccess::read_write} &&
+                instruction.memory_read && instruction.memory_write &&
+                instruction.register_reads == memory_reads &&
+                instruction.register_writes == std::vector<RegisterOperand>{status};
+            if (accumulator_form || index_form) {
+                const auto value = binary("and",
+                    binary(increment ? "add" : "sub", reg_expr(target), constant_expr(1, 8)), constant_expr(0xff, 8));
+                Intrinsic effect{accumulator_form ? "m65c02_accumulator_increment" : "m65c02_index_increment",
+                    {reg_expr(target), reg_expr(status)}, IntrinsicMemoryEffect::none};
+                effect.register_writes = {target, status};
+                effect.register_output_values = {value, update_nz(value, reg_expr(status))};
+                return effect;
+            }
+            if (memory_form) {
+                const auto old_byte = operands.front();
+                const auto value = binary(increment ? "add" : "sub", old_byte, constant_expr(1, 8));
+                const auto result = binary("and", value, constant_expr(0xff, 8));
+                Intrinsic effect{increment ? "m65c02_memory_increment" : "m65c02_memory_decrement",
+                    {old_byte, result, reg_expr(status)}, IntrinsicMemoryEffect::read_write};
+                effect.register_writes = {status};
+                effect.register_output_values = {update_nz(result, reg_expr(status))};
+                effect.memory_output = IntrinsicMemoryOutput{0, 1};
+                return effect;
+            }
+        }
+        const bool push_index = instruction.opcode == Opcode::m65c02_phx ||
+                                instruction.opcode == Opcode::m65c02_phy;
+        const bool pull_index = instruction.opcode == Opcode::m65c02_plx ||
+                                instruction.opcode == Opcode::m65c02_ply;
+        if ((push_index || pull_index) && instruction.operands.empty() && operands.empty() &&
+            instruction.flow == FlowKind::fallthrough && instruction.access.empty()) {
+            const RegisterOperand value_register{RegisterBank::mos6502,
+                static_cast<std::uint8_t>(instruction.opcode == Opcode::m65c02_phy ||
+                                          instruction.opcode == Opcode::m65c02_ply ? 2 : 1), 8, false};
+            if (push_index && !instruction.memory_read && instruction.memory_write &&
+                instruction.register_reads == std::vector<RegisterOperand>{value_register, stack_pointer} &&
+                instruction.register_writes == std::vector<RegisterOperand>{stack_pointer}) {
+                Intrinsic effect{instruction.opcode == Opcode::m65c02_phx
+                        ? "m65c02_phx_stack_write_page_0100_wrap" : "m65c02_phy_stack_write_page_0100_wrap",
+                    {reg_expr(value_register), reg_expr(stack_pointer), constant_expr(0x0100, 16)},
+                    IntrinsicMemoryEffect::write};
+                effect.register_writes = {stack_pointer};
+                effect.register_output_values = {binary("and",
+                    binary("sub", reg_expr(stack_pointer), constant_expr(1, 8)), constant_expr(0xff, 8))};
+                return effect;
+            }
+            if (pull_index && instruction.memory_read && !instruction.memory_write &&
+                instruction.register_reads == std::vector<RegisterOperand>{stack_pointer, status} &&
+                instruction.register_writes == std::vector<RegisterOperand>{value_register, stack_pointer, status}) {
+                auto pulled = std::make_shared<Expression>(Expression{integer_type(8),
+                    UnknownValue{instruction.opcode == Opcode::m65c02_plx
+                        ? "PLX byte pulled from $0100 | ((S+1)&$ff)" :
+                          "PLY byte pulled from $0100 | ((S+1)&$ff)"}});
+                const auto new_sp = binary("and", binary("add", reg_expr(stack_pointer), constant_expr(1, 8)),
+                    constant_expr(0xff, 8));
+                auto zero_flag = std::make_shared<Expression>(Expression{integer_type(8), UnaryValue{"zext",
+                    boolean_binary("eq", pulled, zero)}});
+                auto negative_flag = std::make_shared<Expression>(Expression{integer_type(8), UnaryValue{"zext",
+                    boolean_binary("bit_extract", pulled, constant_expr(7, 8))}});
+                auto new_status = binary("or", binary("or", binary("and", reg_expr(status), constant_expr(0x7d, 8)),
+                    binary("shl", std::move(zero_flag), constant_expr(1, 8))),
+                    binary("shl", std::move(negative_flag), constant_expr(7, 8)));
+                Intrinsic effect{instruction.opcode == Opcode::m65c02_plx
+                        ? "m65c02_plx_stack_read_page_0100_wrap" : "m65c02_ply_stack_read_page_0100_wrap",
+                    {reg_expr(stack_pointer)}, IntrinsicMemoryEffect::read};
+                effect.register_writes = {value_register, stack_pointer, status};
+                effect.register_output_values = {pulled, new_sp, new_status};
+                return effect;
+            }
+        }
+        if (instruction.opcode == Opcode::m65c02_stz && instruction.operands.size() == 1 &&
+            operands.size() == 1 && is_memory(instruction.operands.front()) &&
+            instruction.access == std::vector<OperandAccess>{OperandAccess::write} &&
+            !instruction.memory_read && instruction.memory_write &&
+            instruction.flow == FlowKind::fallthrough) {
+            const auto *memory = std::get_if<MemoryOperand>(&instruction.operands.front());
+            if (memory && memory->data_width == 8 && memory->address_width == 16 &&
+                !memory->base && !memory->ip_relative &&
+                (!memory->index || *memory->index == RegisterOperand{RegisterBank::mos6502, 1, 8, false}) &&
+                operands.front() && operands.front()->type == integer_type(8) &&
+                std::holds_alternative<MemoryValue>(operands.front()->value))
+                return Store{operands.front(), zero};
+        }
+        if ((instruction.opcode == Opcode::m65c02_tsb || instruction.opcode == Opcode::m65c02_trb) &&
+            instruction.operands.size() == 1 && operands.size() == 1 && is_memory(instruction.operands.front()) &&
+            instruction.access == std::vector<OperandAccess>{OperandAccess::read_write} &&
+            instruction.memory_read && instruction.memory_write &&
+            instruction.flow == FlowKind::fallthrough &&
+            instruction.register_reads == std::vector<RegisterOperand>{accumulator, status} &&
+            instruction.register_writes == std::vector<RegisterOperand>{status} &&
+            operands.front() && operands.front()->type == integer_type(8) &&
+            std::holds_alternative<MemoryValue>(operands.front()->value)) {
+            const auto *memory = std::get_if<MemoryOperand>(&instruction.operands.front());
+            if (memory && memory->data_width == 8 && memory->address_width == 16 &&
+                !memory->base && !memory->index && !memory->ip_relative) {
+                const auto old_byte = operands.front();
+                ExpressionPtr written = instruction.opcode == Opcode::m65c02_tsb
+                    ? binary("or", old_byte, reg_expr(accumulator))
+                    : binary("and", old_byte, binary("xor", reg_expr(accumulator), constant_expr(0xff, 8)));
+                auto status_value = reg_expr(status);
+                auto tested = binary("and", old_byte, reg_expr(accumulator));
+                auto zero_flag = std::make_shared<Expression>(Expression{integer_type(8), UnaryValue{"zext",
+                    boolean_binary("eq", std::move(tested), zero)}});
+                auto updated_status = binary("or", binary("and", status_value, constant_expr(0xfd, 8)),
+                    binary("shl", std::move(zero_flag), constant_expr(1, 8)));
+                Intrinsic effect{instruction.opcode == Opcode::m65c02_tsb ? "m65c02_tsb" : "m65c02_trb",
+                    {old_byte, written, reg_expr(accumulator), status_value}, IntrinsicMemoryEffect::read_write};
+                effect.register_writes = {status};
+                effect.register_output_values = {std::move(updated_status)};
+                effect.memory_output = IntrinsicMemoryOutput{0, 1};
+                return effect;
+            }
+        }
+        if (instruction.opcode == Opcode::m6502_bit && instruction.operands.size() == 1 && operands.size() == 1 &&
+            operands.front() && operands.front()->type == integer_type(8) &&
+            instruction.access == std::vector<OperandAccess>{OperandAccess::read} &&
+            !instruction.memory_write && instruction.flow == FlowKind::fallthrough &&
+            instruction.register_reads == std::vector<RegisterOperand>{accumulator, status} &&
+            instruction.register_writes == std::vector<RegisterOperand>{status}) {
+            const auto *immediate = std::get_if<ImmediateOperand>(&instruction.operands.front());
+            const auto *memory = std::get_if<MemoryOperand>(&instruction.operands.front());
+            const bool immediate_form = immediate && !instruction.memory_read && immediate->effective_width == 8 &&
+                immediate->encoded_width == 8 && !immediate->is_signed && immediate->value <= 0xff;
+            const bool indexed_form = memory && instruction.memory_read && memory->data_width == 8 &&
+                memory->address_width == 16 && !memory->base && !memory->ip_relative &&
+                memory->index == RegisterOperand{RegisterBank::mos6502, 1, 8, false};
+            if (immediate_form || indexed_form) {
+                const auto value = operands.front();
+                const auto tested = binary("and", reg_expr(accumulator), value);
+                auto zero_flag = std::make_shared<Expression>(Expression{integer_type(8), UnaryValue{"zext",
+                    boolean_binary("eq", tested, zero)}});
+                ExpressionPtr updated_status = binary("or", binary("and", reg_expr(status),
+                    constant_expr(immediate_form ? 0xfd : 0x3d, 8)),
+                    binary("shl", std::move(zero_flag), constant_expr(1, 8)));
+                if (indexed_form) {
+                    auto negative_flag = std::make_shared<Expression>(Expression{integer_type(8), UnaryValue{"zext",
+                        boolean_binary("bit_extract", value, constant_expr(7, 8))}});
+                    auto overflow_flag = std::make_shared<Expression>(Expression{integer_type(8), UnaryValue{"zext",
+                        boolean_binary("bit_extract", value, constant_expr(6, 8))}});
+                    updated_status = binary("or", std::move(updated_status),
+                        binary("shl", std::move(negative_flag), constant_expr(7, 8)));
+                    updated_status = binary("or", std::move(updated_status),
+                        binary("shl", std::move(overflow_flag), constant_expr(6, 8)));
+                }
+                Intrinsic effect{immediate_form ? "m65c02_bit_immediate" : "m65c02_bit_indexed",
+                    {value, reg_expr(accumulator), reg_expr(status)},
+                    indexed_form ? IntrinsicMemoryEffect::read : IntrinsicMemoryEffect::none};
+                effect.register_writes = {status};
+                effect.register_output_values = {std::move(updated_status)};
+                return effect;
+            }
+        }
+        if ((instruction.opcode == Opcode::m65c02_rmb || instruction.opcode == Opcode::m65c02_smb) &&
+            instruction.condition < 8 && instruction.operands.size() == 1 && operands.size() == 1 &&
+            is_memory(instruction.operands.front()) &&
+            instruction.access == std::vector<OperandAccess>{OperandAccess::read_write} &&
+            instruction.memory_read && instruction.memory_write &&
+            instruction.flow == FlowKind::fallthrough && instruction.register_reads.empty() &&
+            instruction.register_writes.empty() && operands.front() && operands.front()->type == integer_type(8) &&
+            std::holds_alternative<MemoryValue>(operands.front()->value)) {
+            const auto *memory = std::get_if<MemoryOperand>(&instruction.operands.front());
+            if (memory && memory->data_width == 8 && memory->address_width == 16 &&
+                !memory->base && !memory->index && !memory->ip_relative) {
+                const auto old_byte = operands.front();
+                const auto mask = std::uint64_t{1} << instruction.condition;
+                const auto written = instruction.opcode == Opcode::m65c02_smb
+                    ? binary("or", old_byte, constant_expr(mask, 8))
+                    : binary("and", old_byte, constant_expr(0xffu ^ mask, 8));
+                Intrinsic effect{instruction.opcode == Opcode::m65c02_smb ? "m65c02_smb" : "m65c02_rmb",
+                    {old_byte, written}, IntrinsicMemoryEffect::read_write};
+                effect.memory_output = IntrinsicMemoryOutput{0, 1};
+                return effect;
+            }
+        }
+    }
     const bool m6502 = instruction.context.architecture == Architecture::mos6502 &&
-                       instruction.context.mode == ExecutionMode::m6502;
+                       (instruction.context.mode == ExecutionMode::m6502 || m65c02);
     if (m6502) {
         const RegisterOperand accumulator{RegisterBank::mos6502, 0, 8, false};
         const RegisterOperand index_x{RegisterBank::mos6502, 1, 8, false};
@@ -2511,7 +2883,8 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
             if (pointer && !pointer->base && !pointer->index && !pointer->ip_relative &&
                 pointer->displacement >= 0 && pointer->displacement <= UINT16_MAX) {
                 const auto slot = static_cast<std::uint16_t>(pointer->displacement);
-                const auto high_slot = static_cast<std::uint16_t>((slot & 0xff00u) | ((slot + 1u) & 0x00ffu));
+                const auto high_slot = m65c02 ? static_cast<std::uint16_t>(slot + 1u) :
+                    static_cast<std::uint16_t>((slot & 0xff00u) | ((slot + 1u) & 0x00ffu));
                 const auto byte_load = [&](std::uint16_t address) -> ExpressionPtr {
                     MemoryValue value;
                     value.type = integer_type(8);
@@ -2717,6 +3090,13 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
                 const auto binary_status = binary("or",
                     binary("or", binary("or", preserved, bit(carry, 0)), bit(zero, 1)),
                     binary("or", bit(overflow, 6), bit(negative, 7)));
+                const auto corrected_cmos_status = [&](ExpressionPtr corrected, ExpressionPtr decimal_carry) {
+                    const auto corrected_zero = boolean_binary("eq", corrected, constant_expr(0, 8));
+                    const auto corrected_negative = boolean_binary("bit_extract", corrected, constant_expr(7, 8));
+                    return binary("or", binary("or", binary("or", preserved, bit(decimal_carry, 0)),
+                        bit(corrected_zero, 1)),
+                        binary("or", bit(overflow, 6), bit(corrected_negative, 7)));
+                };
                 const auto decimal_bit = boolean_binary("bit_extract", status_value, constant_expr(3, 8));
                 ExpressionPtr decimal_result;
                 ExpressionPtr decimal_status;
@@ -2754,12 +3134,17 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
                     const auto valid_high_b = boolean_binary("ule", binary("shr", rhs, constant_expr(4, 8)), constant_expr(9, 8));
                     const auto valid = boolean_binary("and", boolean_binary("and", valid_a, valid_b),
                         boolean_binary("and", valid_high_a, valid_high_b));
-                    decimal_result = binary("select_if", valid, binary("pair", corrected_byte, decimal_unknown));
                     const auto valid_status = binary("or",
                         binary("or", binary("or", preserved, bit(decimal_carry, 0)), bit(zero, 1)),
                         binary("or", bit(decimal_overflow, 6), bit(decimal_negative, 7)));
-                    decimal_status = binary("select_if", valid,
-                        binary("pair", valid_status, binary("or", preserved, decimal_unknown_flags)));
+                    if (m65c02) {
+                        decimal_result = corrected_byte;
+                        decimal_status = corrected_cmos_status(corrected_byte, decimal_carry);
+                    } else {
+                        decimal_result = binary("select_if", valid, binary("pair", corrected_byte, decimal_unknown));
+                        decimal_status = binary("select_if", valid,
+                            binary("pair", valid_status, binary("or", preserved, decimal_unknown_flags)));
+                    }
                 } else {
                     const auto borrow = boolean_unary("not", carry_in);
                     const auto low_a = binary("and", lhs, constant_expr(0x0f, 8));
@@ -2792,18 +3177,25 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
                     const auto valid_high_b = boolean_binary("ule", binary("shr", rhs, constant_expr(4, 8)), constant_expr(9, 8));
                     const auto valid = boolean_binary("and", boolean_binary("and", valid_a, valid_b),
                         boolean_binary("and", valid_high_a, valid_high_b));
-                    decimal_result = binary("select_if", valid, binary("pair", corrected_byte, decimal_unknown));
                     const auto valid_status = binary("or",
                         binary("or", binary("or", preserved, bit(carry, 0)), bit(zero, 1)),
                         binary("or", bit(decimal_overflow, 6), bit(decimal_negative, 7)));
-                    decimal_status = binary("select_if", valid,
-                        binary("pair", valid_status, binary("or", preserved, decimal_unknown_flags)));
+                    if (m65c02) {
+                        decimal_result = corrected_byte;
+                        decimal_status = corrected_cmos_status(corrected_byte,
+                            boolean_unary("not", high_borrow));
+                    } else {
+                        decimal_result = binary("select_if", valid, binary("pair", corrected_byte, decimal_unknown));
+                        decimal_status = binary("select_if", valid,
+                            binary("pair", valid_status, binary("or", preserved, decimal_unknown_flags)));
+                    }
                 }
                 const auto alternatives = binary("pair", decimal_result, result_byte);
                 const auto selected_result = binary("select_if", decimal_bit, alternatives);
                 const auto status_alternatives = binary("pair", decimal_status, binary_status);
                 const auto selected_status = binary("select_if", decimal_bit, status_alternatives);
                 Intrinsic effect{rra ? "m6502_rra_ror_then_adc" : isc ? "m6502_isc_increment_then_sbc" :
+                    m65c02 ? (subtract ? "m65c02_sbc" : "m65c02_adc") :
                     subtract ? "m6502_sbc" : "m6502_adc",
                     (rra || isc) ? std::vector<ExpressionPtr>{old_byte, rhs, reg_expr(accumulator), status_value} :
                           std::vector<ExpressionPtr>{},
@@ -4661,6 +5053,23 @@ a64_unhandled:
         Branch branch{condition, instruction.direct_target, {}};
         if (instruction.flow == FlowKind::jump && !instruction.direct_target && !operands.empty())
             branch.indirect_target = operands.front();
+        if (m65c02 && (instruction.opcode == Opcode::m65c02_bbr || instruction.opcode == Opcode::m65c02_bbs) &&
+            instruction.condition < 8 && instruction.operands.size() == 2 && operands.size() == 2 &&
+            operands.front() && operands.front()->type == integer_type(8) &&
+            std::holds_alternative<MemoryValue>(operands.front()->value)) {
+            const auto *memory = std::get_if<MemoryOperand>(&instruction.operands.front());
+            if (memory && memory->data_width == 8 && memory->address_width == 16 &&
+                !memory->base && !memory->index && !memory->ip_relative &&
+                instruction.access == std::vector<OperandAccess>{OperandAccess::read, OperandAccess::address} &&
+                instruction.memory_read && !instruction.memory_write && instruction.direct_target) {
+                const auto mask = std::uint64_t{1} << instruction.condition;
+                const auto selected = std::make_shared<Expression>(Expression{integer_type(8),
+                    BinaryValue{"and", operands.front(), constant_expr(mask, 8)}});
+                branch.predicate = boolean_binary(instruction.opcode == Opcode::m65c02_bbs ? "ne" : "eq",
+                    selected, constant_expr(0, 8));
+                branch.condition = "predicate";
+            }
+        }
         if (a64 && instruction.opcode == Opcode::a64_b_cond && instruction.condition < 14) {
             branch.predicate = a64_nzcv_predicate(instruction.condition,
                 reg_expr({RegisterBank::arm_flags, 0, 4, false}));
@@ -9147,6 +9556,19 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
             [](const LiftedInstruction &instruction) { return std::holds_alternative<Return>(instruction.statement); });
     };
 
+    // These CIL operations explicitly terminate rather than return. Arbitrary
+    // intrinsics and calls do not prove that a path cannot return.
+    auto has_only_terminal_nonreturn = [](const LiftedBlock &block) {
+        if (block.instructions.empty() || !block.successors.empty()) return false;
+        const auto *terminal = std::get_if<Intrinsic>(&block.instructions.back().statement);
+        if (!terminal || (terminal->name != "throw" && terminal->name != "rethrow_current_exception" &&
+                          terminal->name != "exception_unhandled")) return false;
+        return std::none_of(block.instructions.begin(), block.instructions.end() - 1,
+            [](const LiftedInstruction &instruction) {
+                return std::holds_alternative<Branch>(instruction.statement) ||
+                       std::holds_alternative<Return>(instruction.statement);
+            });
+    };
     const auto *entry = find_block(function.entry);
     if (!entry) return fallback("function entry block is absent");
 
@@ -10164,12 +10586,11 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
     if (auto structured = try_ssa_post_tested_loop()) return *structured;
 
     // A post-tested loop may begin at a conditional body dispatcher after a
-    // straight-line function-entry/preheader chain. Its disjoint arms can
-    // finish at separate conditional latches which either repeat at the
-    // dispatcher or leave through one shared return. Keep this recognizer
-    // deliberately narrower than the general loop path: it requires two
-    // exact latch edges and rejects memory SSA rather than guessing copies.
-    auto try_explicit_preheader_two_latch_loop = [&]() -> std::optional<StructuredPseudocode> {
+    // straight-line function-entry/preheader chain. Bounded nested dispatch
+    // trees can lead to multiple conditional latches which either repeat at
+    // the dispatcher or leave through one shared return. Every dispatch arm,
+    // latch, and phi edge is validated before emitting this form.
+    auto try_explicit_preheader_multi_latch_loop = [&]() -> std::optional<StructuredPseudocode> {
         if (function.blocks.size() < 5 || function.blocks.size() > 128) return {};
         std::map<std::uint64_t, std::set<std::uint64_t>> predecessors;
         std::set<std::uint64_t> ids;
@@ -10185,6 +10606,7 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                 if (++edge_count > 4096 || !edge.target) return {};
                 const auto *target = find_block(*edge.target);
                 if (!target || !edge_targets(edge, target->begin) ||
+                    (edge.block && edge.block->value != target->id.value) ||
                     !targets.insert(target->id.value).second) return {};
                 predecessors[target->id.value].insert(block.id.value);
             }
@@ -10208,71 +10630,99 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
             return {};
         const auto *dispatch = terminal_conditional(*header);
         const auto *preheader = preheader_path.back();
-        if (!preheader || !has_unconditional_edge(*preheader, header->begin) ||
-            predecessors[header->id.value].size() != 3) return {};
+        if (!preheader || !has_unconditional_edge(*preheader, header->begin)) return {};
 
-        struct LatchArm {
-            std::vector<const LiftedBlock *> body;
-            const LiftedBlock *latch = nullptr;
+        struct LatchTreeNode {
+            std::vector<const LiftedBlock *> path;
+            const LiftedBlock *branch_block = nullptr;
             const Branch *condition = nullptr;
+            bool latch = false;
             bool repeat_on_true = false;
-            const LiftedBlock *exit = nullptr;
+            std::size_t true_child = 0;
+            std::size_t false_child = 0;
         };
-        const auto trace_arm = [&](Address start) -> std::optional<LatchArm> {
-            LatchArm arm;
-            auto *current = find_block(start);
-            auto predecessor = header->id.value;
+        std::vector<LatchTreeNode> tree;
+        std::vector<std::size_t> roots;
+        std::set<std::uint64_t> claimed;
+        std::set<std::uint64_t> latch_ids;
+        std::optional<Address> shared_exit_address;
+        if (!claimed.insert(header->id.value).second) return {};
+        for (const auto *block : preheader_path)
+            if (!claimed.insert(block->id.value).second) return {};
+
+        std::function<std::optional<std::size_t>(Address, std::uint64_t, unsigned)> trace_tree;
+        trace_tree = [&](Address start, std::uint64_t initial_predecessor,
+                         unsigned depth) -> std::optional<std::size_t> {
+            if (depth >= 64 || tree.size() >= 127) return {};
+            LatchTreeNode node;
             std::set<std::uint64_t> seen;
-            while (current && current != header && arm.body.size() < 64 &&
+            auto *current = find_block(start);
+            auto predecessor = initial_predecessor;
+            while (current && current != header && node.path.size() < 64 &&
                    seen.insert(current->id.value).second &&
                    predecessors[current->id.value] == std::set<std::uint64_t>{predecessor}) {
                 if (!current->phis.empty() || current->switch_dispatch || contains_return(*current) ||
                     current->memory_phi || !current->memory_partition_phis.empty() ||
-                    !has_only_simple_statements(*current)) return {};
-                const auto *test = terminal_conditional(*current);
-                if (test) {
-                    if (!conditional_edges_match_targets(*current, *test) || current->successors.size() != 2 ||
-                        !test->true_target || !test->false_target ||
-                        (*test->true_target == header->begin) == (*test->false_target == header->begin)) return {};
-                    const auto exit_address = *test->true_target == header->begin
-                        ? *test->false_target : *test->true_target;
-                    const auto *exit = find_block(exit_address);
-                    if (!exit || exit == header || exit == preheader || current == preheader) return {};
-                    arm.latch = current;
-                    arm.condition = test;
-                    arm.repeat_on_true = *test->true_target == header->begin;
-                    arm.exit = exit;
-                    return arm;
+                    !has_only_simple_statements(*current) || !claimed.insert(current->id.value).second) return {};
+                const auto *condition = terminal_conditional(*current);
+                if (condition) {
+                    if (!conditional_edges_match_targets(*current, *condition) || current->successors.size() != 2 ||
+                        !condition->true_target || !condition->false_target ||
+                        *condition->true_target == *condition->false_target) return {};
+                    node.branch_block = current;
+                    node.condition = condition;
+                    const bool repeats_true = *condition->true_target == header->begin;
+                    const bool repeats_false = *condition->false_target == header->begin;
+                    if (repeats_true != repeats_false) {
+                        const auto exit_address = repeats_true ? *condition->false_target : *condition->true_target;
+                        const auto *exit = find_block(exit_address);
+                        if (!exit || exit == header || exit == preheader || current == preheader) return {};
+                        if (shared_exit_address && *shared_exit_address != exit_address) return {};
+                        shared_exit_address = exit_address;
+                        node.latch = true;
+                        node.repeat_on_true = repeats_true;
+                        const auto index = tree.size();
+                        tree.push_back(std::move(node));
+                        if (!latch_ids.insert(current->id.value).second) return {};
+                        return index;
+                    }
+                    const auto index = tree.size();
+                    tree.push_back(std::move(node));
+                    const auto branch = tree[index].condition;
+                    const auto true_child = trace_tree(*branch->true_target,
+                        tree[index].branch_block->id.value, depth + 1);
+                    if (!true_child) return {};
+                    const auto false_child = trace_tree(*branch->false_target,
+                        tree[index].branch_block->id.value, depth + 1);
+                    if (!false_child) return {};
+                    tree[index].true_child = *true_child;
+                    tree[index].false_child = *false_child;
+                    return index;
                 }
                 if (current->successors.size() != 1 || !current->successors.front().target ||
                     !has_unconditional_edge(*current, *current->successors.front().target)) return {};
-                arm.body.push_back(current);
+                node.path.push_back(current);
                 predecessor = current->id.value;
                 current = find_block(*current->successors.front().target);
             }
             return {};
         };
-        auto true_arm = trace_arm(*dispatch->true_target);
-        auto false_arm = trace_arm(*dispatch->false_target);
-        if (!true_arm || !false_arm || !true_arm->latch || !false_arm->latch ||
-            true_arm->latch == false_arm->latch || true_arm->exit != false_arm->exit) return {};
-        const auto *exit = true_arm->exit;
-        const std::set<std::uint64_t> latches{true_arm->latch->id.value, false_arm->latch->id.value};
-        if (predecessors[header->id.value] !=
-                std::set<std::uint64_t>{preheader->id.value, true_arm->latch->id.value, false_arm->latch->id.value} ||
-            predecessors[exit->id.value] != latches || !has_only_terminal_return(*exit)) return {};
+        const auto true_root = trace_tree(*dispatch->true_target, header->id.value, 0);
+        const auto false_root = true_root
+            ? trace_tree(*dispatch->false_target, header->id.value, 0)
+            : std::optional<std::size_t>{};
+        if (!true_root || !false_root || latch_ids.size() < 2 || latch_ids.size() > 64 ||
+            !shared_exit_address) return {};
+        roots = {*true_root, *false_root};
+        const auto *exit = find_block(*shared_exit_address);
+        if (!exit || !has_only_terminal_return(*exit) ||
+            predecessors[header->id.value] != [&] {
+                auto expected = latch_ids;
+                expected.insert(preheader->id.value);
+                return expected;
+            }() || predecessors[exit->id.value] != latch_ids) return {};
 
-        std::set<std::uint64_t> covered;
-        for (const auto *block : preheader_path)
-            if (!covered.insert(block->id.value).second) return {};
-        if (!covered.insert(header->id.value).second) return {};
-        for (const auto *block : true_arm->body)
-            if (!covered.insert(block->id.value).second) return {};
-        for (const auto *block : false_arm->body)
-            if (!covered.insert(block->id.value).second) return {};
-        if (!covered.insert(true_arm->latch->id.value).second ||
-            !covered.insert(false_arm->latch->id.value).second ||
-            !covered.insert(exit->id.value).second || covered.size() != function.blocks.size()) return {};
+        if (!claimed.insert(exit->id.value).second || claimed.size() != function.blocks.size()) return {};
 
         std::size_t phi_input_count = 0;
         const auto build_copies = [&](const LiftedBlock &target, const std::set<std::uint64_t> &expected,
@@ -10298,28 +10748,39 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
             return true;
         };
         std::map<std::uint64_t, std::vector<std::pair<std::string, std::string>>> header_copies, exit_copies;
-        const std::set<std::uint64_t> header_predecessors{
-            preheader->id.value, true_arm->latch->id.value, false_arm->latch->id.value};
+        auto header_predecessors = latch_ids;
+        header_predecessors.insert(preheader->id.value);
         if (!build_copies(*header, header_predecessors, header_copies) ||
-            !build_copies(*exit, latches, exit_copies)) return {};
+            !build_copies(*exit, latch_ids, exit_copies)) return {};
         if (exit->successors.size() != 0) return {};
 
-        const auto emit_latch = [&](const LatchArm &arm, unsigned indent) {
+        std::function<void(std::size_t, unsigned)> emit_tree;
+        emit_tree = [&](std::size_t index, unsigned indent) {
+            const auto &node = tree[index];
+            for (const auto *block : node.path) emit_block(*block, indent, true);
+            emit_block(*node.branch_block, indent, true);
             const std::string spaces(indent, ' ');
-            emit_block(*arm.latch, indent, true);
-            const auto condition = branch_condition_text(*arm.condition);
-            const auto emit_repeat = [&]() {
-                emit_parallel_copies(out, header_copies[arm.latch->id.value], indent + 4);
-                out << std::string(indent + 4, ' ') << "continue;\n";
-            };
-            const auto emit_exit = [&]() {
-                emit_parallel_copies(out, exit_copies[arm.latch->id.value], indent + 4);
-                out << std::string(indent + 4, ' ') << "break;\n";
-            };
-            out << spaces << "if (" << condition << ") {\n";
-            if (arm.repeat_on_true) emit_repeat(); else emit_exit();
+            if (node.latch) {
+                const auto condition = branch_condition_text(*node.condition);
+                const auto emit_repeat = [&]() {
+                    emit_parallel_copies(out, header_copies[node.branch_block->id.value], indent + 4);
+                    out << std::string(indent + 4, ' ') << "continue;\n";
+                };
+                const auto emit_exit = [&]() {
+                    emit_parallel_copies(out, exit_copies[node.branch_block->id.value], indent + 4);
+                    out << std::string(indent + 4, ' ') << "break;\n";
+                };
+                out << spaces << "if (" << condition << ") {\n";
+                if (node.repeat_on_true) emit_repeat(); else emit_exit();
+                out << spaces << "} else {\n";
+                if (node.repeat_on_true) emit_exit(); else emit_repeat();
+                out << spaces << "}\n";
+                return;
+            }
+            out << spaces << "if (" << branch_condition_text(*node.condition) << ") {\n";
+            emit_tree(node.true_child, indent + 4);
             out << spaces << "} else {\n";
-            if (arm.repeat_on_true) emit_exit(); else emit_repeat();
+            emit_tree(node.false_child, indent + 4);
             out << spaces << "}\n";
         };
 
@@ -10329,17 +10790,15 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
         out << "    while (true) {\n";
         emit_block(*header, 8, true);
         out << "        if (" << branch_condition_text(*dispatch) << ") {\n";
-        for (const auto *block : true_arm->body) emit_block(*block, 12, true);
-        emit_latch(*true_arm, 12);
+        emit_tree(roots[0], 12);
         out << "        } else {\n";
-        for (const auto *block : false_arm->body) emit_block(*block, 12, true);
-        emit_latch(*false_arm, 12);
+        emit_tree(roots[1], 12);
         out << "        }\n    }\n";
         emit_block(*exit, 4, false);
         out << "}\n";
         return StructuredPseudocode{out.str(), false, {}};
     };
-    if (auto structured = try_explicit_preheader_two_latch_loop()) return *structured;
+    if (auto structured = try_explicit_preheader_multi_latch_loop()) return *structured;
 
     if (function.blocks.size() >= 4 && has_only_simple_statements(*entry) && entry->phis.empty() &&
         entry->successors.size() == 1 && entry->successors.front().target) {
@@ -13199,7 +13658,7 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                 ++predecessor_count[*next];
             }
             if (children[i].empty()) {
-                if (!has_only_terminal_return(block) || branch_count != 0) return {};
+                if ((!has_only_terminal_return(block) && !has_only_terminal_nonreturn(block)) || branch_count != 0) return {};
             } else if (children[i].size() == 1) {
                 if (contains_return(block)) return {};
                 if (!block.switch_dispatch &&

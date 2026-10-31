@@ -47,6 +47,17 @@ class DebuggerView final : public wxPanel {
   private:
     struct TerminationState;
     struct InspectionState;
+    struct SourceStepOutTarget {
+        debugger::BreakpointId breakpoint = 0;
+        debugger::ProcessId process = 0;
+        debugger::ThreadId thread = 0;
+        DocumentId document{0};
+        std::uint64_t document_revision = 0;
+        std::uint64_t runtime_address = 0;
+        std::string source_location;
+        bool instruction_step_over = false;
+        bool source_step_over = false;
+    };
     std::shared_ptr<debugger::DebugSession> session_;
     std::shared_ptr<TerminationState> termination_state_;
     std::shared_ptr<InspectionState> inspection_state_;
@@ -242,6 +253,7 @@ class DebuggerView final : public wxPanel {
     std::vector<std::size_t> visible_breakpoint_rows_;
     std::optional<std::uint64_t> pending_event_;
     std::optional<debugger::ThreadId> pending_event_thread_;
+    std::optional<SourceStepOutTarget> source_step_out_target_;
     std::optional<std::uint64_t> thread_schedule_snapshot_event_;
     std::uint64_t session_generation_ = 0;
     std::uint64_t thread_request_ = 0;
@@ -285,6 +297,9 @@ class DebuggerView final : public wxPanel {
     void thread_context_action(debugger::ThreadResumeKind action);
     void interrupt_selected_thread();
     void step_event();
+    void step_over_event();
+    void step_out_event();
+    bool cancel_source_step_out();
     void add_breakpoint();
     void refresh_breakpoints();
     void render_breakpoints(std::optional<debugger::BreakpointId> preferred = {});

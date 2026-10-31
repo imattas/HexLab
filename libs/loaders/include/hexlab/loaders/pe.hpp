@@ -148,6 +148,28 @@ HEXLAB_LOADERS_EXPORT Result<PeAuthenticodeSignatureVerification> verify_pe_auth
     const Image &, const ImageMetadata &, std::size_t certificate_record,
     std::stop_token = {});
 
+struct PeAuthenticodeSignerTrust {
+    bool signature_valid = false;
+    bool chain_built = false;
+    bool chain_trusted = false;
+    bool revocation_checked = false;
+    std::uint32_t signature_error = 0;
+    std::uint32_t chain_error_status = 0;
+    std::uint32_t policy_error = 0;
+    std::uint32_t provider_error = 0;
+    bool operator==(const PeAuthenticodeSignerTrust &) const = default;
+};
+struct PeAuthenticodeTrustVerification {
+    std::size_t certificate_record = 0;
+    std::vector<PeAuthenticodeSignerTrust> signers;
+};
+// Verifies signer signatures and builds a local-machine Authenticode code-
+// signing chain using embedded certificates and local cached trust material.
+// It disables AIA/network retrieval and does not check revocation or timestamps.
+HEXLAB_LOADERS_EXPORT Result<PeAuthenticodeTrustVerification> verify_pe_authenticode_trust(
+    const Image &, const ImageMetadata &, std::size_t certificate_record,
+    std::stop_token = {});
+
 // Decoded compiler product/count pair from the XOR-encoded Rich header in the
 // DOS stub. The product id and build number are the high and low 16 bits of
 // comp_id, respectively. This is provenance metadata, not a verified compiler

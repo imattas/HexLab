@@ -179,6 +179,13 @@ HEXLAB_LOADERS_EXPORT symbols::DwarfTypeSignatureResolver make_elf_dwo_type_sign
 // Reads the fixed header and, for extended counts, the first section record.
 // Table extents are checked without materializing the tables or whole input.
 HEXLAB_LOADERS_EXPORT Result<ElfHeader> read_elf_header(const ByteStorage &, std::stop_token);
+// Checks whether a bounded DWP CU index contains usable INFO+ABBREV
+// contributions for every DWO ID declared by the primary ELF's skeleton
+// units. A valid incomplete or mismatched package returns false.
+HEXLAB_LOADERS_EXPORT Result<bool> elf_dwp_matches_split_units(
+    const ByteStorage &, const ElfHeader &primary_header,
+    std::span<const std::uint64_t> skeleton_dwo_ids,
+    std::stop_token = {}, std::uint64_t max_bytes = 64u * 1024u * 1024u);
 HEXLAB_LOADERS_EXPORT Result<LoadedImage> load_elf(std::shared_ptr<const ByteStorage>, std::stop_token);
 HEXLAB_LOADERS_EXPORT Result<LoadedImage> load_elf(std::shared_ptr<const ByteStorage>, const ElfLoadOptions &,
                                                    std::stop_token);

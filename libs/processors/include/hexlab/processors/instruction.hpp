@@ -706,7 +706,9 @@ enum class Opcode {
     // A32 byte reversal and bit-reversal operations; appended for cache stability.
     a32_rev, a32_rev16, a32_revsh, a32_rbit,
     // RVV widening integer reductions, appended to preserve serialized IDs.
-    rv_vwredsum, rv_vwredsumu
+    rv_vwredsum, rv_vwredsumu,
+    // PowerPC floating-point D-form update memory operations; appended for cache stability.
+    ppc_lfsu, ppc_lfdu, ppc_stfsu, ppc_stfdu
 };
 enum class OperandAccess { read, write, read_write, address };
 // The encoded x86 group-one repeat prefix is retained separately from the
@@ -867,15 +869,17 @@ struct JvmSwitchTable {
     std::vector<JvmSwitchCase> cases;
     bool operator==(const JvmSwitchTable &) const = default;
 };
-// Published NMOS 6502 instruction timing. Additional cycles are conditional:
-// indexed reads may incur one cycle on a page crossing; a taken branch incurs
-// one cycle and a taken page-crossing branch incurs one further cycle. This
-// describes clock counts, not individual bus transactions.
+// Published NMOS 6502 and W65C02S instruction timing. Additional cycles are
+// conditional: indexed reads may incur one cycle on a page crossing; a taken
+// branch incurs one cycle and a taken page-crossing branch can incur one
+// further cycle. CMOS ADC/SBC incur one extra cycle when decimal mode is set.
+// This describes clock counts, not individual bus transactions.
 struct M6502Timing {
     std::uint8_t base_cycles = 0;
     bool page_cross_penalty = false;
     bool branch_taken_penalty = false;
     bool branch_page_cross_penalty = false;
+    bool decimal_mode_penalty = false;
     bool operator==(const M6502Timing &) const = default;
 };
 struct Instruction {

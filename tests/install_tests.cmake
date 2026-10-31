@@ -38,7 +38,7 @@ set(FIXTURES "${PREFIX}/test-fixtures/segmented-cli")
 include("${CMAKE_CURRENT_LIST_DIR}/segmented_cli_tests.cmake")
 execute_process(COMMAND "${PREFIX}/bin/hexlab_cli.exe" --version
   RESULT_VARIABLE status OUTPUT_VARIABLE output ERROR_VARIABLE error TIMEOUT 10)
-if(NOT "${status}" STREQUAL "0" OR NOT output MATCHES "^HexLab 0\\.1\\.0[\r\n]+$")
+if(NOT "${status}" STREQUAL "0" OR NOT output MATCHES "^HexLab 0\\.1\\.1[\r\n]+$")
   message(FATAL_ERROR "Installed CLI failed: ${status}; ${output}; ${error}")
 endif()
 if(DESKTOP)

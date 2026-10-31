@@ -378,8 +378,18 @@ hexlab::Result<ImportResult> import_dwarf_package_unit(
         macro.little_endian = little_endian;
         macro.stop = stop;
         auto macro_units = import_dwarf_macro_v5(macro);
-        if (!macro_units) return macro_units.error();
-        imported.value().macro_units = std::move(macro_units.value());
+        if (!macro_units) {
+            if (macro_units.error().code != hexlab::ErrorCode::unsupported)
+                return macro_units.error();
+            // Keep the already identity-checked split-unit import and its raw
+            // macro contribution. Unsupported import graphs/opcodes are
+            // reported explicitly rather than dropping all valid split DIEs.
+            imported.value().diagnostics.push_back(
+                "DWP macro records for CU " + std::to_string(dwo_id) +
+                " were not expanded: " + macro_units.error().message);
+        } else {
+            imported.value().macro_units = std::move(macro_units.value());
+        }
     }
     return imported;
 }

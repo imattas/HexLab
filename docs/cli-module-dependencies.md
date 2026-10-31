@@ -52,9 +52,41 @@ to the importing object's canonical directory. Candidate paths are
 canonicalized and considered only when they remain below the supplied sysroot
 and exactly identify another supplied file. A declared search path takes
 precedence over basename matching; without one, existing supplied-basename
-behavior applies. Other dynamic-loader tokens, environment variables, default
-system directories, inherited RPATH lookup, and filesystem discovery are not
-implemented. This is a partial path-resolution aid, not full loader precedence.
+behavior applies. Other dynamic-loader tokens, environment variables,
+inherited RPATH lookup, and filesystem discovery are not implemented by this
+supplied-file path mode. This is a partial path-resolution aid, not full loader
+precedence.
+
+Add `--glibc-system-search` to explicitly include the target sysroot's glibc
+cache and standard default directories in filesystem discovery:
+
+```text
+hexlab_cli modules --sysroot ./rootfs --discover --glibc-system-search --graph ./rootfs/bin/app
+```
+
+The cache reader opens only `<sysroot>/etc/ld.so.cache`, after canonicalizing
+the sysroot and verifying the cache itself stays beneath it. The cache snapshot
+is reused for the graph walk. This opt-in never reads the host cache or process
+environment. Cache size and entry count are bounded. The new glibc cache
+format 1.1 is supported; old and compatibility layouts, unknown byte order,
+malformed entries, nonzero required OS versions, and hardware-capability
+entries are reported as unsupported and cannot supply candidates. Cache ABI
+flags are matched conservatively against the importer's ELF machine and class;
+unknown machine-specific variants remain unsupported. Every cache path is
+interpreted below the explicit sysroot and must canonicalize to a regular file
+inside it.
+
+The same opt-in searches `/lib` and `/usr/lib`, plus recognized multiarch
+default directories for x86, AArch64, ARM, RISC-V, LoongArch, s390x, and
+PPC64, all below the sysroot. Candidate rows retain whether they came from the
+cache or a default directory. This is still an offline inventory: it does not
+apply glibc hardware-capability precedence, secure-execution policy,
+`-z nodefaultlib`,
+or establish which duplicate file a real process would load. The CLI loads
+candidate metadata without execution and rejects ELF class, byte-order,
+machine, OSABI, or supported machine-ABI mismatches before adding graph nodes.
+Without `--glibc-system-search`, the cache and standard directories are not
+read or searched.
 
 Examples:
 
@@ -66,6 +98,10 @@ Examples:
 `hexlab_cli modules --sysroot <root-directory> --discover --graph <ELF-root>`
 loads dependency metadata from exact filenames inside an explicit filesystem
 root. Repeat `--search-dir <directory>` to add directories inside that sysroot.
+Repeat `--ld-library-path-dir <directory>` to supply target
+`LD_LIBRARY_PATH` entries for the graph walk. These are explicit host paths
+inside the sysroot; HexLab never reads the host process environment. Both
+directory kinds share the 128-entry bound.
 The command never executes the binaries. It opens no ambient host library
 paths and does not enumerate directory trees. Extra supplied files retain
 input-order node IDs; discovered files follow in deterministic dependency and
@@ -98,9 +134,18 @@ to descendant basename dependencies. A module's own `DT_RUNPATH` suppresses
 its own `DT_RPATH` for both direct lookup and inheritance; it does not erase
 RPATH entries inherited from its ancestors.
 
+Caller-supplied `LD_LIBRARY_PATH` directories are considered after applicable
+own/inherited `DT_RPATH` entries and before the current object's `DT_RUNPATH`.
+Every compatible candidate is retained with `LD_LIBRARY_PATH` provenance,
+including duplicates across directories; the inventory does not claim a
+selected runtime provider. The user must provide each directory as a separate
+`--ld-library-path-dir` argument. Entries are canonicalized, must be
+directories beneath the sysroot, and cannot escape through symlinks.
+
 ```text
 hexlab_cli modules --sysroot ./sdk --discover --target-cwd ./sdk/app \
-  --lib-token lib64 --platform-token x86_64 --graph ./sdk/app/bin/tool
+  --ld-library-path-dir ./sdk/lib --lib-token lib64 --platform-token x86_64 \
+  --graph ./sdk/app/bin/tool
 ```
 
 The target working directory must be an existing directory inside the

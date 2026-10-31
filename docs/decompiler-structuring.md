@@ -8,16 +8,19 @@ as each region's join. It lowers SSA phi values into edge-specific assignments
 and follows multi-block straight-line arms. A simple conditional early return
 is also structured, including the case where the return is on the branch's
 false edge.
-Decision trees whose leaves all return are also structured without requiring a
-common post-dominator. Their nodes may be nested two-way conditionals, complete
-multiway switches, or single-successor cleanup blocks. Shared terminal returns
-and nonterminal return subtrees may be duplicated under their incoming guarded
-paths when every CFG predecessor is represented in the tree, fan-in is at most
-64, and each register or memory phi has exactly one input for every actual
-predecessor. Phi copies are lowered for the incoming edge at each expansion.
-Unresolved edges, incomplete switch metadata, cycles, external side entries,
-and mixed return/non-return leaves retain the fallback unless another existing
-recognizer handles them. Return-only trees use iterative validation and
+Decision trees whose leaves return are structured without requiring a common
+post-dominator. The same recognizer accepts explicit CIL `throw`, `rethrow`, and
+unhandled-exception terminal transfers as non-returning leaves. It does not
+infer non-return behavior from calls, unknown intrinsics, or empty exits. Their
+nodes may be nested two-way conditionals, complete multiway switches, or
+single-successor cleanup blocks. Shared terminal leaves and nonterminal return
+subtrees may be duplicated under their incoming guarded paths when every CFG
+predecessor is represented in the tree, fan-in is at most 64, and each register
+or memory phi has exactly one input for every actual predecessor. Phi copies
+are lowered for the incoming edge at each expansion. Unresolved edges,
+incomplete switch metadata, cycles, external side entries, and other mixed
+return/non-return leaves retain the fallback unless another existing
+recognizer handles them. These decision trees use iterative validation and
 emission, so nesting depth does not consume recursive C++ stack frames. The
 recognizer accepts up to 4,096 blocks, 4,096 edges, and switch cases, 65,536
 expanded block occurrences and phi copies, and 262,144 emitted instruction
@@ -305,18 +308,21 @@ phis in the exit chain, side entries, additional exits, non-return exits,
 overlapping arms, malformed edges, incomplete block coverage, and larger
 graphs retain the existing fallback.
 
-An explicit-preheader post-tested loop may also use a two-arm body dispatcher
-whose arms end in distinct conditional latches. Each latch must target the
-dispatcher header on one edge and the same terminal-return block on the other.
-The function-entry path to the header is a bounded, phi-free linear chain;
-header register phis must have exactly one initial input from its preheader
-and one recurrent input from each latch. Return-block register phis must match
-the two latch edges. Each arm is limited to 64 blocks including its latch, and the
-complete function is limited to 128 blocks and 4,096 edges. The formatter emits
-the preheader once, applies initial phi copies, then emits each latch's repeat
-or exit copies before `continue` or `break`. Memory phis, nested or shared arm
-paths, extra exits, side entries, and malformed edge/phi sets retain the
-existing lossless fallback.
+An explicit-preheader post-tested loop may also use a bounded nested body-
+dispatch tree whose leaves end in distinct conditional latches. Each latch must
+target the dispatcher header on one edge and the same terminal-return block on
+the other. Internal dispatches and linear arm paths must have exact single-
+predecessor links; the complete function must be covered by the preheader,
+header, dispatch tree, latches, and one return block. The tree is limited to 64
+latch leaves, 127 branch nodes, and at most 64 nodes along any dispatch path
+(including its latch leaf); each linear path is capped at 64 blocks, and the
+complete function at 128 blocks and 4,096 edges. Header
+register phis must have exactly one initial input from the preheader and one
+recurrent input from every latch. Return-block register phis must match exactly
+the latch edges. The formatter emits the preheader once, applies initial phi
+copies, then emits each latch's repeat or exit copies before `continue` or
+`break`. Memory phis, shared paths, extra exits, side entries, non-return exits,
+and malformed edge/phi sets retain the existing lossless fallback.
 
 The acyclic structurer also handles nested regions with multiple explicit
 terminal returns. An analysis-only virtual exit supplies post-dominators for

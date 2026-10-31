@@ -21,6 +21,10 @@ sizes where the format supplies them, skips unsupported or incomplete field
 records, maps only fully contained fields into a compared segment, merges
 overlapping ranges, and cap collected fields at one million per input. Both
 frontends apply the same relocation-kind exclusions and cancellation checks.
+For i386 ELF, they also mask `R_386_SIZE32` only when the loader has validated
+its four-byte field, decoded its implicit addend, and mapped it to an exact file
+offset. Other symbol-size relocations remain visible, so the comparison does
+not guess extents from unsupported or incomplete rows.
 Matched region offsets pair by the comparison engine's existing bounded anchor algorithm; if
 an insertion/deletion shifts a masked field before synchronization recovers,
 callers should provide masks for both region sides according to their intended

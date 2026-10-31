@@ -632,10 +632,13 @@ bool transfer(const Instruction &instruction, FlowState &state) {
         case Opcode::m6502_rti:
             state.m6502_decimal_known = false;
             return true;
-        case Opcode::m6502_tsx:
+        case Opcode::m6502_tsx: {
             // TSX gives X a stable, byte-wide snapshot of the hardware stack
             // pointer. Keep its entry-relative depth as a frame base until X
-            // is overwritten.
+            // is overwritten. If S has not moved since the previous snapshot,
+            // A/Y copies of that same sampled value remain valid; TSX itself
+            // only replaces X. A changed or unknown depth cannot be reconciled
+            // with those aliases because their deltas use the old frame base.
             if (instruction.flow != FlowKind::fallthrough || !has_register(instruction.register_reads, 4) ||
                 !has_register(instruction.register_writes, 1)) {
                 state.frame_depth = {};
@@ -645,17 +648,24 @@ bool transfer(const Instruction &instruction, FlowState &state) {
                 state.supported = false;
                 return true;
             }
+            const bool same_sample = state.frame_depth.known && state.stack_depth.known &&
+                                     state.frame_depth.value == state.stack_depth.value;
+            const auto accumulator_alias = same_sample ? state.m6502_stack_alias_deltas[0] : FlowValue{};
+            const auto y_alias = same_sample ? state.m6502_stack_alias_deltas[2] : FlowValue{};
             state.frame_depth = state.stack_depth;
             state.frame_register = -1;
             state.frame_register_delta = {};
             state.m6502_stack_alias_deltas = {};
             state.m6502_stack_alias_deltas[1] = {true, 0};
+            state.m6502_stack_alias_deltas[0] = accumulator_alias;
+            state.m6502_stack_alias_deltas[2] = y_alias;
             if (!state.frame_depth.known || state.frame_depth.value < -127 || state.frame_depth.value > 127) {
                 state.frame_depth = {};
                 state.m6502_stack_alias_deltas = {};
                 state.supported = false;
             }
             return true;
+        }
         case Opcode::m6502_txs:
             // TXS copies the X snapshot back to S. If TSX established X as a
             // stack snapshot and X has not been clobbered, this restores the

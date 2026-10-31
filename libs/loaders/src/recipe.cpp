@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <iterator>
 #include <mutex>
 #include <string_view>
 #include <system_error>
@@ -784,6 +785,7 @@ Result<LoadedImage> load_image(std::shared_ptr<const ByteStorage> storage, const
     auto loaded = load_durable_image(tracking.value(), resolved.value(), stop);
     if (!loaded)
         return loaded.error();
+    std::vector<Diagnostic> split_discovery_diagnostics;
     // DWARF .debug_sup filenames are untrusted hints. Automatic discovery is
     // limited to a basename-only supplementary ELF beside a file-backed
     // primary input; its role and checksum are validated before use.
@@ -811,15 +813,44 @@ Result<LoadedImage> load_image(std::shared_ptr<const ByteStorage> storage, const
         bool split_package_selected = false;
         if (candidate) {
             auto package = FileStorage::open(*candidate);
-            if (!package) return package.error();
-            if (package.value()->size() > UINT64_C(64) * 1024 * 1024)
-                return Error{ErrorCode::resource_limit, "Discovered ELF DWP exceeds 64 MiB"};
-            ElfLoadOptions options;
-            options.dwarf_split_debug_package = std::move(package.value());
-            auto split = load_elf(tracking.value(), options, stop);
-            if (!split) return split.error();
-            loaded = std::move(split);
-            split_package_selected = true;
+            const auto diagnose_candidate = [&](std::string message) {
+                split_discovery_diagnostics.push_back(
+                    {DiagnosticSeverity::warning, std::move(message), {}});
+            };
+            if (!package) {
+                if (package.error().code == ErrorCode::canceled) return package.error();
+                diagnose_candidate("Adjacent split-debug DWP could not be opened: " + package.error().message);
+            } else if (package.value()->size() > UINT64_C(64) * 1024 * 1024) {
+                diagnose_candidate("Adjacent split-debug DWP exceeds 64 MiB and was ignored");
+            } else {
+                const auto *primary = loaded.value().metadata.elf ? &*loaded.value().metadata.elf : nullptr;
+                const auto *dwarf = primary && primary->dwarf_info ? &*primary->dwarf_info : nullptr;
+                if (!primary || !dwarf || dwarf->split_dwo_ids.empty()) {
+                    diagnose_candidate("Adjacent split-debug DWP was ignored because the primary ELF has no retained skeleton DWO IDs");
+                } else {
+                    auto matches = elf_dwp_matches_split_units(*package.value(), primary->header,
+                                                               dwarf->split_dwo_ids, stop);
+                    if (!matches) {
+                        if (matches.error().code == ErrorCode::canceled) return matches.error();
+                        diagnose_candidate("Adjacent split-debug DWP could not be identity-checked and was ignored: " +
+                                           matches.error().message);
+                    } else if (!matches.value()) {
+                        diagnose_candidate("Adjacent split-debug DWP has no usable CU contribution for an exact primary DWO ID and was ignored");
+                    } else {
+                        ElfLoadOptions options;
+                        options.dwarf_split_debug_package = std::move(package.value());
+                        auto split = load_elf(tracking.value(), options, stop);
+                        if (!split) {
+                            if (split.error().code == ErrorCode::canceled) return split.error();
+                            diagnose_candidate("Identity-matched adjacent split-debug DWP failed bounded import and was ignored: " +
+                                               split.error().message);
+                        } else {
+                            loaded = std::move(split);
+                            split_package_selected = true;
+                        }
+                    }
+                }
+            }
         }
         // If there is no adjacent DWP, allow the bounded caller-scoped DWO
         // resolver to try the basename named by each skeleton. The resolver
@@ -847,6 +878,9 @@ Result<LoadedImage> load_image(std::shared_ptr<const ByteStorage> storage, const
             loaded = std::move(split);
         }
     }
+    loaded.value().diagnostics.insert(loaded.value().diagnostics.end(),
+        std::make_move_iterator(split_discovery_diagnostics.begin()),
+        std::make_move_iterator(split_discovery_diagnostics.end()));
     loaded.value().metadata_reads = tracking.value()->reads();
     return loaded;
 }

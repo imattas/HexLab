@@ -8,8 +8,47 @@ event-sequence contract.
 The desktop Debugger view exposes this operation as **Step** beside Continue.
 It requires a pending stop event, resumes one instruction, and restarts the
 event poller so the next stop refreshes thread/register state and locals. The
-step is instruction-level; it does not perform source-level step-over or
-step-out.
+**Step** is instruction-level. **Step over** first tries to stop at the next
+distinct source line within the same complete recovered function. It scans at
+most 16,384 instruction facts and performs at most 256 source-location
+lookups, requires unambiguous source locations and a fresh loaded-image
+mapping, and plants a one-shot software breakpoint at the next line. Functions
+with incomplete recovery, ambiguous or missing line
+records, or no later line use the instruction-level behavior: for a decoded
+call at the stopped PC it plants a one-shot breakpoint at the fall-through
+instruction; other or unavailable instruction facts perform one instruction
+step. A source-line or call-return breakpoint requires a free address with no
+existing breakpoint. A scan that reaches either bound reports the limit and
+leaves the target stopped. Any intervening stop, thread change, or process
+change cancels the temporary run. Step-over continues only the thread that
+owns the pending event, leaving peers stopped. The Debugger view also offers a
+conservative source-level **Step out** operation, described below.
+
+## Source step-out
+
+Source step-out uses the current stopped thread's recovered stack frames. It
+requires fresh frames for the pending event, an identifiable event-owning
+thread, and a caller frame whose return PC belongs to the same currently loaded
+module as the stopped PC. Both PCs must resolve to unambiguous source-line
+records in that image, and the caller return PC must be in initialized
+executable data and round-trip through the module mapping. The current module
+mapping is refreshed and must match the mapping used to recover those frames.
+
+When these conditions hold, the desktop view places a one-shot session
+breakpoint at the caller return PC and continues the pending event. It removes
+the temporary breakpoint on the next target stop and reports whether the
+caller return address was reached. A stop in another thread, any intervening
+stop, process exit, or module/process change cancels the operation. The user
+can cancel it by removing the temporary breakpoint from the breakpoint list.
+The target is bound to the process, thread, source document identity and
+revision observed when the operation starts; the UI reports if the source
+document changes while execution continues.
+
+The implementation does not guess when frames are stale or unavailable,
+source-line records are absent or ambiguous, the caller crosses into another
+module, an existing breakpoint occupies the return address, or the target
+architecture is outside the recovered x86/x64/AArch64 frame path. In those
+cases it reports why source step-out cannot proceed.
 
 On Windows, when the pending event is an `INT3` at a software breakpoint owned
 by the backend, stepping temporarily restores the byte saved when that
@@ -62,8 +101,8 @@ retry before acknowledging an event or detaching. The event message reports a
 release failure, and continuing that event returns the retry error while keeping
 the event pending. This cannot make OS thread suspension atomic, and a failed
 Windows resume operation can leave a peer suspended until a later retry or
-backend teardown. Hardware/data breakpoints and source-level step-over are not
-implemented.
+backend teardown. Source-level step-over and hardware/data breakpoint
+step-over are not implemented by this operation.
 
 Over GDB Remote Serial Protocol, the backend checks `vContSupported` and then
 queries `vCont?` for the actions the stub actually implements. It uses
