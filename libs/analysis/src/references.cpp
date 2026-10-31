@@ -3868,10 +3868,97 @@ RegisterReferenceFacts a64_reference_facts(const Image *image, const RelocationC
 
             if (!propagated) {
                 std::vector<std::pair<std::uint32_t, Address>> loaded_pointers;
+                std::vector<std::pair<std::uint32_t, Address>> writeback_bases;
                 for (std::size_t i = 0; i < instruction.operands.size(); ++i) {
                     const auto *memory = std::get_if<MemoryOperand>(&instruction.operands[i]);
                     if (!memory || i >= instruction.access.size())
                         continue;
+                    // Preserve a proven integer base update for A64 immediate
+                    // pre/post-index transfers. The memory operand already
+                    // records the access address (zero displacement for a
+                    // post-index form); writeback_displacement is the separate
+                    // value assigned to the base after the transfer.
+                    const bool writeback_load = instruction.opcode == Opcode::a64_ldr ||
+                        instruction.opcode == Opcode::a64_ldrb || instruction.opcode == Opcode::a64_ldrh ||
+                        instruction.opcode == Opcode::a64_ldp;
+                    const bool writeback_store = instruction.opcode == Opcode::a64_str ||
+                        instruction.opcode == Opcode::a64_strb || instruction.opcode == Opcode::a64_strh ||
+                        instruction.opcode == Opcode::a64_stp;
+                    if ((writeback_load || writeback_store) && memory->writeback && memory->base &&
+                        !memory->index && memory->address_width == 64 &&
+                        memory->base->bank == RegisterBank::arm64_gpr && memory->base->index != 31 &&
+                        memory->base->width == 64 &&
+                        (memory->post_index ? memory->displacement == 0
+                                            : memory->displacement == memory->writeback_displacement)) {
+                        const bool pair = instruction.opcode == Opcode::a64_ldp || instruction.opcode == Opcode::a64_stp;
+                        const auto transfer_count = pair ? std::size_t{2} : std::size_t{1};
+                        const auto expected_memory_access = writeback_load ? OperandAccess::read : OperandAccess::write;
+                        const auto expected_register_access = writeback_load ? OperandAccess::write : OperandAccess::read;
+                        const auto expected_memory_width = instruction.opcode == Opcode::a64_ldrb ||
+                            instruction.opcode == Opcode::a64_strb ? std::uint16_t{8} :
+                            instruction.opcode == Opcode::a64_ldrh || instruction.opcode == Opcode::a64_strh
+                                ? std::uint16_t{16} : memory->data_width;
+                        const auto expected_register_width = !pair && expected_memory_width < 32
+                            ? std::uint16_t{32} : expected_memory_width;
+                        std::vector<RegisterOperand> expected_reads, expected_writes;
+                        bool transfers_valid = instruction.operands.size() == transfer_count + 1 &&
+                            instruction.access.size() == transfer_count + 1 &&
+                            i == transfer_count && memory->data_width == expected_memory_width &&
+                            (pair ? (memory->data_width == 32 || memory->data_width == 64)
+                                  : (instruction.opcode == Opcode::a64_ldr || instruction.opcode == Opcode::a64_str
+                                        ? (memory->data_width == 32 || memory->data_width == 64) : true));
+                        for (std::size_t transfer_index = 0; transfers_valid && transfer_index < transfer_count;
+                             ++transfer_index) {
+                            const auto *transfer = std::get_if<RegisterOperand>(&instruction.operands[transfer_index]);
+                            transfers_valid = transfer && transfer->width == expected_register_width &&
+                                (transfer->bank == RegisterBank::arm64_gpr ||
+                                 (transfer->bank == RegisterBank::arm64_zero && transfer->index == 31)) &&
+                                instruction.access[transfer_index] == expected_register_access &&
+                                !(transfer->bank == memory->base->bank && transfer->index == memory->base->index) &&
+                                (transfer_index == 0 || [&] {
+                                    const auto *previous_transfer = std::get_if<RegisterOperand>(
+                                        &instruction.operands[transfer_index - 1]);
+                                    return previous_transfer &&
+                                        (previous_transfer->bank != transfer->bank ||
+                                         previous_transfer->index != transfer->index);
+                                }());
+                            if (transfers_valid && transfer->bank != RegisterBank::arm64_zero) {
+                                if (writeback_load) expected_writes.push_back(*transfer);
+                                else expected_reads.push_back(*transfer);
+                            }
+                        }
+                        expected_reads.push_back(*memory->base);
+                        expected_writes.push_back(*memory->base);
+                        const auto base_read_count = std::count(instruction.register_reads.begin(),
+                            instruction.register_reads.end(), *memory->base);
+                        const auto base_write_count = std::count(instruction.register_writes.begin(),
+                            instruction.register_writes.end(), *memory->base);
+                        const auto memory_operand_count = std::count_if(instruction.operands.begin(),
+                            instruction.operands.end(), [](const Operand &operand) {
+                                return std::holds_alternative<MemoryOperand>(operand);
+                            });
+                        const auto previous = registers.find(memory->base->index);
+                        if (transfers_valid && instruction.access[i] == expected_memory_access &&
+                            instruction.register_reads == expected_reads &&
+                            instruction.register_writes == expected_writes &&
+                            base_read_count == 1 && base_write_count == 1 && memory_operand_count == 1 &&
+                            previous != registers.end() && previous->second.space == instruction.address.space) {
+                            std::optional<std::uint64_t> updated;
+                            const auto displacement = memory->writeback_displacement;
+                            if (displacement >= 0) {
+                                const auto amount = static_cast<std::uint64_t>(displacement);
+                                if (amount <= UINT64_MAX - previous->second.offset)
+                                    updated = previous->second.offset + amount;
+                            } else {
+                                const auto amount = static_cast<std::uint64_t>(-(displacement + 1)) + 1;
+                                if (amount <= previous->second.offset)
+                                    updated = previous->second.offset - amount;
+                            }
+                            if (updated)
+                                writeback_bases.emplace_back(memory->base->index,
+                                    Address{previous->second.space, *updated});
+                        }
+                    }
                     // A64 integer LDR literal uses an instruction-relative
                     // address and has no base register. Resolve its slot just
                     // like ADRP+LDR so subsequent BR/BLR targets can be proven.
@@ -4049,6 +4136,8 @@ RegisterReferenceFacts a64_reference_facts(const Image *image, const RelocationC
                 }
                 erase_written();
                 for (const auto &[register_index, value] : loaded_pointers)
+                    registers[register_index] = value;
+                for (const auto &[register_index, value] : writeback_bases)
                     registers[register_index] = value;
             }
             if (instruction.flow == FlowKind::call)
