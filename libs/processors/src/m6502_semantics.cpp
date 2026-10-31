@@ -13,9 +13,9 @@ evaluate_m6502_load(Opcode opcode, std::uint8_t operand, std::uint8_t status) no
     return M6502LoadResult{operand, updated};
 }
 
-std::optional<M6502BinaryArithmeticResult>
-evaluate_m6502_binary_arithmetic(Opcode opcode, std::uint8_t accumulator,
-                                 std::uint8_t operand, std::uint8_t status) noexcept {
+static std::optional<M6502BinaryArithmeticResult>
+evaluate_binary_arithmetic(Opcode opcode, std::uint8_t accumulator,
+                           std::uint8_t operand, std::uint8_t status, bool cmos) noexcept {
     if (opcode != Opcode::m6502_adc && opcode != Opcode::m6502_sbc)
         return {};
 
@@ -68,8 +68,17 @@ evaluate_m6502_binary_arithmetic(Opcode opcode, std::uint8_t accumulator,
             negative = (binary_result & 0x80) != 0;
             overflow = (((accumulator ^ operand) & (accumulator ^ binary_result)) & 0x80) != 0;
         }
+        if (cmos) {
+            // W65C02 updates N/Z from the corrected decimal result. V follows
+            // the binary ALU result, independent of decimal adjustment.
+            negative = (result & 0x80u) != 0;
+            overflow = ((accumulator ^ binary_result) &
+                (subtract ? (accumulator ^ operand) : static_cast<std::uint8_t>(~(accumulator ^ operand))) &
+                0x80u) != 0;
+        }
+        const auto zero = cmos ? result == 0 : binary_result == 0;
         const auto updated = static_cast<std::uint8_t>((status & 0x3cu) |
-            (carry ? 0x01u : 0) | (binary_result == 0 ? 0x02u : 0) |
+            (carry ? 0x01u : 0) | (zero ? 0x02u : 0) |
             (overflow ? 0x40u : 0) | (negative ? 0x80u : 0));
         return M6502BinaryArithmeticResult{result, updated};
     }
@@ -84,6 +93,18 @@ evaluate_m6502_binary_arithmetic(Opcode opcode, std::uint8_t accumulator,
         (overflow ? 0x40u : 0) |
         (result & 0x80u));
     return M6502BinaryArithmeticResult{result, updated};
+}
+
+std::optional<M6502BinaryArithmeticResult>
+evaluate_m6502_binary_arithmetic(Opcode opcode, std::uint8_t accumulator,
+                                 std::uint8_t operand, std::uint8_t status) noexcept {
+    return evaluate_binary_arithmetic(opcode, accumulator, operand, status, false);
+}
+
+std::optional<M6502BinaryArithmeticResult>
+evaluate_m65c02_binary_arithmetic(Opcode opcode, std::uint8_t accumulator,
+                                  std::uint8_t operand, std::uint8_t status) noexcept {
+    return evaluate_binary_arithmetic(opcode, accumulator, operand, status, true);
 }
 
 std::optional<M6502BinaryArithmeticResult>
@@ -114,6 +135,36 @@ evaluate_m6502_binary_arithmetic_instruction(const Instruction &instruction,
         return {};
     }
     return evaluate_m6502_binary_arithmetic(instruction.opcode, accumulator, operand, status);
+}
+
+std::optional<M6502BinaryArithmeticResult>
+evaluate_m65c02_binary_arithmetic_instruction(const Instruction &instruction,
+                                              std::uint8_t accumulator,
+                                              std::uint8_t operand,
+                                              std::uint8_t status) noexcept {
+    if (instruction.context.architecture != Architecture::mos6502 ||
+        instruction.context.mode != ExecutionMode::m65c02 ||
+        (instruction.opcode != Opcode::m6502_adc && instruction.opcode != Opcode::m6502_sbc) ||
+        instruction.operands.size() != 1 || instruction.access.size() != 1 ||
+        instruction.access[0] != OperandAccess::read || instruction.memory_write)
+        return {};
+    const RegisterOperand a{RegisterBank::mos6502, 0, 8, false};
+    const RegisterOperand p{RegisterBank::mos6502, 3, 8, false};
+    const auto contains = [](const auto &registers, RegisterOperand reg) {
+        return std::find(registers.begin(), registers.end(), reg) != registers.end();
+    };
+    if (!contains(instruction.register_reads, a) || !contains(instruction.register_reads, p) ||
+        !contains(instruction.register_writes, a) || !contains(instruction.register_writes, p))
+        return {};
+    if (const auto *immediate = std::get_if<ImmediateOperand>(&instruction.operands[0])) {
+        if (immediate->effective_width != 8 || immediate->value > UINT8_MAX || instruction.memory_read)
+            return {};
+    } else if (const auto *memory = std::get_if<MemoryOperand>(&instruction.operands[0])) {
+        if (memory->data_width != 8 || !instruction.memory_read) return {};
+    } else {
+        return {};
+    }
+    return evaluate_m65c02_binary_arithmetic(instruction.opcode, accumulator, operand, status);
 }
 
 std::optional<M6502CompareResult>

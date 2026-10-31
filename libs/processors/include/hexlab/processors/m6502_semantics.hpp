@@ -32,6 +32,12 @@ struct M6502BinaryArithmeticResult {
 HEXLAB_PROCESSORS_EXPORT std::optional<M6502BinaryArithmeticResult>
 evaluate_m6502_binary_arithmetic(Opcode opcode, std::uint8_t accumulator,
                                  std::uint8_t operand, std::uint8_t status) noexcept;
+// Evaluate W65C02 ADC/SBC after the caller fetches its operand. Decimal mode
+// applies CMOS correction, takes N/Z from the corrected result, and computes
+// V from the binary ALU result. Other opcodes return no result.
+HEXLAB_PROCESSORS_EXPORT std::optional<M6502BinaryArithmeticResult>
+evaluate_m65c02_binary_arithmetic(Opcode opcode, std::uint8_t accumulator,
+                                 std::uint8_t operand, std::uint8_t status) noexcept;
 // Bind ADC/SBC evaluation to the decoded accumulator, P, and byte-operand
 // facts. The caller supplies the fetched operand and current A/P values.
 HEXLAB_PROCESSORS_EXPORT std::optional<M6502BinaryArithmeticResult>
@@ -39,6 +45,11 @@ evaluate_m6502_binary_arithmetic_instruction(const Instruction &instruction,
                                              std::uint8_t accumulator,
                                              std::uint8_t operand,
                                              std::uint8_t status) noexcept;
+HEXLAB_PROCESSORS_EXPORT std::optional<M6502BinaryArithmeticResult>
+evaluate_m65c02_binary_arithmetic_instruction(const Instruction &instruction,
+                                              std::uint8_t accumulator,
+                                              std::uint8_t operand,
+                                              std::uint8_t status) noexcept;
 
 struct M6502CompareResult {
     std::uint8_t status = 0;
