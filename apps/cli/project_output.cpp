@@ -1366,6 +1366,8 @@ int print_derived(std::ostream &out, const Arguments &args, const ProjectSnapsho
                         ? "unsigned_byte_offset_scaled_from_target_base"
                     : site.entry_encoding == SwitchEntryEncoding::unsigned_dword_offset_from_target_base
                         ? "unsigned_dword_offset_from_target_base"
+                    : site.entry_encoding == SwitchEntryEncoding::signed_byte_offset_from_target_base
+                        ? "signed_byte_offset_from_target_base"
                     : site.entry_encoding == SwitchEntryEncoding::signed_halfword_offset_from_target_base
                         ? "signed_halfword_offset_from_target_base"
                     : "signed_offset_from_target_base")
