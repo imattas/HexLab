@@ -518,10 +518,91 @@ inline void print_pe_import_resolutions(const std::vector<SuppliedModule> &modul
     }
 }
 
+struct MachOExportResolution {
+    enum class Status { resolved, missing_library, ambiguous_library, missing_export,
+                        ambiguous_export, cycle, depth_limit, unsupported } status = Status::missing_export;
+    const SuppliedModule *provider = nullptr;
+    const MachODyldExport *symbol = nullptr;
+    std::vector<std::string> route;
+};
+
+// Follow only explicit dyld re-export terminals through supplied images. The
+// original load-command ordinal selects each next image; no basename aliases,
+// flat lookup, or host loader state is inferred. A repeated (image, symbol)
+// pair and a fixed hop ceiling bound cycles and malformed chains.
+inline MachOExportResolution resolve_macho_export(const std::vector<SuppliedModule> &modules,
+                                                   const SuppliedModule &initial_provider,
+                                                   std::int32_t importer_cpu_type,
+                                                   std::string name) {
+    constexpr std::size_t max_reexport_hops = 32;
+    MachOExportResolution result;
+    const SuppliedModule *provider = &initial_provider;
+    std::set<std::pair<std::size_t, std::string>> visited;
+    for (std::size_t hop = 0; hop <= max_reexport_hops; ++hop) {
+        if (!provider->metadata || !provider->metadata->macho) {
+            result.status = MachOExportResolution::Status::unsupported;
+            return result;
+        }
+        const auto &metadata = *provider->metadata->macho;
+        if (metadata.selected_slice >= metadata.container.slices.size() ||
+            metadata.container.slices[metadata.selected_slice].header.cpu_type != importer_cpu_type) {
+            result.status = MachOExportResolution::Status::unsupported;
+            return result;
+        }
+        const auto owner = std::find_if(modules.begin(), modules.end(), [&](const auto &candidate) {
+            return &candidate == provider;
+        });
+        if (owner == modules.end()) { result.status = MachOExportResolution::Status::unsupported; return result; }
+        const auto module_index = static_cast<std::size_t>(owner - modules.begin());
+        if (!visited.emplace(module_index, name).second) {
+            result.status = MachOExportResolution::Status::cycle;
+            return result;
+        }
+        std::vector<const MachODyldExport *> matches;
+        for (const auto &exported : metadata.dyld_exports)
+            if (exported.name == name) matches.push_back(&exported);
+        if (matches.empty()) { result.status = MachOExportResolution::Status::missing_export; return result; }
+        if (matches.size() != 1) { result.status = MachOExportResolution::Status::ambiguous_export; return result; }
+        const auto *exported = matches.front();
+        result.route.push_back(module_leaf(provider->path) + "!" + name + " (export terminal file offset " +
+            std::to_string(exported->terminal_file_offset) + ")");
+        constexpr std::uint64_t export_reexport = 0x08;
+        if (!(exported->flags & export_reexport)) {
+            if (!exported->is_definition()) { result.status = MachOExportResolution::Status::unsupported; return result; }
+            result.status = MachOExportResolution::Status::resolved;
+            result.provider = provider;
+            result.symbol = exported;
+            return result;
+        }
+        if (hop == max_reexport_hops || !exported->library_ordinal || *exported->library_ordinal == 0) {
+            result.status = hop == max_reexport_hops ? MachOExportResolution::Status::depth_limit
+                                                     : MachOExportResolution::Status::unsupported;
+            return result;
+        }
+        const MachOLibrary *library = nullptr;
+        for (const auto &row : metadata.libraries)
+            if (row.ordinal && *row.ordinal == *exported->library_ordinal) {
+                if (library) { library = nullptr; break; }
+                library = &row;
+            }
+        if (!library) { result.status = MachOExportResolution::Status::missing_library; return result; }
+        std::vector<const SuppliedModule *> candidates;
+        for (const auto &candidate : modules)
+            if (candidate.metadata && candidate.metadata->macho &&
+                module_leaf(candidate.path) == module_leaf(library->name)) candidates.push_back(&candidate);
+        if (candidates.empty()) { result.status = MachOExportResolution::Status::missing_library; return result; }
+        if (candidates.size() != 1) { result.status = MachOExportResolution::Status::ambiguous_library; return result; }
+        provider = candidates.front();
+        name = exported->import_name && !exported->import_name->empty()
+            ? *exported->import_name : exported->name;
+    }
+    result.status = MachOExportResolution::Status::depth_limit;
+    return result;
+}
+
 // Resolve Mach-O bind names only against explicitly supplied images and the
-// export trie of the selected provider slice. Ordinals and install-name
-// basenames remain authoritative; special flat/weak lookup namespaces are not
-// guessed as a search order.
+// selected export slice. Ordinals and install-name basenames remain authoritative;
+// re-export chains are followed only through matching supplied load-command ordinals.
 inline void print_macho_import_resolutions(const std::vector<SuppliedModule> &modules, std::ostream &out) {
     constexpr std::size_t max_imports = 100000;
     struct ImportUse {
@@ -642,28 +723,36 @@ inline void print_macho_import_resolutions(const std::vector<SuppliedModule> &mo
                 out << "incompatible architecture (" << provider->path << ")\n";
                 continue;
             }
-            std::vector<const MachODyldExport *> matches;
-            for (const auto &exported : provider_meta.dyld_exports)
-                if (exported.name == use.name) matches.push_back(&exported);
-            if (matches.empty()) {
-                out << "unresolved (no exact export in " << provider->path;
-                if (!provider_meta.dyld_complete) out << "; provider export metadata is partial";
-                out << ")\n";
-                continue;
+            const auto resolution = resolve_macho_export(modules, *provider,
+                importer_slice.header.cpu_type, use.name);
+            using MachOStatus = MachOExportResolution::Status;
+            switch (resolution.status) {
+            case MachOStatus::missing_library:
+                out << "unresolved (re-export library not supplied or ordinal unavailable)\n"; continue;
+            case MachOStatus::ambiguous_library:
+                out << "ambiguous supplied re-export libraries\n"; continue;
+            case MachOStatus::missing_export:
+                out << "unresolved (no exact export in supplied re-export chain)\n"; continue;
+            case MachOStatus::ambiguous_export:
+                out << "ambiguous exports in supplied re-export chain\n"; continue;
+            case MachOStatus::cycle:
+                out << "unresolved (Mach-O re-export cycle detected)\n"; continue;
+            case MachOStatus::depth_limit:
+                out << "unresolved (Mach-O re-export depth exceeds 32 hops)\n"; continue;
+            case MachOStatus::unsupported:
+                out << "unsupported export kind or incompatible re-export image\n"; continue;
+            case MachOStatus::resolved: break;
             }
-            if (matches.size() != 1) {
-                out << "ambiguous exports in " << provider->path << " (" << matches.size() << ")\n";
-                continue;
-            }
-            const auto &exported = *matches.front();
-            if (!exported.is_definition()) {
-                if (exported.import_name)
-                    out << "reexported by " << provider->path << " as " << *exported.import_name << " (not followed)\n";
-                else
-                    out << "unsupported export kind in " << provider->path << "\n";
-                continue;
-            }
-            out << "resolved " << provider->path;
+            const auto &exported = *resolution.symbol;
+            out << "resolved ";
+            if (resolution.route.size() > 1) {
+                out << "through re-export chain ";
+                for (std::size_t index = 0; index < resolution.route.size(); ++index) {
+                    if (index) out << " -> ";
+                    out << resolution.route[index];
+                }
+                out << " to " << resolution.provider->path;
+            } else out << resolution.provider->path;
             if (exported.address) out << " at 0x" << std::hex << exported.address->offset << std::dec;
             else out << " (preferred address unavailable)";
             out << "\n";
