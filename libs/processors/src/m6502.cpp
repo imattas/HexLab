@@ -181,8 +181,9 @@ static DecodeResult decode_m6502_impl(std::span<const std::byte> bytes, Address 
             opcode == Opcode::m6502_lda || opcode == Opcode::m6502_ldx || opcode == Opcode::m6502_ldy;
         if (writes_value) i.register_writes.push_back(value);
         if (writes_flags) i.register_writes.push_back(p);
-        // A partial N/Z update preserves the incoming modeled P bits.
-        if (reads_carry || opcode == Opcode::m6502_lda || opcode == Opcode::m6502_ldx || opcode == Opcode::m6502_ldy)
+        // Data operations update selected P bits and preserve the rest, so
+        // the incoming status register is an explicit dependency.
+        if (writes_flags || reads_carry)
             i.register_reads.push_back(p);
         return finish(length);
     };
@@ -312,6 +313,7 @@ static DecodeResult decode_m6502_impl(std::span<const std::byte> bytes, Address 
     auto transfer = [&](Opcode opcode, R from, R to, bool flags) -> DecodeResult {
         implied(opcode);
         i.register_reads.push_back(from);
+        if (flags) i.register_reads.push_back(p);
         i.register_writes.push_back(to);
         if (flags) i.register_writes.push_back(p);
         return finish(1);
