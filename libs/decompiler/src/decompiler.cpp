@@ -2531,6 +2531,51 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
                 return effect;
             }
         }
+        const bool compare = instruction.opcode == Opcode::m6502_cmp || instruction.opcode == Opcode::m6502_cpx ||
+                             instruction.opcode == Opcode::m6502_cpy;
+        if (compare && instruction.operands.size() == 1 && operands.size() == 1 && operands.front() &&
+            operands.front()->type == integer_type(8) && instruction.flow == FlowKind::fallthrough &&
+            instruction.access == std::vector<OperandAccess>{OperandAccess::read} && !instruction.memory_write &&
+            instruction.register_writes == std::vector<RegisterOperand>{status}) {
+            const auto compared_index = instruction.opcode == Opcode::m6502_cpx ? 1u :
+                                        instruction.opcode == Opcode::m6502_cpy ? 2u : 0u;
+            const RegisterOperand compared{RegisterBank::mos6502, static_cast<std::uint8_t>(compared_index), 8, false};
+            const auto *immediate = std::get_if<ImmediateOperand>(&instruction.operands.front());
+            const auto *memory = std::get_if<MemoryOperand>(&instruction.operands.front());
+            const bool immediate_form = immediate && immediate->encoded_width == 8 && immediate->effective_width == 8 &&
+                !immediate->is_signed && immediate->value <= 0xff && !instruction.memory_read;
+            const bool valid_memory_index = !memory || !memory->index ||
+                (memory->index->bank == RegisterBank::mos6502 && memory->index->width == 8 &&
+                 (memory->index->index == 1 || memory->index->index == 2));
+            const bool memory_form = memory && memory->data_width == 8 && memory->address_width == 16 &&
+                instruction.memory_read && !memory->base && !memory->ip_relative && valid_memory_index &&
+                std::holds_alternative<MemoryValue>(operands.front()->value);
+            std::vector<RegisterOperand> expected_reads;
+            if (memory && memory->index) expected_reads.push_back(*memory->index);
+            expected_reads.push_back(compared);
+            expected_reads.push_back(status);
+            if ((immediate_form || memory_form) && instruction.register_reads == expected_reads) {
+                const auto difference = binary("and", binary("sub", reg_expr(compared), operands.front()),
+                    constant_expr(0xff, 8));
+                const auto carry = boolean_binary("uge", reg_expr(compared), operands.front());
+                const auto equal = boolean_binary("eq", reg_expr(compared), operands.front());
+                const auto negative = boolean_binary("bit_extract", difference, constant_expr(7, 8));
+                auto carry_flag = std::make_shared<Expression>(Expression{integer_type(8), UnaryValue{"zext", carry}});
+                auto zero_flag = std::make_shared<Expression>(Expression{integer_type(8), UnaryValue{"zext", equal}});
+                auto negative_flag = std::make_shared<Expression>(Expression{integer_type(8), UnaryValue{"zext", negative}});
+                auto updated_status = binary("or", binary("or", binary("or",
+                    binary("and", reg_expr(status), constant_expr(0x7c, 8)), std::move(carry_flag)),
+                    binary("shl", std::move(zero_flag), constant_expr(1, 8))),
+                    binary("shl", std::move(negative_flag), constant_expr(7, 8)));
+                Intrinsic effect{instruction.opcode == Opcode::m6502_cmp ? "m65c02_cmp" :
+                                 instruction.opcode == Opcode::m6502_cpx ? "m65c02_cpx" : "m65c02_cpy",
+                    {reg_expr(compared), operands.front(), reg_expr(status)},
+                    memory_form ? IntrinsicMemoryEffect::read : IntrinsicMemoryEffect::none};
+                effect.register_writes = {status};
+                effect.register_output_values = {std::move(updated_status)};
+                return effect;
+            }
+        }
         const auto opcode = instruction.opcode;
         const bool accumulator_adjust = opcode == Opcode::m6502_inc || opcode == Opcode::m6502_dec;
         const bool index_adjust = opcode == Opcode::m6502_inx || opcode == Opcode::m6502_dex ||
