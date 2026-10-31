@@ -3175,10 +3175,20 @@ RegisterReferenceFacts a64_reference_facts(const Image *image, const RelocationC
                 const auto *dst = architecture_register(instruction, 0, RegisterBank::arm64_gpr, 64);
                 const auto *address = std::get_if<MemoryOperand>(&instruction.operands[1]);
                 erase_written();
-                if (dst && dst->index != 31 && address && address->resolved_address) {
-                    registers[dst->index] = *address->resolved_address;
-                    if (riscv_target_segment(*image, *address->resolved_address, OperandAccess::address))
-                        result.immediate_targets[{fact->id, 1}] = *address->resolved_address;
+                if (dst && dst->index != 31 && address) {
+                    // A RELA ADR/ADRP field denotes S+A, while the encoded
+                    // instruction may still contain its unapplied addend.
+                    // Prefer the exact relocation result and never fall back
+                    // to those placeholder bits for an unresolved relocation.
+                    OperandResolution relocated;
+                    if (relocations.overlaps(instruction.address, instruction.length))
+                        relocated = reference_detail::take(resolver.operand(instruction, 1, stop));
+                    const auto target = relocated.relocated() ? relocated.address : address->resolved_address;
+                    if (target) {
+                        registers[dst->index] = *target;
+                        if (riscv_target_segment(*image, *target, OperandAccess::address))
+                            result.immediate_targets[{fact->id, 1}] = *target;
+                    }
                 }
                 propagated = true;
             } else if ((instruction.opcode == Opcode::a64_add || instruction.opcode == Opcode::a64_sub ||
@@ -3190,7 +3200,10 @@ RegisterReferenceFacts a64_reference_facts(const Image *image, const RelocationC
                     (dst_operand->width == 32 || dst_operand->width == 64) ? dst_operand : nullptr;
                 const auto *src = src_operand && src_operand->bank == RegisterBank::arm64_gpr &&
                     (src_operand->width == 32 || src_operand->width == 64) ? src_operand : nullptr;
-                const auto immediate = immediate_value(instruction, 2);
+                auto immediate = immediate_value(instruction, 2);
+                OperandResolution relocated_immediate;
+                if (relocations.overlaps(instruction.address, instruction.length))
+                    relocated_immediate = reference_detail::take(resolver.operand(instruction, 2, stop));
                 const auto *register_offset = std::get_if<RegisterOperand>(&instruction.operands[2]);
                 const bool flag_setting = instruction.opcode == Opcode::a64_adds ||
                                           instruction.opcode == Opcode::a64_subs;
@@ -3224,7 +3237,17 @@ RegisterReferenceFacts a64_reference_facts(const Image *image, const RelocationC
                     return instruction.register_writes == expected_writes;
                 };
                 std::optional<Address> target;
-                if (flag_set_effects_valid() && dst && dst->index != 31 && src && src->index != 31 &&
+                if (relocated_immediate.relocated()) {
+                    // ADD_ABS_LO12_NC relocates only the immediate's low
+                    // twelve bits. Keep the source register in the equation;
+                    // replacing the result with S+A is unsound for any other
+                    // source value.
+                    if (instruction.opcode == Opcode::a64_add && immediate && relocated_immediate.address)
+                        immediate = relocated_immediate.address->offset & UINT64_C(0xfff);
+                    else
+                        immediate.reset();
+                }
+                if (!target && flag_set_effects_valid() && dst && dst->index != 31 && src && src->index != 31 &&
                     dst->width == src->width && immediate) {
                     const auto base = registers.find(src->index);
                     if (base != registers.end() && base->second.space == instruction.address.space) {
@@ -3962,8 +3985,21 @@ RegisterReferenceFacts a64_reference_facts(const Image *image, const RelocationC
                     // A64 integer LDR literal uses an instruction-relative
                     // address and has no base register. Resolve its slot just
                     // like ADRP+LDR so subsequent BR/BLR targets can be proven.
-                    if (!memory->base && !memory->index && memory->ip_relative && memory->resolved_address) {
-                        const auto literal = *memory->resolved_address;
+                    if (!memory->base && !memory->index && memory->ip_relative) {
+                        std::optional<Address> literal_target;
+                        bool relocation_owns_literal = false;
+                        if (relocations.overlaps(instruction.address, instruction.length)) {
+                            const auto resolved = reference_detail::take(
+                                resolver.operand(instruction, static_cast<std::uint32_t>(i), stop));
+                            relocation_owns_literal = resolved.relocated();
+                            if (relocation_owns_literal)
+                                literal_target = resolved.address;
+                        }
+                        if (!relocation_owns_literal)
+                            literal_target = memory->resolved_address;
+                        if (!literal_target)
+                            continue;
+                        const auto literal = *literal_target;
                         const auto width = std::max<std::uint64_t>(1, (memory->data_width + 7) / 8);
                         if (!riscv_target_segment(*image, literal, instruction.access[i], width))
                             continue;
@@ -3998,6 +4034,56 @@ RegisterReferenceFacts a64_reference_facts(const Image *image, const RelocationC
                                 loaded_pointers.emplace_back(loaded_destination->index, *value);
                         }
                         continue;
+                    }
+                    if (relocations.overlaps(instruction.address, instruction.length)) {
+                        const auto resolved = reference_detail::take(
+                            resolver.operand(instruction, static_cast<std::uint32_t>(i), stop));
+                        if (resolved.relocated()) {
+                            // An unresolved address relocation owns the field;
+                            // do not use the still-encoded low bits as a slot.
+                            if (!resolved.address)
+                                continue;
+                            std::optional<Address> relocated_address;
+                            if (memory->ip_relative) {
+                                relocated_address = resolved.address;
+                            } else if (!memory->index && memory->base &&
+                                memory->base->bank == RegisterBank::arm64_gpr && memory->base->index != 31 &&
+                                memory->base->width == 64) {
+                                const auto base = registers.find(memory->base->index);
+                                const auto low12 = resolved.address->offset & UINT64_C(0xfff);
+                                if (base != registers.end() && base->second.space == instruction.address.space &&
+                                    low12 <= UINT64_MAX - base->second.offset)
+                                    relocated_address = Address{base->second.space, base->second.offset + low12};
+                            }
+                            if (!relocated_address)
+                                continue;
+                            const auto address = *relocated_address;
+                            const auto access_width = std::max<std::uint64_t>(1, (memory->data_width + 7) / 8);
+                            if (riscv_target_segment(*image, address, instruction.access[i], access_width)) {
+                                result.memory_targets[{fact->id, static_cast<std::uint32_t>(i)}] = address;
+                                const auto *destination = instruction.operands.empty()
+                                    ? nullptr : std::get_if<RegisterOperand>(&instruction.operands[0]);
+                                const bool destination_written = destination &&
+                                    destination->bank == RegisterBank::arm64_gpr && destination->index != 31 &&
+                                    destination->width == 64 && memory->data_width == 64 &&
+                                    instruction.opcode == Opcode::a64_ldr &&
+                                    instruction.access[i] == OperandAccess::read &&
+                                    std::any_of(instruction.register_writes.begin(), instruction.register_writes.end(),
+                                        [&](const RegisterOperand &written) {
+                                            return written.bank == destination->bank && written.index == destination->index;
+                                        });
+                                if (destination_written && riscv_target_segment(*image, address, OperandAccess::read, 8)) {
+                                    const auto slot = reference_detail::take(resolver.data_at(*image, address, 8, stop));
+                                    if (slot.relocated()) {
+                                        if (slot.address && riscv_target_segment(*image, *slot.address, OperandAccess::address))
+                                            loaded_pointers.emplace_back(destination->index, *slot.address);
+                                    } else if (const auto value = static_pointer_load(*image, relocations, address, 64)) {
+                                        loaded_pointers.emplace_back(destination->index, *value);
+                                    }
+                                }
+                            }
+                            continue;
+                        }
                     }
                     if (!memory->base || memory->base->bank != RegisterBank::arm64_gpr ||
                         memory->base->index == 31 || memory->base->width != 64)
@@ -6451,6 +6537,10 @@ derive_reference_values(const Image *image, const FunctionSnapshot &functions, c
                                 expression.resolved_address = target->second;
                                 dataflow_target = true;
                             }
+                        } else if (instruction.context.architecture == Architecture::arm64 &&
+                                   a64_facts.memory_targets.contains(operand_key)) {
+                            expression.resolved_address = a64_facts.memory_targets.at(operand_key);
+                            dataflow_target = true;
                         } else if (resolution.relocated())
                             expression.resolved_address = resolution.address;
                         else if (const auto x86_target =
@@ -6463,12 +6553,6 @@ derive_reference_values(const Image *image, const FunctionSnapshot &functions, c
                                      riscv_facts.memory_targets.find({fact->id, static_cast<std::uint32_t>(i)});
                                  riscv_target != riscv_facts.memory_targets.end()) {
                             expression.resolved_address = riscv_target->second;
-                            dataflow_target = true;
-                        }
-                        else if (const auto a64_target =
-                                     a64_facts.memory_targets.find({fact->id, static_cast<std::uint32_t>(i)});
-                                 a64_target != a64_facts.memory_targets.end()) {
-                            expression.resolved_address = a64_target->second;
                             dataflow_target = true;
                         }
                         else if (const auto mips_target =

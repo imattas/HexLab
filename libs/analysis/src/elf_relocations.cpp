@@ -295,16 +295,98 @@ Result<ElfOperandResolution> ElfRelocationResolver::operand(const Instruction &i
             if (output.relocations.size() != 1)
                 return output;
             const auto &row = state_->metadata->relocations[output.relocations.front()];
-            const bool branch = (instruction.opcode == Opcode::a64_bl && row.type == 283) ||
-                                (instruction.opcode == Opcode::a64_b && row.type == 282);
-            if (!branch || state_->metadata->header.machine != 183 || !state_->metadata->header.is_64 ||
+            if (state_->metadata->header.machine != 183 || !state_->metadata->header.is_64 ||
                 state_->metadata->header.order != ByteOrder::little || !row.explicit_addend ||
                 row.place != instruction.address || row.field_size != 4)
                 return output;
-            auto solved = state_->solve(std::move(output), Use::pc_relative, 0, 64);
-            if (solved.address && (solved.address->offset & 3)) {
+
+            const auto *memory = index < instruction.operands.size()
+                ? std::get_if<MemoryOperand>(&instruction.operands[index]) : nullptr;
+            const auto *immediate = index < instruction.operands.size()
+                ? std::get_if<ImmediateOperand>(&instruction.operands[index]) : nullptr;
+            std::uint32_t word = 0;
+            for (unsigned byte = 0; byte < 4; ++byte)
+                word |= std::uint32_t(std::to_integer<unsigned>(instruction.bytes[byte])) << (byte * 8);
+            const bool branch = (instruction.opcode == Opcode::a64_bl && row.type == 283) ||
+                (instruction.opcode == Opcode::a64_b && row.type == 282) ||
+                ((instruction.opcode == Opcode::a64_tbz || instruction.opcode == Opcode::a64_tbnz) &&
+                 row.type == 279) ||
+                ((instruction.opcode == Opcode::a64_b_cond || instruction.opcode == Opcode::a64_cbz ||
+                  instruction.opcode == Opcode::a64_cbnz) && row.type == 280);
+            const bool literal = row.type == 273 && memory && memory->ip_relative &&
+                (instruction.opcode == Opcode::a64_ldr || instruction.opcode == Opcode::a64_ldrsw);
+            const bool adr = row.type == 274 && instruction.opcode == Opcode::a64_adr && memory &&
+                memory->ip_relative;
+            const bool adrp = (row.type == 275 || row.type == 276) && instruction.opcode == Opcode::a64_adrp &&
+                memory && memory->ip_relative;
+            const bool add_low12 = row.type == 277 && instruction.opcode == Opcode::a64_add && immediate &&
+                (word & 0x7fc00000u) == 0x11000000u;
+            const auto load_store_width = row.type == 278 ? std::uint16_t{8}
+                : row.type == 284 ? std::uint16_t{16}
+                : row.type == 285 ? std::uint16_t{32}
+                : row.type == 286 ? std::uint16_t{64} : std::uint16_t{0};
+            const bool load_store_opcode = (load_store_width == 8 &&
+                    (instruction.opcode == Opcode::a64_ldrb || instruction.opcode == Opcode::a64_strb)) ||
+                (load_store_width == 16 && (instruction.opcode == Opcode::a64_ldrh ||
+                    instruction.opcode == Opcode::a64_strh)) ||
+                ((load_store_width == 32 || load_store_width == 64) &&
+                    (instruction.opcode == Opcode::a64_ldr || instruction.opcode == Opcode::a64_str));
+            const bool load_store_low12 = load_store_width && memory && !memory->ip_relative &&
+                memory->data_width == load_store_width && ((word >> 30) & 3u) == (load_store_width == 64 ? 3u
+                    : load_store_width == 32 ? 2u : load_store_width == 16 ? 1u : 0u) && load_store_opcode;
+            if (!(branch || literal || adr || adrp || add_low12 || load_store_low12))
+                return output;
+
+            const bool pc_relative = branch || literal || adr || adrp;
+            auto solved = state_->solve(std::move(output), pc_relative ? Use::pc_relative : Use::absolute, 0, 64);
+            const auto within_signed_range = [&](unsigned bits) {
+                if (!solved.address || solved.address->space != instruction.address.space)
+                    return false;
+                const auto place = instruction.address.offset;
+                const auto target = solved.address->offset;
+                const auto magnitude = UINT64_C(1) << (bits - 1);
+                return target >= place ? target - place < magnitude : place - target <= magnitude;
+            };
+            if (solved.address && (branch || literal) && (solved.address->offset & 3)) {
                 solved.address.reset();
                 solved.reason = ElfResolutionReason::field_mismatch;
+            }
+            if (solved.address && literal && !within_signed_range(21)) {
+                solved.address.reset();
+                solved.reason = ElfResolutionReason::overflow;
+            }
+            if (solved.address && adr && !within_signed_range(21)) {
+                solved.address.reset();
+                solved.reason = ElfResolutionReason::overflow;
+            }
+            if (solved.address && adrp)
+                solved.address->offset &= ~UINT64_C(0xfff);
+            if (solved.address && row.type == 275) {
+                const auto place_page = instruction.address.offset & ~UINT64_C(0xfff);
+                const auto target_page = solved.address->offset;
+                const auto magnitude = UINT64_C(1) << 32;
+                if (solved.address->space != instruction.address.space ||
+                    (target_page >= place_page ? target_page - place_page >= magnitude
+                                               : place_page - target_page > magnitude)) {
+                    solved.address.reset();
+                    solved.reason = ElfResolutionReason::overflow;
+                }
+            }
+            if (solved.address && load_store_low12 &&
+                (solved.address->offset & ((load_store_width / 8) - 1))) {
+                solved.address.reset();
+                solved.reason = ElfResolutionReason::field_mismatch;
+            }
+            if (solved.address && (row.type == 279 || row.type == 280 || row.type == 282 || row.type == 283)) {
+                const auto place = instruction.address.offset;
+                const auto target = solved.address->offset;
+                const auto range = row.type == 279 ? (UINT64_C(1) << 15)
+                    : row.type == 280 ? (UINT64_C(1) << 20) : (UINT64_C(1) << 27);
+                if (solved.address->space != instruction.address.space || (target & 3) ||
+                    (target >= place ? target - place >= range : place - target > range)) {
+                    solved.address.reset();
+                    solved.reason = ElfResolutionReason::overflow;
+                }
             }
             return solved;
         }
