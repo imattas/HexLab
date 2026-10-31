@@ -308,18 +308,21 @@ phis in the exit chain, side entries, additional exits, non-return exits,
 overlapping arms, malformed edges, incomplete block coverage, and larger
 graphs retain the existing fallback.
 
-An explicit-preheader post-tested loop may also use a two-arm body dispatcher
-whose arms end in distinct conditional latches. Each latch must target the
-dispatcher header on one edge and the same terminal-return block on the other.
-The function-entry path to the header is a bounded, phi-free linear chain;
-header register phis must have exactly one initial input from its preheader
-and one recurrent input from each latch. Return-block register phis must match
-the two latch edges. Each arm is limited to 64 blocks including its latch, and the
-complete function is limited to 128 blocks and 4,096 edges. The formatter emits
-the preheader once, applies initial phi copies, then emits each latch's repeat
-or exit copies before `continue` or `break`. Memory phis, nested or shared arm
-paths, extra exits, side entries, and malformed edge/phi sets retain the
-existing lossless fallback.
+An explicit-preheader post-tested loop may also use a bounded nested body-
+dispatch tree whose leaves end in distinct conditional latches. Each latch must
+target the dispatcher header on one edge and the same terminal-return block on
+the other. Internal dispatches and linear arm paths must have exact single-
+predecessor links; the complete function must be covered by the preheader,
+header, dispatch tree, latches, and one return block. The tree is limited to 64
+latch leaves, 127 branch nodes, and at most 64 nodes along any dispatch path
+(including its latch leaf); each linear path is capped at 64 blocks, and the
+complete function at 128 blocks and 4,096 edges. Header
+register phis must have exactly one initial input from the preheader and one
+recurrent input from every latch. Return-block register phis must match exactly
+the latch edges. The formatter emits the preheader once, applies initial phi
+copies, then emits each latch's repeat or exit copies before `continue` or
+`break`. Memory phis, shared paths, extra exits, side entries, non-return exits,
+and malformed edge/phi sets retain the existing lossless fallback.
 
 The acyclic structurer also handles nested regions with multiple explicit
 terminal returns. An analysis-only virtual exit supplies post-dominators for
