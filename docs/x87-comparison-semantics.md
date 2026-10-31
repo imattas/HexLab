@@ -52,6 +52,17 @@ the pop side effects of FCOMP/FCOMIP/FUCOMIP only when the comparison completed.
 Arithmetic and conversion remain symbolic in the decompiler until exact
 extended-precision arithmetic semantics are available.
 
+The decompiler now consumes this helper for the non-popping FCOMI/FUCOMI
+condition-flag slice. It requires proven nonempty physical tags before adding
+the value formula and keeps FSW and the effectful comparison intrinsic.
+Same-block literal folding checks actual FCW masks when known, or requires
+agreement across all IM/DM combinations when unknown. The formula preserves
+incoming flags outside AF/SF/OF/CF/PF/ZF, clears AF/SF/OF, and uses incoming
+CF/PF/ZF on an unmasked exception. It does not turn the helper's `relation`
+field into a retired comparison when `completed` is false. Unknown tags,
+stack faults, and popping-form retirement remain conservative; see
+[x87 decompiler behavior](decompiler-x87.md).
+
 The comparison behavior follows Intel's instruction reference for [FCOM and
 FCOMP](https://www.intel.com/content/dam/www/public/us/en/documents/manuals/64-ia-32-architectures-software-developer-manual-volume-2a.pdf)
 and [FCOMI/FUCOMI](https://www.intel.com/content/dam/www/public/us/en/documents/manuals/64-ia-32-architectures-software-developer-manual-volume-2a.pdf).

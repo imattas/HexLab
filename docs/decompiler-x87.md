@@ -49,6 +49,25 @@ The decoder reports `FCOMI`, `FUCOMI`, `FCOMIP`, and `FUCOMIP` as reads of two
 decompiler preserves each instruction as an `x87_<mnemonic>` intrinsic, so the
 numeric comparison and its floating exception behavior remain explicit effects.
 
+For non-popping `FCOMI` and `FUCOMI`, function lifting also exposes an
+EFLAGS value formula when incoming TOP and both physical tags prove that the
+operands are nonempty. Its condition result distinguishes ordered FCOMI from
+FUCOMI's quiet-NaN behavior, consults FCW.IM/DM, and preserves incoming
+CF/PF/ZF when an unmasked numeric exception prevents comparison completion.
+The formula clears AF/SF/OF and preserves every other incoming flag bit.
+FSW remains an unknown parallel output of the effectful intrinsic, and the
+existing pending-exception trap edge remains attached to the instruction.
+
+The optimizer can substitute exact same-block binary80 SSA literals into this
+formula and evaluate CF/PF/ZF using `evaluate_x87_compare`. With unknown FCW,
+it checks all four IM/DM combinations and folds only an identical result;
+it never assumes the reset exception masks. An incomplete evaluation also
+requires known incoming flags. Quiet NaNs therefore produce unordered for
+FUCOMI without assuming invalid masking; FCOMI with NaNs and comparisons
+with denormals stay symbolic when mask-dependent. Unknown or empty tags
+retain the original opaque flags output. Popping FCOMIP/FUCOMIP remain
+opaque because their TOP/tag retirement also depends on completion.
+
 When a later x86 conditional branch uses those flags, the lifted predicate
 reads the SSA version of EFLAGS written by the compare. The predicate uses
 the architectural x87 compare result mapping: CF represents less or unordered,
@@ -65,11 +84,10 @@ Conditions involving SF or OF are left without a reconstructed predicate:
 SAHF writes SF from FSW.B and preserves the previous OF value. Unrelated AX,
 FSW, or EFLAGS writes and calls invalidate the propagated state.
 
-Compare values and floating exception behavior remain opaque; branch recovery
-only interprets the architecturally defined condition bits. The pass does not
-distinguish `FCOM` from `FUCOM` exception signaling, model x87 TOP or concrete
-logical stack rotation (although push/pop depth is retained), or make
-rounding/exception state precise for arithmetic.
+Legacy compare values and floating exception behavior remain opaque; their
+branch recovery only interprets the architecturally defined condition bits.
+General arithmetic rounding/exception state and exception-dependent stack
+retirement remain incomplete.
 
 ## FLD ST(i) value copies
 

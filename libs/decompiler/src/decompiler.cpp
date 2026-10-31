@@ -115,6 +115,55 @@ void refine_x87_stack_writes(Statement &statement, const Instruction &instructio
         }
     }
 }
+void refine_x87_compare_flags(Statement &statement, const Instruction &instruction,
+                              const X87StackState &stack) {
+    // Popping forms still need exception-dependent TOP/tag retirement. Only
+    // expose the non-popping numeric result when both operands are proven
+    // nonempty; an unknown/empty tag must not turn a stack fault into a value.
+    const auto &name = instruction.mnemonic_override;
+    if ((name != "fcomi" && name != "fucomi") || instruction.x87_stack_delta != 0 ||
+        instruction.operands.size() != 2) return;
+    auto *effect = std::get_if<Intrinsic>(&statement);
+    if (!effect) return;
+    std::vector<ExpressionPtr> values;
+    for (const auto &operand : instruction.operands) {
+        const auto *reg = std::get_if<RegisterOperand>(&operand);
+        if (!reg || reg->bank != RegisterBank::x87 || reg->width != 80 || reg->index >= 8) return;
+        const auto physical = x87_physical_register(stack, reg->index);
+        if (!physical || !stack.tags[*physical] || *stack.tags[*physical] == X87Tag::empty) return;
+        values.push_back(std::make_shared<Expression>(Expression{
+            ValueType{TypeKind::floating, 80, false}, RegisterValue{*reg, {}}}));
+    }
+    const auto flags = std::find_if(instruction.register_reads.begin(), instruction.register_reads.end(),
+        [](RegisterOperand reg) { return reg.bank == RegisterBank::flags; });
+    const auto control = std::find_if(instruction.register_reads.begin(), instruction.register_reads.end(),
+        [](RegisterOperand reg) { return reg.bank == RegisterBank::x87_control && reg.width == 16; });
+    if (flags == instruction.register_reads.end() || control == instruction.register_reads.end() ||
+        flags->width < 16 || flags->width > 64) return;
+    const ValueType type{TypeKind::integer, flags->width, false};
+    const auto binary = [&](std::string operation, ExpressionPtr left, ExpressionPtr right) {
+        return std::make_shared<Expression>(Expression{type,
+            BinaryValue{std::move(operation), std::move(left), std::move(right)}});
+    };
+    const auto prior_flags = std::make_shared<Expression>(Expression{type, RegisterValue{*flags, {}}});
+    const auto fcw = std::make_shared<Expression>(Expression{
+        ValueType{TypeKind::integer, 16, false}, RegisterValue{*control, {}}});
+    // The condition expression returns only CF/PF/ZF. It consults IM/DM,
+    // preserving their prior values on an unmasked numeric exception.
+    const auto condition_flags = binary("x87_" + name + "_condition_flags",
+        binary("pair", values[0], values[1]), binary("pair", fcw, prior_flags));
+    const auto width_mask = flags->width == 64 ? UINT64_MAX : (UINT64_C(1) << flags->width) - 1;
+    const auto preserve_mask = std::make_shared<Expression>(Expression{type,
+        ConstantValue{width_mask & ~UINT64_C(0x8d5), type}});
+    const auto condition_mask = std::make_shared<Expression>(Expression{type, ConstantValue{0x45, type}});
+    const auto flags_value = binary("or", binary("and", prior_flags, preserve_mask),
+        binary("and", condition_flags, condition_mask));
+    effect->register_output_values.clear();
+    for (const auto reg : effect->register_writes)
+        effect->register_output_values.push_back(reg == *flags ? flags_value :
+            std::make_shared<Expression>(Expression{ValueType{TypeKind::integer, reg.width, false},
+                UnknownValue{"x87 status after " + name}}));
+}
 } // namespace
 
 ExpressionTypeScope::ExpressionTypeScope(std::span<const RecoveredVariable> variables)
@@ -2119,6 +2168,8 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
     if ((instruction.context.architecture == Architecture::x86 ||
          instruction.context.architecture == Architecture::x86_64) && instruction.opcode == Opcode::x87) {
         const auto &name = instruction.mnemonic_override;
+        const bool integer_flag_compare = name == "fcomi" || name == "fucomi" ||
+                                          name == "fcomip" || name == "fucomip";
         const bool integer_memory = name.starts_with("fi");
         const bool real_memory = name == "fld" || name == "fst" || name == "fstp" ||
             name == "fcom" || name == "fcomp" || name.starts_with("fadd") ||
@@ -2148,7 +2199,8 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
         // ST(0), FSW, FCW, or FTW) without duplicating explicit operands.
         for (const auto &reg : instruction.register_reads) {
             if (reg.bank != RegisterBank::x87 && reg.bank != RegisterBank::x87_status &&
-                reg.bank != RegisterBank::x87_control && reg.bank != RegisterBank::x87_tag)
+                reg.bank != RegisterBank::x87_control && reg.bank != RegisterBank::x87_tag &&
+                !(integer_flag_compare && reg.bank == RegisterBank::flags))
                 continue;
             const bool explicit_read = std::any_of(instruction.operands.begin(), instruction.operands.end(),
                 [&](const Operand &operand) {
@@ -7591,13 +7643,25 @@ std::string expression_text(const Expression &expression) {
             if (value.operation == "bitnot") return "~(" + operand + ")";
             return value.operation + "(" + operand + ")";
         } else if constexpr (std::is_same_v<T, BinaryValue>) {
+            if (value.operation == "x87_fcomi_condition_flags" ||
+                value.operation == "x87_fucomi_condition_flags") {
+                const auto *operands = value.left ? std::get_if<BinaryValue>(&value.left->value) : nullptr;
+                const auto *environment = value.right ? std::get_if<BinaryValue>(&value.right->value) : nullptr;
+                if (operands && operands->operation == "pair" && environment && environment->operation == "pair" &&
+                    operands->left && operands->right && environment->left && environment->right)
+                    return value.operation + "(" + expression_text(*operands->left) + ", " +
+                        expression_text(*operands->right) + ", " + expression_text(*environment->left) +
+                        ", " + expression_text(*environment->right) + ")";
+            }
             if (value.operation.rfind("x86_mul_full_", 0) == 0)
                 return value.operation + "(" + expression_text(*value.left) + ", " +
                        expression_text(*value.right) + ")";
             if (value.operation == "jvm_lcmp" || value.operation == "jvm_fcmpl_nan_minus_one" ||
                 value.operation == "jvm_fcmpg_nan_plus_one" || value.operation == "jvm_dcmpl_nan_minus_one" ||
                 value.operation == "jvm_dcmpg_nan_plus_one" ||
-                value.operation == "x87_pending_unmasked_exception")
+                value.operation == "x87_pending_unmasked_exception" ||
+                value.operation == "x87_fcomi_condition_flags" ||
+                value.operation == "x87_fucomi_condition_flags")
                 return value.operation + "(" + expression_text(*value.left) + ", " +
                        expression_text(*value.right) + ")";
             if (value.operation == "a64_udiv" || value.operation == "a64_sdiv" ||
@@ -8522,6 +8586,8 @@ Result<LiftedFunction> lift_function(const FunctionRecord &function, const Funct
             }
             if (auto *intrinsic = std::get_if<Intrinsic>(&statement); intrinsic && x87_instruction)
                 intrinsic->x87_stack_state = x87_stack_state;
+            if (x87_instruction)
+                detail::refine_x87_compare_flags(statement, decoded, x87_stack_state);
             const auto x87_post_state = transfer_x87_stack_state(x87_stack_state, decoded);
             if (x87_instruction && (x87_stack_state.top || decoded.mnemonic_override == "fld1" ||
                                     decoded.mnemonic_override == "fldz"))

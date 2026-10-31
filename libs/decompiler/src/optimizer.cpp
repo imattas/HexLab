@@ -261,7 +261,44 @@ std::optional<ConstantValue> fold_riscv_fround(const BinaryValue &binary, ValueT
     return ConstantValue{exceptions ? evaluated->fflags_set : evaluated->value, expected_result};
 }
 
+std::optional<ConstantValue> fold_x87_condition_flags(const BinaryValue &binary, ValueType type) {
+    const bool ordered = binary.operation == "x87_fcomi_condition_flags";
+    if ((!ordered && binary.operation != "x87_fucomi_condition_flags") ||
+        type.kind != TypeKind::integer || type.bits < 16 || type.bits > 64) return {};
+    const auto *operands = binary.left ? std::get_if<BinaryValue>(&binary.left->value) : nullptr;
+    const auto *environment = binary.right ? std::get_if<BinaryValue>(&binary.right->value) : nullptr;
+    if (!operands || operands->operation != "pair" || !environment || environment->operation != "pair" ||
+        !operands->left || !operands->right || !environment->left || !environment->right) return {};
+    const ValueType extended{TypeKind::floating, 80, false};
+    if (operands->left->type != extended || operands->right->type != extended ||
+        environment->left->type != ValueType{TypeKind::integer, 16, false} ||
+        environment->right->type != type) return {};
+    const auto *left = std::get_if<X87Binary80Value>(&operands->left->value);
+    const auto *right = std::get_if<X87Binary80Value>(&operands->right->value);
+    if (!left || !right) return {};
+    const auto *control = std::get_if<ConstantValue>(&environment->left->value);
+    const auto *flags = std::get_if<ConstantValue>(&environment->right->value);
+    std::optional<std::uint32_t> common;
+    // Only IM/DM affect comparison completion. With unknown FCW, require
+    // every mask setting to agree. Never assume the reset mask value.
+    for (std::uint16_t masks = 0; masks < (control ? 1 : 4); ++masks) {
+        X87CompareRequest request;
+        request.left = left->value;
+        request.right = right->value;
+        request.control_word = static_cast<std::uint16_t>(control ? control->value : masks);
+        request.eflags = flags ? static_cast<std::uint32_t>(flags->value) : 0;
+        request.kind = ordered ? X87CompareKind::fcomi : X87CompareKind::fucomi;
+        const auto evaluated = evaluate_x87_compare(request);
+        if (!evaluated || !evaluated->eflags || (!evaluated->completed && !flags)) return {};
+        const auto condition = *evaluated->eflags & 0x45u;
+        if (common && *common != condition) return {};
+        common = condition;
+    }
+    return common ? std::optional<ConstantValue>{ConstantValue{*common, type}} : std::nullopt;
+}
+
 std::optional<ConstantValue> fold_binary(const BinaryValue &binary, ValueType result_type) {
+    if (auto compared = fold_x87_condition_flags(binary, result_type)) return compared;
     if (auto rounded = fold_riscv_fround(binary, result_type)) return rounded;
     const auto *left = binary.left ? std::get_if<ConstantValue>(&binary.left->value) : nullptr;
     const auto *right = binary.right ? std::get_if<ConstantValue>(&binary.right->value) : nullptr;
@@ -1080,9 +1117,37 @@ void propagate_x87_binary80_constants(LiftedFunction &function) {
                 continue;
             }
             if (auto *intrinsic = std::get_if<Intrinsic>(&instruction.statement)) {
-                // Opaque x87 effects invalidate prior payload facts; retain
-                // only explicitly modeled literal parallel outputs.
-                constants.clear();
+                if (intrinsic->name == "x87_fcomi" || intrinsic->name == "x87_fucomi") {
+                    // Substitute only immutable, same-block SSA payload facts.
+                    // Unknown outputs have distinct versions and never inherit
+                    // the value of a previous write to that physical register.
+                    const auto rewrite = [&](const auto &self, const ExpressionPtr &value,
+                                             unsigned depth) -> ExpressionPtr {
+                        if (!value || depth > 64) return value;
+                        if (const auto *reg = std::get_if<RegisterValue>(&value->value);
+                            reg && reg->reg.bank == RegisterBank::x87 && reg->version &&
+                            value->type == ValueType{TypeKind::floating, 80, false}) {
+                            const auto found = constants.find(key(reg->reg, *reg->version));
+                            if (found != constants.end()) return x87_constant_expression(found->second);
+                        }
+                        if (const auto *binary = std::get_if<BinaryValue>(&value->value)) {
+                            const BinaryValue rewritten{binary->operation,
+                                self(self, binary->left, depth + 1), self(self, binary->right, depth + 1)};
+                            if (auto folded = fold_binary(rewritten, value->type))
+                                return constant_expression(*folded);
+                            return std::make_shared<Expression>(Expression{value->type, rewritten});
+                        }
+                        return value;
+                    };
+                    for (auto &output : intrinsic->register_output_values)
+                        output = rewrite(rewrite, output, 0);
+                }
+                // Retain immutable payload versions across the bounded literal
+                // pushes and non-popping compares used by this proof. Other
+                // opaque effects keep the existing conservative barrier.
+                if (intrinsic->name != "x87_fld1" && intrinsic->name != "x87_fldz" &&
+                    intrinsic->name != "x87_fcomi" && intrinsic->name != "x87_fucomi")
+                    constants.clear();
                 const auto count = std::min(intrinsic->register_writes.size(),
                     std::min(intrinsic->register_output_versions.size(), intrinsic->register_output_values.size()));
                 for (std::size_t i = 0; i < count; ++i) {

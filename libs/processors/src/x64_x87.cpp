@@ -322,7 +322,9 @@ bool register_form(State &s, std::uint8_t opcode, unsigned group, unsigned index
     if (opcode == 0xdb && (group == 5 || group == 6)) {
         mnemonic(s, group == 5 ? "fucomi" : "fcomi");
         s.operand(st0, OperandAccess::read); s.operand(sti, OperandAccess::read);
-        s.flags_write = true; compare_status(s); return true;
+        // Preserve unrelated EFLAGS bits and, on an unmasked comparison
+        // exception, the incoming ZF/PF/CF as well.
+        s.flags_read = true; s.flags_write = true; compare_status(s); return true;
     }
     if (opcode == 0xda || opcode == 0xdb)
         invalid("Reserved x87 register encoding");
@@ -384,7 +386,7 @@ bool register_form(State &s, std::uint8_t opcode, unsigned group, unsigned index
         if (group == 5 || group == 6) {
             mnemonic(s, group == 5 ? "fucomip" : "fcomip");
             s.operand(st0, OperandAccess::read); s.operand(sti, OperandAccess::read);
-            s.flags_write = true; compare_status(s); pop(s); return true;
+            s.flags_read = true; s.flags_write = true; compare_status(s); pop(s); return true;
         }
         invalid("Reserved DF register extension");
     }
