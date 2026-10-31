@@ -18,8 +18,12 @@ cast success and exact `ClassCastException` behavior are not inferred.
 synchronization intrinsics with unknown effects. This does not model monitor
 ownership, reentrancy, or exceptional exits. `multianewarray` validates an
 array Class descriptor and its requested rank, consumes each dimension size in
-JVM stack order, and emits an allocation intrinsic. Exact heap contents and
-allocation exceptions remain opaque.
+JVM stack order, and emits an allocation intrinsic. `new`, `newarray`,
+`anewarray`, and `multianewarray` retain a may-trap edge for
+`OutOfMemoryError` with an opaque runtime predicate; primitive/reference array
+allocations also retain the exact negative-size predicate. Heap contents,
+allocator thresholds, class-initialization failures, and other linkage errors
+remain unresolved.
 
 All operands use the existing typed stack checks. Values cross basic blocks
 through versioned stack definitions and phis. Reference-bearing joins and
