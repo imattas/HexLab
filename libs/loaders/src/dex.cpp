@@ -85,6 +85,25 @@ bool extent(std::uint64_t off, std::uint64_t count, std::uint64_t stride, std::u
     return off <= size && (!count || (stride && count <= (size - off) / stride));
 }
 
+// Standard Dalvik operations below can transfer control to an in-method
+// handler without completing their normal register write. Keep this list
+// conservative: extra handler predecessors lose type precision at joins but
+// cannot manufacture a value that was written only on the normal path.
+bool dex_opcode_may_throw(std::uint8_t opcode) {
+    if (opcode == 0x1a || opcode == 0x1b || opcode == 0x1c || opcode == 0x1d ||
+        opcode == 0x1e || opcode == 0x1f || opcode == 0x20 || opcode == 0x21 ||
+        opcode == 0x22 || opcode == 0x23 ||
+        (opcode >= 0x24 && opcode <= 0x27) ||
+        (opcode >= 0x44 && opcode <= 0x78) ||
+        opcode == 0x93 || opcode == 0x94 || opcode == 0x9e || opcode == 0x9f ||
+        opcode == 0xb3 || opcode == 0xb4 || opcode == 0xbe || opcode == 0xbf ||
+        opcode == 0xd3 || opcode == 0xd4 || opcode == 0xde || opcode == 0xdf ||
+        opcode == 0xfa || opcode == 0xfb || opcode == 0xfc || opcode == 0xfd ||
+        opcode == 0xfe || opcode == 0xff)
+        return true;
+    return false;
+}
+
 bool next_utf8_codepoint(std::string_view text, std::size_t &cursor, std::uint32_t &codepoint) {
     if (cursor >= text.size()) return false;
     const auto lead = static_cast<std::uint8_t>(text[cursor++]);
@@ -2219,14 +2238,12 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
                             }
                             if (changed) type_work.push_back(successor);
                         };
-                        // An invoke can transfer control to a catch handler
-                        // before its normal result is written. Preserve the
-                        // instruction's pre-state on this exceptional edge;
-                        // the adjacent move-result remains a normal edge only.
-                        const bool invoke = (opcode >= 0x6e && opcode <= 0x72) ||
-                            (opcode >= 0x74 && opcode <= 0x78) ||
-                            (opcode >= 0xfa && opcode <= 0xfd);
-                        if (invoke) {
+                        // A throwing operation can transfer control to a catch
+                        // handler before its normal register effects complete.
+                        // Propagate the pre-state so destinations such as a
+                        // get-result or allocation register are not spuriously
+                        // initialized on the exceptional edge.
+                        if (dex_opcode_may_throw(opcode)) {
                             for (const auto &region : exception_regions) {
                                 if (offset < region.begin || offset >= region.end) continue;
                                 for (const auto &handler : region.handlers)

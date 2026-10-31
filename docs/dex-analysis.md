@@ -418,8 +418,12 @@ either a proven match or a malformed DEX. The pass does not resolve
 external class definitions, infer common supertypes at joins, validate
 field-owner receivers, or prove access, dispatch target identity, constructor
 uninitialized-object rules, or quick/inline call signatures. Exceptional
-state propagation currently covers invoke instructions only; handlers reached
-through other potentially throwing instructions are outside this type-flow
-slice. The complete Dalvik verifier lattice remains unsupported.
+state propagation covers standard array and field access, invokes, object and
+array allocation, type/string resolution, monitors, throw, and integer/long
+division and remainder. It sends each covered instruction's pre-state to
+matching handlers, so a destination written only on the normal path is not
+treated as initialized in a catch block. Other potentially throwing optimized
+or unmodeled instruction families are outside this slice. The complete Dalvik
+verifier lattice remains unsupported.
 Methods with unsupported instruction decoding do not receive this CFG type
 pass. It is a bounded partial verifier, not Android ART verification.
