@@ -41,6 +41,15 @@ least one non-ASCII scalar. Persisted encoding ID 45 is appended and derived
 cache version 96 recomputes older scans. The result remains a heuristic code
 page interpretation and does not infer locale or language.
 
+Windows-950 adds a bounded Microsoft Big5 candidate using the Unicode
+Consortium's [CP950 mapping table](https://www.unicode.org/Public/MAPPINGS/VENDORS/MICSFT/WINDOWS/CP950.TXT).
+The scanner accepts the defined lead and trail ranges, splits on invalid or
+undefined pairs, preserves source byte/address extents, and emits UTF-8
+previews. Candidate extents identical to strict UTF-8 are suppressed. Encoding
+ID 46 is appended and derived-cache version 98 recomputes older scans. Windows-
+950 is a mapping candidate; it does not infer locale or language, and arbitrary
+binary can still produce overlapping candidates.
+
 Windows-1251 is scanned as a second single-byte heuristic, with an explicit
 fixed mapping for Cyrillic letters and punctuation. Its undefined byte 0x98
 ends a candidate. As with Windows-1252, emitted candidates must contain a
