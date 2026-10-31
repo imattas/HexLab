@@ -5,6 +5,7 @@
 #include <optional>
 #include <stop_token>
 #include <string>
+#include <span>
 
 namespace hexlab {
 // Bounded WebAssembly v1 container/function-body loader. It retains import and
@@ -32,6 +33,29 @@ struct WasmImportHostFacts {
     bool memory64 = false;
 };
 using WasmTableMemoryImportResolver = std::function<std::optional<WasmImportHostFacts>(const WasmImport &)>;
+
+// Offline module inventory linking. This compares only caller-supplied parsed
+// metadata; it never opens files, loads modules, or executes host code.
+struct WasmLinkModule {
+    std::string identity;
+    const WasmMetadata *metadata = nullptr;
+};
+enum class WasmLinkStatus : std::uint8_t { linked, missing, ambiguous, incompatible, unsupported, invalid_inventory };
+struct WasmLinkResolution {
+    std::string consumer, module, name;
+    WasmExternalKind kind = WasmExternalKind::function;
+    WasmLinkStatus status = WasmLinkStatus::missing;
+    std::optional<std::string> provider;
+    std::optional<std::uint32_t> provider_export_index;
+    std::string detail;
+};
+struct WasmLinkOptions {
+    std::size_t maximum_modules = 4096;
+    std::size_t maximum_imports = 1'000'000;
+    std::size_t maximum_export_comparisons = 16'000'000;
+};
+HEXLAB_LOADERS_EXPORT std::vector<WasmLinkResolution> link_wasm_inventory(
+    std::span<const WasmLinkModule>, WasmLinkOptions = {}, std::stop_token = {});
 HEXLAB_LOADERS_EXPORT Result<LoadedImage> load_wasm(std::shared_ptr<const ByteStorage>, std::stop_token,
                                                     WasmGlobalImportResolver = {},
                                                     WasmTableMemoryImportResolver = {},
