@@ -1,9 +1,13 @@
-# Darwin native debugger backend
+# Historical Darwin native debugger backend
 
-CMake selects `native_backend_macos.cpp` on Darwin. The backend uses Darwin
-ptrace for lifecycle events and Mach task/thread APIs for inspection. It targets
-native x86-64 processes on x86-64 macOS and native AArch64 processes on AArch64
-macOS. OS permissions for `task_for_pid` and ptrace remain required.
+This page describes an unshipped backend retained for historical reference.
+HexLab supports Windows and Linux hosts only. The Darwin backend is not selected
+by CMake, built, or shipped.
+
+The former backend used Darwin ptrace for lifecycle events and Mach task/thread
+APIs for inspection. It targeted native x86-64 processes on x86-64 macOS and
+native AArch64 processes on AArch64 macOS. OS permissions for `task_for_pid`
+and ptrace remain required.
 
 ## Process, memory, and threads
 

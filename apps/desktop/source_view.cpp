@@ -33,7 +33,7 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#if defined(__linux__) || defined(__APPLE__)
+#if defined(__linux__)
 #include <sys/xattr.h>
 #endif
 #endif
@@ -115,12 +115,6 @@ bool replace_source_file(const std::filesystem::path &path, std::span<const std:
     }
 #if defined(__linux__)
     const auto attributes_size = ::listxattr(path.c_str(), nullptr, 0);
-    if (attributes_size < 0 || attributes_size > 0) {
-        failure = "Source file has extended attributes that cannot be preserved safely";
-        return false;
-    }
-#elif defined(__APPLE__)
-    const auto attributes_size = ::listxattr(path.c_str(), nullptr, 0, 0);
     if (attributes_size < 0 || attributes_size > 0) {
         failure = "Source file has extended attributes that cannot be preserved safely";
         return false;

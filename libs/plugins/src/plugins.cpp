@@ -2579,11 +2579,7 @@ std::filesystem::path default_plugin_state_path() {
     if (const auto* base = std::getenv("XDG_STATE_HOME"); base && *base)
         return std::filesystem::path(base) / "hexlab" / "plugin-state-v1.bin";
     if (const auto* home = std::getenv("HOME"); home && *home)
-#ifdef __APPLE__
-        return std::filesystem::path(home) / "Library" / "Application Support" / "HexLab" / "plugin-state-v1.bin";
-#else
         return std::filesystem::path(home) / ".local" / "state" / "hexlab" / "plugin-state-v1.bin";
-#endif
 #endif
     return {};
 }
@@ -3213,7 +3209,6 @@ Result<std::vector<PluginCandidate>> PluginManager::scan_directory(
             const auto entry_status = current->symlink_status(ec);
             if (ec) return Error{ErrorCode::io, "cannot inspect plugin directory entry: " + ec.message()};
             const bool regular = std::filesystem::is_regular_file(entry_status);
-            const bool directory_bundle = std::filesystem::is_directory(entry_status);
             if (!std::filesystem::is_symlink(entry_status)) {
                 const auto filename = entry_path.filename().u8string();
                 std::string ascii_name;
@@ -3224,9 +3219,6 @@ Result<std::vector<PluginCandidate>> PluginManager::scan_directory(
                 bool supported = false;
 #if defined(_WIN32)
                 supported = regular && ascii_name.size() > 4 && ascii_name.ends_with(".dll");
-#elif defined(__APPLE__)
-                supported = (regular && (ascii_name.ends_with(".dylib") || ascii_name.ends_with(".so"))) ||
-                            (directory_bundle && ascii_name.ends_with(".bundle"));
 #else
                 supported = regular && ascii_name.ends_with(".so");
                 if (regular && !supported) {

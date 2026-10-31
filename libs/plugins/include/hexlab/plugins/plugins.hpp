@@ -187,8 +187,8 @@ public:
        SHA-256 pin is checked immediately before and after native module open,
        and identity/capability declarations are checked before start. */
     Result<PluginInfo> load_candidate(const PluginCandidate& candidate);
-    /* Enumerates only direct native-module candidates (macOS .bundle directories
-       are supported). Symlinks and unrelated nested directories are skipped;
+    /* Enumerates only direct native-module candidates. Symlinks and unrelated
+       nested directories are skipped;
        scanning is bounded and does not load or execute any candidate. */
     Result<std::vector<PluginCandidate>> scan_directory(
         const std::string& directory, std::size_t max_entries = 4096) const;

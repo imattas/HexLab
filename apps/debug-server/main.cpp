@@ -626,7 +626,7 @@ unsigned rsp_signal(const DebugEvent& event) {
     default: return 6; // SIGABRT for an otherwise unmapped fatal exception
     }
 #else
-    // Linux and Darwin backends put the native stop signal in event.code.
+    // Linux puts the native stop signal in event.code.
     return event.code > 0 && event.code <= 64 ? event.code : 6;
 #endif
 }
@@ -709,9 +709,6 @@ bool single_step_supported(const ServerState& state) {
            process->architecture == hexlab::Architecture::x86_64;
 #elif defined(__linux__) && defined(__aarch64__)
     return process->architecture == hexlab::Architecture::arm64;
-#elif defined(__APPLE__)
-    return process->architecture == hexlab::Architecture::x86_64 ||
-           process->architecture == hexlab::Architecture::arm64;
 #else
     return false;
 #endif
@@ -1192,7 +1189,7 @@ std::optional<std::string> resume_and_wait(ServerState& state, std::string_view 
         state.session.continue_execution(sequence, disposition);
     // A one-thread schedule is equivalent to legacy stepping only after a
     // fresh listing proves that no peer could run. This retains the narrow
-    // Darwin backend without making unsupported multi-thread plans global.
+    // Linux backend without making unsupported multi-thread plans global.
     if (!resumed && request->vcont && !resolved.process_continue &&
         resumed.error().code == hexlab::ErrorCode::unsupported && resolved.schedule.size() == 1 &&
         resolved.schedule.front().thread == state.event->thread &&

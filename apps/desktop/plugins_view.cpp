@@ -520,8 +520,6 @@ void PluginsView::load() {
     if (path.empty()) {
 #ifdef __WXMSW__
         constexpr const char *wildcard = "Plugin libraries (*.dll)|*.dll|All files (*.*)|*.*";
-#elif defined(__APPLE__)
-        constexpr const char *wildcard = "Plugin libraries (*.dylib)|*.dylib|All files (*.*)|*";
 #else
         constexpr const char *wildcard = "Plugin libraries (*.so, *.so.*)|*.so;*.so.*|All files (*)|*";
 #endif
