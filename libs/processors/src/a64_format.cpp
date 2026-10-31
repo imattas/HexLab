@@ -202,11 +202,27 @@ std::string format(const Instruction &i) {
                    (name == "ubfx" || name == "sbfx" ? ", #" + hex(second) : "");
         }
     }
-    std::string result = mnemonic(i.opcode, i.condition);
     std::uint32_t encoded_word = 0;
     if (i.bytes.size() == 4)
         for (unsigned byte = 0; byte < 4; ++byte)
             encoded_word |= std::uint32_t(std::to_integer<unsigned>(i.bytes[byte])) << (byte * 8);
+    std::string result = mnemonic(i.opcode, i.condition);
+    const bool unscaled_encoding = i.bytes.size() == 4 &&
+        (encoded_word & 0x3b200000u) == 0x38000000u &&
+        ((encoded_word >> 10) & 3u) == 0 && ((encoded_word >> 22) & 3u) <= 1;
+    const unsigned unscaled_size = encoded_word >> 30;
+    const bool unscaled_load = ((encoded_word >> 22) & 3u) == 1;
+    const auto unscaled_opcode = unscaled_size == 0
+        ? (unscaled_load ? Opcode::a64_ldrb : Opcode::a64_strb)
+        : unscaled_size == 1
+            ? (unscaled_load ? Opcode::a64_ldrh : Opcode::a64_strh)
+            : unscaled_load ? Opcode::a64_ldr : Opcode::a64_str;
+    const bool unscaled_transfer = unscaled_encoding && i.opcode == unscaled_opcode;
+    if (unscaled_transfer) {
+        if (unscaled_size == 0) result = unscaled_load ? "ldurb" : "sturb";
+        else if (unscaled_size == 1) result = unscaled_load ? "ldurh" : "sturh";
+        else result = unscaled_load ? "ldur" : "stur";
+    }
     const bool extended_add_sub = i.bytes.size() == 4 &&
         (encoded_word & 0x1f200000u) == 0x0b200000u;
     for (std::size_t n = 0; n < i.operands.size(); ++n) {

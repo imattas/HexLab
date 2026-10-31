@@ -115,11 +115,11 @@ bool data(Instruction &i, std::uint32_t word) {
     } else if ((word & 0x3b200000u) == 0x38000000u) {
         const auto size = word >> 30, op = (word >> 22) & 3;
         const auto mode = (word >> 10) & 3;
-        if (op > 1 || (mode != 1 && mode != 3))
-            return false; // Signed loads, unscaled-offset mode, and unprivileged forms have separate contracts.
-        const bool load = op == 1, post_index = mode == 1;
+        if (op > 1 || mode == 2)
+            return false; // Signed loads and unprivileged forms have separate contracts.
+        const bool load = op == 1, writeback = mode != 0, post_index = mode == 1;
         const auto data_register = word & 31, base_register = (word >> 5) & 31;
-        if (base_register != 31 && base_register == data_register)
+        if (writeback && base_register != 31 && base_register == data_register)
             return false; // Writeback overlap has constrained-unpredictable semantics.
         const auto offset = signed_value((word >> 12) & 0x1ff, 9);
         i.opcode = size == 0   ? (load ? Opcode::a64_ldrb : Opcode::a64_strb)
@@ -131,11 +131,11 @@ bool data(Instruction &i, std::uint32_t word) {
         memory.address_width = 64;
         memory.base = reg(base_register, 64, true);
         memory.displacement = post_index ? 0 : offset;
-        memory.writeback = true;
+        memory.writeback = writeback;
         memory.post_index = post_index;
-        memory.writeback_displacement = offset;
+        memory.writeback_displacement = writeback ? offset : 0;
         i.register_reads.push_back(*memory.base);
-        i.register_writes.push_back(*memory.base);
+        if (writeback) i.register_writes.push_back(*memory.base);
         operand(i, memory, load ? OperandAccess::read : OperandAccess::write);
         i.memory_read = load;
         i.memory_write = !load;
