@@ -223,6 +223,7 @@ Field field(const ElfHeader &header, std::uint32_t type) {
         case 11: return {K::jump_slot, 8}; // R_390_JMP_SLOT
         case 12: return {K::base_relative, 8}; // R_390_RELATIVE
         case 22: return {K::absolute, 8}; // R_390_64
+        case 23: return {K::pc_relative, 8}; // R_390_PC64
         default: break;
         }
     }

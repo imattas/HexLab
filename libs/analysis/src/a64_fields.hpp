@@ -36,6 +36,14 @@ inline bool a64_packed_operand(const Instruction &i, std::uint32_t index) {
     case Opcode::a64_adds:
     case Opcode::a64_sub:
     case Opcode::a64_subs:
+    case Opcode::a64_and:
+    case Opcode::a64_orr:
+    case Opcode::a64_eor:
+    case Opcode::a64_ands:
+    case Opcode::a64_bic:
+    case Opcode::a64_orn:
+    case Opcode::a64_eon:
+    case Opcode::a64_bics:
         return index == 2;
     default:
         return false;

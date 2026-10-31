@@ -2498,6 +2498,41 @@ private:
             }
             if(take("using")){
                 cpp_declarations=true;
+                if(take("enum")) {
+                    const auto target=parse_lookup_name();
+                    need(";");
+                    auto type=lookup_type(target);
+                    if(!type)type=lookup_type("enum "+target);
+                    if(!type||type->kind()!=Kind::enumeration)
+                        fail(ErrorCode::unsupported,"class using enum target '"+target+"' is not a known enum type");
+                    for(const auto &enumerator:type->enumerator_values()) {
+                        const auto imported=tag+"::"+enumerator.name;
+                        if(member_names.contains(enumerator.name)||method_names.contains(enumerator.name)||
+                           result_.symbols.contains(imported)||names_.contains(imported)||
+                           result_.enum_constants.contains(imported))
+                            fail(ErrorCode::conflict,"class using enum conflicts with existing name '"+imported+"'");
+                        if(enumerator.value>static_cast<std::uint64_t>(INT64_MAX))
+                            fail(ErrorCode::unsupported,"class using enum cannot expose an enumerator above INT64_MAX");
+                        const auto value=static_cast<std::int64_t>(enumerator.value);
+                        result_.enum_constants.emplace(imported,value);
+                        const auto scoped_source=type->name()+"::"+enumerator.name;
+                        auto line=result_.enum_constant_source_lines.find(scoped_source);
+                        if(line==result_.enum_constant_source_lines.end()) {
+                            const auto separator=type->name().rfind("::");
+                            const auto scope=separator==std::string::npos?std::string{}:type->name().substr(0,separator);
+                            line=result_.enum_constant_source_lines.find(
+                                scope.empty()?enumerator.name:scope+"::"+enumerator.name);
+                        }
+                        if(line!=result_.enum_constant_source_lines.end())
+                            result_.enum_constant_source_lines.emplace(imported,line->second);
+                        enum_value_bindings_.insert_or_assign(imported,value);
+                        enum_value_bindings_.insert_or_assign("::"+imported,value);
+                        enum_unqualified_bindings_[enumerator.name].emplace_back(tag,value);
+                        member_names.insert(enumerator.name);
+                    }
+                    ++declaration_ordinal;
+                    continue;
+                }
                 if(at("namespace")||at("typename")||peek(1).text!="=")
                     fail(ErrorCode::unsupported,"class using declarations require an ordinary 'using Name = Type' alias");
                 const auto alias=next().text;
@@ -2868,6 +2903,14 @@ private:
         };
         if (spelling.starts_with("::"))
             return find_expanded(std::string(spelling.substr(2)));
+
+        // Class-scope `using enum` introduces enumerators into the class
+        // scope. Check innermost aggregate scopes before namespace lookup so
+        // static_asserts and later member constant expressions can use them.
+        for (auto aggregate = aggregate_scopes_.rbegin(); aggregate != aggregate_scopes_.rend(); ++aggregate) {
+            const auto candidate = *aggregate + "::" + std::string(spelling);
+            if (const auto value = find_expanded(candidate)) return value;
+        }
 
         auto scope = current_namespace();
         for (;;) {

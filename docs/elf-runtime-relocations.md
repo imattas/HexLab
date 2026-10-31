@@ -65,6 +65,7 @@ with these types:
 | s390x | `R_390_PC16DBL` | 17 | `(S + A - P) >> 1` (signed 16-bit field) |
 | s390x | `R_390_PC32` | 5 | `S + A - P` (low 32 bits) |
 | s390x | `R_390_PC32DBL` | 19 | `(S + A - P) >> 1` (word32 field) |
+| s390x | `R_390_PC64` | 23 | `S + A - P` (low 64 bits) |
 | s390x | `R_390_GLOB_DAT` | 10 | `S + A` (low 64 bits) |
 | s390x | `R_390_JMP_SLOT` | 11 | `S` |
 | s390x | `R_390_RELATIVE` | 12 | `B + A` |
@@ -156,7 +157,7 @@ header's byte order. PPC64 instruction-field, TLS, COPY, IFUNC, and other
 dynamic relocation types remain skipped.
 
 The s390x profile applies big-endian ELF64 `ET_DYN` dynamic RELA records for
-`R_390_8/16/32`, `R_390_PC16/PC16DBL/PC32/PC32DBL`, `R_390_RELATIVE`,
+`R_390_8/16/32`, `R_390_PC16/PC16DBL/PC32/PC32DBL/PC64`, `R_390_RELATIVE`,
 `R_390_64`, `R_390_GLOB_DAT`, and `R_390_JMP_SLOT`.
 `RELATIVE` requires symbol index zero and uses checked `B + A`; `64` and
 `GLOB_DAT` use `S + A` with the ABI's low-64-bit result, while `JMP_SLOT`
@@ -170,7 +171,8 @@ ABI evaluates these expressions modulo 64 bits. `R_390_8` requires zero upper
 `R_390_32` stores the low 32 bits. `PC16` applies the same upper-48-bit rule
 to `S + A - P`. `PC16DBL` and `PC32DBL` require an even `S + A - P`,
 arithmetically shift it right by one, and range-check the scaled result as
-signed 16 or 32 bits respectively. The 8-bit field needs no alignment, 16-bit
+signed 16 or 32 bits respectively. `PC64` stores the low 64 bits of
+`S + A - P`. The 8-bit field needs no alignment, 16-bit
 fields require two-byte alignment, and the 32-bit fields require four-byte
 alignment except `PC32DBL`, whose ABI field alignment is two bytes. The
 remaining 64-bit types require aligned, complete eight-byte fields in writable

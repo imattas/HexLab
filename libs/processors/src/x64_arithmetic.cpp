@@ -54,6 +54,8 @@ bool arithmetic(State &s, std::uint8_t opcode, bool extended) {
                 s.i.register_reads.push_back(gpr(index, pair_width));
             s.i.register_writes.push_back(gpr(0, pair_width));
             s.i.register_writes.push_back(gpr(2, pair_width));
+            // CMPXCHG8B/16B updates only ZF and preserves all other FLAGS bits.
+            s.flags_read = true;
             s.flags_write = true;
             return true;
         }

@@ -671,7 +671,9 @@ enum class Opcode {
     korb, korw, kord, korq, kxorb, kxorw, kxord, kxorq,
     kxnorb, kxnorw, kxnord, kxnorq, knotb, knotw, knotd, knotq,
     // AVX-512 opmask transfers; append to preserve persisted opcode IDs.
-    kmovb, kmovw, kmovd, kmovq
+    kmovb, kmovw, kmovd, kmovq,
+    // AArch64 inverted shifted-register logical forms; preserve old IDs.
+    a64_bic, a64_orn, a64_eon, a64_bics
 };
 enum class OperandAccess { read, write, read_write, address };
 // The encoded x86 group-one repeat prefix is retained separately from the

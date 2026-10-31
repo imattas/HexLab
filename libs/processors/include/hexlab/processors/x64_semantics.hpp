@@ -38,6 +38,17 @@ struct X86ArithmeticResult {
     bool operator==(const X86ArithmeticResult &) const = default;
 };
 
+struct X86CmpxchgWideResult {
+    std::uint64_t memory_low = 0, memory_high = 0;
+    std::uint64_t accumulator_low = 0, accumulator_high = 0;
+    X86Flags flags{};
+    std::uint8_t width = 0; // Total compare width: 64 for CMPXCHG8B, 128 for CMPXCHG16B.
+    bool matched = false;
+    bool writes_memory = false;
+    bool writes_accumulator = false;
+    bool operator==(const X86CmpxchgWideResult &) const = default;
+};
+
 struct X86DefinedFlag {
     bool value = false;
     bool defined = false;
@@ -266,6 +277,27 @@ constexpr std::uint64_t mask_for(unsigned width) noexcept {
     return width == 64 ? UINT64_MAX : (std::uint64_t{1} << width) - 1;
 }
 } // namespace x86_semantics_detail
+
+// Evaluate CMPXCHG8B/16B from caller-supplied memory and register values.
+// Pair width is 32 for CMPXCHG8B and 64 for CMPXCHG16B. ZF changes while
+// other represented FLAGS bits are preserved. Memory and atomicity are
+// caller-owned.
+constexpr std::optional<X86CmpxchgWideResult> evaluate_x86_cmpxchg_wide(
+    unsigned pair_width, std::uint64_t memory_low, std::uint64_t memory_high,
+    std::uint64_t accumulator_low, std::uint64_t accumulator_high,
+    std::uint64_t source_low, std::uint64_t source_high, X86Flags incoming) noexcept {
+    if (pair_width != 32 && pair_width != 64) return std::nullopt;
+    const auto mask = x86_semantics_detail::mask_for(pair_width);
+    memory_low &= mask; memory_high &= mask;
+    accumulator_low &= mask; accumulator_high &= mask;
+    source_low &= mask; source_high &= mask;
+    const bool matched = accumulator_low == memory_low && accumulator_high == memory_high;
+    incoming.zero = matched;
+    return X86CmpxchgWideResult{
+        matched ? source_low : memory_low, matched ? source_high : memory_high,
+        matched ? accumulator_low : memory_low, matched ? accumulator_high : memory_high,
+        incoming, static_cast<std::uint8_t>(pair_width * 2), matched, matched, !matched};
+}
 
 constexpr std::optional<X86MultiplyResult> evaluate_x86_multiply(X86MultiplyKind kind,
                                                                   std::uint64_t lhs,

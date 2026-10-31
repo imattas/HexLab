@@ -86,6 +86,23 @@ introduced name must be unambiguous in the destination scope; conflicts fail
 the import rather than shadowing another declaration. This adds lookup and
 constant-expression visibility only: it does not create replacement enumerator
 types or model language linkage.
+The declaration is also supported in a class or struct body. Its imported names
+are recorded as class-qualified constants such as `Options::read`, and later
+class-scope constant expressions can use the unqualified names:
+
+```cpp
+enum class Permission { read = 1, write = 2 };
+struct FileOptions {
+    using enum Permission;
+    static_assert(read == 1);
+    unsigned access : read | write;
+};
+```
+
+The import records these names as constants, not as data members, so they do not
+change object layout. A class member that collides with an imported enumerator
+is rejected. As elsewhere in the import result, values above `INT64_MAX` cannot
+be exposed through the signed enum-constant lookup map.
 Namespace aliases are also expanded while resolving qualified enumerator names
 in enum value expressions, so forms such as `namespace short_name = api; enum
 Flags { combined = short_name::FlagsBase::read | short_name::FlagsBase::write

@@ -208,6 +208,47 @@ inline std::optional<X86CmpxchgResult> evaluate_x86_cmpxchg_instruction(
                             matched, matched, !matched};
 }
 
+// Evaluate decoded CMPXCHG8B/16B using caller-supplied memory and implicit
+// register-pair values. Memory access, faults, and LOCK atomicity remain the
+// caller's responsibility.
+inline std::optional<X86CmpxchgWideResult> evaluate_x86_cmpxchg_wide_instruction(
+    const Instruction &instruction, std::uint64_t memory_low, std::uint64_t memory_high,
+    std::uint64_t accumulator_low, std::uint64_t accumulator_high,
+    std::uint64_t source_low, std::uint64_t source_high, X86Flags incoming) noexcept {
+    using namespace x64_instruction_semantics_detail;
+    const bool legacy = instruction.context.architecture == Architecture::x86 &&
+        (instruction.context.mode == ExecutionMode::x86_16 || instruction.context.mode == ExecutionMode::x86_32);
+    const bool long_mode = instruction.context.architecture == Architecture::x86_64 &&
+        instruction.context.mode == ExecutionMode::x86_64;
+    const bool wide = instruction.opcode == Opcode::cmpxchg16b;
+    if ((!legacy && !long_mode) ||
+        (instruction.opcode != Opcode::cmpxchg8b && !wide) || (wide && !long_mode) ||
+        instruction.flow != FlowKind::fallthrough || instruction.operands.size() != 1 ||
+        instruction.access.size() != 1 || instruction.access[0] != OperandAccess::read_write ||
+        !instruction.memory_read || !instruction.memory_write)
+        return std::nullopt;
+    const auto *memory = std::get_if<MemoryOperand>(&instruction.operands[0]);
+    const unsigned pair_width = wide ? 64 : 32;
+    if (!memory || memory->data_width != pair_width * 2) return std::nullopt;
+    const auto has = [](const auto &registers, RegisterOperand reg) {
+        return std::find(registers.begin(), registers.end(), reg) != registers.end();
+    };
+    const RegisterOperand accumulator_low_reg{RegisterBank::gpr, 0, static_cast<std::uint16_t>(pair_width), false};
+    const RegisterOperand accumulator_high_reg{RegisterBank::gpr, 2, static_cast<std::uint16_t>(pair_width), false};
+    const RegisterOperand source_low_reg{RegisterBank::gpr, 3, static_cast<std::uint16_t>(pair_width), false};
+    const RegisterOperand source_high_reg{RegisterBank::gpr, 1, static_cast<std::uint16_t>(pair_width), false};
+    const auto flags_width = static_cast<std::uint16_t>(long_mode ? 64 :
+        instruction.context.mode == ExecutionMode::x86_16 ? 16 : 32);
+    const RegisterOperand flags{RegisterBank::flags, 0, flags_width, false};
+    for (const auto reg : {accumulator_low_reg, accumulator_high_reg, source_low_reg, source_high_reg})
+        if (!has(instruction.register_reads, reg)) return std::nullopt;
+    if (!has(instruction.register_reads, flags) ||
+        instruction.register_writes != std::vector<RegisterOperand>{
+            accumulator_low_reg, accumulator_high_reg, flags}) return std::nullopt;
+    return evaluate_x86_cmpxchg_wide(pair_width, memory_low, memory_high,
+        accumulator_low, accumulator_high, source_low, source_high, incoming);
+}
+
 // Caller supplies the runtime destination/source values (memory reads are
 // intentionally outside this pure evaluator). Validate the decoded operand
 // effects before applying either independent ADX carry chain.

@@ -3,8 +3,11 @@ if(WIN32)
 else()
   set(HEXLAB_PLUGIN_NATIVE src/module_provider_posix.cpp)
 endif()
-hexlab_add_library(plugins SOURCES src/plugins.cpp src/runtime.cpp src/scalar_ir.cpp ${HEXLAB_PLUGIN_NATIVE}
+hexlab_add_library(plugins SOURCES src/plugins.cpp src/plugin_authenticode.cpp src/runtime.cpp src/scalar_ir.cpp ${HEXLAB_PLUGIN_NATIVE}
   DEPENDS hexlab::core hexlab::automation hexlab::loaders hexlab::processors hexlab::debugger hexlab::decompiler)
+if(WIN32)
+  target_link_libraries(hexlab_plugins PRIVATE Wintrust)
+endif()
 if(UNIX AND NOT APPLE)
   target_link_libraries(hexlab_plugins PRIVATE ${CMAKE_DL_LIBS})
 endif()

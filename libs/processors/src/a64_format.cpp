@@ -13,6 +13,10 @@ std::string mnemonic(Opcode opcode, std::uint8_t condition) {
     if (opcode == Opcode::a64_adcs) return "adcs";
     if (opcode == Opcode::a64_sbc) return "sbc";
     if (opcode == Opcode::a64_sbcs) return "sbcs";
+    if (opcode == Opcode::a64_bic) return "bic";
+    if (opcode == Opcode::a64_orn) return "orn";
+    if (opcode == Opcode::a64_eon) return "eon";
+    if (opcode == Opcode::a64_bics) return "bics";
     if (opcode == Opcode::a64_rbit) return "rbit";
     if (opcode == Opcode::a64_rev16) return "rev16";
     if (opcode == Opcode::a64_rev32) return "rev32";
@@ -228,7 +232,7 @@ std::string format(const Instruction &i) {
                         "uxtb", "uxth", "uxtw", "uxtx", "sxtb", "sxth", "sxtw", "sxtx"};
                     result += std::string(extensions[(encoded_word >> 13) & 7u]) + " ";
             }
-            if (n == 3 && !extended_add_sub && (i.opcode == Opcode::a64_add || i.opcode == Opcode::a64_adds || i.opcode == Opcode::a64_sub || i.opcode == Opcode::a64_subs || i.opcode == Opcode::a64_and || i.opcode == Opcode::a64_orr || i.opcode == Opcode::a64_eor || i.opcode == Opcode::a64_ands)) {
+            if (n == 3 && !extended_add_sub && (i.opcode == Opcode::a64_add || i.opcode == Opcode::a64_adds || i.opcode == Opcode::a64_sub || i.opcode == Opcode::a64_subs || i.opcode == Opcode::a64_and || i.opcode == Opcode::a64_orr || i.opcode == Opcode::a64_eor || i.opcode == Opcode::a64_ands || i.opcode == Opcode::a64_bic || i.opcode == Opcode::a64_orn || i.opcode == Opcode::a64_eon || i.opcode == Opcode::a64_bics)) {
                 static constexpr const char *shifts[]{"lsl", "lsr", "asr", "ror"};
                 const auto shift = (std::to_integer<unsigned>(i.bytes[2]) >> 6) & 3;
                 result += std::string(shifts[shift]) + " ";

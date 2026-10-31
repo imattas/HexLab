@@ -12,6 +12,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -47,6 +48,8 @@ class PluginsView final : public wxPanel {
         bool replace_candidates = false;
         std::vector<plugins::PluginCandidate> candidates;
         std::optional<plugins::PluginUnloadPlan> unload_plan;
+        std::string signature_path;
+        std::optional<plugins::PluginAuthenticodeTrust> signature_trust;
     };
     struct OperationState;
     std::shared_ptr<plugins::PluginManager> manager_;
@@ -83,11 +86,13 @@ class PluginsView final : public wxPanel {
     std::vector<plugins::PluginCandidate> candidate_rows_;
     std::vector<std::size_t> visible_candidate_rows_;
     std::unordered_set<std::string> disabled_candidate_paths_;
+    std::unordered_map<std::string, plugins::PluginAuthenticodeTrust> candidate_signature_results_;
     wxWindow *load_button_ = nullptr, *unload_button_ = nullptr, *invoke_button_ = nullptr;
     wxWindow *provider_button_ = nullptr;
     wxWindow *export_candidates_button_ = nullptr;
     wxWindow *scan_button_ = nullptr, *load_candidate_button_ = nullptr;
     wxWindow *install_candidate_button_ = nullptr;
+    wxWindow *verify_candidate_signature_button_ = nullptr;
     wxWindow *plan_button_ = nullptr, *load_dependencies_button_ = nullptr, *unload_dependents_button_ = nullptr;
     wxWindow *unload_all_button_ = nullptr;
     wxWindow *toggle_candidate_button_ = nullptr;
@@ -98,6 +103,7 @@ class PluginsView final : public wxPanel {
     void export_candidate_report();
     void load_candidate();
     void install_candidate();
+    void verify_candidate_signature();
     void toggle_candidate_enabled();
     void plan_candidate();
     void load_candidate_dependencies();
