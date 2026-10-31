@@ -1130,7 +1130,7 @@ inline std::optional<X86OpmaskTestResult> evaluate_x86_opmask_test(
         instruction.x86_evex || instruction.operands.size() != 2 || instruction.access.size() != 2 ||
         instruction.access[0] != OperandAccess::read || instruction.access[1] != OperandAccess::read ||
         instruction.memory_read || instruction.memory_write || instruction.register_reads.size() != 3 ||
-        !instruction.register_writes.empty()) return std::nullopt;
+        instruction.register_writes.size() != 1) return std::nullopt;
     for (const auto &operand : instruction.operands) {
         const auto *reg = std::get_if<RegisterOperand>(&operand);
         if (!reg || reg->bank != RegisterBank::opmask || reg->index >= 8 || reg->width != 64 || reg->high_byte)
@@ -1141,12 +1141,15 @@ inline std::optional<X86OpmaskTestResult> evaluate_x86_opmask_test(
     const bool cf = use_or ? ((destination | source) == mask) : ((destination & ~source & mask) == 0);
     const bool zf = use_or ? ((destination | source) == 0) : ((destination & source) == 0);
     const auto *flags_read = &instruction.register_reads[2];
+    const auto &flags_write = instruction.register_writes[0];
     if (instruction.register_reads[0].bank != RegisterBank::opmask || instruction.register_reads[0].index !=
             std::get<RegisterOperand>(instruction.operands[0]).index || instruction.register_reads[0].width != 64 ||
         instruction.register_reads[1].bank != RegisterBank::opmask || instruction.register_reads[1].index !=
             std::get<RegisterOperand>(instruction.operands[1]).index || instruction.register_reads[1].width != 64 ||
         flags_read->bank != RegisterBank::flags || flags_read->width !=
-            (instruction.context.mode == ExecutionMode::x86_64 ? 64 : 32))
+            (instruction.context.mode == ExecutionMode::x86_64 ? 64 : 32) ||
+        flags_write.bank != RegisterBank::flags || flags_write.index != 0 || flags_write.width != flags_read->width ||
+        flags_write.high_byte)
         return std::nullopt;
     constexpr std::uint64_t CF = 1, PF = 1u << 2, AF = 1u << 4, ZF = 1u << 6, SF = 1u << 7, OF = 1u << 11;
     constexpr std::uint64_t written = CF | PF | AF | ZF | SF | OF;
