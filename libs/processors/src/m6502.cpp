@@ -60,7 +60,7 @@ static DecodeResult decode_m6502_impl(std::span<const std::byte> bytes, Address 
         i.length = static_cast<std::uint8_t>(length);
         std::copy_n(bytes.begin(), length, i.bytes.begin());
         const auto base_cycles = documented_cycles[op];
-        if (base_cycles) {
+        if (!cmos && base_cycles) {
             M6502Timing timing;
             timing.base_cycles = base_cycles;
             if (i.flow == FlowKind::conditional_branch) {
@@ -178,6 +178,94 @@ static DecodeResult decode_m6502_impl(std::span<const std::byte> bytes, Address 
         if (operand.index) i.register_reads.push_back(*operand.index);
         i.memory_write = true;
         return finish(length);
+    }
+    if (cmos && (op == 0x04 || op == 0x0c || op == 0x14 || op == 0x1c)) {
+        const auto mode = (op == 0x04 || op == 0x14) ? Mode::zero_page : Mode::absolute;
+        if (!begin((op == 0x04 || op == 0x0c) ? Opcode::m65c02_tsb : Opcode::m65c02_trb,
+                   sized_mode(mode)))
+            return bad(DecodeStatus::truncated, "65C02 TSB/TRB operand is truncated");
+        i.operands.emplace_back(memory(mode));
+        i.access = {OperandAccess::read_write};
+        i.register_reads = {a, p};
+        i.register_writes = {p};
+        i.memory_read = i.memory_write = true;
+        return finish(sized_mode(mode));
+    }
+    if (cmos && (op == 0x89 || op == 0x34 || op == 0x3c)) {
+        const auto mode = op == 0x89 ? Mode::immediate : op == 0x34 ? Mode::zero_page_x : Mode::absolute_x;
+        auto result = data_op(Opcode::m6502_bit, mode, a, false);
+        if (result.status == DecodeStatus::decoded) {
+            // CMOS BIT immediate changes only Z. All BIT forms preserve
+            // unaffected status bits, so the incoming P value is an input.
+            result.instruction->register_reads.push_back(p);
+        }
+        return result;
+    }
+    if (cmos && (op == 0x1a || op == 0x3a)) {
+        if (!begin(op == 0x1a ? Opcode::m6502_inc : Opcode::m6502_dec, 1))
+            return bad(DecodeStatus::truncated, "65C02 accumulator increment/decrement is truncated");
+        i.operands.emplace_back(a);
+        i.access = {OperandAccess::read_write};
+        i.register_reads = {a, p};
+        i.register_writes = {a, p};
+        return finish(1);
+    }
+    if (cmos && (op == 0x5a || op == 0x7a || op == 0xda || op == 0xfa)) {
+        const bool push = op == 0x5a || op == 0xda;
+        const auto value = (op == 0x5a || op == 0x7a) ? y : x;
+        const Opcode opcode = op == 0x5a ? Opcode::m65c02_phy : op == 0x7a ? Opcode::m65c02_ply :
+                              op == 0xda ? Opcode::m65c02_phx : Opcode::m65c02_plx;
+        if (!begin(opcode, 1)) return bad(DecodeStatus::truncated, "65C02 stack operation is truncated");
+        if (push) {
+            i.register_reads = {value, s};
+            i.register_writes = {s};
+            i.memory_write = true;
+        } else {
+            i.register_reads = {s};
+            i.register_writes = {value, s, p};
+            i.memory_read = true;
+        }
+        return finish(1);
+    }
+    if (cmos && (op & 0x0f) == 0x07) {
+        const auto bit = static_cast<std::uint8_t>((op >> 4) & 7);
+        if (!begin((op & 0x80) ? Opcode::m65c02_smb : Opcode::m65c02_rmb, 2))
+            return bad(DecodeStatus::truncated, "65C02 RMB/SMB zero-page operand is truncated");
+        i.condition = bit;
+        i.operands.emplace_back(memory(Mode::zero_page));
+        i.access = {OperandAccess::read_write};
+        i.memory_read = i.memory_write = true;
+        return finish(2);
+    }
+    if (cmos && (op & 0x0f) == 0x0f) {
+        if (!begin((op & 0x80) ? Opcode::m65c02_bbs : Opcode::m65c02_bbr, 3))
+            return bad(DecodeStatus::truncated, "65C02 BBR/BBS operands are truncated");
+        i.condition = static_cast<std::uint8_t>((op >> 4) & 7);
+        i.operands.emplace_back(memory(Mode::zero_page));
+        const auto displacement = static_cast<std::int8_t>(byte(2));
+        i.operands.emplace_back(RelativeOperand{displacement, 8, 16, EncodedField{2, 1}});
+        i.access = {OperandAccess::read, OperandAccess::address};
+        i.memory_read = true;
+        i.flow = FlowKind::conditional_branch;
+        i.direct_target = Address{at.space, static_cast<std::uint16_t>(at.offset + 3 + displacement)};
+        return finish(3);
+    }
+    if (cmos && (op == 0xcb || op == 0xdb)) {
+        if (!begin(op == 0xcb ? Opcode::m65c02_wai : Opcode::m65c02_stp, 1))
+            return bad(DecodeStatus::truncated, "65C02 wait/stop opcode is truncated");
+        if (op == 0xdb) i.flow = FlowKind::trap;
+        return finish(1);
+    }
+    if (cmos && op == 0x7c) {
+        if (!begin(Opcode::m6502_jmp, 3)) return bad(DecodeStatus::truncated, "65C02 indexed JMP pointer is truncated");
+        auto pointer = memory(Mode::absolute_x);
+        pointer.data_width = 16;
+        i.operands.emplace_back(pointer);
+        i.access = {OperandAccess::address};
+        i.register_reads = {x};
+        i.memory_read = true;
+        i.flow = FlowKind::jump;
+        return finish(3);
     }
     // Do not let the NMOS unofficial-opcode table reinterpret bytes in the
     // CMOS profile. The supported CMOS additions above have explicit cases;
@@ -463,7 +551,7 @@ static DecodeResult decode_m6502_impl(std::span<const std::byte> bytes, Address 
         return undocumented_nop(Mode::zero_page_x);
     case 0x0c:
         return undocumented_nop(Mode::absolute);
-    case 0x1c: case 0x3c: case 0x5c: case 0x7c: case 0xdc: case 0xfc:
+    case 0x1c: case 0x3c: case 0x5c: case 0xdc: case 0xfc:
         return undocumented_nop(Mode::absolute_x);
 
     // Direct and indirect control flow.
