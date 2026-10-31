@@ -17,7 +17,7 @@ if(NOT COMMAND hexlab_add_library)
   target_link_libraries(hexlab_types PUBLIC hexlab_options)
 endif()
 
-hexlab_add_library(symbols SOURCES src/dwarf.cpp src/dwarf_eval.cpp src/dwarf_line.cpp src/dwarf_package.cpp src/demangle.cpp DEPENDS hexlab::types)
+hexlab_add_library(symbols SOURCES src/dwarf.cpp src/dwarf_eval.cpp src/dwarf_line.cpp src/dwarf_macro.cpp src/dwarf_package.cpp src/demangle.cpp DEPENDS hexlab::types)
 
 if(BUILD_TESTING)
   add_executable(hexlab_demangle_tests "${CMAKE_CURRENT_SOURCE_DIR}/../../tests/symbols/demangle_tests.cpp")

@@ -362,6 +362,20 @@ hexlab::Result<ImportResult> import_dwarf_package_unit(
         if (!line_units) return line_units.error();
         imported.value().line_units = std::move(line_units.value());
     }
+    if (!imported.value().macro_contributions.empty()) {
+        const auto &macro_data = imported.value().macro_contributions.back();
+        DwarfMacroSections macro;
+        macro.source_id = macro_data.source_id;
+        macro.macro = macro_data.bytes;
+        macro.strings = macro_data.strings;
+        macro.line_units = imported.value().line_units;
+        macro.section_offset = macro_data.section_offset;
+        macro.little_endian = little_endian;
+        macro.stop = stop;
+        auto macro_units = import_dwarf_macro_v5(macro);
+        if (!macro_units) return macro_units.error();
+        imported.value().macro_units = std::move(macro_units.value());
+    }
     return imported;
 }
 
