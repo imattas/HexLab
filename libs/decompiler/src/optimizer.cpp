@@ -2176,6 +2176,17 @@ struct SummaryWorker {
                             constants.emplace(key(mutable_intrinsic->register_writes[0],
                                 mutable_intrinsic->register_output_versions[0]),
                                 ConstantValue{result->value_bits, {TypeKind::integer, 32, false}});
+                        } else {
+                            // The decoder models the possible destination write
+                            // in the SSA output set. Preserve that write as
+                            // explicitly unknown when an enabled exception
+                            // suppresses it, while still recording the known
+                            // FCSR update in the second output.
+                            mutable_intrinsic->register_output_values = {
+                                std::make_shared<Expression>(Expression{
+                                    {TypeKind::integer, 32, false},
+                                    UnknownValue{"MIPS COP1 conversion suppressed destination write"}}),
+                                constant_expression({result->fcsr_after, {TypeKind::integer, 32, false}})};
                         }
                     }
                 }
