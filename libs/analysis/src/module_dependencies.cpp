@@ -309,6 +309,9 @@ Result<ElfDependencyFileReport> discover_elf_dependency_files(
             return Error{ErrorCode::invalid_argument, "ELF system dependency limits must be positive"};
         if (explicit_directories.size() > limits.search_directories)
             return Error{ErrorCode::resource_limit, "ELF dependency search-directory limit exceeded"};
+        if (context.environment_directories.size() > limits.search_directories ||
+            explicit_directories.size() > limits.search_directories - context.environment_directories.size())
+            return Error{ErrorCode::resource_limit, "ELF environment and explicit search-directory limit exceeded"};
         std::error_code ec;
         const auto root = std::filesystem::canonical(sysroot, ec);
         if (ec || !std::filesystem::is_directory(root, ec))
@@ -471,7 +474,11 @@ Result<ElfDependencyFileReport> discover_elf_dependency_files(
             context.inherited_unsupported_rpath > max_count - inherited_local_unsupported)
             return Error{ErrorCode::resource_limit, "ELF inherited unsupported-path count overflow"};
         report.inherited_unsupported_rpath = context.inherited_unsupported_rpath + inherited_local_unsupported;
-        search = has_runpath ? std::move(runpath) : std::move(rpath);
+        // glibc searches an object's RPATH (when RUNPATH is absent), inherited
+        // ancestor RPATH, LD_LIBRARY_PATH, and then the object's RUNPATH.
+        // This inventory retains every compatible candidate; this order is
+        // provenance only and does not select a runtime link map.
+        if (!has_runpath) search = std::move(rpath);
         for (const auto &directory : context.inherited_rpath) {
             if (search.size() >= limits.search_directories)
                 return Error{ErrorCode::resource_limit, "ELF combined search-directory limit exceeded"};
@@ -480,6 +487,22 @@ Result<ElfDependencyFileReport> discover_elf_dependency_files(
                              "Inherited DT_RPATH directories must remain inside the sysroot"};
             search.push_back({directory.path, ElfDependencyPathSource::inherited_rpath,
                               directory.search_entry_file_offset});
+        }
+        for (const auto &directory : context.environment_directories) {
+            if (search.size() >= limits.search_directories)
+                return Error{ErrorCode::resource_limit, "ELF combined search-directory limit exceeded"};
+            auto canonical = std::filesystem::canonical(directory, ec);
+            if (ec || !contained(canonical, root) || !std::filesystem::is_directory(canonical, ec))
+                return Error{ErrorCode::invalid_argument,
+                             "LD_LIBRARY_PATH directories must exist inside the explicit sysroot"};
+            search.push_back({canonical, ElfDependencyPathSource::environment_directory, {}});
+        }
+        if (has_runpath) {
+            for (const auto &directory : runpath) {
+                if (search.size() >= limits.search_directories)
+                    return Error{ErrorCode::resource_limit, "ELF combined search-directory limit exceeded"};
+                search.push_back(directory);
+            }
         }
         for (const auto &directory : explicit_directories) {
             if (search.size() >= limits.search_directories)

@@ -14,7 +14,7 @@
 namespace hexlab {
 enum class ElfDependencyPathSource {
     needed_path, runpath, rpath, inherited_rpath, explicit_directory, auxiliary_path, filter_path,
-    glibc_cache, default_directory
+    glibc_cache, default_directory, environment_directory
 };
 struct ElfDependencyFileCandidate {
     std::filesystem::path path;
@@ -62,8 +62,11 @@ struct ElfDependencyPathContext {
     std::optional<std::filesystem::path> target_working_directory;
     std::string lib_token;
     std::string platform_token;
-    // Explicit opt-ins. Both sources are rooted beneath the caller's sysroot;
-    // no host cache, environment, or filesystem defaults are consulted.
+    // Caller-supplied target LD_LIBRARY_PATH entries, represented as host
+    // paths beneath the explicit sysroot. The host environment is never read.
+    std::vector<std::filesystem::path> environment_directories;
+    // Explicit opt-ins. Cache and default sources are rooted beneath the
+    // caller's sysroot; the host environment is never consulted.
     bool use_glibc_ld_so_cache = false;
     bool use_standard_default_directories = false;
     // Reuse a caller-preloaded cache while resolving multiple importers. Its
