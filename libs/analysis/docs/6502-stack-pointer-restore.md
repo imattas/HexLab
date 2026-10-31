@@ -14,6 +14,13 @@ depth remains known across the balanced call. A `TXS` with no proven live
 `TSX`-derived X value remains an unknown stack-pointer write and makes
 subsequent stack-relative results incomplete.
 
+A later `TSX` replaces X's alias and resets the frame base. It preserves tracked
+A/Y copies only when the current S depth equals the previous TSX sample, which
+proves those byte values still describe the newly sampled S. If S moved or its
+depth is unknown, the old A/Y copies are discarded because their deltas use a
+different frame base. At CFG joins, an alias is retained only when every
+incoming path has the same known delta; otherwise it is discarded.
+
 Page-one indexed stack slots using `$0100,X` or `$0100,Y` can use either
 register's independently tracked copy. The source alias remains available
 after a transfer instruction copies it to another register.
@@ -32,3 +39,8 @@ incoming hardware S value.
 This recovers balanced save/restore sequences without guessing the incoming
 hardware S value. It does not model cycle timing, interrupt interleavings, or
 stack-page wrapping across an unknown entry S value.
+
+Register values and deltas are byte-wide. Relative deltas use the unique signed
+modulo-256 range -127 through 127. A displacement outside it, including either
+ambiguous half-page case, is discarded so wrap cannot merge distinct linear
+slot identities.
