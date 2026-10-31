@@ -197,6 +197,8 @@ std::optional<RiscvVectorEffect> riscv_vector_effect(Opcode opcode) {
     case Opcode::rv_vfredosum: return RiscvVectorEffect{"vfredosum.vs", false, true};
     case Opcode::rv_vfredmin: return RiscvVectorEffect{"vfredmin.vs", false, true};
     case Opcode::rv_vfredmax: return RiscvVectorEffect{"vfredmax.vs", false, true};
+    case Opcode::rv_vfwredusum: return RiscvVectorEffect{"vfwredusum.vs", false, true};
+    case Opcode::rv_vfwredosum: return RiscvVectorEffect{"vfwredosum.vs", false, true};
     RVV_TRIPLE(vsll, false);
     RVV_TRIPLE(vsrl, false);
     RVV_TRIPLE(vsra, false);

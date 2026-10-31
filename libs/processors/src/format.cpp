@@ -824,6 +824,8 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
     if (op == Opcode::rv_vfredosum) return "vfredosum.vs";
     if (op == Opcode::rv_vfredmin) return "vfredmin.vs";
     if (op == Opcode::rv_vfredmax) return "vfredmax.vs";
+    if (op == Opcode::rv_vfwredusum) return "vfwredusum.vs";
+    if (op == Opcode::rv_vfwredosum) return "vfwredosum.vs";
     if (op >= Opcode::rv_vadd_vv && op <= Opcode::rv_vxor_vi) {
         static constexpr const char *names[]{"vadd.vv","vadd.vx","vadd.vi","vsub.vv","vsub.vx",
             "vand.vv","vand.vx","vand.vi","vor.vv","vor.vx","vor.vi","vxor.vv","vxor.vx","vxor.vi"};
