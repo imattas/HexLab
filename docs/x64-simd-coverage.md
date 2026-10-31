@@ -109,8 +109,18 @@ The decoder validates map/prefix/`W`/`L` combinations, reserved `vvvv` for
 prints the width-specific mnemonic and the instruction effects identify the
 full K-register reads and write; the opcode variant carries the active low
 8/16/32/64-bit operation width, with bits above that width cleared in the
-destination. No pure runtime mask evaluator or typed decompiler lift is added
-here; CPU feature checks and exception delivery remain caller-owned.
+destination. The decoder itself does not perform CPU feature checks or
+exception delivery.
+
+`evaluate_x86_opmask_boolean` now evaluates the decoded KAND/KANDN/KOR/KXOR/
+KXNOR/KNOT register forms from caller-supplied K-register values. It validates
+the opcode width, x86-64 context, operand/access shapes, and explicit register
+read/write effects before returning the low-width result, zero-extended to
+64 bits. KANDN computes `~src1 & src2`; KNOT complements its sole source.
+These instructions do not modify flags. The helper neither reads nor commits
+machine state; the caller remains responsible for sampling and writing K
+registers. KTEST/KORTEST decoding and flag semantics, CPU feature checks, and
+decompiler lifting remain unsupported.
 
 VEX `KMOVB/W/D/Q` now covers K-register copies, K-to-memory stores,
 memory-to-K loads, and transfers between K registers and GPRs. The byte/word

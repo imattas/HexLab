@@ -543,11 +543,15 @@ bool vex_simd(State &state, std::uint8_t opcode, unsigned map, unsigned pp, unsi
         right.bank = RegisterBank::opmask;
         right.width = 64;
         right.high_byte = false;
+        state.i.register_writes.push_back(destination);
         state.operand(destination, OperandAccess::write);
         if (unary) {
+            state.i.register_reads.push_back(right);
             state.operand(right, OperandAccess::read);
         } else {
             auto left = RegisterOperand{RegisterBank::opmask, static_cast<std::uint16_t>(vvvv), 64, false};
+            state.i.register_reads.push_back(left);
+            state.i.register_reads.push_back(right);
             state.operand(left, OperandAccess::read);
             state.operand(right, OperandAccess::read);
         }

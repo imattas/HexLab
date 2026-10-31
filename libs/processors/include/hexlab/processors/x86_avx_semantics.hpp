@@ -1062,6 +1062,100 @@ inline std::optional<X86EvexMaskCompareResult> evaluate_x86_evex_vector_to_mask(
     return result;
 }
 
+// Caller-driven value semantics for the decoded VEX K-register Boolean family.
+// The source values are the low 8/16/32/64-bit contents of the decoded K
+// operands. K-register destinations are zero-extended from the opcode width.
+struct X86OpmaskBooleanResult {
+    std::uint64_t value = 0;
+    std::uint8_t width = 0;
+    bool operator==(const X86OpmaskBooleanResult &) const = default;
+};
+
+inline std::optional<X86OpmaskBooleanResult> evaluate_x86_opmask_boolean(
+    const Instruction &instruction, std::uint64_t source1,
+    std::optional<std::uint64_t> source2 = std::nullopt) noexcept {
+    unsigned width = 0;
+    enum class Operation : std::uint8_t { and_, and_not, or_, xor_, xnor, not_ } operation{};
+    switch (instruction.opcode) {
+    case Opcode::kandb: width = 8; operation = Operation::and_; break;
+    case Opcode::kandw: width = 16; operation = Operation::and_; break;
+    case Opcode::kandd: width = 32; operation = Operation::and_; break;
+    case Opcode::kandq: width = 64; operation = Operation::and_; break;
+    case Opcode::kandnb: width = 8; operation = Operation::and_not; break;
+    case Opcode::kandnw: width = 16; operation = Operation::and_not; break;
+    case Opcode::kandnd: width = 32; operation = Operation::and_not; break;
+    case Opcode::kandnq: width = 64; operation = Operation::and_not; break;
+    case Opcode::korb: width = 8; operation = Operation::or_; break;
+    case Opcode::korw: width = 16; operation = Operation::or_; break;
+    case Opcode::kord: width = 32; operation = Operation::or_; break;
+    case Opcode::korq: width = 64; operation = Operation::or_; break;
+    case Opcode::kxorb: width = 8; operation = Operation::xor_; break;
+    case Opcode::kxorw: width = 16; operation = Operation::xor_; break;
+    case Opcode::kxord: width = 32; operation = Operation::xor_; break;
+    case Opcode::kxorq: width = 64; operation = Operation::xor_; break;
+    case Opcode::kxnorb: width = 8; operation = Operation::xnor; break;
+    case Opcode::kxnorw: width = 16; operation = Operation::xnor; break;
+    case Opcode::kxnord: width = 32; operation = Operation::xnor; break;
+    case Opcode::kxnorq: width = 64; operation = Operation::xnor; break;
+    case Opcode::knotb: width = 8; operation = Operation::not_; break;
+    case Opcode::knotw: width = 16; operation = Operation::not_; break;
+    case Opcode::knotd: width = 32; operation = Operation::not_; break;
+    case Opcode::knotq: width = 64; operation = Operation::not_; break;
+    default: return std::nullopt;
+    }
+
+    const bool unary = operation == Operation::not_;
+    const auto expected_operands = unary ? 2u : 3u;
+    if (instruction.context.architecture != Architecture::x86_64 ||
+        instruction.context.mode != ExecutionMode::x86_64 ||
+        instruction.flow != FlowKind::fallthrough || instruction.x86_evex ||
+        instruction.x86_opmask || instruction.x86_opmask_zeroing ||
+        instruction.x86_evex_broadcast || instruction.x86_evex_sae ||
+        instruction.memory_read || instruction.memory_write ||
+        instruction.operands.size() != expected_operands ||
+        instruction.access.size() != expected_operands ||
+        instruction.access[0] != OperandAccess::write ||
+        instruction.access[1] != OperandAccess::read ||
+        (!unary && instruction.access[2] != OperandAccess::read) ||
+        (unary && source2.has_value()) || (!unary && !source2))
+        return std::nullopt;
+
+    const auto *destination = std::get_if<RegisterOperand>(&instruction.operands[0]);
+    const auto *first = std::get_if<RegisterOperand>(&instruction.operands[1]);
+    const auto *second = unary ? nullptr : std::get_if<RegisterOperand>(&instruction.operands[2]);
+    const auto valid_register = [](const RegisterOperand *reg) {
+        return reg && reg->bank == RegisterBank::opmask && reg->index < 8 &&
+            reg->width == 64 && !reg->high_byte;
+    };
+    if (!valid_register(destination) || !valid_register(first) || (!unary && !valid_register(second)) ||
+        instruction.register_reads.size() != expected_operands - 1 ||
+        instruction.register_writes.size() != 1 ||
+        instruction.register_writes[0].bank != RegisterBank::opmask ||
+        instruction.register_writes[0].index != destination->index ||
+        instruction.register_writes[0].width != 64 || instruction.register_writes[0].high_byte)
+        return std::nullopt;
+    if (instruction.register_reads[0].bank != RegisterBank::opmask ||
+        instruction.register_reads[0].index != first->index ||
+        instruction.register_reads[0].width != 64 || instruction.register_reads[0].high_byte)
+        return std::nullopt;
+    if (!unary && (instruction.register_reads[1].bank != RegisterBank::opmask ||
+        instruction.register_reads[1].index != second->index ||
+        instruction.register_reads[1].width != 64 || instruction.register_reads[1].high_byte))
+        return std::nullopt;
+
+    const auto mask = width == 64 ? UINT64_MAX : (UINT64_C(1) << width) - 1;
+    std::uint64_t value = 0;
+    switch (operation) {
+    case Operation::and_: value = source1 & *source2; break;
+    case Operation::and_not: value = ~source1 & *source2; break;
+    case Operation::or_: value = source1 | *source2; break;
+    case Operation::xor_: value = source1 ^ *source2; break;
+    case Operation::xnor: value = ~(source1 ^ *source2); break;
+    case Operation::not_: value = ~source1; break;
+    }
+    return X86OpmaskBooleanResult{value & mask, static_cast<std::uint8_t>(width)};
+}
+
 inline std::optional<X86EvexIntegerResult> evaluate_x86_evex_popcount(
     const Instruction &instruction, const std::array<std::byte, 64> &source,
     const std::array<std::byte, 64> *old_destination = nullptr,
