@@ -9147,6 +9147,19 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
             [](const LiftedInstruction &instruction) { return std::holds_alternative<Return>(instruction.statement); });
     };
 
+    // These CIL operations explicitly terminate rather than return. Arbitrary
+    // intrinsics and calls do not prove that a path cannot return.
+    auto has_only_terminal_nonreturn = [](const LiftedBlock &block) {
+        if (block.instructions.empty() || !block.successors.empty()) return false;
+        const auto *terminal = std::get_if<Intrinsic>(&block.instructions.back().statement);
+        if (!terminal || (terminal->name != "throw" && terminal->name != "rethrow_current_exception" &&
+                          terminal->name != "exception_unhandled")) return false;
+        return std::none_of(block.instructions.begin(), block.instructions.end() - 1,
+            [](const LiftedInstruction &instruction) {
+                return std::holds_alternative<Branch>(instruction.statement) ||
+                       std::holds_alternative<Return>(instruction.statement);
+            });
+    };
     const auto *entry = find_block(function.entry);
     if (!entry) return fallback("function entry block is absent");
 
@@ -13199,7 +13212,7 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                 ++predecessor_count[*next];
             }
             if (children[i].empty()) {
-                if (!has_only_terminal_return(block) || branch_count != 0) return {};
+                if ((!has_only_terminal_return(block) && !has_only_terminal_nonreturn(block)) || branch_count != 0) return {};
             } else if (children[i].size() == 1) {
                 if (contains_return(block)) return {};
                 if (!block.switch_dispatch &&
