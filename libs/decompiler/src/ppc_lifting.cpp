@@ -528,6 +528,42 @@ std::optional<Statement> lift_ppc_instruction(const Instruction &i, std::vector<
         return result;
     }
 
+    if (i.opcode == Opcode::ppc_lfsu || i.opcode == Opcode::ppc_lfdu ||
+        i.opcode == Opcode::ppc_stfsu || i.opcode == Opcode::ppc_stfdu) {
+        const bool load = i.opcode == Opcode::ppc_lfsu || i.opcode == Opcode::ppc_lfdu;
+        const std::uint16_t bits = (i.opcode == Opcode::ppc_lfsu || i.opcode == Opcode::ppc_stfsu) ? 32 : 64;
+        const auto *data = ops.size() == 2 ? std::get_if<R>(&ops[0]) : nullptr;
+        const auto *memory_operand = ops.size() == 2 ? std::get_if<MemoryOperand>(&ops[1]) : nullptr;
+        if (!data || data->bank != RegisterBank::ppc_fpr || data->width != bits || !memory_operand ||
+            !memory_operand->writeback || memory_operand->post_index || !memory_operand->base ||
+            memory_operand->index || memory_operand->scale != 1 || memory_operand->address_width != width ||
+            memory_operand->ip_relative ||
+            memory_operand->base->bank != RegisterBank::ppc_gpr || memory_operand->base->width != width ||
+            memory_operand->base->index == 0 ||
+            memory_operand->writeback_displacement != memory_operand->displacement ||
+            memory_operand->data_width != bits || i.register_reads != (load ? std::vector<R>{*memory_operand->base} : std::vector<R>{*data, *memory_operand->base}) ||
+            i.register_writes != (load ? std::vector<R>{*data, *memory_operand->base} : std::vector<R>{*memory_operand->base}) ||
+            i.access != (load ? std::vector<OperandAccess>{OperandAccess::write, OperandAccess::address} :
+                                std::vector<OperandAccess>{OperandAccess::read, OperandAccess::address}) ||
+            i.memory_read != load || i.memory_write == load)
+            return effect(i, "ppc_fp_update_memory_unmodeled");
+
+        // One indivisible intrinsic preserves fault ordering: memory completes
+        // before the base writeback is committed. Both formulas read old RA.
+        std::vector<ExpressionPtr> outputs;
+        if (load)
+            outputs.push_back(std::make_shared<Expression>(Expression{
+                floating(bits), UnknownValue{"ppc_fp_update_load_result"}}));
+        const auto address_width = memory_operand->address_width;
+        auto displacement = static_cast<std::uint64_t>(memory_operand->displacement);
+        if (address_width < 64) displacement &= (std::uint64_t{1} << address_width) - 1;
+        outputs.push_back(binary("add", reg(*memory_operand->base), constant(displacement, address_width), address_width));
+        const char *name = i.opcode == Opcode::ppc_lfsu ? "ppc_lfsu" :
+                           i.opcode == Opcode::ppc_lfdu ? "ppc_lfdu" :
+                           i.opcode == Opcode::ppc_stfsu ? "ppc_stfsu" : "ppc_stfdu";
+        return effect_with_outputs(i, name, std::move(outputs));
+    }
+
     if ((i.opcode == Opcode::ppc_lfs || i.opcode == Opcode::ppc_lfd ||
          i.opcode == Opcode::ppc_stfs || i.opcode == Opcode::ppc_stfd) && ops.size() == 2 && dst &&
         dst->bank == RegisterBank::ppc_fpr) {

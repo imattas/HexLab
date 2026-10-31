@@ -523,9 +523,13 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
     case Opcode::ppc_rldcr: return "rldcr";
     case Opcode::ppc_rldcr_dot: return "rldcr.";
     case Opcode::ppc_lfs: return "lfs";
+    case Opcode::ppc_lfsu: return "lfsu";
     case Opcode::ppc_lfd: return "lfd";
+    case Opcode::ppc_lfdu: return "lfdu";
     case Opcode::ppc_stfs: return "stfs";
+    case Opcode::ppc_stfsu: return "stfsu";
     case Opcode::ppc_stfd: return "stfd";
+    case Opcode::ppc_stfdu: return "stfdu";
     case Opcode::ppc_fadds: return "fadds";
     case Opcode::ppc_fsubs: return "fsubs";
     case Opcode::ppc_fmuls: return "fmuls";
