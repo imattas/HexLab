@@ -124,12 +124,17 @@ when exactly one loaded catalog has an exact AssemblyRef identity match and
 exactly one TypeDef has the requested full name. It can also follow an
 ExportedType row with an AssemblyRef implementation through further supplied
 catalogs, including nested names. Nested TypeRefs inherit the outer TypeRef's
-assembly scope. Missing assemblies, duplicate loaded identities, duplicate
+assembly scope. Identity matching accepts exact full-key or token bytes, and
+compares a full key with its derived eight-byte SHA-1 public-key token when the
+two catalogs store different representations, subject to 1 MiB per-key and
+64 MiB aggregate key-processing caps plus a 16,000,000 identity-comparison cap;
+other Assembly identity fields must still match.
+Missing assemblies, duplicate loaded identities, duplicate
 TypeDef/ExportedType names, File implementations, and forwarding cycles stay
 unresolved with a reason in `unresolved_scope`. Binding is bounded by the
 4,096-catalog limit and never searches disk or loads code. ModuleRef and null
-TypeRef scopes remain unresolved. Public-key-to-token conversion and missing
-assembly identities are not inferred.
+TypeRef scopes remain unresolved. Missing assembly identities and oversized
+public keys are not inferred or hashed.
 
 When catalog binding succeeds, a TypeRef node inside a retained TypeSpec also
 records the exact destination catalog index and TypeDef token, in addition to
