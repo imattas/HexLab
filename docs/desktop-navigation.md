@@ -174,6 +174,14 @@ is ready; selection is restored by its document, page, and result identity when
 that result remains visible. Filtering narrows only results already loaded by
 the selected Find scope; it does not broaden a current-document search or load
 additional result pages.
+
+Current-document Find result rows are collected from immutable search pages on a
+background worker. The worker checks cancellation at least every 256 matches and
+publishes batches of at most 256 rows; a changed document or result generation
+retires queued work, and the view rejects batches whose generation or document
+identity no longer matches. Selection and navigation stay disabled until
+collection finishes. The view then restores selection by document, page, and
+history result index, so navigation remains tied to the captured search history.
 ## Search names across open documents
 
 Choose **Navigate > Search Names in Open Documents...** (`Ctrl+Shift+G`) to

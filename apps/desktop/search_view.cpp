@@ -354,7 +354,12 @@ struct SearchView::CollectionWork {
         std::vector<std::shared_ptr<const SearchPage>> pages;
     };
     struct Seed { DocumentId document; std::size_t index = 0; SearchMatch match; std::shared_ptr<const SearchPage> page; };
-    struct Batch { std::uint64_t generation = 0; std::vector<Seed> rows; bool done = false; };
+    struct Batch {
+        std::uint64_t generation = 0;
+        DocumentId document;
+        std::vector<Seed> rows;
+        bool done = false;
+    };
     std::atomic<std::uint64_t> generation{0};
     std::mutex mutex;
     std::condition_variable_any ready;
@@ -525,7 +530,7 @@ SearchView::SearchView(wxWindow *parent) : wxPanel(parent), filter_work_(std::ma
                     }
                     pending.push_back({request.document, index++, match, page});
                     if (pending.size() == 256) {
-                        CollectionWork::Batch batch{request.generation, std::move(pending), false};
+                        CollectionWork::Batch batch{request.generation, request.document, std::move(pending), false};
                         pending.clear();
                         std::unique_lock lock(collection->mutex);
                         collection->ready.wait(lock, stop, [&] { return !collection->batch.has_value() ||
@@ -543,7 +548,7 @@ SearchView::SearchView(wxWindow *parent) : wxPanel(parent), filter_work_(std::ma
             }
             if (canceled || stop.stop_requested()) continue;
             if (!pending.empty()) {
-                CollectionWork::Batch batch{request.generation, std::move(pending), false};
+                CollectionWork::Batch batch{request.generation, request.document, std::move(pending), false};
                 std::unique_lock lock(collection->mutex);
                 collection->ready.wait(lock, stop, [&] { return !collection->batch.has_value() ||
                     collection->generation.load(std::memory_order_acquire) != request.generation; });
@@ -554,7 +559,7 @@ SearchView::SearchView(wxWindow *parent) : wxPanel(parent), filter_work_(std::ma
                 collection->ready.notify_all();
             }
             // A per-worker scratch vector avoids retaining rows from a canceled request.
-            CollectionWork::Batch done{request.generation, {}, true};
+            CollectionWork::Batch done{request.generation, request.document, {}, true};
             std::unique_lock lock(collection->mutex);
             collection->ready.wait(lock, stop, [&] { return !collection->batch.has_value() ||
                 collection->generation.load(std::memory_order_acquire) != request.generation; });
@@ -688,7 +693,8 @@ void SearchView::poll_collection() {
         }
     }
     collection_work_->ready.notify_all();
-    if (!batch || batch->generation != collection_work_->generation.load(std::memory_order_acquire)) return;
+    if (!batch || batch->generation != collection_work_->generation.load(std::memory_order_acquire) ||
+        all_documents_ || !document_ || *document_ != batch->document) return;
     if (!batch->rows.empty()) {
         if (!collection_rows_) return;
         for (auto &seed : batch->rows) {
