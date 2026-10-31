@@ -542,6 +542,11 @@ class Itanium {
     std::string expression(std::size_t d) {
         depth(d); component();
         if (peek() == 'L') return literal(d + 1);
+        if (take("cv")) {
+            const auto target = render(parse_type_node(d + 1));
+            const auto value = expression(d + 1);
+            return combine({"static_cast<", target, ">(", value, ")"});
+        }
         static constexpr std::pair<std::string_view, std::string_view> unary[] = {
             {"ps", "+"}, {"ng", "-"}, {"ad", "&"}, {"de", "*"}, {"co", "~"}, {"nt", "!"}};
         for (const auto &[code, op] : unary) if (take(code)) return combine({"(", op, expression(d + 1), ")"});
