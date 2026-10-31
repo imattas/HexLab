@@ -114,6 +114,17 @@ available in the raw value. JSON capsules and nested FMP/JSON rows use the same
 labels; the names describe header bits and do not imply that an update is safe
 or applicable.
 
+For version-3 FMP image headers, the CLI also names the defined
+`ImageCapsuleSupport` authentication and dependency bits, reports the exact
+source offset of that 64-bit field, and preserves unrecognized bits separately
+from the raw value. If the authentication bit disagrees with recognition of a
+standard PKCS#7 `EFI_FIRMWARE_IMAGE_AUTHENTICATION` prefix, it emits a bounded
+per-item warning at the support-field offset. This is an inventory consistency
+hint: an unknown certificate format is reported as unrecognized, and no update
+is rejected or treated as trusted because of this warning. The bit definitions
+follow [UEFI 2.11, section 23](https://uefi.org/specs/UEFI/2.11/23_Firmware_Update_and_Reporting.html)
+and EDK II's [`FmpCapsule.h`](https://github.com/tianocore/edk2/blob/master/MdePkg/Include/Guid/FmpCapsule.h).
+
 For a single contiguous FMP capsule, export one top-level update image with
 `hexlab_cli firmware inspect update.cap --extract-item 0 --output image.bin
 --format uefi-capsule`. The index is zero-based and addresses the parser's

@@ -216,7 +216,14 @@ void write_capsule_item(std::ostream &out, const firmware::UefiCapsuleItem &item
             << " vendor-code-size=" << hex_value(item.vendor_code_size)
             << " vendor-code-offset=" << hex_value(item.vendor_code_offset);
         if (item.image_header_version >= 2) out << " hardware-instance=" << hex_value(item.hardware_instance);
-        if (item.image_header_version >= 3) out << " image-capsule-support=" << hex_value(item.image_capsule_support);
+        if (item.image_header_version >= 3) {
+            out << " image-capsule-support=" << hex_value(item.image_capsule_support)
+                << " image-capsule-support-offset=" << hex_value(item.image_capsule_support_offset)
+                << " support-authentication=" << (item.capsule_support_authentication_advertised ? "yes" : "no")
+                << " support-dependency=" << (item.capsule_support_dependency_advertised ? "yes" : "no");
+            if (item.capsule_support_unrecognized_bits)
+                out << " support-unrecognized-bits=" << hex_value(item.capsule_support_unrecognized_bits);
+        }
         if (item.authentication_present)
             out << " authentication=pkcs7 monotonic-count=" << hex_value(item.authentication_monotonic_count)
                 << " certificate-offset=" << hex_value(item.authentication_certificate_offset)
@@ -236,6 +243,10 @@ void write_capsule_item(std::ostream &out, const firmware::UefiCapsuleItem &item
                 << " lowest-supported-firmware-version=" << hex_value(item.lowest_supported_firmware_version);
     }
     out << '\n';
+    if (item.capsule_support_authentication_mismatch)
+        out << indent << "  Image capsule support warning at "
+            << hex_value(item.image_capsule_support_offset) << ": "
+            << item.capsule_support_authentication_diagnostic << '\n';
     write_embedded_volumes(out, item, std::string(indent) + "  ", logical);
     if (!item.nested_capsule_scan_complete)
         out << indent << "  Nested capsule scan incomplete: " << item.nested_capsule_diagnostic << '\n';

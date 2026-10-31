@@ -62,6 +62,16 @@ struct UefiCapsuleItem {
     std::uint64_t vendor_code_offset = 0;
     std::uint64_t hardware_instance = 0;
     std::uint64_t image_capsule_support = 0;
+    // Exact source byte for the v3 ImageCapsuleSupport field; zero for older
+    // image-header versions.
+    std::uint64_t image_capsule_support_offset = 0;
+    bool capsule_support_authentication_advertised = false;
+    bool capsule_support_dependency_advertised = false;
+    std::uint64_t capsule_support_unrecognized_bits = 0;
+    // A mismatch is advisory: the parser inventories the bytes but does not
+    // reject a capsule based on firmware-specific update policy.
+    bool capsule_support_authentication_mismatch = false;
+    std::string capsule_support_authentication_diagnostic;
     // Bounded PI firmware volumes discovered inside the update image payload.
     std::vector<UefiCapsuleEmbeddedVolume> embedded_volumes;
     bool embedded_volume_scan_attempted = false;
