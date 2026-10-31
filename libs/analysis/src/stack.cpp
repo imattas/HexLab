@@ -39,6 +39,10 @@ struct FlowState {
     // arithmetic, then invalidate it because their result carry is unknown.
     bool m6502_carry_known = false;
     bool m6502_carry_set = false;
+    // Decimal mode changes NMOS 6502 ADC/SBC results, so stack-derived A
+    // arithmetic is usable only after CLD proves binary mode.
+    bool m6502_decimal_known = false;
+    bool m6502_decimal_set = false;
     // For the NMOS 6502 TSX/$0100,X convention, track a small signed
     // displacement from the sampled S value. Values outside +/-127 are
     // intentionally discarded because 8-bit index wrap makes linear slot
@@ -157,6 +161,14 @@ bool merge(FlowState &current, const FlowState &incoming) {
     } else if (!current.m6502_carry_known && incoming.m6502_carry_known) {
         current.ambiguous = true;
     }
+    bool m6502_decimal_changed = false;
+    if (current.m6502_decimal_known &&
+        (!incoming.m6502_decimal_known || current.m6502_decimal_set != incoming.m6502_decimal_set)) {
+        current.m6502_decimal_known = false;
+        m6502_decimal_changed = true;
+    } else if (!current.m6502_decimal_known && incoming.m6502_decimal_known) {
+        current.ambiguous = true;
+    }
     bool frame_register_delta_changed = false;
     if (current.frame_register >= 0 && incoming.frame_register == current.frame_register) {
         if (current.frame_register_delta.known && incoming.frame_register_delta.known) {
@@ -218,7 +230,8 @@ bool merge(FlowState &current, const FlowState &incoming) {
     return stack_changed || frame_changed || previously_supported != current.supported ||
            previously_ambiguous != current.ambiguous || previous_frame_register != current.frame_register ||
            previous_arm64_frame_pointer != current.arm64_frame_pointer || frame_register_delta_changed ||
-           riscv_alias_changed || arm64_alias_changed || m6502_alias_changed || m6502_carry_changed;
+           riscv_alias_changed || arm64_alias_changed || m6502_alias_changed || m6502_carry_changed ||
+           m6502_decimal_changed;
 }
 
 bool arm32_register(const std::optional<RegisterOperand> &value, std::uint8_t index) {
@@ -554,13 +567,20 @@ bool transfer(const Instruction &instruction, FlowState &state) {
             state.m6502_carry_set = instruction.opcode == Opcode::m6502_sec;
             return true;
         }
+        if (instruction.opcode == Opcode::m6502_cld || instruction.opcode == Opcode::m6502_sed) {
+            state.m6502_decimal_known = instruction.flow == FlowKind::fallthrough &&
+                                        has_register(instruction.register_writes, 3);
+            state.m6502_decimal_set = instruction.opcode == Opcode::m6502_sed;
+            return true;
+        }
         if (instruction.opcode == Opcode::m6502_adc || instruction.opcode == Opcode::m6502_sbc) {
             const auto operand = immediate_value(instruction, 0);
             const bool valid = instruction.flow == FlowKind::fallthrough && operand && *operand >= 0 && *operand <= 255 &&
                 has_register(instruction.register_reads, 0) && has_register(instruction.register_writes, 0) &&
                 has_register(instruction.register_writes, 3);
             auto &accumulator = state.m6502_stack_alias_deltas[0];
-            if (valid && state.m6502_carry_known && accumulator.known) {
+            if (valid && state.m6502_carry_known && state.m6502_decimal_known &&
+                !state.m6502_decimal_set && accumulator.known) {
                 const auto delta = instruction.opcode == Opcode::m6502_adc
                     ? *operand + static_cast<std::int64_t>(state.m6502_carry_set)
                     : -*operand - static_cast<std::int64_t>(!state.m6502_carry_set);
@@ -591,9 +611,12 @@ bool transfer(const Instruction &instruction, FlowState &state) {
             state.frame_register_delta = {};
             state.m6502_stack_alias_deltas = {};
             state.m6502_carry_known = false;
+            state.m6502_decimal_known = false;
             return true;
         case Opcode::m6502_rts:
+            return true;
         case Opcode::m6502_rti:
+            state.m6502_decimal_known = false;
             return true;
         case Opcode::m6502_tsx:
             // TSX gives X a stable, byte-wide snapshot of the hardware stack
@@ -699,6 +722,7 @@ bool transfer(const Instruction &instruction, FlowState &state) {
             state.m6502_stack_alias_deltas[0] = {};
             return add(state.stack_depth, -1);
         case Opcode::m6502_plp:
+            state.m6502_decimal_known = false;
             return add(state.stack_depth, -1);
         default:
             break;
