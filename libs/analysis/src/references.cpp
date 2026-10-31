@@ -4575,6 +4575,30 @@ RegisterReferenceFacts mips_reference_facts(const Image *image, const Relocation
                         result.immediate_targets[{fact->id, 1}] = target;
                 }
                 propagated = true;
+            } else if (mips32 && (instruction.opcode == Opcode::mips_andi ||
+                                  instruction.opcode == Opcode::mips_xori) &&
+                       instruction.operands.size() == 3) {
+                const auto *dst = architecture_register(instruction, 0, RegisterBank::mips_gpr, 32);
+                const auto *src = architecture_register(instruction, 1, RegisterBank::mips_gpr, 32);
+                std::optional<std::uint32_t> source_value;
+                if (src) {
+                    if (src->index == 0) source_value = 0;
+                    else if (const auto value = registers.find(src->index);
+                             value != registers.end() && value->second.space == instruction.address.space)
+                        source_value = static_cast<std::uint32_t>(value->second.offset);
+                }
+                const auto folded = source_value
+                    ? evaluate_mips32_logical_immediate_instruction(instruction, *source_value)
+                    : std::optional<Mips32LogicalImmediateResult>{};
+                const std::optional<Address> target = dst && dst->index != 0 && folded && folded->writes_destination
+                    ? std::optional<Address>{Address{instruction.address.space, folded->value}} : std::nullopt;
+                erase_written();
+                if (dst && dst->index != 0 && target) {
+                    registers[dst->index] = *target;
+                    if (riscv_target_segment(*image, *target, OperandAccess::address))
+                        result.immediate_targets[{fact->id, 2}] = *target;
+                }
+                propagated = true;
             } else if (((!mips64 && (instruction.opcode == Opcode::mips_addi ||
                                      instruction.opcode == Opcode::mips_addiu || instruction.opcode == Opcode::mips_ori)) ||
                         (mips64 && (instruction.opcode == Opcode::mips64_addi || instruction.opcode == Opcode::mips64_addiu ||
