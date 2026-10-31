@@ -302,6 +302,7 @@ const char *execution_mode_id(ExecutionMode mode) {
     case ExecutionMode::ppc32: return "ppc32";
     case ExecutionMode::ppc64: return "ppc64";
     case ExecutionMode::m6502: return "m6502";
+    case ExecutionMode::m65c02: return "m65c02";
     case ExecutionMode::jvm: return "jvm";
     default: return "unknown";
     }

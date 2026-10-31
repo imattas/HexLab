@@ -27,7 +27,8 @@ Result<bool> validate_raw_coordinates(const RawOptions &o) {
     const bool legacy = o.architecture == Architecture::x86 && o.mode == ExecutionMode::x86_32;
     const bool long_mode = o.architecture == Architecture::x86_64 && o.mode == ExecutionMode::x86_64;
     const bool a64 = o.architecture == Architecture::arm64 && o.mode == ExecutionMode::a64;
-    const bool m6502 = o.architecture == Architecture::mos6502 && o.mode == ExecutionMode::m6502;
+    const bool m6502 = o.architecture == Architecture::mos6502 &&
+                       (o.mode == ExecutionMode::m6502 || o.mode == ExecutionMode::m65c02);
     const bool rv32 = o.architecture == Architecture::riscv32 && o.mode == ExecutionMode::rv32;
     const bool rv64 = o.architecture == Architecture::riscv64 && o.mode == ExecutionMode::rv64;
     const bool mips64 = o.architecture == Architecture::mips64 && o.mode == ExecutionMode::mips64;
@@ -36,7 +37,7 @@ Result<bool> validate_raw_coordinates(const RawOptions &o) {
     if (!ppc32 && !ppc64 && o.order != ByteOrder::little)
         return Error{ErrorCode::invalid_argument, "Explicit raw byte order is currently available only for PowerPC"};
     if (!legacy && !long_mode && !a64 && !m6502 && !rv32 && !rv64 && !mips64 && !ppc32 && !ppc64)
-        return Error{ErrorCode::unsupported, "Raw architecture/mode must be x86-32, x86-64, A64, MOS 6502, RV32I, RV64I, MIPS64, PPC32 or PPC64"};
+        return Error{ErrorCode::unsupported, "Raw architecture/mode must be x86-32, x86-64, A64, MOS 6502, WDC 65C02, RV32I, RV64I, MIPS64, PPC32 or PPC64"};
     if (a64 && ((o.entry && (o.entry->offset & 3)) || (!o.entry && o.executable && (o.base.offset & 3))))
         return Error{ErrorCode::invalid_argument, "A64 raw code entry must be four-byte aligned"};
     if (legacy && o.base.offset > UINT32_MAX)
@@ -69,7 +70,7 @@ Result<std::shared_ptr<const Image>> load_raw(std::shared_ptr<const ByteStorage>
     if (o.x86_profile)
         return profile_detail::load_segmented(std::move(storage), *o.x86_profile, stop);
     ImageLayout layout{{o.base.space, static_cast<uint8_t>(o.arm_profile || o.mode == ExecutionMode::x86_32 || o.mode == ExecutionMode::rv32 || o.mode == ExecutionMode::ppc32 ? 32 :
-                                                            o.mode == ExecutionMode::m6502 ? 16 : 64),
+                                                            (o.mode == ExecutionMode::m6502 || o.mode == ExecutionMode::m65c02) ? 16 : 64),
                         1, o.order},
                        o.architecture,
                        o.mode,

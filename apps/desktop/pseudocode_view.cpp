@@ -628,7 +628,8 @@ std::uint16_t pointer_width(const FunctionRecord &function, const FunctionSnapsh
             std::uint16_t current = 0;
             switch (instruction.context.mode) {
             case ExecutionMode::x86_16:
-            case ExecutionMode::m6502: current = 16; break;
+            case ExecutionMode::m6502:
+            case ExecutionMode::m65c02: current = 16; break;
             case ExecutionMode::x86_64:
             case ExecutionMode::a64:
             case ExecutionMode::rv64:

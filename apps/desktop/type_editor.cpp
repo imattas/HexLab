@@ -73,7 +73,8 @@ std::uint64_t project_pointer_size(const ProjectSnapshot &project) {
             return layout.stack_address_width / 8;
         switch (layout.mode) {
         case ExecutionMode::x86_16:
-        case ExecutionMode::m6502: return 2;
+        case ExecutionMode::m6502:
+        case ExecutionMode::m65c02: return 2;
         case ExecutionMode::x86_32:
         case ExecutionMode::a32:
         case ExecutionMode::thumb:

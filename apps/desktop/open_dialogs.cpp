@@ -27,6 +27,7 @@ bool configure_raw_mapping(wxWindow *parent, OpenRequest &request) {
     mode->Append("PowerPC PPC32 big-endian");
     mode->Append("PowerPC PPC64 little-endian");
     mode->Append("PowerPC PPC64 big-endian");
+    mode->Append("WDC 65C02 (CMOS scalar subset)");
     mode->SetSelection(0);
     box->Add(mode, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
     box->Add(new wxStaticText(&dialog, wxID_ANY, "Base address (decimal or 0x hexadecimal)"), 0, wxLEFT | wxRIGHT, 10);
@@ -98,12 +99,13 @@ bool configure_raw_mapping(wxWindow *parent, OpenRequest &request) {
             const bool rv32 = mode->GetSelection() == 5;
             const bool rv64 = mode->GetSelection() == 6;
             const bool mips64 = mode->GetSelection() == 7;
+            const bool m65c02 = mode->GetSelection() == 12;
             const int ppc_choice = mode->GetSelection() - 8;
             const bool ppc32 = ppc_choice == 0 || ppc_choice == 1;
             const bool ppc64 = ppc_choice == 2 || ppc_choice == 3;
             RawOptions raw{a64       ? Architecture::arm64
                            : legacy  ? Architecture::x86
-                           : m6502   ? Architecture::mos6502
+                           : m6502 || m65c02 ? Architecture::mos6502
                            : rv32    ? Architecture::riscv32
                            : rv64    ? Architecture::riscv64
                            : mips64  ? Architecture::mips64
@@ -111,6 +113,7 @@ bool configure_raw_mapping(wxWindow *parent, OpenRequest &request) {
                                      : Architecture::x86_64,
                            a64       ? ExecutionMode::a64
                            : legacy  ? ExecutionMode::x86_32
+                           : m65c02 ? ExecutionMode::m65c02
                            : m6502   ? ExecutionMode::m6502
                            : rv32    ? ExecutionMode::rv32
                            : rv64    ? ExecutionMode::rv64

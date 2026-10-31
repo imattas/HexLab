@@ -172,7 +172,7 @@ The object fields are `entry`, `analysis_status`, `partial`,
 `pseudocode`, `instruction_count`, `lifted_instruction_count`, `origin_rows`,
 `omitted_origin_rows`, and `origin_rows_complete`.
 
-Raw inputs require an explicit mapping. Choose `--arch x86-32` for flat 32-bit coordinates, `--arch x86-64` for long mode, `--arch 6502` for the NMOS 6502 decoder subset, or `--arch rv32` / `--arch rv64` for the base RISC-V integer subsets. The 32-bit base, entry and complete mapped extent must fit its address domain; 6502 coordinates are limited to 16 bits. Empty inputs still require a valid base:
+Raw inputs require an explicit mapping. Choose `--arch x86-32` for flat 32-bit coordinates, `--arch x86-64` for long mode, `--arch 6502` for the NMOS 6502 decoder subset, `--arch 65c02` for the WDC 65C02 decoder subset, or `--arch rv32` / `--arch rv64` for the base RISC-V integer subsets. The 32-bit base, entry and complete mapped extent must fit its address domain; 6502 and 65C02 coordinates are limited to 16 bits. Empty inputs still require a valid base:
 
 ```powershell
 ./hexlab_cli.exe project create code.hxproj --input code.bin --format raw --arch x86-64 --base 0x1000
