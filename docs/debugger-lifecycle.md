@@ -116,3 +116,10 @@ Destroying an active `DebugSession`, including replacing an active destination
 through move assignment, attempts the normal detach path before releasing its
 backend ownership. Move assignment preserves the moved-from session as empty;
 the cleanup attempt follows the destructor's best-effort behavior.
+
+The Win32 backend also attempts one normal detach if it is destroyed directly
+while it still owns a process. This retry can restore debugger-owned state and
+release the Windows debug relationship after a prior transient cleanup failure.
+Backend destruction cannot return a cleanup error; callers that need to know
+whether detach succeeded should call `DebugSession::detach()` explicitly. This
+fallback never terminates the target.

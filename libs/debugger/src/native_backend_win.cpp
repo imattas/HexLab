@@ -863,7 +863,17 @@ std::optional<Arm32StepDestination> arm32_branch_destination(
 
 class Win32Backend final : public Backend {
 public:
-    ~Win32Backend() override { close_handles(); }
+    ~Win32Backend() override {
+        // DebugSession normally detaches before it releases this backend, but
+        // Backend is also a public interface and can be destroyed directly.
+        // Retry the normal cleanup path once while the native state is still
+        // available; never terminate a target merely because the backend dies.
+        if (process_) {
+            try { (void)detach(); }
+            catch (...) { /* Destruction cannot surface cleanup diagnostics. */ }
+        }
+        close_handles();
+    }
     bool output_events_require_acknowledgement() const noexcept override { return true; }
 
     Result<std::vector<ProcessInfo>> processes() override {
