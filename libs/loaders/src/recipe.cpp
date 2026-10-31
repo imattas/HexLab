@@ -12,11 +12,40 @@
 #include <stdexcept>
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <mutex>
 #include <string_view>
 #include <system_error>
 namespace hexlab {
 namespace {
+bool has_local_pe_pdb_candidate(const std::filesystem::path &image_path, std::stop_token stop) {
+    constexpr std::size_t max_directory_entries = 4096;
+    auto fallback = image_path.filename();
+    fallback.replace_extension(".pdb");
+    std::error_code error;
+    auto status = std::filesystem::symlink_status(image_path.parent_path() / fallback, error);
+    if (!error && std::filesystem::is_regular_file(status)) return true;
+    error.clear();
+    std::filesystem::directory_iterator entry(image_path.parent_path(), error), end;
+    if (error) return true; // Do the authoritative metadata pass if discovery was inconclusive.
+    std::size_t visited = 0;
+    while (entry != end && visited++ < max_directory_entries) {
+        if ((visited & 63u) == 0 && stop.stop_requested()) return false;
+        auto extension = entry->path().extension().string();
+        std::transform(extension.begin(), extension.end(), extension.begin(),
+                       [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+        if (extension == ".pdb") {
+            error.clear();
+            status = std::filesystem::symlink_status(entry->path(), error);
+            if (!error && std::filesystem::is_regular_file(status)) return true;
+        }
+        entry.increment(error);
+        if (error) return true;
+    }
+    // If the enumeration budget was reached, a sidecar may be beyond the
+    // bounded prefix, so retain the exact CodeView check rather than assume none.
+    return entry != end;
+}
 Result<LoadRecipe> attach_adjacent_pe_pdb(const ByteStorage &storage, LoadRecipe recipe,
                                           std::stop_token stop) {
     if (recipe.format != Format::pe || recipe.pdb_path)
@@ -26,6 +55,10 @@ Result<LoadRecipe> attach_adjacent_pe_pdb(const ByteStorage &storage, LoadRecipe
         return recipe;
     if (stop.stop_requested())
         return Error{ErrorCode::canceled, "Image loading canceled"};
+    if (!has_local_pe_pdb_candidate(file->backing_path(), stop)) {
+        if (stop.stop_requested()) return Error{ErrorCode::canceled, "Image loading canceled"};
+        return recipe;
+    }
     auto parsed = load_pe(file->shared_from_this(), stop);
     if (!parsed) {
         if (parsed.error().code == ErrorCode::canceled) return parsed.error();
