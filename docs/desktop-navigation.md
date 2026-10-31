@@ -44,12 +44,17 @@ searching large captured name sets does not hold the wx event loop. Current-
 document Jump opens its chooser before collecting symbols, annotations,
 bookmarks, recovered functions, and sections; the worker collects these from
 the captured document and project snapshots, checking cancellation between
-records. The resulting source snapshot is reused for refinements and remains
-owned by the worker if the dialog closes. While a query is being scanned,
-the old result list is cleared and navigation is disabled. Rapid refinements
-are coalesced to the newest query; completed results are accepted only for their
-matching query generation. Navigation also verifies the current document id,
-revision, project snapshot, and displayed snapshot before following a result.
+records. The chooser is bound to the document's open generation and exact
+snapshot: changing tabs, closing/reopening the document, or publishing a newer
+snapshot cancels active work and discards completed pages. Each displayed batch
+contains at most 256 destinations; when more results arrive, selection remains
+anchored by name and full destination identity. The resulting source snapshot
+is reused for refinements and remains owned by the worker if the dialog closes.
+While a query is being scanned, the old result list is cleared and navigation is
+disabled. Rapid refinements are coalesced to the newest query; completed results
+are accepted only for their matching query generation. Navigation also verifies
+the current document id, revision, project snapshot, and displayed snapshot
+before following a result.
 Cross-document workers likewise own immutable
 captured project snapshots, and every chosen destination is checked against the
 live document session and project snapshot before navigation. Search caps still

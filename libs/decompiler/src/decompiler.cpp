@@ -925,6 +925,8 @@ std::string operation_name(Opcode opcode) {
     case Opcode::vpcmpuw: return "vpcmpuw";
     case Opcode::vpcmpud: return "vpcmpud";
     case Opcode::vpcmpuq: return "vpcmpuq";
+    case Opcode::vfpclassps: return "vfpclassps";
+    case Opcode::vfpclasspd: return "vfpclasspd";
     case Opcode::movdqa: return "movdqa";
     case Opcode::movdqu: return "movdqu";
     case Opcode::movss: return "movss";
@@ -5775,6 +5777,65 @@ a64_unhandled:
                         effect.register_output_values.clear();
                         break;
                     }
+                }
+            }
+            return effect;
+        }
+    }
+
+    if (x86 && instruction.context.mode == ExecutionMode::x86_64 && instruction.x86_evex &&
+        (instruction.opcode == Opcode::vfpclassps || instruction.opcode == Opcode::vfpclasspd) &&
+        (instruction.vector_bits == 128 || instruction.vector_bits == 256 || instruction.vector_bits == 512) &&
+        instruction.operands.size() == 3 && !instruction.x86_opmask_zeroing && !instruction.x86_evex_sae &&
+        (!instruction.x86_opmask || (*instruction.x86_opmask > 0 && *instruction.x86_opmask < 8))) {
+        const auto width = static_cast<unsigned>(instruction.vector_bits);
+        const auto lane_bits = static_cast<std::uint16_t>(instruction.opcode == Opcode::vfpclassps ? 32 : 64);
+        const auto *destination = std::get_if<RegisterOperand>(&instruction.operands[0]);
+        const auto *memory = std::get_if<MemoryOperand>(&instruction.operands[1]);
+        const auto *classes = std::get_if<ImmediateOperand>(&instruction.operands[2]);
+        const bool source_valid = x86_avx_detail::is_evex_vector(instruction.operands[1], width) ||
+            (memory && memory->data_width == (instruction.x86_evex_broadcast ? lane_bits : width));
+        if (destination && destination->bank == RegisterBank::opmask && destination->index < 8 &&
+            destination->width == 64 && !destination->high_byte && source_valid &&
+            (!instruction.x86_evex_broadcast || memory) && classes &&
+            classes->encoded_width == 8 && classes->effective_width == 8 && !classes->is_signed &&
+            (!instruction.vector_element_bits || instruction.vector_element_bits == lane_bits)) {
+            const auto lanes = static_cast<std::uint8_t>(width / lane_bits);
+            const auto value_type = instruction.x86_evex_broadcast
+                ? floating_type(lane_bits)
+                : vector_type(static_cast<std::uint16_t>(width), TypeKind::floating, lane_bits, lanes);
+            std::vector<ExpressionPtr> inputs{
+                retag_expr(operands[1], value_type), retag_expr(operands[2], integer_type(8)),
+                reg_expr({RegisterBank::mxcsr, 0, 32, false})};
+            if (instruction.x86_opmask)
+                inputs.push_back(reg_expr({RegisterBank::opmask, *instruction.x86_opmask, 64, false}));
+            Intrinsic effect{"x86_" + operation_name(instruction.opcode) + "_f" +
+                std::to_string(lane_bits) + "x" + std::to_string(lanes) + "_classmask" +
+                std::to_string(classes->value) + "_to_k" + std::to_string(destination->index) +
+                (instruction.x86_evex_broadcast ? "_broadcast" : "") +
+                (instruction.x86_opmask ? "_masked_zero" : "_unmasked") + "_daz_control_no_fp_exceptions",
+                std::move(inputs), memory ? IntrinsicMemoryEffect::read : IntrinsicMemoryEffect::none};
+            effect.register_writes = instruction.register_writes;
+            effect.result_type = integer_type(64);
+            auto class_input = std::make_shared<Expression>(Expression{value_type, BinaryValue{
+                "x86_evex_fpclass_classmask" + std::to_string(classes->value) + "_daz_control",
+                retag_expr(operands[1], value_type), retag_expr(operands[2], integer_type(8))}});
+            class_input = std::make_shared<Expression>(Expression{class_input->type, BinaryValue{
+                "x86_evex_fpclass_mxcsr_daz", std::move(class_input),
+                reg_expr({RegisterBank::mxcsr, 0, 32, false})}});
+            ExpressionPtr output = std::make_shared<Expression>(Expression{integer_type(64),
+                UnaryValue{"x86_evex_fpclass_result_masked_lanes_zero_high_bits", class_input}});
+            if (instruction.x86_opmask)
+                output = std::make_shared<Expression>(Expression{integer_type(64), BinaryValue{
+                    "and", std::move(output), reg_expr({RegisterBank::opmask, *instruction.x86_opmask, 64, false})}});
+            const auto active_bits = (UINT64_C(1) << lanes) - 1;
+            output = std::make_shared<Expression>(Expression{integer_type(64), BinaryValue{
+                "and", std::move(output), constant_expr(active_bits, 64)}});
+            for (const auto written : effect.register_writes) {
+                if (written == *destination) effect.register_output_values.push_back(output);
+                else if (written.bank == RegisterBank::mxcsr) {
+                    effect.register_output_values.clear();
+                    break;
                 }
             }
             return effect;

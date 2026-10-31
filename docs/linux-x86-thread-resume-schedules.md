@@ -22,13 +22,19 @@ stop, the backend first executes the displaced instruction with all peers
 stopped, rearms the breakpoint, then resumes the selected threads with their
 requested signals. The internal step is not surfaced as a user step event;
 the backend keeps waiting for the next real stop and returns that event after
-stopping the process threads. A schedule that requests a single-step at the
-breakpoint remains single-thread only, so its step event is preserved. If an
-earlier schedule already has a single-step in flight, another schedule may
-continue other stopped threads, but any new single-step action is rejected
-until the outstanding step produces its event. Resume failures stop already
-continued peers and preserve recovery state if rollback fails. This feature
-does not make multiple ptrace operations atomic.
+stopping the process threads. An owner single-step schedule at the breakpoint
+may also select peer continuations. The owner executes the displaced
+instruction alone; after rearming the trap byte, selected peers resume with
+their requested signal dispositions. The backend stops them and preserves any
+racing signal, clone, or exit status before returning the owner's single-step
+event, leaving peer events queued for later delivery. If a peer resume fails,
+already resumed peers are stopped again, the owner still receives its
+single-step event with the peer-resume failure attached, and recovery state is
+retained. If rollback cannot stop every resumed peer, later resumes remain
+blocked until recovery succeeds. If an earlier schedule already has a
+single-step in flight, another schedule may continue other stopped threads,
+but any new single-step action is rejected until the outstanding step produces
+its event. This feature does not make multiple ptrace operations atomic.
 
 Each scheduled action can choose a signal disposition. If the thread owns a
 signal-delivery stop, omitting the choice preserves and redelivers that signal;

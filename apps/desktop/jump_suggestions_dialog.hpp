@@ -29,16 +29,18 @@ public:
     using Search = std::function<NamedLocationSearch(const wxString &, NamedLocationScope, NamedLocationSearchMode,
                                                       const std::atomic_bool &, std::size_t, std::size_t)>;
     using Describe = std::function<wxString(const NamedLocationCandidate &)>;
+    using SourceCurrent = std::function<bool()>;
     JumpSuggestionsDialog(wxWindow *parent, const wxString &query, Search search, Describe describe,
                           NamedLocationSearchMode initial_mode = NamedLocationSearchMode::contains,
                           const wxString &title = "Jump name suggestions",
                           const wxString &instructions = "Search this document's captured names, then choose a destination:",
-                          bool allow_fuzzy = true, bool background_search = false, bool allow_paging = false)
+                          bool allow_fuzzy = true, bool background_search = false, bool allow_paging = false,
+                          SourceCurrent source_current = {})
         : wxDialog(parent, wxID_ANY, title, wxDefaultPosition, wxDefaultSize,
                    wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER),
           search_(std::move(search)), describe_(std::move(describe)), timer_(this),
           poll_timer_(this), background_search_(background_search), allow_paging_(allow_paging),
-          async_state_(std::make_shared<AsyncState>()) {
+          async_state_(std::make_shared<AsyncState>()), source_current_(std::move(source_current)) {
         auto *layout = new wxBoxSizer(wxVERTICAL);
         auto *instructions_label = new wxStaticText(this, wxID_ANY, instructions);
         instructions_label->Wrap(FromDIP(640));
@@ -183,13 +185,21 @@ private:
         bool closing = false;
         std::shared_ptr<std::atomic_bool> active_cancel;
     };
-    static void launch_async(const std::shared_ptr<AsyncState> &state, Search search, AsyncRequest request) {
+    static void launch_async(const std::shared_ptr<AsyncState> &state, Search search, AsyncRequest request,
+                             SourceCurrent source_current) {
         try {
-            std::thread([state, search = std::move(search), request = std::move(request)]() mutable {
+            std::thread([state, search = std::move(search), request = std::move(request),
+                         source_current = std::move(source_current)]() mutable {
                 NamedLocationSearch result;
                 try {
-                    result = search(request.query, request.scope, request.mode, *request.cancelled,
-                                    request.offset, page_size_);
+                    if (source_current && !source_current()) {
+                        result = {{}, true, "current document changed; close and reopen this search"};
+                    } else {
+                        result = search(request.query, request.scope, request.mode, *request.cancelled,
+                                        request.offset, page_size_);
+                        if (source_current && !source_current())
+                            result = {{}, true, "current document changed; close and reopen this search"};
+                    }
                 } catch (...) {
                     result.truncated = true;
                     result.limitation = "background name search failed";
@@ -209,7 +219,7 @@ private:
                         state->active_cancel.reset();
                     }
                 }
-                if (next) launch_async(state, std::move(search), std::move(*next));
+                if (next) launch_async(state, std::move(search), std::move(*next), source_current);
             }).detach();
         } catch (...) {
             NamedLocationSearch result;
@@ -221,6 +231,7 @@ private:
         }
     }
     void request_background_search() {
+        if (source_invalidated_) return;
         page_offset_ = 0;
         more_available_ = false;
         searching_ = true;
@@ -244,10 +255,10 @@ private:
             async_state_->running = true;
             async_state_->active_cancel = request.cancelled;
         }
-        launch_async(async_state_, search_, std::move(request));
+        launch_async(async_state_, search_, std::move(request), source_current_);
     }
     void request_next_page() {
-        if (!background_search_ || !allow_paging_ || searching_ || !more_available_) return;
+        if (source_invalidated_ || !background_search_ || !allow_paging_ || searching_ || !more_available_) return;
         AsyncRequest request{++generation_, query_->GetValue(),
             static_cast<NamedLocationScope>(scope_->GetSelection()),
             static_cast<NamedLocationSearchMode>(mode_->GetSelection()), page_offset_};
@@ -256,17 +267,35 @@ private:
         { std::lock_guard lock(async_state_->mutex);
           if (async_state_->closing) return;
           async_state_->running = true; async_state_->active_cancel = request.cancelled; }
-        launch_async(async_state_, search_, std::move(request));
+        launch_async(async_state_, search_, std::move(request), source_current_);
     }
     void poll_background_search() {
         if (!background_search_) return;
+        if (!source_invalidated_ && source_current_ && !source_current_()) {
+            source_invalidated_ = true;
+            ++generation_;
+            {
+                std::lock_guard lock(async_state_->mutex);
+                if (async_state_->active_cancel)
+                    async_state_->active_cancel->store(true, std::memory_order_relaxed);
+                async_state_->queued.reset();
+            }
+            candidates_.clear(); list_->Clear(); more_available_ = false;
+            searching_ = false; more_->Enable(false); update_accept();
+            status_->SetLabel("Current document changed; close and reopen this search.");
+            return;
+        }
         std::optional<AsyncResult> completed;
         {
             std::lock_guard lock(async_state_->mutex);
             completed = std::move(async_state_->completed);
             async_state_->completed.reset();
         }
-        if (completed && completed->generation == generation_)
+        if (completed && completed->generation == generation_ && source_current_ && !source_current_()) {
+            candidates_.clear(); list_->Clear(); more_available_ = false;
+            searching_ = false; more_->Enable(false); update_accept();
+            status_->SetLabel("Current document changed; close and reopen this search.");
+        } else if (completed && completed->generation == generation_)
             show_result(std::move(completed->search), completed->offset);
     }
     void load_preferences(const wxString &initial_query) {
@@ -381,9 +410,11 @@ private:
     bool background_search_ = false;
     bool allow_paging_ = false;
     bool more_available_ = false, searching_ = false;
+    bool source_invalidated_ = false;
     std::size_t page_offset_ = 0;
     static constexpr std::size_t page_size_ = 256;
     std::uint64_t generation_ = 0;
     std::shared_ptr<AsyncState> async_state_;
+    SourceCurrent source_current_;
 };
 } // namespace hexlab::desktop

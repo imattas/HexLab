@@ -730,6 +730,8 @@ public:
                             resume_failure = sys_error("PTRACE_CONT event thread after breakpoint rearm").message;
                             failed_trace = true;
                         } else if (!step.deferred_resumes.empty()) {
+                            if (step.report_step_after_deferred_resumes)
+                                displaced_user_step = true;
                             std::vector<pid_t> resumed;
                             for (const auto& [resume_tid, signal] : step.deferred_resumes) {
                                 if (ptrace(PTRACE_CONT, resume_tid, nullptr,
@@ -750,7 +752,8 @@ public:
                                 failed_trace = true;
                                 break;
                             }
-                            if (resume_failure.empty()) continue;
+                            if (resume_failure.empty() && !step.report_step_after_deferred_resumes)
+                                continue;
                         } else displaced_user_step = true;
                     } else displaced_user_step = trace_complete && resume_failure.empty() && internal_step_only;
                     if (!trace_complete && WIFSTOPPED(status)) {
@@ -846,7 +849,7 @@ public:
                         pending_breakpoint_.reset(); // the displaced instruction has already executed
                         // A real watchpoint still owns this stop even when
                         // rearming its simultaneous internal step failed.
-                        if (event.breakpoint_ids.empty()) {
+                        if (event.breakpoint_ids.empty() && !displaced_user_step) {
                             event.kind = EventKind::exception;
                             auto ip = instruction_pointer(tid);
                             if (ip) event.address = ip.value();
@@ -1020,10 +1023,21 @@ public:
                     if (owner_signal != 0 && owner_action->signal_disposition != ContinueStatus::handled)
                         return Error{ErrorCode::unsupported,
                             "cannot combine a Linux software-breakpoint step-over with delivery of the owner's pending signal"};
-                    // Keep peers stopped while the trap byte is displaced. The
-                    // owner's user-visible single-step event is delivered first;
-                    // the caller can then choose which peers to continue.
-                    auto stepped = begin_displaced_step(owner, false);
+                    // The shared trap byte must be rearmed before any peer can
+                    // run. After the owner completes its instruction, resume
+                    // requested peers, capture any racing peer stops, then
+                    // deliver the owner's step event first.
+                    std::vector<std::pair<pid_t, int>> deferred_resumes;
+                    deferred_resumes.reserve(runnable.size() - 1);
+                    for (const auto* action : runnable) {
+                        const auto tid = static_cast<pid_t>(action->thread);
+                        if (tid == owner) continue;
+                        const int queued = signal_for(*action);
+                        const int delivered = action->signal_disposition == ContinueStatus::handled ? 0 : queued;
+                        deferred_resumes.emplace_back(tid, delivered);
+                    }
+                    auto stepped = begin_displaced_step(owner, false, false,
+                                                        std::move(deferred_resumes), true);
                     if (!stepped) return stepped;
                     apply_stopped_signal_dispositions();
                     return std::monostate{};
@@ -1801,6 +1815,7 @@ private:
         bool continue_process;
         bool continue_thread = false;
         std::vector<std::pair<pid_t, int>> deferred_resumes;
+        bool report_step_after_deferred_resumes = false;
     };
     struct BreakpointRollback { pid_t thread; std::uint64_t address, instruction_pointer; };
     struct HardwareRecord { BreakpointId id; std::uint64_t address; BreakpointKind kind; std::uint8_t size; bool enabled = true; };
@@ -1957,7 +1972,8 @@ private:
         return ip.value() == bp->first || (bp->first != UINT64_MAX && ip.value() == bp->first + 1);
     }
     Status begin_displaced_step(pid_t tid, bool continue_process, bool continue_thread = false,
-                                std::vector<std::pair<pid_t, int>> deferred_resumes = {}) {
+                                std::vector<std::pair<pid_t, int>> deferred_resumes = {},
+                                bool report_step_after_deferred_resumes = false) {
         if (displaced_step_) return Error{ErrorCode::busy, "a displaced breakpoint instruction is already running"};
         auto stopped = stop_all_threads();
         if (!stopped) { resume_blocked_ = true; return stopped; }
@@ -1984,7 +2000,8 @@ private:
         if (!displaced) return restore(displaced.error());
         if (ptrace(PTRACE_SINGLESTEP, tid, nullptr, nullptr) != 0)
             return restore(sys_error("PTRACE_SINGLESTEP over software breakpoint"));
-        displaced_step_ = DisplacedStep{tid, address, continue_process, continue_thread, std::move(deferred_resumes)};
+        displaced_step_ = DisplacedStep{tid, address, continue_process, continue_thread,
+                                        std::move(deferred_resumes), report_step_after_deferred_resumes};
         breakpoint_rollback_.reset();
         stopped_.erase(tid);
         pending_breakpoint_.reset(); pending_.reset(); pending_signal_ = 0;

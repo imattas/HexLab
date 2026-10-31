@@ -49,6 +49,13 @@ struct X86EvexMaskCompareResult {
     bool operator==(const X86EvexMaskCompareResult &) const = default;
 };
 
+struct X86EvexFpClassResult {
+    std::uint64_t mask = 0;
+    std::uint16_t vector_bits = 0;
+    std::uint8_t active_bits = 0;
+    bool operator==(const X86EvexFpClassResult &) const = default;
+};
+
 struct X86EvexFloatCompareResult {
     std::uint64_t mask = 0;
     std::uint16_t vector_bits = 0;
@@ -1399,6 +1406,73 @@ inline std::optional<X86EvexMaskCompareResult> evaluate_x86_evex_mask_compare(
         case 7: match = true; break;
         }
         if (match) result.mask |= UINT64_C(1) << lane;
+    }
+    return result;
+}
+
+// VFPCLASS has no floating-point exceptions. MXCSR.DAZ controls whether
+// subnormal inputs are classified as signed zero; memory access and faults
+// remain the caller's responsibility. Masked-off lanes and high K bits clear.
+inline std::optional<X86EvexFpClassResult> evaluate_x86_evex_fpclass(
+    const Instruction &instruction, const std::array<std::byte, 64> &source,
+    std::uint64_t opmask_value = UINT64_MAX, std::uint32_t mxcsr = 0x1f80) noexcept {
+    using namespace x86_avx_detail;
+    if (instruction.context.architecture != Architecture::x86_64 ||
+        instruction.context.mode != ExecutionMode::x86_64 || !instruction.x86_evex ||
+        (instruction.opcode != Opcode::vfpclassps && instruction.opcode != Opcode::vfpclasspd) ||
+        (instruction.vector_bits != 128 && instruction.vector_bits != 256 && instruction.vector_bits != 512) ||
+        instruction.operands.size() != 3 || instruction.x86_opmask_zeroing || instruction.x86_evex_sae ||
+        (instruction.x86_opmask && (*instruction.x86_opmask == 0 || *instruction.x86_opmask >= 8)))
+        return std::nullopt;
+    const unsigned width = instruction.vector_bits;
+    const unsigned lane_bits = instruction.opcode == Opcode::vfpclassps ? 32 : 64;
+    const auto *destination = std::get_if<RegisterOperand>(&instruction.operands[0]);
+    const auto *memory = std::get_if<MemoryOperand>(&instruction.operands[1]);
+    const auto *classes = std::get_if<ImmediateOperand>(&instruction.operands[2]);
+    const bool source_vector = is_evex_vector(instruction.operands[1], width);
+    const bool source_memory = memory && memory->data_width ==
+        (instruction.x86_evex_broadcast ? lane_bits : width);
+    if (!destination || destination->bank != RegisterBank::opmask || destination->index >= 8 ||
+        destination->width != 64 || destination->high_byte ||
+        (!source_vector && !source_memory) || (instruction.x86_evex_broadcast && !memory) ||
+        !classes || classes->encoded_width != 8 || classes->effective_width != 8 || classes->is_signed ||
+        (instruction.vector_element_bits && instruction.vector_element_bits != lane_bits))
+        return std::nullopt;
+
+    const unsigned lanes = width / lane_bits;
+    const auto exponent_mask = lane_bits == 32 ? UINT64_C(0x7f800000) : UINT64_C(0x7ff0000000000000);
+    const auto fraction_mask = lane_bits == 32 ? UINT64_C(0x007fffff) : UINT64_C(0x000fffffffffffff);
+    const auto quiet_mask = lane_bits == 32 ? UINT64_C(0x00400000) : UINT64_C(0x0008000000000000);
+    const auto sign_mask = lane_bits == 32 ? UINT64_C(0x80000000) : UINT64_C(0x8000000000000000);
+    const bool daz = (mxcsr & (UINT32_C(1) << 6)) != 0;
+    X86EvexFpClassResult result{};
+    result.vector_bits = static_cast<std::uint16_t>(width);
+    result.active_bits = static_cast<std::uint8_t>(lanes);
+    for (unsigned lane = 0; lane < lanes; ++lane) {
+        if (instruction.x86_opmask && !(opmask_value & (UINT64_C(1) << lane))) continue;
+        const unsigned offset = instruction.x86_evex_broadcast ? 0 : lane * (lane_bits / 8);
+        auto bits = load_lane(source, offset, lane_bits);
+        const bool denormal = (bits & exponent_mask) == 0 && (bits & fraction_mask) != 0;
+        if (daz && denormal) bits &= sign_mask;
+        const bool negative = (bits & sign_mask) != 0;
+        const auto exponent = bits & exponent_mask;
+        const auto fraction = bits & fraction_mask;
+        const bool special = exponent == exponent_mask;
+        const bool nan = special && fraction != 0;
+        const bool signaling = nan && !(fraction & quiet_mask);
+        const bool zero = exponent == 0 && fraction == 0;
+        const bool infinity = special && fraction == 0;
+        const bool finite_nonzero = !special && !zero;
+        const bool matches =
+            (((classes->value >> 0) & 1) && nan && !signaling) ||
+            (((classes->value >> 1) & 1) && zero && !negative) ||
+            (((classes->value >> 2) & 1) && zero && negative) ||
+            (((classes->value >> 3) & 1) && infinity && !negative) ||
+            (((classes->value >> 4) & 1) && infinity && negative) ||
+            (((classes->value >> 5) & 1) && denormal && !daz) ||
+            (((classes->value >> 6) & 1) && finite_nonzero && negative) ||
+            (((classes->value >> 7) & 1) && signaling);
+        if (matches) result.mask |= UINT64_C(1) << lane;
     }
     return result;
 }

@@ -119,8 +119,11 @@ read/write effects before returning the low-width result, zero-extended to
 64 bits. KANDN computes `~src1 & src2`; KNOT complements its sole source.
 These instructions do not modify flags. The helper neither reads nor commits
 machine state; the caller remains responsible for sampling and writing K
-registers. KTEST/KORTEST decoding and flag semantics, CPU feature checks, and
-decompiler lifting remain unsupported.
+registers. VEX KTEST/KORTEST B/W/D/Q forms also decode as K0-K7 register-only
+operations and expose exact caller-driven CF/ZF results plus the written flag
+mask. Typed decompiler output preserves untouched RFLAGS bits and clears the
+architecturally undefined OF/SF/AF/PF bits. CPU feature checks and exception
+delivery remain outside the decoder and evaluator.
 
 VEX `KMOVB/W/D/Q` now covers K-register copies, K-to-memory stores,
 memory-to-K loads, and transfers between K registers and GPRs. The byte/word
@@ -237,6 +240,7 @@ families:
 | AVX2 lane routing and narrowing | VEX.128/.256 `vpunpcklbw/lwd/ldq/lqdq`, `vpunpckhbw/hwd/hdq/hqdq`, `vpacksswb/ssdw/uswb/usdw`, `vpshufb` |
 | AVX2 immediate dword shuffle | VEX.128/.256 `vpshufd`, with independent 128-bit-lane selectors |
 | AVX-512 packed compare to mask | EVEX.128/.256/.512 `vpcmpb/w/d/q` and `vpcmpub/uw/ud/uq`, with immediate predicates 0-7; floating `vcmpps/pd` supports broadcast memory input or register-source SAE |
+| AVX-512 floating classification to mask | EVEX.128/.256/.512 `vfpclassps/pd`, all eight immediate class selectors, optional `aaa` mask, and EVEX.b memory broadcast |
 | AVX-512 AND-NOT | EVEX.128/.256/.512 `vpandnd/q` with merge/zero masking and upper-ZMM clearing |
 | AVX-512 byte shuffle | EVEX.128/.256/.512 `vpshufb`, lane-local to each 128-bit group with merge/zero masking |
 | AVX-512 dword permutation | EVEX.128/.256/.512 `vpermd` with full-vector dword selectors, merge/zero masking, and upper-ZMM clearing |
@@ -493,6 +497,19 @@ of operating-system exceptions remain the caller's responsibility. Scalar VEX
 comparisons and packed floating arithmetic execution remain unsupported.
 The opcode forms and predicate width follow Intel SDM Vol. 2's `VCMPPS` and
 `VCMPPD` entries (same [manual](https://www.intel.com/content/dam/www/public/us/en/documents/manuals/64-ia-32-architectures-software-developers-manual.pdf)).
+
+EVEX `VFPCLASSPS/PD` is decoded for 128/256/512-bit vectors with K0-K7
+destinations, optional `aaa` execution mask, and EVEX.b 32-/64-bit memory
+broadcast. W selects the PS/PD source width; `vvvv/V'` must be reserved-zero
+and destination zeroing is rejected. Imm8 bits select qNaN, +0, -0, +infinity,
+-infinity, denormal, finite-negative, and sNaN classification, respectively.
+Masked-off lanes and result bits above the active lane count are zero. The
+typed decompiler yields a 64-bit K mask and retains source width, class mask,
+broadcast, DAZ control, and memory-read effect. The evaluator uses exact
+binary32/binary64 encodings; MXCSR.DAZ makes subnormals classify as signed zero.
+VFPCLASS raises no SIMD floating-point exceptions and writes no MXCSR state;
+memory faults and CPU feature enforcement remain the caller's responsibility.
+Malformed reserved fields and register-source EVEX.b forms fail closed.
 
 EVEX.512 packed integer wrapping add/sub now covers `VPADDB/W/D/Q` and
 `VPSUBB/W/D/Q` with ZMM register and 512-bit memory operands. K1-K7 masking is

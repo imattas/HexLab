@@ -3922,6 +3922,23 @@ struct MainFrame::Impl {
         // to the exact document view that produced its candidates.
         const auto source_document = shown;
         const auto source_project = source_document->project;
+        const auto source_generation = [&] {
+            std::lock_guard lock(active_document_bridge->mutex);
+            return active_document_bridge->active_id == source_document->id &&
+                   active_document_bridge->current == source_document
+                ? active_document_bridge->open_generation : std::uint64_t{};
+        }();
+        const auto source_current = [bridge = active_document_bridge, source_document, source_generation] {
+            if (!source_generation) return false;
+            std::lock_guard lock(bridge->mutex);
+            return bridge->active_id == source_document->id &&
+                   bridge->current == source_document &&
+                   bridge->open_generation == source_generation;
+        };
+        if (!source_generation) {
+            log("Jump canceled because the active document changed.");
+            return;
+        }
         const auto navigate_from_source = [&](Location destination) {
             const auto current = controller->state().current();
             const auto current_project = controller->documents().project(source_document->id);
@@ -4073,7 +4090,7 @@ struct MainFrame::Impl {
                         return candidate.name + " - " + location_text(candidate.location, source_document->image.get());
                     }, requested.length() == 1 ? NamedLocationSearchMode::exact : NamedLocationSearchMode::contains,
                     "Jump name suggestions", "Search this document's names, then choose a destination:",
-                    true, true, true);
+                    true, true, true, source_current);
                 if (chooser.ShowModal() == wxID_OK)
                     if (const auto selected = chooser.selected_candidate())
                         navigate_from_source(selected->location);

@@ -452,6 +452,8 @@ enum class Opcode {
     rv_vfsqrt_v, rv_vfclass_v,
     // EVEX packed floating compare-to-opmask forms; append to preserve IDs.
     vcmpps, vcmppd,
+    // EVEX floating-point classification to opmask; append for cache ID stability.
+    vfpclassps, vfpclasspd,
     // RVV reciprocal estimate intrinsics; append to preserve cached IDs.
     rv_vfrsqrt7_v, rv_vfrec7_v,
     // x86 wide memory compare-exchange; appended to retain persisted IDs.

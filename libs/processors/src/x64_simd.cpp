@@ -1578,6 +1578,48 @@ bool evex_simd(State &state, std::uint8_t opcode, unsigned map, unsigned pp, uns
         return true;
     }
 
+    if (map == 3 && opcode == 0x66) {
+        if (pp != 1)
+            invalid("EVEX VFPCLASSPS/VFPCLASSPD requires pp=66");
+        if (vvvv != 0)
+            invalid("EVEX VFPCLASS requires reserved vvvv/V' encoding");
+        if (zeroing)
+            invalid("EVEX VFPCLASS does not permit destination zeroing");
+        const auto lane_bits = static_cast<std::uint16_t>(w ? 64 : 32);
+        const bool memory_broadcast = broadcast;
+        auto decoded = modrm(state, static_cast<std::uint16_t>(memory_broadcast ? lane_bits : vector_bits), 64);
+        if (reg_high || decoded.reg.index >= 8)
+            invalid("EVEX VFPCLASS destination must encode K0-K7 without register extension");
+        Operand source = std::move(decoded.rm);
+        if (auto *reg = std::get_if<RegisterOperand>(&source)) {
+            if (memory_broadcast)
+                invalid("EVEX.b is only supported for VFPCLASS memory broadcast");
+            reg->bank = vector_bits == 128 ? RegisterBank::xmm :
+                        vector_bits == 256 ? RegisterBank::ymm : RegisterBank::zmm;
+            reg->width = static_cast<std::uint16_t>(vector_bits);
+            reg->high_byte = false;
+            if (rm_high) reg->index = static_cast<std::uint8_t>(reg->index + 16);
+        } else if (auto *memory = std::get_if<MemoryOperand>(&source)) {
+            memory->data_width = static_cast<std::uint16_t>(memory_broadcast ? lane_bits : vector_bits);
+            if (memory->displacement_encoding && memory->displacement_encoding->size == 1)
+                memory->displacement *= static_cast<std::int64_t>((memory_broadcast ? lane_bits : vector_bits) / 8);
+        }
+        state.i.opcode = w ? Opcode::vfpclasspd : Opcode::vfpclassps;
+        state.i.x86_evex = true;
+        state.i.x86_evex_broadcast = memory_broadcast;
+        state.i.vector_bits = static_cast<std::uint16_t>(vector_bits);
+        state.i.vector_element_bits = lane_bits;
+        if (mask) {
+            state.i.x86_opmask = static_cast<std::uint8_t>(mask);
+            state.i.register_reads.push_back({RegisterBank::opmask, static_cast<std::uint8_t>(mask), 64, false});
+        }
+        state.i.register_reads.push_back({RegisterBank::mxcsr, 0, 32, false});
+        state.operand(RegisterOperand{RegisterBank::opmask, decoded.reg.index, 64, false}, OperandAccess::write);
+        state.operand(std::move(source), OperandAccess::read);
+        state.operand(state.immediate(8, 8, false), OperandAccess::read);
+        return true;
+    }
+
     if (map == 3) {
         if (opcode != 0x1e && opcode != 0x1f && opcode != 0x3e && opcode != 0x3f)
             return false;
