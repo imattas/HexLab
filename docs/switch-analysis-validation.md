@@ -424,6 +424,19 @@ executable MIPS64 instructions. Guarded counts still use the exact
 prefix, up to 4096 entries. Other load/sign-extension sequences and
 cross-block dynamic values remain unsupported.
 
+The N64 recognizer also accepts signed byte offsets with the exact same-block
+sequence `LUI`/`ORI tableBase; DSLL scaledIndex, selector, 0; DADDU address,
+tableBase, scaledIndex; LB target, 0(address); DADDU target, codeBase, target;
+JR target`. Each one-byte slot is interpreted
+as a signed 8-bit displacement from a separately proven 64-bit code base.
+The table extent is bounded by the existing exact `SLTIU`/`BEQ` guard when
+present and otherwise by the verified 4096-entry prefix. The byte slots must
+be file-backed and relocation-free, and every result must decode as executable
+MIPS64 code. Relocation-covered `LUI`/`ORI`/`DADDIU` table-base operands are
+also rejected as unresolved inputs to this raw-byte pattern. CLI JSON reports
+`signed_byte_offset_from_target_base`. PIC/GOT bases, cross-block dynamic
+values, and other load/sign-extension sequences remain unsupported.
+
 MIPS32 O32 also recognizes a bounded signed-relative form:
 `LW target, tableBase, scaledIndex; ADDU target, codeBase, target; JR target`
 (the ADDU sources may be reversed). The scale is four, and the code base must

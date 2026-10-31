@@ -3015,7 +3015,7 @@ std::optional<SwitchSite> mips64_register_absolute_switch(
     // straight-line block:
     //   LUI/ORI tableBase; DSLL index, selector, 3; DADDU address, tableBase, index;
     //   LD target, 0(address); JR target.
-    // Relative tables use sign-extending LW or LH followed by
+    // Relative tables use sign-extending LW, LH, or LB followed by
     // DADDU target, codeBase, target; JR target.
     // The same register facts also accept DADDIU adjustments around the base.
     if (dispatch_index < 4 || dispatch_index >= facts.size() || stop.stop_requested() ||
@@ -3054,8 +3054,9 @@ std::optional<SwitchSite> mips64_register_absolute_switch(
     if (terminal_load_index >= facts.size() || !facts[terminal_load_index])
         return {};
     const auto &terminal_load = facts[terminal_load_index]->instruction;
+    const bool relative_byte_table = relative_table && terminal_load.opcode == Opcode::mips_lb;
     const bool relative_halfword_table = relative_table && terminal_load.opcode == Opcode::mips_lh;
-    const std::size_t relative_entry_bytes = relative_halfword_table ? 2 : 4;
+    const std::size_t relative_entry_bytes = relative_byte_table ? 1 : relative_halfword_table ? 2 : 4;
     const auto load_end = analysis_detail::continuation_address(terminal_load);
     const auto *loaded_register = terminal_load.operands.empty() ? nullptr : register_operand(terminal_load, 0);
     const auto expected_load_end = relative_table
@@ -3064,7 +3065,8 @@ std::optional<SwitchSite> mips64_register_absolute_switch(
     if (!load_end || !expected_load_end || load_end.value() != expected_load_end.value() ||
         terminal_load.context != dispatch.context ||
         terminal_load.opcode != (relative_table
-            ? (relative_halfword_table ? Opcode::mips_lh : Opcode::mips_lw) : Opcode::mips64_ld) ||
+            ? (relative_byte_table ? Opcode::mips_lb : relative_halfword_table ? Opcode::mips_lh : Opcode::mips_lw)
+            : Opcode::mips64_ld) ||
         terminal_load.flow != FlowKind::fallthrough ||
         !loaded_register || !same_register(loaded_register, target_register))
         return {};
@@ -3167,6 +3169,11 @@ std::optional<SwitchSite> mips64_register_absolute_switch(
             return {};
 
         const auto *destination = instruction.operands.empty() ? nullptr : register_operand(instruction, 0);
+        const auto relocation_free_immediate = [&](std::uint32_t operand_index) {
+            if (!relocations) return true;
+            const auto evidence = relocations->operand(instruction, operand_index, stop);
+            return evidence && !evidence.value().relocated();
+        };
         const auto erase_written = [&] {
             for (const auto &written : instruction.register_writes)
                 if (written.bank == RegisterBank::mips_gpr && written.index != 0)
@@ -3175,7 +3182,8 @@ std::optional<SwitchSite> mips64_register_absolute_switch(
         if (instruction.opcode == Opcode::mips_lui && instruction.operands.size() == 2 && destination &&
             destination->bank == RegisterBank::mips_gpr && destination->width == 64 && destination->index != 0) {
             const auto *immediate = std::get_if<ImmediateOperand>(&instruction.operands[1]);
-            if (!immediate || immediate->effective_width != 16 || immediate->value > 0xffff) {
+            if (!immediate || !relocation_free_immediate(1) || immediate->effective_width != 16 ||
+                immediate->value > 0xffff) {
                 erase_written();
                 continue;
             }
@@ -3192,7 +3200,8 @@ std::optional<SwitchSite> mips64_register_absolute_switch(
             std::optional<Value> value;
             if (destination->bank == RegisterBank::mips_gpr && destination->width == 64 && destination->index != 0 &&
                 source && source->bank == RegisterBank::mips_gpr && source->width == 64 && immediate &&
-                immediate->encoded_width == 16 && immediate->effective_width == 64 && !immediate->is_signed &&
+                relocation_free_immediate(2) && immediate->encoded_width == 16 &&
+                immediate->effective_width == 64 && !immediate->is_signed &&
                 immediate->value <= 0xffff) {
                 std::optional<Value> base;
                 if (source->index == 0) base = Value{Address{dispatch.address.space, 0}};
@@ -3211,7 +3220,7 @@ std::optional<SwitchSite> mips64_register_absolute_switch(
             std::optional<Value> value;
             if (destination->bank == RegisterBank::mips_gpr && destination->width == 64 && destination->index != 0 &&
                 source && source->bank == RegisterBank::mips_gpr && source->width == 64 && immediate &&
-                immediate->effective_width == 64 && immediate->is_signed) {
+                relocation_free_immediate(2) && immediate->effective_width == 64 && immediate->is_signed) {
                 std::optional<Value> base;
                 if (source->index == 0) base = Value{Address{dispatch.address.space, 0}};
                 else if (const auto found = registers.find(source->index); found != registers.end())
@@ -3294,13 +3303,13 @@ std::optional<SwitchSite> mips64_register_absolute_switch(
             continue;
         }
         if ((instruction.opcode == Opcode::mips64_ld ||
-             (relative_table && (instruction.opcode == Opcode::mips_lw ||
+             (relative_table && (instruction.opcode == Opcode::mips_lb || instruction.opcode == Opcode::mips_lw ||
                                  instruction.opcode == Opcode::mips_lh))) &&
             instruction.operands.size() == 2 && destination) {
             const auto *memory = std::get_if<MemoryOperand>(&instruction.operands[1]);
             std::optional<Value> value;
             const auto entry_width = instruction.opcode == Opcode::mips64_ld ? 64u
-                : instruction.opcode == Opcode::mips_lh ? 16u : 32u;
+                : instruction.opcode == Opcode::mips_lb ? 8u : instruction.opcode == Opcode::mips_lh ? 16u : 32u;
             if (destination->bank == RegisterBank::mips_gpr && destination->width == 64 && destination->index != 0 &&
                 memory && memory->data_width == entry_width && memory->address_width == 64 && memory->base &&
                 memory->base->bank == RegisterBank::mips_gpr && memory->base->width == 64 &&
@@ -3345,8 +3354,8 @@ std::optional<SwitchSite> mips64_register_absolute_switch(
     site.selector = *found->second.selector;
     site.scale = static_cast<std::uint8_t>(relative_table ? relative_entry_bytes : 8);
     if (relative_table) {
-        site.entry_encoding = relative_halfword_table
-            ? SwitchEntryEncoding::signed_halfword_offset_from_target_base
+        site.entry_encoding = relative_byte_table ? SwitchEntryEncoding::signed_byte_offset_from_target_base
+            : relative_halfword_table ? SwitchEntryEncoding::signed_halfword_offset_from_target_base
             : SwitchEntryEncoding::signed_offset_from_target_base;
         site.target_base = relative_base;
     }
@@ -3379,7 +3388,9 @@ std::optional<SwitchSite> mips64_register_absolute_switch(
         if (!target || !decodes_at(image, dispatch.context, target->address, stop)) {
             site.complete = false;
             if (relative_table)
-                site.incomplete_reason = relative_halfword_table
+                site.incomplete_reason = relative_byte_table
+                    ? "MIPS64 signed byte-relative entry could not be resolved to executable code"
+                    : relative_halfword_table
                     ? "MIPS64 signed halfword-relative entry could not be resolved to executable code"
                     : "MIPS64 signed-relative entry could not be resolved to executable code";
             break;

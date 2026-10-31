@@ -31,7 +31,8 @@ enum class SwitchEntryEncoding {
     signed_halfword_offset_from_target_base,
     // Targets and keys came from a validated decoded switch payload rather
     // than entries interpreted by this table scanner.
-    decoded_metadata
+    decoded_metadata,
+    signed_byte_offset_from_target_base
 };
 
 struct SwitchSite {
