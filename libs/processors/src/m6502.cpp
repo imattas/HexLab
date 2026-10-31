@@ -60,20 +60,53 @@ static DecodeResult decode_m6502_impl(std::span<const std::byte> bytes, Address 
         i.length = static_cast<std::uint8_t>(length);
         std::copy_n(bytes.begin(), length, i.bytes.begin());
         const auto base_cycles = documented_cycles[op];
-        if (!cmos && base_cycles) {
+        if (base_cycles || cmos) {
             M6502Timing timing;
             timing.base_cycles = base_cycles;
+            if (cmos) {
+                // W65C02S differs from the NMOS base table for indirect JMP,
+                // absolute-X read/modify/write, and its extension opcodes.
+                if (op == 0x6c) timing.base_cycles = 6;
+                if (op == 0x1e || op == 0x3e || op == 0x5e || op == 0x7e || op == 0xde || op == 0xfe)
+                    timing.base_cycles = 6;
+                if (op == 0x12 || op == 0x32 || op == 0x52 || op == 0x72 ||
+                    op == 0x92 || op == 0xb2 || op == 0xd2 || op == 0xf2)
+                    timing.base_cycles = 5; // (zp) ALU/load/store forms.
+                else if (op == 0x80) timing.base_cycles = 3; // BRA includes its taken cycle.
+                else if (op == 0x64) timing.base_cycles = 3;
+                else if (op == 0x74) timing.base_cycles = 4;
+                else if (op == 0x9c) timing.base_cycles = 4;
+                else if (op == 0x9e) timing.base_cycles = 5;
+                else if (op == 0x04 || op == 0x14) timing.base_cycles = 5; // TSB/TRB zp.
+                else if (op == 0x0c || op == 0x1c) timing.base_cycles = 6; // TSB/TRB abs.
+                else if (op == 0x89) timing.base_cycles = 2;
+                else if (op == 0x34 || op == 0x3c) timing.base_cycles = 4;
+                else if (op == 0x1a || op == 0x3a) timing.base_cycles = 2;
+                else if (op == 0x5a || op == 0xda) timing.base_cycles = 3; // PHX/PHY.
+                else if (op == 0x7a || op == 0xfa) timing.base_cycles = 4; // PLX/PLY.
+                else if ((op & 0x0f) == 0x07) timing.base_cycles = 5; // RMB/SMB.
+                else if ((op & 0x0f) == 0x0f) timing.base_cycles = 5; // BBR/BBS.
+                else if (op == 0xcb || op == 0xdb) timing.base_cycles = 3; // WAI/STP.
+                else if (op == 0x7c) timing.base_cycles = 6; // JMP (abs,X).
+            }
             if (i.flow == FlowKind::conditional_branch) {
                 timing.branch_taken_penalty = true;
                 timing.branch_page_cross_penalty = true;
+            } else if (cmos && (op == 0x80 || (op & 0x0f) == 0x0f)) {
+                // BRA is always taken (already included in its base); BBR/BBS
+                // take one additional cycle and may take another across pages.
+                timing.branch_page_cross_penalty = true;
+                if ((op & 0x0f) == 0x0f) timing.branch_taken_penalty = true;
             } else if (i.memory_read && !i.memory_write) {
                 const auto *operand = i.operands.empty() ? nullptr : std::get_if<MemoryOperand>(&i.operands.front());
                 // The absolute indexed forms have a three-byte encoding. The
                 // (zp),Y family has its own low-nibble encoding and a two-byte
                 // instruction; both gain one read cycle only across a page.
-                timing.page_cross_penalty = (operand && operand->index && length == 3) ||
+                timing.page_cross_penalty = (operand && operand->index && length == 3 && op != 0x7c) ||
                                             ((op & 0x1f) == 0x11);
             }
+            timing.decimal_mode_penalty = cmos &&
+                (i.opcode == Opcode::m6502_adc || i.opcode == Opcode::m6502_sbc);
             i.m6502_timing = timing;
         }
         return {DecodeStatus::decoded, std::move(i), {}};
