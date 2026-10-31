@@ -1321,7 +1321,7 @@ evaluate_riscv_vector_integer_operation(RiscvOpcode opcode, const RiscvVectorInt
 
     const bool widening_reduction = opcode == RiscvOpcode::vwredsum || opcode == RiscvOpcode::vwredsumu;
     if (widening_reduction && (sew == 64 || config.lmul_log2 > 2))
-        return {}; // 128-bit results or an LMUL>8 destination group are unsupported.
+        return {}; // 128-bit results or an LMUL>4 source group are unsupported.
     bool reduction = true;
     switch (opcode) {
     case RiscvOpcode::vredsum: case RiscvOpcode::vredand: case RiscvOpcode::vredor:
