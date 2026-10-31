@@ -155,6 +155,9 @@ struct MinidumpRegister {
     // value is meaningful only for registers of at most 64 bits.
     std::vector<std::byte> bytes;
     FileOffset file_offset{};
+    // Exact source location for each byte when the register is assembled from
+    // multiple captured spans. Empty for legacy records with only file_offset.
+    std::vector<FileOffset> byte_file_offsets;
     bool operator==(const MinidumpRegister &) const = default;
 };
 enum class MinidumpContextStatus : std::uint8_t {
