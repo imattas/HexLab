@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <map>
 #include <set>
+#include <string_view>
 
 namespace hexlab {
 Result<std::vector<ElfLibraryResolution>> resolve_elf_needed_libraries(
@@ -83,5 +84,172 @@ Result<std::vector<ElfLibraryResolution>> resolve_elf_needed_libraries(
     } catch (const std::bad_alloc &) {
         return Error{ErrorCode::resource_limit, "Cannot allocate bounded ELF dependency-resolution data"};
     }
+}
+
+namespace {
+Result<std::string> normalize_elf_path(std::string_view input, std::size_t limit, bool require_absolute) {
+    if (input.empty() || input.size() > limit)
+        return Error{input.empty() ? ErrorCode::malformed : ErrorCode::resource_limit,
+                     "ELF search path is empty or exceeds path-byte limit"};
+    if (input.find('\\') != std::string_view::npos || input.find('\0') != std::string_view::npos)
+        return Error{ErrorCode::malformed, "ELF search path contains an invalid path separator or NUL"};
+    const bool absolute = input.front() == '/';
+    if (require_absolute && !absolute)
+        return Error{ErrorCode::invalid_argument, "ELF importer and manifest paths must be absolute"};
+    std::vector<std::string_view> components;
+    std::size_t at = 0;
+    while (at <= input.size()) {
+        const auto end = input.find('/', at);
+        const auto part = input.substr(at, end == std::string_view::npos ? input.size() - at : end - at);
+        if (!part.empty() && part != ".") {
+            if (part == "..") {
+                if (components.empty()) {
+                    if (!absolute)
+                        components.push_back(part);
+                } else if (components.back() == "..") {
+                    if (!absolute) components.push_back(part);
+                } else {
+                    components.pop_back();
+                }
+            } else {
+                components.push_back(part);
+            }
+        }
+        if (end == std::string_view::npos) break;
+        at = end + 1;
+    }
+    std::string result = absolute ? "/" : "";
+    for (const auto part : components) {
+        if (!result.empty() && result.back() != '/') result.push_back('/');
+        result.append(part);
+        if (result.size() > limit)
+            return Error{ErrorCode::resource_limit, "Normalized ELF search path exceeds path-byte limit"};
+    }
+    if (result.empty()) result = ".";
+    return result;
+}
+
+Result<std::vector<std::string>> elf_search_directories(std::string_view value,
+                                                         std::string_view origin,
+                                                         const ElfLibrarySearchContext &context) {
+    std::vector<std::string> result;
+    if (value.size() > context.max_path_bytes)
+        return Error{ErrorCode::resource_limit, "ELF dynamic search path exceeds path-byte limit"};
+    std::size_t at = 0;
+    while (at <= value.size()) {
+        if (result.size() == context.max_search_entries)
+            return Error{ErrorCode::resource_limit, "ELF dynamic search path exceeds entry limit"};
+        const auto end = value.find(':', at);
+        const auto element = value.substr(at, end == std::string_view::npos ? value.size() - at : end - at);
+        if (element.empty())
+            return Error{ErrorCode::malformed, "Empty ELF search-path element is unsupported"};
+        std::string expanded;
+        for (std::size_t i = 0; i < element.size();) {
+            if (element[i] != '$') {
+                expanded.push_back(element[i++]);
+            } else if (element.substr(i, 7) == "$ORIGIN" &&
+                       (i + 7 == element.size() || element[i + 7] == '/')) {
+                expanded.append(origin);
+                i += 7;
+            } else if (element.substr(i, 9) == "${ORIGIN}" &&
+                       (i + 9 == element.size() || element[i + 9] == '/')) {
+                expanded.append(origin);
+                i += 9;
+            } else {
+                return Error{ErrorCode::malformed, "Unsupported or malformed ELF search-path token"};
+            }
+            if (expanded.size() > context.max_path_bytes)
+                return Error{ErrorCode::resource_limit, "Expanded ELF search path exceeds path-byte limit"};
+        }
+        auto normalized = normalize_elf_path(expanded, context.max_path_bytes, true);
+        if (!normalized) return normalized.error();
+        result.push_back(std::move(normalized.value()));
+        if (end == std::string_view::npos) break;
+        at = end + 1;
+    }
+    return result;
+}
+} // namespace
+
+Result<std::vector<ElfLibraryResolution>> resolve_elf_needed_libraries(
+    const LoadedImage &loaded, std::span<const ElfLibraryManifestEntry> manifest,
+    const ElfLibrarySearchContext &context, std::stop_token stop, ElfLibraryResolutionLimits limits) {
+    if (context.max_search_entries == 0 || context.max_path_bytes == 0)
+        return Error{ErrorCode::invalid_argument, "ELF search-path limits must be positive"};
+    auto base = resolve_elf_needed_libraries(loaded, manifest, stop, limits);
+    if (!base) return base.error();
+    if (!loaded.metadata.elf)
+        return Error{ErrorCode::invalid_argument, "Dependency resolution requires ELF metadata"};
+
+    std::optional<std::string> rpath, runpath;
+    bool has_rpath = false, has_runpath = false;
+    for (const auto &table : loaded.metadata.elf->dynamic_tables) {
+        for (const auto &entry : table.entries) {
+            if (stop.stop_requested()) return Error{ErrorCode::canceled, "ELF dependency resolution canceled"};
+            if (entry.tag != 15 && entry.tag != 29) continue;
+            auto &present = entry.tag == 29 ? has_runpath : has_rpath;
+            auto &value = entry.tag == 29 ? runpath : rpath;
+            if (present)
+                return Error{ErrorCode::malformed, "Multiple ELF RPATH/RUNPATH entries are unsupported"};
+            if (!entry.string_value)
+                return Error{ErrorCode::malformed, "ELF RPATH/RUNPATH has no validated string"};
+            present = true;
+            value = *entry.string_value;
+        }
+    }
+    if (!has_rpath && !has_runpath)
+        return base; // No encoded search policy: retain exact-name manifest behavior.
+
+    auto importer = normalize_elf_path(context.importer_path, context.max_path_bytes, true);
+    if (!importer) return importer.error();
+    const auto slash = importer.value().find_last_of('/');
+    const auto origin = slash == 0 ? std::string("/") : importer.value().substr(0, slash);
+    const auto &selected = has_runpath ? *runpath : *rpath;
+    auto directories = elf_search_directories(selected, origin, context);
+    if (!directories) return directories.error();
+    const auto source = has_runpath ? ElfLibrarySearchSource::runpath : ElfLibrarySearchSource::rpath;
+
+    std::vector<std::optional<std::string>> candidate_paths;
+    candidate_paths.reserve(manifest.size());
+    for (const auto &entry : manifest) {
+        if (!entry.path) {
+            candidate_paths.emplace_back();
+            continue;
+        }
+        auto normalized = normalize_elf_path(*entry.path, context.max_path_bytes, true);
+        if (!normalized) return normalized.error();
+        candidate_paths.emplace_back(std::move(normalized.value()));
+    }
+
+    for (auto &resolution : base.value()) {
+        if (stop.stop_requested()) return Error{ErrorCode::canceled, "ELF dependency resolution canceled"};
+        const auto original = resolution.candidates;
+        resolution.state = ElfLibraryResolutionState::missing;
+        resolution.manifest_index.reset();
+        resolution.candidates.clear();
+        resolution.source = source;
+        for (const auto &directory : directories.value()) {
+            std::vector<std::size_t> matches;
+            for (const auto index : original) {
+                if (stop.stop_requested()) return Error{ErrorCode::canceled, "ELF dependency resolution canceled"};
+                if (!candidate_paths[index]) continue;
+                const auto candidate_slash = candidate_paths[index]->find_last_of('/');
+                const auto candidate_directory = candidate_slash == 0 ? std::string("/") : candidate_paths[index]->substr(0, candidate_slash);
+                if (candidate_directory == directory) matches.push_back(index);
+            }
+            if (!matches.empty()) {
+                resolution.matched_directory = directory;
+                resolution.candidates = std::move(matches);
+                if (resolution.candidates.size() == 1) {
+                    resolution.state = ElfLibraryResolutionState::resolved;
+                    resolution.manifest_index = resolution.candidates.front();
+                } else {
+                    resolution.state = ElfLibraryResolutionState::ambiguous;
+                }
+                break;
+            }
+        }
+    }
+    return std::move(base.value());
 }
 } // namespace hexlab
