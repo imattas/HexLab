@@ -104,6 +104,56 @@ ExpressionPtr ppc_fpscr_record_cr1(ExpressionPtr fpscr) {
     // is not statically known.
     return unary("ppc_fpscr_cr1", std::move(fpscr), 4);
 }
+ExpressionPtr ppc_fpscr_flag(ExpressionPtr fpscr, std::uint32_t mask) {
+    return predicate("ne", binary("and", std::move(fpscr), constant(mask, 32), 32), constant(0, 32));
+}
+ExpressionPtr ppc_bool_or(ExpressionPtr left, ExpressionPtr right) {
+    return predicate("bool_or", std::move(left), std::move(right));
+}
+ExpressionPtr ppc_fpscr_vx(ExpressionPtr fpscr) {
+    constexpr std::uint32_t invalid_mask = (1u << 24) | (1u << 23) | (1u << 22) |
+        (1u << 21) | (1u << 20) | (1u << 19) | (1u << 10) | (1u << 9) | (1u << 8);
+    return ppc_fpscr_flag(std::move(fpscr), invalid_mask);
+}
+ExpressionPtr ppc_fpscr_fex(ExpressionPtr fpscr) {
+    constexpr std::uint32_t ox = 1u << 28, ux = 1u << 27, zx = 1u << 26, xx = 1u << 25;
+    constexpr std::uint32_t ve = 1u << 7, oe = 1u << 6, ue = 1u << 5, ze = 1u << 4, xe = 1u << 3;
+    const auto invalid = ppc_fpscr_vx(fpscr);
+    auto enabled_invalid = predicate("bool_and", std::move(invalid), ppc_fpscr_flag(fpscr, ve));
+    auto enabled_overflow = predicate("bool_and", ppc_fpscr_flag(fpscr, ox), ppc_fpscr_flag(fpscr, oe));
+    auto enabled_underflow = predicate("bool_and", ppc_fpscr_flag(fpscr, ux), ppc_fpscr_flag(fpscr, ue));
+    auto enabled_zero_divide = predicate("bool_and", ppc_fpscr_flag(fpscr, zx), ppc_fpscr_flag(fpscr, ze));
+    auto enabled_inexact = predicate("bool_and", ppc_fpscr_flag(fpscr, xx), ppc_fpscr_flag(fpscr, xe));
+    return ppc_bool_or(std::move(enabled_invalid),
+        ppc_bool_or(std::move(enabled_overflow), ppc_bool_or(std::move(enabled_underflow),
+            ppc_bool_or(std::move(enabled_zero_divide), std::move(enabled_inexact)))));
+}
+std::uint32_t ppc_mcrfs_exception_mask(unsigned field) {
+    // FPSCR fields are numbered from the most-significant nibble. mcrfs clears
+    // exception bits copied to the CR, not unrelated result/control bits.
+    switch (field) {
+    case 0: return 1u << 28; // OX; FX is cleared separately when it is copied.
+    case 1: return 0x0f000000u; // UX, ZX, XX, VXSNAN.
+    case 2: return 0x00f00000u; // VXISI, VXIDI, VXZDZ, VXIMZ.
+    case 3: return 0x00080000u; // VXVC; FR, FI, and FPRF are retained.
+    case 4: return 0;
+    case 5: return 0x00000700u; // VXSOFT, VXSQRT, VXCVI; reserved bit retained.
+    case 6: return 0;
+    case 7: return 0;
+    default: return UINT32_MAX;
+    }
+}
+ExpressionPtr ppc_fpscr_after_mcrfs(ExpressionPtr fpscr, unsigned field) {
+    auto clear_mask = ppc_mcrfs_exception_mask(field);
+    if (field == 0) clear_mask |= 1u << 31; // FX is cleared when its field is copied.
+    auto cleared = binary("and", fpscr, constant(UINT32_MAX ^ clear_mask, 32), 32);
+    // FEX and VX are derived summary bits. Recompute them after clearing the
+    // selected exception bits instead of treating them as directly writable.
+    auto base = binary("and", cleared, constant(UINT32_MAX ^ ((1u << 30) | (1u << 29)), 32), 32);
+    auto fex = binary("shl", unary("zext", ppc_fpscr_fex(cleared), 32), constant(30, 32), 32);
+    auto vx = binary("shl", unary("zext", ppc_fpscr_vx(cleared), 32), constant(29, 32), 32);
+    return binary("or", binary("or", std::move(base), std::move(fex), 32), std::move(vx), 32);
+}
 ExpressionPtr ppc_record_cr0(ExpressionPtr result, std::uint16_t bits) {
     const auto zero = constant(0, bits);
     auto lt = predicate("slt", result, zero);
@@ -476,6 +526,24 @@ std::optional<Statement> lift_ppc_instruction(const Instruction &i, std::vector<
             std::make_shared<Expression>(Expression{floating(64), UnknownValue{"ppc_mffs_fpr_encoding"}})};
         if (writes_record) outputs.push_back(ppc_fpscr_record_cr1(reg(status)));
         return effect_with_outputs(i, "ppc_mffs", std::move(outputs));
+    }
+    if (i.opcode == Opcode::ppc_mcrfs && ops.size() == 2) {
+        const auto *destination = std::get_if<R>(&ops[0]);
+        const auto *source = std::get_if<ImmediateOperand>(&ops[1]);
+        const R status{RegisterBank::ppc_fpscr, 0, 32, false};
+        if (!destination || destination->bank != RegisterBank::ppc_cr || destination->width != 4 ||
+            destination->index >= 8 || !source || source->encoded_width != 3 ||
+            source->effective_width != 3 || source->is_signed || source->value >= 8 ||
+            i.access != std::vector<OperandAccess>{OperandAccess::write, OperandAccess::read} ||
+            i.register_reads != std::vector<R>{status} ||
+            i.register_writes != std::vector<R>{*destination, status})
+            return effect(i, "ppc_malformed_mcrfs");
+        const auto shift = static_cast<std::uint32_t>((7 - source->value) * 4);
+        auto field = binary("and", binary("shr", reg(status), constant(shift, 32), 32),
+                            constant(0xf, 32), 32);
+        auto cr_value = unary("trunc", std::move(field), 4);
+        auto next_status = ppc_fpscr_after_mcrfs(reg(status), static_cast<unsigned>(source->value));
+        return effect_with_outputs(i, "ppc_mcrfs", {std::move(cr_value), std::move(next_status)});
     }
     if ((i.opcode == Opcode::ppc_mtfsb0 || i.opcode == Opcode::ppc_mtfsb1 ||
          i.opcode == Opcode::ppc_mtfsfi || i.opcode == Opcode::ppc_mtfsf) && !ops.empty()) {

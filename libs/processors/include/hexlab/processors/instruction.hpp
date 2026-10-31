@@ -687,7 +687,8 @@ enum class Opcode {
     // RVV widening floating-point reductions; append for stable IDs.
     rv_vfwredusum, rv_vfwredosum,
     // PowerPC FPSCR transfer/control forms; append to preserve serialized IDs.
-    ppc_mffs, ppc_mtfsb0, ppc_mtfsb1, ppc_mtfsfi, ppc_mtfsf
+    ppc_mffs, ppc_mtfsb0, ppc_mtfsb1, ppc_mtfsfi, ppc_mtfsf,
+    ppc_mcrfs
 };
 enum class OperandAccess { read, write, read_write, address };
 // The encoded x86 group-one repeat prefix is retained separately from the

@@ -692,6 +692,17 @@ DecodeResult decode_powerpc(DecodeContext context, std::span<const std::byte> by
         } else {
             return fail(DecodeStatus::unsupported, "PowerPC opcode-31 X-form is outside the enabled integer subset");
         }
+    } else if (op == 63 && ((w >> 1) & 0x3ff) == 64) { // mcrfs BF,BFA
+        const auto destination_field = (rt >> 2) & 7;
+        const auto source_field = (ra >> 2) & 7;
+        if (rc || (rt & 3) != 0 || (ra & 3) != 0 || rb != 0)
+            return fail(DecodeStatus::invalid, "PowerPC MCRFS has nonzero reserved fields");
+        const auto destination = cr(destination_field);
+        i.opcode = Opcode::ppc_mcrfs;
+        i.operands = {destination, ImmediateOperand{source_field, 3, 3, false, {}}};
+        i.access = {OperandAccess::write, OperandAccess::read};
+        i.register_reads = {fpscr()};
+        i.register_writes = {destination, fpscr()};
     } else if (op == 63 && (((w >> 1) & 0x3ff) == 583 ||
                             ((w >> 1) & 0x3ff) == 70 ||
                             ((w >> 1) & 0x3ff) == 38 ||
