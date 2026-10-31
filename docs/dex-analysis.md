@@ -148,6 +148,12 @@ dynamic call-site resolution are not performed. These records are available
 through the public loaded-image metadata model; there is no separate database
 serializer for DEX metadata, so project reopen reparses the source through its
 loader recipe rather than restoring these records from a metadata blob.
+The CLI's DEX inspection output also previews dynamic linkage: up to 128
+method-handle rows and 128 call-site rows show handle kinds, local target/name
+indices, and bounded trailing bootstrap arguments. At most 512 encoded argument
+nodes are printed across the whole call-site preview; omitted table rows and
+argument values are reported. This preview does not resolve external targets
+or execute bootstrap methods.
 The interpreter validates register, string, type, and code-address references,
 requires an `end_sequence`, and caps each program at two million opcodes and
 the aggregate retained debug metadata at two million rows/64 MiB. Multi-member

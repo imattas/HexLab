@@ -280,6 +280,29 @@ std::optional<SimdSplatOpInfo> simd_splat_op(std::uint32_t subopcode) {
     default: return {};
     }
 }
+struct SimdIntegerUnaryInfo { std::string_view name; ValueType result_type; };
+std::optional<SimdIntegerUnaryInfo> simd_integer_unary(std::uint32_t subopcode) {
+    switch (subopcode) {
+    case 0x60: return SimdIntegerUnaryInfo{"wasm_i8x16_abs", vector(128)};
+    case 0x61: return SimdIntegerUnaryInfo{"wasm_i8x16_neg", vector(128)};
+    case 0x62: return SimdIntegerUnaryInfo{"wasm_i8x16_popcnt", vector(128)};
+    case 0x63: return SimdIntegerUnaryInfo{"wasm_i8x16_all_true", integer(32)};
+    case 0x64: return SimdIntegerUnaryInfo{"wasm_i8x16_bitmask", integer(32)};
+    case 0x80: return SimdIntegerUnaryInfo{"wasm_i16x8_abs", vector(128)};
+    case 0x81: return SimdIntegerUnaryInfo{"wasm_i16x8_neg", vector(128)};
+    case 0x83: return SimdIntegerUnaryInfo{"wasm_i16x8_all_true", integer(32)};
+    case 0x84: return SimdIntegerUnaryInfo{"wasm_i16x8_bitmask", integer(32)};
+    case 0xa0: return SimdIntegerUnaryInfo{"wasm_i32x4_abs", vector(128)};
+    case 0xa1: return SimdIntegerUnaryInfo{"wasm_i32x4_neg", vector(128)};
+    case 0xa3: return SimdIntegerUnaryInfo{"wasm_i32x4_all_true", integer(32)};
+    case 0xa4: return SimdIntegerUnaryInfo{"wasm_i32x4_bitmask", integer(32)};
+    case 0xc0: return SimdIntegerUnaryInfo{"wasm_i64x2_abs", vector(128)};
+    case 0xc1: return SimdIntegerUnaryInfo{"wasm_i64x2_neg", vector(128)};
+    case 0xc3: return SimdIntegerUnaryInfo{"wasm_i64x2_all_true", integer(32)};
+    case 0xc4: return SimdIntegerUnaryInfo{"wasm_i64x2_bitmask", integer(32)};
+    default: return {};
+    }
+}
 std::optional<SimdLaneOpInfo> simd_lane_op(std::uint32_t subopcode) {
     const auto i32 = integer(32), i64 = integer(64), f32 = floating(32), f64 = floating(64);
     switch (subopcode) {
@@ -824,6 +847,41 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
             }
             if (op == 0xfd) {
                 const auto subopcode = simd_subopcode(code[n]->instruction);
+                if (subopcode && *subopcode == 13) {
+                    // wasm.cpp decodes each of the sixteen shuffle bytes as
+                    // an 8-bit unsigned immediate and rejects values >= 32.
+                    // Recheck the shape here so malformed synthetic
+                    // Instruction records fail closed before lifting.
+                    const auto &instruction = code[n]->instruction;
+                    if (instruction.operands.size() != 16)
+                        return unsupported("SIMD shuffle requires exactly sixteen lane selectors");
+                    for (std::size_t lane = 0; lane < instruction.operands.size(); ++lane) {
+                        const auto selected = immediate(instruction, lane);
+                        if (!selected || *selected >= 32)
+                            return unsupported("SIMD shuffle selector is missing or outside the two input vectors");
+                    }
+                    auto second = shape_pop(stack, vector(128));
+                    auto first = shape_pop(stack, vector(128));
+                    if (!second) return second.error();
+                    if (!first) return first.error();
+                    stack.push_back(vector(128));
+                    continue;
+                }
+                if (subopcode && *subopcode == 14) {
+                    auto indices = shape_pop(stack, vector(128));
+                    auto source = shape_pop(stack, vector(128));
+                    if (!indices) return indices.error();
+                    if (!source) return source.error();
+                    stack.push_back(vector(128));
+                    continue;
+                }
+                const auto integer_unary = subopcode ? simd_integer_unary(*subopcode) : std::optional<SimdIntegerUnaryInfo>{};
+                if (integer_unary) {
+                    auto value = shape_pop(stack, vector(128));
+                    if (!value) return value.error();
+                    stack.push_back(integer_unary->result_type);
+                    continue;
+                }
                 const auto splat = subopcode ? simd_splat_op(*subopcode) : std::optional<SimdSplatOpInfo>{};
                 if (splat) {
                     auto scalar = shape_pop(stack, splat->scalar_type);
@@ -1618,6 +1676,44 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
             }
             if (op == 0xfd) {
                 const auto subopcode = simd_subopcode(i);
+                const auto integer_unary = subopcode ? simd_integer_unary(*subopcode) : std::optional<SimdIntegerUnaryInfo>{};
+                if (integer_unary) {
+                    auto value = pop(vector(128));
+                    if (!value) return value.error();
+                    stack.push_back(unary(std::string(integer_unary->name), value.value(), integer_unary->result_type));
+                    continue;
+                }
+                if (subopcode && *subopcode == 13) {
+                    // The shuffle selector is an instruction immediate, not a
+                    // runtime vector. Keep its complete validated byte-lane
+                    // map in the operation name so the typed binary IR stays
+                    // deterministic without inventing a third expression
+                    // operand or dropping lane provenance.
+                    if (i.operands.size() != 16)
+                        return unsupported("SIMD shuffle requires exactly sixteen lane selectors");
+                    std::string operation = "wasm_i8x16_shuffle_";
+                    for (std::size_t lane = 0; lane < i.operands.size(); ++lane) {
+                        const auto selected = immediate(i, lane);
+                        if (!selected || *selected >= 32)
+                            return unsupported("SIMD shuffle selector is missing or outside the two input vectors");
+                        if (lane) operation.push_back('_');
+                        operation += std::to_string(*selected);
+                    }
+                    auto second = pop(vector(128));
+                    auto first = pop(vector(128));
+                    if (!second) return second.error();
+                    if (!first) return first.error();
+                    stack.push_back(binary(std::move(operation), first.value(), second.value(), vector(128)));
+                    continue;
+                }
+                if (subopcode && *subopcode == 14) {
+                    auto indices = pop(vector(128));
+                    auto source = pop(vector(128));
+                    if (!indices) return indices.error();
+                    if (!source) return source.error();
+                    stack.push_back(binary("wasm_i8x16_swizzle", source.value(), indices.value(), vector(128)));
+                    continue;
+                }
                 const auto splat = subopcode ? simd_splat_op(*subopcode) : std::optional<SimdSplatOpInfo>{};
                 if (splat) {
                     auto scalar = pop(splat->scalar_type);
