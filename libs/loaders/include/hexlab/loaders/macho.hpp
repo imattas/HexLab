@@ -43,9 +43,15 @@ HEXLAB_LOADERS_EXPORT Result<MachOCodeDirectoryHashVerification> verify_macho_co
 struct MachOChainedTargetBases {
     std::optional<std::uint64_t> shared_cache_base;
     std::array<std::optional<std::uint64_t>, 4> cache_level_bases{};
+    // Half-open VM address ranges accepted as targets after base addition.
+    struct Mapping { std::uint64_t address = 0, size = 0; bool operator==(const Mapping &) const = default; };
+    // Optional validated VM ranges for checking externally based results.
+    // An empty list retains the base-only behavior for that namespace.
+    std::vector<Mapping> shared_cache_mappings;
+    std::array<std::vector<Mapping>, 4> cache_level_mappings{};
 };
 enum class MachOChainedExternalTargetStatus : std::uint8_t {
-    resolved, missing_base, invalid_encoding, overflow
+    resolved, missing_base, invalid_encoding, overflow, outside_mapping
 };
 struct MachOChainedExternalTarget {
     std::size_t pointer_index = 0;
@@ -59,8 +65,9 @@ struct MachOChainedTargetResolutionLimits {
     std::size_t max_pointer_rows = 1'000'000;
 };
 // Resolves format-4/13 shared-cache and format-8/11 kernel-cache-level rebase
-// payloads against bases explicitly supplied by the caller. Authenticated
-// results are pre-PAC addresses and are not usable signed pointers.
+// payloads against bases explicitly supplied by the caller. Optional caller
+// mappings constrain the computed target to validated cache VM ranges.
+// Authenticated results are pre-PAC addresses and are not usable signed pointers.
 HEXLAB_LOADERS_EXPORT Result<std::vector<MachOChainedExternalTarget>> resolve_macho_chained_external_targets(
     const MachOMetadata &, const MachOChainedTargetBases &, std::stop_token = {},
     MachOChainedTargetResolutionLimits = {});
