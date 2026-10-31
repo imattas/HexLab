@@ -251,7 +251,7 @@ class ReferenceIndex {
     std::map<std::string, std::vector<std::size_t>> elf_symbols_;
     std::map<std::string, std::vector<std::size_t>> macho_symbols_;
 };
-inline constexpr std::uint32_t reference_cache_version = 30;
+inline constexpr std::uint32_t reference_cache_version = 31;
 inline constexpr std::size_t reference_record_limit = 4000000, reference_payload_limit = 64 * 1024 * 1024;
 HEXLAB_ANALYSIS_EXPORT Result<std::shared_ptr<const ReferenceIndex>>
 derive_references(const FunctionSnapshot &, const ImageMetadata &, const AnalysisDecisions &, std::stop_token);
