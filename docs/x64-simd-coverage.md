@@ -772,6 +772,19 @@ the VEX.128 upper-YMM clearing effect. EVEX and other immediate shuffle forms
 remain unsupported. See Intel's
 [AVX/AVX2 instruction reference](https://www.intel.com/content/dam/develop/external/us/en/documents/319433-024-697869.pdf).
 
+## AVX2 immediate dword blend
+
+VEX.128/.256 `VPBLENDD` (`66 0F3A 02 /r ib`) decodes with a vector
+destination, the `vvvv` source, a register or full-width memory source, and the
+eight-bit selector retained as an immediate. Selector bits choose the
+corresponding 32-bit lane from the ModRM source; unset bits select from the
+`vvvv` source. The packed evaluator applies this lane selection exactly to
+caller-supplied bytes, and the decompiler retains a typed integer-vector
+intrinsic with the memory-read and VEX.128 upper-YMM clear effects. Reserved
+prefix/W encodings are rejected. EVEX forms, CPU feature dispatch, and memory
+fault behavior remain outside this slice. See Intel's
+[AVX/AVX2 instruction reference](https://www.intel.com/content/dam/develop/external/us/en/documents/manuals/64-ia-32-architectures-software-developer-vol-2a-manual.pdf).
+
 
 ## SSE4.2 scalar CRC32C
 

@@ -690,7 +690,9 @@ enum class Opcode {
     ppc_mffs, ppc_mtfsb0, ppc_mtfsb1, ppc_mtfsfi, ppc_mtfsf,
     ppc_mcrfs,
     // MIPS64 doubleword CP0 transfers; append to preserve serialized IDs.
-    mips64_dmfc0, mips64_dmtc0
+    mips64_dmfc0, mips64_dmtc0,
+    // AVX2 immediate dword blend; appended to preserve serialized IDs.
+    vpblendd
 };
 enum class OperandAccess { read, write, read_write, address };
 // The encoded x86 group-one repeat prefix is retained separately from the

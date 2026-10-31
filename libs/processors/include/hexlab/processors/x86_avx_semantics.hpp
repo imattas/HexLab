@@ -607,14 +607,16 @@ inline std::optional<X86AvxPackedResult> evaluate_x86_avx_packed(
     const bool move = instruction.opcode == Opcode::vmovups;
     const bool shuffle = instruction.opcode == Opcode::vshufps || instruction.opcode == Opcode::vshufpd;
     const bool immediate_shuffle = instruction.opcode == Opcode::vpshufd;
+    const bool immediate_blend = instruction.opcode == Opcode::vpblendd;
     const auto immediate_shift = immediate_shift_shape(instruction.opcode);
     const auto absolute = absolute_lane_width(instruction.opcode);
-    if (!move && !shuffle && !immediate_shuffle && !immediate_shift && !absolute &&
+    if (!move && !shuffle && !immediate_shuffle && !immediate_blend && !immediate_shift && !absolute &&
         !is_avx_integer_bitwise_or_compare(instruction.opcode))
         return std::nullopt;
     if (shuffle && instruction.operands.size() != 4) return std::nullopt;
-    if ((!move && !shuffle && !immediate_shuffle && !absolute && instruction.operands.size() != 3) ||
+    if ((!move && !shuffle && !immediate_shuffle && !immediate_blend && !absolute && instruction.operands.size() != 3) ||
         (immediate_shuffle && instruction.operands.size() != 3)) return std::nullopt;
+    if (immediate_blend && instruction.operands.size() != 4) return std::nullopt;
     if (move && instruction.operands.size() != 2) return std::nullopt;
 
     const bool store = move && std::holds_alternative<MemoryOperand>(instruction.operands[0]);
@@ -670,6 +672,27 @@ inline std::optional<X86AvxPackedResult> evaluate_x86_avx_packed(
             return std::nullopt;
         }
         const auto *selector = std::get_if<ImmediateOperand>(&instruction.operands[2]);
+        if (!selector || selector->encoded_width != 8 || selector->effective_width != 8 ||
+            selector->is_signed || selector->value > 0xff)
+            return std::nullopt;
+    } else if (immediate_blend) {
+        const auto *destination = std::get_if<RegisterOperand>(&instruction.operands[0]);
+        if (!destination || (destination->bank != RegisterBank::xmm && destination->bank != RegisterBank::ymm))
+            return std::nullopt;
+        bits = destination->width;
+        if ((bits != 128 && bits != 256) || !is_xmm_or_ymm(instruction.operands[0], bits) ||
+            (instruction.vector_bits && instruction.vector_bits != bits) ||
+            (instruction.vector_element_bits && instruction.vector_element_bits != 32) ||
+            !is_xmm_or_ymm(instruction.operands[1], bits))
+            return std::nullopt;
+        register_destination = destination->index;
+        const auto &source = instruction.operands[2];
+        if (const auto *memory = std::get_if<MemoryOperand>(&source)) {
+            if (memory->data_width != bits) return std::nullopt;
+        } else if (!is_xmm_or_ymm(source, bits)) {
+            return std::nullopt;
+        }
+        const auto *selector = std::get_if<ImmediateOperand>(&instruction.operands[3]);
         if (!selector || selector->encoded_width != 8 || selector->effective_width != 8 ||
             selector->is_signed || selector->value > 0xff)
             return std::nullopt;
@@ -752,6 +775,16 @@ inline std::optional<X86AvxPackedResult> evaluate_x86_avx_packed(
                     result.bytes[lane_base + output_lane * 4 + byte] =
                         source1[lane_base + source_lane * 4 + byte];
             }
+        }
+        return result;
+    }
+
+    if (immediate_blend) {
+        const auto selector = static_cast<unsigned>(std::get<ImmediateOperand>(instruction.operands[3]).value);
+        for (unsigned lane = 0; lane < bytes / 4; ++lane) {
+            const auto &source = (selector >> lane) & 1u ? source2 : source1;
+            for (unsigned byte = 0; byte < 4; ++byte)
+                result.bytes[lane * 4 + byte] = source[lane * 4 + byte];
         }
         return result;
     }
