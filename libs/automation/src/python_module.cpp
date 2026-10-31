@@ -1104,7 +1104,8 @@ PyObject* call_project(PyObject*,PyObject* args){return guarded([&]()->PyObject*
         if(!PyList_Check(selection)&&!PyTuple_Check(selection))invalid("catalogs must be a list or tuple");
         const auto selected_count=PySequence_Size(selection);
         if(selected_count<1||selected_count>256)invalid("catalogs must contain 1 through 256 entries");
-        std::vector<FlirtCatalogInput> inputs;inputs.reserve(static_cast<std::size_t>(selected_count));
+        std::vector<automation::FlirtCatalogInput> inputs;
+        inputs.reserve(static_cast<std::size_t>(selected_count));
         std::uint64_t aggregate_bytes=0;
         constexpr std::uint64_t max_catalog_bytes=64u*1024u*1024u;
         for(Py_ssize_t index=0;index<selected_count;++index){
@@ -1118,7 +1119,8 @@ PyObject* call_project(PyObject*,PyObject* args){return guarded([&]()->PyObject*
                 invalid("aggregate catalog bytes exceed 64 MiB");
             auto provenance=text(provenance_object);
             if(provenance.size()>256)invalid("catalog provenance exceeds 256 UTF-8 bytes");
-            FlirtCatalogInput input;input.bytes.resize(static_cast<std::size_t>(raw_size));
+            automation::FlirtCatalogInput input;
+            input.bytes.resize(static_cast<std::size_t>(raw_size));
             if(raw_size)std::memcpy(input.bytes.data(),raw,static_cast<std::size_t>(raw_size));
             input.provenance=std::move(provenance);aggregate_bytes+=static_cast<std::uint64_t>(raw_size);
             inputs.push_back(std::move(input));
