@@ -65,6 +65,8 @@ evaluate_mips32_multiply_accumulate(Mips32MultiplyAccumulateOperation operation,
     case Mips32MultiplyAccumulateOperation::msubu:
         product = static_cast<std::uint64_t>(lhs) * rhs;
         break;
+    default:
+        return {};
     }
     const bool subtract = operation == Mips32MultiplyAccumulateOperation::msub ||
                           operation == Mips32MultiplyAccumulateOperation::msubu;
