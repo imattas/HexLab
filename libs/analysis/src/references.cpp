@@ -610,9 +610,9 @@ std::optional<Address> static_signed_word_pointer_load(const Image &image,
     const Address target{source.space, static_cast<std::uint64_t>(static_cast<std::int64_t>(signed_value))};
     return riscv_target_segment(image, target, OperandAccess::address) ? std::optional<Address>{target} : std::nullopt;
 }
-// Narrow A64 loads can carry a complete, directly mapped address in compact
+// Narrow loads can carry a complete, directly mapped address in compact
 // pointer tables. Accept only file-backed, unrelocated bytes and validate the
-// zero-extended value in the source address space before propagating it.
+// extended value in the source address space before propagating it.
 std::optional<Address> static_narrow_pointer_load(const Image &image, const RelocationCoverage &relocations,
                                                   Address source, std::uint8_t bit_width) {
     if (bit_width != 8 && bit_width != 16) return {};
@@ -5278,6 +5278,12 @@ RegisterReferenceFacts mips_reference_facts(const Image *image, const Relocation
                         const bool mips64_zero_extended_pointer_load = mips64 &&
                             instruction.opcode == Opcode::mips64_lwu && memory->data_width == 32 &&
                             destination && destination->width == 64;
+                        const bool mips32_narrow_pointer_load = mips32 && destination &&
+                            destination->width == 32 &&
+                            (((instruction.opcode == Opcode::mips_lb || instruction.opcode == Opcode::mips_lbu) &&
+                              memory->data_width == 8) ||
+                             ((instruction.opcode == Opcode::mips_lh || instruction.opcode == Opcode::mips_lhu) &&
+                              memory->data_width == 16));
                         if (!merge_load && (full_width_pointer_load || mips64_zero_extended_pointer_load) &&
                             instruction.access[i] == OperandAccess::read &&
                             memory->data_width == (mips64_zero_extended_pointer_load ? 32 : width) &&
@@ -5285,6 +5291,17 @@ RegisterReferenceFacts mips_reference_facts(const Image *image, const Relocation
                             if (const auto value = static_pointer_load(*image, relocations, target,
                                 mips64_zero_extended_pointer_load ? 32 : width))
                                 loaded_pointer = std::pair{destination->index, *value};
+                        if (mips32_narrow_pointer_load && !merge_load &&
+                            instruction.access[i] == OperandAccess::read && destination_written) {
+                            const bool sign_extend = instruction.opcode == Opcode::mips_lb ||
+                                                     instruction.opcode == Opcode::mips_lh;
+                            const auto value = sign_extend
+                                ? static_signed_narrow_pointer_load(*image, relocations, target,
+                                                                    memory->data_width, 32)
+                                : static_narrow_pointer_load(*image, relocations, target, memory->data_width);
+                            if (value)
+                                loaded_pointer = std::pair{destination->index, *value};
+                        }
                     }
                 }
                 erase_written();
