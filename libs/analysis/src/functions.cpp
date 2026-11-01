@@ -3178,6 +3178,8 @@ Sha256Digest function_engine_fingerprint(const AnalysisOptions &options) {
     (void)hash.update(std::as_bytes(std::span(riscv_compressed_switch_version)));
     constexpr std::string_view mips64_base_control_version = "mips64-base-exceptions-cache-hardware-control-v1";
     (void)hash.update(std::as_bytes(std::span(mips64_base_control_version)));
+    constexpr std::string_view mips64_numeric_version = "mips64-finite-cop1-numeric-execution-v1";
+    (void)hash.update(std::as_bytes(std::span(mips64_numeric_version)));
     constexpr std::string_view wasm_indirect_selector_version = "wasm-indirect-constant-selector-v1";
     (void)hash.update(std::as_bytes(std::span(wasm_indirect_selector_version)));
     for (auto value : {options.min_string_characters, options.instruction_budget, options.string_budget,

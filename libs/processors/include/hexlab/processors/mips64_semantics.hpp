@@ -5,8 +5,37 @@
 #include "hexlab/processors/processors_export.hpp"
 #include <cstdint>
 #include <optional>
+#include <span>
+#include <string_view>
 
 namespace hexlab {
+
+struct Mips64FpNumericInfo {
+    Opcode opcode;
+    std::string_view intrinsic_name;
+    std::uint16_t source_width, result_width;
+    bool integer_source = false, integer_result = false, binary = false;
+};
+struct Mips64FpNumericResult {
+    std::uint64_t value_bits = 0;
+    std::uint32_t fcsr_after = 0;
+    bool inexact = false;
+};
+HEXLAB_PROCESSORS_EXPORT std::span<const Mips64FpNumericInfo>
+mips64_fp_numeric_inventory() noexcept;
+// Shape/effect validation without executing the instruction.
+HEXLAB_PROCESSORS_EXPORT std::optional<Mips64FpNumericInfo>
+mips64_fp_numeric_instruction_info(const Instruction &) noexcept;
+// Bounded, host-FPU-independent execution: finite normal/zero inputs, normal
+// or zero FP results, in-range signed W/L results, FS=0. All RM modes are
+// supported. NaN/Inf, subnormal/tiny/overflow, invalid inputs, and enabled
+// Inexact traps return no result; callers must preserve the opaque operation.
+HEXLAB_PROCESSORS_EXPORT std::optional<Mips64FpNumericResult>
+evaluate_mips64_fp_numeric(Opcode, std::uint64_t left_bits, std::uint64_t right_bits,
+                           std::uint32_t fcsr) noexcept;
+HEXLAB_PROCESSORS_EXPORT std::optional<Mips64FpNumericResult>
+evaluate_mips64_fp_numeric_instruction(const Instruction &, std::uint64_t left_bits,
+                                       std::uint64_t right_bits, std::uint32_t fcsr) noexcept;
 
 // Evaluate the MIPS64 SPECIAL2 DCLZ/DCLO count over the full 64-bit GPR.
 HEXLAB_PROCESSORS_EXPORT std::optional<std::uint64_t>

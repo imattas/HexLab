@@ -39,7 +39,7 @@ The MIPS64 Release 2 SPECIAL3 decoder also recognizes WSBH, SEB, SEH, DSBH, and 
 
 The decoder covers selected integer SPECIAL operations, including trapping ADD/SUB and DADD/DSUB, nontrapping ADDU/SUBU and DADDU/DSUBU, signed/unsigned SLT, word and doubleword fixed/variable shifts, MOVZ/MOVN, and SYNC. MIPS64 Release 2 DROTR, DROTR32, and DROTRV decode with their distinct shift encodings and lift as 64-bit rotate-right bitvector formulas; a zero variable count avoids a width-sized shift. Since ISA revision selection is not modeled, Release 2 rotate encodings are accepted in the generic MIPS64 context. The SPECIAL3 word EXT/INS forms validate their 32-bit ranges and lift through 32-bit field formulas with sign extension to the GPR width. EXT reads the source word; INS reads the previous destination and source word, then merges the selected field. For INS, the architecture's sign-extended word input precondition is not checked dynamically. The pre-Release 6 SPECIAL2 MUL form writes the sign-extended low word of the signed 32-bit product to rd; HI/LO are marked as writes with unknown values because their post-instruction contents are architecturally unpredictable. Predictable source inputs must be sign-extended word values, a runtime precondition that is not validated. Immediate forms include ADDI/U, SLTI/U, logical immediates, LUI, and DADDI/U. The word ADD/ADDU/SUB/SUBU, ADDI/ADDIU, and fixed/variable shift forms operate on 32-bit values and sign-extend results to the 64-bit GPR; SLT/SLTU and SLTI/SLTIU produce a 64-bit 0/1 result. It also covers word MULT/MULTU/DIV/DIVU and doubleword DMULT/DMULTU/DDIV/DDIVU, 64-bit HI/LO moves, J/JAL, register jumps, BEQ/BNE/BLEZ/BGTZ/BLTZ/BGEZ and their likely forms, BLTZAL/BGEZAL and likely link variants, which write PC+8 to r31 regardless of branch outcome, byte/halfword/word and unaligned merge loads/stores, including LDL/LDR/SDL/SDR, plus LD/SD/LWU and LL/SC/LLD/SCD. LL and LL.D sign-extend their loaded values to 64 bits; SC and SCD conditionally write memory and return the success result in the target GPR. The decompiler retains word/doubleword multiply and divide as named HI/LO intrinsics. Separate processor helpers evaluate multiply and defined division cases for caller-provided operands; division-by-zero, signed overflow, and invalid word inputs return explicit unpredictable outcomes without concrete HI/LO values. Its scalar COP1 subset includes LWC1/LDC1/SWC1/SDC1, S/D-format ADD/SUB/MUL/DIV/SQRT/ABS/MOV/NEG and conditional MOVF/MOVT/MOVZ/MOVN, all 16 compare predicates selecting FCC0-FCC7, BC1F/BC1T and branch-likely BC1FL/BC1TL selecting FCC0-FCC7, MFC1/DMFC1/CFC1/MTC1/DMTC1/CTC1, and selected S/D/W/L conversions (including fixed-rounding W/L conversions). COP1 transfers support FCCR25, FEXR26, FENR28, and FCSR31; the separate control-register views are tracked alongside aggregate FCSR state. COP1 decode carries FPR width, GPR/FPR/FCSR read/write, memory, and delay-slot effects. The decompiler keeps conversions and transfers as named typed intrinsics, including MFC1's 32-bit sign extension, and models FCSR state as an architectural effect. Likely conditional branches bypass their delay slot on the not-taken path. Control transfers retain their classic delay-slot count, and MIPS64 continuation arithmetic uses the 64-bit address domain. Reserved encodings and unsupported instructions are kept distinct from truncated input. The stack analyzer understands DADDIU stack/frame adjustments and common DADDU register-copy idioms.
 
-This is an instruction and analysis subset, not full MIPS64 ISA or ABI support. Unaligned merge operations are decoded with merge/read-modify-write effects and retained as byte-order-tagged typed intrinsics. The processor library also exposes a pure byte-lane evaluator for LWL/LWR/LDL/LDR/SWL/SWR/SDL/SDR, including exact merged values, GPR byte masks, memory byte masks, and sign extension for word loads. The shared decompiler IR does not yet represent dynamic byte-granular memory effects, so lifted merge operations remain typed intrinsics instead of being lowered to ordinary full-width loads or stores. COP1 now decodes all 16 classic (pre-Release 6) S/D compare predicates across FCC0-FCC7 and retains each predicate, operands, and FCSR write as a named intrinsic; host floating-point evaluation remains intentionally absent. COP1 rounding modes and exception/NaN behavior are retained as named intrinsic effects rather than evaluated. BC1TL/BC1FL branch-likely forms select FCC0-FCC7, annul the delay slot on the not-taken path, and execute it on the taken path. REGIMM link-likely forms now annul their delay slot on the not-taken path; their r31 link value is modeled as a pre-slot write. The LL/SC reservation monitor is not modeled. MFC0/MTC0 and DMFC0/DMTC0 support CP0 select zero with explicit GPR/CP0 widths and register effects; other CP0 selectors remain unsupported. CP0 ERET is recognized as a return with no delay slot or explicit operands; privilege checks, Status/ERL/EXL updates, EPC versus ErrorEPC selection, and exception behavior are not modeled. Unsupported REGIMM suboperations, other coprocessors, compressed modes, ISA revision selection, and MIPS-specific relocation evaluation remain outside this slice. Static address propagation is described below. FCSR alias effects are modeled in lifted SSA as described below. ELF64 identification alone does not establish a particular psABI.
+This is an instruction and analysis subset, not full MIPS64 ISA or ABI support. Unaligned merge operations are decoded with merge/read-modify-write effects and retained as byte-order-tagged typed intrinsics. The processor library also exposes a pure byte-lane evaluator for LWL/LWR/LDL/LDR/SWL/SWR/SDL/SDR, including exact merged values, GPR byte masks, memory byte masks, and sign extension for word loads. The shared decompiler IR does not yet represent dynamic byte-granular memory effects, so lifted merge operations remain typed intrinsics instead of being lowered to ordinary full-width loads or stores. COP1 now decodes all 16 classic (pre-Release 6) S/D compare predicates across FCC0-FCC7 and retains each predicate, operands, and FCSR write as a named intrinsic; host floating-point evaluation remains intentionally absent. COP1 effects remain explicit; the bounded normal/zero numeric execution described below supports all rounding modes while exceptional domains remain unevaluated. BC1TL/BC1FL branch-likely forms select FCC0-FCC7, annul the delay slot on the not-taken path, and execute it on the taken path. REGIMM link-likely forms now annul their delay slot on the not-taken path; their r31 link value is modeled as a pre-slot write. The LL/SC reservation monitor is not modeled. MFC0/MTC0 and DMFC0/DMTC0 support CP0 select zero with explicit GPR/CP0 widths and register effects; other CP0 selectors remain unsupported. CP0 ERET is recognized as a return with no delay slot or explicit operands; privilege checks, Status/ERL/EXL updates, EPC versus ErrorEPC selection, and exception behavior are not modeled. Unsupported REGIMM suboperations, other coprocessors, compressed modes, ISA revision selection, and MIPS-specific relocation evaluation remain outside this slice. Static address propagation is described below. FCSR alias effects are modeled in lifted SSA as described below. ELF64 identification alone does not establish a particular psABI.
 
 The processor library also exposes `evaluate_mips64_multiply_accumulate` for
 SPECIAL2 `MADD`, `MADDU`, `MSUB`, and `MSUBU`. It consumes the low 32 bits of
@@ -111,7 +111,7 @@ resolved; in particular, their symbol and addend identities are never inferred
 from nearby raw immediates. N32 propagation and other ABI details remain
 outside this 64-bit address-state slice.
 
-The decompiler lifts the currently decoded integer subset into shared SSA. It preserves 64-bit arithmetic, sign-extending word operations and loads, zero-extending LWU, doubleword fixed and variable shifts (variable counts explicitly mask to six bits), effective-address loads/stores, typed unaligned merge intrinsics, common equality and signed conditional branches, JR-to-ra returns, and HI/LO dataflow. Word and doubleword multiply/divide remain typed named intrinsics with HI/LO writes. Separate processor evaluators compute exact multiply and defined division results; unpredictable division cases remain opaque in pseudocode. COP1 comparisons and branch predicates identify the selected FCC number. MFC1/DMFC1/MTC1/DMTC1 lower as typed bitcast/truncate/sign-extension SSA transfers, and CFC1/CTC1 on aggregate FCSR31 lower as 32-bit control-word transfers. CFC1 FCCR/FEXR/FENR now extracts their architectural fields from aggregate FCSR; CTC1 to those views updates only their corresponding FCSR fields and preserves the rest. FCCR[7:1] maps to FCSR[31:25], FCCR[0] to FCSR[23], FEXR maps Cause[17:12] and Flags[6:2], and FENR maps Enables[11:7], FS[24], and RM[1:0]. Runtime reserved-bit validation and CTC1 exceptions are not evaluated. COP1 arithmetic and numeric conversions retain typed intrinsic operands/results and FCSR effects. S/D conditional moves retain their old destination, source, exact FCC or GPR condition, and a conservative typed output; MOVF/MOVT read the selected FCC from FCSR without changing flags. Host floating-point evaluation, runtime rounding, NaN behavior, and exception flags remain unevaluated. DADD, DADDI, and DSUB compute wrapped 64-bit results and expose exact signed-overflow may-trap edges; DADDU/DSUBU remain non-trapping modulo-64 operations. DMULT/DDIV families remain named intrinsics in pseudocode; the processor helper evaluates multiply results, while division exceptional results remain unevaluated. SCD retains its conditional-store and success-result effects. Ordinary delay-slot statements execute before the delayed transfer in the lifted block, while JAL/JALR link writes remain before the slot; branch predicates, indirect call targets, and return values use their pre-slot SSA snapshot. Branch-likely predicates select the taken edge before the slot: the taken path executes the slot and then transfers, while the not-taken path annuls the slot and continues at PC+8. Delay-slot execution remains explicit in the CFG.
+The decompiler lifts the currently decoded integer subset into shared SSA. It preserves 64-bit arithmetic, sign-extending word operations and loads, zero-extending LWU, doubleword fixed and variable shifts (variable counts explicitly mask to six bits), effective-address loads/stores, typed unaligned merge intrinsics, common equality and signed conditional branches, JR-to-ra returns, and HI/LO dataflow. Word and doubleword multiply/divide remain typed named intrinsics with HI/LO writes. Separate processor evaluators compute exact multiply and defined division results; unpredictable division cases remain opaque in pseudocode. COP1 comparisons and branch predicates identify the selected FCC number. MFC1/DMFC1/MTC1/DMTC1 lower as typed bitcast/truncate/sign-extension SSA transfers, and CFC1/CTC1 on aggregate FCSR31 lower as 32-bit control-word transfers. CFC1 FCCR/FEXR/FENR now extracts their architectural fields from aggregate FCSR; CTC1 to those views updates only their corresponding FCSR fields and preserves the rest. FCCR[7:1] maps to FCSR[31:25], FCCR[0] to FCSR[23], FEXR maps Cause[17:12] and Flags[6:2], and FENR maps Enables[11:7], FS[24], and RM[1:0]. Runtime reserved-bit validation and CTC1 exceptions are not evaluated. COP1 arithmetic and numeric conversions retain typed intrinsic operands/results and FCSR effects. S/D conditional moves retain their old destination, source, exact FCC or GPR condition, and a conservative typed output; MOVF/MOVT read the selected FCC from FCSR without changing flags. Host floating-point evaluation and NaN/exceptional execution remain absent; the bounded constant execution below evaluates proven normal/zero numeric values and their Inexact status. DADD, DADDI, and DSUB compute wrapped 64-bit results and expose exact signed-overflow may-trap edges; DADDU/DSUBU remain non-trapping modulo-64 operations. DMULT/DDIV families remain named intrinsics in pseudocode; the processor helper evaluates multiply results, while division exceptional results remain unevaluated. SCD retains its conditional-store and success-result effects. Ordinary delay-slot statements execute before the delayed transfer in the lifted block, while JAL/JALR link writes remain before the slot; branch predicates, indirect call targets, and return values use their pre-slot SSA snapshot. Branch-likely predicates select the taken edge before the slot: the taken path executes the slot and then transfers, while the not-taken path annuls the slot and continues at PC+8. Delay-slot execution remains explicit in the CFG.
 
 CLZ/CLO lift as a 32-bit count over the low word (with the source word
 constraint described above), and DCLZ/DCLO lift as 64-bit counts. The processor
@@ -275,3 +275,70 @@ with `BUILD_TESTING=OFF`, targeting `hexlab_processors`, `hexlab_analysis`,
 and `hexlab_decompiler`, plus `git diff --check`. No tests were added or run;
 there is no new independent instruction-oracle evidence. Capability status
 remains partial.
+
+
+## Bounded COP1 numeric execution
+
+The processor API now exposes `mips64_fp_numeric_inventory`,
+`mips64_fp_numeric_instruction_info`, `evaluate_mips64_fp_numeric`, and its
+validated decoded-instruction adapter. The inventory covers 36 ordinary
+numeric operations:
+
+| Family | Operations |
+| --- | --- |
+| S/D arithmetic | ADD, SUB, MUL, DIV, SQRT in both formats |
+| Floating/integer to floating | CVT.S.D, CVT.D.S, CVT.S.W, CVT.D.W, CVT.S.L, CVT.D.L |
+| Floating to signed integer | CVT.W/L.S/D plus ROUND, TRUNC, CEIL, FLOOR W/L.S/D |
+
+This is deliberately bounded execution. Floating inputs must be finite
+normal values or signed zero; integer inputs are raw signed W/L payloads.
+Floating outputs must be normal or zero, and integer outputs must fit signed
+W/L. FS must be zero. RM selects nearest/even, toward zero, toward positive,
+or toward negative; fixed-rounding conversions override RM. Exact zero
+signs are retained for arithmetic and floating-format conversions.
+
+The evaluator uses integer bit arithmetic throughout. Addition/subtraction
+align complete significands in a fixed 2176-bit buffer, multiplication
+retains the complete product, division keeps quotient and remainder, and
+square root uses a restoring integer algorithm. Guard/remainder information
+feeds one rounding step. It does not change or depend on host floating-point
+rounding, denormal controls, or the host representation of NaNs.
+
+Successful execution returns a result payload and FCSR update. Cause bits
+are replaced by the current operation's status; existing Flags remain sticky.
+A rounded result adds Inexact Cause and Flag. An enabled Inexact trap returns
+no evaluated result. NaNs/infinities, subnormal inputs, nonzero tiny or
+overflowing floating results, zero divisors, negative nonzero square roots,
+out-of-range integer conversions, and FS=1 likewise return no result. There
+is no guessed default value or claimed precise IEEE exception handling for
+those cases. Underflow, Overflow, Invalid, Divide-by-zero, NaN payload rules,
+ABS2008 behavior, FPU availability/FR modes, and exception delivery remain
+outside this evaluator.
+
+The lifter validates the complete FPR/FCSR operand/effect shape and emits
+canonical `mips64.*` numeric intrinsics with source values and an explicit
+incoming FCSR. Their destination is an output rather than an artificial old
+value input. Ordinary SSA optimization and call-summary output optimization
+can evaluate these intrinsics when all required payloads and FCSR are known,
+recording separate typed FPR and FCSR output constants while retaining the
+intrinsic effect. Unknown or unsupported cases keep their named effects.
+Local propagation stops at calls and opaque intrinsics and skips delayed
+transfer snapshots. There is no new cross-block/phi numeric proof.
+
+MTC1/DMTC1 and MFC1/DMFC1 payload bitcasts can feed and consume these constants.
+Only versioned MIPS FPR reads with matching register, expression, and constant
+width may reinterpret a known payload between integer and floating types.
+Arbitrary mismatched constants are not retyped. A write drops facts for other
+widths of the same FPR index; physical S/D register aliasing is not inferred.
+MIPS32 evaluators and its existing word-conversion folder are unchanged.
+
+The operation and rounding basis is the existing [MIPS64 instruction
+reference, revision 5.04](https://wiki.chuang.ac.cn/_media/md00087-2b-mips64bis-afp-05.04.pdf).
+The function fingerprint adds `mips64-finite-cop1-numeric-execution-v1`.
+Validation was limited to static arithmetic/integration review,
+`git diff --check`, and successful isolated MSVC Debug ClCompile checks for
+`mips64_fp_semantics.cpp`, `mips64_lifting.cpp`, `optimizer.cpp`, and the
+fingerprint's `functions.cpp`, with `BUILD_TESTING=OFF`. No tests, numeric
+execution probes, or independent floating-point oracle were added or run;
+this expansion does not claim runtime or whole-IEEE validation. Capability
+status remains partial.

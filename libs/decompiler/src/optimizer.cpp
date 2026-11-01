@@ -1,6 +1,7 @@
 #include "hexlab/decompiler/optimizer.hpp"
 #include "hexlab/processors/riscv_semantics.hpp"
 #include "hexlab/processors/mips32_semantics.hpp"
+#include "hexlab/processors/mips64_semantics.hpp"
 #include "hexlab/processors/x86_crc32_semantics.hpp"
 
 #include <algorithm>
@@ -1072,12 +1073,164 @@ void simplify_statement(Statement &statement, const std::map<Key, ConstantValue>
         else if constexpr (std::is_same_v<T, Return>)
             value.value = simplify_expression(value.value, constants, allow_register_propagation, require_matching_type);
         else if constexpr (std::is_same_v<T, Intrinsic>) {
+            const auto numeric_inventory = mips64_fp_numeric_inventory();
+            const bool typed_mips64_numeric = std::any_of(numeric_inventory.begin(), numeric_inventory.end(),
+                [&](const auto &item) { return item.intrinsic_name == value.name; });
             for (auto &operand : value.operands)
-                operand = simplify_expression(operand, constants, allow_register_propagation, require_matching_type);
+                operand = simplify_expression(operand, constants, allow_register_propagation,
+                    require_matching_type || typed_mips64_numeric);
             for (auto &output : value.register_output_values)
                 output = simplify_expression(output, constants, allow_register_propagation, require_matching_type);
         }
     }, statement);
+}
+
+void bind_mips64_fp_payloads(Intrinsic &effect, const std::map<Key, ConstantValue> &constants) {
+    const auto inventory = mips64_fp_numeric_inventory();
+    const auto found = std::find_if(inventory.begin(), inventory.end(),
+        [&](const auto &item) { return item.intrinsic_name == effect.name; });
+    if (found == inventory.end() || effect.operands.size() != (found->binary ? 3u : 2u)) return;
+    const ValueType expected{found->integer_source ? TypeKind::integer : TypeKind::floating,
+        found->source_width, false};
+    for (std::size_t n = 0; n + 1 < effect.operands.size(); ++n) {
+        const auto *source = effect.operands[n] ? std::get_if<RegisterValue>(&effect.operands[n]->value) : nullptr;
+        if (!source || !source->version || source->reg.bank != RegisterBank::mips_fpr ||
+            source->reg.index > 31 || source->reg.high_byte ||
+            source->reg.width != expected.bits || effect.operands[n]->type != expected) continue;
+        const auto value = constants.find(key(source->reg, *source->version));
+        if (value != constants.end() && value->second.type.bits == expected.bits &&
+            (value->second.type.kind == TypeKind::floating || value->second.type.kind == TypeKind::integer) &&
+            (expected.bits == 64 || value->second.value <= UINT32_MAX))
+            effect.operands[n] = constant_expression({value->second.value, expected});
+    }
+}
+
+ExpressionPtr fold_mips64_payload_expression(const ExpressionPtr &value,
+    const std::map<Key, ConstantValue> &constants, unsigned depth = 0) {
+    if (!value || depth > 16) return value;
+    if (const auto *reg = std::get_if<RegisterValue>(&value->value);
+        reg && reg->version && reg->reg.bank == RegisterBank::mips_fpr &&
+        reg->reg.index < 32 && !reg->reg.high_byte &&
+        reg->reg.width == value->type.bits && (value->type.bits == 32 || value->type.bits == 64) &&
+        (value->type.kind == TypeKind::integer || value->type.kind == TypeKind::floating)) {
+        const auto found = constants.find(key(reg->reg, *reg->version));
+        if (found != constants.end() && found->second.type.bits == value->type.bits &&
+            (found->second.type.kind == TypeKind::integer || found->second.type.kind == TypeKind::floating) &&
+            (value->type.bits == 64 || found->second.value <= UINT32_MAX))
+            return constant_expression({found->second.value, value->type});
+    }
+    const auto *unary = std::get_if<UnaryValue>(&value->value);
+    if (!unary) return value;
+    auto copy = std::make_shared<Expression>(*value);
+    auto &operation = std::get<UnaryValue>(copy->value);
+    operation.operand = fold_mips64_payload_expression(unary->operand, constants, depth + 1);
+    const auto *constant = operation.operand ? std::get_if<ConstantValue>(&operation.operand->value) : nullptr;
+    const auto width = operation.operation == "bitcast_f32" ? 32u :
+        operation.operation == "bitcast_f64" ? 64u : 0u;
+    if (width && constant && constant->type == operation.operand->type &&
+        constant->type.bits == width && copy->type.bits == width &&
+        (constant->type.kind == TypeKind::integer || constant->type.kind == TypeKind::floating) &&
+        (copy->type.kind == TypeKind::integer || copy->type.kind == TypeKind::floating) &&
+        (width == 64 || constant->value <= UINT32_MAX))
+        return constant_expression({constant->value, copy->type});
+    if (const auto result = fold_unary(operation, copy->type)) return constant_expression(*result);
+    return copy;
+}
+
+void forget_mips64_fp_width_aliases(std::map<Key, ConstantValue> &constants, RegisterOperand written) {
+    if (written.bank != RegisterBank::mips_fpr) return;
+    for (auto it = constants.begin(); it != constants.end();) {
+        if (std::get<0>(it->first) == static_cast<unsigned>(RegisterBank::mips_fpr) &&
+            std::get<1>(it->first) == written.index && std::get<2>(it->first) != written.width)
+            it = constants.erase(it);
+        else ++it;
+    }
+}
+
+bool fold_mips64_fp_numeric(Intrinsic &effect) {
+    const auto inventory = mips64_fp_numeric_inventory();
+    const auto found = std::find_if(inventory.begin(), inventory.end(),
+        [&](const auto &item) { return item.intrinsic_name == effect.name; });
+    if (found == inventory.end()) return false;
+    const auto &item = *found;
+    const auto count = item.binary ? 3u : 2u;
+    const ValueType input_type{item.integer_source ? TypeKind::integer : TypeKind::floating,
+        item.source_width, false};
+    const ValueType output_type{item.integer_result ? TypeKind::integer : TypeKind::floating,
+        item.result_width, false};
+    if (effect.memory_effect != IntrinsicMemoryEffect::none || effect.operands.size() != count ||
+        effect.register_writes.size() != 2 || effect.register_output_versions.size() != 2 ||
+        !effect.register_output_versions[0] || !effect.register_output_versions[1] ||
+        effect.register_writes[0].bank != RegisterBank::mips_fpr ||
+        effect.register_writes[0].width != item.result_width || effect.register_writes[0].index > 31 ||
+        effect.register_writes[0].high_byte ||
+        effect.register_writes[1] != RegisterOperand{RegisterBank::mips_fcsr, 0, 32, false} ||
+        effect.result_type != output_type) return false;
+    std::array<std::uint64_t, 2> sources{};
+    for (unsigned n = 0; n < count; ++n) {
+        const auto *value = effect.operands[n] ? std::get_if<ConstantValue>(&effect.operands[n]->value) : nullptr;
+        const ValueType expected = n + 1 == count ? ValueType{TypeKind::integer, 32, false} : input_type;
+        if (!value || value->type != expected || effect.operands[n]->type != expected ||
+            (expected.bits == 32 && value->value > UINT32_MAX)) return false;
+        if (n + 1 != count) sources[n] = value->value;
+    }
+    const auto &control = std::get<ConstantValue>(effect.operands.back()->value);
+    const auto result = evaluate_mips64_fp_numeric(item.opcode, sources[0], sources[1],
+        static_cast<std::uint32_t>(control.value));
+    if (!result) return false;
+    effect.register_output_values = {
+        constant_expression({result->value_bits, output_type}),
+        constant_expression({result->fcsr_after, {TypeKind::integer, 32, false}})};
+    return true;
+}
+
+void propagate_mips64_fp_numeric_constants(LiftedFunction &function) {
+    const auto inventory = mips64_fp_numeric_inventory();
+    const auto is_numeric = [&](const Intrinsic &effect) {
+        return std::any_of(inventory.begin(), inventory.end(),
+            [&](const auto &item) { return item.intrinsic_name == effect.name; });
+    };
+    const bool needed = std::any_of(function.blocks.begin(), function.blocks.end(), [&](const auto &block) {
+        return std::any_of(block.instructions.begin(), block.instructions.end(), [&](const auto &instruction) {
+            const auto *effect = std::get_if<Intrinsic>(&instruction.statement);
+            return effect && is_numeric(*effect);
+        });
+    });
+    if (!needed) return;
+    for (auto &block : function.blocks) {
+        std::map<Key, ConstantValue> constants;
+        for (auto &instruction : block.instructions) {
+            auto &statement = instruction.statement;
+            if (std::holds_alternative<Call>(statement)) { constants.clear(); continue; }
+            const bool delayed = std::visit([](const auto &value) {
+                using T = std::decay_t<decltype(value)>;
+                if constexpr (std::is_same_v<T, Branch> || std::is_same_v<T, Return>)
+                    return value.delay_slot_snapshot_block.has_value() || value.delay_slot_snapshot_instruction.has_value();
+                else return false;
+            }, statement);
+            if (delayed) continue;
+            if (auto *effect = std::get_if<Intrinsic>(&statement)) bind_mips64_fp_payloads(*effect, constants);
+            simplify_statement(statement, constants, true, true);
+            if (auto *effect = std::get_if<Intrinsic>(&statement)) {
+                if (!fold_mips64_fp_numeric(*effect)) { constants.clear(); continue; }
+                forget_mips64_fp_width_aliases(constants, effect->register_writes[0]);
+                for (std::size_t n = 0; n < 2; ++n)
+                    constants.emplace(key(effect->register_writes[n], effect->register_output_versions[n]),
+                        std::get<ConstantValue>(effect->register_output_values[n]->value));
+            } else if (const auto *assignment = std::get_if<Assign>(&statement)) {
+                if (!assignment->destination_version || !*assignment->destination_version || !assignment->value) {
+                    constants.clear();
+                    continue;
+                }
+                auto &mutable_assignment = std::get<Assign>(statement);
+                mutable_assignment.value = fold_mips64_payload_expression(mutable_assignment.value, constants);
+                forget_mips64_fp_width_aliases(constants, assignment->destination);
+                if (const auto *value = std::get_if<ConstantValue>(&assignment->value->value);
+                    value && value->type.bits == assignment->destination.width && value->type.bits <= 64)
+                    constants.emplace(key(assignment->destination, *assignment->destination_version), *value);
+            }
+        }
+    }
 }
 
 void propagate_x87_binary80_constants(LiftedFunction &function) {
@@ -2024,6 +2177,7 @@ static Result<LiftedFunction> simplify_constants_once(const LiftedFunction &inpu
             }
         }
     }
+    propagate_mips64_fp_numeric_constants(result);
     propagate_x87_binary80_constants(result);
     return result;
 }
@@ -2221,6 +2375,7 @@ struct SummaryWorker {
             if (std::holds_alternative<Call>(statement)) constants.clear();
             return;
         }
+        if (auto *effect = std::get_if<Intrinsic>(&statement)) bind_mips64_fp_payloads(*effect, constants);
         simplify_statement(statement, constants, true, true);
         if (const auto *call = std::get_if<Call>(&statement)) call_constants(*call, constants);
         else if (const auto *intrinsic = std::get_if<Intrinsic>(&statement)) {
@@ -2231,7 +2386,12 @@ struct SummaryWorker {
                 if (auto *mutable_intrinsic = std::get_if<Intrinsic>(&statement);
                     mutable_intrinsic && mutable_intrinsic->memory_effect == IntrinsicMemoryEffect::none &&
                     mutable_intrinsic->register_output_versions.size() == mutable_intrinsic->register_writes.size()) {
-                    if (const auto result = fold_mips32_word_conversion(*mutable_intrinsic)) {
+                    if (fold_mips64_fp_numeric(*mutable_intrinsic)) {
+                        for (std::size_t n = 0; n < 2; ++n)
+                            constants.emplace(key(mutable_intrinsic->register_writes[n],
+                                mutable_intrinsic->register_output_versions[n]),
+                                std::get<ConstantValue>(mutable_intrinsic->register_output_values[n]->value));
+                    } else if (const auto result = fold_mips32_word_conversion(*mutable_intrinsic)) {
                         const auto fcsr_index = std::size_t{1};
                         constants.emplace(key(mutable_intrinsic->register_writes[fcsr_index],
                             mutable_intrinsic->register_output_versions[fcsr_index]),
@@ -2574,6 +2734,7 @@ Result<CallSummaryOptimization> optimize_with_call_summaries(
         for (const auto &input : inputs) {
             budget.tick();
             LiftedFunction function = *input.function;
+            propagate_mips64_fp_numeric_constants(function);
             MemoryAliases aliases;
             for (auto &block : function.blocks) {
                 std::map<Key, ConstantValue> constants;

@@ -1,4 +1,5 @@
 #include "mips64_lifting.hpp"
+#include "hexlab/processors/mips64_semantics.hpp"
 
 #include <type_traits>
 #include <string>
@@ -69,6 +70,24 @@ std::optional<Statement> lift_mips64_instruction(const Instruction &instruction)
         if (destination->index == 0) return Intrinsic{"nop", {}, IntrinsicMemoryEffect::none};
         return Assign{*destination, std::move(value)};
     };
+
+    for (const auto &numeric : mips64_fp_numeric_inventory()) {
+        if (numeric.opcode != op) continue;
+        if (!mips64_fp_numeric_instruction_info(instruction))
+            return intrinsic(instruction, "mips64_malformed_fp_numeric", IntrinsicMemoryEffect::unknown);
+        Intrinsic effect{std::string(numeric.intrinsic_name), {}, IntrinsicMemoryEffect::none};
+        // Destination is an output, never an artificial old-value input.
+        for (std::size_t n = 1; n < items.size(); ++n) {
+            auto value = operand(items[n]);
+            if (!numeric.integer_source) value = std::make_shared<Expression>(Expression{
+                floating(numeric.source_width), std::move(value->value)});
+            effect.operands.push_back(std::move(value));
+        }
+        effect.operands.push_back(reg({RegisterBank::mips_fcsr, 0, 32, false}));
+        effect.result_type = numeric.integer_result ? integer(numeric.result_width) : floating(numeric.result_width);
+        effect.register_writes = instruction.register_writes;
+        return effect;
+    }
 
     if (op == Opcode::mips_syscall || op == Opcode::mips_break) {
         const auto *code = items.size() == 1 ? std::get_if<ImmediateOperand>(&items[0]) : nullptr;
