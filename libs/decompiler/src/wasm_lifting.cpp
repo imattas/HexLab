@@ -390,6 +390,13 @@ std::optional<std::pair<std::string, ValueType>> simd_comparison(const Instructi
     const unsigned lanes = 128u / info->lane_bits;
     return std::pair{name, vector(128, TypeKind::integer, info->lane_bits, lanes)};
 }
+std::optional<ValueType> merge_wasm_stack_type(ValueType left, ValueType right) {
+    if (left == right) return left;
+    if (left.kind == TypeKind::vector && right.kind == TypeKind::vector &&
+        left.bits == 128 && right.bits == 128)
+        return vector(128);
+    return {};
+}
 std::optional<std::string_view> simd_float_unary(std::uint32_t subopcode) {
     switch (subopcode) {
     case 0x67: return "f32x4.ceil";
@@ -837,9 +844,26 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
         }
         return result;
     };
+    const auto merge_shapes = [](Shape &current, const Shape &incoming) -> std::optional<bool> {
+        if (current.size() != incoming.size()) return {};
+        Shape merged = current;
+        bool changed = false;
+        for (std::size_t slot = 0; slot < merged.size(); ++slot) {
+            const auto type = merge_wasm_stack_type(merged[slot], incoming[slot]);
+            if (!type) return {};
+            changed |= *type != merged[slot];
+            merged[slot] = *type;
+        }
+        if (changed) current = std::move(merged);
+        return changed;
+    };
     const auto matching_suffix = [](const Shape &stack, const std::vector<ValueType> &types) {
         if (stack.size() < types.size()) return false;
-        return std::equal(types.begin(), types.end(), stack.end() - static_cast<std::ptrdiff_t>(types.size()));
+        const auto first = stack.end() - static_cast<std::ptrdiff_t>(types.size());
+        return std::equal(types.begin(), types.end(), first,
+            [](ValueType expected, ValueType actual) {
+                return merge_wasm_stack_type(expected, actual).has_value();
+            });
     };
     while(!work.empty()){
         const auto bi=work.back();work.pop_back();queued[bi]=false;
@@ -854,20 +878,24 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
                 Shape end_shape=stack;
                 end_shape.resize(*label_heights[li]);
                 end_shape.insert(end_shape.end(), labels[li].result_types.begin(), labels[li].result_types.end());
-                if(end_shapes[li]&&*end_shapes[li]!=end_shape)return unsupported("control label receives incompatible operand stacks");
-                end_shapes[li]=end_shape;
+                if (end_shapes[li]) {
+                    if (!merge_shapes(*end_shapes[li], end_shape))
+                        return unsupported("control label receives incompatible operand stacks");
+                } else end_shapes[li] = end_shape;
                 Shape branch_shape=labels[li].kind==3?stack:end_shape;
-                if(branch_shapes[li]&&*branch_shapes[li]!=branch_shape)return unsupported("control label branch shape is inconsistent");
-                branch_shapes[li]=std::move(branch_shape);
+                if (branch_shapes[li]) {
+                    if (!merge_shapes(*branch_shapes[li], branch_shape))
+                        return unsupported("control label branch shape is inconsistent");
+                } else branch_shapes[li] = std::move(branch_shape);
                 continue;
             }
             if(op==1)continue;
             if(op==5){const auto li=active_labels[n].back();if(!label_heights[li])return unsupported("if stack height is unavailable");if(!matching_suffix(stack,labels[li].result_types))return unsupported("if then arm result types mismatch");stack.resize(*label_heights[li]);stack.insert(stack.end(),labels[li].result_types.begin(),labels[li].result_types.end());continue;}
-            if(op==0x0b){if(end_label[n]){const auto li=*end_label[n];if(!label_heights[li]||!matching_suffix(stack,labels[li].result_types))return unsupported("block end result types mismatch");stack.resize(*label_heights[li]);stack.insert(stack.end(),labels[li].result_types.begin(),labels[li].result_types.end());if(!end_shapes[li]||*end_shapes[li]!=stack)return unsupported("block end has an incompatible operand stack");}else if(n==function_end){auto result=signature_results();if(!result)return result.error();if(stack!=result.value())return unsupported("function end result stack does not match its signature");}continue;}
+            if(op==0x0b){if(end_label[n]){const auto li=*end_label[n];if(!label_heights[li]||!matching_suffix(stack,labels[li].result_types))return unsupported("block end result types mismatch");stack.resize(*label_heights[li]);stack.insert(stack.end(),labels[li].result_types.begin(),labels[li].result_types.end());if(!end_shapes[li]||!merge_shapes(*end_shapes[li],stack))return unsupported("block end has an incompatible operand stack");}else if(n==function_end){auto result=signature_results();if(!result)return result.error();if(stack!=result.value())return unsupported("function end result stack does not match its signature");}continue;}
             if(op==0x0f){auto result=signature_results();if(!result)return result.error();if(!matching_suffix(stack,result.value()))return unsupported("return stack does not match the function result types");continue;}
             if(op==0x00)break;
             if(op==0x1a){auto v=shape_pop(stack,{});if(!v)return v.error();continue;}
-            if(op==0x1b){auto c=shape_pop(stack,integer(32));if(!c)return c.error();auto a=shape_pop(stack,{});if(!a)return a.error();auto b=shape_pop(stack,a.value());if(!b)return b.error();stack.push_back(a.value());continue;}
+            if(op==0x1b){auto c=shape_pop(stack,integer(32));if(!c)return c.error();auto a=shape_pop(stack,{});if(!a)return a.error();auto b=shape_pop(stack,{});if(!b)return b.error();const auto selected=merge_wasm_stack_type(a.value(),b.value());if(!selected)return unsupported("select operands have incompatible Wasm types");stack.push_back(*selected);continue;}
             if(op==0x1c){const auto type_code=immediate(code[n]->instruction);if(!type_code||*type_code>UINT8_MAX)return unsupported("typed select result type unavailable");const auto type=wasm_value_type(static_cast<std::uint8_t>(*type_code));if(!type)return unsupported("typed select result type is unsupported");auto c=shape_pop(stack,integer(32));if(!c)return c.error();auto a=shape_pop(stack,*type);if(!a)return a.error();auto b=shape_pop(stack,*type);if(!b)return b.error();stack.push_back(*type);continue;}
             if(op==0x0c||op==0x0d){if(op==0x0d){auto c=shape_pop(stack,integer(32));if(!c)return c.error();}continue;}
             if(op==0x0e){auto c=shape_pop(stack,integer(32));if(!c)return c.error();continue;}
@@ -1232,10 +1260,20 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
                 edge_shape.insert(edge_shape.end(), types.begin(), types.end());
                 for (std::size_t value = 0; value < types.size(); ++value)
                     source_slots.push_back(value_base + value);
-                if(*branch_shapes[li]!=edge_shape)return unsupported("branch stack prefix disagrees at its target");
+                if (!merge_shapes(*branch_shapes[li], edge_shape))
+                    return unsupported("branch stack prefix disagrees at its target");
+                edge_shape = *branch_shapes[li];
             }
             if (source_slots.size() != edge_shape.size())
                 return Error{ErrorCode::malformed, "WebAssembly edge stack projection has an inconsistent height"};
+            if (edge.bridge) {
+                auto &bridge_shape = *entries[*edge.bridge];
+                const auto changed = merge_shapes(bridge_shape, edge_shape);
+                if (!changed)
+                    return unsupported("edge bridge receives incompatible operand stack shapes");
+                exits[*edge.bridge] = bridge_shape;
+                edge_shape = bridge_shape;
+            }
             if (!edge.bridge) {
                 auto &maps = incoming_slot_sources[edge.target];
                 const auto map_it = maps.find(bi);
@@ -1267,7 +1305,11 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
                 }
             }
             if(!entries[edge.target]){entries[edge.target]=edge_shape;if(!queued[edge.target]){work.push_back(edge.target);queued[edge.target]=true;}}
-            else if(*entries[edge.target]!=edge_shape)return unsupported("operand stack shapes disagree at a control-flow join");
+            else {
+                const auto changed = merge_shapes(*entries[edge.target], edge_shape);
+                if (!changed) return unsupported("operand stack shapes disagree at a control-flow join");
+                if (*changed && !queued[edge.target]) { work.push_back(edge.target); queued[edge.target] = true; }
+            }
         }
     }
 
