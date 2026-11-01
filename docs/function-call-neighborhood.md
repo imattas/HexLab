@@ -36,6 +36,16 @@ Depth is bounded to 1 through 32, while node and edge budgets cap large output;
 the JSON/DOT graph model reports omitted nodes or edges when a cap is reached.
 `--kind call` continues to mean the image-wide call graph.
 
+The Desktop References pane also offers **Go to caller**, **Go to callee**, and
+**Explore call paths** for an address inside a recovered function. The first two
+show resolved one-hop relationships and their call sites. Call-path exploration
+asks whether to follow downstream callees or upstream callers, then presents
+multi-hop routes with call-site addresses and reference provenance. It expands
+at most 256 paths, returns at most 64 routes, and follows at most five edges;
+cycles and repeated functions within one route are skipped. A bounded result
+states when more relationships or routes may exist. Choosing a route navigates
+to its endpoint in the active document.
+
 The analysis API uses `GraphKind::function_calls` with the selected
 `FunctionId` and `GraphOptions::call_depth` (bounded to 1–32). The project graph
 service resolves a selected virtual address to its owner before building the

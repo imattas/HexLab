@@ -370,7 +370,7 @@ ReferenceView::ReferenceView(wxWindow *parent) : wxPanel(parent) {
     call_callers_->SetToolTip("Choose a resolved executable caller of the containing function.");
     call_paths_ = new wxButton(this, wxID_ANY, "Explore call paths");
     call_paths_->SetName("reference-call-paths");
-    call_paths_->SetToolTip("Browse bounded multi-hop paths through resolved executable calls.");
+    call_paths_->SetToolTip("Browse bounded multi-hop caller or callee paths from the selected function.");
     context_bar->Add(call_callees_, 0, wxALL, pad);
     context_bar->Add(call_callers_, 0, wxALL, pad);
     context_bar->Add(call_paths_, 0, wxALL, pad);
@@ -780,14 +780,22 @@ void ReferenceView::explore_call_paths() {
     const auto revision = navigation_revision_;
     const auto *image = snapshot->loaded->image.get();
     constexpr std::size_t max_depth = 5, max_expansions = 256, max_paths = 64;
+    const wxString directions[] = {"Downstream: callers to callees", "Upstream: callees to callers"};
+    wxSingleChoiceDialog direction_dialog(this,
+        "Choose which direction to follow resolved call edges from the selected function.",
+        "Explore call paths", 2, directions);
+    if (direction_dialog.ShowModal() != wxID_OK) return;
+    const bool upstream = direction_dialog.GetSelection() == 1;
     struct Path {
         std::vector<Address> functions;
         std::vector<FunctionCallRelation> edges;
     };
     const auto root_neighborhood = function_call_neighborhood(*snapshot, std::get<Address>(*location_), image);
     // The bounded neighborhood also identifies the recovered function containing the selected address.
-    if (root_neighborhood.callees.empty()) {
-        wxMessageBox("No resolved executable call paths begin at this function.", "Call paths",
+    const auto &root_edges = upstream ? root_neighborhood.callers : root_neighborhood.callees;
+    if (root_edges.empty()) {
+        wxMessageBox(upstream ? "No resolved executable callers were found for this function."
+                              : "No resolved executable callees were found for this function.", "Call paths",
                      wxOK | wxICON_INFORMATION, this);
         return;
     }
@@ -812,7 +820,8 @@ void ReferenceView::explore_call_paths() {
                 key, function_call_neighborhood(*snapshot, path.functions.back(), image)).first;
         const auto &neighborhood = neighborhood_it->second;
         omitted = omitted || neighborhood.omitted;
-        for (const auto &edge : neighborhood.callees) {
+        const auto &links = upstream ? neighborhood.callers : neighborhood.callees;
+        for (const auto &edge : links) {
             const auto already_in_path = std::any_of(path.functions.begin(), path.functions.end(), [&](Address node) {
                 return call_address_key(node) == call_address_key(edge.entry);
             });
@@ -837,7 +846,8 @@ void ReferenceView::explore_call_paths() {
     }
     if (!pending.empty() || expanded >= max_expansions) omitted = true;
     if (paths.empty()) {
-        wxMessageBox("No multi-hop resolved executable call paths were found.", "Call paths",
+        wxMessageBox(upstream ? "No multi-hop resolved caller paths were found."
+                              : "No multi-hop resolved callee paths were found.", "Call paths",
                      wxOK | wxICON_INFORMATION, this);
         return;
     }
@@ -860,14 +870,17 @@ void ReferenceView::explore_call_paths() {
         wxString label = preview_text(presentation_name(*snapshot, Location{path.functions.front()}), 72);
         for (std::size_t i = 0; i < path.edges.size(); ++i) {
             const auto &edge = path.edges[i];
-            label += " -> " + preview_text(presentation_name(*snapshot, Location{edge.entry}), 72) +
+            label += upstream ? " <- " : " -> ";
+            label += preview_text(presentation_name(*snapshot, Location{edge.entry}), 72) +
                      wxString::Format(" @ %s [ref #%llu, %s]",
                          location_text(Location{edge.call_site}, image),
                          static_cast<unsigned long long>(edge.reference_id.value), provenance_name(edge.provenance));
         }
         choices.Add(label);
     }
-    wxString prompt = "Choose a multi-hop route. Each edge shows its call site, stable reference ID and provenance; selection navigates to the endpoint.";
+    wxString prompt = upstream
+        ? "Choose an upstream caller route. Each edge shows its call site, stable reference ID and provenance; selection navigates to the outer caller."
+        : "Choose a downstream callee route. Each edge shows its call site, stable reference ID and provenance; selection navigates to the endpoint.";
     if (omitted) prompt += "\nThe search reached a configured bound; additional paths may exist.";
     wxSingleChoiceDialog dialog(this, prompt, "Resolved call paths", choices);
     if (dialog.ShowModal() != wxID_OK) return;

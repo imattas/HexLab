@@ -37,6 +37,11 @@ struct FlowState {
     // Independently tracked NMOS 6502 copies of a TSX snapshot in A, X, or Y.
     // Each delta is relative to frame_depth, the stack depth sampled by TSX.
     std::array<FlowValue, 3> m6502_stack_alias_deltas{};
+    // At each bounded entry-relative hardware stack depth, retain a proven
+    // TSX-derived byte value saved by PHA/PHX/PHY. Unknown pushes overwrite
+    // the slot with unknown so a later pull cannot resurrect stale provenance.
+    // 0 means unknown; the remaining byte values encode deltas [-127,127].
+    std::array<std::uint8_t, 255> m6502_saved_stack_aliases{};
     // Carry is only tracked when explicitly set by CLC/SEC. ADC/SBC can use
     // it to preserve a stack-derived accumulator offset through immediate
     // arithmetic, then invalidate it because their result carry is unknown.
@@ -74,6 +79,11 @@ bool m6502_slot_offset_unambiguous(std::int64_t offset) noexcept {
     return offset >= -127 && offset <= 127;
 }
 
+std::optional<std::size_t> m6502_saved_stack_index(std::int64_t depth) noexcept {
+    if (depth < -127 || depth > 127) return {};
+    return static_cast<std::size_t>(depth + 127);
+}
+
 struct M6502IndexStackOperation {
     bool push = false;
     std::uint8_t index = 0;
@@ -105,6 +115,43 @@ bool m6502_index_stack_facts_valid(const Instruction &instruction, M6502IndexSta
                           exact_set(instruction.register_writes, {stack})
                         : exact_set(instruction.register_reads, {stack, status}) &&
                           exact_set(instruction.register_writes, {value, stack, status}));
+}
+
+bool m6502_a_stack_facts_valid(const Instruction &instruction) {
+    if (instruction.context.architecture != Architecture::mos6502 ||
+        (instruction.context.mode != ExecutionMode::m6502 &&
+         instruction.context.mode != ExecutionMode::m65c02) ||
+        instruction.flow != FlowKind::fallthrough || !instruction.operands.empty() ||
+        !instruction.access.empty() || instruction.memory_read == instruction.memory_write)
+        return false;
+    const RegisterOperand a{RegisterBank::mos6502, 0, 8, false};
+    const RegisterOperand p{RegisterBank::mos6502, 3, 8, false};
+    const RegisterOperand s{RegisterBank::mos6502, 4, 8, false};
+    const auto exact = [](const auto &registers, std::initializer_list<RegisterOperand> expected) {
+        return registers.size() == expected.size() && std::all_of(expected.begin(), expected.end(),
+            [&](const auto &reg) { return std::count(registers.begin(), registers.end(), reg) == 1; });
+    };
+    const bool cmos = instruction.context.mode == ExecutionMode::m65c02;
+    switch (instruction.opcode) {
+    case Opcode::m6502_pha:
+        return instruction.memory_write && !instruction.memory_read && exact(instruction.register_reads, {a, s}) &&
+               exact(instruction.register_writes, {s});
+    case Opcode::m6502_php:
+        return instruction.memory_write && !instruction.memory_read && exact(instruction.register_reads, {p, s}) &&
+               exact(instruction.register_writes, {s});
+    case Opcode::m6502_pla:
+        return instruction.memory_read && !instruction.memory_write &&
+               exact(instruction.register_reads, cmos ? std::initializer_list<RegisterOperand>{s, p}
+                                                      : std::initializer_list<RegisterOperand>{s}) &&
+               exact(instruction.register_writes, {a, s, p});
+    case Opcode::m6502_plp:
+        return instruction.memory_read && !instruction.memory_write &&
+               exact(instruction.register_reads, cmos ? std::initializer_list<RegisterOperand>{s, p}
+                                                      : std::initializer_list<RegisterOperand>{s}) &&
+               exact(instruction.register_writes, {s, p});
+    default:
+        return false;
+    }
 }
 
 bool add(FlowValue &value, std::int64_t delta) {
@@ -268,6 +315,18 @@ bool merge(FlowState &current, const FlowState &incoming) {
             current.ambiguous = true;
         }
     }
+    bool m6502_saved_stack_changed = false;
+    for (std::size_t index = 0; index < current.m6502_saved_stack_aliases.size(); ++index) {
+        auto &saved = current.m6502_saved_stack_aliases[index];
+        const auto incoming_saved = incoming.m6502_saved_stack_aliases[index];
+        if (saved != 0 && saved != incoming_saved) {
+            saved = 0;
+            m6502_saved_stack_changed = true;
+            current.ambiguous = true;
+        } else if (saved == 0 && incoming_saved != 0) {
+            current.ambiguous = true;
+        }
+    }
     if (current.arm64_frame_pointer != incoming.arm64_frame_pointer) {
         current.arm64_frame_pointer = false;
         current.frame_depth = {};
@@ -278,7 +337,8 @@ bool merge(FlowState &current, const FlowState &incoming) {
     return stack_changed || frame_changed || previously_supported != current.supported ||
            previously_ambiguous != current.ambiguous || previous_frame_register != current.frame_register ||
            previous_arm64_frame_pointer != current.arm64_frame_pointer || frame_register_delta_changed ||
-           riscv_alias_changed || mips32_alias_changed || arm64_alias_changed || m6502_alias_changed || m6502_carry_changed ||
+           riscv_alias_changed || mips32_alias_changed || arm64_alias_changed || m6502_alias_changed ||
+           m6502_saved_stack_changed || m6502_carry_changed ||
            m6502_decimal_changed;
 }
 
@@ -684,6 +744,13 @@ bool transfer(const Instruction &instruction, FlowState &state) {
                             return reg.bank == RegisterBank::mos6502 && reg.index == 3;
                         }))
             state.m6502_carry_known = false;
+        const auto index_stack = m6502_index_stack_operation(instruction.opcode);
+        const bool modeled_stack_push = instruction.opcode == Opcode::m6502_pha ||
+            instruction.opcode == Opcode::m6502_php ||
+            (index_stack && index_stack->push);
+        if (instruction.memory_write && !modeled_stack_push &&
+            instruction.opcode != Opcode::m6502_jsr && instruction.opcode != Opcode::m6502_brk)
+            state.m6502_saved_stack_aliases = {};
         switch (instruction.opcode) {
         case Opcode::m6502_jsr:
             // A callee may overwrite any general register. Keep the caller's
@@ -694,6 +761,7 @@ bool transfer(const Instruction &instruction, FlowState &state) {
             state.frame_register = -1;
             state.frame_register_delta = {};
             state.m6502_stack_alias_deltas = {};
+            state.m6502_saved_stack_aliases = {};
             state.m6502_carry_known = false;
             state.m6502_decimal_known = false;
             return true;
@@ -701,9 +769,11 @@ bool transfer(const Instruction &instruction, FlowState &state) {
             return true;
         case Opcode::m6502_rti:
             state.m6502_decimal_known = false;
+            state.m6502_saved_stack_aliases = {};
             return true;
         case Opcode::m6502_brk:
             // Its three implicit pushes are modeled at the observation site.
+            state.m6502_saved_stack_aliases = {};
             return true;
         case Opcode::m6502_tsx: {
             // TSX gives X a stable, byte-wide snapshot of the hardware stack
@@ -718,6 +788,7 @@ bool transfer(const Instruction &instruction, FlowState &state) {
                 state.frame_register = -1;
                 state.frame_register_delta = {};
                 state.m6502_stack_alias_deltas = {};
+                state.m6502_saved_stack_aliases = {};
                 state.supported = false;
                 return true;
             }
@@ -729,12 +800,14 @@ bool transfer(const Instruction &instruction, FlowState &state) {
             state.frame_register = -1;
             state.frame_register_delta = {};
             state.m6502_stack_alias_deltas = {};
+            if (!same_sample) state.m6502_saved_stack_aliases = {};
             state.m6502_stack_alias_deltas[1] = {true, 0};
             state.m6502_stack_alias_deltas[0] = accumulator_alias;
             state.m6502_stack_alias_deltas[2] = y_alias;
             if (!state.frame_depth.known || state.frame_depth.value < -127 || state.frame_depth.value > 127) {
                 state.frame_depth = {};
                 state.m6502_stack_alias_deltas = {};
+                state.m6502_saved_stack_aliases = {};
                 state.supported = false;
             }
             return true;
@@ -755,6 +828,7 @@ bool transfer(const Instruction &instruction, FlowState &state) {
                 }
             }
             state.stack_depth = {};
+            state.m6502_saved_stack_aliases = {};
             state.supported = false;
             return true;
         case Opcode::m6502_inx:
@@ -842,14 +916,55 @@ bool transfer(const Instruction &instruction, FlowState &state) {
             return true;
         }
         case Opcode::m6502_pha:
-        case Opcode::m6502_php:
+        case Opcode::m6502_php: {
+            if (!m6502_a_stack_facts_valid(instruction)) {
+                state.stack_depth = {};
+                state.m6502_stack_alias_deltas = {};
+                state.m6502_saved_stack_aliases = {};
+                state.supported = false;
+                return true;
+            }
+            if (const auto slot = state.stack_depth.known
+                    ? m6502_saved_stack_index(state.stack_depth.value) : std::optional<std::size_t>{}) {
+                const auto alias = state.m6502_stack_alias_deltas[0];
+                state.m6502_saved_stack_aliases[*slot] = instruction.opcode == Opcode::m6502_pha && alias.known
+                    ? static_cast<std::uint8_t>(alias.value + 128) : 0;
+            } else {
+                state.m6502_saved_stack_aliases = {};
+            }
             return add(state.stack_depth, 1);
+        }
         case Opcode::m6502_pla:
-            state.m6502_stack_alias_deltas[0] = {};
+        case Opcode::m6502_plp: {
+            if (!m6502_a_stack_facts_valid(instruction)) {
+                state.stack_depth = {};
+                state.m6502_stack_alias_deltas = {};
+                state.m6502_saved_stack_aliases = {};
+                state.m6502_decimal_known = false;
+                state.supported = false;
+                return true;
+            }
+            std::optional<std::size_t> slot;
+            if (state.stack_depth.known) {
+                std::int64_t cell_depth = 0;
+                if (subtract_checked(state.stack_depth.value, 1, cell_depth))
+                    slot = m6502_saved_stack_index(cell_depth);
+            }
+            if (slot) {
+                if (instruction.opcode == Opcode::m6502_pla) {
+                    const auto saved = state.m6502_saved_stack_aliases[*slot];
+                    state.m6502_stack_alias_deltas[0] = saved
+                        ? FlowValue{true, static_cast<std::int64_t>(saved) - 128} : FlowValue{};
+                }
+                state.m6502_saved_stack_aliases[*slot] = {};
+            } else {
+                state.m6502_saved_stack_aliases = {};
+                if (instruction.opcode == Opcode::m6502_pla)
+                    state.m6502_stack_alias_deltas[0] = {};
+            }
+            if (instruction.opcode == Opcode::m6502_plp) state.m6502_decimal_known = false;
             return add(state.stack_depth, -1);
-        case Opcode::m6502_plp:
-            state.m6502_decimal_known = false;
-            return add(state.stack_depth, -1);
+        }
         case Opcode::m65c02_phx:
         case Opcode::m65c02_phy:
         case Opcode::m65c02_plx:
@@ -863,9 +978,32 @@ bool transfer(const Instruction &instruction, FlowState &state) {
                 state.supported = false;
                 return true;
             }
-            // Pulls overwrite the index with an unknown byte. No stack-value
-            // provenance is inferred from a preceding push, even if balanced.
-            if (!operation.push) state.m6502_stack_alias_deltas[operation.index] = {};
+            if (operation.push) {
+                const auto slot = state.stack_depth.known
+                    ? m6502_saved_stack_index(state.stack_depth.value) : std::optional<std::size_t>{};
+                if (slot) {
+                    const auto alias = state.m6502_stack_alias_deltas[operation.index];
+                    state.m6502_saved_stack_aliases[*slot] = alias.known
+                        ? static_cast<std::uint8_t>(alias.value + 128) : 0;
+                } else
+                    state.m6502_saved_stack_aliases = {};
+            } else {
+                std::optional<std::size_t> slot;
+                if (state.stack_depth.known) {
+                    std::int64_t cell_depth = 0;
+                    if (subtract_checked(state.stack_depth.value, 1, cell_depth))
+                        slot = m6502_saved_stack_index(cell_depth);
+                }
+                if (slot) {
+                    const auto saved = state.m6502_saved_stack_aliases[*slot];
+                    state.m6502_stack_alias_deltas[operation.index] = saved
+                        ? FlowValue{true, static_cast<std::int64_t>(saved) - 128} : FlowValue{};
+                    state.m6502_saved_stack_aliases[*slot] = {};
+                } else {
+                    state.m6502_stack_alias_deltas[operation.index] = {};
+                    state.m6502_saved_stack_aliases = {};
+                }
+            }
             return add(state.stack_depth, operation.push ? 1 : -1);
         }
         default:

@@ -31,10 +31,14 @@ Result<MachOSharedCacheInfo> inspect_macho_shared_cache_mappings(
         return Error{ErrorCode::malformed, "dyld shared-cache header is shorter than its mapping-table prefix"};
     if (stop.stop_requested()) return Error{ErrorCode::canceled, "dyld shared-cache inspection canceled"};
 
-    auto header_view = storage.read_at(FileOffset{0}, header_prefix_size);
+    constexpr std::size_t shared_region_start_offset = 224;
+    constexpr std::size_t shared_region_start_end = shared_region_start_offset + sizeof(std::uint64_t);
+    const auto header_bytes = static_cast<std::size_t>(std::min<std::uint64_t>(
+        storage.size(), shared_region_start_end));
+    auto header_view = storage.read_at(FileOffset{0}, header_bytes);
     if (!header_view) return header_view.error();
     const auto header = header_view.value().bytes;
-    if (header.size() != header_prefix_size)
+    if (header.size() < header_prefix_size)
         return Error{ErrorCode::malformed, "dyld shared-cache header prefix is truncated"};
     constexpr std::array<char, 7> magic_prefix{'d', 'y', 'l', 'd', '_', 'v', '1'};
     for (std::size_t i = 0; i < magic_prefix.size(); ++i)
@@ -51,6 +55,10 @@ Result<MachOSharedCacheInfo> inspect_macho_shared_cache_mappings(
         result.magic.push_back(static_cast<char>(character));
     }
     while (!result.magic.empty() && result.magic.back() == ' ') result.magic.pop_back();
+    if (header.size() >= shared_region_start_end) {
+        const auto base = little_u64(header, shared_region_start_offset);
+        if (base != 0) result.shared_region_start = base;
+    }
 
     const auto mapping_offset = little_u32(header, 16);
     const auto mapping_count = little_u32(header, 20);
@@ -117,6 +125,23 @@ Result<FileOffset> macho_shared_cache_file_offset(
     if (mapping.file_offset > UINT64_MAX - displacement)
         return Error{ErrorCode::overflow, "dyld shared-cache file offset overflows"};
     return FileOffset{mapping.file_offset + displacement};
+}
+
+Result<MachOChainedTargetBases> macho_chained_target_bases_from_shared_cache(
+    const MachOSharedCacheInfo &cache) {
+    if (!cache.shared_region_start || !*cache.shared_region_start)
+        return Error{ErrorCode::unsupported,
+            "dyld shared-cache header does not provide a usable unslid shared-region base"};
+    if (cache.mappings.empty() || cache.mappings.size() > 65'536)
+        return Error{ErrorCode::invalid_argument, "dyld shared-cache mapping inventory is empty or exceeds its limit"};
+    for (const auto &mapping : cache.mappings) {
+        if (!mapping.size || mapping.address > UINT64_MAX - mapping.size ||
+            *cache.shared_region_start > mapping.address)
+            return Error{ErrorCode::malformed, "dyld shared-cache mapping inventory conflicts with its shared-region base"};
+    }
+    MachOChainedTargetBases bases;
+    bases.shared_cache_base = cache.shared_region_start;
+    return bases;
 }
 
 } // namespace hexlab

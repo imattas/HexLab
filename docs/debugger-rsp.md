@@ -361,7 +361,9 @@ back to determine whether the requested snapshot committed; otherwise it
 restores the prior snapshot when known. Failed or ambiguous recovery clears the
 connection-local cache and reports unknown remote state. These are private
 optional extensions; ordinary GDB RSP peers continue through the standard
-multi-packet path below.
+multi-packet path below. Readback rejects NUL bytes in environment names,
+values, and working-directory paths, matching the launch-setting encoder's
+validation and preventing an invalid snapshot from being used for rollback.
 
 For standard peers, this is a sequence of server settings, not an atomic remote transaction. If a
 set/unset packet fails or the caller cancels mid-batch, the client resets the

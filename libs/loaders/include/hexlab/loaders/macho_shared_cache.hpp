@@ -1,9 +1,11 @@
 #pragma once
 
 #include "hexlab/image/byte_storage.hpp"
+#include "hexlab/loaders/macho.hpp"
 #include "hexlab/loaders/loaders_export.hpp"
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <stop_token>
 #include <string>
 #include <vector>
@@ -21,6 +23,9 @@ struct MachOSharedCacheMapping {
 
 struct MachOSharedCacheInfo {
     std::string magic;
+    // Unslid base used by dyld chained fixups whose targets are relative to
+    // the beginning of the shared cache. Absent for truncated legacy headers.
+    std::optional<std::uint64_t> shared_region_start;
     std::vector<MachOSharedCacheMapping> mappings;
 };
 
@@ -39,5 +44,11 @@ HEXLAB_LOADERS_EXPORT Result<MachOSharedCacheInfo> inspect_macho_shared_cache_ma
 // contiguous.
 HEXLAB_LOADERS_EXPORT Result<FileOffset> macho_shared_cache_file_offset(
     const MachOSharedCacheInfo &, std::uint64_t address, std::uint64_t size);
+
+// Builds the shared-cache base input for chained target resolution from the
+// validated dyld_cache_header field. Mapping ranges are intentionally omitted:
+// the legacy table may not describe split-cache companions.
+HEXLAB_LOADERS_EXPORT Result<MachOChainedTargetBases> macho_chained_target_bases_from_shared_cache(
+    const MachOSharedCacheInfo &);
 
 } // namespace hexlab

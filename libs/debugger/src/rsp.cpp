@@ -135,7 +135,12 @@ Result<RemoteLaunchSettings> decode_launch_settings(std::string_view data) {
         item.name.assign(data.substr(at, n)); at += n;
         if (item.name.find('=') != std::string::npos || item.name.find('\0') != std::string::npos || !names.insert(item.name).second)
             return Error{ErrorCode::malformed, "invalid launch-settings variable name"};
-        if (v != UINT32_MAX) { item.value = std::string(data.substr(at, v)); at += v; }
+        if (v != UINT32_MAX) {
+            item.value = std::string(data.substr(at, v));
+            if (item.value->find('\0') != std::string::npos)
+                return Error{ErrorCode::malformed, "NUL in launch environment value"};
+            at += v;
+        }
         const auto cost = n + (v == UINT32_MAX ? 0 : v);
         if (cost > 64 * 1024 - total) return Error{ErrorCode::malformed, "launch-settings snapshot exceeds byte limit"};
         total += cost; result.environment.push_back(std::move(item));

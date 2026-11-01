@@ -14,6 +14,12 @@ The CLI syntax is `macho chained-targets <image> [--shared-cache-base <address>]
 
 Format references: [Apple dyld chained fixup definitions](https://github.com/apple-oss-distributions/dyld/blob/main/include/mach-o/fixup-chains.h) and [Apple kernel documentation for `dyld_chained_ptr_64_kernel_cache_rebase`](https://developer.apple.com/documentation/kernel/dyld_chained_ptr_64_kernel_cache_rebase).
 
+`inspect_macho_shared_cache_mappings` also retains the dyld cache header's unslid `sharedRegionStart` when the
+header contains that field. `macho_chained_target_bases_from_shared_cache` converts the base into resolver input,
+so formats 4 and 13 can be resolved without manually copying it. It leaves mapping constraints empty because the
+legacy mapping table may omit split-cache companions; callers that need membership validation must supply complete
+mapping ranges from all cache files.
+
 ## Preferred-image-base offset rebases
 
 Formats 6 (`DYLD_CHAINED_PTR_64_OFFSET`), 9 (`DYLD_CHAINED_PTR_ARM64E_USERLAND`),
