@@ -698,11 +698,18 @@ candidate parameter list unresolved. Integer-only 8-byte structures use R3,
 and supported 16-byte structures are projected across R3/R4. Larger supported
 structures use the classifier's hidden R3 result pointer. Complete 128-bit
 vector parameters use V2-V13 by vector-class order, and vector results use V2;
-typed vector metadata must identify a complete vector. More than twelve vector
-parameters, variadic placement, vector aggregates, and aggregate layouts outside
-that bounded classifier subset remain unsupported. Unprototyped vector register
-observations do not establish parameter order and are not promoted to candidate
-parameters on their own.
+typed vector metadata must identify a complete vector. The shared ABI API can
+classify variadic PPC64 call sites when callers provide the actual argument
+types: it applies default promotions, then maps unnamed values to GPR
+doubleword positions and parameter-save-area homes, including partial
+register/stack splits. The current decompiler call IR does not retain ordered
+actual argument expressions or types, so type recovery does not invoke that
+call-site API and does not recover or render unnamed PPC64 call arguments.
+Variadic prototypes still constrain their named fixed parameters. Anonymous
+vector arguments, vector aggregates, more than twelve vector parameters, and
+aggregate layouts outside the bounded classifier subset remain unsupported.
+Unprototyped vector register observations do not establish parameter order and
+are not promoted to candidate parameters on their own.
 The profile follows the [OpenPOWER 64-bit ELF ABI specification](https://openpower.foundation/specifications/64bitelfabi/).
 
 MIPS N32 explicit prototypes now use the shared scalar classifier to constrain incoming `A0`–`A7` integer/pointer or `F12`–`F19` floating arguments and exact entry-relative 8-byte stack slots after the eight argument positions. The N32 data model retains 32-bit pointers with 64-bit GPR containers. Interprocedural argument propagation carries these classified scalar locations only when caller and callee ABI descriptions match, and uses the declared parameter index rather than treating the separate register classes as independently ordered. Scalar integer/pointer results use V0 and floating results use F0 through the existing MIPS N32 profile. Variadic, aggregate, array, vector and unprototyped mixed-class argument recovery remain unsupported; register observations alone do not establish parameter order.

@@ -415,12 +415,27 @@ the initial 32-byte frame header, at least 64 bytes and long enough for every
 argument home. The caller maintains 16-byte stack alignment and cleans up its
 frame.
 
-Variadic signatures, vector and complex values, decimal and extended binary
-floating formats, 128-bit integers, arrays as parameters, unresolved types,
-other aggregate layouts, and unknown C++ class semantics are unsupported.
-The algorithm follows the OpenPOWER [64-bit ELFv2 ABI specification](https://openpower.foundation/specifications/64bitelfabi/),
-especially [parameter save area, register selection, and returns in the
-published source](https://github.com/OpenPOWERFoundation/ELFv2-ABI/blob/2c052b1ec5a5e2c51989eb109f8559a9df6d8202/specification/ch_2.xml).
+For a variadic prototype, the prototype-only classifier places only its named
+parameters but reserves at least the 64-byte parameter save area required by
+the ellipsis. The call-site API requires actual types for every argument. It
+applies C default promotions to unnamed arguments (boolean and sub-32-bit
+integer values to `int`, and `float` to `double`), then applies the ELFv2
+unnamed-parameter rule: anonymous values consume GPR positions by 8-byte
+doubleword, even for promoted floating values. Values that straddle the last
+GPR are split between that register and the next stack home; later doublewords
+use their `SP+32+8*home` parameter-save-area locations. Anonymous C-like
+structures with supported integer-only fields are emitted as ordered 8-byte
+memory-image parts, including a short final part. The caller reserves at least
+64 bytes for the parameter save area on every variadic call.
+
+Variadic vectors, complex values, decimal and extended binary floating
+formats, 128-bit integers, arrays as parameters, unresolved types, aggregates
+over 32 bytes or with other layouts, and unknown C++ class semantics remain
+unsupported. The bounded call-site path follows ELFv2 §2.2.3.4: the unnamed
+parameter and GPR allocation rules, float promotion, save-area requirement,
+and partial GPR-to-memory split. The named-parameter behavior and fixed stack
+homes remain unchanged. See the OpenPOWER [64-bit ELFv2 ABI specification](https://openpower.foundation/specifications/64bitelfabi/)
+and its [official source](https://github.com/OpenPOWERFoundation/ELFv2-ABI/blob/2c052b1ec5a5e2c51989eb109f8559a9df6d8202/specification/ch_2.xml).
 
 ## SysV AMD64 binary80 scalar
 

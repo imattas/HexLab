@@ -1611,7 +1611,9 @@ AbiSignatureClassification classify_riscv_integer(CallingConvention convention,
 } // namespace
 
 namespace {
-AbiSignatureClassification classify_ppc64le_elfv2(const types::Type &function_type) {
+AbiSignatureClassification classify_ppc64le_elfv2(
+    const types::Type &function_type,
+    std::size_t variadic_start = std::numeric_limits<std::size_t>::max()) {
     AbiSignatureClassification out;
     out.convention = CallingConvention::ppc64le_elfv2;
     out.pointer_size = 8;
@@ -1629,8 +1631,8 @@ AbiSignatureClassification classify_ppc64le_elfv2(const types::Type &function_ty
     };
     if (function_type.kind() != types::Kind::function || !function_type.result_type())
         return fail_signature("input type is not a function signature");
-    if (function_type.variadic())
-        return fail_signature("PowerPC64 ELFv2 variadic placement is unsupported");
+    if (function_type.variadic() && variadic_start == std::numeric_limits<std::size_t>::max())
+        variadic_start = function_type.parameters().size();
     if (function_type.function_convention() != types::FunctionConvention::platform_default &&
         function_type.function_convention() != types::FunctionConvention::c_decl)
         return fail_signature("function declaration requests a different calling convention");
@@ -1640,7 +1642,7 @@ AbiSignatureClassification classify_ppc64le_elfv2(const types::Type &function_ty
         std::uint64_t size = 0;
         std::string reason;
     };
-    const auto shape = [&](const types::Type &source, bool result) {
+    const auto shape = [&](const types::Type &source, bool result, bool unnamed = false) {
         const auto &type = unqualified(source);
         Shape s;
         s.size = type.size().value_or(0);
@@ -1686,7 +1688,8 @@ AbiSignatureClassification classify_ppc64le_elfv2(const types::Type &function_ty
             // Reject classes with methods and all field classes needing special
             // float, vector, union, or bitfield treatment. The caller must
             // supply only C-compatible types; triviality is not modeled.
-            if ((s.size != 8 && s.size != 16 && s.size != 24 && s.size != 32) ||
+            if ((unnamed ? (s.size > 32) :
+                 (s.size != 8 && s.size != 16 && s.size != 24 && s.size != 32)) ||
                 type.members().empty() || !type.methods().empty()) {
                 s.reason = "PowerPC64 ELFv2 aggregate is outside the bounded C-like layout subset";
                 break;
@@ -1750,7 +1753,8 @@ AbiSignatureClassification classify_ppc64le_elfv2(const types::Type &function_ty
     std::uint64_t next_vector = 2;
     bool spilled = false;
     bool placement_known = true;
-    for (const auto &parameter : function_type.parameters()) {
+    for (std::size_t parameter_index = 0; parameter_index < function_type.parameters().size(); ++parameter_index) {
+        const auto &parameter = function_type.parameters()[parameter_index];
         if (!placement_known) {
             out.arguments.push_back(unsupported("preceding value makes PowerPC64 ELFv2 placement indeterminate"));
             continue;
@@ -1760,21 +1764,48 @@ AbiSignatureClassification classify_ppc64le_elfv2(const types::Type &function_ty
             out.complete = placement_known = false;
             continue;
         }
-        const auto value = shape(*parameter.type, false);
+        const bool unnamed = parameter_index >= variadic_start;
+        const auto value = shape(*parameter.type, false, unnamed);
         if (value.cls == Shape::Class::invalid || value.cls == Shape::Class::void_result) {
             out.arguments.push_back(unsupported(value.reason.empty() ?
                 "void is only valid as a function result" : value.reason));
             out.complete = placement_known = false;
             continue;
         }
-        const auto words = value.cls == Shape::Class::aggregate ? value.size / 8 : 1;
-        if (slot > (std::numeric_limits<std::uint64_t>::max() - 32) / 8 - words) {
+        if (unnamed && value.cls == Shape::Class::vector) {
+            out.arguments.push_back(unsupported("PowerPC64 ELFv2 variadic vector argument classification is outside the bounded C default-promotion model"));
+            out.complete = placement_known = false;
+            continue;
+        }
+        const auto words = unnamed ? (value.size + 7) / 8
+            : value.cls == Shape::Class::aggregate ? value.size / 8 : 1;
+        constexpr auto max_doublewords =
+            (std::numeric_limits<std::uint64_t>::max() - 32) / 8;
+        if (words > max_doublewords || slot > max_doublewords - words) {
             out.arguments.push_back(unsupported("PowerPC64 ELFv2 parameter area overflows"));
             out.complete = placement_known = false;
             continue;
         }
         AbiValueLocation argument;
-        if (value.cls == Shape::Class::vector && next_vector <= 13) {
+        if (unnamed) {
+            // ELFv2 §2.2.3.4's parameter algorithm classifies every ellipsis
+            // argument as an unnamed parameter: its doublewords consume GPR
+            // positions (and the corresponding parameter-save-area homes),
+            // even when the value's ordinary class is floating point.
+            for (std::uint64_t part = 0; part < words; ++part) {
+                const auto part_offset = part * 8;
+                const auto part_size = std::min<std::uint64_t>(8, value.size - part_offset);
+                const auto home = slot + part;
+                if (home < 8)
+                    argument.locations.push_back(reg_location("R" + std::to_string(3 + home),
+                        part_size, part_offset, 8));
+                else {
+                    argument.locations.push_back(stack_location(32 + home * 8, part_size, 8,
+                                                                part_offset, 8));
+                    spilled = true;
+                }
+            }
+        } else if (value.cls == Shape::Class::vector && next_vector <= 13) {
             argument.locations.push_back(reg_location("V" + std::to_string(next_vector++), 16, 0, 16));
         } else if (value.cls == Shape::Class::vector) {
             out.arguments.push_back(unsupported("PowerPC64 ELFv2 vector arguments beyond V13 are outside the bounded classifier"));
@@ -1805,7 +1836,9 @@ AbiSignatureClassification classify_ppc64le_elfv2(const types::Type &function_ty
     }
     // Once a stack home is used, the caller reserves the whole parameter save
     // area, including its first eight doublewords.
-    if (spilled) out.stack_argument_bytes = std::max<std::uint64_t>(64, slot * 8);
+    if (spilled || function_type.variadic() ||
+        variadic_start != std::numeric_limits<std::size_t>::max())
+        out.stack_argument_bytes = std::max<std::uint64_t>(64, slot * 8);
     return out;
 }
 
@@ -2545,9 +2578,10 @@ AbiSignatureClassification classify_abi_call(
         return failure("call-site ABI input is not a complete function type");
     if (!function_type.variadic())
         return failure("call-site ABI classification requires a variadic function type");
+    const bool ppc64_call = convention == CallingConvention::ppc64le_elfv2;
     if (convention != CallingConvention::sysv_x86_64 && convention != CallingConvention::windows_x64 &&
-        !aapcs32_call && !aapcs64_call && !x86_32_fastcall_call)
-        return failure("call-site variadic classification supports SysV AMD64, Microsoft x64, AAPCS32/AAPCS64, and x86 fastcall");
+        !aapcs32_call && !aapcs64_call && !x86_32_fastcall_call && !ppc64_call)
+        return failure("call-site variadic classification supports SysV AMD64, Microsoft x64, AAPCS32/AAPCS64, PPC64 ELFv2, and x86 fastcall");
     constexpr std::size_t max_call_arguments = 4096;
     if (actual_argument_types.size() > max_call_arguments)
         return failure("variadic call-site argument count exceeds 4096");
@@ -2614,7 +2648,9 @@ AbiSignatureClassification classify_abi_call(
     auto concrete_type = types::Type::function(function_type.result_type(), std::move(call_parameters),
                                                 false, concrete_convention);
     if (!concrete_type) return failure(concrete_type.error().message);
-    auto out = classify_abi_signature(effective_convention, *concrete_type.value());
+    auto out = ppc64_call
+        ? classify_ppc64le_elfv2(*concrete_type.value(), fixed_parameters.size())
+        : classify_abi_signature(effective_convention, *concrete_type.value());
     if (out.arguments.size() != actual_argument_types.size())
         return failure("ABI classifier returned an inconsistent call-site argument count");
 
