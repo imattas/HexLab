@@ -48,6 +48,7 @@ constexpr unsigned long nt_arm_hw_break = 0x402;
 constexpr unsigned long nt_arm_hw_watch = 0x403;
 constexpr unsigned long nt_arm_sve = 0x405;
 constexpr unsigned long nt_arm_pac_mask = 0x406;
+constexpr unsigned long nt_arm_tagged_addr_ctrl = 0x409;
 constexpr unsigned long nt_arm_ssve = 0x40b;
 constexpr unsigned long nt_arm_za = 0x40c;
 constexpr unsigned long nt_arm_zt = 0x40d;
@@ -456,6 +457,20 @@ Result<Aarch64PacMask> get_pac_mask(pid_t tid) {
     if (io.iov_len != sizeof(mask))
         return Error{ErrorCode::malformed, "Linux AArch64 NT_ARM_PAC_MASK regset has an unexpected size"};
     return mask;
+}
+Result<std::uint64_t> get_tagged_addr_ctrl(pid_t tid) {
+    std::uint64_t control{};
+    iovec io{&control, sizeof(control)};
+    if (ptrace(PTRACE_GETREGSET, tid, reinterpret_cast<void*>(nt_arm_tagged_addr_ctrl), &io) != 0) {
+        const int error = errno;
+        if (error == EINVAL || error == EIO || error == ENODEV || error == ENOSYS)
+            return Error{ErrorCode::unsupported, "Linux AArch64 tagged-address control state is unavailable"};
+        errno = error;
+        return sys_error("PTRACE_GETREGSET NT_ARM_TAGGED_ADDR_CTRL");
+    }
+    if (io.iov_len != sizeof(control))
+        return Error{ErrorCode::malformed, "Linux AArch64 NT_ARM_TAGGED_ADDR_CTRL regset has an unexpected size"};
+    return control;
 }
 Result<std::pair<Aarch64TlsState, bool>> get_tls_state(pid_t tid) {
     Aarch64TlsState state{};
@@ -1605,6 +1620,11 @@ public:
             append_pac_mask("pac_data_mask", pac_mask.value().data);
             append_pac_mask("pac_instruction_mask", pac_mask.value().instruction);
         } else if (pac_mask.error().code != ErrorCode::unsupported) return pac_mask.error();
+        auto tagged_addr_ctrl = get_tagged_addr_ctrl(static_cast<pid_t>(thread));
+        if (tagged_addr_ctrl)
+            append_bytes("tagged_addr_ctrl", reinterpret_cast<const std::byte*>(&tagged_addr_ctrl.value()),
+                         sizeof(tagged_addr_ctrl.value()), "system");
+        else if (tagged_addr_ctrl.error().code != ErrorCode::unsupported) return tagged_addr_ctrl.error();
         auto tls = get_tls_state(static_cast<pid_t>(thread));
         if (tls) {
             append_bytes("tpidr_el0", reinterpret_cast<const std::byte*>(&tls.value().first.tpidr_el0), 8, "thread");

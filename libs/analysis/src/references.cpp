@@ -7021,6 +7021,16 @@ derive_reference_values(const Image *image, const FunctionSnapshot &functions, c
             if (fact)
                 instructions_by_id.emplace(fact->id, &fact->instruction);
         }
+        const auto wasm_tail_direct_call = [](const Instruction &instruction) {
+            return instruction.context.architecture == Architecture::wasm &&
+                instruction.context.mode == ExecutionMode::wasm32 && instruction.flow == FlowKind::jump &&
+                instruction.mnemonic_override == "return_call";
+        };
+        const auto wasm_tail_indirect_call = [](const Instruction &instruction) {
+            return instruction.context.architecture == Architecture::wasm &&
+                instruction.context.mode == ExecutionMode::wasm32 && instruction.flow == FlowKind::jump &&
+                instruction.mnemonic_override == "return_call_indirect";
+        };
         // A deliberately narrow call_indirect resolver. It accepts only a
         // constant selector immediately before the operator and a local
         // table whose complete decoded module has no possible table writes.
@@ -7028,7 +7038,8 @@ derive_reference_values(const Image *image, const FunctionSnapshot &functions, c
             -> std::variant<std::monostate, Address, ExternalIdentity> {
             if (!image || !functions.complete || functions.omitted_functions || functions.omitted_blocks || !metadata.wasm ||
                 call.context.architecture != Architecture::wasm || call.context.mode != ExecutionMode::wasm32 ||
-                call.flow != FlowKind::call || call.mnemonic_override != "call_indirect" ||
+                !((call.flow == FlowKind::call && call.mnemonic_override == "call_indirect") ||
+                  wasm_tail_indirect_call(call)) ||
                 call.operands.size() != 2)
                 return {};
             const auto &wasm = *metadata.wasm;
@@ -7512,8 +7523,9 @@ derive_reference_values(const Image *image, const FunctionSnapshot &functions, c
             if (instruction.flow != FlowKind::call && instruction.flow != FlowKind::jump &&
                 instruction.flow != FlowKind::conditional_branch)
                 continue;
+            const bool wasm_tail_call = wasm_tail_direct_call(instruction) || wasm_tail_indirect_call(instruction);
             const auto kind = analysis_detail::is_mips_conditional_link_branch(instruction) ? ReferenceKind::conditional_call
-                              : instruction.flow == FlowKind::call   ? ReferenceKind::call
+                              : (instruction.flow == FlowKind::call || wasm_tail_call) ? ReferenceKind::call
                               : instruction.flow == FlowKind::jump ? ReferenceKind::jump
                                                                    : ReferenceKind::conditional_jump;
             auto control_index = instruction.opcode == Opcode::rv_jalr && instruction.operands.size() > 1
@@ -7564,6 +7576,29 @@ derive_reference_values(const Image *image, const FunctionSnapshot &functions, c
             if (!target && image && instruction.context.architecture == Architecture::dex &&
                 instruction.flow == FlowKind::call)
                 target = dex_invoke_code_target(instruction, *image, metadata);
+            const bool wasm_direct_call =
+                (instruction.context.architecture == Architecture::wasm &&
+                 instruction.context.mode == ExecutionMode::wasm32 && instruction.flow == FlowKind::call &&
+                 instruction.mnemonic_override == "call") || wasm_tail_direct_call(instruction);
+            if (!target && image && wasm_direct_call && metadata.wasm && control_index < instruction.operands.size()) {
+                const auto *index = std::get_if<ImmediateOperand>(&instruction.operands[control_index]);
+                const auto &wasm = *metadata.wasm;
+                const auto total_functions = static_cast<std::uint64_t>(wasm.imported_functions) + wasm.defined_functions;
+                if (index && !index->is_signed && index->effective_width == 32 &&
+                    index->value >= wasm.imported_functions && index->value < total_functions &&
+                    index->value < wasm.function_type_indices.size() &&
+                    wasm.function_type_indices[static_cast<std::size_t>(index->value)] < wasm.function_types.size() &&
+                    index->value <= UINT32_MAX) {
+                    const Address candidate{AddressSpaceId{static_cast<std::uint32_t>(index->value)}, 0};
+                    const auto *segment = image->segment_at(candidate);
+                    const auto context = image->context_at(candidate);
+                    if (segment && segment->begin == candidate && segment->executable && segment->size &&
+                        segment->file_size == segment->size && context &&
+                        context.value().architecture == Architecture::wasm &&
+                        context.value().mode == ExecutionMode::wasm32)
+                        target = candidate;
+                }
+            }
             if (!target && !resolution.constant && !resolution.relocated()) {
                 bool dataflow_target = false;
                 const auto computed = x86_facts.immediate_targets.find(
@@ -7628,8 +7663,7 @@ derive_reference_values(const Image *image, const FunctionSnapshot &functions, c
             else if (const auto *indirect_import = std::get_if<ExternalIdentity>(&indirect))
                 wasm_import_target = *indirect_import;
             if (!target && instruction.context.architecture == Architecture::wasm &&
-                instruction.context.mode == ExecutionMode::wasm32 && instruction.flow == FlowKind::call &&
-                instruction.mnemonic_override == "call" && metadata.wasm &&
+                instruction.context.mode == ExecutionMode::wasm32 && wasm_direct_call && metadata.wasm &&
                 control_index < instruction.operands.size()) {
                 const auto *index = std::get_if<ImmediateOperand>(&instruction.operands[control_index]);
                 const auto &wasm = *metadata.wasm;

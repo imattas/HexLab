@@ -765,7 +765,7 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
     for (std::size_t n=0;n<code.size();++n) {
         const auto op=std::to_integer<std::uint8_t>(code[n]->instruction.bytes[0]);
         if (op==2||op==3||op==4||op==5||op==0x0b||op==0x00) { boundaries.insert(n); boundaries.insert(n+1); }
-        if (op==0x0c||op==0x0d||op==0x0e) { boundaries.insert(n); boundaries.insert(n+1); }
+        if (op==0x0c||op==0x0d||op==0x0e||op==0x12||op==0x13) { boundaries.insert(n); boundaries.insert(n+1); }
         for (std::size_t li=0;li<function_label;++li)
             if (labels[li].opener<n&&n<labels[li].end) active_labels[n].push_back(li);
         std::sort(active_labels[n].begin(),active_labels[n].end(),[&](auto a,auto b){return labels[a].opener<labels[b].opener;});
@@ -802,7 +802,7 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
         const auto finish=bi+1<starts.size()?starts[bi+1]:code.size(),n=finish-1;
         const auto op=std::to_integer<std::uint8_t>(code[n]->instruction.bytes[0]);
         const auto fallthrough=n+1;
-        if(op==0x0f||op==0x00||(op==0x0b&&n==function_end))continue;
+        if(op==0x0f||op==0x00||op==0x12||op==0x13||(op==0x0b&&n==function_end))continue;
         if(op==0x0c||op==0x0d){const auto depth=*immediate(code[n]->instruction);const auto li=active_labels[n][active_labels[n].size()-1-static_cast<std::size_t>(depth)];const auto target=li==function_label?function_end:labels[li].kind==3?labels[li].opener+1:labels[li].end+1;if(!add_edge(bi,target,op==0x0c?BlockEdgeKind::jump:BlockEdgeKind::conditional_true,li))return unsupported("branch target is not a block boundary");if(op==0x0d&&fallthrough<code.size()&&!add_edge(bi,fallthrough,BlockEdgeKind::conditional_false))return unsupported("conditional fallthrough is not a block boundary");continue;}
         if (op == 0x0e) { auto targets = table_targets(n); if (!targets) return targets.error(); for (const auto &target : targets.value()) if (!add_edge(bi, target.target, BlockEdgeKind::jump, target.label)) return unsupported("br_table target is not a block boundary"); continue; }
         if(op==4){const auto li=*opener_label[n];const auto false_target=labels[li].else_index<code.size()?labels[li].else_index+1:labels[li].end+1;if(fallthrough>=code.size()||!add_edge(bi,fallthrough,BlockEdgeKind::conditional_true)||false_target>=code.size()||!add_edge(bi,false_target,BlockEdgeKind::conditional_false))return unsupported("if target is outside the function body");continue;}
@@ -927,7 +927,7 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
                 else { auto value = shape_pop(stack, *type); if (!value) return value.error(); }
                 continue;
             }
-            if (op == 0x10) {
+            if (op == 0x10 || op == 0x12) {
                 const auto index = immediate(code[n]->instruction);
                 const auto *callee = index ? signature_for(*index) : nullptr;
                 if (!callee || callee->parameter_count != callee->parameter_types.size() ||
@@ -941,14 +941,18 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
                     auto argument = shape_pop(stack, *type);
                     if (!argument) return argument.error();
                 }
-                for (const auto result : callee->result_types) {
+                if (op == 0x12 && (!function_signature ||
+                    callee->result_types != function_signature->result_types))
+                    return unsupported("return_call result types do not match the current function signature");
+                if (op == 0x12) stack.clear();
+                else for (const auto result : callee->result_types) {
                     const auto type = wasm_value_type(result);
                     if (!type) return unsupported("direct call result type is unsupported");
                     stack.push_back(*type);
                 }
                 continue;
             }
-            if (op == 0x11) {
+            if (op == 0x11 || op == 0x13) {
                 const auto type_index = immediate(code[n]->instruction, 0);
                 if (!metadata || !type_index || *type_index >= metadata->function_types.size())
                     return unsupported("call_indirect type metadata is unavailable");
@@ -964,7 +968,11 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
                     auto argument = shape_pop(stack, *type);
                     if (!argument) return argument.error();
                 }
-                for (const auto result : callee.result_types) {
+                if (op == 0x13 && (!function_signature ||
+                    callee.result_types != function_signature->result_types))
+                    return unsupported("return_call_indirect result types do not match the current function signature");
+                if (op == 0x13) stack.clear();
+                else for (const auto result : callee.result_types) {
                     auto type = wasm_value_type(result);
                     if (!type) return unsupported("call_indirect result type is unsupported");
                     stack.push_back(*type);
@@ -1544,7 +1552,7 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
                     if (!pop_stack_fact()) invalidate_stack_facts();
                 } else if (op != 0x01) {
                     invalidate_stack_facts();
-                    if (op == 0x10 || op == 0x11) {
+                    if (op == 0x10 || op == 0x11 || op == 0x12 || op == 0x13) {
                         // Calls can mutate any mutable global through direct,
                         // imported, or table-dispatched code.
                         if (metadata)
@@ -1776,12 +1784,15 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
                 }
                 continue;
             }
-            if (op == 0x10) {
+            if (op == 0x10 || op == 0x12) {
                 const auto index = immediate(code[n]->instruction);
                 const auto *callee = index ? signature_for(*index) : nullptr;
                 if (!index || !callee || callee->parameter_count != callee->parameter_types.size() ||
                     callee->result_count != callee->result_types.size())
                     return unsupported("direct call target or function signature metadata is unavailable");
+                if (op == 0x12 && (!function_signature ||
+                    callee->result_types != function_signature->result_types))
+                    return unsupported("return_call result types do not match the current function signature");
                 if (callee->parameter_types.size() > max_stack || callee->result_types.size() > max_stack)
                     return Error{ErrorCode::resource_limit, "direct call exceeds the 128-value parameter/result bound"};
                 std::vector<ExpressionPtr> arguments(callee->parameter_types.size());
@@ -1793,17 +1804,22 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
                     arguments[argument - 1] = value.value();
                 }
                 Intrinsic call;
-                call.name = "wasm_call_function_" + std::to_string(*index);
+                call.name = (op == 0x12 ? "wasm_return_call_function_" : "wasm_call_function_") + std::to_string(*index);
                 call.operands = std::move(arguments);
                 call.memory_effect = IntrinsicMemoryEffect::unknown;
                 auto result_values = append_call_results(call, callee->result_types);
                 if (!result_values) return result_values.error();
                 emit(n, std::move(call));
+                if (op == 0x12) {
+                    auto returned = emit_return(n, function_result_types.value());
+                    if (!returned) return returned.error();
+                    continue;
+                }
                 if (stack.size() > max_stack)
                     return Error{ErrorCode::resource_limit, "WebAssembly operand stack exceeds 128 values"};
                 continue;
             }
-            if (op == 0x11) {
+            if (op == 0x11 || op == 0x13) {
                 const auto type_index = immediate(i, 0), table_index = immediate(i, 1);
                 if (!metadata || !type_index || !table_index || *table_index != 0 ||
                     static_cast<std::uint64_t>(metadata->imported_tables) + metadata->defined_tables != 1 ||
@@ -1814,6 +1830,9 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
                     callee->result_count != callee->result_types.size() ||
                     callee->parameter_types.size() > 127 || callee->result_types.size() > max_stack)
                     return Error{ErrorCode::resource_limit, "call_indirect exceeds the 127-parameter or 128-result bound"};
+                if (op == 0x13 && (!function_signature ||
+                    callee->result_types != function_signature->result_types))
+                    return unsupported("return_call_indirect result types do not match the current function signature");
                 if (stack.empty() || stack.back()->type != integer(32))
                     return unsupported("call_indirect table index is unavailable or not i32");
                 auto table_index_value = stack.back();
@@ -1833,7 +1852,7 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
                     arguments[argument - 1] = value.value();
                 }
                 Intrinsic call;
-                call.name = "wasm_call_indirect_type_" + std::to_string(*type_index);
+                call.name = (op == 0x13 ? "wasm_return_call_indirect_type_" : "wasm_call_indirect_type_") + std::to_string(*type_index);
                 if (target_function)
                     call.name += "_target_" + std::to_string(*target_function);
                 call.operands = std::move(arguments);
@@ -1842,6 +1861,10 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
                 auto result_values = append_call_results(call, callee->result_types);
                 if (!result_values) return result_values.error();
                 emit(n, std::move(call));
+                if (op == 0x13) {
+                    auto returned = emit_return(n, function_result_types.value());
+                    if (!returned) return returned.error();
+                }
                 continue;
             }
             if (op >= 0x28 && op <= 0x3e) {

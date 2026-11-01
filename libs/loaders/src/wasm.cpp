@@ -1970,15 +1970,15 @@ bool validate_body(const FunctionBody &body, std::span<const std::byte> module,
             if (!pop(0x7f) || !pop_types(first))
                 return fail("branch table type mismatch");
             dead();
-        } else if (op == 0x10 || op == 0x11) {
+        } else if (op == 0x10 || op == 0x11 || op == 0x12 || op == 0x13) {
             if (!code.uleb(index)) return fail("invalid call index");
             const WasmFunctionType *callee = nullptr;
-            if (op == 0x10) {
+            if (op == 0x10 || op == 0x12) {
                 if (index >= metadata.function_type_indices.size()) return fail("call index out of range");
                 callee = &metadata.function_types[metadata.function_type_indices[index]];
             } else {
-                std::uint8_t table = 0;
-                if (!code.byte(table) || table != 0 || index >= metadata.function_types.size() ||
+                std::uint32_t table = 0;
+                if (!code.uleb(table) || table != 0 || index >= metadata.function_types.size() ||
                     metadata.imported_tables + metadata.defined_tables != 1)
                     return fail("invalid indirect call type or table");
                 if (!pop(0x7f)) return fail("indirect call table index must be i32");
@@ -1986,7 +1986,13 @@ bool validate_body(const FunctionBody &body, std::span<const std::byte> module,
             }
             for (auto it = callee->parameter_types.rbegin(); it != callee->parameter_types.rend(); ++it)
                 if (!pop(*it)) return fail("call argument type mismatch");
-            for (auto type : callee->result_types) if (!push(type)) return fail("operand stack limit exceeded");
+            if (op == 0x12 || op == 0x13) {
+                if (callee->result_types != signature.result_types)
+                    return fail("tail-call result types must match the current function");
+                dead();
+            } else {
+                for (auto type : callee->result_types) if (!push(type)) return fail("operand stack limit exceeded");
+            }
         } else if (op == 0x1a) {
             if (!pop(0)) return fail("drop stack underflow");
         } else if (op == 0x1b) {

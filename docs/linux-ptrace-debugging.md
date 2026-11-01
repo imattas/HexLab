@@ -101,6 +101,12 @@ as malformed instead of being guessed. The masks describe PAC bit positions,
 not authentication keys, and are not suitable for interpreting TTBR1/kernel
 pointers.
 
+When `NT_ARM_TAGGED_ADDR_CTRL` is available, register inspection also includes
+the 64-bit `tagged_addr_ctrl` value in the `system` group. It is a read-only
+snapshot of the thread's Linux tagged-address/MTE ABI controls; HexLab does not
+decode or change its flag fields. MTE allocation-tag memory reads use the
+separate `read_memory_tags` API described below.
+
 `NT_FPREGSET` represents the base FPSIMD view. When `NT_ARM_SVE` is available,
 the register view also exposes the active vector length, `z0`-`z31`,
 `p0`-`p15`, `ffr`, and FPSR/FPCR; `vN` and `dN` remain aliases of the low

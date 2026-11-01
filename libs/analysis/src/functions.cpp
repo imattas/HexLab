@@ -177,11 +177,26 @@ std::optional<Address> dex_direct_call_target(const Instruction &instruction, co
         context.value().mode != ExecutionMode::dex) return {};
     return target;
 }
+bool wasm_terminal_direct_call(const Instruction &instruction) {
+    return instruction.context.architecture == Architecture::wasm &&
+        instruction.context.mode == ExecutionMode::wasm32 &&
+        ((instruction.flow == FlowKind::call && instruction.mnemonic_override == "call") ||
+         (instruction.flow == FlowKind::jump && instruction.mnemonic_override == "return_call"));
+}
+bool wasm_terminal_indirect_call(const Instruction &instruction) {
+    return instruction.context.architecture == Architecture::wasm &&
+        instruction.context.mode == ExecutionMode::wasm32 &&
+        ((instruction.flow == FlowKind::call && instruction.mnemonic_override == "call_indirect") ||
+         (instruction.flow == FlowKind::jump && instruction.mnemonic_override == "return_call_indirect"));
+}
+bool wasm_terminal_call(const Instruction &instruction) {
+    return wasm_terminal_direct_call(instruction) || wasm_terminal_indirect_call(instruction);
+}
 std::optional<Address> wasm_direct_call_target(const Instruction &instruction, const Image &image,
                                                 const ImageMetadata &metadata) {
     if (instruction.context.architecture != Architecture::wasm ||
-        instruction.context.mode != ExecutionMode::wasm32 || instruction.flow != FlowKind::call ||
-        instruction.mnemonic_override != "call" || instruction.operands.size() != 1 || !metadata.wasm)
+        instruction.context.mode != ExecutionMode::wasm32 || !wasm_terminal_direct_call(instruction) ||
+        instruction.operands.size() != 1 || !metadata.wasm)
         return {};
     const auto *index = std::get_if<ImmediateOperand>(&instruction.operands.front());
     const auto &wasm = *metadata.wasm;
@@ -207,8 +222,8 @@ std::optional<Address> wasm_direct_call_target(const Instruction &instruction, c
 std::optional<ExternalIdentity> wasm_import_call_target(const Instruction &instruction,
                                                         const ImageMetadata &metadata) {
     if (instruction.context.architecture != Architecture::wasm ||
-        instruction.context.mode != ExecutionMode::wasm32 || instruction.flow != FlowKind::call ||
-        instruction.mnemonic_override != "call" || instruction.operands.size() != 1 || !metadata.wasm)
+        instruction.context.mode != ExecutionMode::wasm32 || !wasm_terminal_direct_call(instruction) ||
+        instruction.operands.size() != 1 || !metadata.wasm)
         return {};
     const auto *index = std::get_if<ImmediateOperand>(&instruction.operands.front());
     const auto &wasm = *metadata.wasm;
@@ -2379,7 +2394,7 @@ Node &Recovery::node(Address address, ThumbITState incoming_it) {
         value.external_call_target = std::move(external_call_target);
         if (value.call_target && target_it().known)
             thumb_states.emplace(*value.call_target, target_it());
-        if (!value.call_target && !value.external_call_target)
+        if (!value.call_target && !value.external_call_target && !wasm_terminal_indirect_call(instruction))
             value.call_issue = FunctionStop{
                 address,
                 instruction.context.architecture == Architecture::arm && flow_target ? FunctionStopReason::unsupported
@@ -2435,6 +2450,7 @@ Node &Recovery::node(Address address, ThumbITState incoming_it) {
     }
     case FlowKind::jump:
     {
+        const bool wasm_tail_call = wasm_terminal_call(instruction);
         const bool predicated_arm_transfer = instruction.context.architecture == Architecture::arm && instruction.arm &&
                                              instruction.arm->predicate != ArmPredicate::always;
         if (instruction.context.architecture == Architecture::arm) {
@@ -2447,9 +2463,24 @@ Node &Recovery::node(Address address, ThumbITState incoming_it) {
                 break;
             }
         }
-        value.edges.push_back({flow_target, flow_target ? BlockEdgeKind::jump : BlockEdgeKind::unresolved, target_it(),
-                               executes_with, writes_nzcv});
-        if (!flow_target) {
+        if (!wasm_tail_call || flow_target || !external_call_target)
+            value.edges.push_back({flow_target, flow_target ? BlockEdgeKind::jump : BlockEdgeKind::unresolved,
+                                   target_it(), executes_with, writes_nzcv});
+        if (wasm_tail_call) {
+            value.call = true;
+            value.call_guard = executes_with;
+            value.call_target = flow_target;
+            value.external_call_target = std::move(external_call_target);
+            if (!value.call_target && !value.external_call_target && !wasm_terminal_indirect_call(instruction))
+                value.call_issue = FunctionStop{address, unresolved(),
+                    "WebAssembly tail call does not resolve to a validated local body or function import"};
+            else if (value.call_target) {
+                if (auto denied = permission(*value.call_target))
+                    value.call_issue = FunctionStop{address, *denied,
+                        "WebAssembly tail-call target has no permitted initialized code"};
+            }
+        }
+        if (!flow_target && !wasm_tail_call) {
             value.stop = FunctionStop{address, unresolved(), "Jump target remains unresolved"};
             value.stop_guard = executes_with;
         }
@@ -2919,6 +2950,11 @@ void Recovery::assign_owners() {
                         continue;
                     }
                     if (edge.kind == BlockEdgeKind::jump) {
+                        const bool resolved_wasm_tail_call = current.fact &&
+                            wasm_terminal_call(current.fact->instruction) && call_reachable &&
+                            current.call_target == edge.target;
+                        if (resolved_wasm_tail_call)
+                            continue;
                         record_call({function->id, at, edge.target, functions.at(*edge.target)->id, true});
                         record({at, FunctionStopReason::tail_candidate,
                                 "Transfer reaches another established function entry"});
@@ -2945,7 +2981,7 @@ void Recovery::assign_owners() {
                                  decoded->second.fact->instruction.flow == FlowKind::jump;
             const bool transfers_to_function = std::any_of(output->calls.begin(), output->calls.end(),
                 [&](const auto &call) {
-                    return call.owner == function->id && call.source == entry && call.tail_candidate && call.callee;
+                    return call.owner == function->id && call.source == entry && call.callee;
                 });
             function->thunk = is_jump && transfers_to_function;
         }
@@ -3056,9 +3092,7 @@ void Recovery::resolve_wasm_indirect_calls() {
         const auto node = nodes.find(call.source);
         if (node == nodes.end() || !node->second.fact) continue;
         const auto &instruction = node->second.fact->instruction;
-        if (instruction.context.architecture != Architecture::wasm ||
-            instruction.context.mode != ExecutionMode::wasm32 || instruction.flow != FlowKind::call ||
-            instruction.mnemonic_override != "call_indirect" || instruction.operands.size() != 2)
+        if (!wasm_terminal_indirect_call(instruction) || instruction.operands.size() != 2)
             continue;
         const auto *required_type = std::get_if<ImmediateOperand>(&instruction.operands[0]);
         const auto *table_index = std::get_if<ImmediateOperand>(&instruction.operands[1]);
@@ -3092,6 +3126,12 @@ void Recovery::resolve_wasm_indirect_calls() {
             identity.wasm_function_index = function_index;
             identity.host_binding = imported->host_binding;
             call.external_target = std::move(identity);
+            if (wasm_tail_indirect_call(instruction)) {
+                auto &edges = node->second.edges;
+                edges.erase(std::remove_if(edges.begin(), edges.end(), [](const NodeEdge &edge) {
+                    return edge.kind == BlockEdgeKind::unresolved && !edge.target;
+                }), edges.end());
+            }
             continue;
         }
         const Address target{AddressSpaceId{function_index}, 0};
@@ -3105,6 +3145,16 @@ void Recovery::resolve_wasm_indirect_calls() {
         if (callee == functions.end()) continue;
         call.target = target;
         call.callee = callee->second->id;
+        auto &source = node->second;
+        if (wasm_tail_indirect_call(instruction)) {
+            source.call_target = target;
+            for (auto &edge : source.edges)
+                if (edge.kind == BlockEdgeKind::unresolved && !edge.target) {
+                    edge.target = target;
+                    edge.kind = BlockEdgeKind::jump;
+                    break;
+                }
+        }
     }
 }
 std::shared_ptr<const FunctionSnapshot> Recovery::run() {
@@ -3247,7 +3297,7 @@ bool semantic_decoder_image_reads_intersect(const AnalysisOptions &options,
 Sha256Digest function_engine_fingerprint(const AnalysisOptions &options) {
     Sha256 hash;
     constexpr std::string_view version =
-        "hexlab-functions-v98-jvm-local-code-method-roots-v1/mips32-regimm-conditional-call-edges-v1/semantic-decoder-manifest-single-capture-v2/x64-rip-indirect-call-slot-target-v1/riscv64-lw-signed-pointer-load-v1/mips64-bitfield-relocation-guard-v1/m6502-65c02-vector-roots-v2/wasm-direct-call-edges-v1/wasm-constant-call-indirect-function-edges-v1/a64-add-sub-carry-v1/riscv-masked-integer-reductions-v1/dex-register-index-16-v1/x64-loop-counter-alias-v1/elf-et-exec-section-init-fini-array-roots-v1/elf-legacy-ctors-dtors-roots-v1/windows-x64-outgoing-stack-store-call-provenance-v2/mips32-gpr-conditional-moves-v1/ppc-popcntb-v1/ppc-addze-addme-lift-v1/x86-implicit-multiply-lift-v1/x86-bit-scan-lift-v1/x86-bit-test-lift-v1/x86-movemask-lift-v2/x86-palignr-fallthrough-v1/x86-ssse3-pabs-lift-v1/ppc64-rldic-reference-v1/ppc64-rldcl-rldcr-reference-v1/a64-extr-reference-v1/a64-madd-msub-reference-v1/a64-conditional-select-nzcv-v1/mips32-cop1-conditional-moves-v1/riscv-bitwise-stack-copies-v1/mips32-cop1-branch-likely-v1/mips64-eh-frame-roots-v1/pe-x86-fpo-roots-and-extents-v1/riscv-bitwise-immediate-addresses-v1/dex-method-roots-call-edges-v2/dex-relative-control-operands-v1/dex-payload-data-v1/riscv-vfrsqrt7-vfrec7-v1/a64-preserving-bitfield-v1/a64-ubfm-sbfm-address-reference-v1/a64-nzcv-constant-flow-v1/nonx86-reference-producer-graph-v1/dataflow-reference-producer-graph-v4/reference-immediate-origin-v1/x86-vdivps-vdivpd-vex-evex-mxcsr-effects-v1/mips64-arithmetic-reference-v1/mips64-shift-rotate-reference-v1/mips64-special-conditional-traps-v1/evex-packed-fp-broadcast-v1/wasm-br-table-12-case-v1/dex-switch-flow-v1/dex-exception-flow-v1/jvm-switch-flow-v2/jvm-exception-flow-v1/pe-guard-cf-function-roots-v1/pe-chpe-execution-ranges-v1/pe-amd64-chained-function-chunks-v1/runtime-initializer-roots-v1/runtime-initializer-array-roots-v2/initializer-source-relocation-provenance-v1/string-scan-work-budget-v1/mips64-delay-slot-ownership-v1/explicit-root-budget-priority-v1/arm-predicate-nzcv-reachability-v1/thumb-it-condition-edges-v1/arm-a32-predicate-thumb-it-flow-v4/zydis-opaque-stop-v1/multiarc-flow-v1/switch-cfg-targets-v4/guard-multiblock-v1/unicode-strings-v3/windows1253-1255-strings-v1/iso8859-10-13-14-16-strings-v1/x86-scalar-context-v5/elf-symbol-roots-v2/elf-symbol-extents-v1/operand-encoding-v1/elf-relocation-flow-v2/pe-pogo-function-roots-v1/elf-powerpc-eh-frame-roots-v1/macho-compact-unwind-extents-v1/ppc64-elfv1-opd-symbol-roots-v1/wasm-export-function-roots-v1/wasm-start-function-root-v1/wasm-element-function-roots-v1/wasm-all-defined-function-roots-v1/m6502-reference-producer-graph-v1/riscv64-lwu-pointer-load-v1/riscv-zbb-count-reference-v1/mips64-dclz-dclo-reference-v1/elf-dwarf-entrypoint-roots-v1/pe-amd64-unwind-handler-roots-v1"
+        "hexlab-functions-v99-wasm-tail-call-analysis-v1-jvm-local-code-method-roots-v1/mips32-regimm-conditional-call-edges-v1/semantic-decoder-manifest-single-capture-v2/x64-rip-indirect-call-slot-target-v1/riscv64-lw-signed-pointer-load-v1/mips64-bitfield-relocation-guard-v1/m6502-65c02-vector-roots-v2/wasm-direct-call-edges-v1/wasm-constant-call-indirect-function-edges-v1/a64-add-sub-carry-v1/riscv-masked-integer-reductions-v1/dex-register-index-16-v1/x64-loop-counter-alias-v1/elf-et-exec-section-init-fini-array-roots-v1/elf-legacy-ctors-dtors-roots-v1/windows-x64-outgoing-stack-store-call-provenance-v2/mips32-gpr-conditional-moves-v1/ppc-popcntb-v1/ppc-addze-addme-lift-v1/x86-implicit-multiply-lift-v1/x86-bit-scan-lift-v1/x86-bit-test-lift-v1/x86-movemask-lift-v2/x86-palignr-fallthrough-v1/x86-ssse3-pabs-lift-v1/ppc64-rldic-reference-v1/ppc64-rldcl-rldcr-reference-v1/a64-extr-reference-v1/a64-madd-msub-reference-v1/a64-conditional-select-nzcv-v1/mips32-cop1-conditional-moves-v1/riscv-bitwise-stack-copies-v1/mips32-cop1-branch-likely-v1/mips64-eh-frame-roots-v1/pe-x86-fpo-roots-and-extents-v1/riscv-bitwise-immediate-addresses-v1/dex-method-roots-call-edges-v2/dex-relative-control-operands-v1/dex-payload-data-v1/riscv-vfrsqrt7-vfrec7-v1/a64-preserving-bitfield-v1/a64-ubfm-sbfm-address-reference-v1/a64-nzcv-constant-flow-v1/nonx86-reference-producer-graph-v1/dataflow-reference-producer-graph-v4/reference-immediate-origin-v1/x86-vdivps-vdivpd-vex-evex-mxcsr-effects-v1/mips64-arithmetic-reference-v1/mips64-shift-rotate-reference-v1/mips64-special-conditional-traps-v1/evex-packed-fp-broadcast-v1/wasm-br-table-12-case-v1/dex-switch-flow-v1/dex-exception-flow-v1/jvm-switch-flow-v2/jvm-exception-flow-v1/pe-guard-cf-function-roots-v1/pe-chpe-execution-ranges-v1/pe-amd64-chained-function-chunks-v1/runtime-initializer-roots-v1/runtime-initializer-array-roots-v2/initializer-source-relocation-provenance-v1/string-scan-work-budget-v1/mips64-delay-slot-ownership-v1/explicit-root-budget-priority-v1/arm-predicate-nzcv-reachability-v1/thumb-it-condition-edges-v1/arm-a32-predicate-thumb-it-flow-v4/zydis-opaque-stop-v1/multiarc-flow-v1/switch-cfg-targets-v4/guard-multiblock-v1/unicode-strings-v3/windows1253-1255-strings-v1/iso8859-10-13-14-16-strings-v1/x86-scalar-context-v5/elf-symbol-roots-v2/elf-symbol-extents-v1/operand-encoding-v1/elf-relocation-flow-v2/pe-pogo-function-roots-v1/elf-powerpc-eh-frame-roots-v1/macho-compact-unwind-extents-v1/ppc64-elfv1-opd-symbol-roots-v1/wasm-export-function-roots-v1/wasm-start-function-root-v1/wasm-element-function-roots-v1/wasm-all-defined-function-roots-v1/m6502-reference-producer-graph-v1/riscv64-lwu-pointer-load-v1/riscv-zbb-count-reference-v1/mips64-dclz-dclo-reference-v1/elf-dwarf-entrypoint-roots-v1/pe-amd64-unwind-handler-roots-v1"
         "mips64-word-shift-reference-v1/wasm-import-call-identities-v1/wasm-constant-call-indirect-reference-v1/"
         "elf-reference-provenance-v1/elf-arithmetic-v2/macho-symbol-roots-v1/macho-relocation-flow-v1/"
         "macho-reference-provenance-v1/macho-dyld-data-provenance-v1/macho-dyld-flow-v1/macho-export-roots-v1/macho-code-policy-v1/elf-unwind-personality-roots-v1/elf-unwind-indirect-personality-slots-v1/elf-unwind-roots-v1/macho-eh-frame-roots-v1/pe-tls-callback-roots-v1/pe-arm64-pdata-provenance-v1/mips64-cop1-condition-predicates-v1/riscv-v-vector-comparisons-v1/riscv-vfclass-vfsqrt-v1/x86-vex128-zero-upper-v1/powerpc-xform-logical-clz-signext-v1/x87-status-control-tag-effects-v1/pe-safe-seh-function-roots-v1/macho-mod-term-function-roots-v1/elf-dwarf-subprogram-roots-v1/thumb2-movw-movt-reference-v1/riscv-addiw-address-reference-v1/aapcs32-stack-argument-slots-v1/mips-o32-stack-argument-slots-v1/mips-n64-stack-argument-slots-v1/a64-32bit-pointer-load-references-v1/ebcdic-cp037-string-candidates-v1/mips64-special2-mul-address-reference-v1/ppc32-rlwinm-address-reference-v1/ppc64-rldimi-address-reference-v1/riscv-outgoing-stack-store-provenance-v1/thumb-tbb-aligned-pc-target-v1/mips64-word-rotr-address-reference-v1/native-import-slot-call-identities-v1/windows932-string-candidates-v1/windows950-string-candidates-v1/m6502-decimal-stack-alias-guard-v1/mips32-derived-stack-aliases-v1/a64-etrel-cross-section-branch-v1/m65c02-index-stack-and-accumulator-alias-v1/a64-division-reference-v1/a64-logical-encoded-extent-v1/mips32-logical-immediate-reference-v1/mips32-merge-load-reference-v1/mips32-narrow-pointer-load-reference-v1/a64-signed-narrow-load-reference-v1/mips64-set-less-than-reference-v1/a64-orr-zero-stack-copies-v1"
