@@ -152,7 +152,8 @@ AnalysisIssuesView::AnalysisIssuesView(wxWindow *parent) : wxPanel(parent) {
     filter_->Append("File inspection diagnostics");
     filter_->Append("Analysis and string diagnostics");
     filter_->Append("Stale diagnostic reports");
-    filter_->SetToolTip("Limit findings to diagnostics whose stored source identity does not match the active analysis.");
+    filter_->Append("Minidump context diagnostics");
+    filter_->SetToolTip("Filter findings by diagnostic source or stale source identity.");
     filter_->SetSelection(0);
     severity_ = new wxChoice(this, wxID_ANY);
     severity_->SetName("analysis-issues-severity");
@@ -1240,6 +1241,7 @@ void AnalysisIssuesView::render() {
         if (selected_filter == 8 && kind != Kind::file_inspection_diagnostic) continue;
         if (selected_filter == 9 && kind != Kind::file_analysis_diagnostic) continue;
         if (selected_filter == 10 && !rows_[index].stale_import) continue;
+        if (selected_filter == 11 && kind != Kind::minidump_context_diagnostic) continue;
         if ((selected_severity == 1 && rows_[index].severity != DiagnosticSeverity::error) ||
             (selected_severity == 2 && rows_[index].severity != DiagnosticSeverity::warning) ||
             (selected_severity == 3 && rows_[index].severity != DiagnosticSeverity::info))

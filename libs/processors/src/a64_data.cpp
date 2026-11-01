@@ -21,6 +21,31 @@ bool data(Instruction &i, std::uint32_t word) {
         memory.resolved_address = target(i.address, displacement);
         operand(i, memory, OperandAccess::read);
         i.memory_read = true;
+    } else if ((word & 0x3ffffc00u) == 0x08dffc00u ||
+               (word & 0x3ffffc00u) == 0x089ffc00u) {
+        // Load-Acquire / Store-Release single-register forms. The size is
+        // encoded independently of the fixed operation class: byte, halfword,
+        // word, and doubleword transfers are all represented here.
+        const bool load = (word & 0x00400000u) != 0;
+        const unsigned size = word >> 30;
+        const unsigned data_width = 8u << size;
+        i.opcode = size == 0 ? (load ? Opcode::a64_ldrb : Opcode::a64_strb)
+                  : size == 1 ? (load ? Opcode::a64_ldrh : Opcode::a64_strh)
+                              : (load ? Opcode::a64_ldr : Opcode::a64_str);
+        i.mnemonic_override = load ? (size == 0 ? "ldarb" : size == 1 ? "ldarh" : "ldar")
+                                   : (size == 0 ? "stlrb" : size == 1 ? "stlrh" : "stlr");
+        const auto data = reg(word & 31, size == 3 ? 64 : 32);
+        operand(i, data, load ? OperandAccess::write : OperandAccess::read);
+        MemoryOperand memory;
+        memory.data_width = static_cast<std::uint16_t>(data_width);
+        memory.address_width = 64;
+        memory.base = reg((word >> 5) & 31, 64, true);
+        i.register_reads.push_back(*memory.base);
+        operand(i, memory, load ? OperandAccess::read : OperandAccess::write);
+        i.memory_read = load;
+        i.memory_write = !load;
+        i.atomic_aq = load;
+        i.atomic_rl = !load;
     } else if ((word & 0x3a000000u) == 0x28000000u && ((word >> 26) & 1u) == 0) {
         const auto opc = word >> 30;
         const auto mode = (word >> 23) & 3u;

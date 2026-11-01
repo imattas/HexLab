@@ -1,5 +1,9 @@
 # WebAssembly module inspection and disassembly
 
+The standalone processor decoder also recognizes the bounded WebAssembly threads/atomics family: `memory.atomic.notify`, `memory.atomic.wait32/64`, `atomic.fence`, atomic load/store variants, and the add/sub/and/or/xor/exchange/compare-exchange read-modify-write variants. Atomic memory instructions retain alignment and offset operands and require the alignment exponent to equal the natural access width; `atomic.fence` retains and validates its zero reserved byte. The module loader and decompiler do not validate or lift these instructions. Encodings follow the [WebAssembly threads proposal](https://github.com/WebAssembly/threads/blob/main/proposals/threads/Overview.md).
+Derived-cache version 101 invalidates instruction records created before these
+atomic forms were decoded.
+
 Integer global initializers support a bounded extended-constant subset with
 i32/i64 addition, subtraction and multiplication, retained instruction
 provenance and exact raw-bit evaluation. See

@@ -58,6 +58,7 @@ class PseudocodeView final : public wxPanel {
     wxButton *rename_function_ = nullptr, *rename_local_ = nullptr, *comment_local_ = nullptr, *edit_comment_ = nullptr;
     wxButton *rename_variable_ = nullptr, *assign_type_ = nullptr, *comment_variable_ = nullptr;
     wxButton *copy_variable_ = nullptr;
+    wxButton *previous_function_ = nullptr, *next_function_ = nullptr;
     wxButton *definition_ = nullptr, *previous_use_ = nullptr, *next_use_ = nullptr;
     wxButton *previous_stack_access_ = nullptr, *next_stack_access_ = nullptr;
     wxButton *copy_pseudocode_ = nullptr, *copy_excerpt_ = nullptr, *save_pseudocode_ = nullptr;
@@ -122,6 +123,9 @@ class PseudocodeView final : public wxPanel {
     std::uint64_t render_serial_ = 0;
     bool updating_ = false;
     void navigate_to(Location);
+    std::optional<Address> adjacent_function(bool next) const;
+    void update_function_navigation();
+    void move_function(bool next);
     void remember_source();
     void restore_source();
     void rebuild_source_origins();

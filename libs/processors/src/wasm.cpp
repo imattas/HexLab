@@ -420,6 +420,60 @@ DecodeResult decode_wasm(std::span<const std::byte> bytes, Address at) {
             for (unsigned n = 0; n < immediate_count; ++n)
                 if (!require_u(32)) return decode_leb_result(last_leb_result);
         }
+    } else if (op == 0xfe) {
+        std::uint64_t subopcode = 0;
+        const auto result = uleb(bytes, position, 32, subopcode);
+        if (result != LebResult::ok) return decode_leb_result(result);
+        if (subopcode == 3) {
+            mnemonic = "atomic.fence";
+            if (position >= bytes.size()) return fail(DecodeStatus::truncated, "truncated WebAssembly atomic.fence reserved immediate");
+            const auto reserved = std::to_integer<std::uint8_t>(bytes[position++]);
+            if (reserved != 0) return fail(DecodeStatus::invalid, "WebAssembly atomic.fence reserved immediate must be zero");
+            operands.push_back(ImmediateOperand{reserved, 8, 8, false, {}});
+        } else if (subopcode <= 2 || (subopcode >= 0x10 && subopcode <= 0x4e)) {
+            unsigned access_log2 = 0;
+            if (subopcode == 0) {
+                mnemonic = "memory.atomic.notify";
+                access_log2 = 2;
+            } else if (subopcode == 1 || subopcode == 2) {
+                mnemonic = subopcode == 1 ? "memory.atomic.wait32" : "memory.atomic.wait64";
+                access_log2 = subopcode == 1 ? 2 : 3;
+            } else {
+                static constexpr std::array<std::string_view, 7> value_types{
+                    "i32", "i64", "i32", "i32", "i64", "i64", "i64"};
+                static constexpr std::array<unsigned, 7> width_log2{2, 3, 0, 1, 0, 1, 2};
+                static constexpr std::array<std::string_view, 7> width_suffix{
+                    "", "", "8", "16", "8", "16", "32"};
+                const auto group = static_cast<unsigned>((subopcode - 0x10) / 7);
+                const auto variant = static_cast<unsigned>((subopcode - 0x10) % 7);
+                static constexpr std::array<std::string_view, 9> operation{
+                    "load", "store", "add", "sub", "and", "or", "xor", "xchg", "cmpxchg"};
+                mnemonic = std::string(value_types[variant]) + ".atomic.";
+                if (group == 0 || group == 1) {
+                    mnemonic += operation[group];
+                    if (!width_suffix[variant].empty()) {
+                        mnemonic += width_suffix[variant];
+                        if (group == 0) mnemonic += "_u";
+                    }
+                } else {
+                    mnemonic += "rmw";
+                    if (!width_suffix[variant].empty()) mnemonic += width_suffix[variant];
+                    mnemonic += ".";
+                    mnemonic += operation[group];
+                    if (!width_suffix[variant].empty()) mnemonic += "_u";
+                }
+                access_log2 = width_log2[variant];
+            }
+            const auto alignment = add_u(32);
+            if (alignment != LebResult::ok) return decode_leb_result(alignment);
+            const auto offset = add_u(32);
+            if (offset != LebResult::ok) return decode_leb_result(offset);
+            const auto *align_operand = std::get_if<ImmediateOperand>(&operands[operands.size() - 2]);
+            if (!align_operand || align_operand->value != access_log2)
+                return fail(DecodeStatus::invalid, "WebAssembly atomic memarg alignment must equal the access width");
+        } else {
+            return fail(DecodeStatus::unsupported, "WebAssembly 0xfe subopcode is outside the enabled threads/atomics subset");
+        }
     } else if (op == 0xd0) {
         mnemonic = "ref.null";
         std::int64_t heap_type = 0;

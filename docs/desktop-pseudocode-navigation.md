@@ -81,3 +81,9 @@ text size. The range is bounded to 6–32 points, and changing it affects only
 the rendered view; it does not alter the generated pseudocode or project data.
 
 Phi destinations shown in the Variables table use a deterministic UI identity made from the join block address and destination register. This keeps a selected phi value recognizable when the same analysis snapshot is refreshed, without adding project records or changing the project format. Selection recovery is scoped to the snapshot's AnalysisKey (input identity, byte and decision revisions, and analysis fingerprints); snapshots without a key recover selection only when the same in-memory snapshot is reused. The identity can change when the CFG changes, and it does not identify a phi across different inputs or analysis revisions. Phi values remain read-only because their block-entry address cannot safely identify a persisted annotation.
+
+The instruction pane's **Previous function** and **Next function** controls navigate
+between recovered function entries in address-space/address order. They stay
+disabled at the ends of the current analysis snapshot and use the normal
+document/project revision guard. Returning to a function restores its saved
+pseudocode and variable selection when the same analysis key is still active.

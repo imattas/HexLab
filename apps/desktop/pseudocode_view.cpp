@@ -964,11 +964,25 @@ PseudocodeView::PseudocodeView(wxWindow *parent) : wxPanel(parent) {
     layout->Add(status_, 0, wxEXPAND | wxALL, FromDIP(4));
     layout->Add(find_layout, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, FromDIP(4));
     auto *content = new wxBoxSizer(wxHORIZONTAL);
+    auto *address_panel = new wxBoxSizer(wxVERTICAL);
+    auto *function_navigation = new wxBoxSizer(wxHORIZONTAL);
+    previous_function_ = new wxButton(this, wxID_ANY, "Previous function");
+    previous_function_->SetName("pseudocode-previous-function");
+    previous_function_->SetToolTip("Navigate to the previous recovered function in address order.");
+    previous_function_->Enable(false);
+    next_function_ = new wxButton(this, wxID_ANY, "Next function");
+    next_function_->SetName("pseudocode-next-function");
+    next_function_->SetToolTip("Navigate to the next recovered function in address order.");
+    next_function_->Enable(false);
+    function_navigation->Add(previous_function_, 1, wxRIGHT, FromDIP(3));
+    function_navigation->Add(next_function_, 1);
+    address_panel->Add(function_navigation, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, FromDIP(4));
     addresses_ = new wxListCtrl(this, wxID_ANY, wxDefaultPosition, wxDefaultSize,
                                 wxLC_REPORT | wxLC_SINGLE_SEL);
     addresses_->SetName("pseudocode-addresses");
     addresses_->InsertColumn(0, "Instruction", wxLIST_FORMAT_LEFT, FromDIP(150));
     addresses_->InsertColumn(1, "Name / comment", wxLIST_FORMAT_LEFT, FromDIP(220));
+    address_panel->Add(addresses_, 1, wxEXPAND | wxALL, FromDIP(4));
     source_ = new wxTextCtrl(this, wxID_ANY, "", wxDefaultPosition, wxDefaultSize,
                              wxTE_MULTILINE | wxTE_READONLY | wxTE_RICH2 | wxHSCROLL);
     source_->SetName("pseudocode-source");
@@ -990,7 +1004,7 @@ PseudocodeView::PseudocodeView(wxWindow *parent) : wxPanel(parent) {
     font_layout->Add(source_font_larger_, 0, wxRIGHT, FromDIP(4));
     font_layout->Add(source_font_reset_, 0, wxRIGHT, FromDIP(4));
     layout->Add(font_layout, 0, wxLEFT | wxRIGHT | wxBOTTOM, FromDIP(4));
-    content->Add(addresses_, 0, wxEXPAND | wxALL, FromDIP(4));
+    content->Add(address_panel, 0, wxEXPAND);
     content->Add(source_, 1, wxEXPAND | wxALL, FromDIP(4));
     layout->Add(content, 1, wxEXPAND);
     auto *navigation = new wxBoxSizer(wxHORIZONTAL);
@@ -1095,6 +1109,8 @@ PseudocodeView::PseudocodeView(wxWindow *parent) : wxPanel(parent) {
         if (!updating_ && event.GetIndex() >= 0 && static_cast<std::size_t>(event.GetIndex()) < rows_.size())
             navigate_to(rows_[static_cast<std::size_t>(event.GetIndex())]);
     });
+    previous_function_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { move_function(false); });
+    next_function_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { move_function(true); });
     stack_slots_->Bind(wxEVT_LIST_ITEM_SELECTED, [this](wxListEvent &event) {
         if (updating_) return;
         const auto row = event.GetIndex();
@@ -1711,6 +1727,37 @@ void PseudocodeView::navigate_to(Location location) {
     } else if (navigate) navigate(location);
 }
 
+std::optional<Address> PseudocodeView::adjacent_function(bool next) const {
+    if (!model_ready_ || !rendered_snapshot_ || !rendered_function_) return {};
+    const auto less = [](Address left, Address right) {
+        return left.space.value < right.space.value ||
+               (left.space == right.space && left.offset < right.offset);
+    };
+    std::optional<Address> candidate;
+    for (const auto &function : rendered_snapshot_->functions) {
+        if (!function) continue;
+        const auto entry = function->entry;
+        if (next) {
+            if (less(*rendered_function_, entry) && (!candidate || less(entry, *candidate)))
+                candidate = entry;
+        } else if (less(entry, *rendered_function_) && (!candidate || less(*candidate, entry))) {
+            candidate = entry;
+        }
+    }
+    return candidate;
+}
+
+void PseudocodeView::update_function_navigation() {
+    if (previous_function_) previous_function_->Enable(adjacent_function(false).has_value());
+    if (next_function_) next_function_->Enable(adjacent_function(true).has_value());
+}
+
+void PseudocodeView::move_function(bool next) {
+    const auto entry = adjacent_function(next);
+    if (!entry) return;
+    navigate_to(Location{*entry});
+}
+
 std::optional<PseudocodeNavigationToken> PseudocodeView::current_navigation_token() const {
     if (!document_ || !model_ready_ || !rendered_function_) return {};
     PseudocodeNavigationToken token;
@@ -1762,6 +1809,8 @@ void PseudocodeView::update(const FunctionSnapshot *snapshot, std::optional<Loca
     ++render_serial_;
     model_ready_ = false;
     rendered_function_.reset();
+    previous_function_->Enable(false);
+    next_function_->Enable(false);
     selected_variable_.reset();
     updating_ = true;
     function_ = nullptr;
@@ -2203,6 +2252,7 @@ void PseudocodeView::update(const FunctionSnapshot *snapshot, std::optional<Loca
     rendered_document_revision_ = document_revision_;
     rebuild_source_origins();
     model_ready_ = true;
+    update_function_navigation();
     const bool query_ready = !find_query_->GetValue().empty();
     const bool current_function_ready = query_ready && !source_->GetValue().empty();
     find_previous_->Enable(current_function_ready);

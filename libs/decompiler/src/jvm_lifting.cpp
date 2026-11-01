@@ -447,6 +447,9 @@ std::optional<bool> verifier_assignability(const HierarchyIndex *index, Hierarch
         return expected.kind == JvmVerificationKind::object;
     if (actual.kind != JvmVerificationKind::object || expected.kind != JvmVerificationKind::object)
         return false;
+    // Every reference type, including arrays, is assignable to java/lang/Object
+    // without needing the optional application hierarchy.
+    if (expected.descriptor == "Ljava/lang/Object;") return true;
     if (depth > 255) return {};
     const bool actual_array = actual.descriptor.starts_with('[');
     const bool expected_array = expected.descriptor.starts_with('[');
@@ -1346,10 +1349,49 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
                 auto signature=parse_method_descriptor(member.value().descriptor);if(!signature)return signature.error();
                 std::vector<ExpressionPtr> arguments(signature.value().parameters.size()+(is_static?0u:1u));
                 for(std::size_t n=signature.value().parameters.size();n>0;--n){auto value=pop(signature.value().parameters[n-1]);if(!value)return value.error();arguments[n-1+(is_static?0u:1u)]=value.value();}
+                if (references && !shapes_only) {
+                    // A known reference value must not flow into an unrelated
+                    // descriptor parameter. Unknown hierarchy edges remain
+                    // symbolic; the call itself is still not executed.
+                    std::size_t descriptor_position = 1;
+                    for (std::size_t n = 0; n < signature.value().parameters.size(); ++n) {
+                        const auto start = descriptor_position;
+                        auto parameter_type = descriptor_type(member.value().descriptor, descriptor_position);
+                        if (!parameter_type) return parameter_type.error();
+                        if (parameter_type.value() != ref32()) continue;
+                        const auto actual = identity(arguments[n + (is_static ? 0u : 1u)]);
+                        if (!actual) continue;
+                        if (actual->kind == JvmVerificationKind::uninitialized ||
+                            actual->kind == JvmVerificationKind::uninitialized_this)
+                            return no("method argument uses an uninitialized verifier value");
+                        auto expected = reference_descriptor(std::string_view(member.value().descriptor).substr(
+                            start, descriptor_position - start));
+                        if (!expected) return no("method reference parameter descriptor is malformed");
+                        expected->defining_loader = metadata->defining_loader;
+                        const auto compatible = verifier_assignability(hierarchy ? &*hierarchy : nullptr,
+                            hierarchy_work, *actual, *expected);
+                        if (compatible && !*compatible)
+                            return no("known method argument reference is not assignable to its descriptor type");
+                    }
+                }
                 if(!is_static){auto receiver=pop(ref32());if(!receiver)return receiver.error();arguments[0]=receiver.value();
                     // Instance invocation can throw before entering the callee
                     // when its receiver is null. Constructor receivers are
                     // verifier-uninitialized values and are known non-null.
+                    if (member.value().name != "<init>" && references && !shapes_only) {
+                        if (const auto actual = identity(arguments[0])) {
+                            if (actual->kind == JvmVerificationKind::uninitialized ||
+                                actual->kind == JvmVerificationKind::uninitialized_this)
+                                return no("instance invocation receiver is an uninitialized verifier value");
+                            auto expected = reference_class(member.value().owner);
+                            if (!expected) return no("instance method owner is not a valid reference type");
+                            expected->defining_loader = metadata->defining_loader;
+                            const auto compatible = verifier_assignability(hierarchy ? &*hierarchy : nullptr,
+                                hierarchy_work, *actual, *expected);
+                            if (compatible && !*compatible)
+                                return no("known invocation receiver is not assignable to the method owner");
+                        }
+                    }
                     if(member.value().name!="<init>")
                         dst.trap_edges.push_back({i.address,TrapEdgeKind::may_trap,
                             "java.lang.NullPointerException from "+i.mnemonic_override,

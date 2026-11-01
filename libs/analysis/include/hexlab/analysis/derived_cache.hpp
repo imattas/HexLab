@@ -1,8 +1,8 @@
 #pragma once
 #include "hexlab/analysis/incremental.hpp"
 namespace hexlab {
-// Version 100: 65C02 vector roots participate in function analysis.
-inline constexpr std::uint32_t derived_cache_version=100;
+// Version 101: AArch64 acquire/release and WebAssembly threads/atomics decoding.
+inline constexpr std::uint32_t derived_cache_version=101;
 inline constexpr std::size_t derived_payload_limit=64*1024*1024,derived_record_limit=1000000;
 // HXDC(4), u16 version, AnalysisKey(120), primary context(5), mapping SHA256(32),
 // counted domain id/context table, completeness and model tables. Every fact is

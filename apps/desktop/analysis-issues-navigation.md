@@ -15,6 +15,10 @@ The kind selector separates runtime relocation and file-inspection diagnostics
 from the general loader diagnostic queue. **Loader diagnostics** keeps the full
 diagnostic set together; the two additional choices isolate each source class
 when a binary reports many unrelated loader findings.
+**Minidump context diagnostics** isolates saved register-context validation
+findings from other loader findings. These rows retain their captured source
+identity, so stale reports remain identifiable after the input or analysis
+revision changes.
 The status line breaks the visible queue down into error, warning, and info
 counts, so the current filter and function scope show their severity mix at a
 glance.

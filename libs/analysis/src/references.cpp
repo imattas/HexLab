@@ -4730,7 +4730,45 @@ RegisterReferenceFacts mips_reference_facts(const Image *image, const Relocation
                     instruction.delay_slots == 0 && !instruction.memory_read && !instruction.memory_write &&
                     !relocations.overlaps(instruction.address, instruction.length);
             };
-            if (mips32 && (instruction.opcode == Opcode::mips_mult || instruction.opcode == Opcode::mips_multu ||
+            if (mips32 && (instruction.opcode == Opcode::mips32_movz || instruction.opcode == Opcode::mips32_movn)) {
+                const auto *dst = architecture_register(instruction, 0, RegisterBank::mips_gpr, 32);
+                const auto *src = architecture_register(instruction, 1, RegisterBank::mips_gpr, 32);
+                const auto *condition = architecture_register(instruction, 2, RegisterBank::mips_gpr, 32);
+                const std::vector<RegisterOperand> reads = dst && src && condition
+                    ? std::vector<RegisterOperand>{*dst, *src, *condition} : std::vector<RegisterOperand>{};
+                const std::vector<RegisterOperand> writes = dst && dst->index != 0
+                    ? std::vector<RegisterOperand>{*dst} : std::vector<RegisterOperand>{};
+                const bool valid = mips32_scalar_form() && instruction.operands.size() == 3 && dst && src && condition &&
+                    dst->index < 32 && src->index < 32 && condition->index < 32 &&
+                    !dst->high_byte && !src->high_byte && !condition->high_byte &&
+                    instruction.access == std::vector<OperandAccess>{OperandAccess::read_write,
+                        OperandAccess::read, OperandAccess::read} &&
+                    instruction.register_reads == reads && instruction.register_writes == writes;
+                const auto source_value = valid ? mips32_gpr_value(src) : std::optional<std::uint32_t>{};
+                const auto condition_value = valid ? mips32_gpr_value(condition) : std::optional<std::uint32_t>{};
+                const auto prior_value = valid ? mips32_gpr_value(dst) : std::optional<std::uint32_t>{};
+                std::optional<std::uint32_t> result_value;
+                if (valid) {
+                    const bool move_when_zero = instruction.opcode == Opcode::mips32_movz;
+                    if (condition_value) {
+                        const bool move = move_when_zero ? *condition_value == 0 : *condition_value != 0;
+                        result_value = move ? source_value : prior_value;
+                    } else if (source_value && prior_value && *source_value == *prior_value) {
+                        // Either path leaves the same exact value in rd.
+                        result_value = source_value;
+                    }
+                }
+                if (valid) erase_written(); else registers.clear();
+                if (dst && dst->index != 0) registers.erase(dst->index);
+                if (valid && dst->index != 0 && result_value) {
+                    const Address value{instruction.address.space, *result_value};
+                    registers[dst->index] = value;
+                    result.address_definitions.insert(fact->id);
+                    if (riscv_target_segment(*image, value, OperandAccess::address))
+                        result.immediate_targets[{fact->id, 1}] = value;
+                }
+                propagated = true;
+            } else if (mips32 && (instruction.opcode == Opcode::mips_mult || instruction.opcode == Opcode::mips_multu ||
                            instruction.opcode == Opcode::mips_div || instruction.opcode == Opcode::mips_divu)) {
                 const auto *left = architecture_register(instruction, 0, RegisterBank::mips_gpr, 32);
                 const auto *right = architecture_register(instruction, 1, RegisterBank::mips_gpr, 32);

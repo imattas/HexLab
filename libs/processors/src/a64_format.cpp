@@ -208,7 +208,7 @@ std::string format(const Instruction &i) {
     if (i.bytes.size() == 4)
         for (unsigned byte = 0; byte < 4; ++byte)
             encoded_word |= std::uint32_t(std::to_integer<unsigned>(i.bytes[byte])) << (byte * 8);
-    std::string result = mnemonic(i.opcode, i.condition);
+    std::string result = i.mnemonic_override.empty() ? mnemonic(i.opcode, i.condition) : i.mnemonic_override;
     const auto unscaled_size = encoded_word >> 30;
     const auto unscaled_op = (encoded_word >> 22) & 3u;
     const bool signed_narrow_unscaled = unscaled_size < 2 && unscaled_op >= 2;

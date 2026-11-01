@@ -950,6 +950,8 @@ struct Instruction {
     // Number of architecturally executed instructions after a control transfer
     // before its target takes effect. Zero for architectures without delay slots.
     std::uint8_t delay_slots = 0;
+    // Acquire/release ordering markers for ordered memory operations (RISC-V
+    // AMOs and AArch64 LDAR/STLR); not a complete concurrency model.
     bool atomic_aq = false, atomic_rl = false;
     // RISC-V CSR state is separate from the integer register and memory banks.
     bool csr_read = false, csr_write = false;
