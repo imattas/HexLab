@@ -406,7 +406,8 @@ bool valid_unqualified_member_name(std::string_view name) {
     return !name.empty() && name.find_first_of(".;[/") == std::string_view::npos;
 }
 Result<std::size_t> method_descriptor_parameter_count(std::string_view descriptor,bool include_this,
-                                                       std::size_t *parameter_slots=nullptr){
+                                                       std::size_t *parameter_slots=nullptr,
+                                                       char *return_type=nullptr){
     if(descriptor.empty()||descriptor.front()!='(')return malformed("invalid method descriptor for MethodParameters");
     std::size_t position=1,count=0,slots=0;const std::size_t slot_limit=include_this?254:255;
     const auto parse_type=[&](bool allow_void)->Result<unsigned>{
@@ -435,10 +436,12 @@ Result<std::size_t> method_descriptor_parameter_count(std::string_view descripto
     }
     if(position>=descriptor.size()||descriptor[position++]!=')')return malformed("method descriptor has no parameter terminator");
     if(position>=descriptor.size())return malformed("method descriptor has no return type");
+    const auto result_type=descriptor[position];
     if(descriptor[position]=='V')++position;
     else {auto result=parse_type(false);if(!result)return result.error();}
     if(position!=descriptor.size())return malformed("trailing bytes in method descriptor");
     if(parameter_slots)*parameter_slots=slots;
+    if(return_type)*return_type=result_type;
     return count;
 }
 // Restrict every nested attribute parser to its declared enclosing extent.
@@ -451,13 +454,24 @@ struct ReaderExtent {
 constexpr std::size_t max_stack_map_frames = 8192;
 constexpr std::size_t max_class_stack_map_frames = 65536;
 constexpr std::size_t max_expanded_verification_entries = 1024 * 1024;
-Result<std::vector<bool>> scan_jvm_code(std::span<const std::byte> bytecode, Address begin,
-                                        const JvmMetadata &metadata, std::stop_token stop) {
+Result<std::vector<bool>> scan_jvm_code(std::span<const std::byte> bytecode, const JvmCode &code,
+                                        const JvmMetadata &metadata, const JvmMember &method,
+                                        std::stop_token stop) {
+    // These are class-context static constraints, not a dataflow/type proof.
+    // Check every instruction, including unreachable encodings, and require
+    // actual Code bounds rather than the decoder's theoretical u2 limit.
+    const bool instance = (method.access_flags & 0x0008u) == 0;
+    std::size_t entry_parameter_slots = 0;
+    char result_type = 0;
+    auto entry_parameters = method_descriptor_parameter_count(method.descriptor, instance, &entry_parameter_slots, &result_type);
+    if (!entry_parameters) return entry_parameters.error();
+    if (entry_parameter_slots + (instance ? 1u : 0u) > code.max_locals)
+        return malformed("JVM method parameters exceed Code.max_locals");
     std::vector<bool> instruction_starts(bytecode.size(), false);
     std::vector<Address> branch_targets;
     for (std::size_t offset = 0; offset < bytecode.size();) {
         if (stop.stop_requested()) return Error{ErrorCode::canceled, "JVM bytecode scan canceled"};
-        auto decoded = decode_jvm(bytecode.subspan(offset), {begin.space, offset});
+        auto decoded = decode_jvm(bytecode.subspan(offset), {code.begin.space, offset});
         if (decoded.status != DecodeStatus::decoded || !decoded.instruction) {
             if (decoded.status == DecodeStatus::unsupported)
                 return Error{ErrorCode::unsupported, "unsupported JVM bytecode: " + decoded.reason};
@@ -468,6 +482,39 @@ Result<std::vector<bool>> scan_jvm_code(std::span<const std::byte> bytecode, Add
         if (!length || length > bytecode.size() - offset)
             return malformed("invalid decoded JVM instruction extent");
         const auto opcode = std::to_integer<std::uint8_t>(bytecode[offset]);
+        const auto operand = [&](std::size_t index) -> const ImmediateOperand * {
+            return index < instruction.operands.size()
+                ? std::get_if<ImmediateOperand>(&instruction.operands[index]) : nullptr;
+        };
+        std::uint8_t local_opcode = opcode;
+        std::optional<std::uint64_t> local_index;
+        if ((opcode >= 0x15 && opcode <= 0x19) || (opcode >= 0x36 && opcode <= 0x3a) ||
+            opcode == 0x84 || opcode == 0xa9) {
+            if (!operand(0)) return malformed("JVM local instruction has no decoded index");
+            local_index = operand(0)->value;
+        } else if ((opcode >= 0x1a && opcode <= 0x2d) || (opcode >= 0x3b && opcode <= 0x4e)) {
+            const bool load = opcode <= 0x2d;
+            const auto group_offset = opcode - (load ? 0x1a : 0x3b);
+            local_opcode = static_cast<std::uint8_t>((load ? 0x15 : 0x36) + group_offset / 4);
+            local_index = group_offset % 4;
+        } else if (opcode == 0xc4) {
+            if (!operand(0) || !operand(1)) return malformed("JVM wide local instruction has no decoded index");
+            local_opcode = static_cast<std::uint8_t>(operand(0)->value);
+            local_index = operand(1)->value;
+        }
+        if (local_index) {
+            const auto slots = local_opcode == 0x16 || local_opcode == 0x18 ||
+                local_opcode == 0x37 || local_opcode == 0x39 ? 2u : 1u;
+            if (*local_index + slots > code.max_locals)
+                return malformed("JVM local instruction exceeds Code.max_locals at bytecode offset " + std::to_string(offset));
+        }
+        if (opcode >= 0xac && opcode <= 0xb1) {
+            const bool matches = opcode == 0xac ? std::string_view("BCISZ").find(result_type) != std::string_view::npos :
+                opcode == 0xad ? result_type == 'J' : opcode == 0xae ? result_type == 'F' :
+                opcode == 0xaf ? result_type == 'D' : opcode == 0xb0 ? result_type == 'L' || result_type == '[' :
+                result_type == 'V';
+            if (!matches) return malformed("JVM return opcode disagrees with the method descriptor");
+        }
         // The standalone decoder can only validate that a pool operand is a
         // nonzero index. Once the classfile pool is available, validate the
         // operand kind and (for dynamic constants) its descriptor category.
@@ -496,6 +543,30 @@ Result<std::vector<bool>> scan_jvm_code(std::span<const std::byte> bytecode, Add
                 constant.tag == 16 || constant.tag == 17;
             if (!loadable || (wide_load != category_two))
                 return malformed("JVM ldc opcode is incompatible with its constant-pool entry kind or category");
+            if (constant.tag == 7 && metadata.major_version < 49)
+                return malformed("JVM ldc class constants require classfile version 49 or later");
+        }
+        if (opcode == 0xbb || opcode == 0xbd || opcode == 0xc0 || opcode == 0xc1 || opcode == 0xc5) {
+            const auto *index = operand(0);
+            if (!index || !index->value || index->value >= metadata.constant_pool.size() ||
+                metadata.constant_pool[static_cast<std::size_t>(index->value)].tag != 7)
+                return malformed("JVM type opcode must reference a CONSTANT_Class entry");
+            const auto &constant = metadata.constant_pool[static_cast<std::size_t>(index->value)];
+            if (!constant.first || constant.first >= metadata.constant_pool.size() ||
+                metadata.constant_pool[static_cast<std::size_t>(constant.first)].tag != 1)
+                return malformed("JVM type opcode has an invalid class-name index");
+            const auto &name = metadata.constant_pool[static_cast<std::size_t>(constant.first)].text;
+            const auto rank = name.find_first_not_of('[');
+            const bool array = !name.empty() && name.front() == '[';
+            if (array ? !valid_field_descriptor(name) : name.empty() || name.find_first_of(".;[") != std::string::npos ||
+                    name.front() == '/' || name.back() == '/' || name.find("//") != std::string::npos)
+                return malformed("JVM type opcode references an invalid class name or array descriptor");
+            if (opcode == 0xbb && array)
+                return malformed("JVM new instruction cannot allocate an array type");
+            if (opcode == 0xbd && array && rank >= 255)
+                return malformed("JVM anewarray instruction exceeds 255 array dimensions");
+            if (opcode == 0xc5 && (!array || !operand(1) || !operand(1)->value || operand(1)->value > rank))
+                return malformed("JVM multianewarray dimensions exceed the referenced array rank");
         }
         if (opcode >= 0xb2 && opcode <= 0xb5) {
             const auto *constant_index = instruction.operands.empty()
@@ -523,6 +594,12 @@ Result<std::vector<bool>> scan_jvm_code(std::span<const std::byte> bytecode, Add
             if(reference.second>=metadata.constant_pool.size())return malformed("JVM invoke has an invalid name-and-type index");
             const auto &name_and_type=metadata.constant_pool[static_cast<std::size_t>(reference.second)];
             if(name_and_type.tag!=12||name_and_type.second>=metadata.constant_pool.size())return malformed("JVM invoke name-and-type entry is malformed");
+            if (!name_and_type.first || name_and_type.first >= metadata.constant_pool.size() ||
+                metadata.constant_pool[static_cast<std::size_t>(name_and_type.first)].tag != 1)
+                return malformed("JVM invoke has an invalid method-name index");
+            const auto &name = metadata.constant_pool[static_cast<std::size_t>(name_and_type.first)].text;
+            if (name == "<init>" && opcode != 0xb7)
+                return malformed("JVM constructors must be invoked with invokespecial");
             const auto &descriptor=metadata.constant_pool[static_cast<std::size_t>(name_and_type.second)];
             if(descriptor.tag!=1)return malformed("JVM invoke descriptor is not CONSTANT_Utf8");
             std::size_t parameter_slots=0;
@@ -548,7 +625,7 @@ Result<std::vector<bool>> scan_jvm_code(std::span<const std::byte> bytecode, Add
         offset += length;
     }
     for (const auto target : branch_targets) {
-        if (target.space != begin.space || target.offset >= bytecode.size() || !instruction_starts[target.offset])
+        if (target.space != code.begin.space || target.offset >= bytecode.size() || !instruction_starts[target.offset])
             return malformed("JVM branch target does not identify an instruction boundary in its Code array");
     }
     return instruction_starts;
@@ -642,7 +719,7 @@ Result<JvmStackMapTable> read_stack_map_table(Reader &reader, const JvmMetadata 
     // No verifier offset is accepted merely because its byte resembles an opcode.
     std::vector<bool> instruction_starts;
     if (count) {
-        auto scanned = scan_jvm_code(bytecode, code.begin, metadata, stop);
+        auto scanned = scan_jvm_code(bytecode, code, metadata, method, stop);
         if (!scanned) return scanned.error();
         instruction_starts = std::move(scanned.value());
     }
@@ -736,7 +813,7 @@ Result<JvmStackMapTable> read_legacy_stack_map(Reader &reader, const JvmMetadata
     expanded_entries += table.initial_locals.size();
     std::vector<bool> instruction_starts;
     if (count) {
-        auto scanned = scan_jvm_code(bytecode, code.begin, metadata, stop);
+        auto scanned = scan_jvm_code(bytecode, code, metadata, method, stop);
         if (!scanned) return scanned.error();
         instruction_starts = std::move(scanned.value());
     }
@@ -1323,7 +1400,7 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage,std::stop_t
                 JvmCode code; code.begin={{static_cast<std::uint32_t>(std::distance(md.methods.data(),member)+1)},0};
                 code.file_begin={code_off}; code.max_stack=ms; code.max_locals=ml; code.code_size=cl;
                 const auto code_bytes=bytes.subspan(code_off,cl);
-                auto code_scan=scan_jvm_code(code_bytes,code.begin,md,stop);
+                auto code_scan=scan_jvm_code(code_bytes,code,md,*member,stop);
                 if(!code_scan)return code_scan.error();
                 code.exception_table.reserve(ec);
                 for(unsigned k=0;k<ec;++k){JvmExceptionHandler e;if(!r.u2(e.start_pc)||!r.u2(e.end_pc)||!r.u2(e.handler_pc)||!r.u2(e.catch_type)||e.start_pc>=e.end_pc||e.end_pc>cl||e.handler_pc>=cl)return malformed("invalid Code exception handler range");

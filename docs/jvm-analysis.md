@@ -14,6 +14,14 @@ for version rules, shared bounds, CLI output and limitations.
 
 The built-in JVM loader reads one bounded classfile (not a JAR). It retains the constant pool, class/super/interface names, fields, methods, and each method's `Code` bounds, max-stack/max-locals values, and exception table. Every nonempty `Code` array maps into its own 32-bit, byte-addressed address space so branch offsets are method-relative.
 
+The class-context `Code` scan also checks parameter capacity and every explicit,
+implicit or `wide` local access against the method's actual `max_locals`, including
+category-2 pairs. It validates return opcode categories, type-operand pool tags
+and array ranks, constructor invocation opcodes, and class-constant load versions.
+These checks apply without stack-map metadata. See [Code static operand
+constraints](jvm-code-static-constraints.md) for the bounds and remaining verifier
+and hierarchy limitations.
+
 `Code` metadata also retains bounded, expanded verifier frames from `StackMapTable` and pre-version-50 `StackMap`, including object constant-pool identities and uninitialized-object offsets. See [JVM stack-map metadata](jvm-stack-map-tables.md) for the public model, instruction-boundary checks, resource bounds, and distinction between parsed frames and full verification.
 
 The classfile loader retains `RuntimeVisibleAnnotations` and
