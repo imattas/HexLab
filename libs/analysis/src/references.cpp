@@ -601,6 +601,34 @@ std::optional<std::uint32_t> static_mips32_word(const Image &image,
     }
     return value;
 }
+std::optional<std::uint64_t> static_mips64_merge_word(const Image &image,
+                                                      const RelocationCoverage &relocations,
+                                                      Address source, std::uint8_t byte_width,
+                                                      ByteOrder order) {
+    if ((byte_width != 4 && byte_width != 8) || (source.offset & (byte_width - 1u)) != 0)
+        return {};
+    const auto *space = image.space(source.space);
+    const auto *segment = image.segment_at(source);
+    if (!space || space->width_bits < 64 || space->order != order || !segment || !segment->readable ||
+        segment->writable || source.offset < segment->begin.offset)
+        return {};
+    const auto relative = source.offset - segment->begin.offset;
+    if (relative > segment->file_size || byte_width > segment->file_size - relative ||
+        relocations.overlaps(source, byte_width))
+        return {};
+    const auto bytes = image.read(source, byte_width);
+    if (!bytes || bytes.value().size() != byte_width)
+        return {};
+    std::uint64_t value = 0;
+    if (space->order == ByteOrder::little) {
+        for (std::size_t index = 0; index < bytes.value().size(); ++index)
+            value |= std::uint64_t(std::to_integer<std::uint8_t>(bytes.value()[index])) << (index * 8);
+    } else {
+        for (const auto byte : bytes.value())
+            value = (value << 8) | std::to_integer<std::uint8_t>(byte);
+    }
+    return value;
+}
 std::optional<Address> static_signed_word_pointer_load(const Image &image,
                                                        const RelocationCoverage &relocations,
                                                        Address source) {
@@ -5520,11 +5548,19 @@ RegisterReferenceFacts mips_reference_facts(const Image *image, const Relocation
                     if (!base_value) continue;
                     const Address target{base_value->space,
                         riscv_add(base_value->offset, memory->displacement, width)};
-                    const bool merge_load = mips32 &&
+                    const bool merge_load32 = mips32 &&
                         (instruction.opcode == Opcode::mips_lwl || instruction.opcode == Opcode::mips_lwr);
+                    const bool merge_load64 = mips64 &&
+                        (instruction.opcode == Opcode::mips64_lwl || instruction.opcode == Opcode::mips64_lwr ||
+                         instruction.opcode == Opcode::mips64_ldl || instruction.opcode == Opcode::mips64_ldr);
+                    const auto merge_width = merge_load32 ? UINT64_C(4) :
+                        merge_load64 && (instruction.opcode == Opcode::mips64_ldl ||
+                                         instruction.opcode == Opcode::mips64_ldr) ? UINT64_C(8) :
+                        merge_load64 ? UINT64_C(4) : UINT64_C(0);
+                    const bool merge_load = merge_load32 || merge_load64;
                     const Address memory_range = merge_load
-                        ? Address{target.space, target.offset & ~UINT64_C(3)} : target;
-                    const auto access_width = merge_load ? UINT64_C(4) :
+                        ? Address{target.space, target.offset & ~(merge_width - 1)} : target;
+                    const auto access_width = merge_load ? merge_width :
                         std::max<std::uint64_t>(1, (memory->data_width + 7) / 8);
                     if (riscv_target_segment(*image, memory_range, instruction.access[i], access_width)) {
                         result.memory_targets[{fact->id, static_cast<std::uint32_t>(i)}] = target;
@@ -5534,7 +5570,7 @@ RegisterReferenceFacts mips_reference_facts(const Image *image, const Relocation
                                 [&](const RegisterOperand &written) {
                                     return written.bank == destination->bank && written.index == destination->index;
                                 });
-                        if (merge_load && instruction.access[i] == OperandAccess::read &&
+                        if (merge_load32 && instruction.access[i] == OperandAccess::read &&
                             memory->data_width == 32 && destination_written) {
                             const auto prior = registers.find(destination->index);
                             if (prior != registers.end() && prior->second.space == instruction.address.space) {
@@ -5545,6 +5581,47 @@ RegisterReferenceFacts mips_reference_facts(const Image *image, const Relocation
                                         instruction, *word, static_cast<std::uint32_t>(prior->second.offset),
                                         static_cast<std::uint8_t>(target.offset & 3u));
                                     if (merged && merged->writes_destination)
+                                        loaded_pointer = std::pair{destination->index,
+                                            Address{instruction.address.space, merged->value}};
+                                }
+                            }
+                        }
+                        if (merge_load64 && instruction.access[i] == OperandAccess::read && destination_written &&
+                            destination->width == 64 && memory->data_width == merge_width * 8 &&
+                            instruction.operands.size() == 2 && i == 1 &&
+                            instruction.flow == FlowKind::fallthrough && instruction.delay_slots == 0 &&
+                            instruction.memory_read && !instruction.memory_write &&
+                            instruction.access == std::vector<OperandAccess>{OperandAccess::read_write,
+                                                                             OperandAccess::read} &&
+                            instruction.register_writes == std::vector<RegisterOperand>{*destination} &&
+                            memory->base && memory->base->bank == RegisterBank::mips_gpr &&
+                            memory->base->width == 64 && memory->base->index < 32 && !memory->base->high_byte &&
+                            !memory->index && !memory->ip_relative && memory->address_width == 64 &&
+                            memory->scale == 1 && !memory->segment && destination->index < 32 &&
+                            !destination->high_byte && destination->index != 0) {
+                            std::vector<RegisterOperand> expected_reads;
+                            if (memory->base->index != 0) expected_reads.push_back(*memory->base);
+                            expected_reads.push_back(*destination);
+                            const auto prior = registers.find(destination->index);
+                            if (instruction.register_reads == expected_reads && prior != registers.end() &&
+                                prior->second.space == instruction.address.space) {
+                                const auto memory_word = static_mips64_merge_word(*image, relocations,
+                                    memory_range, static_cast<std::uint8_t>(merge_width), instruction.context.order);
+                                if (memory_word) {
+                                    const auto operation = instruction.opcode == Opcode::mips64_lwl
+                                        ? Mips64MergeOperation::load_left_word :
+                                        instruction.opcode == Opcode::mips64_lwr
+                                            ? Mips64MergeOperation::load_right_word :
+                                        instruction.opcode == Opcode::mips64_ldl
+                                            ? Mips64MergeOperation::load_left_doubleword :
+                                              Mips64MergeOperation::load_right_doubleword;
+                                    const auto merged = evaluate_mips64_merge(operation, instruction.context.order,
+                                        static_cast<std::uint8_t>(target.offset & (merge_width - 1)),
+                                        prior->second.offset, *memory_word);
+                                    if (merged && merged->writes_register &&
+                                        riscv_target_segment(*image,
+                                            Address{instruction.address.space, merged->value},
+                                            OperandAccess::address))
                                         loaded_pointer = std::pair{destination->index,
                                             Address{instruction.address.space, merged->value}};
                                 }
