@@ -3165,6 +3165,8 @@ Sha256Digest function_engine_fingerprint(const AnalysisOptions &options) {
     (void)hash.update(std::as_bytes(std::span(version)));
     constexpr std::string_view riscv_compressed_version = "riscv-integer-compressed-v1";
     (void)hash.update(std::as_bytes(std::span(riscv_compressed_version)));
+    constexpr std::string_view riscv_compressed_switch_version = "riscv-compressed-switch-analysis-v1";
+    (void)hash.update(std::as_bytes(std::span(riscv_compressed_switch_version)));
     constexpr std::string_view wasm_indirect_selector_version = "wasm-indirect-constant-selector-v1";
     (void)hash.update(std::as_bytes(std::span(wasm_indirect_selector_version)));
     for (auto value : {options.min_string_characters, options.instruction_budget, options.string_budget,
