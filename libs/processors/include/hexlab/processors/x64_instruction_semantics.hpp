@@ -2,6 +2,7 @@
 
 #include "hexlab/processors/instruction.hpp"
 #include "hexlab/processors/x64_semantics.hpp"
+#include "hexlab/processors/x86_decimal_adjust_semantics.hpp"
 #include <algorithm>
 #include <functional>
 #include <optional>
@@ -701,47 +702,13 @@ struct X86DaaDasResult {
 // returned flags contain only defined outputs; callers must keep OF unknown.
 inline std::optional<X86DaaDasResult> evaluate_x86_daa_das_instruction(
     const Instruction &instruction, std::uint8_t al, std::uint64_t incoming_flags) noexcept {
-    if ((instruction.context.architecture != Architecture::x86 &&
-         instruction.context.architecture != Architecture::x86_64) ||
-        (instruction.context.mode != ExecutionMode::x86_16 &&
-         instruction.context.mode != ExecutionMode::x86_32) ||
-        (instruction.opcode != Opcode::daa && instruction.opcode != Opcode::das) ||
-        instruction.length != 1 || instruction.bytes[0] !=
-            std::byte{static_cast<std::uint8_t>(instruction.opcode == Opcode::daa ? 0x27 : 0x2f)} ||
-        !instruction.operands.empty() || !instruction.access.empty())
+    const auto operation = x86_decimal_adjust_operation(instruction);
+    if (!operation || (*operation != X86DecimalAdjust::daa && *operation != X86DecimalAdjust::das))
         return std::nullopt;
-    const RegisterOperand al_register{RegisterBank::gpr, 0, 8, false};
-    const auto contains = [](const auto &registers, RegisterOperand value) {
-        return std::find(registers.begin(), registers.end(), value) != registers.end();
-    };
-    const auto flags_width = instruction.context.mode == ExecutionMode::x86_16 ? 16u : 32u;
-    const RegisterOperand flags_register{RegisterBank::flags, 0, static_cast<std::uint16_t>(flags_width), false};
-    if (!contains(instruction.register_reads, al_register) ||
-        !contains(instruction.register_writes, al_register) ||
-        !contains(instruction.register_reads, flags_register) ||
-        !contains(instruction.register_writes, flags_register))
-        return std::nullopt;
-
-    constexpr std::uint64_t cf = UINT64_C(1) << 0;
-    constexpr std::uint64_t pf = UINT64_C(1) << 2;
-    constexpr std::uint64_t af = UINT64_C(1) << 4;
-    constexpr std::uint64_t zf = UINT64_C(1) << 6;
-    constexpr std::uint64_t sf = UINT64_C(1) << 7;
-    const bool subtract = instruction.opcode == Opcode::das;
-    const bool adjust_low = (al & 0x0f) > 9 || (incoming_flags & af) != 0;
-    const bool adjust_high = al > 0x99 || (incoming_flags & cf) != 0;
-    unsigned adjusted = al;
-    if (adjust_low) adjusted = subtract ? adjusted - 6u : adjusted + 6u;
-    if (adjust_high) adjusted = subtract ? adjusted - 0x60u : adjusted + 0x60u;
-    X86DaaDasResult result;
-    result.al = static_cast<std::uint8_t>(adjusted);
-    result.flags_defined_mask = cf | af | pf | zf | sf;
-    if (adjust_high) result.flags_value |= cf;
-    if (adjust_low) result.flags_value |= af;
-    if ((std::popcount(result.al) & 1) == 0) result.flags_value |= pf;
-    if (result.al == 0) result.flags_value |= zf;
-    if (result.al & 0x80u) result.flags_value |= sf;
-    return result;
+    const auto adjusted = evaluate_x86_decimal_adjust(*operation, al, incoming_flags);
+    if (!adjusted) return std::nullopt;
+    return X86DaaDasResult{static_cast<std::uint8_t>(adjusted->ax),
+                           adjusted->flags_value, adjusted->flags_defined_mask};
 }
 
 struct X86PopcntResult {

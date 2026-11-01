@@ -1042,6 +1042,8 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
     if (op == Opcode::aad) return "aad";
     if (op == Opcode::daa) return "daa";
     if (op == Opcode::das) return "das";
+    if (op == Opcode::aaa) return "aaa";
+    if (op == Opcode::aas) return "aas";
     if (op == Opcode::cwde) return "cwde";
     if (op == Opcode::cdqe) return "cdqe";
     if (op == Opcode::cwd) return "cwd";

@@ -93,6 +93,7 @@ bool move(State &, std::uint8_t, bool extended);
 bool arithmetic(State &, std::uint8_t, bool extended);
 bool bit_operations(State &, std::uint8_t, bool extended);
 bool accumulator_sign_extension(State &, std::uint8_t, bool extended);
+bool decimal_adjust(State &, std::uint8_t, bool extended);
 bool stack_flow(State &, std::uint8_t, bool extended);
 bool x87(State &, std::uint8_t);
 DecodeResult decode_scalar(std::span<const std::byte>, Address, DecodeContext);

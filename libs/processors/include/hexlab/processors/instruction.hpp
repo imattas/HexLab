@@ -725,7 +725,9 @@ enum class Opcode {
     // MIPS32 Release 2 rotate-right aliases of SRL/SRLV; append for stable IDs.
     mips32_rotr, mips32_rotrv,
     // MIPS32 Release 2 SPECIAL2 multiply-accumulate forms; appended for stable IDs.
-    mips32_madd, mips32_maddu, mips32_msub, mips32_msubu
+    mips32_madd, mips32_maddu, mips32_msub, mips32_msubu,
+    // Legacy unpacked decimal adjustment; append for persisted ID stability.
+    aaa, aas
 };
 enum class OperandAccess { read, write, read_write, address };
 // The encoded x86 group-one repeat prefix is retained separately from the

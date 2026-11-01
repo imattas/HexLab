@@ -9,6 +9,7 @@
 #include "mips64_lifting.hpp"
 #include "ppc_lifting.hpp"
 #include "riscv_fp_lifting.hpp"
+#include "x86_decimal_adjust_lifting.hpp"
 #include "hexlab/processors/m6502_semantics.hpp"
 
 #include <algorithm>
@@ -1271,6 +1272,7 @@ ExpressionPtr arm32_select(ExpressionPtr predicate, ExpressionPtr when_true, Exp
 }
 
 Statement lift_instruction(const Instruction &instruction, std::vector<std::string> &diagnostics) {
+    if (auto adjusted = lift_x86_decimal_adjust(instruction)) return std::move(*adjusted);
     std::vector<ExpressionPtr> operands;
     operands.reserve(instruction.operands.size());
     for (const auto &operand : instruction.operands)
@@ -8507,6 +8509,17 @@ Result<LiftedFunction> lift_function(const FunctionRecord &function, const Funct
             state->x87_sahf = true;
             state->registers.clear();
             return state;
+        }
+        if (const auto adjustment = x86_decimal_adjust_operation(instruction)) {
+            PendingX86Compare pending;
+            pending.raw_x86_flags = true;
+            pending.operation = "decimal_adjust";
+            const bool unpacked = *adjustment == X86DecimalAdjust::aaa || *adjustment == X86DecimalAdjust::aas;
+            // This tracker uses compact CF/PF/ZF/SF/OF bits. AF is carried
+            // by the explicit FLAGS expression but no Jcc consumes it.
+            pending.defined_flags = unpacked ? 0x01 : 0x0f;
+            pending.producer_instruction_id = instruction_id;
+            return std::optional<PendingX86Compare>{std::move(pending)};
         }
         if ((instruction.opcode == Opcode::rdrand || instruction.opcode == Opcode::rdseed) &&
             evaluate_x86_random_instruction(instruction, 0, false, 0)) {

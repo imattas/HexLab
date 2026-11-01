@@ -117,18 +117,9 @@ bool string_operation(State &s, std::uint8_t opcode) {
 }
 } // namespace
 bool move(State &s, std::uint8_t opcode, bool extended) {
-    const auto wide = s.width();
-    if (!extended && (opcode == 0x27 || opcode == 0x2f)) {
-        if (s.rules.long_mode())
-            invalid("DAA/DAS are not valid in long mode");
-        s.i.opcode = opcode == 0x27 ? Opcode::daa : Opcode::das;
-        const RegisterOperand al{RegisterBank::gpr, 0, 8, false};
-        s.i.register_reads.push_back(al);
-        s.i.register_writes.push_back(al);
-        s.flags_read = true;
-        s.flags_write = true;
+    if (decimal_adjust(s, opcode, extended))
         return true;
-    }
+    const auto wide = s.width();
     if (!extended && (opcode == 0xd4 || opcode == 0xd5)) {
         if (s.rules.long_mode())
             invalid("AAM/AAD are not valid in long mode");
