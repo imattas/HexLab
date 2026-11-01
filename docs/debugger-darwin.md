@@ -1,13 +1,16 @@
-# Darwin native debugger backend
+# Historical Darwin native debugger notes
 
 > Historical implementation notes only. HexLab host support is Windows and
 > Linux; the Darwin backend is not built or shipped, and this page is not a
-> promise of macOS support.
+> promise of macOS support. The project rejects macOS at CMake configuration,
+> ships no macOS package, and selects only Windows and Linux native debugger
+> backends. Apple-target files, including Mach-O, remain analyzable on those
+> supported hosts.
 
-On macOS, `make_native_backend()` selects a Mach/ptrace implementation for
-x86-64 and AArch64 hosts. It enumerates processes with `sysctl`, reads target
-architecture from the executable's Mach-O header, launches with
-`PT_TRACE_ME`, and attaches/detaches with `PT_ATTACHEXC`/`PT_DETACH`. A launch or
+The former macOS implementation of `make_native_backend()` used a Mach/ptrace
+backend for x86-64 and AArch64 hosts. It enumerated processes with `sysctl`, read
+target architecture from the executable's Mach-O header, launched with
+`PT_TRACE_ME`, and attached/detached with `PT_ATTACHEXC`/`PT_DETACH`. A launch or
 attach exposes the initial stop as a normal debugger event. Continued stops
 are observed through `waitpid`; continue, single-step, and interrupt use
 `PT_CONTINUE`, `PT_STEP`, and `SIGSTOP`.
