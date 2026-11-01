@@ -85,6 +85,7 @@ struct Arguments {
     bool history_verify_input = false;
     bool recovery_json = false;
     bool recovery_inspect_wal = false;
+    bool recovery_inspect_journal = false;
     bool integrity_json = false;
     bool integrity_verify_history = false;
     bool schema_json = false;

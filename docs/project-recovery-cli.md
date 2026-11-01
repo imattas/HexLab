@@ -88,6 +88,17 @@ WAL as a recovery candidate. These diagnostics do not change candidate
 validation or restore behavior. A WAL that is invalid, truncated, or budget
 limited makes the optional diagnostics incomplete and returns exit code 3.
 
+Add `--inspect-journal` to report matching project (`*.hxproj-journal`) and
+HexLab staging (`.hexlab-save-*.tmp-journal` or
+`.hexlab-previous-*.tmp-journal`) rollback journals in the same directory scan.
+The journal report is separately marked diagnostic-only and unassociated. It
+is capped at 8 matching files, 8 MiB and 1,024 records per file, and 8,192
+directory entries. JSON adds a `journal_diagnostics` object; text output shows
+the header, valid/claimed record counts, checksum failures and scan status.
+Nothing is replayed, rolled back, deleted, or promoted to a recovery candidate.
+Invalid, truncated, or budget-limited diagnostics make the listing incomplete
+and return exit code 3.
+
 Use `--kind interrupted-save` or `--kind previous-version` to show only one
 artifact class. The scan still validates all matching recovery-name candidates
 before filtering, so the filter does not weaken validation or bypass directory

@@ -77,8 +77,10 @@ interpreted below the explicit sysroot and must canonicalize to a regular file
 inside it.
 
 The same opt-in searches `/lib` and `/usr/lib`, plus recognized multiarch
-default directories for x86, AArch64, ARM, RISC-V, LoongArch, s390x, and
-PPC64, all below the sysroot. Candidate rows retain whether they came from the
+default directories for x86, AArch64, ARM, RISC-V, LoongArch, s390x, SPARC,
+and PPC64, all below the sysroot. SPARC32 and SPARC V9 use their respective
+`sparc-linux-gnu` and `sparc64-linux-gnu` directories under both `/lib` and
+`/usr/lib`. Candidate rows retain whether they came from the
 cache or a default directory. This is still an offline inventory: it does not
 apply glibc hardware-capability precedence, secure-execution policy,
 `-z nodefaultlib`,

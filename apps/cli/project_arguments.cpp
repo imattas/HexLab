@@ -253,7 +253,7 @@ Arguments parse(std::span<const std::wstring_view> args) {
     }
     require(!result.path.empty(), "Empty project path");
     Options options;
-    const std::set<std::wstring_view> flags{L"--readonly", L"--replace", L"--remove", L"--signed", L"--unsigned", L"--function-entries", L"--all-functions", L"--json", L"--verify-replay", L"--verify-history", L"--verify-input", L"--dry-run", L"--skip-assignments-on-mismatch", L"--file-offset-assignments-on-mismatch", L"--replace-assignments", L"--self-contained"};
+    const std::set<std::wstring_view> flags{L"--readonly", L"--replace", L"--remove", L"--signed", L"--unsigned", L"--function-entries", L"--all-functions", L"--json", L"--inspect-wal", L"--inspect-journal", L"--verify-replay", L"--verify-history", L"--verify-input", L"--dry-run", L"--skip-assignments-on-mismatch", L"--file-offset-assignments-on-mismatch", L"--replace-assignments", L"--self-contained"};
     for (std::size_t n = option_start; n < args.size(); ++n) {
         auto name = args[n];
         require(name.starts_with(L"--"), "Expected a named option");
@@ -327,6 +327,7 @@ Arguments parse(std::span<const std::wstring_view> args) {
     } else if (result.action == L"recovery-list") {
         result.recovery_json = options.flag(L"--json");
         result.recovery_inspect_wal = options.flag(L"--inspect-wal");
+        result.recovery_inspect_journal = options.flag(L"--inspect-journal");
         if (options.contains(L"--kind")) {
             const auto kind = options.pop(L"--kind");
             require(kind == L"interrupted-save" || kind == L"previous-version",

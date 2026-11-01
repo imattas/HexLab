@@ -270,6 +270,8 @@ std::vector<std::string> standard_default_dirs(const ElfHeader &header) {
     else if (header.machine == 258 && header.is_64) add("/lib", "loongarch64-linux-gnu");
     else if (header.machine == 22 && header.is_64) add("/lib", "s390x-linux-gnu");
     else if (header.machine == 22 && !header.is_64) add("/lib", "s390-linux-gnu");
+    else if (header.machine == 43 && header.is_64) add("/lib", "sparc64-linux-gnu");
+    else if (header.machine == 2 && !header.is_64) add("/lib", "sparc-linux-gnu");
     else if (header.machine == 21 && header.is_64)
         add("/lib", header.order == ByteOrder::little ? "powerpc64le-linux-gnu" : "powerpc64-linux-gnu");
     else if (header.machine == 20 && !header.is_64)

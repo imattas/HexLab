@@ -655,10 +655,10 @@ side-entered cleanup paths retain the existing fallback.
 
 A nested pre-tested child loop may contain a guarded return-only side path while
 its other conditional edge continues along the child body. The return side may
-contain up to 64 single-entry, phi-free straight-line blocks and must end in a
-terminal return. Its blocks are emitted only under the original branch
-predicate; the sibling continuation remains in the child loop's ordinary body
-spine. Return paths cannot be shared, re-enter either loop, contain nested
+contain up to 1,024 single-entry, phi-free straight-line blocks, matching the
+bounded CFG size, and must end in a terminal return. Its blocks are emitted
+only under the original branch predicate; the sibling continuation remains in
+the child loop's ordinary body spine. Return paths cannot be shared, re-enter either loop, contain nested
 branches or switches, or carry register, whole-memory, or partition-memory
 phis. Malformed edges and unrecognized return paths retain the existing
 state-machine or label/goto fallback.

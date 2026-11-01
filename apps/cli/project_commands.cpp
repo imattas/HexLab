@@ -279,6 +279,76 @@ RecoveryWalDiagnostics inspect_recovery_wals(const std::filesystem::path &direct
     return result;
 }
 
+struct RecoveryJournalRow {
+    std::string name;
+    std::optional<database::JournalInspection> report;
+    std::string error;
+};
+struct RecoveryJournalDiagnostics {
+    std::vector<RecoveryJournalRow> rows;
+    std::size_t visited_entries = 0, matching_names = 0, omitted_files = 0;
+    bool complete = true;
+};
+RecoveryJournalDiagnostics inspect_recovery_journals(const std::filesystem::path &directory) {
+    constexpr std::size_t entry_limit = 8192, file_limit = 8;
+    constexpr std::uint64_t bytes_per_file = 8ull * 1024 * 1024;
+    constexpr std::size_t records_per_file = 1024;
+    RecoveryJournalDiagnostics result;
+    std::error_code error;
+    std::filesystem::directory_iterator current(directory, error), end;
+    if (error) {
+        result.complete = false;
+        result.rows.push_back({{}, {}, "Cannot enumerate rollback-journal diagnostics: " + error.message()});
+        return result;
+    }
+    while (current != end) {
+        if (result.visited_entries >= entry_limit) { result.complete = false; break; }
+        ++result.visited_entries;
+        const auto entry = *current;
+        current.increment(error);
+        if (error) {
+            result.complete = false;
+            result.rows.push_back({{}, {}, "Cannot enumerate rollback-journal diagnostics: " + error.message()});
+            break;
+        }
+        const auto filename = entry.path().filename().u8string();
+        const bool project_journal = filename.ends_with(u8".hxproj-journal");
+        const bool staging_journal = (filename.starts_with(u8".hexlab-save-") ||
+                                      filename.starts_with(u8".hexlab-previous-")) &&
+                                     filename.ends_with(u8".tmp-journal");
+        if (!project_journal && !staging_journal) continue;
+        ++result.matching_names;
+        if (result.rows.size() >= file_limit) { ++result.omitted_files; result.complete = false; continue; }
+        std::string name(reinterpret_cast<const char *>(filename.data()), filename.size());
+        if (name.size() > 256) {
+            auto cut = std::size_t{256};
+            while (cut && cut < name.size() && (static_cast<unsigned char>(name[cut]) & 0xc0u) == 0x80u) --cut;
+            name.resize(cut); name += "...";
+        }
+        std::error_code status_error;
+        const auto status = entry.symlink_status(status_error);
+        if (status_error || std::filesystem::is_symlink(status) || !std::filesystem::is_regular_file(status)) {
+            std::string reason = status_error ? "Cannot inspect rollback journal: " + status_error.message()
+                : "Rollback-journal diagnostic candidate is not a regular file";
+            if (reason.size() > 256) reason.resize(256);
+            result.rows.push_back({std::move(name), {}, std::move(reason)});
+            result.complete = false;
+            continue;
+        }
+        auto report = database::inspect_rollback_journal(entry.path(), {bytes_per_file, records_per_file}, {});
+        if (!report) {
+            std::string reason = report.error().message;
+            if (reason.size() > 256) reason.resize(256);
+            result.rows.push_back({std::move(name), {}, std::move(reason)});
+            result.complete = false;
+            continue;
+        }
+        if (!report.value().scan_complete) result.complete = false;
+        result.rows.push_back({std::move(name), std::move(report.value()), {}});
+    }
+    return result;
+}
+
 int run_project_integrity(const project_detail::Arguments &args, std::ostream &out) {
     using namespace project_detail;
     auto project = take(database::ProjectStore::open(args.path, database::ProjectMode::read_only, {}));
@@ -376,6 +446,9 @@ int run_recovery_list(const project_detail::Arguments &args, std::ostream &out) 
     std::optional<RecoveryWalDiagnostics> wal_diagnostics;
     if (args.recovery_inspect_wal)
         wal_diagnostics = inspect_recovery_wals(directory);
+    std::optional<RecoveryJournalDiagnostics> journal_diagnostics;
+    if (args.recovery_inspect_journal)
+        journal_diagnostics = inspect_recovery_journals(directory);
     const auto &scanned = scan.candidates;
     std::vector<database::ProjectRecoveryCandidate> candidates;
     candidates.reserve(scanned.size());
@@ -452,6 +525,37 @@ int run_recovery_list(const project_detail::Arguments &args, std::ostream &out) 
             }
             out << "]}";
         }
+        if (journal_diagnostics) {
+            const auto inspected_files = static_cast<std::size_t>(std::count_if(
+                journal_diagnostics->rows.begin(), journal_diagnostics->rows.end(),
+                [](const auto &row) { return row.report.has_value(); }));
+            out << ",\"journal_diagnostics\":{\"diagnostic_only\":true,\"associated_with_project\":false"
+                << ",\"complete\":" << (journal_diagnostics->complete ? "true" : "false")
+                << ",\"visited_entries\":" << journal_diagnostics->visited_entries
+                << ",\"matching_names\":" << journal_diagnostics->matching_names
+                << ",\"inspected_files\":" << inspected_files
+                << ",\"omitted_files\":" << journal_diagnostics->omitted_files
+                << ",\"max_bytes_per_file\":8388608,\"max_records_per_file\":1024,\"items\":[";
+            for (std::size_t i = 0; i < journal_diagnostics->rows.size(); ++i) {
+                if (i) out << ',';
+                const auto &row = journal_diagnostics->rows[i];
+                out << "{\"name\":" << json_string(row.name);
+                if (!row.error.empty()) { out << ",\"error\":" << json_string(row.error) << '}'; continue; }
+                const auto &report = *row.report;
+                out << ",\"file_bytes\":" << report.file_bytes
+                    << ",\"inspected_bytes\":" << report.inspected_bytes
+                    << ",\"header_valid\":" << (report.header_valid ? "true" : "false")
+                    << ",\"records_claimed\":" << report.records_claimed
+                    << ",\"complete_records\":" << report.complete_records
+                    << ",\"valid_records\":" << report.valid_records
+                    << ",\"checksum_failures\":" << report.checksum_failures
+                    << ",\"trailing_bytes\":" << report.trailing_bytes
+                    << ",\"scan_complete\":" << (report.scan_complete ? "true" : "false")
+                    << ",\"stop_reason\":" << json_string(report.stop_reason)
+                    << ",\"diagnostic\":" << json_string(report.diagnostic) << '}';
+            }
+            out << "]}";
+        }
         out << "}\n";
     } else {
         out << "Validated project recovery artifacts in " << escape(path_utf8(directory));
@@ -498,8 +602,29 @@ int run_recovery_list(const project_detail::Arguments &args, std::ostream &out) 
                     << " stop_reason=" << report.stop_reason << '\n';
             }
         }
+        if (journal_diagnostics) {
+            const auto inspected_files = static_cast<std::size_t>(std::count_if(
+                journal_diagnostics->rows.begin(), journal_diagnostics->rows.end(),
+                [](const auto &row) { return row.report.has_value(); }));
+            out << "Rollback-journal diagnostics (diagnostic only; no database association or rollback): inspected="
+                << inspected_files << " matching=" << journal_diagnostics->matching_names
+                << " omitted=" << journal_diagnostics->omitted_files
+                << " complete=" << (journal_diagnostics->complete ? "yes" : "no; limits or validation stopped a scan") << '\n';
+            for (const auto &row : journal_diagnostics->rows) {
+                out << "  " << escape(row.name) << ": ";
+                if (!row.error.empty()) { out << "unavailable: " << escape(row.error) << '\n'; continue; }
+                const auto &report = *row.report;
+                out << "header_valid=" << (report.header_valid ? "yes" : "no")
+                    << " valid_records=" << report.valid_records << '/' << report.records_claimed
+                    << " complete_records=" << report.complete_records
+                    << " checksum_failures=" << report.checksum_failures
+                    << " scan_complete=" << (report.scan_complete ? "yes" : "no")
+                    << " stop_reason=" << report.stop_reason << '\n';
+            }
+        }
     }
-    return scan.complete && (!wal_diagnostics || wal_diagnostics->complete) ? 0 : 3;
+    return scan.complete && (!wal_diagnostics || wal_diagnostics->complete) &&
+           (!journal_diagnostics || journal_diagnostics->complete) ? 0 : 3;
 }
 
 int run_recovery_restore(const project_detail::Arguments &args, std::ostream &out) {
@@ -1095,8 +1220,8 @@ void project_usage(std::ostream &out) {
            "       hexlab_cli project history preview <project.hxproj> --step N [--max-steps N] [--max-bytes N] [--json]\n"
            "       hexlab_cli project history save <project.hxproj> --step N --output <copy.hxproj>\n"
            "           [--expected-edit N] [--max-steps N] [--max-bytes N] [--replace] [--json]\n"
-           "       hexlab_cli project recovery list <directory> [--kind interrupted-save|previous-version] [--inspect-wal] [--json]\n"
-           "       hexlab_cli project recovery list <project.hxproj> [--kind interrupted-save|previous-version] [--inspect-wal] [--json]\n"
+           "       hexlab_cli project recovery list <directory> [--kind interrupted-save|previous-version] [--inspect-wal] [--inspect-journal] [--json]\n"
+           "       hexlab_cli project recovery list <project.hxproj> [--kind interrupted-save|previous-version] [--inspect-wal] [--inspect-journal] [--json]\n"
            "       hexlab_cli project recovery restore <artifact.tmp> --output <project.hxproj> [--replace] [--json]\n"
            "       hexlab_cli project recovery restore-in-place <previous-version.tmp> --target <existing-project.hxproj> [--json]\n"
            "       hexlab_cli project recovery inspect-wal <file-wal> [--max-bytes <n>] [--max-frames <n>] [--json]\n"
@@ -1132,6 +1257,7 @@ void project_usage(std::ostream &out) {
            "history save: publishes an independent project at an exact step with full undo/redo history; source stays unchanged\n"
            "recovery list: read-only scan for validated artifacts; rejected matching names include bounded reasons; a project path scans its directory\n"
            "  --inspect-wal adds bounded read-only diagnostics for matching project/staging WAL sidecars; never associates or replays them\n"
+           "  --inspect-journal adds bounded read-only diagnostics for matching project/staging rollback journals; never associates or replays them\n"
            "recovery restore: revalidates an artifact and publishes an independent project copy; --json emits the published path and UUID; source artifact stays intact\n"
            "recovery restore-in-place: restores a validated interrupted-save or previous-version artifact over its same-UUID target; close connections first, target must be reopened, source is retained\n"
            "recovery inspect-wal: reads WAL bytes without SQLite; checks header, salts, checksums, commit markers; diagnostic only; exit 3 means invalid, truncated, empty or budget-limited\n"
