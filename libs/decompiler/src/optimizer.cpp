@@ -2418,8 +2418,17 @@ struct SummaryWorker {
                     }
                 }
             }
-        } else if (const auto *assignment = std::get_if<Assign>(&statement);
-                   assignment && assignment->destination_version && assignment->value) {
+        } else if (const auto *assignment = std::get_if<Assign>(&statement)) {
+            // RHS simplification above must observe the pre-write payload.
+            // Match the local numeric pass's S/D alias barrier on every write,
+            // including nonconstant assignments and missing SSA definitions.
+            forget_mips64_fp_width_aliases(constants, assignment->destination);
+            if (!assignment->destination_version || !*assignment->destination_version) {
+                if (assignment->destination.bank == RegisterBank::mips_fpr)
+                    invalidate_registers(constants, {assignment->destination}, budget);
+                return;
+            }
+            if (!assignment->value) return;
             const auto *constant = std::get_if<ConstantValue>(&assignment->value->value);
             if (constant && usable_constant(*constant) && assignment->destination.width == constant->type.bits)
                 constants.emplace(key(assignment->destination, *assignment->destination_version), *constant);

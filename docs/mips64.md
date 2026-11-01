@@ -329,7 +329,11 @@ MTC1/DMTC1 and MFC1/DMFC1 payload bitcasts can feed and consume these constants.
 Only versioned MIPS FPR reads with matching register, expression, and constant
 width may reinterpret a known payload between integer and floating types.
 Arbitrary mismatched constants are not retyped. A write drops facts for other
-widths of the same FPR index; physical S/D register aliasing is not inferred.
+widths of the same FPR index in both local and call-summary propagation;
+physical S/D register aliasing is not inferred. Call-summary propagation also
+invalidates every width of an unversioned FPR destination without publishing
+a new constant. These barriers apply after RHS evaluation, including writes
+whose new payload is unknown.
 MIPS32 evaluators and its existing word-conversion folder are unchanged.
 
 The operation and rounding basis is the existing [MIPS64 instruction
