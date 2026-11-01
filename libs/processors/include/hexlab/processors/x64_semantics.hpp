@@ -131,6 +131,40 @@ struct X86BzhiResult {
     bool operator==(const X86BzhiResult &) const = default;
 };
 
+enum class X86Bmi2Shift : std::uint8_t { shlx, shrx, sarx, rorx };
+struct X86Bmi2ShiftResult {
+    std::uint64_t value = 0;
+    std::uint64_t flags = 0; // Every incoming FLAGS bit is preserved.
+    bool operator==(const X86Bmi2ShiftResult &) const = default;
+};
+
+// BMI2 shifts mask the count and never update flags, even for nonzero counts.
+// Unsigned arithmetic implements SARX sign fill without host signed shifts.
+constexpr std::optional<X86Bmi2ShiftResult> evaluate_x86_bmi2_shift(
+    X86Bmi2Shift operation, std::uint64_t source, std::uint64_t count,
+    unsigned width, std::uint64_t incoming_flags = 0) noexcept {
+    if (width != 32 && width != 64) return std::nullopt;
+    const auto mask = width == 64 ? UINT64_MAX : UINT64_C(0xffffffff);
+    source &= mask;
+    const auto shift = static_cast<unsigned>(count & (width - 1u));
+    std::uint64_t value;
+    switch (operation) {
+    case X86Bmi2Shift::shlx: value = (source << shift) & mask; break;
+    case X86Bmi2Shift::shrx: value = source >> shift; break;
+    case X86Bmi2Shift::sarx:
+        value = source >> shift;
+        if (shift && (source & (UINT64_C(1) << (width - 1u))))
+            value |= mask & ~((UINT64_C(1) << (width - shift)) - 1u);
+        break;
+    case X86Bmi2Shift::rorx:
+        value = width == 32 ? std::rotr(static_cast<std::uint32_t>(source), static_cast<int>(shift)) :
+                             std::rotr(source, static_cast<int>(shift));
+        break;
+    default: return std::nullopt;
+    }
+    return X86Bmi2ShiftResult{value, incoming_flags};
+}
+
 // Evaluate BMI2 BZHI. The index is the low byte of the second source; an
 // index at least as large as the operand width copies the source and sets CF.
 constexpr std::optional<X86BzhiResult> evaluate_x86_bzhi(

@@ -1334,67 +1334,106 @@ inline std::optional<X86Bmi2Result> evaluate_x86_bmi2_instruction(
     return evaluate_x86_bmi2(operation, source, bit_mask, destination->width);
 }
 
-// Evaluate BMI2 SHLX/SHRX/SARX/RORX. The caller supplies the source value and,
-// except for RORX, the count-register value; memory reads remain caller-owned.
-inline std::optional<std::uint64_t> evaluate_x86_bmi2_shift_instruction(
-    const Instruction &instruction, std::uint64_t source,
-    std::uint64_t runtime_count = 0) noexcept {
+// Evaluate the result plus unchanged FLAGS of typed BMI2 shifts. The source
+// and variable count are caller-supplied runtime values; RORX uses its imm8.
+// Memory access, CPUID enforcement, and destination commit remain caller-owned.
+inline std::optional<X86Bmi2ShiftResult> evaluate_x86_bmi2_shift_flags_instruction(
+    const Instruction &instruction, std::uint64_t source, std::uint64_t runtime_count,
+    std::uint64_t incoming_flags) noexcept {
     using namespace x64_instruction_semantics_detail;
     if (!x86_32_or_64_context(instruction) ||
-        instruction.flow != FlowKind::fallthrough || instruction.memory_write ||
-        (instruction.opcode != Opcode::shlx && instruction.opcode != Opcode::shrx &&
-         instruction.opcode != Opcode::sarx && instruction.opcode != Opcode::rorx) ||
+        instruction.flow != FlowKind::fallthrough || instruction.memory_write || instruction.lock_prefix ||
+        instruction.x86_repeat != X86RepeatPrefix::none || instruction.x86_evex ||
+        instruction.x86_opmask || instruction.x86_opmask_zeroing ||
+        (instruction.x86_flags_read_mask && *instruction.x86_flags_read_mask != 0) ||
+        (instruction.x86_flags_write_mask && *instruction.x86_flags_write_mask != 0) ||
         instruction.operands.size() != 3 || instruction.access.size() != 3 ||
         instruction.access[0] != OperandAccess::write || instruction.access[1] != OperandAccess::read ||
         instruction.access[2] != OperandAccess::read)
         return std::nullopt;
-    const bool immediate_count = instruction.opcode == Opcode::rorx;
-    const auto max_register = static_cast<std::uint8_t>(instruction.context.architecture == Architecture::x86 ? 7 : 15);
+    X86Bmi2Shift operation;
+    switch (instruction.opcode) {
+    case Opcode::shlx: operation = X86Bmi2Shift::shlx; break;
+    case Opcode::shrx: operation = X86Bmi2Shift::shrx; break;
+    case Opcode::sarx: operation = X86Bmi2Shift::sarx; break;
+    case Opcode::rorx: operation = X86Bmi2Shift::rorx; break;
+    default: return std::nullopt;
+    }
+    const bool long_mode = instruction.context.mode == ExecutionMode::x86_64;
+    const auto max_register = static_cast<std::uint8_t>(long_mode ? 15 : 7);
     const auto *destination = std::get_if<RegisterOperand>(&instruction.operands[0]);
     const unsigned width = destination ? destination->width : 0;
-    if (!destination || destination->bank != RegisterBank::gpr || destination->index > max_register || destination->high_byte ||
-        (width != 32 && width != 64) || operand_width(instruction.operands[1]) != width ||
-        (width == 64 && instruction.context.mode != ExecutionMode::x86_64) ||
-        (std::holds_alternative<MemoryOperand>(instruction.operands[1]) && !instruction.memory_read) ||
-        (std::holds_alternative<RegisterOperand>(instruction.operands[1]) && instruction.memory_read))
+    const auto valid_gpr = [&](RegisterOperand reg, unsigned bits) {
+        return reg.bank == RegisterBank::gpr && reg.index <= max_register && !reg.high_byte && reg.width == bits;
+    };
+    if (!destination || !valid_gpr(*destination, width) ||
+        (width != 32 && width != 64) || (width == 64 && !long_mode) ||
+        instruction.register_writes.size() != 1 || instruction.register_writes[0] != *destination)
         return std::nullopt;
     const auto *source_register = std::get_if<RegisterOperand>(&instruction.operands[1]);
-    if (source_register && (source_register->bank != RegisterBank::gpr || source_register->index > max_register ||
-                            source_register->high_byte))
+    const auto *memory = std::get_if<MemoryOperand>(&instruction.operands[1]);
+    if ((!source_register && !memory) || (source_register && !valid_gpr(*source_register, width)) ||
+        (instruction.memory_read != (memory != nullptr)))
         return std::nullopt;
-    const auto has = [](const auto &registers, RegisterOperand reg) {
-        return std::find(registers.begin(), registers.end(), reg) != registers.end();
-    };
-    if (!has(instruction.register_writes, *destination) ||
-        (source_register && !has(instruction.register_reads, *source_register)))
-        return std::nullopt;
+    if (memory) {
+        const unsigned address_width = memory->address_width;
+        const bool valid_base = !memory->base || (memory->ip_relative
+            ? long_mode && *memory->base == RegisterOperand{RegisterBank::ip, 0,
+                  static_cast<std::uint16_t>(address_width), false}
+            : valid_gpr(*memory->base, address_width));
+        if (memory->data_width != width ||
+            (long_mode ? (address_width != 32 && address_width != 64) :
+                         (address_width != 16 && address_width != 32)) ||
+            !valid_base || (memory->ip_relative && (!memory->base || memory->index)) ||
+            (memory->index && !valid_gpr(*memory->index, address_width)) ||
+            (memory->segment && (memory->segment->bank != RegisterBank::segment ||
+                memory->segment->index > 5 || memory->segment->width != 16 || memory->segment->high_byte)) ||
+            (memory->scale != 1 && memory->scale != 2 && memory->scale != 4 && memory->scale != 8) ||
+            memory->writeback || memory->post_index || !memory->index_extend.empty() || memory->index_shift_amount)
+            return std::nullopt;
+    }
+    const RegisterOperand *count_register = nullptr;
     std::uint64_t count = runtime_count;
-    if (immediate_count) {
+    if (operation == X86Bmi2Shift::rorx) {
         const auto *immediate = std::get_if<ImmediateOperand>(&instruction.operands[2]);
-        if (!immediate || immediate->encoded_width != 8 || immediate->effective_width != 8 || immediate->is_signed)
+        if (!immediate || immediate->encoded_width != 8 || immediate->effective_width != 8 ||
+            immediate->is_signed || immediate->value > 0xffu)
             return std::nullopt;
         count = immediate->value;
     } else {
-        const auto *count_register = std::get_if<RegisterOperand>(&instruction.operands[2]);
-        if (!count_register || count_register->bank != RegisterBank::gpr || count_register->index > max_register ||
-            count_register->width != width ||
-            count_register->high_byte || !has(instruction.register_reads, *count_register))
-            return std::nullopt;
+        count_register = std::get_if<RegisterOperand>(&instruction.operands[2]);
+        if (!count_register || !valid_gpr(*count_register, width)) return std::nullopt;
     }
-    const auto mask = x86_semantics_detail::mask_for(width);
-    source &= mask;
-    const unsigned shift = static_cast<unsigned>(count) & (width - 1);
-    if (instruction.opcode == Opcode::shlx) return (source << shift) & mask;
-    if (instruction.opcode == Opcode::shrx) return source >> shift;
-    if (instruction.opcode == Opcode::rorx) {
-        if (width == 32) return std::rotr(static_cast<std::uint32_t>(source), static_cast<int>(shift));
-        return std::rotr(source, static_cast<int>(shift));
+    const auto has_read = [&](RegisterOperand reg) {
+        return std::find(instruction.register_reads.begin(), instruction.register_reads.end(), reg) !=
+            instruction.register_reads.end();
+    };
+    if ((source_register && !has_read(*source_register)) || (count_register && !has_read(*count_register)) ||
+        (memory && ((memory->base && !has_read(*memory->base)) ||
+                    (memory->index && !has_read(*memory->index)) ||
+                    (memory->segment && !has_read(*memory->segment)))))
+        return std::nullopt;
+    // FLAGS dependencies or unexpected implicit reads must never make BMI2
+    // indistinguishable from legacy SHL/SHR/SAR. Aliased source/count reads
+    // may be deduplicated by the decoder.
+    for (const auto reg : instruction.register_reads) {
+        if ((source_register && reg == *source_register) || (count_register && reg == *count_register) ||
+            (memory && ((memory->base && reg == *memory->base) ||
+                        (memory->index && reg == *memory->index) ||
+                        (memory->segment && reg == *memory->segment)))) continue;
+        return std::nullopt;
     }
-    if (shift == 0) return source;
-    auto result = source >> shift;
-    if (source & (UINT64_C(1) << (width - 1)))
-        result |= mask & ~((UINT64_C(1) << (width - shift)) - 1);
-    return result & mask;
+    return evaluate_x86_bmi2_shift(operation, source, count, width, incoming_flags);
+}
+
+// Compatibility value-only API; validation and count masking are shared with
+// the flag-preserving adapter, including the existing immediate RORX form.
+inline std::optional<std::uint64_t> evaluate_x86_bmi2_shift_instruction(
+    const Instruction &instruction, std::uint64_t source,
+    std::uint64_t runtime_count = 0) noexcept {
+    const auto result = evaluate_x86_bmi2_shift_flags_instruction(instruction, source, runtime_count, 0);
+    if (!result) return std::nullopt;
+    return result->value;
 }
 
 // Evaluate the scalar result and defined status flags for a decoded BZHI.

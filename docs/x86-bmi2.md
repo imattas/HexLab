@@ -27,6 +27,9 @@ widths when a single destination is present, and retains all recorded register
 outputs for `MULX`. This preserves semantics without pretending the C-like
 expression model represents all BMI2 behavior.
 
-VEX-encoded forms are not currently enabled in the 16-bit or 32-bit execution
-modes. EVEX/APX variants remain unsupported. The native VEX BMI1 family is
+VEX-encoded forms are enabled in 32-bit and 64-bit execution modes; 16-bit
+execution mode remains unsupported. SHLX/SHRX/SARX use 32-bit operands in
+32-bit mode even with VEX.W=1. Their exact decode and flag-preserving evaluator
+contract is documented in [BMI2 shifts](x86-bmi2-shifts.md).
+EVEX/APX variants remain unsupported. The native VEX BMI1 family is
 documented in [x86 BMI1 integer instructions](x86-bmi1.md).

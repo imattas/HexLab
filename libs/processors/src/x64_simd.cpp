@@ -706,6 +706,21 @@ bool vex_simd(State &state, std::uint8_t opcode, unsigned map, unsigned pp, unsi
         return true;
     }
     if (map == 2 || map == 3) {
+        if (map == 2 && opcode == 0xf7 && (pp == 1 || pp == 2 || pp == 3)) {
+            if (l)
+                invalid("BMI2 shifts require VEX.L=0");
+            // VEX.W is ignored outside long mode for SHLX/SHRX/SARX.
+            // These three-operand operations never consume or replace FLAGS.
+            const std::uint16_t width = w && state.rules.long_mode() ? 64 : 32;
+            auto decoded = modrm(state, width, width);
+            state.i.opcode = pp == 1 ? Opcode::shlx : pp == 2 ? Opcode::sarx : Opcode::shrx;
+            state.operand(decoded.reg, OperandAccess::write);
+            state.operand(std::move(decoded.rm), OperandAccess::read);
+            state.operand(gpr(static_cast<std::uint8_t>(vvvv), width), OperandAccess::read);
+            state.flags_read_mask = 0;
+            state.flags_write_mask = 0;
+            return true;
+        }
         const bool bmi1 = map == 2 && pp == 0 &&
             (opcode == 0xf2 || opcode == 0xf3 || opcode == 0xf7);
         if (bmi1) {
@@ -743,7 +758,7 @@ bool vex_simd(State &state, std::uint8_t opcode, unsigned map, unsigned pp, unsi
         }
         const bool bmi2_map2 = map == 2 &&
             ((opcode == 0xf5 && (pp == 0 || pp == 2 || pp == 3)) ||
-             (opcode == 0xf6 && pp == 3) || (opcode == 0xf7 && (pp == 1 || pp == 2 || pp == 3)));
+             (opcode == 0xf6 && pp == 3));
         const bool bmi2_rorx = map == 3 && opcode == 0xf0 && pp == 3;
         if (bmi2_map2 || bmi2_rorx) {
             if (l)
@@ -776,13 +791,6 @@ bool vex_simd(State &state, std::uint8_t opcode, unsigned map, unsigned pp, unsi
                 state.operand(decoded.reg, OperandAccess::write);
                 state.operand(vreg, OperandAccess::read);
                 state.operand(std::move(decoded.rm), OperandAccess::read);
-                return true;
-            }
-            if (opcode == 0xf7 && (pp == 1 || pp == 2 || pp == 3)) {
-                state.i.opcode = pp == 1 ? Opcode::shlx : pp == 2 ? Opcode::sarx : Opcode::shrx;
-                state.operand(decoded.reg, OperandAccess::write);
-                state.operand(std::move(decoded.rm), OperandAccess::read);
-                state.operand(vreg, OperandAccess::read);
                 return true;
             }
         }
