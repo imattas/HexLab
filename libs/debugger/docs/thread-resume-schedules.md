@@ -63,7 +63,7 @@ retain the owned event, with no retry as an unfiltered continuation.
 | Backend | Supported filtered schedule | Explicit restrictions |
 | --- | --- | --- |
 | Linux x86/x64 | One selected thread continues or steps; multiple selected threads may continue while others stay stopped. One schedule may single-step the pending event owner while other selected threads continue, or step one non-owner while the event owner remains stopped and other peers continue. Continuing past an owned software breakpoint with selected peers first steps the owner alone, rearms the breakpoint, then resumes the selected set before waiting for the next real stop. When the owner is explicitly single-stepped at an owned software breakpoint, requested peer continuations begin only after the trap byte is rearmed; the backend captures racing peer stops and returns the owner's step event first, retaining peer events for later delivery. | Every traced thread must be stopped before a schedule. Deferred-event owners cannot be rescheduled. A breakpoint step-over cannot combine delivery of the owner's pending signal with the displaced instruction. Mixed schedules otherwise support at most one step; multiple steps remain unsupported. |
-| Linux AArch64 | One selected thread continues or steps; a multi-thread schedule may combine one single-step action with any number of continue actions. The event owner can remain stopped when another thread runs. A scheduled action may preserve/redeliver its queued signal by default or suppress it with `signal_disposition = handled`; `not_handled` explicitly requests redelivery. Continuing past an owned software or hardware execute breakpoint with selected peers first steps the owner alone, then resumes the selected set before waiting for the next real stop. An explicit owner step at an owned software breakpoint resumes selected peers after BRK rearm, captures racing peer stops, and returns the owner's step first. Hardware execute-breakpoint owner steps keep selected peers stopped through the returned step event. | Every traced thread must be stopped. At most one single-step may be outstanding; a later schedule cannot resume that step thread or issue another step until its event is collected. A breakpoint step-over cannot combine delivery of the owner's pending signal with the displaced instruction. Hardware execute-breakpoint step-over schedules support only the event owner and selected peer continuations; the owner can continue or single-step. |
+| Linux AArch64 | One selected thread continues or steps; a multi-thread schedule may combine one single-step action with any number of continue actions. The event owner can remain stopped when another thread runs. A scheduled action may preserve/redeliver its queued signal by default or suppress it with `signal_disposition = handled`; `not_handled` explicitly requests redelivery. Continuing past an owned software or hardware execute breakpoint with selected peers first steps the owner alone, then resumes the selected set before waiting for the next real stop. An explicit owner step at an owned software breakpoint resumes selected peers after BRK rearm, captures racing peer stops, and returns the owner's step first. Explicit owner steps at hardware execute breakpoints likewise resume selected peers after debug-register restoration and capture their racing stops before returning the owner step. | Every traced thread must be stopped. At most one single-step may be outstanding; a later schedule cannot resume that step thread or issue another step until its event is collected. A breakpoint step-over cannot combine delivery of the owner's pending signal with the displaced instruction. Hardware execute-breakpoint step-over schedules support only the event owner and selected peer continuations; the owner can continue or single-step. |
 | Windows | The event owner may step with selected peers continuing on x86/x64 and ARM64. Omitted threads stay suspended until the next debug event. For a displaced x86/x64 or ARM64 software-breakpoint instruction, every peer is held for that one instruction, including peers selected to continue; their continuation can be chosen after the resulting event is collected. The event owner may be explicitly stopped while a continue-only peer subset runs; unselected threads retain one debugger-owned suspend count. The event owner's `signal_disposition` selects `DBG_CONTINUE` (default/`handled`) or `DBG_EXCEPTION_NOT_HANDLED` (`not_handled`) for a pending exception. | Foreign-thread steps, multiple steps, and an active displaced software-breakpoint step reject. `not_handled` is valid only for an exception event and cannot be combined with a single-step. Non-owner actions cannot set an event disposition. |
 | Darwin (unsupported host) | Native scheduling is unavailable because HexLab does not build or run as a macOS host. | This row records the retired backend boundary; native process debugging is supported on Windows and Linux only. |
 
@@ -108,8 +108,9 @@ the trap is rearmed, and the backend captures any peer stops before returning
 the owner's step event; peer events remain queued for later delivery. AArch64
 requires a confirmed `TRAP_TRACE` before replaying deferred software-breakpoint
 continuations; other signal or interrupt stops cancel that replay and remain
-visible with peers held. AArch64 hardware execute-breakpoint owner steps keep selected peers
-stopped through the returned event. Hardware execute-breakpoint schedules
+visible with peers held. AArch64 hardware execute-breakpoint owner steps also
+defer peers until a confirmed trace and successful debug-register restore, then
+capture peer stops before returning the owner event. Hardware execute-breakpoint schedules
 require the owner and only peer continuations; non-owner steps remain unsupported.
 
 For Linux AArch64 software-breakpoint continue schedules, the displaced owner
@@ -128,9 +129,14 @@ confirmed owner `TRAP_TRACE` does not become a pending signal to redeliver on
 retry. Failed and unattempted peers retain their queued signals, while BRK and
 the owned original-instruction bookkeeping remain intact during rollback.
 
-For a Linux AArch64 hardware execute-breakpoint continue schedule, the owner
-completes its internal step before the backend resumes selected peers. If a
-peer continuation fails, the completed owner step remains a `single_step`
+For a Linux AArch64 hardware execute-breakpoint schedule, the owner completes
+its internal step and restores its saved debug regset before the backend
+resumes selected peers. A continue schedule then resumes the owner last with
+signal zero and keeps waiting for a real event. An explicit owner step leaves
+the owner stopped, captures racing peer stops and returns the owner step first.
+Only a confirmed `TRAP_TRACE` may release the deferred threads; target signals,
+interrupts, clone, exit and failed debug-register restoration cancel the plan.
+If a peer continuation fails, the completed owner step remains a `single_step`
 event with the failure attached; already resumed peers are stopped again, and
 the step's `TRAP_TRACE` is consumed rather than redelivered. Further resumes
 are blocked only if peer rollback cannot restore the stopped-thread invariant.

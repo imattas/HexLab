@@ -52,8 +52,10 @@ separate debugger daemon. The x86-64 host build continues to select
 - A continue-only thread schedule may pass an owned hardware execute breakpoint
   with selected peers: peers remain stopped while the event owner executes one
   instruction and its debug-register state is restored, then the selected peers
-  resume. The owner may instead request a user-visible step; selected peers stay
-  stopped through that returned step event. Non-owner steps remain unsupported,
+  resume, followed by the owner itself. The owner may instead request a
+  user-visible step: selected peers resume after debug-register restoration,
+  then are stopped again before the owner step is returned. Racing peer events
+  remain queued. Non-owner steps remain unsupported,
   and the owner's pending signal must be suppressed for the displaced instruction.
 - At an owned software-breakpoint stop, an owner-only step returns its
   `single_step` event with peers held. A schedule that also selects peers resumes
@@ -68,6 +70,18 @@ separate debugger daemon. The x86-64 host build continues to select
   peer-resume error attached. It stops peers already resumed and blocks later
   resumes only if rollback cannot restore the stopped-thread state. The internal
   trace trap is consumed and is not redelivered.
+- Hardware execute-breakpoint mixed schedules release selected peers only after
+  `PTRACE_GETSIGINFO` confirms `TRAP_TRACE` and the saved execute-debug regset is
+  restored. An interrupt, target-generated SIGTRAP, other signal, clone event,
+  owner exit, or failed restoration cancels deferred continuations. Real stops
+  retain their event and signal provenance; a missing siginfo record cannot
+  authorize peer execution. Clone and exit also discard the deferred plan so a
+  later unrelated step cannot replay it. Continue schedules restart the owner
+  last with signal zero; explicit owner steps leave that owner stopped.
+- The hardware mixed-step scheduling addition passed GCC 13.3 object compilation
+  and Clang 18.1 syntax checking on x86-64 WSL with `__aarch64__` selected.
+  These checks use host Linux headers and generate no native AArch64 code.
+  No tests or live ptrace execution were run for this addition.
 - File-backed module inspection from `/proc/<pid>/maps`, grouped by exact path.
   Reported spans cover the min/max mapped range and can include gaps.
 

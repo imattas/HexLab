@@ -43,8 +43,16 @@ event, the backend stops the resumed peers and queues their racing signal,
 clone, or exit events for later delivery. A peer-resume failure is appended to
 the completed owner step; incomplete rollback blocks later resumes until
 recovery succeeds. A non-trace signal or interrupt stop cancels deferred
-continuations and remains visible with the selected peers held. Hardware execute-breakpoint owner steps
-still leave selected peers stopped through the returned step event. These
+continuations and remains visible with the selected peers held. Hardware
+execute-breakpoint owner steps likewise defer selected peer continuations
+until a confirmed `TRAP_TRACE` and successful restoration of the saved debug
+regset. They capture racing peer stops before returning the owner's step
+event. A continue schedule restarts selected peers first and the owner last,
+with the internal trace signal suppressed. Target-generated SIGTRAP, missing
+siginfo, interrupts, clone, exit, and failed restoration cannot trigger the
+deferred continuations. Clone and owner exit discard that deferred plan.
+Hardware peer-resume failures retain the completed owner step and the existing
+bounded rollback behavior. These
 ptrace operations use stop-and-rollback and are not atomic.
 Memory reads and writes, breakpoint changes, detach, and register writes
 require the entire process thread group to be owned and stopped. If the task
@@ -112,9 +120,9 @@ kernel implementation: [`user_sve_header` and `NT_ARM_SVE` layout](https://githu
 [`encode_ctrl_reg`](https://github.com/torvalds/linux/blob/master/arch/arm64/include/asm/hw_breakpoint.h),
 and [watchpoint hit attribution](https://github.com/torvalds/linux/blob/master/arch/arm64/kernel/hw_breakpoint.c).
 
-The current backend, including deferred-resume owner ordering and signal
-handling, passed GCC 13.3 syntax checking under x86-64 WSL with the AArch64
-guard defined and host Linux headers. This checks the source only; it does not
-generate AArch64 code. Native AArch64 compilation, ptrace UAPI behavior, and
+The hardware mixed-step scheduling addition passed GCC 13.3 object compilation
+and Clang 18.1 syntax checking under x86-64 WSL with the AArch64 guard defined
+and host Linux headers. Both checks produced only existing warnings. This checks
+the source only; the object contains x86-64 code. Native AArch64 compilation, ptrace UAPI behavior, and
 runtime breakpoint handling remain unverified. No tests or target runtime
 checks have been run for these changes.

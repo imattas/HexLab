@@ -780,6 +780,7 @@ public:
                     pending_signal_ = 0;
                     if (hardware_step_state_ && hardware_step_state_->thread == tid) {
                         hardware_step_state_.reset(); step_pending_ = false; step_thread_ = 0;
+                        deferred_breakpoint_resumes_.reset();
                     }
                     if (pending_hardware_execute_ && pending_thread_ == tid) pending_hardware_execute_ = false;
                     tracked_.erase(tid); stopped_.erase(tid); seized_.erase(tid); interrupting_.erase(tid);
@@ -902,7 +903,7 @@ public:
                             deferred_breakpoint_resumes_.reset();
                         } else if (step_pending_ && step_thread_ == tid) {
                             step_pending_ = false; step_thread_ = 0;
-                            if (last_signal_ == SIGTRAP && !hardware_trap && !hardware_step_restore_failed) {
+                            if (trace_trap && !hardware_trap && !hardware_step_restore_failed) {
                                 e.kind = EventKind::single_step;
                                 // Do not redeliver the TRAP_TRACE used to
                                 // finish an execute-breakpoint step-over if a
@@ -932,9 +933,10 @@ public:
                                         e.message += "; deferred schedule failed: " + error.message;
                                         break;
                                     }
-                                    const bool all_resumed = resumed.size() == deferred_breakpoint_resumes_->threads.size();
+                                    const bool keep_waiting = resumed.size() == deferred_breakpoint_resumes_->threads.size() &&
+                                        !deferred_breakpoint_resumes_->report_owner_step;
                                     deferred_breakpoint_resumes_.reset();
-                                    if (all_resumed) continue;
+                                    if (keep_waiting) continue;
                                 }
                             } else {
                                 deferred_breakpoint_resumes_.reset();
@@ -947,6 +949,7 @@ public:
                         if (!restored)
                             e.message += "; failed to restore AArch64 execute-breakpoint state: " + restored.error().message;
                         step_pending_ = false; step_thread_ = 0;
+                        deferred_breakpoint_resumes_.reset();
                     }
                 }
                 if (e.kind != EventKind::process_exited && !requested_thread_interrupt) {
@@ -1139,9 +1142,11 @@ public:
             }
             if (pending_hardware_execute_) {
                 // Keep every peer stopped while the event owner executes the
-                // instruction at the hardware breakpoint. An owner step
-                // returns its step event with peers held; owner continue
-                // resumes selected peers after debug state is restored.
+                // instruction at the hardware breakpoint. Only a confirmed
+                // trace trap and restored debug state may release selected
+                // peers. An explicit step returns the owner event after
+                // capturing those peers' racing stops; continue releases
+                // the owner last and waits for the next real event.
                 if (std::any_of(runnable.begin(), runnable.end(), [&](const auto* action) {
                         const auto tid = static_cast<pid_t>(action->thread);
                         return tid != owner && action->kind != ThreadResumeKind::continue_execution;
@@ -1163,22 +1168,26 @@ public:
                     return Error{ErrorCode::unsupported,
                         "cannot combine AArch64 hardware-breakpoint step-over with delivery of the owner's pending signal"};
                 std::vector<std::pair<pid_t, int>> deferred_resumes;
-                if ((*owner_action)->kind == ThreadResumeKind::continue_execution) {
-                    deferred_resumes.reserve(runnable.size() - 1);
-                    for (const auto* action : runnable) {
-                        const auto tid = static_cast<pid_t>(action->thread);
-                        if (tid == owner) continue;
-                        const int queued = signal_for(*action);
-                        deferred_resumes.emplace_back(tid,
-                            action->signal_disposition == ContinueStatus::handled ? 0 : queued);
-                    }
+                deferred_resumes.reserve(runnable.size());
+                for (const auto* action : runnable) {
+                    const auto tid = static_cast<pid_t>(action->thread);
+                    if (tid == owner) continue;
+                    const int queued = signal_for(*action);
+                    deferred_resumes.emplace_back(tid,
+                        action->signal_disposition == ContinueStatus::handled ? 0 : queued);
                 }
+                const bool report_owner_step = (*owner_action)->kind == ThreadResumeKind::single_step;
+                // The internal PTRACE_SINGLESTEP consumes the owner's signal
+                // suppression. Do not inject its original execute trap again.
+                // Keep the owner stopped until all peer resumes succeed.
+                if (!report_owner_step) deferred_resumes.emplace_back(owner, 0);
                 auto configured = ensure_hardware_breakpoints_configured();
                 if (!configured) return configured;
                 auto stepped = begin_hardware_execute_step(owner, pending_hardware_execute_address_);
                 if (!stepped) return stepped;
-                if ((*owner_action)->kind == ThreadResumeKind::continue_execution)
-                    deferred_breakpoint_resumes_ = Aarch64DeferredBreakpointResumes{std::move(deferred_resumes), false};
+                deferred_signals_.erase(owner);
+                deferred_breakpoint_resumes_ = Aarch64DeferredBreakpointResumes{
+                    std::move(deferred_resumes), report_owner_step};
                 for (const auto& action : actions) {
                     const auto tid = static_cast<pid_t>(action.thread);
                     if (action.kind != ThreadResumeKind::stop) continue;
