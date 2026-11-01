@@ -225,6 +225,7 @@ struct RegisterReferenceFacts {
 struct RelocationCoverage;
 bool mapped_data_range(const Image &, Address, OperandAccess, std::uint64_t);
 std::optional<Address> static_m6502_indirect_target(const Image &, const RelocationCoverage &, Address);
+std::optional<Address> static_m65c02_indexed_indirect_target(const Image &, const RelocationCoverage &, Address);
 std::optional<std::uint16_t> static_m6502_zero_page_pointer(const Image &, const RelocationCoverage &, Address);
 std::optional<Address> dex_invoke_code_target(const Instruction &, const Image &, const ImageMetadata &);
 RegisterReferenceFacts m6502_reference_facts(const Image *image, const RelocationCoverage &relocations,
@@ -239,9 +240,11 @@ RegisterReferenceFacts m6502_reference_facts(const Image *image, const Relocatio
         for (const auto &fact : block->instructions) {
             reference_detail::canceled(stop);
             if (!fact || fact->instruction.context.architecture != Architecture::mos6502 ||
-                fact->instruction.context.mode != ExecutionMode::m6502)
+                (fact->instruction.context.mode != ExecutionMode::m6502 &&
+                 fact->instruction.context.mode != ExecutionMode::m65c02))
                 continue;
             const auto &instruction = fact->instruction;
+            const bool cmos = instruction.context.mode == ExecutionMode::m65c02;
             const auto assign = [&](KnownRegister &destination, const KnownRegister &source) {
                 if (source) destination = std::pair{source->first, fact->id};
                 else destination.reset();
@@ -256,7 +259,22 @@ RegisterReferenceFacts m6502_reference_facts(const Image *image, const Relocatio
             };
             if (instruction.opcode == Opcode::m6502_jmp && instruction.operands.size() == 1) {
                 const auto *pointer = std::get_if<MemoryOperand>(&instruction.operands.front());
-                if (pointer && !pointer->base && !pointer->index && !pointer->ip_relative &&
+                if (cmos && pointer && !pointer->base && pointer->index &&
+                    pointer->index->bank == RegisterBank::mos6502 && pointer->index->index == 1 &&
+                    pointer->index->width == 8 && x && !pointer->ip_relative &&
+                    pointer->displacement >= 0 && pointer->displacement <= UINT16_MAX &&
+                    pointer->displacement_encoding && pointer->displacement_encoding->size == 2 &&
+                    pointer->displacement_encoding->offset == 1 && !instruction.bytes.empty() &&
+                    std::to_integer<std::uint8_t>(instruction.bytes.front()) == 0x7c) {
+                    const auto slot_offset = static_cast<std::uint16_t>(
+                        static_cast<std::uint16_t>(pointer->displacement) + x->first);
+                    const Address slot{instruction.address.space, slot_offset};
+                    if (const auto target = static_m65c02_indexed_indirect_target(*image, relocations, slot)) {
+                        result.memory_targets[{fact->id, 0}] = slot;
+                        result.immediate_targets[{fact->id, 0}] = *target;
+                        result.producer_instruction_ids[{fact->id, 0}] = {x->second};
+                    }
+                } else if (!cmos && pointer && !pointer->base && !pointer->index && !pointer->ip_relative &&
                     pointer->displacement >= 0 && pointer->displacement <= UINT16_MAX) {
                     const Address slot{instruction.address.space, static_cast<std::uint16_t>(pointer->displacement)};
                     if (const auto target = static_m6502_indirect_target(*image, relocations, slot)) {
@@ -685,7 +703,41 @@ std::optional<Address> static_m6502_indirect_target(const Image &image, const Re
                                           ((pointer.offset + 1) & UINT64_C(0x00ff))};
     const auto read_byte = [&](Address at) -> std::optional<std::uint8_t> {
         const auto *segment = image.segment_at(at);
-        if (!segment || !segment->readable || at.offset < segment->begin.offset ||
+        if (!segment || !segment->readable || segment->writable || at.offset < segment->begin.offset ||
+            relocations.overlaps(at, 1))
+            return {};
+        const auto relative = at.offset - segment->begin.offset;
+        if (relative >= segment->file_size)
+            return {};
+        const auto bytes = image.read(at, 1);
+        if (!bytes || bytes.value().size() != 1)
+            return {};
+        return std::to_integer<std::uint8_t>(bytes.value().front());
+    };
+    const auto low_byte = read_byte(pointer);
+    const auto high_byte = read_byte(high);
+    if (!low_byte || !high_byte)
+        return {};
+    const Address target{pointer.space, std::uint64_t(*low_byte) | (std::uint64_t(*high_byte) << 8)};
+    const auto *segment = image.segment_at(target);
+    if (!segment || !segment->executable || target.offset < segment->begin.offset ||
+        target.offset - segment->begin.offset >= segment->size)
+        return {};
+    return target;
+}
+std::optional<Address> static_m65c02_indexed_indirect_target(const Image &image,
+                                                             const RelocationCoverage &relocations,
+                                                             Address pointer) {
+    const auto *space = image.space(pointer.space);
+    if (!space || space->width_bits != 16 || pointer.offset > UINT16_MAX)
+        return {};
+    // W65C02S JMP (abs,X) reads two adjacent bytes in the 16-bit address
+    // space. Unlike the NMOS JMP (abs) bug, the high byte advances across
+    // page boundaries (and wraps from $FFFF to $0000).
+    const Address high{pointer.space, static_cast<std::uint16_t>(pointer.offset + 1)};
+    const auto read_byte = [&](Address at) -> std::optional<std::uint8_t> {
+        const auto *segment = image.segment_at(at);
+        if (!segment || !segment->readable || segment->writable || at.offset < segment->begin.offset ||
             relocations.overlaps(at, 1))
             return {};
         const auto relative = at.offset - segment->begin.offset;
