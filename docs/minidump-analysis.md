@@ -325,13 +325,23 @@ CONTEXT with the AMD64 ContextFlags family at the documented AMD64 offset is
 decoded using AMD64 register offsets. This context representation can be used
 for either ARM64EC execution or x64 emulation; the minidump context alone does
 not distinguish those modes, so the loader labels it only AMD64-compatible.
+When captured memory also contains the thread's current PC and its module's
+PE headers, load-configuration record, and complete valid CHPE code map, the
+loader resolves the execution mode from the PC's code-map range: kind 1 selects
+ARM64EC and kind 2 selects x64 emulation. In the first case the candidate
+ARM64EC aliases become regular `arm64ec_*` register rows; in the second they
+are omitted, leaving the AMD64 register view. The distinction remains unknown
+if required bytes are absent, the module mapping overlaps, or PE/CHPE metadata
+is invalid, incomplete, or unsupported. The loader does not infer a mode from
+module base/size, module name, TEB, or other CONTEXT values. CHPE kind 0
+(ARM64) and other unrecognized cases also remain unknown.
 For this fixed layout, the register list also exposes conditional
 `arm64ec_candidate_*` aliases for the mapped GPRs, PC/SP/FP/LR, and V0-V15.
 Aliases backed by one AMD64 field preserve that field's exact file offset and
 bytes; LR and X6-X12/X15 use the low 64 bits of their mapped x87 slots, while
-V0-V15 use XMM0-XMM15. The prefix is deliberate: these rows describe the
-documented ARM64EC overlay as a possible view, not a finding that the thread
-was executing ARM64EC code. X16/X17 use composite rows with segmented source
+V0-V15 use XMM0-XMM15. When mode evidence is unavailable, the prefix is
+deliberate: these rows describe the documented ARM64EC overlay as a possible
+view, not a finding that the thread was executing ARM64EC code. X16/X17 use composite rows with segmented source
 provenance. X18 is exposed as `arm64ec_candidate_x18` only when a nonzero TEB
 address is available from the owning `MINIDUMP_THREAD` record; its eight bytes
 and byte-level provenance point to that record's TEB field. An exception

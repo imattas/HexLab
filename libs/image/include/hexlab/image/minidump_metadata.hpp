@@ -163,8 +163,11 @@ struct MinidumpRegister {
 enum class MinidumpContextStatus : std::uint8_t {
     decoded, partial, not_captured, unsupported_architecture, architecture_mismatch, malformed
 };
+enum class MinidumpExecutionMode : std::uint8_t { unknown, arm64ec, x64_emulation };
 struct MinidumpContext {
     std::uint16_t processor_architecture = 0xffff;
+    // Resolved only when the captured PC falls in a validated in-dump CHPE code-map range.
+    MinidumpExecutionMode execution_mode = MinidumpExecutionMode::unknown;
     std::uint64_t flags = 0;
     bool control_valid = false, integer_valid = false;
     std::vector<MinidumpRegister> registers;
