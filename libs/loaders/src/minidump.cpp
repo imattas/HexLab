@@ -378,71 +378,94 @@ void add_arm64ec_candidate_overlay(MinidumpContext &context,
 }
 struct Region { std::uint64_t begin, size, file; };
 std::optional<std::vector<std::byte>> read_virtual(const ByteStorage &storage,
-    std::span<const Region> regions, std::uint64_t address, std::size_t size) {
+    std::span<const Region> regions, std::uint64_t address, std::size_t size, std::stop_token stop) {
     if (address > UINT64_MAX - size) return {};
+    if (!size) return std::vector<std::byte>{};
+    const auto end = address + size;
+    auto first = std::lower_bound(regions.begin(), regions.end(), address,
+        [](const Region &region, std::uint64_t value) { return region.begin < value; });
+    while (first != regions.begin() && std::prev(first)->begin + std::prev(first)->size > address) --first;
+
+    // Validate the complete requested interval before copying any bytes. This
+    // catches gaps and overlaps that begin in the middle of a would-be chunk.
+    auto cursor = address;
+    auto current_region = first;
+    while (cursor < end) {
+        if (stop.stop_requested() || current_region == regions.end()) return {};
+        const auto region_end = current_region->begin + current_region->size;
+        if (current_region->begin > cursor || region_end <= cursor) return {};
+        cursor = std::min(region_end, end);
+        auto next = std::next(current_region);
+        if (cursor == end) {
+            if (next != regions.end() && next->begin < end) return {};
+            break;
+        }
+        if (next == regions.end() || next->begin != cursor) return {};
+        current_region = next;
+    }
+
     std::vector<std::byte> bytes(size);
     std::size_t copied = 0;
+    current_region = first;
     while (copied < size) {
+        if (stop.stop_requested() || current_region == regions.end()) return {};
         const auto current = address + copied;
-        const Region *match = nullptr;
-        for (const auto &region : regions) {
-            if (current >= region.begin && current - region.begin < region.size) {
-                if (match) return {};
-                match = &region;
-            }
-        }
-        if (!match) return {};
-        const auto chunk = std::min<std::uint64_t>(size - copied, match->size - (current - match->begin));
-        auto data = read(storage, match->file + (current - match->begin), static_cast<std::size_t>(chunk));
+        const auto chunk = std::min<std::uint64_t>(end - current,
+            current_region->begin + current_region->size - current);
+        auto data = read(storage, current_region->file + (current - current_region->begin),
+                         static_cast<std::size_t>(chunk));
         if (!data) return {};
         std::copy(data.value().bytes.begin(), data.value().bytes.end(), bytes.begin() + static_cast<std::ptrdiff_t>(copied));
         copied += static_cast<std::size_t>(chunk);
+        if (copied < size) ++current_region;
     }
     return bytes;
 }
 std::optional<MinidumpExecutionMode> classify_chpe_pc(const ByteStorage &storage,
-    std::span<const Region> regions, const MinidumpModule &module, std::uint64_t pc) {
+    std::span<const Region> regions, const MinidumpModule &module, std::uint64_t pc, std::stop_token stop) {
     constexpr std::uint64_t max_header = 64u * 1024u, max_code_map_bytes = 1024u * 1024u;
     constexpr std::uint16_t machine_amd64 = 0x8664, machine_arm64ec = 0xa641, machine_arm64x = 0xa64e;
     if (!module.image_size || pc < module.image_base || pc - module.image_base >= module.image_size) return {};
-    const auto dos = read_virtual(storage, regions, module.image_base, 64);
+    const auto dos = read_virtual(storage, regions, module.image_base, 64, stop);
     if (!dos || u(*dos, 0, 2) != 0x5a4d) return {};
     const auto nt_offset = u(*dos, 0x3c, 4);
     if (nt_offset > max_header || nt_offset + 24 > module.image_size) return {};
-    const auto nt = read_virtual(storage, regions, module.image_base + nt_offset, 24);
+    const auto nt = read_virtual(storage, regions, module.image_base + nt_offset, 24, stop);
     if (!nt || u(*nt, 0, 4) != 0x00004550) return {};
     const auto machine = static_cast<std::uint16_t>(u(*nt, 4, 2));
     const auto optional_size = static_cast<std::uint16_t>(u(*nt, 20, 2));
     if ((machine != machine_amd64 && machine != machine_arm64ec && machine != machine_arm64x) ||
         optional_size < 112 + 11 * 8 || optional_size > 4096 ||
         nt_offset + 24 + optional_size > module.image_size) return {};
-    const auto optional = read_virtual(storage, regions, module.image_base + nt_offset + 24, optional_size);
+    const auto optional = read_virtual(storage, regions, module.image_base + nt_offset + 24, optional_size, stop);
     if (!optional || u(*optional, 0, 2) != 0x20b || u(*optional, 108, 4) < 11) return {};
     const auto image_size = u(*optional, 56, 4);
     const auto load_config_rva = u(*optional, 112 + 10 * 8, 4);
     const auto load_config_size = u(*optional, 112 + 10 * 8 + 4, 4);
     if (!image_size || image_size > module.image_size || load_config_size < 208 ||
         load_config_rva >= image_size || load_config_size > image_size - load_config_rva) return {};
-    const auto load_config = read_virtual(storage, regions, module.image_base + load_config_rva, 208);
+    const auto load_config = read_virtual(storage, regions, module.image_base + load_config_rva, 208, stop);
     if (!load_config || u(*load_config, 0, 4) < 208) return {};
     const auto chpe_va = u(*load_config, 200, 8);
     if (chpe_va < module.image_base) return {};
     const auto metadata_rva = chpe_va - module.image_base;
     if (metadata_rva > image_size || 12 > image_size - metadata_rva) return {};
-    const auto chpe = read_virtual(storage, regions, module.image_base + metadata_rva, 12);
+    const auto chpe = read_virtual(storage, regions, module.image_base + metadata_rva, 12, stop);
     if (!chpe || (u(*chpe, 0, 4) != 1 && u(*chpe, 0, 4) != 2)) return {};
     const auto chpe_header_size = u(*chpe, 0, 4) == 1 ? 80u : 92u;
     if (chpe_header_size > image_size - metadata_rva ||
-        !read_virtual(storage, regions, module.image_base + metadata_rva, chpe_header_size)) return {};
+        !read_virtual(storage, regions, module.image_base + metadata_rva, chpe_header_size, stop)) return {};
     const auto map_rva = u(*chpe, 4, 4), map_count = u(*chpe, 8, 4);
     if (!map_count || map_count > max_code_map_bytes / 8 || map_rva > image_size ||
         map_count * 8 > image_size - map_rva) return {};
-    const auto map = read_virtual(storage, regions, module.image_base + map_rva, static_cast<std::size_t>(map_count * 8));
+    const auto map = read_virtual(storage, regions, module.image_base + map_rva,
+                                  static_cast<std::size_t>(map_count * 8), stop);
     if (!map) return {};
     const auto pc_rva = pc - module.image_base;
     std::uint64_t previous_end = 0;
     std::optional<std::uint32_t> pc_kind;
     for (std::uint64_t index = 0; index < map_count; ++index) {
+        if ((index & 0x3ffu) == 0 && stop.stop_requested()) return {};
         const auto at = static_cast<std::size_t>(index * 8);
         const auto tagged_start = static_cast<std::uint32_t>(u(*map, at, 4));
         const auto start = tagged_start & ~std::uint32_t{3};
@@ -461,7 +484,7 @@ std::optional<MinidumpExecutionMode> classify_chpe_pc(const ByteStorage &storage
     return {};
 }
 void resolve_arm64ec_execution_mode(MinidumpContext &context, const ByteStorage &storage,
-    std::span<const Region> regions, std::span<const MinidumpModule> modules) {
+    std::span<const Region> regions, std::span<const MinidumpModule> modules, std::stop_token stop) {
     if (context.processor_architecture != 9) return;
     const auto rip = std::find_if(context.registers.begin(), context.registers.end(),
                                   [](const auto &reg) { return reg.name == "rip"; });
@@ -473,7 +496,7 @@ void resolve_arm64ec_execution_mode(MinidumpContext &context, const ByteStorage 
         match = &module;
     }
     if (!match) return;
-    const auto mode = classify_chpe_pc(storage, regions, *match, rip->value);
+    const auto mode = classify_chpe_pc(storage, regions, *match, rip->value, stop);
     if (!mode) return;
     context.execution_mode = *mode;
     std::erase_if(context.diagnostics, [](const auto &message) {
@@ -1540,10 +1563,38 @@ Result<LoadedImage> load_minidump(std::shared_ptr<const ByteStorage> storage, st
         }
 
         if (metadata.processor_architecture == 12) {
+            if (stop.stop_requested()) return Error{ErrorCode::canceled, "Minidump ARM64EC mode resolution canceled"};
+            auto indexed_regions = regions;
+            std::sort(indexed_regions.begin(), indexed_regions.end(), [](const auto &left, const auto &right) {
+                return left.begin < right.begin || (left.begin == right.begin && left.size < right.size);
+            });
+            if (stop.stop_requested()) return Error{ErrorCode::canceled, "Minidump ARM64EC mode resolution canceled"};
+            bool indexed_regions_disjoint = true;
+            for (std::size_t index = 1; index < indexed_regions.size(); ++index) {
+                if ((index & 0x3ffu) == 0 && stop.stop_requested())
+                    return Error{ErrorCode::canceled, "Minidump ARM64EC mode resolution canceled"};
+                const auto &previous = indexed_regions[index - 1];
+                if (previous.begin + previous.size > indexed_regions[index].begin) {
+                    indexed_regions_disjoint = false;
+                    break;
+                }
+            }
+            const auto resolve_mode = [&](MinidumpContext &context) {
+                if (indexed_regions_disjoint) {
+                    resolve_arm64ec_execution_mode(context, *storage, indexed_regions, metadata.modules, stop);
+                } else if (context.processor_architecture == 9) {
+                    context.diagnostics.emplace_back(
+                        "ARM64EC versus x64 emulation remains unresolved because captured virtual memory ranges overlap");
+                }
+            };
             for (auto &thread : metadata.threads)
-                if (thread.context) resolve_arm64ec_execution_mode(*thread.context, *storage, regions, metadata.modules);
+                if (thread.context) {
+                    resolve_mode(*thread.context);
+                    if (stop.stop_requested()) return Error{ErrorCode::canceled, "Minidump ARM64EC mode resolution canceled"};
+                }
             if (metadata.exception && metadata.exception->context)
-                resolve_arm64ec_execution_mode(*metadata.exception->context, *storage, regions, metadata.modules);
+                resolve_mode(*metadata.exception->context);
+            if (stop.stop_requested()) return Error{ErrorCode::canceled, "Minidump ARM64EC mode resolution canceled"};
         }
 
         if (auto names = stream(stream_thread_names)) {
