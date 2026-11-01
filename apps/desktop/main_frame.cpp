@@ -295,6 +295,7 @@ const char *execution_mode_id(ExecutionMode mode) {
     case ExecutionMode::thumb: return "thumb";
     case ExecutionMode::a64: return "a64";
     case ExecutionMode::rv32: return "rv32";
+    case ExecutionMode::rv32c: return "rv32c";
     case ExecutionMode::rv64: return "rv64";
     case ExecutionMode::rv64c: return "rv64c";
     case ExecutionMode::mips32: return "mips32";

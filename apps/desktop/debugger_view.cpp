@@ -121,8 +121,8 @@ std::string register_architecture_label(const debugger::RegisterValue &reg) {
     if (architecture.find("i386") != std::string::npos || architecture == "x86") return "x86";
     if (architecture.find("aarch64") != std::string::npos || architecture.find("arm64") != std::string::npos) return "AArch64";
     if (architecture == "arm" || architecture.find("armv") != std::string::npos) return "ARM";
-    if (architecture.find("riscv64") != std::string::npos || architecture == "rv64") return "RISC-V 64";
-    if (architecture.find("riscv32") != std::string::npos || architecture == "rv32") return "RISC-V 32";
+    if (architecture.find("riscv64") != std::string::npos || (architecture == "rv64" || architecture == "rv64c")) return "RISC-V 64";
+    if (architecture.find("riscv32") != std::string::npos || (architecture == "rv32" || architecture == "rv32c")) return "RISC-V 32";
     if (architecture.find("mips64") != std::string::npos) return "MIPS64";
     if (architecture.find("mips") != std::string::npos) return "MIPS";
     if (architecture.find("powerpc64") != std::string::npos || architecture.find("ppc64") != std::string::npos) return "PowerPC64";

@@ -279,7 +279,7 @@ std::uint8_t address_size(const Image &image) {
     switch (image.layout().mode) {
     case ExecutionMode::x86_16: return 2;
     case ExecutionMode::x86_32: case ExecutionMode::a32: case ExecutionMode::thumb:
-    case ExecutionMode::mips32: case ExecutionMode::rv32: case ExecutionMode::ppc32: return 4;
+    case ExecutionMode::mips32: case ExecutionMode::rv32c: case ExecutionMode::rv32: case ExecutionMode::ppc32: return 4;
     default: return 8;
     }
 }

@@ -378,7 +378,7 @@ std::span<const ProcessorVariantInfo> processor_variant_inventory() noexcept {
         "scalar-f-and-d", "selected-rvv"};
     static constexpr std::string_view rv64_families[]{"rv64i", "rv64m", "rv64a", "zicsr", "scalar-f-and-d",
         "selected-zfa-and-rvv"};
-    static constexpr std::string_view rv64c_families[]{"rv64i", "rv64m", "rv64a", "rv64c", "zicsr",
+    static constexpr std::string_view rv64c_families[]{"rv64i", "rv64m", "rv64a", "rv64c-integer", "zicsr",
         "scalar-f-and-d", "selected-zfa-and-rvv"};
     static constexpr std::string_view mips32_families[]{"integer", "loads-and-stores", "control-flow-delay-slots",
         "hilo", "cop1-s-d-w"};

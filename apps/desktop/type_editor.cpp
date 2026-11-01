@@ -78,7 +78,7 @@ std::uint64_t project_pointer_size(const ProjectSnapshot &project) {
         case ExecutionMode::x86_32:
         case ExecutionMode::a32:
         case ExecutionMode::thumb:
-        case ExecutionMode::rv32:
+        case ExecutionMode::rv32c: case ExecutionMode::rv32:
         case ExecutionMode::mips32:
         case ExecutionMode::ppc32: return 4;
         case ExecutionMode::x86_64:

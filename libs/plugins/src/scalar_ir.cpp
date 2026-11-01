@@ -20,7 +20,7 @@ bool native_scalar_context(DecodeContext context){
     // Existing analysis dispatch does not delegate A32/Thumb decoding.
     case Architecture::arm:return false;
     case Architecture::arm64:return context.mode==ExecutionMode::a64;
-    case Architecture::riscv32:return context.mode==ExecutionMode::rv32;
+    case Architecture::riscv32:return is_riscv32_mode(context.mode);
     case Architecture::riscv64:return context.mode==ExecutionMode::rv64||context.mode==ExecutionMode::rv64c;
     case Architecture::mips32:return context.mode==ExecutionMode::mips32;
     case Architecture::mips64:return context.mode==ExecutionMode::mips64;
@@ -45,7 +45,7 @@ bool native_scalar_register(RegisterOperand reg, DecodeContext context) {
     case RegisterBank::arm32_gpr: return reg.width==32&&reg.index<15;
     case RegisterBank::arm64_gpr: return reg.width==64&&reg.index<31;
     case RegisterBank::riscv_gpr:
-        return reg.index>0&&reg.index<32&&reg.width==(context.mode==ExecutionMode::rv32?32:64);
+        return reg.index>0&&reg.index<32&&reg.width==(is_riscv32_mode(context.mode)?32:64);
     case RegisterBank::mips_gpr:
         return reg.index>0&&reg.index<32&&reg.width==(context.mode==ExecutionMode::mips32?32:64);
     case RegisterBank::ppc_gpr:

@@ -524,7 +524,7 @@ std::optional<RegisterOperand> semantic_register_v2(DecodeContext context,
     const auto mode_bits = [&] {
         switch (context.mode) {
         case ExecutionMode::x86_16: return 16u;
-        case ExecutionMode::x86_32: case ExecutionMode::a32: case ExecutionMode::rv32:
+        case ExecutionMode::x86_32: case ExecutionMode::a32: case ExecutionMode::rv32c: case ExecutionMode::rv32:
         case ExecutionMode::mips32: case ExecutionMode::ppc32: return 32u;
         case ExecutionMode::x86_64: case ExecutionMode::a64: case ExecutionMode::rv64:
         case ExecutionMode::rv64c: case ExecutionMode::mips64: case ExecutionMode::ppc64: return 64u;
@@ -691,7 +691,7 @@ std::optional<Instruction> convert_semantic_v2(const HexLabSemanticInstructionV2
             if (source.kind == HEXLAB_SEMANTIC_ABSOLUTE_MEMORY_V2) {
                 const auto address_width = context.mode == ExecutionMode::x86_16 || context.mode == ExecutionMode::m6502 || context.mode == ExecutionMode::m65c02 ? 16u :
                     context.mode == ExecutionMode::x86_32 || context.mode == ExecutionMode::a32 ||
-                    context.mode == ExecutionMode::rv32 || context.mode == ExecutionMode::mips32 ||
+                    is_riscv32_mode(context.mode) || context.mode == ExecutionMode::mips32 ||
                     context.mode == ExecutionMode::ppc32 ? 32u : 64u;
                 if (access == OperandAccess::address || source.bank || source.index ||
                     source.address_width || source.base_bank || source.base_index || source.base_width ||
@@ -704,7 +704,7 @@ std::optional<Instruction> convert_semantic_v2(const HexLabSemanticInstructionV2
                     (source.address_width != 16 && source.address_width != 32 && source.address_width != 64)) return {};
                 const auto mode_address_width = context.mode == ExecutionMode::x86_16 || context.mode == ExecutionMode::m6502 || context.mode == ExecutionMode::m65c02 ? 16u :
                     context.mode == ExecutionMode::x86_32 || context.mode == ExecutionMode::a32 ||
-                    context.mode == ExecutionMode::rv32 || context.mode == ExecutionMode::mips32 ||
+                    is_riscv32_mode(context.mode) || context.mode == ExecutionMode::mips32 ||
                     context.mode == ExecutionMode::ppc32 ? 32u : 64u;
                 if (source.address_width > mode_address_width) return {};
                 memory.address_width = static_cast<std::uint16_t>(source.address_width);
@@ -3675,6 +3675,7 @@ constexpr FlatImageMode flat_image_modes[] = {
     {"x86_64", "x86_64", Architecture::x86_64, ExecutionMode::x86_64, 64, 1, false},
     {"arm64", "a64", Architecture::arm64, ExecutionMode::a64, 64, 4, false},
     {"riscv32", "rv32", Architecture::riscv32, ExecutionMode::rv32, 32, 4, false},
+    {"riscv32", "rv32c", Architecture::riscv32, ExecutionMode::rv32c, 32, 2, false},
     {"riscv64", "rv64", Architecture::riscv64, ExecutionMode::rv64, 64, 4, false},
     {"riscv64", "rv64c", Architecture::riscv64, ExecutionMode::rv64c, 64, 2, false},
     {"mips32", "mips32", Architecture::mips32, ExecutionMode::mips32, 32, 4, true},
@@ -3845,7 +3846,7 @@ Result<std::optional<Instruction>> PluginManager::decode_processor_semantic(
         case ExecutionMode::x86_16: return std::string("x86_16"); case ExecutionMode::x86_32: return std::string("x86_32");
         case ExecutionMode::x86_64: return std::string("x86_64"); case ExecutionMode::a32: return std::string("a32");
         case ExecutionMode::thumb: return std::string("thumb"); case ExecutionMode::a64: return std::string("a64");
-        case ExecutionMode::rv32: return std::string("rv32"); case ExecutionMode::rv64: return std::string("rv64");
+        case ExecutionMode::rv32c: return std::string("rv32c"); case ExecutionMode::rv32: return std::string("rv32"); case ExecutionMode::rv64: return std::string("rv64");
         case ExecutionMode::rv64c: return std::string("rv64c"); case ExecutionMode::mips32: return std::string("mips32");
         case ExecutionMode::mips64: return std::string("mips64"); case ExecutionMode::ppc32: return std::string("ppc32");
         case ExecutionMode::ppc64: return std::string("ppc64"); case ExecutionMode::m6502: return std::string("m6502");
@@ -4025,7 +4026,7 @@ Result<std::optional<Instruction>> PluginManager::decode_processor_semantic(
                 std::uint16_t address_width = 64;
                 switch (decode_context.mode) {
                 case ExecutionMode::x86_16: case ExecutionMode::m6502: case ExecutionMode::m65c02: address_width = 16; break;
-                case ExecutionMode::x86_32: case ExecutionMode::a32: case ExecutionMode::rv32:
+                case ExecutionMode::x86_32: case ExecutionMode::a32: case ExecutionMode::rv32c: case ExecutionMode::rv32:
                 case ExecutionMode::mips32: case ExecutionMode::ppc32: address_width = 32; break;
                 default: break;
                 }
@@ -4066,7 +4067,9 @@ Result<std::optional<decompiler::Intrinsic>> PluginManager::instruction_ir(
         case Architecture::x86_64:return architecture=="x86_64"&&mode=="x86_64"&&context.mode==ExecutionMode::x86_64;
         case Architecture::arm:return architecture=="arm"&&mode=="a32"&&context.mode==ExecutionMode::a32;
         case Architecture::arm64:return architecture=="arm64"&&mode=="a64"&&context.mode==ExecutionMode::a64;
-        case Architecture::riscv32:return architecture=="riscv32"&&mode=="rv32"&&context.mode==ExecutionMode::rv32;
+        case Architecture::riscv32:return architecture=="riscv32"&&
+            ((mode=="rv32"&&context.mode==ExecutionMode::rv32)||
+             (mode=="rv32c"&&context.mode==ExecutionMode::rv32c));
         case Architecture::riscv64:return architecture=="riscv64"&&(context.mode==ExecutionMode::rv64?mode=="rv64":context.mode==ExecutionMode::rv64c&&mode=="rv64c");
         case Architecture::mips32:return architecture=="mips32"&&mode=="mips32"&&context.mode==ExecutionMode::mips32;
         case Architecture::mips64:return architecture=="mips64"&&mode=="mips64"&&context.mode==ExecutionMode::mips64;

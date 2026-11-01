@@ -36,6 +36,7 @@ std::string_view mode_id(ExecutionMode value) {
     case ExecutionMode::rv64: return "rv64";
     case ExecutionMode::rv64c: return "rv64c";
     case ExecutionMode::rv32: return "rv32";
+    case ExecutionMode::rv32c: return "rv32c";
     case ExecutionMode::mips32: return "mips32";
     case ExecutionMode::mips64: return "mips64";
     case ExecutionMode::ppc32: return "ppc32";

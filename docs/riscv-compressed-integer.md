@@ -8,8 +8,9 @@ and accept interleaved 16-bit and 32-bit instructions. The existing `rv32`
 and `rv64` modes keep IALIGN=32 and reject compressed instructions.
 
 Little-endian ELF32 and ELF64 RISC-V images select their compressed mode
-when `EF_RISCV_RVC` is set. The raw loader API and CLI accept `rv32c` and
-`rv64c`; their executable entry must be aligned to two bytes. RV32 base,
+when `EF_RISCV_RVC` is set. The raw loader API, CLI and desktop raw dialog
+accept RV32IC and RV64IC; CLI names are `rv32c` and `rv64c`. Their executable
+entry must be aligned to two bytes. RV32 base,
 entry, and mapped extent retain the 32-bit address-domain checks. The new
 execution mode is appended to preserve existing recipe enum values.
 
@@ -62,9 +63,25 @@ cannot establish a preceding instruction boundary in mixed-width code.
 Compressed floating-point forms, RV128C, Zc extension instructions,
 custom-extension shift behavior, and distinct named hint extensions remain
 outside this integer C implementation. An unsupported compressed encoding
-is not passed to the permissive Capstone fallback. Desktop raw-mode
-selectors and the plugin mode catalog have not been extended with RV32C;
-ELF mode selection and engine/CLI entry points provide the integration.
+is not passed to the permissive Capstone fallback.
+
+Desktop mode labels, pseudocode pointer/ABI inference, type layout and debug
+local-address handling retain RV32C's 32-bit width. Plugin decoding,
+semantic effects, scalar IR and image providers use the distinct
+`riscv32`/`rv32c` identifiers; register and address widths are 32 bits and
+flat plugin images use two-byte instruction alignment. A provider registered
+only for `rv32` is not silently applied to `rv32c`. Native scalar lifting
+continues to use the shared RISC-V architecture path.
+
+The processor inventory advertises integer C separately from scalar F/D and
+selected RVV forms. Function recovery delegates to the decoder capability;
+reference and stack analysis recognize both RV32 modes. Existing canonical
+RISC-V instruction lifting and ILP32 ABI recovery therefore apply to RV32C
+instructions. A function-engine fingerprint salt invalidates snapshots
+derived from earlier compressed-decoder and reference behavior. Remaining
+explicit `rv32` checks select the fixed-width decoder, retain exact external
+mode identities, or choose the uncompressed default when C is unspecified;
+in particular, FLIRT architecture/application metadata does not infer C.
 
 The initial audit found no RV32C decoder entry point, a missing XLEN
 parameter in the compressed decoder, rejected RV64 right shifts 32-63,
@@ -73,8 +90,12 @@ Those decode gaps and compressed reference-propagation gates are addressed
 here. Existing scalar floating-point and vector instruction families are
 unchanged.
 
-Validation: Windows MSVC Debug processor build passed. The headless CLI
-dependency build was started separately; its completion is not part of this
-focused compile evidence. No tests were added or run,
+Validation: Windows MSVC Debug processor build and focused analysis/plugin
+`ClCompile` checks passed. The six changed desktop translation units
+(`main_frame`, `open_dialogs`, `pseudocode_view`, `type_editor`,
+`debugger_view` and `debugger_locals`) also passed a focused Debug `ClCompile`
+check. The final processor-inventory source compiled successfully.
+The broad headless CLI dependency build was stopped in favor of focused
+compile checks. No tests were added or run,
 as instructed for this repository. Encoding and HINT boundaries were audited
 against the [C version 2.0 specification](https://docs.riscv.org/reference/isa/v20240411/unpriv/c-st-ext.html).

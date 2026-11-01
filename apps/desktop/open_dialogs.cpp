@@ -28,6 +28,8 @@ bool configure_raw_mapping(wxWindow *parent, OpenRequest &request) {
     mode->Append("PowerPC PPC64 little-endian");
     mode->Append("PowerPC PPC64 big-endian");
     mode->Append("WDC 65C02 (CMOS scalar subset)");
+    mode->Append("RISC-V RV32IC (integer compressed)");
+    mode->Append("RISC-V RV64IC (integer compressed)");
     mode->SetSelection(0);
     box->Add(mode, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
     box->Add(new wxStaticText(&dialog, wxID_ANY, "Base address (decimal or 0x hexadecimal)"), 0, wxLEFT | wxRIGHT, 10);
@@ -96,8 +98,10 @@ bool configure_raw_mapping(wxWindow *parent, OpenRequest &request) {
             const bool legacy = mode->GetSelection() == 1;
             const bool a64 = mode->GetSelection() == 3;
             const bool m6502 = mode->GetSelection() == 4;
-            const bool rv32 = mode->GetSelection() == 5;
-            const bool rv64 = mode->GetSelection() == 6;
+            const bool rv32c = mode->GetSelection() == 13;
+            const bool rv64c = mode->GetSelection() == 14;
+            const bool rv32 = mode->GetSelection() == 5 || rv32c;
+            const bool rv64 = mode->GetSelection() == 6 || rv64c;
             const bool mips64 = mode->GetSelection() == 7;
             const bool m65c02 = mode->GetSelection() == 12;
             const int ppc_choice = mode->GetSelection() - 8;
@@ -115,6 +119,8 @@ bool configure_raw_mapping(wxWindow *parent, OpenRequest &request) {
                            : legacy  ? ExecutionMode::x86_32
                            : m65c02 ? ExecutionMode::m65c02
                            : m6502   ? ExecutionMode::m6502
+                           : rv32c   ? ExecutionMode::rv32c
+                           : rv64c   ? ExecutionMode::rv64c
                            : rv32    ? ExecutionMode::rv32
                            : rv64    ? ExecutionMode::rv64
                            : mips64  ? ExecutionMode::mips64
