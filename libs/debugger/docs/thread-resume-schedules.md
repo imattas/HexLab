@@ -128,6 +128,13 @@ confirmed owner `TRAP_TRACE` does not become a pending signal to redeliver on
 retry. Failed and unattempted peers retain their queued signals, while BRK and
 the owned original-instruction bookkeeping remain intact during rollback.
 
+For a Linux AArch64 hardware execute-breakpoint continue schedule, the owner
+completes its internal step before the backend resumes selected peers. If a
+peer continuation fails, the completed owner step remains a `single_step`
+event with the failure attached; already resumed peers are stopped again, and
+the step's `TRAP_TRACE` is consumed rather than redelivered. Further resumes
+are blocked only if peer rollback cannot restore the stopped-thread invariant.
+
 If a Linux x86/x64 peer continuation fails after the displaced owner instruction
 has completed and the trap has been rearmed, the backend still returns the
 owner's `single_step` event and appends the peer-resume failure. Successfully

@@ -904,6 +904,10 @@ public:
                             step_pending_ = false; step_thread_ = 0;
                             if (last_signal_ == SIGTRAP && !hardware_trap && !hardware_step_restore_failed) {
                                 e.kind = EventKind::single_step;
+                                // Do not redeliver the TRAP_TRACE used to
+                                // finish an execute-breakpoint step-over if a
+                                // deferred peer continuation fails.
+                                pending_signal_ = 0;
                                 if (deferred_breakpoint_resumes_) {
                                     std::vector<pid_t> resumed;
                                     for (const auto& [resume_tid, signal] : deferred_breakpoint_resumes_->threads) {
@@ -921,7 +925,10 @@ public:
                                             resume_blocked_ = true;
                                             e.message += "; deferred-schedule rollback failed: " + rollback.error().message;
                                         } else rollback_threads_.clear();
-                                        e.kind = EventKind::exception;
+                                        // The owner already completed the
+                                        // displaced instruction. Keep that
+                                        // user-visible step event even when a
+                                        // later peer continuation fails.
                                         e.message += "; deferred schedule failed: " + error.message;
                                         break;
                                     }

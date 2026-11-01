@@ -63,6 +63,11 @@ separate debugger daemon. The x86-64 host build continues to select
   again; `resume_blocked_` is set only if that rollback is incomplete. Peer stop
   events observed during rollback remain queued, and signal state is consumed
   only for peer continuations accepted by ptrace.
+- If a selected peer cannot be resumed after an AArch64 hardware execute-breakpoint
+  instruction completes, the backend returns the completed owner step with the
+  peer-resume error attached. It stops peers already resumed and blocks later
+  resumes only if rollback cannot restore the stopped-thread state. The internal
+  trace trap is consumed and is not redelivered.
 - File-backed module inspection from `/proc/<pid>/maps`, grouped by exact path.
   Reported spans cover the min/max mapped range and can include gaps.
 
