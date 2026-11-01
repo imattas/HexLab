@@ -110,16 +110,17 @@ NaNs. This bit-level operation does not use host floating-point or update
 `fflags`; the caller supplies a raw binary32 value with no upper bits set or a
 raw binary64 value. NaN-box validation for scalar S operands remains outside
 this evaluator.
-The Zfa FROUND.S/D and FROUNDNX.S/D round-to-integral forms are decoded with
+The Zfa FROUND.H/S/D and FROUNDNX.H/S/D round-to-integral forms are decoded with
 their selected rounding mode and lifted as typed floating-point intrinsics.
-The processor semantics API also evaluates their raw binary32/binary64 bit
-patterns for a caller-resolved rounding mode, preserving signed zero and NaN
-payloads while quieting signaling NaNs. FROUND reports NV for signaling NaNs;
+The processor semantics API also evaluates their raw binary16/binary32/binary64
+bit patterns for a caller-resolved rounding mode, preserving signed zero and
+producing canonical quiet NaNs. FROUND reports NV for signaling NaNs;
 FROUNDNX additionally reports NX when a non-NaN finite input changes. Dynamic
 `frm` selection is represented in SSA, and known effective modes allow the
 optimizer to fold non-NaN value and exception formulas while preserving the
 sticky flag update; see [Zfa round-to-integral evaluation](riscv-zfa-rounding.md).
-RV64F NaN-boxing is not modeled. The decoder does not evaluate IEEE-754 results
+The H forms require Zfh, which the decoder does not currently gate by profile.
+Physical FPR NaN-boxing is not modeled. The decoder does not evaluate IEEE-754 results
 or compute precise exception flags for general floating arithmetic. Q-format
 operations, compressed floating forms, and RV32-only absent forms remain
 unsupported or invalid according to their encoding.

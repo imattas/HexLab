@@ -123,7 +123,9 @@ enum class RiscvOpcode {
     // RVV widening floating-point reductions; appended to preserve decoder IDs.
     vfwredusum, vfwredosum,
     // RVV widening integer reductions, appended to preserve decoder IDs.
-    vwredsum, vwredsumu
+    vwredsum, vwredsumu,
+    // Zfa/Zfh half-precision round-to-integral forms; preserve prior IDs.
+    fround_h, froundnx_h
 };
 
 struct RiscvRegister {

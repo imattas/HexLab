@@ -48,6 +48,8 @@ std::optional<Conversion> conversion(Opcode op) {
     case Opcode::rv_froundnx_s: return Conversion{"froundnx.s", floating(32), floating(32), false, 17};
     case Opcode::rv_fround_d: return Conversion{"fround.d", floating(64), floating(64), false, 16};
     case Opcode::rv_froundnx_d: return Conversion{"froundnx.d", floating(64), floating(64), false, 17};
+    case Opcode::rv_fround_h: return Conversion{"fround.h", floating(16), floating(16), false, 16};
+    case Opcode::rv_froundnx_h: return Conversion{"froundnx.h", floating(16), floating(16), false, 17};
 #undef FP_TO_INT
 #define INT_TO_FP(OP, NAME, INT, SIGN, FP, MASK) case Opcode::rv_##OP: return Conversion{NAME, integer(INT, SIGN), floating(FP), false, MASK}
     INT_TO_FP(fcvt_s_w, "fcvt.s.w", 32, true, 32, 1);

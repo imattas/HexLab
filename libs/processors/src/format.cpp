@@ -836,6 +836,8 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
     if (op == Opcode::rv_froundnx_s) return "froundnx.s";
     if (op == Opcode::rv_fround_d) return "fround.d";
     if (op == Opcode::rv_froundnx_d) return "froundnx.d";
+    if (op == Opcode::rv_fround_h) return "fround.h";
+    if (op == Opcode::rv_froundnx_h) return "froundnx.h";
     if (op == Opcode::rv_fminm_s) return "fminm.s";
     if (op == Opcode::rv_fmaxm_s) return "fmaxm.s";
     if (op == Opcode::rv_fminm_d) return "fminm.d";

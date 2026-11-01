@@ -715,7 +715,9 @@ enum class Opcode {
     a64_ldrsb, a64_ldrsh,
     // Classic MIPS64 base control/cache forms; append for persisted ID stability.
     mips64_cache, mips64_synci, mips64_rdhwr, mips64_di, mips64_ei,
-    mips64_ssnop, mips64_ehb, mips64_pause
+    mips64_ssnop, mips64_ehb, mips64_pause,
+    // Zfa/Zfh half-precision round-to-integral forms; append for stable IDs.
+    rv_fround_h, rv_froundnx_h
 };
 enum class OperandAccess { read, write, read_write, address };
 // The encoded x86 group-one repeat prefix is retained separately from the

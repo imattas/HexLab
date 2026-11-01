@@ -200,6 +200,8 @@ DecodeResult decode_riscv_context(DecodeContext context, std::span<const std::by
         opcode = Opcode::rv_vwredsum;
     else if (source.opcode == RiscvOpcode::vwredsumu)
         opcode = Opcode::rv_vwredsumu;
+    else if (source.opcode == RiscvOpcode::fround_h || source.opcode == RiscvOpcode::froundnx_h)
+        opcode = source.opcode == RiscvOpcode::fround_h ? Opcode::rv_fround_h : Opcode::rv_froundnx_h;
     else
         return {DecodeStatus::invalid, {}, "RV64 opcode has no generic representation"};
 

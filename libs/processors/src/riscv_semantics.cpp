@@ -1126,29 +1126,33 @@ evaluate_riscv_fcvtmod_w_d(std::uint64_t source_bits, unsigned xlen) noexcept {
 std::optional<RiscvFloatingRoundResult>
 evaluate_riscv_fround_operation(RiscvOpcode opcode, std::uint64_t source_bits,
                                 std::uint8_t rounding_mode) noexcept {
+    const bool half = opcode == RiscvOpcode::fround_h || opcode == RiscvOpcode::froundnx_h;
     const bool single = opcode == RiscvOpcode::fround_s || opcode == RiscvOpcode::froundnx_s;
-    const bool exact = opcode == RiscvOpcode::froundnx_s || opcode == RiscvOpcode::froundnx_d;
-    if ((!single && opcode != RiscvOpcode::fround_d && opcode != RiscvOpcode::froundnx_d) ||
+    const bool exact = opcode == RiscvOpcode::froundnx_h || opcode == RiscvOpcode::froundnx_s ||
+                       opcode == RiscvOpcode::froundnx_d;
+    if ((!half && !single && opcode != RiscvOpcode::fround_d && opcode != RiscvOpcode::froundnx_d) ||
         rounding_mode > 4)
         return {};
 
-    const unsigned fraction_bits = single ? 23 : 52;
-    const unsigned exponent_bits = single ? 8 : 11;
-    const int bias = single ? 127 : 1023;
+    const unsigned fraction_bits = half ? 10 : single ? 23 : 52;
+    const unsigned exponent_bits = half ? 5 : single ? 8 : 11;
+    const int bias = half ? 15 : single ? 127 : 1023;
     const std::uint64_t sign_mask = UINT64_C(1) << (fraction_bits + exponent_bits);
     const std::uint64_t fraction_mask = (UINT64_C(1) << fraction_bits) - 1;
     const std::uint64_t exponent_mask = (UINT64_C(1) << exponent_bits) - 1;
     const std::uint64_t quiet_mask = UINT64_C(1) << (fraction_bits - 1);
-    const std::uint64_t input = single ? source_bits & UINT32_MAX : source_bits;
+    const std::uint64_t input = half ? source_bits & UINT16_MAX : single ? source_bits & UINT32_MAX : source_bits;
     const std::uint64_t sign = input & sign_mask;
     const auto encoded_exponent = static_cast<unsigned>((input >> fraction_bits) & exponent_mask);
     const auto fraction = input & fraction_mask;
     RiscvFloatingRoundResult result{input, 0};
 
     if (encoded_exponent == exponent_mask) {
-        if (fraction != 0 && (fraction & quiet_mask) == 0) {
-            result.value = input | quiet_mask;
-            result.fflags_set = 0x10; // NV
+        if (fraction != 0) {
+            // Arithmetic NaN results use the RISC-V canonical quiet NaN,
+            // independent of the source sign and payload.
+            result.value = (exponent_mask << fraction_bits) | quiet_mask;
+            if ((fraction & quiet_mask) == 0) result.fflags_set = 0x10; // NV
         }
         return result;
     }
@@ -1187,7 +1191,8 @@ evaluate_riscv_fround_operation(RiscvOpcode opcode, std::uint64_t source_bits,
         magnitude = truncated + (increment ? (UINT64_C(1) << discarded) : 0);
     }
     result.value = sign | magnitude;
-    if (single) result.value &= UINT32_MAX;
+    if (half) result.value &= UINT16_MAX;
+    else if (single) result.value &= UINT32_MAX;
     if (exact && fractional) result.fflags_set |= 0x01; // NX
     return result;
 }

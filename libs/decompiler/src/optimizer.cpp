@@ -236,7 +236,9 @@ std::optional<ConstantValue> fold_riscv_fround(const BinaryValue &binary, ValueT
     if (exceptions) operation.remove_suffix(std::string_view(".exceptions").size());
     RiscvOpcode opcode;
     std::uint16_t width = 0;
-    if (operation == "fround.s") { opcode = RiscvOpcode::fround_s; width = 32; }
+    if (operation == "fround.h") { opcode = RiscvOpcode::fround_h; width = 16; }
+    else if (operation == "froundnx.h") { opcode = RiscvOpcode::froundnx_h; width = 16; }
+    else if (operation == "fround.s") { opcode = RiscvOpcode::fround_s; width = 32; }
     else if (operation == "froundnx.s") { opcode = RiscvOpcode::froundnx_s; width = 32; }
     else if (operation == "fround.d") { opcode = RiscvOpcode::fround_d; width = 64; }
     else if (operation == "froundnx.d") { opcode = RiscvOpcode::froundnx_d; width = 64; }
@@ -250,10 +252,11 @@ std::optional<ConstantValue> fold_riscv_fround(const BinaryValue &binary, ValueT
         binary.right->type != mode_type || mode->type != mode_type || result_type != expected_result ||
         mode->value > 4 || (source->value & ~width_mask(width)))
         return {};
-    const auto exponent_mask = width == 32 ? UINT64_C(0x7f800000) : UINT64_C(0x7ff0000000000000);
-    const auto fraction_mask = width == 32 ? UINT64_C(0x007fffff) : UINT64_C(0x000fffffffffffff);
-    // Do not bring the helper's payload-preserving NaN policy into architectural
-    // folding until canonical NaNs and physical FPR boxing are modeled.
+    const auto exponent_mask = width == 16 ? UINT64_C(0x7c00) :
+                               width == 32 ? UINT64_C(0x7f800000) : UINT64_C(0x7ff0000000000000);
+    const auto fraction_mask = width == 16 ? UINT64_C(0x03ff) :
+                               width == 32 ? UINT64_C(0x007fffff) : UINT64_C(0x000fffffffffffff);
+    // Physical FPR boxing is not modeled, so NaN cases remain symbolic here.
     if ((source->value & exponent_mask) == exponent_mask && (source->value & fraction_mask))
         return {};
     const auto evaluated = evaluate_riscv_fround_operation(opcode, source->value,

@@ -941,8 +941,7 @@ bool decode_fp_op(std::uint32_t w, RiscvInstruction &i, unsigned xlen) {
     const unsigned rs1 = (w >> 15) & 31, rs2 = (w >> 20) & 31, rs3 = (w >> 27) & 31;
     const unsigned fmt = (w >> 25) & 3, f7 = (w >> 25) & 0x7f;
     if (major != 0x53 && major != 0x43 && major != 0x47 && major != 0x4b && major != 0x4f) return false;
-    if (fmt == 2) return false; // Q is recognized but outside this F/D slice.
-    if (fmt == 3) return false;
+    if (fmt == 3) return false; // Q is outside the supported scalar formats.
     const bool d = fmt == 1;
     auto set = [&](RiscvOpcode op, bool flags, bool rm, bool uses_rounding = true) {
         if (rm && (f3 == 5 || f3 == 6)) return false;
@@ -960,6 +959,14 @@ bool decode_fp_op(std::uint32_t w, RiscvInstruction &i, unsigned xlen) {
     auto fp_rs2 = [&] { operand(i, RiscvRegister{static_cast<std::uint8_t>(rs2), true}, RiscvOperandAccess::read); };
     auto gpr_rd = [&] { operand(i, RiscvRegister{static_cast<std::uint8_t>(rd)}, RiscvOperandAccess::write); };
     auto gpr_rs1 = [&] { operand(i, RiscvRegister{static_cast<std::uint8_t>(rs1)}, RiscvOperandAccess::read); };
+    if (fmt == 2) {
+        // Zfa FROUND.H/FROUNDNX.H require Zfh. Other half-precision
+        // instructions remain outside the selected scalar decoder slice.
+        if (major != 0x53 || f7 != 0x22 || (rs2 != 4 && rs2 != 5) ||
+            !set(rs2 == 4 ? RiscvOpcode::fround_h : RiscvOpcode::froundnx_h, true, true))
+            return false;
+        fp_rd(); fp_rs1(); return true;
+    }
     if (major != 0x53) {
         if (fmt > 1) return false;
         static constexpr RiscvOpcode s_ops[]{RiscvOpcode::fmadd_s,RiscvOpcode::fmsub_s,RiscvOpcode::fnmsub_s,RiscvOpcode::fnmadd_s};

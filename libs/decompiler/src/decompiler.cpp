@@ -199,6 +199,8 @@ ValueType vector_type(std::uint16_t bits, TypeKind element_kind = TypeKind::unkn
     return {TypeKind::vector, bits, element_signed, element_kind, element_bits, lanes};
 }
 std::string riscv_fp_name(Opcode op) {
+    if (op == Opcode::rv_fround_h) return "fround.h";
+    if (op == Opcode::rv_froundnx_h) return "froundnx.h";
     if (op == Opcode::rv_fleq_s) return "fleq.s";
     if (op == Opcode::rv_fltq_s) return "fltq.s";
     if (op == Opcode::rv_fleq_d) return "fleq.d";
@@ -4909,7 +4911,8 @@ a64_unhandled:
         if ((op >= Opcode::rv_flw && op <= Opcode::rv_fmv_d_x) || op == Opcode::rv_fcvtmod_w_d ||
             (op >= Opcode::rv_fleq_s && op <= Opcode::rv_fltq_d) ||
             op == Opcode::rv_fli_s || op == Opcode::rv_fli_d ||
-            (op >= Opcode::rv_fround_s && op <= Opcode::rv_froundnx_d)) {
+            (op >= Opcode::rv_fround_s && op <= Opcode::rv_froundnx_d) ||
+            op == Opcode::rv_fround_h || op == Opcode::rv_froundnx_h) {
             if (auto converted = lift_riscv_fp_conversion(instruction, operands)) return *converted;
             if ((op == Opcode::rv_flw || op == Opcode::rv_fld) && dst && operands.size() >= 2) {
                 auto loaded = *operands[1];

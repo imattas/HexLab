@@ -257,14 +257,15 @@ HEXLAB_PROCESSORS_EXPORT std::optional<RiscvIntegerConversionResult>
 evaluate_riscv_fcvtmod_w_d(std::uint64_t source_bits, unsigned xlen) noexcept;
 
 struct RiscvFloatingRoundResult {
-    std::uint64_t value = 0; // raw binary32/binary64 destination bits.
+    std::uint64_t value = 0; // raw binary16/binary32/binary64 destination bits.
     std::uint8_t fflags_set = 0; // accrued exception bits: NX=1, UF=2, OF=4, DZ=8, NV=16.
 };
 
-// Evaluate Zfa FROUND.S/D or FROUNDNX.S/D from raw IEEE-754 bits. The caller
+// Evaluate Zfa FROUND.H/S/D or FROUNDNX.H/S/D from raw IEEE-754 bits. The caller
 // supplies the effective rounding mode after resolving dynamic frm; supported
 // modes are RNE/RTZ/RDN/RUP/RMM (0..4). FROUNDNX additionally accrues NX when
-// the input has a fractional part. Signaling NaNs are quieted and accrue NV.
+// the input has a fractional part. NaN results are canonical; signaling NaNs
+// accrue NV. This evaluates logical values and does not validate FPR boxing.
 HEXLAB_PROCESSORS_EXPORT std::optional<RiscvFloatingRoundResult>
 evaluate_riscv_fround_operation(RiscvOpcode opcode, std::uint64_t source_bits,
                                 std::uint8_t rounding_mode) noexcept;

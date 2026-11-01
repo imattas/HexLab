@@ -54,17 +54,19 @@ into `fflags` like `FCVT.W.D`. The intrinsic keeps modulo-2^32 behavior visible
 to downstream analysis, including the specified zero result for NaN and
 infinity; it remains opaque and the lifter does not calculate conversion
 values or flags.
-Zfa `FROUND.S/D` and `FROUNDNX.S/D` use the FCVT.S.D/FCVT.D.S encoding
-families with `rs2=4/5`, respectively. They preserve the S/D source and
+Zfa `FROUND.H/S/D` and `FROUNDNX.H/S/D` use the FCVT encoding
+families with `rs2=4/5`, respectively. They preserve the H/S/D source and
 destination types, validate and retain `rm`, and use `frm` only for `rm=111`.
 The typed intrinsics preserve round-to-integral behavior; symbolic accrued
 flags are bounded to NV for FROUND and NV/NX for FROUNDNX. The processor
-semantics API now supplies exact optimizer folding for non-NaN binary32/64
+semantics API now supplies exact optimizer folding for non-NaN binary16/32/64
 source constants with a known valid effective rounding mode (0 through 4).
 Both value and raised-exception formulas fold; the intrinsic and sticky
 `old_fflags | raised_flags` output remain explicit. Unknown/reserved modes,
 NaNs, and mismatched value types stay symbolic. See
 [Zfa round-to-integral evaluation](riscv-zfa-rounding.md).
+The H forms require Zfh; the decoder does not currently enforce extension
+availability, and the lifter does not model physical FPR NaN-boxing.
 
 Zfa `FLI.S` and `FLI.D` decode the complete five-bit immediate selector table
 from the FMV encoding with `rs2=1`. The selector is retained as an immediate,
