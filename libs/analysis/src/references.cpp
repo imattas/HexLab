@@ -2156,7 +2156,8 @@ RegisterReferenceFacts non_x86_producer_facts(
                     break;
                 }
             const bool a64_wide_move = architecture == Architecture::arm64 &&
-                (instruction.opcode == Opcode::a64_movz || instruction.opcode == Opcode::a64_movk);
+                (instruction.opcode == Opcode::a64_movn || instruction.opcode == Opcode::a64_movz ||
+                 instruction.opcode == Opcode::a64_movk);
             const bool a64_division = architecture == Architecture::arm64 &&
                 (instruction.opcode == Opcode::a64_udiv || instruction.opcode == Opcode::a64_sdiv);
             const bool a64_wide_move_valid = !a64_wide_move ||
