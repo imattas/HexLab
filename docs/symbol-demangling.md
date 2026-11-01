@@ -33,7 +33,11 @@ member-function pointer declarators preserve C++ precedence, rendering forms
 such as `int (*)(float)` and `int (Widget::*)(float)`. Itanium function types
 retain the bounded `Do` non-throwing exception specification as `noexcept`,
 including when combined with cv-qualified member-function types and pointer
-declarators. Template arguments
+declarators. Ordinary top-level function and data encodings retain an ABI
+vendor suffix after `.` as
+`[vendor suffix: ...]`, so compiler variants such as `.isra.0` and `.cold.1`
+remain distinguishable in analysis labels. The suffix is treated as opaque
+metadata and is not parsed as part of the C++ name. Template arguments
 support bounded integer literals and recursive `X <expression> E` arithmetic,
 comparison, bitwise, logical, assignment, unary, and conditional (`qu`)
 expression forms. The

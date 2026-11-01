@@ -208,7 +208,6 @@ void show_annotation_review(wxFrame& frame, SessionController& controller, Docum
     std::size_t page_start = 0, page_count = 0;
     bool search_all_rows = false;
     std::vector<std::size_t> all_matches;
-    constexpr std::size_t all_search_limit = 100000;
     wxDialog dialog(&frame, wxID_ANY, "Review Names and Comments", wxDefaultPosition, wxDefaultSize,
                     wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER);
     auto* layout = new wxBoxSizer(wxVERTICAL);
@@ -218,9 +217,9 @@ void show_annotation_review(wxFrame& frame, SessionController& controller, Docum
     auto* filter = new wxTextCtrl(&dialog, wxID_ANY, {});
     filter->SetName("annotation-review-filter");
     filter->SetHint("Filter annotations by location, saved name, or comment");
-    filter->SetToolTip("Case-insensitive substring filter over the current page, or over up to 100,000 rows when Search all rows is enabled.");
+    filter->SetToolTip("Case-insensitive substring filter over the current page, or over every saved row when Search all rows is enabled.");
     layout->Add(filter, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, dialog.FromDIP(8));
-    auto* search_all = new wxCheckBox(&dialog, wxID_ANY, "Search all rows (up to 100,000)");
+    auto* search_all = new wxCheckBox(&dialog, wxID_ANY, "Search all rows");
     search_all->SetName("annotation-review-search-all");
     layout->Add(search_all, 0, wxLEFT | wxRIGHT | wxBOTTOM, dialog.FromDIP(8));
     auto* search = new wxButton(&dialog, wxID_ANY, "Search all now");
@@ -309,8 +308,7 @@ void show_annotation_review(wxFrame& frame, SessionController& controller, Docum
         std::size_t result_count = 0;
         if (search_all_rows) {
             all_matches.clear();
-            const auto scan_count = std::min(annotations.size(), all_search_limit);
-            for (std::size_t index = 0; index < scan_count; ++index) {
+            for (std::size_t index = 0; index < annotations.size(); ++index) {
                 const auto& row = annotations[index];
                 const auto location = location_text(row.location, project->loaded ? project->loaded->image.get() : nullptr);
                 const auto searchable = location + " " + wxString::FromUTF8(row.name.data(), row.name.size()) + " " +
@@ -347,7 +345,6 @@ void show_annotation_review(wxFrame& frame, SessionController& controller, Docum
         auto status_text = wxString::Format("%zu matching rows shown (%zu-%zu of %zu); edit revision %llu",
             visible_rows.size(), range_start, range_end, search_all_rows ? result_count : annotations.size(),
             static_cast<unsigned long long>(expected_edit));
-        if (search_all_rows && annotations.size() > all_search_limit) status_text += "; scan capped at 100,000";
         status->SetLabel(status_text + (writable ? wxString{} : wxString(" (review only)")));
         previous->Enable(page_start != 0); next->Enable(page_start + page_count < (search_all_rows ? result_count : annotations.size()));
         update_selection();

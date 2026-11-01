@@ -181,8 +181,11 @@ source-file browsing, line navigation, mapping previews, and line-map export
 inspect only the selected path. The original row order within each group is
 retained, including overlapping inline scopes, so indexing changes lookup cost
 without changing which mapping is selected or how ambiguity is reported.
-Selecting a different visible source line starts at its first mapped address in
-the active address space.
+Selecting a different visible source line navigates to the mapped instruction
+whose source column is closest to the caret, breaking ties by lower address.
+This makes clicking within a statement with multiple instruction mappings land
+near the corresponding machine operation instead of always jumping to the
+first instruction on the line.
 
 Use **Copy location** to copy the currently focused visible line as its full
 debug source path and line number. When the line has a machine-address mapping

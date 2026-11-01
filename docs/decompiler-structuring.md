@@ -58,8 +58,16 @@ straight-line body chain. The chain can contain a conditional `break`, a
 conditional edge back to the header rendered as `continue`, and a nested
 canonical pre-tested loop whose exit rejoins the parent body. These conditional
 transfers must be unambiguous. The nested loop body can contain the conditional
-diamonds described below, joined by straight-line chains. The parent continuation is emitted after the loop,
-preserving common cleanup and result code that precedes the return. The
+diamonds described below, joined by straight-line chains. A pre-tested parent
+loop can also contain a complete switch whose phi-free case targets form
+disjoint linear chains to one shared continuation. A chain may fall through
+directly into the next case target; labels are emitted at each target so the
+original dispatch and fallthrough paths reach the intended statements. Exact
+target predecessors and continuation predecessors are required, and the
+continuation must have no register or memory phis. Cycles, side entries,
+multiple fallthrough predecessors, and other switch shapes retain the existing
+loop, region, or state-machine fallback. The parent continuation is emitted
+after the loop, preserving common cleanup and result code that precedes the return. The
 post-tested form supports the loop edge on either condition arm and inverts the
 displayed condition when needed. Its body may also contain a bounded switch whose
 phi-free, straight-line arms reconverge at one shared continuation. Register

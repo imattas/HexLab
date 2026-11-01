@@ -35,7 +35,17 @@ class Itanium {
         if (input_.substr(at_, 2) == "TV" || input_.substr(at_, 2) == "TT" ||
             input_.substr(at_, 2) == "TI" || input_.substr(at_, 2) == "TS")
             return parse_type_special_name();
-        return parse_encoding();
+        auto result = parse_encoding();
+        if (at_ == input_.size()) return result;
+        // The ABI permits a vendor-specific suffix after a dot on ordinary
+        // top-level function/data encodings. Preserve it so compiler variants
+        // such as .isra.N/.cold.N do not collapse to one name.
+        if (!take(".") || at_ == input_.size()) malformed();
+        append(result, " [vendor suffix: ");
+        append(result, input_.substr(at_));
+        append(result, "]");
+        at_ = input_.size();
+        return result;
     }
   private:
     struct Offset {
@@ -97,7 +107,7 @@ class Itanium {
     }
     std::string parse_encoding(bool require_function = false) {
         const auto name = parse_name(0, false);
-        if (at_ == input_.size()) {
+        if (at_ == input_.size() || peek() == '.') {
             if (require_function) malformed();
             return name.type.base;
         }
@@ -109,7 +119,7 @@ class Itanium {
         }
         append(result, name.type.base); append(result, "(");
         std::vector<std::string> args;
-        while (at_ < input_.size()) {
+        while (at_ < input_.size() && peek() != '.') {
             if (args.size() >= limits_.max_components) limit();
             args.push_back(render(parse_type_node(0)));
         }

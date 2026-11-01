@@ -11453,6 +11453,7 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
             std::vector<std::uint64_t> values;
             bool is_default = false;
             bool terminates_function = false;
+            bool falls_through = false;
             std::vector<const LiftedBlock *> body;
         };
         struct LoopSwitchBody {
@@ -12052,6 +12053,140 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                         edge_targets(edge, *edge.target);
                 }
                 LoopSwitchBody region;
+                // A case may deliberately fall through into the next case.
+                // Prove a forest of direct, phi-free target chains and emit
+                // each target label in chain order so the source switch keeps
+                // that transfer without duplicating a block.
+                bool fallthrough_switch = false;
+                if (valid) {
+                    bool fallthrough_valid = true;
+                    using SwitchTargetKey = std::pair<std::uint32_t, std::uint64_t>;
+                    std::map<SwitchTargetKey, const LiftedBlock *> target_blocks;
+                    std::map<SwitchTargetKey, SwitchTargetKey> next_target;
+                    std::map<SwitchTargetKey, std::size_t> target_predecessors;
+                    std::map<SwitchTargetKey, std::vector<std::uint64_t>> values_by_target;
+                    const SwitchTargetKey default_key{dispatch.default_target->space.value,
+                                                       dispatch.default_target->offset};
+                    for (const auto &item : dispatch.cases)
+                        values_by_target[{item.target.space.value, item.target.offset}].push_back(item.value);
+                    values_by_target.try_emplace(default_key);
+                    for (const auto &[key, _] : values_by_target) {
+                        const auto *target = find_block(Address{{key.first}, key.second});
+                        if (!target || target == body || target == header || target == exit_block ||
+                            !target->phis.empty() || target->memory_phi ||
+                            !target->memory_partition_phis.empty() || target->switch_dispatch ||
+                            contains_return(*target) || !has_only_simple_statements(*target) ||
+                            target->successors.size() != 1) {
+                            fallthrough_valid = false;
+                            break;
+                        }
+                        target_blocks.emplace(key, target);
+                    }
+
+                    const LiftedBlock *fallthrough_join = nullptr;
+                    std::set<std::uint64_t> join_predecessors;
+                    for (const auto &[key, target] : target_blocks) {
+                        if (!fallthrough_valid) break;
+                        const auto &edge = target->successors.front();
+                        if (!edge.target ||
+                            (edge.kind != BlockEdgeKind::jump && edge.kind != BlockEdgeKind::fallthrough) ||
+                            !has_unconditional_edge(*target, *edge.target)) {
+                            fallthrough_valid = false;
+                            break;
+                        }
+                        const auto *successor = find_block(*edge.target);
+                        if (!successor || (edge.block && edge.block != successor->id)) {
+                            fallthrough_valid = false;
+                            break;
+                        }
+                        const SwitchTargetKey successor_key{successor->begin.space.value,
+                                                            successor->begin.offset};
+                        if (target_blocks.contains(successor_key) || values_by_target.contains(successor_key)) {
+                            next_target.emplace(key, successor_key);
+                            if (++target_predecessors[successor_key] > 1) fallthrough_valid = false;
+                        } else {
+                            if (successor->phis.size() || successor->memory_phi ||
+                                !successor->memory_partition_phis.empty() || successor == body ||
+                                successor == header || successor == exit_block ||
+                                !valid_diamond_memory_phi(*successor) ||
+                                !diamond_predecessors[successor->id.value].contains(target->id.value) ||
+                                (fallthrough_join && fallthrough_join != successor)) {
+                                fallthrough_valid = false;
+                                break;
+                            }
+                            fallthrough_join = successor;
+                            join_predecessors.insert(target->id.value);
+                        }
+                    }
+                    if (fallthrough_valid && fallthrough_join) {
+                        for (const auto &[key, target] : target_blocks) {
+                            std::set<std::uint64_t> expected{body->id.value};
+                            for (const auto &[prior, next] : next_target)
+                                if (next == key) expected.insert(target_blocks.at(prior)->id.value);
+                            if (diamond_predecessors[target->id.value] != expected) {
+                                fallthrough_valid = false;
+                                break;
+                            }
+                        }
+                        if (fallthrough_valid && diamond_predecessors[fallthrough_join->id.value] != join_predecessors)
+                            fallthrough_valid = false;
+                    } else {
+                        fallthrough_valid = false;
+                    }
+
+                    std::vector<SwitchTargetKey> roots;
+                    std::set<std::uint64_t> claimed_targets;
+                    if (fallthrough_valid) {
+                        for (const auto &[key, _] : target_blocks)
+                            if (!target_predecessors.contains(key)) roots.push_back(key);
+                        std::set<SwitchTargetKey> visited;
+                        for (const auto root : roots) {
+                            auto current = root;
+                            std::vector<SwitchTargetKey> chain;
+                            while (visited.insert(current).second) {
+                                chain.push_back(current);
+                                const auto next = next_target.find(current);
+                                if (next == next_target.end()) break;
+                                current = next->second;
+                            }
+                            if (chain.empty() || next_target.contains(chain.back())) {
+                                fallthrough_valid = false;
+                                break;
+                            }
+                            for (const auto key : chain) {
+                                const auto *target = target_blocks.at(key);
+                                if (loop_body_ids.contains(target->id.value) ||
+                                    !claimed_targets.insert(target->id.value).second) {
+                                    fallthrough_valid = false;
+                                    break;
+                                }
+                                LoopSwitchArm arm;
+                                arm.target = target->begin;
+                                arm.values = values_by_target[key];
+                                arm.is_default = key == default_key;
+                                arm.falls_through = next_target.contains(key);
+                                arm.body.push_back(target);
+                                region.arms.push_back(std::move(arm));
+                            }
+                            if (!fallthrough_valid) break;
+                        }
+                        if (fallthrough_valid && visited.size() == target_blocks.size()) {
+                            fallthrough_switch = true;
+                            region.continuation = fallthrough_join;
+                            next_address = fallthrough_join->begin;
+                        } else {
+                            fallthrough_valid = false;
+                        }
+                    }
+                    if (fallthrough_switch)
+                        loop_body_ids.insert(claimed_targets.begin(), claimed_targets.end());
+                }
+                if (fallthrough_switch) {
+                    switch_loop_bodies.emplace(body->id.value, std::move(region));
+                } else {
+                region = LoopSwitchBody{};
+                // The ordinary case formatter handles disjoint arms that
+                // reconverge, or independent return paths.
                 std::vector<std::vector<const LiftedBlock *>> traces;
                 std::vector<bool> return_arms;
                 std::vector<Address> unique_targets;
@@ -12141,6 +12276,7 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                 } else {
                     loop_body_edges_valid = false;
                     break;
+                }
                 }
             } else if (body_condition && body->successors.size() == 2 &&
                 body_condition->true_target && body_condition->false_target) {
@@ -13097,7 +13233,8 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                             out << "        case 0x" << std::hex << value << std::dec << ":\n";
                         if (arm.is_default) out << "        default:\n";
                         for (const auto *arm_block : arm.body) emit_block(*arm_block, 12, true);
-                        if (!arm.terminates_function) out << "            break;\n";
+                        if (!arm.terminates_function && !arm.falls_through)
+                            out << "            break;\n";
                     }
                     out << "        }\n";
                     continue;

@@ -8,10 +8,10 @@ current page. Page changes clear the selection. The filter applies a
 case-insensitive substring search to location, saved name, and comment within
 the current page; the match count is shown in the status line. Filtering clears
 the current selection, and clear/copy actions use only visible selected rows.
-Enable **Search all rows** and choose **Search all now** to scan the first
-100,000 saved annotation rows across page boundaries. Results remain paged at
-512 rows; the status line identifies when the scan cap omits later rows. A
-changed query is applied when **Search all now** is chosen.
+Enable **Search all rows** to scan every saved annotation row across page
+boundaries. Results remain paged at 512 rows, while the search index retains
+the matching row positions so navigation can reach matches anywhere in the
+project. A changed query is applied when **Search all now** is chosen.
 
 Rows preview at most 128 UTF-8 name bytes and 160 comment bytes. Selecting a row
 shows a larger preview capped at 512 name bytes and 4096 comment bytes, with

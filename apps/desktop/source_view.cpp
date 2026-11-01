@@ -1843,16 +1843,21 @@ void SourceView::select_source_line() {
     if (!source_->PositionToXY(source_->GetInsertionPoint(), &x, &y) || y < 0) return;
     const auto line = focused_source_line();
     if (!line) return;
-    std::set<std::uint64_t> candidate_offsets;
+    const auto caret_column = x >= 0 ? static_cast<std::uint64_t>(x) + 1 : 1;
+    std::optional<std::pair<std::uint64_t, std::uint64_t>> candidate;
     const auto path_index = rows_by_path_.find(rendered_path_);
     if (path_index != rows_by_path_.end()) for (const auto index : path_index->second) {
         const auto &row = rows_[index];
         if (row.path == rendered_path_ && rendered_space_ && row.address.space == *rendered_space_ &&
-            row.line == *line)
-            candidate_offsets.insert(row.address.offset);
+            row.line == *line) {
+            const auto distance = row.column > caret_column ? row.column - caret_column
+                                                           : caret_column - row.column;
+            const auto score = std::pair{distance, row.address.offset};
+            if (!candidate || score < *candidate) candidate = score;
+        }
     }
-    if (!candidate_offsets.empty())
-        navigate(Location{Address{*rendered_space_, *candidate_offsets.begin()}});
+    if (candidate)
+        navigate(Location{Address{*rendered_space_, candidate->second}});
 }
 
 std::optional<std::int64_t> SourceView::focused_source_line() const {
