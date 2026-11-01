@@ -982,7 +982,7 @@ std::optional<SwitchBound> guarded_case_bound(const Image &image, const Function
                 immediate = std::get_if<ImmediateOperand>(&compare.operands[1]);
                 exclusive_upper_bound = branch.condition == 8;
             } else if (((context.architecture == Architecture::riscv64 && context.mode == ExecutionMode::rv64) ||
-                        (context.architecture == Architecture::riscv32 && context.mode == ExecutionMode::rv32)) &&
+                        (context.architecture == Architecture::riscv32 && is_riscv32_mode(context.mode))) &&
                        compare.opcode == Opcode::rv_sltiu && compare.operands.size() == 3 &&
                        branch.opcode == Opcode::rv_beq && branch.operands.size() == 3) {
                 // SLTIU guard, selector, positive_bound; BEQ guard, X0,
@@ -994,7 +994,7 @@ std::optional<SwitchBound> guarded_case_bound(const Image &image, const Function
                 immediate = std::get_if<ImmediateOperand>(&compare.operands[2]);
                 const auto *left = register_operand(branch, 0);
                 const auto *right = register_operand(branch, 1);
-                const auto width = context.mode == ExecutionMode::rv32 ? 32u : 64u;
+                const auto width = is_riscv32_mode(context.mode) ? 32u : 64u;
                 if (!guard || !compared_register || !immediate || guard->bank != RegisterBank::riscv_gpr ||
                     guard->width != width || guard->index == 0 || *guard == *compared_register ||
                     !((same_register(left, guard) && right && right->bank == RegisterBank::riscv_gpr &&
@@ -1136,7 +1136,7 @@ std::optional<SwitchBound> guarded_case_bound(const Image &image, const Function
                   compared_register->width != selector.width)) ||
                 ((context.architecture == Architecture::riscv64 || context.architecture == Architecture::riscv32) &&
                  (selector.bank != RegisterBank::riscv_gpr ||
-                  selector.width != (context.mode == ExecutionMode::rv32 ? 32 : 64) || selector.index == 0 ||
+                  selector.width != (is_riscv32_mode(context.mode) ? 32 : 64) || selector.index == 0 ||
                   !compared_register || compared_register->width != selector.width)) ||
                 (context.architecture == Architecture::powerpc &&
                  (selector.bank != RegisterBank::ppc_gpr || selector.width != 32 || selector.index == 0 ||
@@ -2618,7 +2618,7 @@ std::optional<Address> riscv_table_base(const Image &image,
         return {};
     const auto &last = facts[*definition]->instruction;
     const auto xlen = last.context.mode == ExecutionMode::rv64 ? 64u
-        : last.context.mode == ExecutionMode::rv32 ? 32u : 0u;
+        : is_riscv32_mode(last.context.mode) ? 32u : 0u;
     const bool matching_architecture = xlen == 64
         ? last.context.architecture == Architecture::riscv64
         : xlen == 32 && last.context.architecture == Architecture::riscv32;
@@ -2718,7 +2718,7 @@ std::optional<SwitchSite> riscv_indexed_absolute_switch(
     const auto &load = load_fact->instruction;
     const auto &address_add = address_add_fact->instruction;
     const auto xlen = dispatch.context.mode == ExecutionMode::rv64 ? 64u
-        : dispatch.context.mode == ExecutionMode::rv32 ? 32u : 0u;
+        : is_riscv32_mode(dispatch.context.mode) ? 32u : 0u;
     const auto entry_bytes = xlen / 8;
     const auto scale_shift = xlen == 64 ? 3u : 2u;
     const bool matching_architecture = xlen == 64
@@ -4366,7 +4366,7 @@ std::optional<SwitchSite> riscv_indexed_relative_switch(
     const std::uint64_t entry_bytes = halfword_offsets ? 2 : 4;
     const std::uint64_t scale_shift = halfword_offsets ? 1 : 2;
     const bool rv32 = branch_instruction.context.architecture == Architecture::riscv32 &&
-                      branch_instruction.context.mode == ExecutionMode::rv32;
+                      is_riscv32_mode(branch_instruction.context.mode);
     const bool rv64 = branch_instruction.context.architecture == Architecture::riscv64 &&
                       branch_instruction.context.mode == ExecutionMode::rv64;
     const unsigned xlen = rv32 ? 32u : rv64 ? 64u : 0u;
@@ -4793,7 +4793,7 @@ static Result<SwitchAnalysis> analyze_switch_tables_impl(const Image &image, con
                 continue;
             }
             const bool riscv32_jalr = instruction.context.architecture == Architecture::riscv32 &&
-                instruction.context.mode == ExecutionMode::rv32;
+                is_riscv32_mode(instruction.context.mode);
             const bool riscv64_jalr = instruction.context.architecture == Architecture::riscv64 &&
                 instruction.context.mode == ExecutionMode::rv64;
             if ((riscv32_jalr || riscv64_jalr) && instruction.opcode == Opcode::rv_jalr &&

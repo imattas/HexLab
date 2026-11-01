@@ -91,9 +91,11 @@ inline Result<Address> continuation_address(const Instruction &instruction) {
     if (context.architecture == Architecture::arm &&
         (context.mode == ExecutionMode::a32 || context.mode == ExecutionMode::thumb))
         return advance(instruction.address, instruction.byte_length());
-    if ((context.architecture == Architecture::riscv64 &&
-         (context.mode == ExecutionMode::rv64 || context.mode == ExecutionMode::rv64c)) ||
-        (context.architecture == Architecture::riscv32 && context.mode == ExecutionMode::rv32))
+    if (context.architecture == Architecture::riscv32 && is_riscv32_mode(context.mode))
+        return Address{instruction.address.space,
+                       static_cast<std::uint32_t>(instruction.address.offset + instruction.byte_length())};
+    if (context.architecture == Architecture::riscv64 &&
+        (context.mode == ExecutionMode::rv64 || context.mode == ExecutionMode::rv64c))
         return advance(instruction.address, instruction.byte_length());
     if (context.architecture == Architecture::powerpc && context.mode == ExecutionMode::ppc32)
         return Address{instruction.address.space,

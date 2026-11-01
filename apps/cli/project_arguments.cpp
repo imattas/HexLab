@@ -513,16 +513,16 @@ Arguments parse(std::span<const std::wstring_view> args) {
             } else {
                 auto arch = options.needed(L"--arch");
                 require(arch == L"x86-32" || arch == L"x86-64" || arch == L"a64" || arch == L"6502" || arch == L"65c02" ||
-                            arch == L"rv32" || arch == L"rv64" || arch == L"mips64" || arch == L"ppc32le" ||
+                            arch == L"rv32" || arch == L"rv32c" || arch == L"rv64" || arch == L"rv64c" || arch == L"mips64" || arch == L"ppc32le" ||
                             arch == L"ppc32be" || arch == L"ppc64le" || arch == L"ppc64be",
-                        "Raw architecture must be x86-32, x86-64, a64, 6502, 65c02, rv32, rv64, mips64, or a PPC32/PPC64 endian variant");
+                        "Raw architecture must be x86-32, x86-64, a64, 6502, 65c02, rv32, rv32c, rv64, rv64c, mips64, or a PPC32/PPC64 endian variant");
                 const bool ppc = arch.starts_with(L"ppc");
                 RawOptions raw{arch == L"a64"      ? Architecture::arm64
                                : arch == L"x86-32" ? Architecture::x86
                                : arch == L"6502"   ? Architecture::mos6502
                                : arch == L"65c02"  ? Architecture::mos6502
-                               : arch == L"rv32"   ? Architecture::riscv32
-                               : arch == L"rv64"   ? Architecture::riscv64
+                               : (arch == L"rv32" || arch == L"rv32c") ? Architecture::riscv32
+                               : (arch == L"rv64" || arch == L"rv64c") ? Architecture::riscv64
                                : arch == L"mips64" ? Architecture::mips64
                                : ppc               ? Architecture::powerpc
                                                    : Architecture::x86_64,
@@ -530,7 +530,9 @@ Arguments parse(std::span<const std::wstring_view> args) {
                                : arch == L"x86-32" ? ExecutionMode::x86_32
                                : arch == L"6502"   ? ExecutionMode::m6502
                                : arch == L"65c02"  ? ExecutionMode::m65c02
+                               : arch == L"rv32c"  ? ExecutionMode::rv32c
                                : arch == L"rv32"   ? ExecutionMode::rv32
+                               : arch == L"rv64c"  ? ExecutionMode::rv64c
                                : arch == L"rv64"   ? ExecutionMode::rv64
                                : arch == L"mips64" ? ExecutionMode::mips64
                                : ppc && arch.starts_with(L"ppc32") ? ExecutionMode::ppc32

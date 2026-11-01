@@ -1,7 +1,7 @@
 # RV32I and RV64I decoder coverage
 
-HexLab now dispatches a fixed-width RV32I/M base-integer subset as well as the
-existing RV64I/M and RV64IC paths. Select `Architecture::riscv32` with
+HexLab dispatches RV32I/M and RV32IC integer subsets as well as the
+RV64I/M and RV64IC paths. Select `Architecture::riscv32` with
 `ExecutionMode::rv32` for RV32I; raw files accept `--arch rv32`, and little-
 endian ELF32 images with `EM_RISCV` and no RVC flag select this mode. RV32
 RV32M multiply/divide operations decode with typed source and destination
@@ -12,13 +12,13 @@ RV64 word-result sign extension follow M version 2.0. RV32 register facts and
 memory address bases retain 32-bit width while using the
 architectural `x0` through `x31` names. Direct branches and jumps participate
 in the common reachable-analysis pipeline. RV32I/M rejects RV64-only LD/LWU/SD
-and RV64 word operations. Compressed instructions are
-explicitly unsupported in RV32 mode; an ELF32 image advertising RVC is left
-without a decoder mode rather than decoded as fixed-width code.
+and RV64 word operations. Select `ExecutionMode::rv32c` or raw `--arch rv32c`
+for integer compressed forms; little-endian ELF32 images advertising RVC
+select this mode. The fixed-width `rv32` mode keeps C disabled.
 
 HexLab includes a bounded, static decoder for RV64I base integer ISA (version
 2.1), integer multiplication/division extension M (version 2.0), atomic
-extension A (version 2.1), and the integer RV64C subset (version 2.0). The
+extension A (version 2.1), and the integer RV32C/RV64C subset (version 2.0). The
 Zifencei `FENCE.I` instruction is also decoded and formatted when its canonical
 encoding is present; it has no explicit operands in the current instruction
 model. The decoder accepts mixed 16-bit and
@@ -50,7 +50,10 @@ sets, conditional success, or inter-hart memory ordering.
 RV64I mode uses IALIGN=32; RV64IC mode uses IALIGN=16 and advances correctly
 across mixed 16-bit and 32-bit instructions. The C subset covers integer
 loads/stores, immediate and register arithmetic, shifts, conditional branches,
-jumps, indirect jumps, and EBREAK. Floating-point compressed encodings remain
+jumps, indirect jumps, and EBREAK. RV32C additionally includes C.JAL; RV64C
+includes doubleword loads/stores and word arithmetic. All standard integer
+forms and HINT code points are accepted with their canonical base opcode;
+see [exact compressed boundaries](riscv-compressed-integer.md). Floating-point compressed encodings remain
 unsupported. It reads the RISC-V length prefix before decoding: 48-bit,
 64-bit, and longer encodings are never mistaken for ordinary 32-bit
 instructions. They are reported as unsupported (or truncated when a detected
@@ -202,21 +205,22 @@ encodings, alignment, explicit unsupported extension cases, all six Zicsr
 opcodes, CSR read/write suppression, unsigned CSR/zimm operands, RV32/RV64/RV64C
 dispatch, and assembly formatting. Existing RVV fixtures cover the earlier add/logical/configuration/unit-stride subset, including VV/VX/VI typing, immediate sign extension, masked v0 reads, reserved forms, generic dispatch, and assembly spelling. The integer comparison and single-width multiply additions have compile-only evidence and remain unverified by fixtures.
 
-For ELF64 little-endian images with `e_machine=EM_RISCV`, the generic
-processor dispatcher selects RV64IC mode when EF_RISCV_RVC is set, otherwise
-RV64I mode. Decoded instructions feed the common listing and reachable-control-
+For ELF32/ELF64 little-endian images with `e_machine=EM_RISCV`, the generic
+processor dispatcher selects RV32IC/RV64IC mode when EF_RISCV_RVC is set,
+otherwise RV32I/RV64I mode. Decoded instructions feed the common listing and reachable-control-
 flow pipeline, including direct branch and call targets. For fixed-width
 RV32I/RV64I code, reachable analysis also resolves unrelocated `AUIPC`/`JALR`
 and `AUIPC`/`ADDI`/`JALR` call or jump sequences when the destination register
 chain is explicit and contiguous. Resolution uses XLEN-width arithmetic and
 JALR's low-bit clearing; recovered call targets feed function discovery. The
 bounded lookback declines inference if any instruction in the sequence
-overlaps an ELF/Mach-O relocation or dyld fixup. RV64IC compressed-code
-lookback is not supported. This does not resolve general relocation pairs,
+overlaps an ELF/Mach-O relocation or dyld fixup. RV32IC/RV64IC raw-byte
+lookback is not supported; the recovered-CFG reference propagator does
+accept their integer operations and compressed immediates. This does not resolve general relocation pairs,
 arbitrary register dataflow, or indirect targets built by other instruction
 sequences. Project references and derived analysis facts validate and
 round-trip the RV64 register bank. The ELF flag-derived mode survives project
-analysis context construction. Other ELF classes and byte orders remain
+analysis context construction. Other byte orders remain
 inspectable as metadata but do not select this decoder. ABI register aliases
 and the disabled ISA extensions listed above remain outside this integration.
 

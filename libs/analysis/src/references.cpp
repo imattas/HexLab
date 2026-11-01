@@ -392,14 +392,26 @@ std::optional<std::int64_t> riscv_signed_immediate(const Instruction &instructio
                                                     std::uint8_t width) {
     if (index >= instruction.operands.size()) return {};
     const auto *value = std::get_if<ImmediateOperand>(&instruction.operands[index]);
-    if (!value || value->encoded_width != width || !value->is_signed) return {};
+    if (!value) return {};
+    if (instruction.length == 2 && is_riscv_compressed_mode(instruction.context.mode)) {
+        const bool upper = instruction.opcode == Opcode::rv_lui && index == 1 && width == 20 &&
+                           value->encoded_width == 6 && value->is_signed;
+        const bool arithmetic = index == 2 && width == 12 &&
+            (instruction.opcode == Opcode::rv_addi || instruction.opcode == Opcode::rv_addiw ||
+             instruction.opcode == Opcode::rv_andi) &&
+            ((value->encoded_width == 6 && value->is_signed) ||
+             (instruction.opcode == Opcode::rv_addi && value->encoded_width == 10));
+        if (!upper && !arithmetic) return {};
+    } else if (value->encoded_width != width || !value->is_signed) return {};
     return std::bit_cast<std::int64_t>(value->value);
 }
 std::optional<std::uint64_t> riscv_unsigned_immediate(const Instruction &instruction, std::size_t index,
                                                        std::uint8_t width) {
     if (index >= instruction.operands.size()) return {};
     const auto *value = std::get_if<ImmediateOperand>(&instruction.operands[index]);
-    if (!value || value->encoded_width != width || value->is_signed) return {};
+    if (!value || value->is_signed ||
+        (value->encoded_width != width && !(instruction.length == 2 && width == 5 &&
+          value->encoded_width == 6 && is_riscv_compressed_mode(instruction.context.mode)))) return {};
     return value->value;
 }
 const RegisterOperand *riscv_register(const Instruction &instruction, std::size_t index) {
@@ -2413,9 +2425,10 @@ RegisterReferenceFacts riscv_reference_facts(const Image *image, const ElfMetada
             const auto &instruction = fact->instruction;
             const auto architecture = instruction.context.architecture;
             const bool rv32 = architecture == Architecture::riscv32 &&
-                              instruction.context.mode == ExecutionMode::rv32;
+                              is_riscv32_mode(instruction.context.mode);
             const bool rv64 = architecture == Architecture::riscv64 &&
-                              instruction.context.mode == ExecutionMode::rv64;
+                              (instruction.context.mode == ExecutionMode::rv64 ||
+                               instruction.context.mode == ExecutionMode::rv64c);
             if (!rv32 && !rv64) {
                 registers.clear();
                 continue;

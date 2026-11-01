@@ -157,7 +157,7 @@ std::int64_t pointer_bytes(const Instruction &instruction) {
     case ExecutionMode::mips64: return 8;
     case ExecutionMode::ppc32: return 4;
     case ExecutionMode::ppc64: return 8;
-    case ExecutionMode::rv32: return 4;
+    case ExecutionMode::rv32: case ExecutionMode::rv32c: return 4;
     case ExecutionMode::rv64:
     case ExecutionMode::rv64c: return 8;
     default: return 0;
@@ -306,7 +306,7 @@ bool riscv_register(const std::optional<RegisterOperand> &value, std::uint8_t in
 // preserve a pointer; a word-sized result or any other mask is not a copy.
 std::optional<RegisterOperand> riscv_bitwise_copy_source(const Instruction &instruction) {
     const bool rv32 = instruction.context.architecture == Architecture::riscv32 &&
-                      instruction.context.mode == ExecutionMode::rv32;
+                      is_riscv32_mode(instruction.context.mode);
     const bool rv64 = instruction.context.architecture == Architecture::riscv64 &&
                       (instruction.context.mode == ExecutionMode::rv64 ||
                        instruction.context.mode == ExecutionMode::rv64c);
@@ -614,7 +614,7 @@ void mark_incoming_riscv_argument(StackFrameAnalysis &result, std::int64_t offse
     });
     if (slot != result.slots.end()) {
         slot->incoming_argument = true;
-        slot->incoming_argument_abi = mode == ExecutionMode::rv32
+        slot->incoming_argument_abi = is_riscv32_mode(mode)
             ? StackArgumentAbi::riscv32 : StackArgumentAbi::riscv64;
     }
 }
@@ -2053,7 +2053,7 @@ Result<StackFrameAnalysis> analyze_stack_frame(const FunctionRecord &function, c
             }
             const bool riscv_stack_context =
                 (instruction.context.architecture == Architecture::riscv32 &&
-                 instruction.context.mode == ExecutionMode::rv32) ||
+                 is_riscv32_mode(instruction.context.mode)) ||
                 (instruction.context.architecture == Architecture::riscv64 &&
                  (instruction.context.mode == ExecutionMode::rv64 ||
                   instruction.context.mode == ExecutionMode::rv64c));
@@ -2076,7 +2076,7 @@ Result<StackFrameAnalysis> analyze_stack_frame(const FunctionRecord &function, c
             } else if (!riscv_stack_context || instruction.flow != FlowKind::fallthrough) {
                 pending_riscv_stores.clear();
             } else {
-                const auto width = static_cast<std::uint16_t>(instruction.context.mode == ExecutionMode::rv32 ? 32 : 64);
+                const auto width = static_cast<std::uint16_t>(is_riscv32_mode(instruction.context.mode) ? 32 : 64);
                 if (std::any_of(instruction.register_writes.begin(), instruction.register_writes.end(),
                     [&](const auto &reg) { return reg.bank == RegisterBank::riscv_gpr && reg.index == 2 &&
                                                   reg.width == width; }))

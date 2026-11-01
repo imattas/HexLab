@@ -334,8 +334,8 @@ Result<LoadedImage> load_elf(std::shared_ptr<const ByteStorage> storage, const E
             if (header.order == ByteOrder::little) {
                 if (header.is_64)
                     mode = (header.flags & 1u) ? ExecutionMode::rv64c : ExecutionMode::rv64;
-                else if (!(header.flags & 1u))
-                    mode = ExecutionMode::rv32;
+                else
+                    mode = (header.flags & 1u) ? ExecutionMode::rv32c : ExecutionMode::rv32;
             }
         } else if (header.machine == 8) {
             // EF_MIPS_ABI2 identifies the N32 ABI: ELFCLASS32 data model on

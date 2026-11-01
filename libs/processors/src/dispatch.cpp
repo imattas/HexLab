@@ -6,8 +6,8 @@
 namespace hexlab {
 namespace {
 DecodeResult decode_riscv_context(DecodeContext context, std::span<const std::byte> bytes, Address at) {
-    const bool rv32 = context.mode == ExecutionMode::rv32;
-    auto result = rv32 ? decode_riscv32(bytes, at)
+    const bool rv32 = is_riscv32_mode(context.mode);
+    auto result = rv32 ? (context.mode == ExecutionMode::rv32c ? decode_riscv32c(bytes, at) : decode_riscv32(bytes, at))
                        : context.mode == ExecutionMode::rv64c ? decode_riscv64c(bytes, at) : decode_riscv64(bytes, at);
     if (!result.instruction)
         return {result.status, {}, std::move(result.reason)};
@@ -296,10 +296,10 @@ ProcessorCapabilities processor_capabilities(DecodeContext context) noexcept {
             return {false, 0, {}, "RV64 does not use x86 segmentation or stack-address overrides"};
         return {true, 4, context.mode == ExecutionMode::rv64c ? "RV64IC scalar subset plus RVV configuration" : "RV64I/M scalar subset plus RVV configuration", {}};
     }
-    if (context.architecture == Architecture::riscv32 && context.mode == ExecutionMode::rv32) {
+    if (context.architecture == Architecture::riscv32 && is_riscv32_mode(context.mode)) {
         if (context.segmented_memory || context.stack_address_width)
             return {false, 0, {}, "RV32 does not use x86 segmentation or stack-address overrides"};
-        return {true, 4, "RV32I/M scalar subset plus RVV configuration", {}};
+        return {true, 4, context.mode == ExecutionMode::rv32c ? "RV32IC scalar subset plus RVV configuration" : "RV32I/M scalar subset plus RVV configuration", {}};
     }
     if (context.architecture == Architecture::mips32 && context.mode == ExecutionMode::mips32) {
         if (context.segmented_memory || context.stack_address_width)
@@ -374,6 +374,8 @@ std::span<const ProcessorVariantInfo> processor_variant_inventory() noexcept {
         "scalar-and-pair-memory", "selected-simd-integer-and-floating"};
     static constexpr std::string_view rv32_families[]{"rv32i", "rv32m", "rv32a", "zicsr", "scalar-f-and-d",
         "selected-rvv"};
+    static constexpr std::string_view rv32c_families[]{"rv32i", "rv32m", "rv32a", "rv32c-integer", "zicsr",
+        "scalar-f-and-d", "selected-rvv"};
     static constexpr std::string_view rv64_families[]{"rv64i", "rv64m", "rv64a", "zicsr", "scalar-f-and-d",
         "selected-zfa-and-rvv"};
     static constexpr std::string_view rv64c_families[]{"rv64i", "rv64m", "rv64a", "rv64c", "zicsr",
@@ -404,6 +406,7 @@ std::span<const ProcessorVariantInfo> processor_variant_inventory() noexcept {
     static constexpr ProcessorVariantCoverage thumb_coverage{thumb_families, native_analysis, native_decompiler, remote_debugger};
     static constexpr ProcessorVariantCoverage a64_coverage{a64_families, native_analysis, native_decompiler, remote_debugger};
     static constexpr ProcessorVariantCoverage rv32_coverage{rv32_families, native_analysis, native_decompiler, remote_debugger};
+    static constexpr ProcessorVariantCoverage rv32c_coverage{rv32c_families, native_analysis, native_decompiler, remote_debugger};
     static constexpr ProcessorVariantCoverage rv64_coverage{rv64_families, native_analysis, native_decompiler, remote_debugger};
     static constexpr ProcessorVariantCoverage rv64c_coverage{rv64c_families, native_analysis, native_decompiler, remote_debugger};
     static constexpr ProcessorVariantCoverage mips32_coverage{mips32_families, native_analysis, native_decompiler, remote_debugger};
@@ -422,6 +425,7 @@ std::span<const ProcessorVariantInfo> processor_variant_inventory() noexcept {
         ProcessorVariantInfo{"thumb", {Architecture::arm, ExecutionMode::thumb, ByteOrder::little}, {}, true, thumb_coverage},
         ProcessorVariantInfo{"a64", {Architecture::arm64, ExecutionMode::a64, ByteOrder::little}, {}, true, a64_coverage},
         ProcessorVariantInfo{"rv32", {Architecture::riscv32, ExecutionMode::rv32, ByteOrder::little}, {}, true, rv32_coverage},
+        ProcessorVariantInfo{"rv32c", {Architecture::riscv32, ExecutionMode::rv32c, ByteOrder::little}, {}, true, rv32c_coverage},
         ProcessorVariantInfo{"rv64", {Architecture::riscv64, ExecutionMode::rv64, ByteOrder::little}, {}, true, rv64_coverage},
         ProcessorVariantInfo{"rv64c", {Architecture::riscv64, ExecutionMode::rv64c, ByteOrder::little}, {}, true, rv64c_coverage},
         ProcessorVariantInfo{"mips32le", {Architecture::mips32, ExecutionMode::mips32, ByteOrder::little}, {}, true, mips32_coverage},
@@ -466,7 +470,7 @@ DecodeResult decode_instruction(DecodeContext context, std::span<const std::byte
     else if (context.architecture == Architecture::riscv64 &&
         (context.mode == ExecutionMode::rv64 || context.mode == ExecutionMode::rv64c))
         result = decode_riscv_context(context, bytes, at);
-    else if (context.architecture == Architecture::riscv32 && context.mode == ExecutionMode::rv32)
+    else if (context.architecture == Architecture::riscv32 && is_riscv32_mode(context.mode))
         result = decode_riscv_context(context, bytes, at);
     else if (context.architecture == Architecture::mips32 && context.mode == ExecutionMode::mips32)
         result = decode_mips32(context.order, bytes, at);
@@ -493,6 +497,9 @@ DecodeResult decode_instruction(DecodeContext context, std::span<const std::byte
     const bool riscv_vector_encoding =
         (context.architecture == Architecture::riscv64 || context.architecture == Architecture::riscv32) &&
         bytes.size() >= 4 && (riscv_opcode == 0x57 || riscv_vector_memory_encoding);
+    const bool riscv_compressed_encoding =
+        (context.architecture == Architecture::riscv64 || context.architecture == Architecture::riscv32) &&
+        bytes.size() >= 2 && (std::to_integer<unsigned>(bytes[0]) & 3u) != 3u;
     bool a32_unpredictable_pc_exchange = false;
     if (context.mode == ExecutionMode::a32 && context.order == ByteOrder::little && bytes.size() >= 4) {
         const auto word = std::to_integer<std::uint32_t>(bytes[0]) |
@@ -508,7 +515,7 @@ DecodeResult decode_instruction(DecodeContext context, std::span<const std::byte
     // typed control-flow instruction with guessed link effects.
     if (a32_unpredictable_pc_exchange)
         return result;
-    if (result.status == DecodeStatus::unsupported && !riscv_vector_encoding &&
+    if (result.status == DecodeStatus::unsupported && !riscv_vector_encoding && !riscv_compressed_encoding &&
         context.architecture != Architecture::wasm && context.architecture != Architecture::dex &&
         context.architecture != Architecture::jvm) {
         auto fallback = processor_detail::decode_capstone_fallback(context, bytes, at);

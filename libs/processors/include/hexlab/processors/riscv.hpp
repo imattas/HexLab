@@ -196,5 +196,7 @@ HEXLAB_PROCESSORS_EXPORT RiscvDecodeResult decode_riscv64(std::span<const std::b
 HEXLAB_PROCESSORS_EXPORT RiscvDecodeResult decode_riscv32(std::span<const std::byte>, Address);
 // RV64I/M/A plus integer RV64C (not floating-point C forms); IALIGN=16.
 HEXLAB_PROCESSORS_EXPORT RiscvDecodeResult decode_riscv64c(std::span<const std::byte>, Address);
+// RV32I/M/A plus integer RV32C, including C.JAL; IALIGN=16. FP C forms are unsupported.
+HEXLAB_PROCESSORS_EXPORT RiscvDecodeResult decode_riscv32c(std::span<const std::byte>, Address);
 
 } // namespace hexlab

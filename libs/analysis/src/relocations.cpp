@@ -105,10 +105,12 @@ Result<std::optional<Address>> riscv_pcrel_jalr_target(const RelocationResolver 
                                                        const ImageMetadata *metadata,
                                                        const Instruction &instruction, std::stop_token stop) {
     const bool rv32 = instruction.context.architecture == Architecture::riscv32 &&
-                      instruction.context.mode == ExecutionMode::rv32;
+                      is_riscv32_mode(instruction.context.mode);
     const bool rv64 = instruction.context.architecture == Architecture::riscv64 &&
                       instruction.context.mode == ExecutionMode::rv64;
-    if ((!rv32 && !rv64) || instruction.opcode != Opcode::rv_jalr || instruction.flow == FlowKind::ret ||
+    // This byte-backtracking resolver requires fixed-width instruction boundaries.
+    // Compressed contexts use recovered CFG facts in the reference propagator.
+    if (is_riscv_compressed_mode(instruction.context.mode) || (!rv32 && !rv64) || instruction.opcode != Opcode::rv_jalr || instruction.flow == FlowKind::ret ||
         (instruction.flow != FlowKind::call && instruction.flow != FlowKind::jump) || instruction.operands.size() != 2 ||
         !metadata)
         return std::optional<Address>{};

@@ -575,7 +575,7 @@ void apply_capstone_detail(csh handle, const cs_insn& insn, Instruction& out, Ar
         }
         if(riscv_relative_branch(insn.id) && rv.op_count && rv.operands[rv.op_count-1].type==RISCV_OP_IMM)
             out.direct_target=relative_target(out,rv.operands[rv.op_count-1].imm,
-                architecture==Architecture::riscv64?64:32,out.context.mode==ExecutionMode::rv64c?2:4);
+                architecture==Architecture::riscv64?64:32,is_riscv_compressed_mode(out.context.mode)?2:4);
     } else if((architecture==Architecture::mips32 || architecture==Architecture::mips64) &&
               control_transfer(out.flow) && mips_classic_direct(insn.id)) {
         const auto &m=d->mips;
@@ -753,8 +753,11 @@ bool capstone_context(DecodeContext context, cs_arch &arch, cs_mode &mode) {
         if (context.architecture != Architecture::mips64) return false;
         arch = CS_ARCH_MIPS; mode = static_cast<cs_mode>(CS_MODE_MIPS64 | endian); return true;
     case ExecutionMode::rv32:
+    case ExecutionMode::rv32c:
         if (context.architecture != Architecture::riscv32) return false;
-        arch = CS_ARCH_RISCV; mode = static_cast<cs_mode>(CS_MODE_RISCV32 | CS_MODE_LITTLE_ENDIAN); return true;
+        arch = CS_ARCH_RISCV;
+        mode = static_cast<cs_mode>(CS_MODE_RISCV32 | CS_MODE_LITTLE_ENDIAN |
+                                    (context.mode == ExecutionMode::rv32c ? CS_MODE_RISCVC : 0)); return true;
     case ExecutionMode::rv64:
     case ExecutionMode::rv64c:
         if (context.architecture != Architecture::riscv64) return false;

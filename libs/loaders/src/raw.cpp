@@ -29,8 +29,9 @@ Result<bool> validate_raw_coordinates(const RawOptions &o) {
     const bool a64 = o.architecture == Architecture::arm64 && o.mode == ExecutionMode::a64;
     const bool m6502 = o.architecture == Architecture::mos6502 &&
                        (o.mode == ExecutionMode::m6502 || o.mode == ExecutionMode::m65c02);
-    const bool rv32 = o.architecture == Architecture::riscv32 && o.mode == ExecutionMode::rv32;
-    const bool rv64 = o.architecture == Architecture::riscv64 && o.mode == ExecutionMode::rv64;
+    const bool rv32 = o.architecture == Architecture::riscv32 && is_riscv32_mode(o.mode);
+    const bool rv64 = o.architecture == Architecture::riscv64 &&
+                      (o.mode == ExecutionMode::rv64 || o.mode == ExecutionMode::rv64c);
     const bool mips64 = o.architecture == Architecture::mips64 && o.mode == ExecutionMode::mips64;
     const bool ppc32 = o.architecture == Architecture::powerpc && o.mode == ExecutionMode::ppc32;
     const bool ppc64 = o.architecture == Architecture::powerpc && o.mode == ExecutionMode::ppc64;
@@ -48,8 +49,10 @@ Result<bool> validate_raw_coordinates(const RawOptions &o) {
         return Error{ErrorCode::overflow, "Raw RV32I base and entry must fit its 32-bit address space"};
     if (ppc32 && (o.base.offset > UINT32_MAX || (o.entry && o.entry->offset > UINT32_MAX)))
         return Error{ErrorCode::overflow, "Raw PPC32 base and entry must fit its 32-bit address space"};
-    if ((rv32 || rv64) && ((o.entry && (o.entry->offset & 3)) || (!o.entry && o.executable && (o.base.offset & 3))))
-        return Error{ErrorCode::invalid_argument, "RISC-V raw code entry must be four-byte aligned"};
+    const auto riscv_alignment_mask = is_riscv_compressed_mode(o.mode) ? 1u : 3u;
+    if ((rv32 || rv64) && ((o.entry && (o.entry->offset & riscv_alignment_mask)) ||
+                          (!o.entry && o.executable && (o.base.offset & riscv_alignment_mask))))
+        return Error{ErrorCode::invalid_argument, "RISC-V raw code entry must satisfy the selected IALIGN"};
     if ((mips64 || ppc32 || ppc64) && ((o.entry && (o.entry->offset & 3)) || (!o.entry && o.executable && (o.base.offset & 3))))
         return Error{ErrorCode::invalid_argument, "MIPS64/PowerPC raw code entry must be four-byte aligned"};
     if (o.entry && (o.entry->space != o.base.space || o.entry->offset < o.base.offset))
@@ -69,7 +72,7 @@ Result<std::shared_ptr<const Image>> load_raw(std::shared_ptr<const ByteStorage>
         return valid.error();
     if (o.x86_profile)
         return profile_detail::load_segmented(std::move(storage), *o.x86_profile, stop);
-    ImageLayout layout{{o.base.space, static_cast<uint8_t>(o.arm_profile || o.mode == ExecutionMode::x86_32 || o.mode == ExecutionMode::rv32 || o.mode == ExecutionMode::ppc32 ? 32 :
+    ImageLayout layout{{o.base.space, static_cast<uint8_t>(o.arm_profile || o.mode == ExecutionMode::x86_32 || is_riscv32_mode(o.mode) || o.mode == ExecutionMode::ppc32 ? 32 :
                                                             (o.mode == ExecutionMode::m6502 || o.mode == ExecutionMode::m65c02) ? 16 : 64),
                         1, o.order},
                        o.architecture,

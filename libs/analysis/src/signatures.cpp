@@ -31,7 +31,7 @@ std::string_view mode_name(ExecutionMode value) {
     case ExecutionMode::x86_64: return "x86_64"; case ExecutionMode::a32: return "a32";
     case ExecutionMode::thumb: return "thumb"; case ExecutionMode::a64: return "a64";
     case ExecutionMode::rv64: return "rv64"; case ExecutionMode::rv64c: return "rv64c";
-    case ExecutionMode::rv32: return "rv32"; case ExecutionMode::mips32: return "mips32";
+    case ExecutionMode::rv32c: return "rv32c"; case ExecutionMode::rv32: return "rv32"; case ExecutionMode::mips32: return "mips32";
     case ExecutionMode::mips64: return "mips64"; case ExecutionMode::m6502: return "m6502";
     case ExecutionMode::ppc32: return "ppc32"; case ExecutionMode::ppc64: return "ppc64";
     default: return "unknown";
@@ -47,7 +47,7 @@ Architecture parse_architecture(std::string_view value) {
 ExecutionMode parse_mode(std::string_view value) {
     for (const auto candidate : {ExecutionMode::x86_16, ExecutionMode::x86_32, ExecutionMode::x86_64,
              ExecutionMode::a32, ExecutionMode::thumb, ExecutionMode::a64, ExecutionMode::rv64,
-             ExecutionMode::rv64c, ExecutionMode::rv32, ExecutionMode::mips32, ExecutionMode::mips64,
+             ExecutionMode::rv64c, ExecutionMode::rv32, ExecutionMode::rv32c, ExecutionMode::mips32, ExecutionMode::mips64,
              ExecutionMode::m6502, ExecutionMode::ppc32, ExecutionMode::ppc64})
         if (mode_name(candidate) == value) return candidate;
     return ExecutionMode::unknown;

@@ -223,6 +223,7 @@ std::string_view processor_mode_label(ExecutionMode mode) {
     case ExecutionMode::thumb: return "Thumb/Thumb-2";
     case ExecutionMode::a64: return "A64";
     case ExecutionMode::rv32: return "RV32";
+    case ExecutionMode::rv32c: return "RV32C";
     case ExecutionMode::rv64: return "RV64";
     case ExecutionMode::rv64c: return "RV64C";
     case ExecutionMode::mips32: return "MIPS32";
@@ -3153,15 +3154,15 @@ OpenRequest parse(std::span<const std::wstring_view> args, bool disassemble,
                     argument_error("Unknown format value");
             } else if (item == L"--arch") {
                 if (value != L"x86-64" && value != L"x86-32" && value != L"a64" && value != L"6502" && value != L"65c02" &&
-                    value != L"rv32" && value != L"rv64" && value != L"mips64" && value != L"ppc32le" &&
+                    value != L"rv32" && value != L"rv32c" && value != L"rv64" && value != L"rv64c" && value != L"mips64" && value != L"ppc32le" &&
                     value != L"ppc32be" && value != L"ppc64le" && value != L"ppc64be")
-                    argument_error("Raw architecture must be x86-32, x86-64, a64, 6502, 65c02, rv32, rv64, mips64, ppc32le/be or ppc64le/be");
+                    argument_error("Raw architecture must be x86-32, x86-64, a64, 6502, 65c02, rv32, rv32c, rv64, rv64c, mips64, ppc32le/be or ppc64le/be");
                 option(architecture, value == L"a64"      ? Architecture::arm64
                                      : value == L"x86-32" ? Architecture::x86
                                      : value == L"6502"   ? Architecture::mos6502
                                      : value == L"65c02"  ? Architecture::mos6502
-                                     : value == L"rv32"   ? Architecture::riscv32
-                                     : value == L"rv64"   ? Architecture::riscv64
+                                     : (value == L"rv32" || value == L"rv32c") ? Architecture::riscv32
+                                     : (value == L"rv64" || value == L"rv64c") ? Architecture::riscv64
                                      : value == L"mips64" ? Architecture::mips64
                                      : value.starts_with(L"ppc") ? Architecture::powerpc
                                                           : Architecture::x86_64);
@@ -3169,6 +3170,8 @@ OpenRequest parse(std::span<const std::wstring_view> args, bool disassemble,
                     option(raw_mode, value.starts_with(L"ppc32") ? ExecutionMode::ppc32 : ExecutionMode::ppc64);
                     option(raw_order, value.ends_with(L"be") ? ByteOrder::big : ByteOrder::little);
                 }
+                if (value == L"rv32c" || value == L"rv64c")
+                    option(raw_mode, value == L"rv32c" ? ExecutionMode::rv32c : ExecutionMode::rv64c);
                 if (value == L"6502" || value == L"65c02")
                     option(raw_mode, value == L"65c02" ? ExecutionMode::m65c02 : ExecutionMode::m6502);
             } else if (item == L"--profile")
@@ -3229,7 +3232,7 @@ OpenRequest parse(std::span<const std::wstring_view> args, bool disassemble,
             request.arm_profile_path = std::move(arm_profile);
         } else {
             if (!architecture || !base)
-                argument_error("Raw format requires --arch x86-32|x86-64|a64|6502|65c02|rv32|rv64|mips64|ppc32le|ppc32be|ppc64le|ppc64be and --base");
+                argument_error("Raw format requires --arch x86-32|x86-64|a64|6502|65c02|rv32|rv32c|rv64|rv64c|mips64|ppc32le|ppc32be|ppc64le|ppc64be and --base");
             request.raw = RawOptions{*architecture,
                                      raw_mode.value_or(*architecture == Architecture::arm64 ? ExecutionMode::a64
                                      : *architecture == Architecture::x86 ? ExecutionMode::x86_32

@@ -53,7 +53,7 @@ bool valid_target(Architecture architecture, ExecutionMode mode) {
     case Architecture::x86_64: return mode == ExecutionMode::x86_64;
     case Architecture::arm: return mode == ExecutionMode::a32 || mode == ExecutionMode::thumb;
     case Architecture::arm64: return mode == ExecutionMode::a64;
-    case Architecture::riscv32: return mode == ExecutionMode::rv32;
+    case Architecture::riscv32: return is_riscv32_mode(mode);
     case Architecture::riscv64: return mode == ExecutionMode::rv64 || mode == ExecutionMode::rv64c;
     case Architecture::mips32: return mode == ExecutionMode::mips32;
     case Architecture::mips64: return mode == ExecutionMode::mips64;

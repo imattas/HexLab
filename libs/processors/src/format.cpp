@@ -1233,7 +1233,7 @@ std::string format_instruction(const Instruction &i) {
     }
     if ((i.context.architecture == Architecture::riscv64 &&
          (i.context.mode == ExecutionMode::rv64 || i.context.mode == ExecutionMode::rv64c)) ||
-        (i.context.architecture == Architecture::riscv32 && i.context.mode == ExecutionMode::rv32)) {
+        (i.context.architecture == Architecture::riscv32 && is_riscv32_mode(i.context.mode))) {
         std::string out = opcode_name(i.opcode, i.condition);
         if (i.opcode >= Opcode::rv_lr_w && i.opcode <= Opcode::rv_amomaxu_d) {
             if (i.atomic_aq && i.atomic_rl) out += ".aqrl";

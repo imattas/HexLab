@@ -1288,10 +1288,31 @@ bool decode_word(std::uint32_t w, RiscvInstruction &i, std::string &unsupported,
     }
 }
 
-bool decode_compressed(std::uint16_t h, RiscvInstruction &i, std::string &unsupported) {
+bool decode_compressed(std::uint16_t h, RiscvInstruction &i, std::string &unsupported, unsigned xlen) {
     const unsigned q = h & 3, f3 = h >> 13, rd = (h >> 7) & 31, rs2 = (h >> 2) & 31;
     const unsigned rp = 8 + ((h >> 2) & 7), rq = 8 + ((h >> 7) & 7);
     auto imm6 = [&] { return sign_extend(((h >> 12) & 1) << 5 | ((h >> 2) & 31), 6); };
+    auto floating = [&] {
+        unsupported = "compressed floating-point instruction is outside the integer C subset";
+        return false;
+    };
+    auto shift_supported = [&] {
+        if (xlen == 32 && (h & 0x1000)) {
+            unsupported = "RV32C shift with shamt[5]=1 is designated for custom extensions";
+            return false;
+        }
+        return true;
+    };
+    auto jump = [&](unsigned link) {
+        const auto b = ((h >> 12) & 1) << 11 | ((h >> 11) & 1) << 4 | ((h >> 9) & 3) << 8 |
+                       ((h >> 8) & 1) << 10 | ((h >> 7) & 1) << 6 | ((h >> 6) & 1) << 7 |
+                       ((h >> 3) & 7) << 1 | ((h >> 2) & 1) << 5;
+        i.opcode = RiscvOpcode::jal;
+        i.flow = link ? RiscvFlow::call : RiscvFlow::jump;
+        operand(i, RiscvRegister{static_cast<std::uint8_t>(link)}, RiscvOperandAccess::write);
+        relative_operand(i, sign_extend(b, 12), 12);
+        return true;
+    };
     auto load = [&](unsigned r, unsigned base, std::int64_t off, unsigned width) {
         i.opcode = width == 64 ? RiscvOpcode::ld : RiscvOpcode::lw;
         operand(i, RiscvRegister{static_cast<std::uint8_t>(r)}, RiscvOperandAccess::write);
@@ -1312,57 +1333,58 @@ bool decode_compressed(std::uint16_t h, RiscvInstruction &i, std::string &unsupp
         const auto ld = ((h >> 10) & 7) << 3 | ((h >> 5) & 3) << 6;
         switch (f3) {
         case 0: if (!u) return false; set_ri(i,RiscvOpcode::addi,rp,2,u,10,false); return true;
-        case 1: case 5: unsupported = "compressed floating-point instruction requires a disabled extension"; return false;
+        case 1: case 5: return floating();
         case 2: load(rp,rq,lw,32); return true;
-        case 3: load(rp,rq,ld,64); return true;
+        case 3: if (xlen == 32) return floating(); load(rp,rq,ld,64); return true;
         case 6: store(rp,rq,lw,32); return true;
-        case 7: store(rp,rq,ld,64); return true;
+        case 7: if (xlen == 32) return floating(); store(rp,rq,ld,64); return true;
         default: return false;
         }
     }
     if (q == 1) {
         switch (f3) {
         case 0: set_ri(i,RiscvOpcode::addi,rd,rd,imm6(),6); return true;
-        case 1: if (!rd) return false; set_ri(i,RiscvOpcode::addiw,rd,rd,imm6(),6); return true;
+        case 1: if (xlen == 32) return jump(1); if (!rd) return false; set_ri(i,RiscvOpcode::addiw,rd,rd,imm6(),6); return true;
         case 2: set_ri(i,RiscvOpcode::addi,rd,0,imm6(),6); return true;
         case 3:
             if (rd == 2) {
                 const auto v=sign_extend(((h>>12)&1)<<9|((h>>6)&1)<<4|((h>>5)&1)<<6|((h>>3)&3)<<7|((h>>2)&1)<<5,10);
                 if (!v) return false; set_ri(i,RiscvOpcode::addi,2,2,v,10); return true;
             }
-            if (!rd || !((h>>2)&31)) return false;
+            // rd=x0 with a nonzero immediate is a HINT; imm=-32 is legal.
+            if (!imm6()) return false;
             i.opcode=RiscvOpcode::lui;
             operand(i,RiscvRegister{static_cast<std::uint8_t>(rd)},RiscvOperandAccess::write);
             operand(i,RiscvImmediate{sign_extend(((h>>12)&1)<<5|((h>>2)&31),6)*4096,6,true},RiscvOperandAccess::read);
             return true;
         case 4: {
             const unsigned sub=(h>>10)&3; const auto sh=((h>>12)&1)<<5|((h>>2)&31);
-            if (sub==0 || sub==1) { if ((h>>12)&1) return false; set_ri(i,sub?RiscvOpcode::srai:RiscvOpcode::srli,rq,rq,sh,6,false); return true; }
+            if (sub==0 || sub==1) { if (!shift_supported()) return false; set_ri(i,sub?RiscvOpcode::srai:RiscvOpcode::srli,rq,rq,sh,6,false); return true; }
             if (sub==2) { set_ri(i,RiscvOpcode::bit_and,rq,rq,imm6(),6); return true; }
             const unsigned sel=(h>>5)&3; const bool wide=(h>>12)&1;
-            if (!wide) { if(sel>3)return false; static constexpr RiscvOpcode ops[]{RiscvOpcode::sub,RiscvOpcode::bit_xor,RiscvOpcode::bit_or,RiscvOpcode::bit_and}; set_rr(i,ops[sel],rq,rq,rs2); return true; }
-            if(sel>1)return false; set_rr(i,sel?RiscvOpcode::addw:RiscvOpcode::subw,rq,rq,rs2); return true;
+            if (!wide) { static constexpr RiscvOpcode ops[]{RiscvOpcode::sub,RiscvOpcode::bit_xor,RiscvOpcode::bit_or,RiscvOpcode::bit_and}; set_rr(i,ops[sel],rq,rq,rp); return true; }
+            if(xlen == 32 || sel>1)return false; set_rr(i,sel?RiscvOpcode::addw:RiscvOpcode::subw,rq,rq,rp); return true;
         }
-        case 5: { const auto b=((h>>12)&1)<<11|((h>>11)&1)<<4|((h>>9)&3)<<8|((h>>8)&1)<<10|((h>>7)&1)<<6|((h>>6)&1)<<7|((h>>3)&7)<<1|((h>>2)&1)<<5; i.opcode=RiscvOpcode::jal;i.flow=RiscvFlow::jump;operand(i,RiscvRegister{0},RiscvOperandAccess::write);relative_operand(i,sign_extend(b,12),12);return true; }
+        case 5: return jump(0);
         case 6: case 7: { const auto b=((h>>12)&1)<<8|((h>>10)&3)<<3|((h>>5)&3)<<6|((h>>3)&3)<<1|((h>>2)&1)<<5; i.opcode=f3==6?RiscvOpcode::beq:RiscvOpcode::bne;i.flow=RiscvFlow::conditional_branch;operand(i,RiscvRegister{static_cast<std::uint8_t>(rq)},RiscvOperandAccess::read);operand(i,RiscvRegister{0},RiscvOperandAccess::read);relative_operand(i,sign_extend(b,9),9);return true; }
         }
     }
     if (q == 2) {
         switch(f3) {
-        case 0: set_ri(i,RiscvOpcode::slli,rd,rd,((h>>12)&1)<<5|((h>>2)&31),6,false);return true;
-        case 1: case 5: unsupported="compressed floating-point instruction requires a disabled extension";return false;
+        case 0: if (!shift_supported()) return false; set_ri(i,RiscvOpcode::slli,rd,rd,((h>>12)&1)<<5|((h>>2)&31),6,false);return true;
+        case 1: case 5: return floating();
         case 2: if(!rd)return false; load(rd,2,((h>>12)&1)<<5|((h>>4)&7)<<2|((h>>2)&3)<<6,32);return true;
-        case 3: if(!rd)return false; load(rd,2,((h>>12)&1)<<5|((h>>5)&3)<<3|((h>>2)&7)<<6,64);return true;
+        case 3: if(xlen == 32)return floating(); if(!rd)return false; load(rd,2,((h>>12)&1)<<5|((h>>5)&3)<<3|((h>>2)&7)<<6,64);return true;
         case 4: {
             const bool high=(h>>12)&1;
-            if(!high && !rs2) { if(!rd)return false;i.opcode=RiscvOpcode::jalr;i.flow=(rd==1||rd==5)?RiscvFlow::ret:RiscvFlow::jump;operand(i,RiscvRegister{0},RiscvOperandAccess::write);operand(i,RiscvMemory{RiscvRegister{static_cast<std::uint8_t>(rd)},0,64,false},RiscvOperandAccess::address);read_register(i,rd);return true; }
+            if(!high && !rs2) { if(!rd)return false;i.opcode=RiscvOpcode::jalr;i.flow=(rd==1||rd==5)?RiscvFlow::ret:RiscvFlow::jump;operand(i,RiscvRegister{0},RiscvOperandAccess::write);operand(i,RiscvMemory{RiscvRegister{static_cast<std::uint8_t>(rd)},0,static_cast<std::uint8_t>(xlen),false},RiscvOperandAccess::address);read_register(i,rd);return true; }
             if(!high) { set_rr(i,RiscvOpcode::add,rd,0,rs2);return true; }
             if(!rs2 && !rd) {i.opcode=RiscvOpcode::ebreak;i.flow=RiscvFlow::trap;return true;}
-            if(!rs2) {i.opcode=RiscvOpcode::jalr;i.flow=RiscvFlow::call;operand(i,RiscvRegister{1},RiscvOperandAccess::write);operand(i,RiscvMemory{RiscvRegister{static_cast<std::uint8_t>(rd)},0,64,false},RiscvOperandAccess::address);read_register(i,rd);return true;}
+            if(!rs2) {i.opcode=RiscvOpcode::jalr;i.flow=RiscvFlow::call;operand(i,RiscvRegister{1},RiscvOperandAccess::write);operand(i,RiscvMemory{RiscvRegister{static_cast<std::uint8_t>(rd)},0,static_cast<std::uint8_t>(xlen),false},RiscvOperandAccess::address);read_register(i,rd);return true;}
             set_rr(i,RiscvOpcode::add,rd,rd,rs2);return true;
         }
         case 6: store(rs2,2,((h>>9)&15)<<2|((h>>7)&3)<<6,32);return true;
-        case 7: store(rs2,2,((h>>10)&7)<<3|((h>>7)&7)<<6,64);return true;
+        case 7: if(xlen == 32)return floating(); store(rs2,2,((h>>10)&7)<<3|((h>>7)&7)<<6,64);return true;
         }
     }
     return false;
@@ -1371,8 +1393,20 @@ bool decode_compressed(std::uint16_t h, RiscvInstruction &i, std::string &unsupp
 
 namespace {
 RiscvDecodeResult decode_riscv(std::span<const std::byte> bytes, Address at, unsigned xlen, bool compressed) {
+    if (xlen == 32 && at.offset > UINT32_MAX)
+        return failure(DecodeStatus::invalid, "RV32 instruction address exceeds its 32-bit address domain");
+    const auto normalize_target = [xlen](RiscvInstruction &instruction) {
+        if (xlen != 32) return;
+        for (auto &value : instruction.operands)
+            if (auto *relative = std::get_if<RiscvRelative>(&value)) {
+                const Address target{instruction.address.space,
+                    (instruction.address.offset + static_cast<std::uint64_t>(relative->displacement)) & UINT32_MAX};
+                relative->target = target;
+                instruction.direct_target = target;
+            }
+    };
     if (at.offset & (compressed ? 1u : 3u))
-        return failure(DecodeStatus::invalid, compressed ? "RV64IC instruction address is not two-byte aligned"
+        return failure(DecodeStatus::invalid, compressed ? "RISC-V C instruction address is not two-byte aligned"
                       : xlen == 32 ? "RV32I instruction address is not four-byte aligned"
                                    : "RV64I instruction address is not four-byte aligned");
     if (bytes.size() < 2)
@@ -1386,9 +1420,10 @@ RiscvDecodeResult decode_riscv(std::span<const std::byte> bytes, Address at, uns
         RiscvInstruction instruction; instruction.address = at; instruction.length = 2;
         std::copy_n(bytes.begin(), 2, instruction.bytes.begin());
         std::string unsupported;
-        if (!decode_compressed(first, instruction, unsupported))
+        if (!decode_compressed(first, instruction, unsupported, xlen))
             return failure(unsupported.empty() ? DecodeStatus::invalid : DecodeStatus::unsupported,
-                           unsupported.empty() ? "reserved or unimplemented RV64C encoding" : unsupported.c_str());
+                           unsupported.empty() ? "reserved integer RISC-V C encoding" : unsupported.c_str());
+        normalize_target(instruction);
         return {DecodeStatus::decoded, std::move(instruction), {}};
     }
     if (low5 == 0x1f) {
@@ -1421,6 +1456,7 @@ RiscvDecodeResult decode_riscv(std::span<const std::byte> bytes, Address at, uns
         return failure(DecodeStatus::invalid, xlen == 32 ? "reserved or unimplemented RV32I/M encoding"
                                                         : "reserved or unimplemented RV64I/M encoding");
     }
+    normalize_target(instruction);
     return {DecodeStatus::decoded, std::move(instruction), {}};
 }
 } // namespace
@@ -1433,5 +1469,8 @@ RiscvDecodeResult decode_riscv64c(std::span<const std::byte> bytes, Address at) 
 }
 RiscvDecodeResult decode_riscv32(std::span<const std::byte> bytes, Address at) {
     return decode_riscv(bytes, at, 32, false);
+}
+RiscvDecodeResult decode_riscv32c(std::span<const std::byte> bytes, Address at) {
+    return decode_riscv(bytes, at, 32, true);
 }
 } // namespace hexlab
