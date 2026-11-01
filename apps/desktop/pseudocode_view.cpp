@@ -72,6 +72,17 @@ std::string phi_identity(const decompiler::LiftedBlock::Phi &phi, Address block_
            std::to_string(phi.destination.index);
 }
 
+std::string ssa_identity(RegisterOperand reg, Address origin) {
+    // SSA version numbers depend on the order in which analysis discovers
+    // definitions. Use instruction provenance and the destination register
+    // instead, so a value keeps the same UI identity across rebuilds that do
+    // not move its defining instruction.
+    return "ssa_" + std::to_string(origin.space.value) + "_" +
+           std::to_string(origin.offset) + "_" +
+           std::to_string(static_cast<unsigned>(reg.bank)) + "_" +
+           std::to_string(reg.index);
+}
+
 std::pair<std::uint32_t, std::uint64_t> address_identity(Address address) {
     return {address.space.value, address.offset};
 }
@@ -757,7 +768,11 @@ std::string render_user_variables(const decompiler::LiftedFunction &function, st
     const auto define = [&](RegisterOperand reg, std::optional<std::uint32_t> version, Address at) {
         if (!version) return;
         const auto token = register_token(reg, version);
-        if (!definitions.emplace(token, at).second) ambiguous.insert(token);
+        if (!definitions.emplace(token, at).second) {
+            ambiguous.insert(token);
+            return;
+        }
+        stable_identities.emplace(token, ssa_identity(reg, at));
     };
     for (const auto &block : function.blocks) {
         for (const auto &phi : block.phis) {
@@ -814,10 +829,10 @@ std::string render_user_variables(const decompiler::LiftedFunction &function, st
         // a partial rename/type assignment.
         const bool safely_editable = access_sites.size() <= 4096;
         const auto identity = stable_identities.contains(token) ? stable_identities.at(token) : token;
-        // Phi values have a stable merge identity and use the block-entry
-        // instruction as their defining origin. The later shared-origin and
-        // function-entry checks decide whether address-keyed persistence can
-        // safely represent this value without colliding with another value.
+        // Definition identities use instruction provenance; phi identities use
+        // the block entry. The later shared-origin and function-entry checks
+        // decide whether address-keyed persistence can safely represent the
+        // edit without colliding with another value.
         const auto *annotation = project ? annotation_at(*project, address) : nullptr;
         const auto *assignment = project ? type_assignment(*project, address) : nullptr;
         const auto *definition = assignment ? type_definition(*project, assignment->type_id) : nullptr;
