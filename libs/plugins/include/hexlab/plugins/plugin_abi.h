@@ -9,7 +9,7 @@ extern "C" {
 #endif
 
 #define HEXLAB_PLUGIN_ABI_MAJOR 1u
-#define HEXLAB_PLUGIN_ABI_MINOR 35u
+#define HEXLAB_PLUGIN_ABI_MINOR 36u
 #define HEXLAB_PLUGIN_QUERY_SYMBOL "hexlab_plugin_query"
 #define HEXLAB_EXTENSION_API_VERSION 1u
 #define HEXLAB_PLUGIN_MAX_EXTENSION_INPUT 32u
@@ -264,6 +264,40 @@ typedef int32_t (*HexLabProcessorDecodeIR)(void* extension_context, uint64_t add
                                           const uint8_t* data, uint32_t size,
                                           HexLabInstructionIR* instruction);
 
+#define HEXLAB_PROCESSOR_READSET_MAX_INPUTS 64u
+#define HEXLAB_PROCESSOR_READSET_MAX_IMAGE_RANGES 1024u
+#define HEXLAB_PROCESSOR_READSET_IDENTITY_CAPACITY 256u
+typedef struct HexLabSemanticImageRead {
+    uint64_t offset;
+    uint64_t size;
+} HexLabSemanticImageRead;
+typedef struct HexLabProcessorSemanticInput {
+    uint32_t struct_size;
+    uint32_t identity_size;
+    char identity[HEXLAB_PROCESSOR_READSET_IDENTITY_CAPACITY];
+    uint8_t sha256[32];
+    uint32_t image_range_first;
+    uint32_t image_range_count;
+} HexLabProcessorSemanticInput;
+typedef struct HexLabProcessorSemanticReadSet {
+    uint32_t struct_size;
+    uint32_t input_capacity;
+    uint32_t input_count;
+    uint32_t image_range_capacity;
+    uint32_t image_range_count;
+    HexLabProcessorSemanticInput* inputs;
+    HexLabSemanticImageRead* image_ranges;
+} HexLabProcessorSemanticReadSet;
+/* ABI 1.36 optional callback. The host supplies fixed arrays and capacities,
+   and preinitializes each input's struct_size. Fill entries and counts without
+   changing capacities or pointers. Range slices must be contiguous and cover
+   the complete range array. Return 1 with a complete read set, including zero
+   inputs when the decoder has no external dependencies; return 0 or a negative
+   value when it cannot certify all dependencies. Buffers are host-owned and
+   valid only for the duration of this call. */
+typedef int32_t (*HexLabProcessorSemanticReadSetFn)(void* extension_context,
+                                                    HexLabProcessorSemanticReadSet* read_set);
+
 typedef struct HexLabProcessorExtension {
     uint32_t struct_size;
     uint32_t api_version;
@@ -288,6 +322,8 @@ typedef struct HexLabProcessorExtension {
     /* Optional ABI 1.22 tail. Preferred pure scalar-IR decode. Same 1/0/negative
        claim/decline/failure convention; older descriptor prefixes are intact. */
     HexLabProcessorDecodeIR decode_ir;
+    /* Optional ABI 1.36 tail. Check struct_size before accessing. */
+    HexLabProcessorSemanticReadSetFn semantic_read_set;
 } HexLabProcessorExtension;
 typedef int32_t (*HexLabRegisterLoaderExtension)(void* host_context,
                                                 const HexLabLoaderExtension* extension);

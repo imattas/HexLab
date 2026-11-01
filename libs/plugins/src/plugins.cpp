@@ -26,6 +26,7 @@
 #include <memory>
 #include <atomic>
 #include <cstdlib>
+#include <stdexcept>
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -46,7 +47,7 @@ constexpr std::size_t max_extensions = 128;
 constexpr std::size_t max_manifest_bytes = 64 * 1024;
 constexpr std::uint64_t max_plugin_hash_bytes = 1024ull * 1024ull * 1024ull;
 constexpr std::size_t max_manifest_capabilities = 256;
-constexpr std::array<HexLabCapability, 24> host_capabilities{{
+constexpr std::array<HexLabCapability, 25> host_capabilities{{
     {sizeof(HexLabCapability), 1, HEXLAB_PLUGIN_ABI_MINOR, 0, "hexlab.host"},
     {sizeof(HexLabCapability), 1, 0, 0, "project.api"},
     {sizeof(HexLabCapability), 1, 2, 0, "project.queries"},
@@ -69,6 +70,7 @@ constexpr std::array<HexLabCapability, 24> host_capabilities{{
     {sizeof(HexLabCapability), 1, 30, 0, "project.instruction-text"},
     {sizeof(HexLabCapability), 1, 31, 0, "debugger.event-text"},
     {sizeof(HexLabCapability), 1, 32, 0, "project.string-preview"},
+    {sizeof(HexLabCapability), 1, 36, 0, "processor.semantic.read-set"},
     {sizeof(HexLabCapability), 1, 0, 0, "plugin.state"},
     {sizeof(HexLabCapability), 1, 0, 0, "project.references.range"},
 }};
@@ -267,6 +269,7 @@ struct HostContext {
         HexLabProcessorSemanticDecodeV2 decode_semantic_v2 = nullptr;
         HexLabProcessorSemanticDecodeV3 decode_semantic_v3 = nullptr;
         HexLabProcessorDecodeIR decode_ir = nullptr;
+        HexLabProcessorSemanticReadSetFn semantic_read_set = nullptr;
         bool disabled = false;
         std::string failure_reason;
     };
@@ -744,6 +747,11 @@ struct ScalarIRCallbackScope {
     explicit ScalarIRCallbackScope(std::uint32_t &value):depth(value){++depth;}
     ~ScalarIRCallbackScope(){--depth;}
 };
+struct SemanticReadSetCallbackScope {
+    std::uint32_t& depth;
+    explicit SemanticReadSetCallbackScope(std::uint32_t& value) : depth(value) { ++depth; }
+    ~SemanticReadSetCallbackScope() { --depth; }
+};
 void initialize_scalar_ir(HexLabInstructionIR &record){
     record={};record.struct_size=sizeof(record);record.api_version=HEXLAB_SCALAR_IR_API_VERSION;
     record.semantic.struct_size=sizeof(record.semantic);record.semantic.api_version=3;
@@ -862,6 +870,10 @@ int32_t host_register_processor(void* raw_context, const HexLabProcessorExtensio
         constexpr auto ir_end = ir_offset + sizeof(extension->decode_ir);
         if (extension->struct_size > ir_offset && extension->struct_size < ir_end) return -1;
         if (extension->struct_size >= ir_end) processor.decode_ir = extension->decode_ir;
+        constexpr auto read_set_offset = offsetof(HexLabProcessorExtension, semantic_read_set);
+        constexpr auto read_set_end = read_set_offset + sizeof(extension->semantic_read_set);
+        if (extension->struct_size > read_set_offset && extension->struct_size < read_set_end) return -1;
+        if (extension->struct_size >= read_set_end) processor.semantic_read_set = extension->semantic_read_set;
         auto& host = *static_cast<HostContext*>(raw_context);
         std::lock_guard lock(host.mutex);
         if (!host.accepting_extensions || host.processors.size() >= max_extensions ||
@@ -1117,6 +1129,7 @@ struct PluginManager::Impl {
     // cross-thread callbacks and unload still serialize on this lock.
     mutable std::recursive_mutex mutex;
     std::uint64_t semantic_generation = 1;
+    std::uint32_t semantic_read_set_callback_depth = 0;
     // Cross-thread calls serialize on mutex. The counter also rejects same-
     // thread lifecycle mutation/recursive decode during a scalar IR callback.
     std::uint32_t scalar_ir_callback_depth = 0;
@@ -2673,6 +2686,7 @@ Result<PluginInfo> PluginManager::load_candidate(const PluginCandidate& candidat
 Result<PluginInfo> PluginManager::load_locked(
     const std::string& path, const PluginCandidate::Manifest* expected) {
     if(impl_->scalar_ir_callback_depth)return Error{ErrorCode::busy,"Cannot load plugins during a scalar IR callback"};
+    if(impl_->semantic_read_set_callback_depth)return Error{ErrorCode::busy,"Cannot load plugins during a semantic read-set callback"};
     std::filesystem::path expected_path;
     try { expected_path = std::filesystem::u8path(path); }
     catch (const std::filesystem::filesystem_error& error) {
@@ -3302,6 +3316,7 @@ Status PluginManager::unload(const std::string& plugin_id) {
 
 Status PluginManager::unload_locked(const std::string& plugin_id) {
     if(impl_->scalar_ir_callback_depth)return Error{ErrorCode::busy,"Cannot unload plugins during a scalar IR callback"};
+    if(impl_->semantic_read_set_callback_depth)return Error{ErrorCode::busy,"Cannot unload plugins during a semantic read-set callback"};
     const auto it = std::find_if(impl_->loaded.begin(), impl_->loaded.end(),
         [&](const auto& item) { return item.info.id == plugin_id; });
     if (it == impl_->loaded.end()) return Error{ErrorCode::out_of_bounds, "plugin is not loaded"};
@@ -3416,6 +3431,7 @@ Status PluginManager::unload_all() {
     if (!impl_) return invalid("plugin manager is unavailable");
     std::lock_guard lock(impl_->mutex);
     if(impl_->scalar_ir_callback_depth)return Error{ErrorCode::busy,"Cannot unload plugins during a scalar IR callback"};
+    if(impl_->semantic_read_set_callback_depth)return Error{ErrorCode::busy,"Cannot unload plugins during a semantic read-set callback"};
     if (impl_->loaded.empty()) return std::monostate{};
     while (!impl_->loaded.empty()) impl_->loaded.pop_back();
     ++impl_->semantic_generation;
@@ -4096,6 +4112,97 @@ AnalysisOptions PluginManager::analysis_options(AnalysisOptions options) const {
     options.semantic_decoder_identity = [state] {
         auto identity = std::atomic_load(&state->semantic_identity);
         return identity ? *identity : std::vector<std::byte>{};
+    };
+    auto inherited_read_set = std::move(options.semantic_decoder_read_set);
+    options.semantic_decoder_read_set = [state, inherited_read_set = std::move(inherited_read_set)] {
+        std::lock_guard manager_lock(state->mutex);
+        if (state->semantic_read_set_callback_depth)
+            throw std::runtime_error("Recursive semantic read-set capture is unsupported");
+        SemanticReadSetCallbackScope callback_scope(state->semantic_read_set_callback_depth);
+        auto inputs = inherited_read_set ? inherited_read_set()
+                                         : std::vector<AnalysisOptions::SemanticDecoderInput>{};
+        std::unordered_set<std::string> identities;
+        std::size_t total_ranges = 0;
+        for (const auto& input : inputs) {
+            if (!identities.insert(input.identity).second)
+                throw std::runtime_error("duplicate inherited semantic decoder input identity");
+            if (input.image_reads.size() > 65536 - total_ranges)
+                throw std::runtime_error("inherited semantic decoder read set exceeds the range limit");
+            total_ranges += input.image_reads.size();
+        }
+
+        for (const auto& plugin : state->loaded) {
+            for (const auto& extension : plugin.context->processors) {
+                if (extension.disabled || !(extension.decode_semantic || extension.decode_semantic_v2 ||
+                                            extension.decode_semantic_v3 || extension.decode_ir))
+                    continue;
+                if (!extension.semantic_read_set)
+                    throw std::runtime_error("semantic processor extension has no certified read set");
+
+                std::array<HexLabProcessorSemanticInput, HEXLAB_PROCESSOR_READSET_MAX_INPUTS> declared_inputs{};
+                std::array<HexLabSemanticImageRead, HEXLAB_PROCESSOR_READSET_MAX_IMAGE_RANGES> declared_ranges{};
+                for (auto& input : declared_inputs) input.struct_size = sizeof(input);
+                HexLabProcessorSemanticReadSet read_set{};
+                read_set.struct_size = sizeof(read_set);
+                read_set.input_capacity = static_cast<std::uint32_t>(declared_inputs.size());
+                read_set.image_range_capacity = static_cast<std::uint32_t>(declared_ranges.size());
+                read_set.inputs = declared_inputs.data();
+                read_set.image_ranges = declared_ranges.data();
+                const auto* const input_buffer = read_set.inputs;
+                const auto* const range_buffer = read_set.image_ranges;
+                int32_t status = -1;
+                try { status = extension.semantic_read_set(extension.extension_context, &read_set); }
+                catch (...) { status = -1; }
+                if (status != 1 || read_set.struct_size != sizeof(read_set) ||
+                    read_set.input_capacity != declared_inputs.size() ||
+                    read_set.image_range_capacity != declared_ranges.size() ||
+                    read_set.inputs != input_buffer || read_set.image_ranges != range_buffer ||
+                    read_set.input_count > declared_inputs.size() ||
+                    read_set.image_range_count > declared_ranges.size())
+                    throw std::runtime_error("semantic processor extension returned an invalid read set");
+
+                std::size_t next_range = 0;
+                for (std::size_t index = 0; index < read_set.input_count; ++index) {
+                    const auto& declared = declared_inputs[index];
+                    if (declared.struct_size != sizeof(declared) || declared.identity_size == 0 ||
+                        declared.identity_size > sizeof(declared.identity) ||
+                        std::memchr(declared.identity, '\0', declared.identity_size) != nullptr ||
+                        declared.image_range_first != next_range ||
+                        declared.image_range_count > read_set.image_range_count - next_range)
+                        throw std::runtime_error("semantic processor extension returned malformed input metadata");
+
+                    AnalysisOptions::SemanticDecoderInput input;
+                    const std::string_view local_identity(declared.identity, declared.identity_size);
+                    input.identity = "plugin:" + std::to_string(plugin.info.id.size()) + ":" + plugin.info.id +
+                                     ";extension:" + std::to_string(extension.id.size()) + ":" + extension.id +
+                                     ";input:" + std::string(local_identity);
+                    if (input.identity.size() > 4096 || !identities.insert(input.identity).second)
+                        throw std::runtime_error("semantic processor extension returned a duplicate or oversized identity");
+                    bool has_digest = false;
+                    for (std::size_t byte = 0; byte < input.sha256.size(); ++byte) {
+                        input.sha256[byte] = static_cast<std::byte>(declared.sha256[byte]);
+                        has_digest |= declared.sha256[byte] != 0;
+                    }
+                    if (!has_digest) throw std::runtime_error("semantic processor extension returned an empty digest");
+
+                    input.image_reads.reserve(declared.image_range_count);
+                    const auto range_end = next_range + declared.image_range_count;
+                    for (; next_range < range_end; ++next_range) {
+                        const auto& range = declared_ranges[next_range];
+                        if (range.size == 0 || range.size > std::numeric_limits<std::uint64_t>::max() - range.offset)
+                            throw std::runtime_error("semantic processor extension returned an invalid image range");
+                        input.image_reads.push_back({range.offset, range.size});
+                    }
+                    if (input.image_reads.size() > 65536 - total_ranges || inputs.size() >= 4096)
+                        throw std::runtime_error("aggregate semantic decoder read set exceeds its limit");
+                    total_ranges += input.image_reads.size();
+                    inputs.push_back(std::move(input));
+                }
+                if (next_range != read_set.image_range_count)
+                    throw std::runtime_error("semantic processor extension returned unclaimed image ranges");
+            }
+        }
+        return inputs;
     };
     return options;
 }

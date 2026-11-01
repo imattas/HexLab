@@ -800,15 +800,16 @@ module; a valid but unavailable requirement makes `PluginManager::load` return
 loader initializers and `hexlab_plugin_query` have already executed by then,
 so this is compatibility negotiation, not a sandbox or trust check.
 
-The host currently declares `hexlab.host` v1.35; `project.api` v1.0,
+The host currently declares `hexlab.host` v1.36; `project.api` v1.0,
 `project.queries` v1.2, `project.edits` v1.6, `project.read` v1.11, and
 `project.types` v1.14; `debugger.api` v1.8 and `debugger.rules` v1.19;
 `loader.image` v1.10; `processor.semantic.v2` v1.7 and
-`processor.semantic.v3` v1.16; `analysis.provider` v1.9; `document.active`
+`processor.semantic.v3` v1.16 and `processor.semantic.read-set` v1.36;
+`analysis.provider` v1.9; `document.active`
 v1.15; `debugger.active` v1.17; `project.breakpoint.active` v1.18; and
 `project.cfg` v1.21, `project.history` v1.28, and
 `project.function-owners` v1.29, `project.instruction-text` v1.30,
-`debugger.event-text` v1.31, `project.string-preview` v1.32, and
+`debugger.event-text` v1.31, `project.string-preview` v1.32,
 `plugin.state` v1.33, and `project.references.range` v1.0. These
 versions describe table contracts; they do not promise that an active project,
 document, or debug target exists at the moment a callback runs. Existing ABI
@@ -965,3 +966,33 @@ one coherent effect.
 Older processor descriptors and core lift overloads remain supported. See
 [plugin scalar instruction IR](plugin-scalar-ir.md) for the precise record,
 register, lifecycle and resource limits and the C-only custom-opcode example.
+
+## Semantic decoder read sets (ABI 1.36)
+
+ABI 1.36 appends the optional `semantic_read_set` callback to
+`HexLabProcessorExtension`. It lets a semantic decoder certify external inputs
+that can change its results. The callback receives host-owned arrays sized for
+at most 64 inputs and 1,024 image ranges per extension. Set `input_count`,
+`image_range_count`, and each input's `struct_size`, identity bytes and length,
+SHA-256 digest, and contiguous range slice. An identity is 1-256 non-NUL bytes;
+the digest must be nonzero and must change whenever the input content or
+meaning changes. Every image range must have a nonzero size and a non-overflowing
+offset-plus-size. Unused ranges and overlapping or skipped slices are rejected.
+
+Return `1` only when the complete read set is known. A successful zero-input
+manifest explicitly certifies that the decoder has no external dependencies.
+Return `0` or a negative value when the callback cannot certify the complete
+set. The host copies declarations immediately after the callback returns;
+plugins must not retain or replace the supplied buffers. The host prefixes
+identities with length-delimited plugin and extension IDs, preventing
+collisions between extensions. Any missing callback, failure, malformed field, duplicate identity,
+or limit violation disables certified incremental reuse for that analysis.
+
+The callback runs synchronously while the plugin manager is locked, so keep it
+bounded and do not call back into plugin lifecycle operations; load and unload
+requests made during the callback return `busy`. Recursive read-set capture is
+rejected. Its result must remain stable for one analysis snapshot. A descriptor
+compiled against ABI 1.35 or earlier remains loadable because the field is append-only, but a
+semantic decoder without this callback cannot certify reuse. Caller-provided
+`AnalysisOptions::semantic_decoder_read_set` entries are retained and combined
+with plugin declarations.

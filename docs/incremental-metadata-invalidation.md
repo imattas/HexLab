@@ -282,4 +282,13 @@ forces a full rebuild.
 
 `AnalysisOptions::semantic_decoder_read_set` declares the complete external inputs consulted by a semantic decoder. Each entry has a caller-selected, nonempty stable identity and a SHA-256 digest of the input content. An empty manifest explicitly declares that the decoder has no external inputs. The manifest is sorted by identity and included in the function-engine fingerprint, so changing an identity or digest invalidates the analysis key and forces full derived reanalysis. The callback code/configuration identity remains a separate `semantic_decoder_identity` responsibility; both identities are required for certified reuse.
 
+Native processor plugins can provide this manifest with the append-only ABI
+1.36 `HexLabProcessorExtension::semantic_read_set` callback. The host gathers
+the declaration for every active semantic extension and composes it with any
+caller-provided read set. Each extension is limited to 64 inputs and 1,024
+primary-image ranges. Plugin and extension IDs qualify each input identity.
+Older descriptors without the field still load, but any active semantic
+extension lacking a complete, valid declaration makes the manifest unknown;
+analysis then uses the existing conservative path without certified reuse.
+
 The host accepts at most 4,096 entries, 1 MiB of identity bytes in total, and 4,096 bytes per identity. Duplicate, empty, NUL-containing, all-zero-digest, throwing, missing, or oversized declarations are treated as incomplete. (An empty external input still has its ordinary SHA-256 digest; all-zero is reserved as an omitted-digest sentinel.) Incomplete declarations disable derived-cache reads and writes and prevent incremental fact reuse; analysis runs from current inputs. For each engine fingerprint, HexLab captures the decoder identity and manifest once, sorts and validates that snapshot, and hashes that same snapshot; it does not call the providers again while constructing that fingerprint. Keyed full function recovery and full derived analysis recheck the engine fingerprint after decoding and fail with a conflict if the decoder identity or manifest changed during the operation. Incremental reanalysis already performs the same end check. The callback contract must keep the read set stable for the full analysis operation and update each digest when input content changes. Any changed manifest digest invalidates the whole derived analysis because the current API does not associate individual external inputs with particular decoded instructions. HexLab cannot discover files or state hidden inside arbitrary decoder callbacks or verify that a caller's digest describes the bytes actually read.
