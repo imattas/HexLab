@@ -85,7 +85,8 @@ Result<std::shared_ptr<ProjectSession>> ProjectSession::attach_impl(std::shared_
     // both diagnostic sources in one database transaction so cancellation or
     // a failed load cannot erase the last completed set.
     if(prepared->loaded && session->store_->mode()!=database::ProjectMode::read_only){
-        take(session->store_->replace_loader_diagnostics(prepared->loaded->diagnostics,
+        const auto loader_key=take(project_analysis_key(*prepared,options));
+        take(session->store_->replace_loader_diagnostics(loader_key,prepared->loaded->diagnostics,
             prepared->loaded->runtime_relocation_diagnostics,stop));
         if(prepared->loaded->metadata.minidump){
             const auto key=take(project_analysis_key(*prepared,options));
@@ -135,16 +136,20 @@ Result<std::shared_ptr<const ProjectSnapshot>> ProjectSession::persist_breakpoin
     });
 }
 Result<std::shared_ptr<const ProjectSnapshot>> ProjectSession::replace_type_import_diagnostics(
-    std::span<const database::TypeImportDiagnostic> diagnostics,std::stop_token stop){
+    const AnalysisKey& key,std::span<const database::TypeImportDiagnostic> diagnostics,std::stop_token stop){
     return project_detail::guarded([&]()->Result<std::shared_ptr<const ProjectSnapshot>>{
         using namespace project_detail;std::lock_guard lock(mutex_);canceled(stop);
-        take(store_->replace_type_import_diagnostics(diagnostics,stop));
+        require(take(project_analysis_key(*snapshot_,options_))==key,"Type import report belongs to an earlier project source",ErrorCode::conflict);
+        std::vector<database::TypeImportDiagnostic> sourced(diagnostics.begin(),diagnostics.end());
+        for(auto& item:sourced){if(item.source_key&&*item.source_key!=key)return Error{ErrorCode::conflict,"Type import row belongs to another project source"};item.source_key=key;}
+        take(store_->replace_type_import_diagnostics(sourced,stop));
         auto next=std::make_shared<ProjectSnapshot>(*snapshot_);next->state=take(store_->snapshot());snapshot_=std::move(next);return snapshot_;
     });
 }
 Result<std::shared_ptr<const ProjectSnapshot>> ProjectSession::upsert_decompiler_diagnostics(const AnalysisKey& key,Address function_entry,
     std::span<const database::TypeImportDiagnostic> diagnostics,std::stop_token stop){
     return project_detail::guarded([&]()->Result<std::shared_ptr<const ProjectSnapshot>>{using namespace project_detail;std::lock_guard lock(mutex_);canceled(stop);
+        require(take(project_analysis_key(*snapshot_,options_))==key,"Decompiler report belongs to an earlier project source",ErrorCode::conflict);
         take(store_->upsert_decompiler_diagnostics(key,function_entry,diagnostics,stop));auto next=std::make_shared<ProjectSnapshot>(*snapshot_);next->state=take(store_->snapshot());snapshot_=std::move(next);return snapshot_;});
 }
 Result<std::shared_ptr<const ProjectSnapshot>> ProjectSession::replace_reviewed_analysis_issue_keys(std::span<const std::string> keys,std::stop_token stop){
@@ -157,7 +162,7 @@ Result<std::shared_ptr<const ProjectSnapshot>> ProjectSession::refresh_analysis(
     auto analysis=take(compute_project_analysis(request,stop));if(analysis.encoded_cache){auto written=store_->write_derived_cache(key,*analysis.encoded_cache,stop);if(written){analysis.cache_status=database::CacheStatus::hit;analysis.cache_reason.clear();}else analysis.cache_reason="Optional derived cache write skipped: "+written.error().message;}
     snapshot_=adopt_project_analysis(*snapshot_,analysis,options_,stop);return snapshot_;
 });}
-Result<std::shared_ptr<const ProjectSnapshot>> ProjectSession::adopt_analysis(const ProjectAnalysis& analysis,std::stop_token stop){return project_detail::guarded([&]()->Result<std::shared_ptr<const ProjectSnapshot>>{std::lock_guard lock(mutex_);snapshot_=project_detail::adopt_project_analysis(*snapshot_,analysis,options_,stop);return snapshot_;});}
+Result<std::shared_ptr<const ProjectSnapshot>> ProjectSession::adopt_analysis(const ProjectAnalysis& analysis,std::stop_token stop){return project_detail::guarded([&]()->Result<std::shared_ptr<const ProjectSnapshot>>{using namespace project_detail;std::lock_guard lock(mutex_);require(take(project_analysis_key(*snapshot_,options_))==analysis.source_key,"Analysis diagnostics belong to an earlier project source",ErrorCode::conflict);auto adopted=adopt_project_analysis(*snapshot_,analysis,options_,stop);if(store_->mode()!=database::ProjectMode::read_only){take(store_->replace_project_analysis_diagnostics(analysis.source_key,analysis.derived.strings->diagnostics,stop));auto next=std::make_shared<ProjectSnapshot>(*adopted);next->state=take(store_->snapshot());adopted=std::move(next);}snapshot_=std::move(adopted);return snapshot_;});}
 Result<std::shared_ptr<const ProjectSnapshot>> ProjectSession::record_cache_result(const AnalysisKey& key,const Result<bool>& result){return project_detail::guarded([&]()->Result<std::shared_ptr<const ProjectSnapshot>>{
     using namespace project_detail;std::lock_guard lock(mutex_);require(take(project_analysis_key(*snapshot_,options_))==key,"Cache completion belongs to an earlier project source",ErrorCode::conflict);auto next=std::make_shared<ProjectSnapshot>(*snapshot_);if(result && result.value()){next->derived_cache_status=database::CacheStatus::hit;next->derived_cache_reason.clear();}else{next->derived_cache_status=database::CacheStatus::stale;next->derived_cache_reason=result?"Optional derived cache was not written":"Optional derived cache write skipped: "+result.error().message;}snapshot_=std::move(next);return snapshot_;
 });}

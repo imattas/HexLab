@@ -657,12 +657,14 @@ void AnalysisIssuesView::rebuild() {
           (file_inspection_strings ? std::min(max_loader_rows, file_inspection_strings->size()) : 0);
     const auto active_type = document_ && type_diagnostics_.contains(document_->value) ? &type_diagnostics_.at(document_->value) : nullptr;
     const auto active_decompiler = document_ && decompiler_diagnostics_.contains(document_->value) ? &decompiler_diagnostics_.at(document_->value) : nullptr;
-    const auto durable_type_count = !active_type && durable_type_import ? std::count_if(durable_type_import->begin(), durable_type_import->end(), [](const auto &item){return item.source!="Decompiler" && item.source!="Minidump register context";}) : 0;
+    const auto durable_type_count = !active_type && durable_type_import ? std::count_if(durable_type_import->begin(), durable_type_import->end(), [](const auto &item){return item.source!="Decompiler" && item.source!="Minidump register context" && item.source!="Project analysis";}) : 0;
+    const auto durable_analysis_count = !project_string_diagnostics && durable_type_import ? std::count_if(durable_type_import->begin(), durable_type_import->end(), [](const auto& item){return item.source=="Project analysis";}) : 0;
     const auto durable_context_count = durable_type_import ? std::count_if(durable_type_import->begin(),durable_type_import->end(),[](const auto& item){return item.source=="Minidump register context";}) : 0;
     const auto current_decompiler_function = active_decompiler && !active_decompiler->empty() ? active_decompiler->front().function_entry : std::optional<Address>{};
     const auto is_superseded_decompiler = [&](const auto &item) { return active_decompiler && item.source=="Decompiler" && current_decompiler_function && item.function_entry==current_decompiler_function && item.source_key && project_ && project_->derived_key && *item.source_key==*project_->derived_key; };
     const auto durable_decompiler_count = durable_type_import ? std::count_if(durable_type_import->begin(), durable_type_import->end(), [&](const auto &item){return item.source=="Decompiler"&&!is_superseded_decompiler(item);}) : 0;
     const auto producer_count = std::min(max_loader_rows, active_type ? active_type->size() : durable_type_count) +
+                                std::min(max_loader_rows, durable_analysis_count) +
                                 std::min(max_loader_rows, active_decompiler ? active_decompiler->size() : durable_decompiler_count);
     const auto diagnostic_total = diagnostic_count + producer_count + std::min(max_loader_rows,static_cast<std::size_t>(durable_context_count));
     const bool diagnostic_source_truncated = project_
@@ -729,7 +731,8 @@ void AnalysisIssuesView::rebuild() {
     }
 
     std::size_t diagnostic_rows = 0;
-    auto add_diagnostics = [&](const std::vector<Diagnostic> &diagnostics, std::string_view source, Kind kind) {
+    auto add_diagnostics = [&](const std::vector<Diagnostic> &diagnostics, std::string_view source, Kind kind,
+                               const std::optional<AnalysisKey>& source_key) {
         std::size_t emitted=0;
         for (const auto &diagnostic : diagnostics) {
             if (emitted >= max_loader_rows || diagnostic_rows >= diagnostic_budget) break;
@@ -738,13 +741,19 @@ void AnalysisIssuesView::rebuild() {
             if (rows_.size() >= max_rows) break;
             Row row{kind, diagnostic.location, {}, {}, std::move(detail)};
             row.severity = diagnostic.severity;
+            const auto key=source_key?source_key:current_loader_key;
+            row.stale_import=!key || !current_loader_key || *key!=*current_loader_key;
+            if(key){row.source_identity=import_identity(*key);row.source_label=import_identity_label(*key);}
+            else row.source_label="Source key unavailable; this report is kept ungrouped.";
             rows_.push_back(std::move(row));
             ++diagnostic_rows;++emitted;
         }
     };
     if (project_) {
-        if (loader_items) add_diagnostics(*loader_items, "Loader", Kind::loader_diagnostic);
-        if (runtime_items) add_diagnostics(*runtime_items, "Runtime relocation", Kind::runtime_relocation_diagnostic);
+        if (loader_items) add_diagnostics(*loader_items, "Loader", Kind::loader_diagnostic,
+            loaded?current_loader_key:(project_->state?project_->state->loader_diagnostics_source_key:std::optional<AnalysisKey>{}));
+        if (runtime_items) add_diagnostics(*runtime_items, "Runtime relocation", Kind::runtime_relocation_diagnostic,
+            loaded?current_loader_key:(project_->state?project_->state->runtime_relocation_diagnostics_source_key:std::optional<AnalysisKey>{}));
         if (project_string_diagnostics) {
             const bool current = project_->derived_key && current_loader_key &&
                                  *project_->derived_key == *current_loader_key;
@@ -771,11 +780,11 @@ void AnalysisIssuesView::rebuild() {
         if (!active_type && durable_type_import) {
             std::size_t emitted=0;
             for (const auto &item : *durable_type_import) {
-                if (item.source=="Decompiler" || item.source=="Minidump register context" || emitted>=max_loader_rows || diagnostic_rows>=diagnostic_budget) continue;
+                if (item.source=="Decompiler" || item.source=="Minidump register context" || item.source=="Project analysis" || emitted>=max_loader_rows || diagnostic_rows>=diagnostic_budget) continue;
                 wxString detail = text(item.source) + " " + severity_text(item.severity) + ": " + preview_text(item.message, 4096);
                 Row row{Kind::type_import_diagnostic, item.location, {}, item.function_entry, std::move(detail)};
                 row.severity = item.severity;
-                row.stale_import = !item.source_key || !project_->derived_key || *item.source_key != *project_->derived_key;
+                row.stale_import = !item.source_key || !current_loader_key || *item.source_key != *current_loader_key;
                 if (item.source_key) {
                     row.source_identity = import_identity(*item.source_key);
                     row.source_label = import_identity_label(*item.source_key);
@@ -784,6 +793,18 @@ void AnalysisIssuesView::rebuild() {
                 }
                 rows_.push_back(std::move(row));
                 ++diagnostic_rows;++emitted;
+            }
+        }
+        if (!project_string_diagnostics && durable_type_import) {
+            std::size_t emitted=0;
+            for(const auto& item:*durable_type_import){
+                if(item.source!="Project analysis" || emitted>=max_loader_rows || diagnostic_rows>=diagnostic_budget)continue;
+                wxString detail="Project analysis "+severity_text(item.severity)+": "+preview_text(item.message,4096);
+                Row row{Kind::file_analysis_diagnostic,item.location,{}, {},std::move(detail)};row.severity=item.severity;
+                row.stale_import=!item.source_key||!current_loader_key||*item.source_key!=*current_loader_key;
+                if(item.source_key){row.source_identity=import_identity(*item.source_key);row.source_label=import_identity_label(*item.source_key);}
+                else row.source_label="Source key unavailable; this report is kept ungrouped.";
+                rows_.push_back(std::move(row));++diagnostic_rows;++emitted;
             }
         }
         if (durable_type_import) {
@@ -804,19 +825,19 @@ void AnalysisIssuesView::rebuild() {
                 wxString detail=text(item.source)+" "+severity_text(item.severity)+": "+preview_text(item.message,4096);
                 Row row{Kind::decompiler_diagnostic,item.location,{},item.function_entry,std::move(detail)};
                 row.severity=item.severity;
-                row.stale_import=!item.source_key||!project_->derived_key||*item.source_key!=*project_->derived_key;
+                row.stale_import=!item.source_key||!current_loader_key||*item.source_key!=*current_loader_key;
                 if(item.source_key){row.source_identity=import_identity(*item.source_key);row.source_label=import_identity_label(*item.source_key);}
                 else row.source_label="Source key unavailable; this report is kept ungrouped.";
                 rows_.push_back(std::move(row));++diagnostic_rows;++emitted;
             }
         }
     } else if (file_diagnostics) {
-        add_diagnostics(*file_diagnostics, "File inspection", Kind::file_inspection_diagnostic);
+        add_diagnostics(*file_diagnostics, "File inspection", Kind::file_inspection_diagnostic, {});
     }
     if (!project_) {
-        if (file_analysis) add_diagnostics(*file_analysis, "Code analysis", Kind::file_analysis_diagnostic);
-        if (file_analysis_strings) add_diagnostics(*file_analysis_strings, "Analysis string scan", Kind::file_analysis_diagnostic);
-        if (file_inspection_strings) add_diagnostics(*file_inspection_strings, "Inspection string scan", Kind::file_analysis_diagnostic);
+        if (file_analysis) add_diagnostics(*file_analysis, "Code analysis", Kind::file_analysis_diagnostic, {});
+        if (file_analysis_strings) add_diagnostics(*file_analysis_strings, "Analysis string scan", Kind::file_analysis_diagnostic, {});
+        if (file_inspection_strings) add_diagnostics(*file_inspection_strings, "Inspection string scan", Kind::file_analysis_diagnostic, {});
     }
     const auto add_producer = [&](const std::vector<AnalysisIssueDiagnostic> *items, Kind kind) {
         if (!items) return;
@@ -826,7 +847,7 @@ void AnalysisIssuesView::rebuild() {
             Row row{kind, item.address, {}, item.function_entry, std::move(detail)};
             row.severity = item.severity;
             if (kind == Kind::type_import_diagnostic || kind == Kind::decompiler_diagnostic) {
-                row.stale_import = !item.source_key || !project_ || !project_->derived_key || *item.source_key != *project_->derived_key;
+                row.stale_import = !item.source_key || !current_loader_key || *item.source_key != *current_loader_key;
                 if (item.source_key) {
                     row.source_identity = import_identity(*item.source_key);
                     row.source_label = import_identity_label(*item.source_key);

@@ -3253,7 +3253,8 @@ struct MainFrame::Impl {
                 persisted.reserve(diagnostics.size());
                 for (const auto &item : diagnostics)
                     persisted.push_back({item.source, item.severity, item.message, item.address, item.function_entry, item.source_key});
-                auto submitted = actor->replace_type_import_diagnostics(std::move(persisted));
+                if (!project->derived_key) return;
+                auto submitted = actor->replace_type_import_diagnostics(*project->derived_key, std::move(persisted));
                 if (!submitted) {
                     controller->documents().report_error(*id, submitted.error());
                 }

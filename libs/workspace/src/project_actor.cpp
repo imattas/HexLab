@@ -217,7 +217,8 @@ struct ProjectActor::Impl {
                 publish(result.snapshot);break;
             }
             case ProjectOperationKind::persist_type_import_diagnostics:{
-                result.snapshot=take(context.session->replace_type_import_diagnostics(work->type_import_diagnostics,work->stop.get_token()));
+                require(work->source_key.has_value(),"Type import report has no source identity",ErrorCode::integrity);
+                result.snapshot=take(context.session->replace_type_import_diagnostics(*work->source_key,work->type_import_diagnostics,work->stop.get_token()));
                 publish(result.snapshot);break;
             }
             case ProjectOperationKind::persist_decompiler_diagnostics:{
@@ -293,7 +294,7 @@ Result<ProjectSubmission> ProjectActor::ready(bool force){auto work=std::make_sh
 Result<ProjectSubmission> ProjectActor::persist_function_recognition(FunctionRecognitionEvidence evidence){auto work=std::make_shared<Impl::Work>();work->kind=ProjectOperationKind::persist_recognition;work->recognition=std::move(evidence);return impl_->enqueue(std::move(work));}
 Result<ProjectSubmission> ProjectActor::read_function_recognition(FunctionRecognitionKind kind){auto work=std::make_shared<Impl::Work>();work->kind=ProjectOperationKind::read_recognition;work->recognition_kind=kind;return impl_->enqueue(std::move(work));}
 Result<ProjectSubmission> ProjectActor::persist_breakpoint_hit_counts(std::vector<database::BreakpointHitCount> counters){auto work=std::make_shared<Impl::Work>();work->kind=ProjectOperationKind::persist_breakpoint_hits;work->breakpoint_hits=std::move(counters);return impl_->enqueue(std::move(work));}
-Result<ProjectSubmission> ProjectActor::replace_type_import_diagnostics(std::vector<database::TypeImportDiagnostic> diagnostics){auto work=std::make_shared<Impl::Work>();work->kind=ProjectOperationKind::persist_type_import_diagnostics;work->type_import_diagnostics=std::move(diagnostics);return impl_->enqueue(std::move(work));}
+Result<ProjectSubmission> ProjectActor::replace_type_import_diagnostics(AnalysisKey key,std::vector<database::TypeImportDiagnostic> diagnostics){auto work=std::make_shared<Impl::Work>();work->kind=ProjectOperationKind::persist_type_import_diagnostics;work->source_key=std::move(key);work->type_import_diagnostics=std::move(diagnostics);return impl_->enqueue(std::move(work));}
 Result<ProjectSubmission> ProjectActor::upsert_decompiler_diagnostics(AnalysisKey key,Address function_entry,std::vector<database::TypeImportDiagnostic> diagnostics){auto work=std::make_shared<Impl::Work>();work->kind=ProjectOperationKind::persist_decompiler_diagnostics;work->source_key=std::move(key);work->function_entry=function_entry;work->type_import_diagnostics=std::move(diagnostics);return impl_->enqueue(std::move(work));}
 Result<ProjectSubmission> ProjectActor::replace_reviewed_analysis_issue_keys(std::vector<std::string> keys){auto work=std::make_shared<Impl::Work>();work->kind=ProjectOperationKind::persist_reviewed_issues;work->reviewed_issue_keys=std::move(keys);return impl_->enqueue(std::move(work));}
 Result<ProjectSubmission> ProjectActor::read_preference(std::string key){auto work=std::make_shared<Impl::Work>();work->kind=ProjectOperationKind::read_preference;work->preference_key=std::move(key);return impl_->enqueue(std::move(work));}

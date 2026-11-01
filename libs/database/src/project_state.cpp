@@ -69,8 +69,8 @@ std::shared_ptr<const ProjectState> read_state(Connection& connection,int versio
     else if(version>=11)budget(connection,"project_breakpoints","42+length(CAST(condition AS BLOB))+length(CAST(log_message AS BLOB))+length(ignore_count)+length(hit_count)",remaining);
     else if(version>=10)budget(connection,"project_breakpoints","34+length(CAST(condition AS BLOB))+length(CAST(log_message AS BLOB))+length(ignore_count)",remaining);
     else if(version>=9)budget(connection,"project_breakpoints","34",remaining);
-    if(version>=12)budget(connection,"loader_diagnostics","16+coalesce(length(location),0)+length(CAST(message AS BLOB))",remaining);
-    if(version>=12){auto rows=take(connection.prepare("SELECT source,severity,location,message FROM loader_diagnostics ORDER BY source,ordinal"));while(take(rows->step())){const auto source=take(rows->integer(0)),severity=take(rows->integer(1));require(source>=0&&source<=1&&severity>=0&&severity<=2,"Invalid persisted loader diagnostic");Diagnostic item{static_cast<DiagnosticSeverity>(severity),take(rows->text(3)),{}};if(!take(rows->is_null(2))){auto location=location_column(*rows,2);auto address=std::get_if<Address>(&location);require(address,"Persisted loader diagnostic has non-address location");item.location=*address;}if(source==0)state->loader_diagnostics.push_back(std::move(item));else state->runtime_relocation_diagnostics.push_back(std::move(item));}}
+    if(version>=12)budget(connection,"loader_diagnostics",version>=19?"16+coalesce(length(location),0)+length(CAST(message AS BLOB))+coalesce(length(analysis_key),0)":"16+coalesce(length(location),0)+length(CAST(message AS BLOB))",remaining);
+    if(version>=12){auto rows=take(connection.prepare(version>=19?"SELECT source,severity,location,message,analysis_key FROM loader_diagnostics ORDER BY source,ordinal":"SELECT source,severity,location,message,NULL FROM loader_diagnostics ORDER BY source,ordinal"));while(take(rows->step())){const auto source=take(rows->integer(0)),severity=take(rows->integer(1));require(source>=0&&source<=1&&severity>=0&&severity<=2,"Invalid persisted loader diagnostic");Diagnostic item{static_cast<DiagnosticSeverity>(severity),take(rows->text(3)),{}};if(!take(rows->is_null(2))){auto location=location_column(*rows,2);auto address=std::get_if<Address>(&location);require(address,"Persisted loader diagnostic has non-address location");item.location=*address;}if(version>=19&&!take(rows->is_null(4))){auto key=decode_analysis_source_key(take(rows->blob(4)));if(source==0)state->loader_diagnostics_source_key=key;else state->runtime_relocation_diagnostics_source_key=key;}if(source==0)state->loader_diagnostics.push_back(std::move(item));else state->runtime_relocation_diagnostics.push_back(std::move(item));}}
     if(version>=13){
         budget(connection,"type_import_diagnostics",version>=15
             ? "8+length(CAST(source AS BLOB))+coalesce(length(location),0)+coalesce(length(function_entry),0)+length(CAST(message AS BLOB))+coalesce(length(analysis_key),0)"
@@ -536,7 +536,7 @@ Result<bool> ProjectStore::persist_breakpoint_hit_counts(std::span<const Breakpo
         return true;
     });
 }
-Result<bool> ProjectStore::replace_loader_diagnostics(std::span<const Diagnostic> loader,
+Result<bool> ProjectStore::replace_loader_diagnostics(const AnalysisKey& source_key,std::span<const Diagnostic> loader,
         std::span<const Diagnostic> runtime,std::stop_token stop){
     return detail::guarded([&]()->Result<bool>{
         std::lock_guard lock(impl_->mutex);
@@ -555,17 +555,20 @@ Result<bool> ProjectStore::replace_loader_diagnostics(std::span<const Diagnostic
         detail::Cancellation cancellation(*impl_->connection,stop);
         auto transaction=detail::take(Transaction::begin(*impl_->connection));
         detail::take(impl_->connection->execute("DELETE FROM loader_diagnostics"));
-        auto insert=detail::take(impl_->connection->prepare("INSERT INTO loader_diagnostics(source,ordinal,severity,location,message) VALUES(?1,?2,?3,?4,?5)"));
+        const auto encoded_key=detail::encode_analysis_source_key(source_key);
+        auto insert=detail::take(impl_->connection->prepare("INSERT INTO loader_diagnostics(source,ordinal,severity,location,message,analysis_key) VALUES(?1,?2,?3,?4,?5,?6)"));
         for(int source=0;source<2;++source){const auto& rows=source==0?loader:runtime;std::uint64_t ordinal=0;for(const auto& item:rows){
             if(stop.stop_requested())return Error{ErrorCode::canceled,"Loader diagnostic persistence canceled"};
             detail::take(insert->bind_integer(1,source));detail::take(insert->bind_integer(2,static_cast<std::int64_t>(ordinal++)));
             detail::take(insert->bind_integer(3,static_cast<int>(item.severity)));
             if(item.location)detail::take(insert->bind_blob(4,detail::take(encode_location(Location{*item.location}))));else detail::take(insert->bind_null(4));
-            detail::take(insert->bind_text(5,item.message));detail::take(insert->step());detail::take(insert->reset());
+            detail::take(insert->bind_text(5,item.message));detail::take(insert->bind_blob(6,encoded_key));detail::take(insert->step());detail::take(insert->reset());
         }}
         detail::take(transaction->commit());
         state->loader_diagnostics.assign(loader.begin(),loader.end());
         state->runtime_relocation_diagnostics.assign(runtime.begin(),runtime.end());
+        state->loader_diagnostics_source_key=source_key;
+        state->runtime_relocation_diagnostics_source_key=source_key;
         impl_->state=std::move(state);
         return true;
     });
@@ -580,7 +583,7 @@ Result<bool> ProjectStore::replace_type_import_diagnostics(std::span<const TypeI
         for(const auto& item:diagnostics){
             if(item.source.empty() || item.source.size()>4096 || static_cast<unsigned>(item.severity)>2 || item.message.size()>65536)
                 return Error{ErrorCode::invalid_argument,"Type import diagnostic is outside persistence limits"};
-            if(item.source=="Minidump register context")return Error{ErrorCode::invalid_argument,"Reserved loader diagnostic source"};
+            if(item.source=="Minidump register context"||item.source=="Project analysis")return Error{ErrorCode::invalid_argument,"Reserved diagnostic source"};
             const auto cost=item.source.size()+item.message.size()+48+(item.source_key?120:0);
             if(bytes>project_payload_limit || cost>project_payload_limit-bytes)
                 return Error{ErrorCode::resource_limit,"Type import diagnostics exceed project payload limit"};
@@ -589,10 +592,10 @@ Result<bool> ProjectStore::replace_type_import_diagnostics(std::span<const TypeI
         if(stop.stop_requested())return Error{ErrorCode::canceled,"Type import diagnostic persistence canceled"};
         auto state=std::make_shared<ProjectState>(*impl_->state);
         std::vector<TypeImportDiagnostic> retained_decompiler;
-        for(const auto& item:state->type_import_diagnostics)if(item.source=="Decompiler" || item.source=="Minidump register context")retained_decompiler.push_back(item);
+        for(const auto& item:state->type_import_diagnostics)if(item.source=="Decompiler" || item.source=="Minidump register context" || item.source=="Project analysis")retained_decompiler.push_back(item);
         detail::Cancellation cancellation(*impl_->connection,stop);
         auto transaction=detail::take(Transaction::begin(*impl_->connection));
-        detail::take(impl_->connection->execute("DELETE FROM type_import_diagnostics WHERE source NOT IN ('Decompiler','Minidump register context')"));
+        detail::take(impl_->connection->execute("DELETE FROM type_import_diagnostics WHERE source NOT IN ('Decompiler','Minidump register context','Project analysis')"));
         auto insert=detail::take(impl_->connection->prepare("INSERT INTO type_import_diagnostics(ordinal,source,severity,location,function_entry,message,analysis_key) VALUES(?1,?2,?3,?4,?5,?6,?7)"));
         auto next_ordinal=detail::take(impl_->connection->prepare("SELECT coalesce(max(ordinal),-1)+1 FROM type_import_diagnostics"));
         if(!detail::take(next_ordinal->step()))return Error{ErrorCode::integrity,"Cannot allocate diagnostic row identity"};
@@ -613,6 +616,24 @@ Result<bool> ProjectStore::replace_type_import_diagnostics(std::span<const TypeI
         state->type_import_diagnostics.insert(state->type_import_diagnostics.end(),retained_decompiler.begin(),retained_decompiler.end());
         impl_->state=std::move(state);
         return true;
+    });
+}
+Result<bool> ProjectStore::replace_project_analysis_diagnostics(const AnalysisKey& key,
+        std::span<const Diagnostic> diagnostics,std::stop_token stop){
+    return detail::guarded([&]()->Result<bool>{
+        std::lock_guard lock(impl_->mutex);
+        if(impl_->mode==ProjectMode::read_only)return Error{ErrorCode::read_only,"Project is read only"};
+        if(diagnostics.size()>2048)return Error{ErrorCode::resource_limit,"Project analysis diagnostics exceed the 2,048-row limit"};
+        std::size_t bytes=0;for(const auto& item:diagnostics){if(static_cast<unsigned>(item.severity)>2||item.message.size()>65536)return Error{ErrorCode::invalid_argument,"Project analysis diagnostic is outside persistence limits"};const auto cost=item.message.size()+192;if(bytes>project_payload_limit||cost>project_payload_limit-bytes)return Error{ErrorCode::resource_limit,"Project analysis diagnostics exceed project payload limit"};bytes+=cost;}
+        if(stop.stop_requested())return Error{ErrorCode::canceled,"Project analysis diagnostic persistence canceled"};
+        auto state=std::make_shared<ProjectState>(*impl_->state);
+        std::erase_if(state->type_import_diagnostics,[](const auto& row){return row.source=="Project analysis";});
+        detail::Cancellation cancellation(*impl_->connection,stop);auto transaction=detail::take(Transaction::begin(*impl_->connection));
+        detail::take(impl_->connection->execute("DELETE FROM type_import_diagnostics WHERE source='Project analysis'"));
+        auto insert=detail::take(impl_->connection->prepare("INSERT INTO type_import_diagnostics(ordinal,source,severity,location,function_entry,message,analysis_key) SELECT coalesce(max(ordinal),-1)+1,?1,?2,?3,NULL,?4,?5 FROM type_import_diagnostics"));
+        const auto encoded_key=detail::encode_analysis_source_key(key);
+        for(const auto& item:diagnostics){if(stop.stop_requested())return Error{ErrorCode::canceled,"Project analysis diagnostic persistence canceled"};detail::take(insert->bind_text(1,"Project analysis"));detail::take(insert->bind_integer(2,static_cast<int>(item.severity)));if(item.location)detail::take(insert->bind_blob(3,detail::take(encode_location(Location{*item.location}))));else detail::take(insert->bind_null(3));detail::take(insert->bind_text(4,item.message));detail::take(insert->bind_blob(5,encoded_key));detail::take(insert->step());detail::take(insert->reset());TypeImportDiagnostic row;row.source="Project analysis";row.severity=item.severity;row.message=item.message;row.location=item.location;row.source_key=key;state->type_import_diagnostics.push_back(std::move(row));}
+        detail::take(transaction->commit());impl_->state=std::move(state);return true;
     });
 }
 Result<bool> ProjectStore::replace_minidump_context_diagnostics(const AnalysisKey& key,

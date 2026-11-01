@@ -94,7 +94,8 @@ analysis decisions. It shows diagnostics from the snapshot's loaded image when o
 is available, and falls back to persisted findings when no image is loaded. This
 keeps findings aligned with edited or restored project bytes even before a newly
 loaded diagnostic set is written to the project. Project loader and runtime-relocation
-diagnostics are stored with the project in schema v12 and are replaced together in
+diagnostics are stored with the project in schema v19 with their full analysis
+source key and are replaced together in
 one transaction only after a complete loader pass succeeds. A failed or canceled
 load leaves the last completed set intact. The latest completed C-header/PDB
 type-import report is stored with writable projects in schema v13, outside user
@@ -133,6 +134,15 @@ current; a successful reattachment collects a replacement. Read-only projects
 display previously stored rows but do not persist a fresh report. File-only
 documents retain their existing aggregate loader messages; this integration
 does not persist or list nested per-context messages there.
+
+Project analysis string-scan diagnostics are also retained in the diagnostic
+report table under the `Project analysis` source family. The report is atomically
+replaced only when analysis for that exact source key is adopted. Source keys
+include input digest and size, byte and decision revisions, recipe and engine
+fingerprints, and any external input fingerprint. Delayed loader, analysis,
+type-import, and decompiler persistence is rejected if the active project source
+has changed. Legacy loader rows and diagnostic rows without a source key are
+kept visible but are labeled stale/unavailable; migration does not infer a key.
 
 The view caps the combined list at 20,000 findings, admits up to
 2,048 rows per diagnostic source (loader, runtime relocation, type import, and

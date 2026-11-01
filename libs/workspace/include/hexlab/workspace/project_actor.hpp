@@ -48,7 +48,7 @@ public:
     HEXLAB_WORKSPACE_EXPORT Result<ProjectSubmission> persist_function_recognition(FunctionRecognitionEvidence);
     HEXLAB_WORKSPACE_EXPORT Result<ProjectSubmission> read_function_recognition(FunctionRecognitionKind);
     HEXLAB_WORKSPACE_EXPORT Result<ProjectSubmission> persist_breakpoint_hit_counts(std::vector<database::BreakpointHitCount>);
-    HEXLAB_WORKSPACE_EXPORT Result<ProjectSubmission> replace_type_import_diagnostics(std::vector<database::TypeImportDiagnostic>);
+    HEXLAB_WORKSPACE_EXPORT Result<ProjectSubmission> replace_type_import_diagnostics(AnalysisKey,std::vector<database::TypeImportDiagnostic>);
     HEXLAB_WORKSPACE_EXPORT Result<ProjectSubmission> upsert_decompiler_diagnostics(AnalysisKey,Address,std::vector<database::TypeImportDiagnostic>);
     HEXLAB_WORKSPACE_EXPORT Result<ProjectSubmission> replace_reviewed_analysis_issue_keys(std::vector<std::string>);
     HEXLAB_WORKSPACE_EXPORT Result<ProjectSubmission> read_preference(std::string key);

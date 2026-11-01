@@ -26,7 +26,7 @@ struct ProjectIntegrityReport {
     bool complete=true;
     std::vector<std::string> issues;
 };
-inline constexpr int current_project_schema_version = 18;
+inline constexpr int current_project_schema_version = 19;
 enum class ProjectSchemaState : std::uint8_t { supported, newer_than_supported, invalid_or_unreadable };
 struct ProjectSchemaCompatibilityReport {
     ProjectSchemaState state = ProjectSchemaState::invalid_or_unreadable;
@@ -142,6 +142,7 @@ struct ProjectState {
     // Loader-origin findings are durable import metadata, independent of the
     // undoable user state. Runtime relocation findings share the same lifecycle.
     std::vector<Diagnostic> loader_diagnostics, runtime_relocation_diagnostics;
+    std::optional<AnalysisKey> loader_diagnostics_source_key, runtime_relocation_diagnostics_source_key;
     // The most recently completed type/debug-symbol import report is durable
     // metadata, not an undoable user edit.
     std::vector<TypeImportDiagnostic> type_import_diagnostics;
@@ -462,7 +463,8 @@ public:
     // Runtime debugger metadata is committed atomically without changing edit
     // revisions or creating undo history.
     HEXLAB_DATABASE_EXPORT Result<bool> persist_breakpoint_hit_counts(std::span<const BreakpointHitCount>,std::stop_token);
-    HEXLAB_DATABASE_EXPORT Result<bool> replace_loader_diagnostics(std::span<const Diagnostic>,std::span<const Diagnostic>,std::stop_token);
+    HEXLAB_DATABASE_EXPORT Result<bool> replace_loader_diagnostics(const AnalysisKey&,std::span<const Diagnostic>,std::span<const Diagnostic>,std::stop_token);
+    HEXLAB_DATABASE_EXPORT Result<bool> replace_project_analysis_diagnostics(const AnalysisKey&,std::span<const Diagnostic>,std::stop_token);
     HEXLAB_DATABASE_EXPORT Result<bool> replace_type_import_diagnostics(std::span<const TypeImportDiagnostic>,std::stop_token);
     // Reserved source "Minidump register context"; replaces only this family,
     // retaining the exact AnalysisKey outside edit history. No guessed locations.
