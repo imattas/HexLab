@@ -297,6 +297,55 @@ std::optional<Address> local_x64_indirect_call_target(const Image &image, const 
         return {};
     return target;
 }
+std::optional<Address> elf_indirect_personality_target(const Image &image, const ImageMetadata &metadata,
+                                                        const ElfEhFramePointer &personality,
+                                                        const RelocationResolver &relocations,
+                                                        std::stop_token stop) {
+    if (!metadata.elf || !(personality.encoding & 0x80) || personality.value == 0)
+        return {};
+    const auto pointer_width = metadata.elf->header.is_64 ? std::uint8_t{8} : std::uint8_t{4};
+    const auto *space = image.space(image.layout().space.id);
+    if (!space || space->width_bits != pointer_width * 8 ||
+        (pointer_width == 4 && personality.value > UINT32_MAX))
+        return {};
+    const Address slot{image.layout().space.id, personality.value};
+    auto resolved = relocations.data_at(image, slot, pointer_width, stop);
+    if (!resolved || stop.stop_requested())
+        return {};
+    std::optional<Address> target;
+    if (resolved.value().relocated()) {
+        // A relocation owns the slot even when its symbol cannot be resolved.
+        // Never reinterpret its encoded addend as a file-backed pointer.
+        target = resolved.value().address;
+    } else {
+        const auto *segment = image.segment_at(slot);
+        if (!segment || !segment->readable || segment->writable || slot.offset < segment->begin.offset)
+            return {};
+        const auto relative = slot.offset - segment->begin.offset;
+        if (relative > segment->file_size || pointer_width > segment->file_size - relative ||
+            image.plaintext_window(slot, pointer_width) != pointer_width)
+            return {};
+        const auto bytes = image.read(slot, pointer_width);
+        if (!bytes || bytes.value().size() != pointer_width)
+            return {};
+        ByteReader reader(bytes.value());
+        if (pointer_width == 4) {
+            auto raw = reader.read_u32(space->order);
+            if (raw) target = Address{slot.space, raw.value()};
+        } else {
+            auto raw = reader.read_u64(space->order);
+            if (raw) target = Address{slot.space, raw.value()};
+        }
+    }
+    if (!target || target->space != slot.space)
+        return {};
+    const auto *target_segment = image.segment_at(*target);
+    if (!target_segment || !target_segment->executable || target->offset < target_segment->begin.offset ||
+        target->offset - target_segment->begin.offset >= target_segment->file_size ||
+        image.code_window(*target, 1) != 1 || image.plaintext_window(*target, 1) != 1)
+        return {};
+    return target;
+}
 } // namespace
 uint64_t Ids::make(FactKind kind, Address address, std::span<const std::byte> extra) {
     std::vector<std::byte> key{std::byte(static_cast<unsigned>(kind))};
@@ -1192,15 +1241,30 @@ void Recovery::seed_roots() {
             seed.unwind_evidence = FunctionSeedUnwindEvidence{function.section, function.file_offset, 8};
             root(std::move(seed), false);
         }
-        // A directly decoded CIE personality is called by the runtime during
-        // exception handling and may have no ordinary code reference. Use the
-        // encoded pointer's own source bytes as unwind provenance. Indirect
-        // encodings remain unresolved metadata and never become roots here.
+        // CIE personality routines are called by the runtime during exception
+        // handling and may have no ordinary code reference. Direct encodings
+        // use their source field; indirect encodings are followed only through
+        // one exact relocation or an immutable, file-backed pointer slot.
+        std::optional<RelocationResolver> personality_relocations;
+        const bool has_indirect_personality = std::any_of(metadata.elf->eh_frame_functions.begin(),
+            metadata.elf->eh_frame_functions.end(), [](const ElfEhFrameFunction &function) {
+                return function.personality && !function.personality->target &&
+                       (function.personality->encoding & 0x80) && function.personality->value != 0;
+            });
+        if (has_indirect_personality) {
+            auto created = RelocationResolver::create(image, metadata, stop);
+            if (created) personality_relocations.emplace(std::move(created.value()));
+            else output->complete = false;
+        }
         for (const auto &function : metadata.elf->eh_frame_functions) {
             canceled();
-            if (!function.personality || !function.personality->target ||
-                !function.personality->encoded_size) continue;
-            FunctionSeed seed{FunctionSeedKind::unwind, *function.personality->target, {}, {}};
+            if (!function.personality || !function.personality->encoded_size) continue;
+            std::optional<Address> target = function.personality->target;
+            if (!target && personality_relocations)
+                target = elf_indirect_personality_target(image, metadata, *function.personality,
+                                                         *personality_relocations, stop);
+            if (!target) continue;
+            FunctionSeed seed{FunctionSeedKind::unwind, *target, {}, {}};
             seed.unwind_evidence = FunctionSeedUnwindEvidence{function.section,
                 function.personality->file_offset, function.personality->encoded_size};
             root(std::move(seed), false);
@@ -3169,7 +3233,7 @@ Sha256Digest function_engine_fingerprint(const AnalysisOptions &options) {
         "hexlab-functions-v98-jvm-local-code-method-roots-v1/mips32-regimm-conditional-call-edges-v1/semantic-decoder-manifest-single-capture-v2/x64-rip-indirect-call-slot-target-v1/riscv64-lw-signed-pointer-load-v1/mips64-bitfield-relocation-guard-v1/m6502-65c02-vector-roots-v2/wasm-direct-call-edges-v1/wasm-constant-call-indirect-function-edges-v1/a64-add-sub-carry-v1/riscv-masked-integer-reductions-v1/dex-register-index-16-v1/x64-loop-counter-alias-v1/elf-et-exec-section-init-fini-array-roots-v1/elf-legacy-ctors-dtors-roots-v1/windows-x64-outgoing-stack-store-call-provenance-v2/mips32-gpr-conditional-moves-v1/ppc-popcntb-v1/ppc-addze-addme-lift-v1/x86-implicit-multiply-lift-v1/x86-bit-scan-lift-v1/x86-bit-test-lift-v1/x86-movemask-lift-v2/x86-palignr-fallthrough-v1/x86-ssse3-pabs-lift-v1/ppc64-rldic-reference-v1/ppc64-rldcl-rldcr-reference-v1/a64-extr-reference-v1/a64-madd-msub-reference-v1/a64-conditional-select-nzcv-v1/mips32-cop1-conditional-moves-v1/riscv-bitwise-stack-copies-v1/mips32-cop1-branch-likely-v1/mips64-eh-frame-roots-v1/pe-x86-fpo-roots-and-extents-v1/riscv-bitwise-immediate-addresses-v1/dex-method-roots-call-edges-v2/dex-relative-control-operands-v1/dex-payload-data-v1/riscv-vfrsqrt7-vfrec7-v1/a64-preserving-bitfield-v1/a64-ubfm-sbfm-address-reference-v1/a64-nzcv-constant-flow-v1/nonx86-reference-producer-graph-v1/dataflow-reference-producer-graph-v4/reference-immediate-origin-v1/x86-vdivps-vdivpd-vex-evex-mxcsr-effects-v1/mips64-arithmetic-reference-v1/mips64-shift-rotate-reference-v1/mips64-special-conditional-traps-v1/evex-packed-fp-broadcast-v1/wasm-br-table-12-case-v1/dex-switch-flow-v1/dex-exception-flow-v1/jvm-switch-flow-v2/jvm-exception-flow-v1/pe-guard-cf-function-roots-v1/pe-chpe-execution-ranges-v1/pe-amd64-chained-function-chunks-v1/runtime-initializer-roots-v1/runtime-initializer-array-roots-v2/initializer-source-relocation-provenance-v1/string-scan-work-budget-v1/mips64-delay-slot-ownership-v1/explicit-root-budget-priority-v1/arm-predicate-nzcv-reachability-v1/thumb-it-condition-edges-v1/arm-a32-predicate-thumb-it-flow-v4/zydis-opaque-stop-v1/multiarc-flow-v1/switch-cfg-targets-v4/guard-multiblock-v1/unicode-strings-v3/windows1253-1255-strings-v1/iso8859-10-13-14-16-strings-v1/x86-scalar-context-v5/elf-symbol-roots-v1/elf-symbol-extents-v1/operand-encoding-v1/elf-relocation-flow-v2/pe-pogo-function-roots-v1/elf-powerpc-eh-frame-roots-v1/macho-compact-unwind-extents-v1/ppc64-elfv1-opd-symbol-roots-v1/wasm-export-function-roots-v1/wasm-start-function-root-v1/wasm-element-function-roots-v1/wasm-all-defined-function-roots-v1/m6502-reference-producer-graph-v1/riscv64-lwu-pointer-load-v1/riscv-zbb-count-reference-v1/mips64-dclz-dclo-reference-v1/elf-dwarf-entrypoint-roots-v1/pe-amd64-unwind-handler-roots-v1"
         "mips64-word-shift-reference-v1/wasm-import-call-identities-v1/wasm-constant-call-indirect-reference-v1/"
         "elf-reference-provenance-v1/elf-arithmetic-v2/macho-symbol-roots-v1/macho-relocation-flow-v1/"
-        "macho-reference-provenance-v1/macho-dyld-data-provenance-v1/macho-dyld-flow-v1/macho-export-roots-v1/macho-code-policy-v1/elf-unwind-personality-roots-v1/elf-unwind-roots-v1/macho-eh-frame-roots-v1/pe-tls-callback-roots-v1/pe-arm64-pdata-provenance-v1/mips64-cop1-condition-predicates-v1/riscv-v-vector-comparisons-v1/riscv-vfclass-vfsqrt-v1/x86-vex128-zero-upper-v1/powerpc-xform-logical-clz-signext-v1/x87-status-control-tag-effects-v1/pe-safe-seh-function-roots-v1/macho-mod-term-function-roots-v1/elf-dwarf-subprogram-roots-v1/thumb2-movw-movt-reference-v1/riscv-addiw-address-reference-v1/aapcs32-stack-argument-slots-v1/mips-o32-stack-argument-slots-v1/mips-n64-stack-argument-slots-v1/a64-32bit-pointer-load-references-v1/ebcdic-cp037-string-candidates-v1/mips64-special2-mul-address-reference-v1/ppc32-rlwinm-address-reference-v1/ppc64-rldimi-address-reference-v1/riscv-outgoing-stack-store-provenance-v1/thumb-tbb-aligned-pc-target-v1/mips64-word-rotr-address-reference-v1/native-import-slot-call-identities-v1/windows932-string-candidates-v1/windows950-string-candidates-v1/m6502-decimal-stack-alias-guard-v1/mips32-derived-stack-aliases-v1/a64-etrel-cross-section-branch-v1/m65c02-index-stack-and-accumulator-alias-v1/a64-division-reference-v1/a64-logical-encoded-extent-v1/mips32-logical-immediate-reference-v1/mips32-merge-load-reference-v1/mips32-narrow-pointer-load-reference-v1/a64-signed-narrow-load-reference-v1/mips64-set-less-than-reference-v1/a64-orr-zero-stack-copies-v1"
+        "macho-reference-provenance-v1/macho-dyld-data-provenance-v1/macho-dyld-flow-v1/macho-export-roots-v1/macho-code-policy-v1/elf-unwind-personality-roots-v1/elf-unwind-indirect-personality-slots-v1/elf-unwind-roots-v1/macho-eh-frame-roots-v1/pe-tls-callback-roots-v1/pe-arm64-pdata-provenance-v1/mips64-cop1-condition-predicates-v1/riscv-v-vector-comparisons-v1/riscv-vfclass-vfsqrt-v1/x86-vex128-zero-upper-v1/powerpc-xform-logical-clz-signext-v1/x87-status-control-tag-effects-v1/pe-safe-seh-function-roots-v1/macho-mod-term-function-roots-v1/elf-dwarf-subprogram-roots-v1/thumb2-movw-movt-reference-v1/riscv-addiw-address-reference-v1/aapcs32-stack-argument-slots-v1/mips-o32-stack-argument-slots-v1/mips-n64-stack-argument-slots-v1/a64-32bit-pointer-load-references-v1/ebcdic-cp037-string-candidates-v1/mips64-special2-mul-address-reference-v1/ppc32-rlwinm-address-reference-v1/ppc64-rldimi-address-reference-v1/riscv-outgoing-stack-store-provenance-v1/thumb-tbb-aligned-pc-target-v1/mips64-word-rotr-address-reference-v1/native-import-slot-call-identities-v1/windows932-string-candidates-v1/windows950-string-candidates-v1/m6502-decimal-stack-alias-guard-v1/mips32-derived-stack-aliases-v1/a64-etrel-cross-section-branch-v1/m65c02-index-stack-and-accumulator-alias-v1/a64-division-reference-v1/a64-logical-encoded-extent-v1/mips32-logical-immediate-reference-v1/mips32-merge-load-reference-v1/mips32-narrow-pointer-load-reference-v1/a64-signed-narrow-load-reference-v1/mips64-set-less-than-reference-v1/a64-orr-zero-stack-copies-v1"
         "/mips64-full-width-switch-bases-v1/windows1251-after-unicode-strings-v1";
     (void)hash.update(std::as_bytes(std::span(version)));
     constexpr std::string_view riscv_compressed_version = "riscv-integer-compressed-v1";
