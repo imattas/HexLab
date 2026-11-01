@@ -1109,6 +1109,10 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
             std::unordered_set<std::uint32_t> visited;
             visited.reserve(64);
             bool unresolved = false;
+            const auto enqueue = [&](std::uint32_t candidate) {
+                if (pending.size() >= 4096) { unresolved = true; return; }
+                pending.push_back(candidate);
+            };
             while (!pending.empty() && visited.size() < 4096 && hierarchy_walk_steps < 1'000'000) {
                 const auto current = pending.back(); pending.pop_back();
                 if (current == expected) return Assignability::yes;
@@ -1116,8 +1120,8 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
                 ++hierarchy_walk_steps;
                 const auto found = local_hierarchy.find(current);
                 if (found == local_hierarchy.end()) { unresolved = true; continue; }
-                if (found->second.superclass) pending.push_back(*found->second.superclass);
-                pending.insert(pending.end(), found->second.interfaces.begin(), found->second.interfaces.end());
+                if (found->second.superclass) enqueue(*found->second.superclass);
+                for (const auto interface_type : found->second.interfaces) enqueue(interface_type);
             }
             if (!pending.empty()) unresolved = true;
             return unresolved ? Assignability::unresolved : Assignability::no;
@@ -1131,17 +1135,21 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
         std::unordered_set<std::uint32_t> visited;
         visited.reserve(64);
         std::size_t steps = 0;
+        const auto enqueue = [&](std::uint32_t candidate) {
+            if (pending.size() >= 4096) return;
+            pending.push_back(candidate);
+        };
         for (std::size_t next = 0; next < pending.size() && steps++ < 4096; ++next) {
             const auto candidate = pending[next];
             if (!visited.insert(candidate).second) continue;
             if (reference_assignability(right, candidate) == Assignability::yes) return candidate;
             if (const auto found = local_hierarchy.find(candidate); found != local_hierarchy.end()) {
-                if (found->second.superclass) pending.push_back(*found->second.superclass);
-                pending.insert(pending.end(), found->second.interfaces.begin(), found->second.interfaces.end());
+                if (found->second.superclass) enqueue(*found->second.superclass);
+                for (const auto interface_type : found->second.interfaces) enqueue(interface_type);
             }
             if (candidate == left || candidate == right) {
                 const auto object = type_id_lookup.find("Ljava/lang/Object;");
-                if (object != type_id_lookup.end() && object->second != candidate) pending.push_back(object->second);
+                if (object != type_id_lookup.end() && object->second != candidate) enqueue(object->second);
             }
         }
         return UINT32_MAX;

@@ -39,7 +39,8 @@ exceptional type propagation is not implemented. Known reference identities are
 checked for assignability at ordinary invoke receivers and instance field
 receivers using the class definitions and array rules present in this DEX.
 When two known reference types meet at a control-flow join, the verifier keeps
-a common in-image supertype when a bounded hierarchy walk can establish one.
+a common in-image supertype when a hierarchy walk of at most 4,096 queued and
+visited types can establish one.
 This preserves useful facts for later receiver, argument, field-store, and
 return checks. If the hierarchy is incomplete or the bounded walk cannot find
 a common type, the joined identity becomes unknown and remains permissive.
