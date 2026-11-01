@@ -51,6 +51,8 @@ struct X87Binary80Value {
     X87Binary80 value;
     bool operator==(const X87Binary80Value &) const = default;
 };
+struct Expression;
+using ExpressionPtr = std::shared_ptr<const Expression>;
 struct MemoryValue {
     ValueType type;
     std::optional<RegisterOperand> base, index;
@@ -78,8 +80,11 @@ struct MemoryValue {
     std::string index_extend;
     // Address arithmetic is reduced to this many low bits before the memory
     // access. Zero leaves the architecture's ordinary address width in force.
-    // Used for pointer-byte reads whose indexed slot wraps at its address width.
+    // Used when indexed address arithmetic wraps at its effective width.
     std::uint8_t address_wrap_bits = 0;
+    // When present, this expression computes the address of this memory access.
+    // It can itself contain memory loads for architectures with nested pointers.
+    ExpressionPtr effective_address;
 };
 struct UnaryValue;
 struct BinaryValue;
@@ -89,8 +94,6 @@ struct UnknownValue {
 struct VariableValue {
     std::string name;
 };
-struct Expression;
-using ExpressionPtr = std::shared_ptr<const Expression>;
 struct UnaryValue { std::string operation; ExpressionPtr operand; };
 struct BinaryValue { std::string operation; ExpressionPtr left, right; };
 struct Expression {

@@ -3949,7 +3949,10 @@ void visit_memory(const ExpressionPtr &expression, const auto &visitor) {
     if (!expression) return;
     std::visit([&](const auto &value) {
         using T = std::decay_t<decltype(value)>;
-        if constexpr (std::is_same_v<T, MemoryValue>) visitor(value);
+        if constexpr (std::is_same_v<T, MemoryValue>) {
+            visitor(value);
+            visit_memory(value.effective_address, visitor);
+        }
         else if constexpr (std::is_same_v<T, UnaryValue>) visit_memory(value.operand, visitor);
         else if constexpr (std::is_same_v<T, BinaryValue>) {
             visit_memory(value.left, visitor);
@@ -4007,6 +4010,7 @@ void recover_expression(ExpressionPtr &expression, const std::map<StackSlotKey, 
                     }
                 }
             }
+            recover_expression(value.effective_address, slots, aliases);
         } else if constexpr (std::is_same_v<T, UnaryValue>) recover_expression(value.operand, slots, aliases);
         else if constexpr (std::is_same_v<T, BinaryValue>) {
             recover_expression(value.left, slots, aliases);

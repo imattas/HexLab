@@ -47,6 +47,7 @@ ExpressionPtr rewrite(const ExpressionPtr &expression, EditState &state) {
         };
         replace_address_register(memory->base, memory->base_version);
         replace_address_register(memory->index, memory->index_version);
+        memory->effective_address = rewrite(memory->effective_address, state);
     }
     return std::make_shared<Expression>(std::move(copy));
 }

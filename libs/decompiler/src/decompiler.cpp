@@ -42,6 +42,7 @@ ExpressionPtr remap_x87_expression(const ExpressionPtr &expression, std::uint8_t
     } else if (auto *memory = std::get_if<MemoryValue>(&copy->value)) {
         if (memory->base) memory->base = x87_physical(*memory->base, top);
         if (memory->index) memory->index = x87_physical(*memory->index, top);
+        memory->effective_address = remap_x87_expression(memory->effective_address, top);
     } else if (auto *unary = std::get_if<UnaryValue>(&copy->value)) {
         unary->operand = remap_x87_expression(unary->operand, top);
     } else if (auto *binary = std::get_if<BinaryValue>(&copy->value)) {
@@ -533,6 +534,65 @@ ExpressionPtr memory_expr(const MemoryOperand &memory) {
     value.displacement = memory.displacement;
     value.absolute = memory.resolved_address;
     return std::make_shared<Expression>(Expression{value.type, std::move(value)});
+}
+
+ExpressionPtr m65c02_indirect_data_operand(const Instruction &instruction,
+                                          const MemoryOperand &operand) {
+    if (instruction.context.architecture != Architecture::mos6502 ||
+        instruction.context.mode != ExecutionMode::m65c02 || instruction.bytes.size() != 2 ||
+        operand.base || operand.ip_relative || operand.displacement < 0 || operand.displacement > 0xff ||
+        operand.address_width != 16 || operand.data_width != 8 ||
+        instruction.length != 2 || instruction.flow != FlowKind::fallthrough ||
+        (!instruction.memory_read && !instruction.memory_write) || instruction.access.size() != 1 ||
+        (instruction.access.front() != OperandAccess::read &&
+         instruction.access.front() != OperandAccess::write &&
+         instruction.access.front() != OperandAccess::read_write) ||
+        std::to_integer<std::uint8_t>(instruction.bytes[1]) !=
+            static_cast<std::uint8_t>(operand.displacement)) return {};
+
+    const auto encoded = std::to_integer<std::uint8_t>(instruction.bytes[0]);
+    const bool indexed_indirect = (encoded & 0x1fu) == 0x01u;
+    const bool indirect_indexed = (encoded & 0x1fu) == 0x11u;
+    const bool zero_page_indirect = (encoded & 0x1fu) == 0x12u;
+    if (!indexed_indirect && !indirect_indexed && !zero_page_indirect) return {};
+
+    const RegisterOperand x{RegisterBank::mos6502, 1, 8, false};
+    const RegisterOperand y{RegisterBank::mos6502, 2, 8, false};
+    if ((indexed_indirect && operand.index != x) ||
+        (indirect_indexed && operand.index != y) ||
+        (zero_page_indirect && operand.index)) return {};
+    const auto pointer_byte = [&](std::int64_t displacement, std::optional<RegisterOperand> index) {
+        MemoryValue value;
+        value.type = integer_type(8);
+        value.absolute = index ? std::optional<Address>{} : std::optional<Address>{
+            Address{instruction.address.space, static_cast<std::uint8_t>(displacement)}};
+        value.index = index;
+        value.displacement = displacement;
+        value.address_wrap_bits = 8;
+        return std::make_shared<Expression>(Expression{value.type, std::move(value)});
+    };
+    const auto zp = operand.displacement;
+    const auto pointer_index = indexed_indirect ? std::optional<RegisterOperand>{x} : std::nullopt;
+    const auto low = pointer_byte(zp, pointer_index);
+    const auto high = pointer_byte((zp + 1) & 0xff, pointer_index);
+    const auto widen = [](ExpressionPtr byte) -> ExpressionPtr {
+        return std::make_shared<Expression>(Expression{integer_type(16), UnaryValue{"zext", std::move(byte)}});
+    };
+    const auto shift = std::make_shared<Expression>(Expression{integer_type(16),
+        BinaryValue{"shl", widen(high), constant_expr(8, 16)}});
+    ExpressionPtr address = std::make_shared<Expression>(Expression{integer_type(16),
+        BinaryValue{"or", widen(low), shift}});
+    if (indirect_indexed) {
+        const auto add_y = std::make_shared<Expression>(Expression{integer_type(16),
+            BinaryValue{"add", address, widen(reg_expr(y))}});
+        address = std::make_shared<Expression>(Expression{integer_type(16),
+            BinaryValue{"and", add_y, constant_expr(0xffff, 16)}});
+    }
+    MemoryValue data;
+    data.type = integer_type(8);
+    data.address_wrap_bits = 16;
+    data.effective_address = std::move(address);
+    return std::make_shared<Expression>(Expression{data.type, std::move(data)});
 }
 
 ExpressionPtr memory_expr(const ArmMemoryOperand &memory) {
@@ -1209,6 +1269,15 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
     operands.reserve(instruction.operands.size());
     for (const auto &operand : instruction.operands)
         operands.push_back(operand_expr(operand));
+    bool nested_m65c02_data_address = false;
+    if (instruction.operands.size() == 1 && operands.size() == 1) {
+        if (const auto *memory = std::get_if<MemoryOperand>(&instruction.operands.front())) {
+            if (auto nested = m65c02_indirect_data_operand(instruction, *memory)) {
+                operands.front() = std::move(nested);
+                nested_m65c02_data_address = true;
+            }
+        }
+    }
 
     const bool x86_context = instruction.context.architecture == Architecture::x86 ||
                              instruction.context.architecture == Architecture::x86_64;
@@ -2518,7 +2587,7 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
         const bool zp_indirect = (encoded & 0x1fu) == 0x12u;
         const bool indexed_indirect = (encoded & 0x1fu) == 0x01u;
         const bool indirect_indexed = (encoded & 0x1fu) == 0x11u;
-        if (memory && (memory->index || zp_indirect)) {
+        if (memory && (memory->index || zp_indirect) && !nested_m65c02_data_address) {
             const std::string addressing = zp_indirect ? "zero_page_indirect_wrap" :
                 indexed_indirect ? "zero_page_indexed_indirect_wrap" :
                 indirect_indexed ? "zero_page_indirect_indexed_wrap" :
@@ -2613,7 +2682,8 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
                 expected_reads.push_back(value_register);
                 if (memory && memory->data_width == 8 && memory->address_width == 16 &&
                     !memory->ip_relative && !memory->base && instruction.access ==
-                        std::vector<OperandAccess>{OperandAccess::write} && !instruction.memory_read &&
+                        std::vector<OperandAccess>{OperandAccess::write} &&
+                    (nested_m65c02_data_address || !instruction.memory_read) &&
                     instruction.memory_write && instruction.register_reads == expected_reads &&
                     instruction.register_writes.empty() && valid_memory_index(memory) &&
                     std::holds_alternative<MemoryValue>(operands.front()->value))
@@ -7504,6 +7574,8 @@ std::string address_text(const MemoryValue &memory) {
             return mask.str();
         }() + ")";
     };
+    if (memory.effective_address)
+        return wrapped(expression_text(*memory.effective_address));
     if (memory.absolute) {
         std::ostringstream out;
         out << "0x" << std::hex << memory.absolute->offset;
@@ -7687,6 +7759,7 @@ std::string expression_text(const Expression &expression) {
             return out.str();
         } else if constexpr (std::is_same_v<T, MemoryValue>) {
             if (value.stack_variable) return *value.stack_variable;
+            if (value.effective_address) return "*[" + address_text(value) + "]";
             const auto access_bytes = static_cast<std::uint16_t>((value.type.bits + 7u) / 8u);
             if (!value.address_wrap_bits && value.base && value.index && value.index_add && value.index_shift.empty() &&
                 value.index_shift_amount == 0 && value.index_extend.empty() && value.scale &&
@@ -9337,7 +9410,7 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                         if constexpr (std::is_same_v<T, RegisterValue>) return overlaps_state(value.reg);
                         else if constexpr (std::is_same_v<T, MemoryValue>)
                             return (value.base && overlaps_state(*value.base)) ||
-                                   (value.index && overlaps_state(*value.index));
+                                   (value.index && overlaps_state(*value.index)) || visit(value.effective_address);
                         else if constexpr (std::is_same_v<T, UnaryValue>) return visit(value.operand);
                         else if constexpr (std::is_same_v<T, BinaryValue>)
                             return visit(value.left) || visit(value.right);

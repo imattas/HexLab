@@ -134,6 +134,48 @@ std::size_t expression_hash(const ExpressionPtr &expression) {
         hash = mix_hash(hash, std::hash<std::string>{}(binary->operation));
         hash = mix_hash(hash, expression_hash(binary->left));
         hash = mix_hash(hash, expression_hash(binary->right));
+    } else if (const auto *memory = std::get_if<MemoryValue>(&expression->value)) {
+        if (memory->effective_address || memory->address_wrap_bits) {
+        const auto hash_register = [&](const RegisterOperand &reg) {
+            hash = mix_hash(hash, static_cast<std::size_t>(reg.bank));
+            hash = mix_hash(hash, reg.index);
+            hash = mix_hash(hash, reg.width);
+            hash = mix_hash(hash, reg.high_byte);
+        };
+        const auto hash_optional_register = [&](const std::optional<RegisterOperand> &reg) {
+            hash = mix_hash(hash, reg.has_value());
+            if (reg) hash_register(*reg);
+        };
+        const auto hash_optional_version = [&](const std::optional<std::uint32_t> &version) {
+            hash = mix_hash(hash, version.value_or(UINT32_MAX));
+        };
+        hash = mix_hash(hash, type_hash(memory->type));
+        hash_optional_register(memory->base);
+        hash_optional_register(memory->index);
+        hash_optional_version(memory->base_version);
+        hash_optional_version(memory->index_version);
+        hash = mix_hash(hash, std::hash<std::string>{}(memory->index_shift));
+        hash = mix_hash(hash, memory->index_shift_amount);
+        hash = mix_hash(hash, memory->index_add);
+        hash = mix_hash(hash, memory->scale);
+        hash = mix_hash(hash, static_cast<std::size_t>(memory->displacement));
+        hash = mix_hash(hash, memory->absolute.has_value());
+        if (memory->absolute) {
+            hash = mix_hash(hash, memory->absolute->space.value);
+            hash = mix_hash(hash, static_cast<std::size_t>(memory->absolute->offset));
+            hash = mix_hash(hash, static_cast<std::size_t>(memory->absolute->offset >> 32));
+        }
+        hash_optional_version(memory->memory_version);
+        hash = mix_hash(hash, memory->memory_partition ? std::hash<std::string>{}(*memory->memory_partition) : 0);
+        hash_optional_version(memory->memory_partition_version);
+        hash = mix_hash(hash, memory->stack_variable ? std::hash<std::string>{}(*memory->stack_variable) : 0);
+        hash_optional_register(memory->stack_frame_register);
+        hash_optional_version(memory->stack_frame_version);
+        hash = mix_hash(hash, static_cast<std::size_t>(memory->stack_frame_offset.value_or(INT64_MIN)));
+        hash = mix_hash(hash, std::hash<std::string>{}(memory->index_extend));
+        hash = mix_hash(hash, memory->address_wrap_bits);
+        if (memory->effective_address) hash = mix_hash(hash, expression_hash(memory->effective_address));
+        }
     }
     return hash;
 }
@@ -156,7 +198,9 @@ ExpressionPtr substitute(const ExpressionPtr &input, const Definitions &definiti
         return input;
     }
     auto result = std::make_shared<Expression>(*input);
-    if (auto *unary = std::get_if<UnaryValue>(&result->value))
+    if (auto *memory = std::get_if<MemoryValue>(&result->value))
+        memory->effective_address = substitute(memory->effective_address, definitions, budget, depth + 1);
+    else if (auto *unary = std::get_if<UnaryValue>(&result->value))
         unary->operand = substitute(unary->operand, definitions, budget, depth + 1);
     else if (auto *binary = std::get_if<BinaryValue>(&result->value)) {
         binary->left = substitute(binary->left, definitions, budget, depth + 1);
@@ -173,6 +217,11 @@ std::size_t expression_nodes(const ExpressionPtr &expression, std::size_t limit 
         const auto operand = expression_nodes(unary->operand, limit - count);
         if (operand > limit - count) return limit + 1;
         count += operand;
+    }
+    else if (const auto *memory = std::get_if<MemoryValue>(&expression->value)) {
+        const auto address = expression_nodes(memory->effective_address, limit - count);
+        if (address > limit - count) return limit + 1;
+        count += address;
     }
     else if (const auto *binary = std::get_if<BinaryValue>(&expression->value)) {
         const auto left = expression_nodes(binary->left, limit - count);
@@ -194,6 +243,24 @@ bool structurally_equal(const ExpressionPtr &a, const ExpressionPtr &b) {
         return *x == std::get<ConstantValue>(b->value);
     if (const auto *x = std::get_if<X87Binary80Value>(&a->value))
         return *x == std::get<X87Binary80Value>(b->value);
+    if (const auto *x = std::get_if<MemoryValue>(&a->value)) {
+        const auto &y = std::get<MemoryValue>(b->value);
+        if (!x->effective_address && !y.effective_address &&
+            !x->address_wrap_bits && !y.address_wrap_bits) return false;
+        return x->type == y.type && x->base == y.base && x->index == y.index &&
+               x->base_version == y.base_version && x->index_version == y.index_version &&
+               x->index_shift == y.index_shift && x->index_shift_amount == y.index_shift_amount &&
+               x->index_add == y.index_add && x->scale == y.scale && x->displacement == y.displacement &&
+               x->absolute == y.absolute && x->memory_version == y.memory_version &&
+               x->memory_partition == y.memory_partition &&
+               x->memory_partition_version == y.memory_partition_version &&
+               x->stack_variable == y.stack_variable &&
+               x->stack_frame_register == y.stack_frame_register &&
+               x->stack_frame_version == y.stack_frame_version &&
+               x->stack_frame_offset == y.stack_frame_offset && x->index_extend == y.index_extend &&
+               x->address_wrap_bits == y.address_wrap_bits &&
+               structurally_equal(x->effective_address, y.effective_address);
+    }
     if (const auto *x = std::get_if<UnaryValue>(&a->value)) {
         const auto &y = std::get<UnaryValue>(b->value);
         return x->operation == y.operation && structurally_equal(x->operand, y.operand);

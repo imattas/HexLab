@@ -28,6 +28,7 @@ void collect(const ExpressionPtr &expression, std::map<Key, RegisterOperand> &re
             if (value.base) registers[key(*value.base)] = *value.base;
             if (value.index) registers[key(*value.index)] = *value.index;
             if (value.stack_frame_register) registers[key(*value.stack_frame_register)] = *value.stack_frame_register;
+            collect(value.effective_address, registers);
         } else if constexpr (std::is_same_v<T, UnaryValue>) collect(value.operand, registers);
         else if constexpr (std::is_same_v<T, BinaryValue>) {
             collect(value.left, registers); collect(value.right, registers);

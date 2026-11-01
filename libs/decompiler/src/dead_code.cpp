@@ -58,6 +58,7 @@ void collect_uses(const ExpressionPtr &expression, std::set<Key> &uses) {
         } else if constexpr (std::is_same_v<T, MemoryValue>) {
             if (value.base && value.base_version) uses.insert(key(*value.base, *value.base_version));
             if (value.index && value.index_version) uses.insert(key(*value.index, *value.index_version));
+            collect_uses(value.effective_address, uses);
         } else if constexpr (std::is_same_v<T, UnaryValue>) collect_uses(value.operand, uses);
         else if constexpr (std::is_same_v<T, BinaryValue>) {
             collect_uses(value.left, uses);

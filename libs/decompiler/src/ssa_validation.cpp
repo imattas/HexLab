@@ -313,6 +313,8 @@ Result<SsaRegisterValidation> validate_register_ssa(const LiftedFunction &functi
             if constexpr (std::is_same_v<T, RegisterValue>) {
                 return check_use(value.reg, value.version, block, instruction);
             } else if constexpr (std::is_same_v<T, MemoryValue>) {
+                auto address_checked = check_expression(value.effective_address, block, instruction, depth + 1);
+                if (!address_checked) return address_checked.error();
                 if (value.address_wrap_bits != 0 && value.address_wrap_bits != 8 &&
                     value.address_wrap_bits != 16 && value.address_wrap_bits != 32 &&
                     value.address_wrap_bits != 64)

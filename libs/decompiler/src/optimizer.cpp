@@ -2082,7 +2082,9 @@ void inspect_expression(const ExpressionPtr &expression, SummaryBudget &budget, 
     if (depth > budget.options.max_expression_depth)
         throw Error{ErrorCode::resource_limit, "Call-summary expression nesting exceeds its budget"};
     budget.take(budget.expressions, 1, budget.options.max_expression_nodes);
-    if (const auto *unary = std::get_if<UnaryValue>(&expression->value))
+    if (const auto *memory = std::get_if<MemoryValue>(&expression->value))
+        inspect_expression(memory->effective_address, budget, depth + 1);
+    else if (const auto *unary = std::get_if<UnaryValue>(&expression->value))
         inspect_expression(unary->operand, budget, depth + 1);
     else if (const auto *binary = std::get_if<BinaryValue>(&expression->value)) {
         inspect_expression(binary->left, budget, depth + 1);
@@ -2417,6 +2419,7 @@ ExpressionPtr rewrite_memory(const ExpressionPtr &expression, const MemoryAliase
     auto result = std::make_shared<Expression>(*expression);
     if (auto *memory = std::get_if<MemoryValue>(&result->value)) {
         if (memory->memory_version) memory->memory_version = resolve_memory(*memory->memory_version, aliases, budget);
+        memory->effective_address = rewrite_memory(memory->effective_address, aliases, budget);
     } else if (auto *unary = std::get_if<UnaryValue>(&result->value))
         unary->operand = rewrite_memory(unary->operand, aliases, budget);
     else if (auto *binary = std::get_if<BinaryValue>(&result->value)) {

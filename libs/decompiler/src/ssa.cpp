@@ -379,6 +379,7 @@ void collect_expression(const ExpressionPtr &expression, std::set<Key> &variable
         else if constexpr (std::is_same_v<T, MemoryValue>) {
             if (value.base) variables.insert(key(*value.base));
             if (value.index) variables.insert(key(*value.index));
+            collect_expression(value.effective_address, variables);
         } else if constexpr (std::is_same_v<T, UnaryValue>) collect_expression(value.operand, variables);
         else if constexpr (std::is_same_v<T, BinaryValue>) {
             collect_expression(value.left, variables);
@@ -401,6 +402,7 @@ void rename_expression(ExpressionPtr &expression, const std::map<Key, std::vecto
         else if constexpr (std::is_same_v<T, MemoryValue>) {
             if (value.base) value.base_version = stacks.at(key(*value.base)).back();
             if (value.index) value.index_version = stacks.at(key(*value.index)).back();
+            rename_expression(value.effective_address, stacks);
         } else if constexpr (std::is_same_v<T, UnaryValue>) rename_expression(value.operand, stacks);
         else if constexpr (std::is_same_v<T, BinaryValue>) {
             rename_expression(value.left, stacks);
@@ -415,7 +417,10 @@ void rename_memory(ExpressionPtr &expression, std::uint32_t version) {
     auto copy = std::make_shared<Expression>(*expression);
     std::visit([&](auto &value) {
         using T = std::decay_t<decltype(value)>;
-        if constexpr (std::is_same_v<T, MemoryValue>) value.memory_version = version;
+        if constexpr (std::is_same_v<T, MemoryValue>) {
+            value.memory_version = version;
+            rename_memory(value.effective_address, version);
+        }
         else if constexpr (std::is_same_v<T, UnaryValue>) rename_memory(value.operand, version);
         else if constexpr (std::is_same_v<T, BinaryValue>) {
             rename_memory(value.left, version); rename_memory(value.right, version);
@@ -432,6 +437,7 @@ void clear_partition_memory(ExpressionPtr &expression) {
         if constexpr (std::is_same_v<T, MemoryValue>) {
             value.memory_partition.reset();
             value.memory_partition_version.reset();
+            clear_partition_memory(value.effective_address);
         } else if constexpr (std::is_same_v<T, UnaryValue>) clear_partition_memory(value.operand);
         else if constexpr (std::is_same_v<T, BinaryValue>) {
             clear_partition_memory(value.left); clear_partition_memory(value.right);
@@ -469,6 +475,8 @@ void rename_partition_memory(ExpressionPtr &expression,
                     value.memory_partition_version = found->second;
                 }
             }
+            rename_partition_memory(value.effective_address, versions, absolute_partitions, dynamic_partitions,
+                                    pointer_origins, integer_constants, integer_ranges);
         } else if constexpr (std::is_same_v<T, UnaryValue>)
             rename_partition_memory(value.operand, versions, absolute_partitions, dynamic_partitions, pointer_origins,
                                     integer_constants, integer_ranges);
@@ -488,6 +496,7 @@ void collect_stack_partitions(const ExpressionPtr &expression, std::set<std::str
         using T = std::decay_t<decltype(value)>;
         if constexpr (std::is_same_v<T, MemoryValue>) {
             if (value.stack_variable) partitions.insert(*value.stack_variable);
+            collect_stack_partitions(value.effective_address, partitions);
         } else if constexpr (std::is_same_v<T, UnaryValue>) collect_stack_partitions(value.operand, partitions);
         else if constexpr (std::is_same_v<T, BinaryValue>) {
             collect_stack_partitions(value.left, partitions);
@@ -507,6 +516,7 @@ void collect_absolute_memory_ranges(const ExpressionPtr &expression,
                 if (ranges.size() >= maximum) overflow = true;
                 else ranges.insert(*range);
             }
+            collect_absolute_memory_ranges(value.effective_address, ranges, maximum, overflow);
         } else if constexpr (std::is_same_v<T, UnaryValue>) {
             collect_absolute_memory_ranges(value.operand, ranges, maximum, overflow);
         } else if constexpr (std::is_same_v<T, BinaryValue>) {
@@ -521,7 +531,10 @@ void clear_memory_versions(ExpressionPtr &expression) {
     auto copy = std::make_shared<Expression>(*expression);
     std::visit([&](auto &value) {
         using T = std::decay_t<decltype(value)>;
-        if constexpr (std::is_same_v<T, MemoryValue>) value.memory_version.reset();
+        if constexpr (std::is_same_v<T, MemoryValue>) {
+            value.memory_version.reset();
+            clear_memory_versions(value.effective_address);
+        }
         else if constexpr (std::is_same_v<T, UnaryValue>) clear_memory_versions(value.operand);
         else if constexpr (std::is_same_v<T, BinaryValue>) {
             clear_memory_versions(value.left); clear_memory_versions(value.right);
@@ -535,7 +548,10 @@ void rename_memory_expression(ExpressionPtr &expression, std::uint32_t version) 
     auto copy = std::make_shared<Expression>(*expression);
     std::visit([&](auto &value) {
         using T = std::decay_t<decltype(value)>;
-        if constexpr (std::is_same_v<T, MemoryValue>) value.memory_version = version;
+        if constexpr (std::is_same_v<T, MemoryValue>) {
+            value.memory_version = version;
+            rename_memory_expression(value.effective_address, version);
+        }
         else if constexpr (std::is_same_v<T, UnaryValue>) rename_memory_expression(value.operand, version);
         else if constexpr (std::is_same_v<T, BinaryValue>) {
             rename_memory_expression(value.left, version);
@@ -838,6 +854,7 @@ Result<LiftedFunction> to_ssa(const LiftedFunction &input,
                 else if constexpr (std::is_same_v<T, MemoryValue>) {
                     if (value.base) registers[key(*value.base)] = canonical_register(*value.base);
                     if (value.index) registers[key(*value.index)] = canonical_register(*value.index);
+                    save_regs(value.effective_address);
                 } else if constexpr (std::is_same_v<T, UnaryValue>) save_regs(value.operand);
                 else if constexpr (std::is_same_v<T, BinaryValue>) { save_regs(value.left); save_regs(value.right); }
             }, expression->value);
@@ -1336,6 +1353,7 @@ Result<LiftedFunction> to_ssa(const LiftedFunction &input,
                     if constexpr (std::is_same_v<T, MemoryValue>) {
                         if (const auto range = dynamic_memory_range(value, pointer_origins, integer_constants, integer_ranges))
                             dynamic_ranges.insert(*range);
+                        collect_dynamic(value.effective_address);
                     } else if constexpr (std::is_same_v<T, UnaryValue>) collect_dynamic(value.operand);
                     else if constexpr (std::is_same_v<T, BinaryValue>) { collect_dynamic(value.left); collect_dynamic(value.right); }
                 }, node->value);
