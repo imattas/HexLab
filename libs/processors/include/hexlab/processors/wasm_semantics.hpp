@@ -3,6 +3,7 @@
 #include "hexlab/processors/instruction.hpp"
 #include "hexlab/processors/wasm_simd_comparison.hpp"
 #include "hexlab/processors/wasm_simd_integer.hpp"
+#include "hexlab/processors/wasm_simd_shift.hpp"
 
 #include <algorithm>
 #include <cstddef>
@@ -90,6 +91,55 @@ inline std::optional<WasmV128> evaluate_wasm_simd_integer_binary_instruction(
         value &= mask;
         for (unsigned index = 0; index < bytes; ++index)
             result[offset + index] = static_cast<std::uint8_t>(value >> (index * 8));
+    }
+    return result;
+}
+
+// Evaluate one of the twelve integer SIMD lane shifts. WebAssembly masks the
+// i32 shift count by lane_width - 1; signed right shifts replicate the lane's
+// sign bit. All lanes are decoded and encoded as explicit little-endian bits.
+inline std::optional<WasmV128> evaluate_wasm_simd_integer_shift_instruction(
+    const Instruction &instruction, const WasmV128 &value, std::uint32_t shift_count) noexcept {
+    if (instruction.context.architecture != Architecture::wasm ||
+        instruction.context.mode != ExecutionMode::wasm32 || instruction.opcode != Opcode::wasm ||
+        instruction.flow != FlowKind::fallthrough || instruction.length < 2 || instruction.length > 6 ||
+        instruction.bytes[0] != std::byte{0xfd} || !instruction.operands.empty() ||
+        !instruction.access.empty() || instruction.memory_read || instruction.memory_write)
+        return std::nullopt;
+    std::uint32_t subopcode = 0;
+    bool terminated = false;
+    for (unsigned index = 1; index < instruction.length; ++index) {
+        const auto byte = std::to_integer<std::uint8_t>(instruction.bytes[index]);
+        const auto payload = static_cast<std::uint32_t>(byte & 0x7f);
+        if (index == 5 && payload > 15) return std::nullopt;
+        subopcode |= payload << ((index - 1) * 7);
+        if (!(byte & 0x80)) {
+            if (index + 1 != instruction.length) return std::nullopt;
+            terminated = true;
+            break;
+        }
+    }
+    const auto info = wasm_simd_integer_shift_op(subopcode);
+    if (!terminated || !info || instruction.mnemonic_override != info->name) return std::nullopt;
+    const auto bits = info->lane_bits;
+    const auto bytes = bits / 8;
+    const auto mask = bits == 64 ? UINT64_MAX : (UINT64_C(1) << bits) - 1;
+    const auto amount = shift_count & (bits - 1);
+    WasmV128 result{};
+    for (unsigned offset = 0; offset < 16; offset += bytes) {
+        std::uint64_t lane = 0;
+        for (unsigned index = 0; index < bytes; ++index)
+            lane |= static_cast<std::uint64_t>(value[offset + index]) << (index * 8);
+        std::uint64_t shifted = lane;
+        if (info->operation == "shl") shifted = (lane << amount) & mask;
+        else if (info->operation == "shr_u") shifted = lane >> amount;
+        else if (info->operation == "shr_s") {
+            shifted = lane >> amount;
+            if (amount != 0 && (lane & (UINT64_C(1) << (bits - 1))))
+                shifted |= mask ^ (mask >> amount);
+        } else return std::nullopt;
+        for (unsigned index = 0; index < bytes; ++index)
+            result[offset + index] = static_cast<std::uint8_t>(shifted >> (index * 8));
     }
     return result;
 }

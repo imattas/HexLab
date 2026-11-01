@@ -1,6 +1,7 @@
 ﻿#include "hexlab/decompiler/wasm_lifting.hpp"
 
 #include "hexlab/processors/wasm_simd_integer.hpp"
+#include "hexlab/processors/wasm_simd_shift.hpp"
 #include <algorithm>
 #include <array>
 #include <deque>
@@ -373,18 +374,8 @@ std::optional<std::uint32_t> simd_subopcode(const Instruction &instruction) {
     }
     return {};
 }
-std::optional<std::string_view> simd_integer_shift(std::uint32_t subopcode) {
-    static constexpr std::array<std::string_view, 12> names{
-        "wasm_i8x16_shl", "wasm_i8x16_shr_s", "wasm_i8x16_shr_u",
-        "wasm_i16x8_shl", "wasm_i16x8_shr_s", "wasm_i16x8_shr_u",
-        "wasm_i32x4_shl", "wasm_i32x4_shr_s", "wasm_i32x4_shr_u",
-        "wasm_i64x2_shl", "wasm_i64x2_shr_s", "wasm_i64x2_shr_u"};
-    for (std::size_t width = 0; width < 4; ++width) {
-        const auto first = std::array<std::uint32_t, 4>{0x6b, 0x8b, 0xab, 0xcb}[width];
-        if (subopcode >= first && subopcode < first + 3)
-            return names[width * 3 + subopcode - first];
-    }
-    return {};
+std::optional<WasmSimdIntegerShiftOp> simd_integer_shift(std::uint32_t subopcode) {
+    return wasm_simd_integer_shift_op(subopcode);
 }
 std::optional<std::string_view> simd_float_unary(std::uint32_t subopcode) {
     switch (subopcode) {
@@ -1103,6 +1094,10 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
                     continue;
                 }
                 if (subopcode && simd_integer_shift(*subopcode)) {
+                    const auto &instruction = code[n]->instruction;
+                    const auto operation = simd_integer_shift(*subopcode);
+                    if (!instruction.operands.empty() || instruction.mnemonic_override != operation->name)
+                        return unsupported("SIMD integer shift opcode metadata is inconsistent");
                     auto shift = shape_pop(stack, integer(32));
                     if (!shift) return shift.error();
                     auto value = shape_pop(stack, vector(128));
@@ -2041,11 +2036,13 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
                         continue;
                     }
                     if (const auto operation = simd_integer_shift(*subopcode)) {
+                        if (!i.operands.empty() || i.mnemonic_override != operation->name)
+                            return unsupported("SIMD integer shift opcode metadata is inconsistent");
                         auto shift = pop(integer(32));
                         auto value = pop(vector(128));
                         if (!shift) return shift.error();
                         if (!value) return value.error();
-                        stack.push_back(binary(std::string(*operation), value.value(), shift.value(), vector(128)));
+                        stack.push_back(binary(std::string(operation->intrinsic_name), value.value(), shift.value(), vector(128)));
                         continue;
                     }
                     if (simd_integer_extend_or_pairwise_add(*subopcode)) {

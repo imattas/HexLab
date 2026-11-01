@@ -1,5 +1,6 @@
 #include "hexlab/processors/decoder.hpp"
 #include "hexlab/processors/wasm_semantics.hpp"
+#include "hexlab/processors/wasm_simd_shift.hpp"
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -217,29 +218,26 @@ DecodeResult decode_wasm(std::span<const std::byte> bytes, Address at) {
         // by broad numeric ranges.
         static constexpr SimdOpcodeName extended_integer_names[]{
             {0x65, "i8x16.narrow_i16x8_s"}, {0x66, "i8x16.narrow_i16x8_u"},
-            {0x6b, "i8x16.shl"}, {0x6c, "i8x16.shr_s"}, {0x6d, "i8x16.shr_u"},
             {0x7c, "i16x8.extadd_pairwise_i8x16_s"}, {0x7d, "i16x8.extadd_pairwise_i8x16_u"},
             {0x7e, "i32x4.extadd_pairwise_i16x8_s"}, {0x7f, "i32x4.extadd_pairwise_i16x8_u"},
             {0x85, "i16x8.narrow_i32x4_s"}, {0x86, "i16x8.narrow_i32x4_u"},
             {0x87, "i16x8.extend_low_i8x16_s"}, {0x88, "i16x8.extend_high_i8x16_s"},
             {0x89, "i16x8.extend_low_i8x16_u"}, {0x8a, "i16x8.extend_high_i8x16_u"},
-            {0x8b, "i16x8.shl"}, {0x8c, "i16x8.shr_s"}, {0x8d, "i16x8.shr_u"},
             {0x9c, "i16x8.extmul_low_i8x16_s"}, {0x9d, "i16x8.extmul_high_i8x16_s"},
             {0x9e, "i16x8.extmul_low_i8x16_u"}, {0x9f, "i16x8.extmul_high_i8x16_u"},
             {0xa7, "i32x4.extend_low_i16x8_s"}, {0xa8, "i32x4.extend_high_i16x8_s"},
             {0xa9, "i32x4.extend_low_i16x8_u"}, {0xaa, "i32x4.extend_high_i16x8_u"},
-            {0xab, "i32x4.shl"}, {0xac, "i32x4.shr_s"}, {0xad, "i32x4.shr_u"},
             {0xba, "i32x4.dot_i16x8_s"},
             {0xbc, "i32x4.extmul_low_i16x8_s"}, {0xbd, "i32x4.extmul_high_i16x8_s"},
             {0xbe, "i32x4.extmul_low_i16x8_u"}, {0xbf, "i32x4.extmul_high_i16x8_u"},
             {0xc7, "i64x2.extend_low_i32x4_s"}, {0xc8, "i64x2.extend_high_i32x4_s"},
             {0xc9, "i64x2.extend_low_i32x4_u"}, {0xca, "i64x2.extend_high_i32x4_u"},
-            {0xcb, "i64x2.shl"}, {0xcc, "i64x2.shr_s"}, {0xcd, "i64x2.shr_u"},
             {0xd6, "i64x2.eq"}, {0xd7, "i64x2.ne"}, {0xd8, "i64x2.lt_s"},
             {0xd9, "i64x2.gt_s"}, {0xda, "i64x2.le_s"}, {0xdb, "i64x2.ge_s"},
             {0xdc, "i64x2.extmul_low_i32x4_s"}, {0xdd, "i64x2.extmul_high_i32x4_s"},
             {0xde, "i64x2.extmul_low_i32x4_u"}, {0xdf, "i64x2.extmul_high_i32x4_u"}};
         const auto integer_arithmetic = wasm_simd_integer_binary_op(static_cast<std::uint32_t>(subopcode));
+        const auto integer_shift = wasm_simd_integer_shift_op(static_cast<std::uint32_t>(subopcode));
         const auto relaxed_simd = std::find_if(std::begin(relaxed_simd_names), std::end(relaxed_simd_names),
             [subopcode](const SimdOpcodeName &candidate) { return candidate.opcode == subopcode; });
         const auto extended_integer = std::find_if(std::begin(extended_integer_names), std::end(extended_integer_names),
@@ -283,6 +281,9 @@ DecodeResult decode_wasm(std::span<const std::byte> bytes, Address at) {
             memory_access = false;
         } else if (integer_arithmetic) {
             name = integer_arithmetic->name;
+            memory_access = false;
+        } else if (integer_shift) {
+            name = integer_shift->name;
             memory_access = false;
         } else if (extended_integer != std::end(extended_integer_names)) {
             name = extended_integer->name;
