@@ -2,6 +2,7 @@
 
 #include "hexlab/processors/wasm_simd_integer.hpp"
 #include "hexlab/processors/wasm_simd_shift.hpp"
+#include "hexlab/processors/wasm_simd_comparison.hpp"
 #include <algorithm>
 #include <array>
 #include <deque>
@@ -10,6 +11,7 @@
 #include <optional>
 #include <set>
 #include <string_view>
+#include <utility>
 #include <vector>
 #include <iterator>
 
@@ -376,6 +378,17 @@ std::optional<std::uint32_t> simd_subopcode(const Instruction &instruction) {
 }
 std::optional<WasmSimdIntegerShiftOp> simd_integer_shift(std::uint32_t subopcode) {
     return wasm_simd_integer_shift_op(subopcode);
+}
+std::optional<std::pair<std::string, ValueType>> simd_comparison(const Instruction &instruction,
+                                                                  std::uint32_t subopcode) {
+    const auto info = wasm_simd_comparison_detail::operation(subopcode);
+    if (!info || !instruction.operands.empty() || !instruction.access.empty() ||
+        instruction.memory_read || instruction.memory_write)
+        return {};
+    const std::string name = std::string(info->mnemonic) + "." + std::string(info->predicate);
+    if (instruction.mnemonic_override != name) return {};
+    const unsigned lanes = 128u / info->lane_bits;
+    return std::pair{name, vector(128, TypeKind::integer, info->lane_bits, lanes)};
 }
 std::optional<std::string_view> simd_float_unary(std::uint32_t subopcode) {
     switch (subopcode) {
@@ -813,7 +826,7 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
     };
     std::vector<EdgeBridge> edge_bridges;
     std::vector<std::size_t> work{0};std::vector<bool> queued(starts.size());queued[0]=true;entries[0]=Shape{};
-    const auto shape_pop=[&](Shape &stack,ValueType expected)->Result<ValueType>{if(stack.empty())return unsupported("operand stack underflow");auto actual=stack.back();stack.pop_back();if(expected.kind!=TypeKind::unknown&&actual!=expected)return unsupported("operand stack type mismatch");return actual;};
+    const auto shape_pop=[&](Shape &stack,ValueType expected)->Result<ValueType>{if(stack.empty())return unsupported("operand stack underflow");auto actual=stack.back();stack.pop_back();const bool any_v128=expected.kind==TypeKind::vector&&expected.bits==128&&expected.element_kind==TypeKind::unknown&&expected.lanes==0;if(expected.kind!=TypeKind::unknown&&(any_v128?(actual.kind!=TypeKind::vector||actual.bits!=128):actual!=expected))return unsupported("operand stack type mismatch");return actual;};
     const auto signature_results = [&]() -> Result<std::vector<ValueType>> {
         std::vector<ValueType> result;
         if (!function_signature) return result;
@@ -1064,13 +1077,15 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
                     stack.push_back(*subopcode == 83 ? integer(32) : vector_type);
                     continue;
                 }
-                if (subopcode && ((*subopcode >= 0x23 && *subopcode <= 0x4c) ||
-                                  (*subopcode >= 0xd6 && *subopcode <= 0xdb))) {
+                if (subopcode && wasm_simd_comparison_detail::operation(*subopcode)) {
+                    const auto comparison = simd_comparison(code[n]->instruction, *subopcode);
+                    if (!comparison)
+                        return unsupported("SIMD comparison opcode metadata is inconsistent");
                     auto right = shape_pop(stack, vector(128));
                     auto left = shape_pop(stack, vector(128));
                     if (!right) return right.error();
                     if (!left) return left.error();
-                    stack.push_back(vector(128));
+                    stack.push_back(comparison->second);
                     continue;
                 }
                 const auto extmul = subopcode ? simd_integer_extmul(*subopcode) : std::optional<std::string_view>{};
@@ -1589,7 +1604,7 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
         for(std::size_t slot=0;slot<phi_versions[bi].size();++slot){const RegisterOperand reg{RegisterBank::wasm_stack,static_cast<std::uint8_t>(slot),entries[bi]->at(slot).bits,false};LiftedBlock::Phi phi{reg,phi_versions[bi][slot],{}};for(const auto pred:predecessors[bi]){const auto projection=incoming_slot_sources[bi].find(pred);if(projection==incoming_slot_sources[bi].end()||slot>=projection->second.size())return Error{ErrorCode::malformed,"WebAssembly predecessor stack projection is unavailable"};const auto source_slot=projection->second[slot];if(source_slot>=output_versions[pred].size())return Error{ErrorCode::malformed,"WebAssembly predecessor has no stack value for join"};phi.inputs.push_back({pred>=starts.size()?bridge_id(pred):BlockId{static_cast<std::uint64_t>(pred+1)},output_versions[pred][source_slot]});}lifted.phis.push_back(std::move(phi));}
         Stack stack;
         if(!predecessors[bi].empty())for(std::size_t slot=0;slot<entries[bi]->size();++slot){const RegisterOperand reg{RegisterBank::wasm_stack,static_cast<std::uint8_t>(slot),entries[bi]->at(slot).bits,false};if(predecessors[bi].size()>1)stack.push_back(std::make_shared<Expression>(Expression{entries[bi]->at(slot),RegisterValue{reg,phi_versions[bi][slot]}}));else{const auto pred=predecessors[bi].front();const auto projection=incoming_slot_sources[bi].find(pred);if(projection==incoming_slot_sources[bi].end()||slot>=projection->second.size())return Error{ErrorCode::malformed,"WebAssembly predecessor stack projection is unavailable"};const auto source_slot=projection->second[slot];if(source_slot>=output_versions[pred].size())return Error{ErrorCode::malformed,"WebAssembly predecessor stack value is unavailable"};stack.push_back(std::make_shared<Expression>(Expression{entries[bi]->at(slot),RegisterValue{reg,output_versions[pred][source_slot]}}));}}
-        auto pop=[&](ValueType expected)->Result<ExpressionPtr>{if(stack.empty())return unsupported("operand stack underflow");auto v=stack.back();stack.pop_back();if(expected.kind!=TypeKind::unknown&&v->type!=expected)return unsupported("operand stack type mismatch");return v;};
+        auto pop=[&](ValueType expected)->Result<ExpressionPtr>{if(stack.empty())return unsupported("operand stack underflow");auto v=stack.back();stack.pop_back();const bool any_v128=expected.kind==TypeKind::vector&&expected.bits==128&&expected.element_kind==TypeKind::unknown&&expected.lanes==0;if(expected.kind!=TypeKind::unknown&&(any_v128?(v->type.kind!=TypeKind::vector||v->type.bits!=128):v->type!=expected))return unsupported("operand stack type mismatch");return v;};
         auto emit=[&](std::size_t n,Statement statement){const auto *fact=code[n];lifted.instructions.push_back({{fact->instruction.address,fact->id},std::move(statement)});};
         const auto take_results = [&](const std::vector<ValueType> &types) -> Result<std::vector<ExpressionPtr>> {
             std::vector<ExpressionPtr> values(types.size());
@@ -2001,18 +2016,15 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
                     }
                     continue;
                 }
-                if (subopcode && ((*subopcode >= 0x23 && *subopcode <= 0x4c) ||
-                                  (*subopcode >= 0xd6 && *subopcode <= 0xdb))) {
-                    // SIMD comparison results are lane masks represented as
-                    // opaque v128 values. Keep the exact decoded mnemonic so
-                    // signedness and lane width survive lifting.
-                    if (i.mnemonic_override.empty())
-                        return unsupported("SIMD comparison mnemonic is unavailable");
+                if (subopcode && wasm_simd_comparison_detail::operation(*subopcode)) {
+                    const auto comparison = simd_comparison(i, *subopcode);
+                    if (!comparison)
+                        return unsupported("SIMD comparison opcode metadata is inconsistent");
                     auto right = pop(vector(128));
                     auto left = pop(vector(128));
                     if (!right) return right.error();
                     if (!left) return left.error();
-                    stack.push_back(binary(i.mnemonic_override, left.value(), right.value(), vector(128)));
+                    stack.push_back(binary(comparison->first, left.value(), right.value(), comparison->second));
                     continue;
                 }
                 if (subopcode) {
