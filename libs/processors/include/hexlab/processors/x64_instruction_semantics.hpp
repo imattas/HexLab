@@ -1299,12 +1299,16 @@ evaluate_x86_bmi1_instruction(const Instruction &instruction, std::uint64_t sour
 inline std::optional<X86Bmi2Result> evaluate_x86_bmi2_instruction(
     const Instruction &instruction, std::uint64_t source, std::uint64_t bit_mask) noexcept {
     using namespace x64_instruction_semantics_detail;
-    if (!x86_context(instruction) ||
-        (instruction.context.mode != ExecutionMode::x86_32 && instruction.context.mode != ExecutionMode::x86_64) ||
-        (instruction.context.architecture == Architecture::x86 &&
-         instruction.context.mode != ExecutionMode::x86_32) ||
-        (instruction.context.architecture == Architecture::x86_64 &&
-         instruction.context.mode != ExecutionMode::x86_64) ||
+    const bool long_mode = instruction.context.architecture == Architecture::x86_64 &&
+                           instruction.context.mode == ExecutionMode::x86_64;
+    const bool legacy32 = instruction.context.architecture == Architecture::x86 &&
+                          instruction.context.mode == ExecutionMode::x86_32;
+    if ((!long_mode && !legacy32) || instruction.context.order != ByteOrder::little ||
+        instruction.flow != FlowKind::fallthrough || instruction.lock_prefix ||
+        instruction.x86_repeat != X86RepeatPrefix::none || instruction.x86_evex ||
+        instruction.x86_opmask || instruction.x86_opmask_zeroing || instruction.memory_write ||
+        (instruction.x86_flags_read_mask && *instruction.x86_flags_read_mask != 0) ||
+        (instruction.x86_flags_write_mask && *instruction.x86_flags_write_mask != 0) ||
         instruction.operands.size() != 3 || instruction.access.size() != 3 ||
         instruction.access[0] != OperandAccess::write ||
         instruction.access[1] != OperandAccess::read || instruction.access[2] != OperandAccess::read)
@@ -1315,22 +1319,60 @@ inline std::optional<X86Bmi2Result> evaluate_x86_bmi2_instruction(
     else return std::nullopt;
     const auto *destination = std::get_if<RegisterOperand>(&instruction.operands[0]);
     const auto *source_reg = std::get_if<RegisterOperand>(&instruction.operands[1]);
-    if (!destination || !source_reg || destination->bank != RegisterBank::gpr ||
-        source_reg->bank != RegisterBank::gpr || destination->high_byte || source_reg->high_byte ||
-        destination->index > 15 || source_reg->index > 15 ||
-        (instruction.context.architecture == Architecture::x86 &&
-         (destination->index > 7 || source_reg->index > 7)) ||
-        (destination->width != 32 && destination->width != 64) ||
-        destination->width != source_reg->width || operand_width(instruction.operands[2]) != destination->width ||
-        (destination->width == 64 && instruction.context.mode != ExecutionMode::x86_64))
+    const auto *mask_reg = std::get_if<RegisterOperand>(&instruction.operands[2]);
+    const auto *mask_memory = std::get_if<MemoryOperand>(&instruction.operands[2]);
+    const unsigned max_register = long_mode ? 15u : 7u;
+    const auto valid_gpr = [&](RegisterOperand reg, unsigned width) {
+        return reg.bank == RegisterBank::gpr && reg.index <= max_register && !reg.high_byte &&
+               reg.width == width;
+    };
+    if (!destination || !source_reg || (!mask_reg && !mask_memory) ||
+        instruction.register_writes != std::vector<RegisterOperand>{*destination} ||
+        destination->bank != RegisterBank::gpr || destination->high_byte ||
+        (destination->width != 32 && (destination->width != 64 || !long_mode)) ||
+        !valid_gpr(*destination, destination->width) || !valid_gpr(*source_reg, destination->width) ||
+        operand_width(instruction.operands[2]) != destination->width ||
+        instruction.memory_read != (mask_memory != nullptr))
         return std::nullopt;
-    if (const auto *mask_reg = std::get_if<RegisterOperand>(&instruction.operands[2])) {
-        if (mask_reg->bank != RegisterBank::gpr || mask_reg->high_byte || mask_reg->index > 15 ||
-            (instruction.context.architecture == Architecture::x86 && mask_reg->index > 7))
+
+    std::vector<RegisterOperand> expected_reads;
+    const auto add_read = [&](RegisterOperand reg) {
+        if (std::find(expected_reads.begin(), expected_reads.end(), reg) == expected_reads.end())
+            expected_reads.push_back(reg);
+    };
+    add_read(*source_reg); // ModRM source 2 is encoded in VEX.vvvv.
+    if (mask_reg) {
+        if (!valid_gpr(*mask_reg, destination->width))
             return std::nullopt;
-    } else if (!std::holds_alternative<MemoryOperand>(instruction.operands[2])) {
-        return std::nullopt;
+        add_read(*mask_reg);
+    } else {
+        const unsigned address_width = mask_memory->address_width;
+        const bool valid_address_width = long_mode ? (address_width == 32 || address_width == 64)
+                                                   : (address_width == 16 || address_width == 32);
+        const auto valid_base = [&]() {
+            if (!mask_memory->base) return true;
+            if (mask_memory->ip_relative)
+                return long_mode && !mask_memory->index &&
+                    *mask_memory->base == RegisterOperand{RegisterBank::ip, 0,
+                        static_cast<std::uint16_t>(address_width), false};
+            return valid_gpr(*mask_memory->base, address_width);
+        };
+        if (!valid_address_width || mask_memory->data_width != destination->width || !valid_base() ||
+            (mask_memory->ip_relative && !mask_memory->base) ||
+            (mask_memory->index && !valid_gpr(*mask_memory->index, address_width)) ||
+            (mask_memory->segment && (mask_memory->segment->bank != RegisterBank::segment ||
+                mask_memory->segment->index > 5 || mask_memory->segment->width != 16 ||
+                mask_memory->segment->high_byte)) ||
+            (mask_memory->scale != 1 && mask_memory->scale != 2 &&
+             mask_memory->scale != 4 && mask_memory->scale != 8) ||
+            mask_memory->writeback || mask_memory->post_index || !mask_memory->index_extend.empty() ||
+            mask_memory->index_shift_amount)
+            return std::nullopt;
+        if (mask_memory->segment) add_read(*mask_memory->segment);
+        if (mask_memory->base) add_read(*mask_memory->base);
+        if (mask_memory->index) add_read(*mask_memory->index);
     }
+    if (instruction.register_reads != expected_reads) return std::nullopt;
     return evaluate_x86_bmi2(operation, source, bit_mask, destination->width);
 }
 
