@@ -385,6 +385,8 @@ DecodeResult decode_scalar(std::span<const std::byte> input, Address address, De
                         ? UINT64_C(1) : UINT64_C(1) << 11;
                     state.flags_read_mask = chain_flag;
                     state.flags_write_mask = chain_flag;
+                    if (state.rules.long_mode() && width == 32)
+                        state.i.register_writes.push_back(gpr(decoded.reg.index, 64));
                 } else if ((map_opcode == 0xf0 || map_opcode == 0xf1) && state.group1 == 0xf2) {
                     const std::uint16_t destination_width = state.rules.long_mode() && (state.rex & 8) ? 64 : 32;
                     const std::uint16_t source_width = map_opcode == 0xf0 ? 8 : state.width();

@@ -5863,6 +5863,89 @@ a64_unhandled:
     const bool x86_vex_context =
         (instruction.context.architecture == Architecture::x86 && instruction.context.mode == ExecutionMode::x86_32) ||
         (instruction.context.architecture == Architecture::x86_64 && instruction.context.mode == ExecutionMode::x86_64);
+    if (x86 && (instruction.opcode == Opcode::adcx || instruction.opcode == Opcode::adox) &&
+        instruction.operands.size() == 2) {
+        const auto *destination_memory = std::get_if<MemoryOperand>(&instruction.operands[0]);
+        const auto destination_register = as_register(instruction.operands[0]);
+        const auto source_register = as_register(instruction.operands[1]);
+        const auto *source_memory = std::get_if<MemoryOperand>(&instruction.operands[1]);
+        const auto width = destination_register ? destination_register->width
+            : destination_memory ? destination_memory->data_width : std::uint16_t{0};
+        const auto source_width = source_register ? source_register->width
+            : source_memory ? source_memory->data_width : std::uint16_t{0};
+        const auto chain_bit = instruction.opcode == Opcode::adcx ? std::uint64_t{0} : std::uint64_t{11};
+        const auto chain_mask = std::uint64_t{1} << chain_bit;
+        const auto read_flags = std::find_if(instruction.register_reads.begin(), instruction.register_reads.end(),
+            [](RegisterOperand reg) { return reg.bank == RegisterBank::flags; });
+        const auto written_flags = std::find_if(instruction.register_writes.begin(), instruction.register_writes.end(),
+            [](RegisterOperand reg) { return reg.bank == RegisterBank::flags; });
+        const auto valid_data_register = [](const std::optional<RegisterOperand> &reg, std::uint16_t bits) {
+            return !reg || (reg->bank == RegisterBank::gpr && reg->width == bits && !reg->high_byte);
+        };
+        const bool valid_context = (instruction.context.mode == ExecutionMode::x86_16 ||
+            instruction.context.mode == ExecutionMode::x86_32 || instruction.context.mode == ExecutionMode::x86_64) &&
+            ((instruction.context.architecture == Architecture::x86 &&
+              instruction.context.mode != ExecutionMode::x86_64) ||
+             (instruction.context.architecture == Architecture::x86_64 &&
+              instruction.context.mode == ExecutionMode::x86_64)) &&
+            ((instruction.context.mode == ExecutionMode::x86_64 &&
+              (width == 16 || width == 32 || width == 64)) ||
+             (instruction.context.mode != ExecutionMode::x86_64 && (width == 16 || width == 32)));
+        const bool valid = valid_context && destination_register && !destination_memory &&
+            (source_register || source_memory) && width == source_width &&
+            valid_data_register(destination_register, width) && valid_data_register(source_register, width) &&
+            instruction.access == std::vector<OperandAccess>{OperandAccess::read_write, OperandAccess::read} &&
+            read_flags != instruction.register_reads.end() && written_flags != instruction.register_writes.end() &&
+            *read_flags == *written_flags && read_flags->width >= 12 &&
+            (read_flags->width == 16 || read_flags->width == 32 || read_flags->width == 64) &&
+            instruction.x86_flags_read_mask == chain_mask &&
+            instruction.x86_flags_write_mask == chain_mask && !instruction.lock_prefix;
+        if (valid) {
+            const auto flags = *read_flags;
+            const auto lhs = retag_expr(operands[0], integer_type(width));
+            const auto rhs = retag_expr(operands[1], integer_type(width));
+            const auto incoming_chain = boolean_binary("bit_extract", reg_expr(flags),
+                constant_expr(chain_bit, flags.width));
+            const auto carry_in = std::make_shared<Expression>(Expression{
+                integer_type(width), UnaryValue{"zext", incoming_chain}});
+            const auto partial = binary("add", lhs, rhs);
+            const auto value = binary("add", partial, carry_in);
+            const auto carry_out = boolean_binary("bool_or", boolean_binary("carry_add", lhs, rhs),
+                boolean_binary("carry_add", partial, carry_in));
+            const auto flags_width_mask = flags.width >= 64 ? UINT64_MAX
+                : (std::uint64_t{1} << flags.width) - 1;
+            const auto flags_without_chain = constant_expr(flags_width_mask & ~chain_mask, flags.width);
+            const auto chain_flag_value = std::make_shared<Expression>(Expression{
+                integer_type(flags.width), UnaryValue{"zext", carry_out}});
+            auto updated_flags = binary("or", binary("and", reg_expr(flags), flags_without_chain),
+                binary("shl", chain_flag_value, constant_expr(chain_bit, flags.width)));
+            Intrinsic effect{instruction.opcode == Opcode::adcx ? "x86_adcx" : "x86_adox",
+                {lhs, rhs, incoming_chain, reg_expr(flags)},
+                source_memory ? IntrinsicMemoryEffect::read : IntrinsicMemoryEffect::none};
+            effect.register_writes = instruction.register_writes;
+            effect.result_type = integer_type(width);
+            for (const auto written : effect.register_writes) {
+                if (destination_register && written == *destination_register) {
+                    effect.register_output_values.push_back(value);
+                } else if (destination_register && destination_register->width == 32 && written.bank == RegisterBank::gpr &&
+                           written.index == destination_register->index && written.width == 64 && !written.high_byte) {
+                    effect.register_output_values.push_back(std::make_shared<Expression>(Expression{
+                        integer_type(64), UnaryValue{"zext", value}}));
+                } else if (written == flags) {
+                    effect.register_output_values.push_back(updated_flags);
+                } else {
+                    effect.register_output_values.clear();
+                    break;
+                }
+            }
+            if (effect.register_output_values.size() == effect.register_writes.size()) return effect;
+        }
+        Intrinsic fallback{"x86_adx_unmodeled", operands,
+            destination_memory ? IntrinsicMemoryEffect::unknown
+                : source_memory ? IntrinsicMemoryEffect::read : IntrinsicMemoryEffect::none};
+        fallback.register_writes = instruction.register_writes;
+        return fallback;
+    }
     if (x86 && (instruction.opcode == Opcode::xchg || instruction.opcode == Opcode::xadd ||
                 instruction.opcode == Opcode::cmpxchg) &&
         instruction.operands.size() == 2) {

@@ -22,7 +22,11 @@ existing consumers and additionally set `x86_flags_read_mask` and
 `x86_flags_write_mask` to CF for ADCX or OF for ADOX. These optional masks let
 data-flow clients preserve the independence of the two chains. Runtime
 instruction execution, CPUID feature enforcement, and fused ADCX/ADOX sequence
-recovery are also outside this slice.
+recovery remain outside this slice. The decompiler now emits a typed arithmetic
+intrinsic with explicit modulo-width result and selected CF/OF output formulas;
+the other tracked FLAGS bits are carried through unchanged. Long-mode 32-bit
+destinations also define the full 64-bit register with zero extension, and the
+derived-cache version advances to invalidate records without that write effect.
 
 Encoding and flag behavior follow the [Intel 64 and IA-32 Architectures
 Software Developer's Manual, Volume 2](https://www.intel.com/content/dam/www/public/us/en/documents/manuals/64-ia-32-architectures-software-developer-vol-2a-manual.pdf).
