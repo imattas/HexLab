@@ -235,6 +235,10 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
         return names[static_cast<std::size_t>(op) - static_cast<std::size_t>(Opcode::mips_lwc1)];
     }
     switch (op) {
+    case Opcode::mips32_madd: return "madd";
+    case Opcode::mips32_maddu: return "maddu";
+    case Opcode::mips32_msub: return "msub";
+    case Opcode::mips32_msubu: return "msubu";
     case Opcode::mips64_jr_hb: return "jr.hb";
     case Opcode::mips64_jalr_hb: return "jalr.hb";
     case Opcode::mips64_c_cond_s: return "c.cond.s";

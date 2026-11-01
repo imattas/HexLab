@@ -4601,6 +4601,22 @@ a64_unhandled:
             effect.register_writes = {hi, lo};
             return effect;
         }
+        case Opcode::mips32_madd: case Opcode::mips32_maddu:
+        case Opcode::mips32_msub: case Opcode::mips32_msubu: {
+            if (operands.size() < 2) break;
+            const bool signed_operation = instruction.opcode == Opcode::mips32_madd ||
+                                          instruction.opcode == Opcode::mips32_msub;
+            const bool subtract = instruction.opcode == Opcode::mips32_msub ||
+                                  instruction.opcode == Opcode::mips32_msubu;
+            const char *name = subtract
+                ? (signed_operation ? "mips.msub.s32" : "mips.msub.u32")
+                : (signed_operation ? "mips.madd.s32" : "mips.madd.u32");
+            Intrinsic effect{name, {reg_expr(hi), reg_expr(lo),
+                                    typed_input(operands[0], signed_operation),
+                                    typed_input(operands[1], signed_operation)}, IntrinsicMemoryEffect::none};
+            effect.register_writes = {hi, lo};
+            return effect;
+        }
         case Opcode::mips_mfhi: case Opcode::mips_mflo: {
             if (instruction.operands.empty()) break;
             const auto destination = as_register(instruction.operands[0]);

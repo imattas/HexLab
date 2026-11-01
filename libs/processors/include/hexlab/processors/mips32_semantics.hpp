@@ -8,6 +8,7 @@
 namespace hexlab {
 
 enum class Mips32HiLoOperation { mult, multu, div, divu };
+enum class Mips32MultiplyAccumulateOperation { madd, maddu, msub, msubu };
 
 // MIPS32 SPECIAL2 MUL returns the low word of the 32x32-bit product. Signed
 // and unsigned products have identical low-word bits modulo 2^32.
@@ -25,6 +26,16 @@ struct Mips32HiLoResult {
 // architecture leaves those HI/LO values unpredictable/undefined.
 HEXLAB_PROCESSORS_EXPORT std::optional<Mips32HiLoResult>
 evaluate_mips32_hilo(Mips32HiLoOperation operation, std::uint32_t lhs, std::uint32_t rhs) noexcept;
+
+// Evaluate SPECIAL2 MADD/MADDU/MSUB/MSUBU against the current HI:LO pair.
+HEXLAB_PROCESSORS_EXPORT std::optional<Mips32HiLoResult>
+evaluate_mips32_multiply_accumulate(Mips32MultiplyAccumulateOperation operation,
+                                    std::uint32_t lhs, std::uint32_t rhs,
+                                    std::uint32_t hi, std::uint32_t lo) noexcept;
+HEXLAB_PROCESSORS_EXPORT std::optional<Mips32HiLoResult>
+evaluate_mips32_multiply_accumulate_instruction(const Instruction &instruction,
+                                                std::uint32_t lhs, std::uint32_t rhs,
+                                                std::uint32_t hi, std::uint32_t lo) noexcept;
 
 struct Mips32HiLoMoveResult {
     std::uint32_t hi = 0;

@@ -4,6 +4,7 @@
 #include <array>
 #include <bit>
 #include <cstdint>
+#include <vector>
 
 namespace hexlab {
 
@@ -39,6 +40,75 @@ std::optional<Mips32HiLoResult> evaluate_mips32_hilo(Mips32HiLoOperation operati
         return Mips32HiLoResult{lhs % rhs, lhs / rhs};
     }
     return {};
+}
+
+std::optional<Mips32HiLoResult>
+evaluate_mips32_multiply_accumulate(Mips32MultiplyAccumulateOperation operation,
+                                    std::uint32_t lhs, std::uint32_t rhs,
+                                    std::uint32_t hi, std::uint32_t lo) noexcept {
+    const auto accumulator = (static_cast<std::uint64_t>(hi) << 32) | lo;
+    std::uint64_t product = 0;
+    switch (operation) {
+    case Mips32MultiplyAccumulateOperation::madd:
+        product = std::bit_cast<std::uint64_t>(
+            static_cast<std::int64_t>(std::bit_cast<std::int32_t>(lhs)) *
+            static_cast<std::int64_t>(std::bit_cast<std::int32_t>(rhs)));
+        break;
+    case Mips32MultiplyAccumulateOperation::maddu:
+        product = static_cast<std::uint64_t>(lhs) * rhs;
+        break;
+    case Mips32MultiplyAccumulateOperation::msub:
+        product = std::bit_cast<std::uint64_t>(
+            static_cast<std::int64_t>(std::bit_cast<std::int32_t>(lhs)) *
+            static_cast<std::int64_t>(std::bit_cast<std::int32_t>(rhs)));
+        break;
+    case Mips32MultiplyAccumulateOperation::msubu:
+        product = static_cast<std::uint64_t>(lhs) * rhs;
+        break;
+    }
+    const bool subtract = operation == Mips32MultiplyAccumulateOperation::msub ||
+                          operation == Mips32MultiplyAccumulateOperation::msubu;
+    const auto result = subtract ? accumulator - product : accumulator + product;
+    return Mips32HiLoResult{static_cast<std::uint32_t>(result >> 32),
+                            static_cast<std::uint32_t>(result)};
+}
+
+std::optional<Mips32HiLoResult>
+evaluate_mips32_multiply_accumulate_instruction(const Instruction &instruction,
+                                                std::uint32_t lhs, std::uint32_t rhs,
+                                                std::uint32_t hi, std::uint32_t lo) noexcept {
+    if (instruction.context.architecture != Architecture::mips32 ||
+        instruction.context.mode != ExecutionMode::mips32 || instruction.length != 4 ||
+        instruction.flow != FlowKind::fallthrough || instruction.delay_slots != 0 ||
+        instruction.memory_read || instruction.memory_write || instruction.operands.size() != 2 ||
+        instruction.access != std::vector<OperandAccess>{OperandAccess::read, OperandAccess::read})
+        return {};
+    const auto *left = std::get_if<RegisterOperand>(&instruction.operands[0]);
+    const auto *right = std::get_if<RegisterOperand>(&instruction.operands[1]);
+    const RegisterOperand hi_reg{RegisterBank::mips_hilo, 0, 32, false};
+    const RegisterOperand lo_reg{RegisterBank::mips_hilo, 1, 32, false};
+    const auto valid_gpr = [](const RegisterOperand *reg) {
+        return reg && reg->bank == RegisterBank::mips_gpr && reg->index < 32 &&
+               reg->width == 32 && !reg->high_byte;
+    };
+    std::vector<RegisterOperand> reads;
+    if (valid_gpr(left) && left->index) reads.push_back(*left);
+    if (valid_gpr(right) && right->index) reads.push_back(*right);
+    reads.push_back(hi_reg);
+    reads.push_back(lo_reg);
+    if (!valid_gpr(left) || !valid_gpr(right) || instruction.register_reads != reads ||
+        instruction.register_writes != std::vector<RegisterOperand>{hi_reg, lo_reg} ||
+        (left->index == 0 && lhs != 0) || (right->index == 0 && rhs != 0))
+        return {};
+    Mips32MultiplyAccumulateOperation operation;
+    switch (instruction.opcode) {
+    case Opcode::mips32_madd: operation = Mips32MultiplyAccumulateOperation::madd; break;
+    case Opcode::mips32_maddu: operation = Mips32MultiplyAccumulateOperation::maddu; break;
+    case Opcode::mips32_msub: operation = Mips32MultiplyAccumulateOperation::msub; break;
+    case Opcode::mips32_msubu: operation = Mips32MultiplyAccumulateOperation::msubu; break;
+    default: return {};
+    }
+    return evaluate_mips32_multiply_accumulate(operation, lhs, rhs, hi, lo);
 }
 
 std::optional<Mips32HiLoMoveResult>

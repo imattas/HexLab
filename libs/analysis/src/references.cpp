@@ -2189,7 +2189,9 @@ RegisterReferenceFacts non_x86_producer_facts(
             const bool mips32_hilo_binary = architecture == Architecture::mips32 &&
                 (instruction.opcode == Opcode::mips_mult || instruction.opcode == Opcode::mips_multu ||
                  instruction.opcode == Opcode::mips_div || instruction.opcode == Opcode::mips_divu ||
-                 instruction.opcode == Opcode::mips_mul);
+                 instruction.opcode == Opcode::mips_mul || instruction.opcode == Opcode::mips32_madd ||
+                 instruction.opcode == Opcode::mips32_maddu || instruction.opcode == Opcode::mips32_msub ||
+                 instruction.opcode == Opcode::mips32_msubu);
             if (mips32_hilo_binary && address_definition) {
                 // This compact chain cannot represent two independent input
                 // branches without inventing an edge between them. Preserve
@@ -4668,6 +4670,44 @@ RegisterReferenceFacts mips_reference_facts(const Image *image, const Relocation
                         instruction.opcode == Opcode::mips_div ? Mips32HiLoOperation::div : Mips32HiLoOperation::divu;
                     folded = evaluate_mips32_hilo(operation, *lhs, *rhs);
                 }
+                if (valid) erase_written(); else registers.clear();
+                registers.erase(mips32_hi_key);
+                registers.erase(mips32_lo_key);
+                if (folded) {
+                    registers[mips32_hi_key] = Address{instruction.address.space, folded->hi};
+                    registers[mips32_lo_key] = Address{instruction.address.space, folded->lo};
+                    result.address_definitions.insert(fact->id);
+                }
+                propagated = true;
+            } else if (mips32 && (instruction.opcode == Opcode::mips32_madd ||
+                                  instruction.opcode == Opcode::mips32_maddu ||
+                                  instruction.opcode == Opcode::mips32_msub ||
+                                  instruction.opcode == Opcode::mips32_msubu)) {
+                const auto *left = architecture_register(instruction, 0, RegisterBank::mips_gpr, 32);
+                const auto *right = architecture_register(instruction, 1, RegisterBank::mips_gpr, 32);
+                const RegisterOperand hi{RegisterBank::mips_hilo, 0, 32, false};
+                const RegisterOperand lo{RegisterBank::mips_hilo, 1, 32, false};
+                std::vector<RegisterOperand> reads;
+                if (left && left->index) reads.push_back(*left);
+                if (right && right->index) reads.push_back(*right);
+                reads.push_back(hi);
+                reads.push_back(lo);
+                const bool valid = mips32_scalar_form() && instruction.operands.size() == 2 && left && right &&
+                    left->index < 32 && right->index < 32 && !left->high_byte && !right->high_byte &&
+                    instruction.access == std::vector<OperandAccess>{OperandAccess::read, OperandAccess::read} &&
+                    instruction.register_reads == reads && instruction.register_writes == std::vector<RegisterOperand>{hi, lo};
+                const auto lhs = valid ? mips32_gpr_value(left) : std::optional<std::uint32_t>{};
+                const auto rhs = valid ? mips32_gpr_value(right) : std::optional<std::uint32_t>{};
+                const auto hi_value = registers.find(mips32_hi_key);
+                const auto lo_value = registers.find(mips32_lo_key);
+                const bool known_accumulator = hi_value != registers.end() && lo_value != registers.end() &&
+                    hi_value->second.space == instruction.address.space && lo_value->second.space == instruction.address.space &&
+                    hi_value->second.offset <= UINT32_MAX && lo_value->second.offset <= UINT32_MAX;
+                std::optional<Mips32HiLoResult> folded;
+                if (valid && lhs && rhs && known_accumulator)
+                    folded = evaluate_mips32_multiply_accumulate_instruction(instruction, *lhs, *rhs,
+                        static_cast<std::uint32_t>(hi_value->second.offset),
+                        static_cast<std::uint32_t>(lo_value->second.offset));
                 if (valid) erase_written(); else registers.clear();
                 registers.erase(mips32_hi_key);
                 registers.erase(mips32_lo_key);

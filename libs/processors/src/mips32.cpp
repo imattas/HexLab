@@ -185,7 +185,21 @@ DecodeResult decode_mips32(ByteOrder order, std::span<const std::byte> bytes, Ad
         if (rs) i.register_reads.push_back(reg(rs));
         if (rt) i.register_writes = {reg(rt)};
     } else if (op == 0x1c) {
-        // MIPS32 Release 2 SPECIAL2 low-word multiply and count-leading ops.
+        // MIPS32 Release 2 SPECIAL2 multiply-accumulate, low-word multiply,
+        // and count-leading ops.
+        if (funct == 0x00 || funct == 0x01 || funct == 0x04 || funct == 0x05) {
+            if (rd != 0 || shamt != 0) return invalid("Reserved MIPS32 multiply-accumulate encoding");
+            i.opcode = funct == 0x00 ? Opcode::mips32_madd : funct == 0x01 ? Opcode::mips32_maddu :
+                       funct == 0x04 ? Opcode::mips32_msub : Opcode::mips32_msubu;
+            i.operands = {reg(rs), reg(rt)};
+            i.access = {OperandAccess::read, OperandAccess::read};
+            if (rs) i.register_reads.push_back(reg(rs));
+            if (rt) i.register_reads.push_back(reg(rt));
+            i.register_reads.push_back(hilo(0));
+            i.register_reads.push_back(hilo(1));
+            i.register_writes = {hilo(0), hilo(1)};
+            return {DecodeStatus::decoded, std::move(i), {}};
+        }
         if (funct == 0x02) {
             if (shamt != 0) return invalid("Reserved MIPS32 MUL encoding");
             i.opcode = Opcode::mips_mul;
