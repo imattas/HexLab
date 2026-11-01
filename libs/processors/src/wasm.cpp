@@ -227,7 +227,6 @@ DecodeResult decode_wasm(std::span<const std::byte> bytes, Address at) {
             {0x9e, "i16x8.extmul_low_i8x16_u"}, {0x9f, "i16x8.extmul_high_i8x16_u"},
             {0xa7, "i32x4.extend_low_i16x8_s"}, {0xa8, "i32x4.extend_high_i16x8_s"},
             {0xa9, "i32x4.extend_low_i16x8_u"}, {0xaa, "i32x4.extend_high_i16x8_u"},
-            {0xba, "i32x4.dot_i16x8_s"},
             {0xbc, "i32x4.extmul_low_i16x8_s"}, {0xbd, "i32x4.extmul_high_i16x8_s"},
             {0xbe, "i32x4.extmul_low_i16x8_u"}, {0xbf, "i32x4.extmul_high_i16x8_u"},
             {0xc7, "i64x2.extend_low_i32x4_s"}, {0xc8, "i64x2.extend_high_i32x4_s"},

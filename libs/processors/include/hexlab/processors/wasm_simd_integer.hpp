@@ -35,7 +35,8 @@ inline std::optional<WasmSimdIntegerBinaryOp> wasm_simd_integer_binary_op(
         {0xb6, "i32x4.min_s", 32, "min_s"}, {0xb7, "i32x4.min_u", 32, "min_u"},
         {0xb8, "i32x4.max_s", 32, "max_s"}, {0xb9, "i32x4.max_u", 32, "max_u"},
         {0x7b, "i8x16.avgr_u", 8, "avgr_u"}, {0x9b, "i16x8.avgr_u", 16, "avgr_u"},
-        {0x82, "i16x8.q15mulr_sat_s", 16, "q15mulr_sat_s"}};
+        {0x82, "i16x8.q15mulr_sat_s", 16, "q15mulr_sat_s"},
+        {0xba, "i32x4.dot_i16x8_s", 16, "dot_i16x8_s"}};
     for (const auto &operation : operations)
         if (operation.subopcode == subopcode) return operation;
     return std::nullopt;

@@ -1129,11 +1129,17 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
                     continue;
                 }
                 if (subopcode && wasm_simd_integer_binary_op(*subopcode)) {
+                    if (*subopcode == 0xba &&
+                        (!code[n]->instruction.operands.empty() ||
+                         code[n]->instruction.mnemonic_override != "i32x4.dot_i16x8_s"))
+                        return unsupported("SIMD dot-product opcode metadata is inconsistent");
                     auto right = shape_pop(stack, vector(128));
                     auto left = shape_pop(stack, vector(128));
                     if (!right) return right.error();
                     if (!left) return left.error();
-                    stack.push_back(vector(128));
+                    const auto result_type = *subopcode == 0xba
+                        ? vector(128, TypeKind::integer, 32, 4, true) : vector(128);
+                    stack.push_back(result_type);
                     continue;
                 }
                 if (subopcode && simd_integer_shift(*subopcode)) {
@@ -2081,12 +2087,17 @@ Result<LiftedFunction> lift_wasm_function(const FunctionRecord &function, const 
                         continue;
                     }
                     if (const auto operation = wasm_simd_integer_binary_op(*subopcode)) {
+                        if (*subopcode == 0xba &&
+                            (!i.operands.empty() || i.mnemonic_override != operation->name))
+                            return unsupported("SIMD dot-product opcode metadata is inconsistent");
                         auto right = pop(vector(128));
                         auto left = pop(vector(128));
                         if (!right) return right.error();
                         if (!left) return left.error();
                         // Generic 128-bit arithmetic would introduce cross-lane carries.
-                        stack.push_back(binary(std::string(operation->name), left.value(), right.value(), vector(128)));
+                        const auto result_type = *subopcode == 0xba
+                            ? vector(128, TypeKind::integer, 32, 4, true) : vector(128);
+                        stack.push_back(binary(std::string(operation->name), left.value(), right.value(), result_type));
                         continue;
                     }
                     if (const auto operation = simd_integer_shift(*subopcode)) {

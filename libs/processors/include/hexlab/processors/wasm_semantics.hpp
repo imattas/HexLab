@@ -59,6 +59,19 @@ inline std::optional<WasmV128> evaluate_wasm_simd_integer_binary_instruction(
             -static_cast<std::int64_t>((mask - value) + 1) : static_cast<std::int64_t>(value);
     };
     WasmV128 result{};
+    if (info->operation == "dot_i16x8_s") {
+        for (unsigned lane = 0; lane < 4; ++lane) {
+            const auto left_offset = lane * 4;
+            const auto first_left = signed_lane(read(lhs, left_offset));
+            const auto second_left = signed_lane(read(lhs, left_offset + 2));
+            const auto first_right = signed_lane(read(rhs, left_offset));
+            const auto second_right = signed_lane(read(rhs, left_offset + 2));
+            const auto dot = static_cast<std::uint32_t>(first_left * first_right + second_left * second_right);
+            for (unsigned index = 0; index < 4; ++index)
+                result[lane * 4 + index] = static_cast<std::uint8_t>(dot >> (index * 8));
+        }
+        return result;
+    }
     for (unsigned offset = 0; offset < 16; offset += bytes) {
         const auto a = read(lhs, offset), b = read(rhs, offset);
         const auto operation = info->operation;
