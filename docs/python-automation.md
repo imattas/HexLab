@@ -82,9 +82,10 @@ cannot silently replace that API.
 
 `Project.recognize_flirt_catalogs()` runs a read-only recovered-function scan
 over an ordered sequence of `(catalog_bytes, provenance)` pairs. Each catalog
-may be FLAIR text, gzip-wrapped `.pat.gz`, or binary IDASGN v5-v10 data. Input
-order and duplicates are retained; result candidates include their zero-based
-`catalog_index`, provenance, symbol kind, name, and matching-pattern count.
+may be FLAIR text, gzip-wrapped `.pat.gz`, or binary IDASGN v5-v10 data. The
+sequence and each pair may be a list or tuple. Order and duplicates are
+retained; result candidates include their zero-based `catalog_index`,
+provenance, symbol kind, name, and matching-pattern count.
 The result reports completeness, candidate/comparison counts, and explicit
 ambiguity. Recognition does not rename functions or persist evidence.
 

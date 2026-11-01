@@ -182,16 +182,17 @@ automatic library naming remain future work.
 ## FLAIR text patterns
 
 The desktop **Analysis > Scan FLAIR Catalogs and Browse Results...** workflow
-accepts an ordered selection of up to 256 `.pat`, gzip-wrapped `.pat.gz`, and
-binary `.sig` catalogs (versions 5-10), then scans the active writable
-project's recovered functions in one bounded recognition pass. Aggregate
+accepts up to 256 `.pat`, gzip-wrapped `.pat.gz`, and binary `.sig` catalogs
+(versions 5-10). Add files to the list and use **Move Up** or **Move Down** to
+choose scan order; adding the same file again retains a separate catalog entry.
+The workflow then scans the active writable project's recovered functions in
+one bounded recognition pass. Aggregate
 catalog inputs and inflated bodies are each capped at 64 MiB; the set is
 capped at 65,536 patterns. Format dispatch uses IDASGN and gzip magic bytes;
 otherwise input is parsed as FLAIR text. Candidates retain their zero-based
 catalog index and per-file provenance, including across duplicate catalogs.
 Set order and raw catalog contents contribute to the persisted evidence
-identity. Its
-results dialog reports catalog provenance, parsed pattern count, target, scan
+identity. Its results dialog reports catalog provenance, parsed pattern count, target, scan
 completeness, and work counters, then lists up to 2,000 matching function
 entries with candidate names, provenance, and ambiguity status. Select a row
 and choose **Go to Selected Function**, or activate the row, to navigate to that

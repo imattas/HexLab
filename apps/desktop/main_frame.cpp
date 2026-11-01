@@ -76,6 +76,7 @@
 #include <wx/textctrl.h>
 #include <wx/timer.h>
 #include <wx/dialog.h>
+#include <wx/listbox.h>
 #include <wx/listctrl.h>
 #include <wx/valnum.h>
 #include <wx/window.h>
@@ -1126,18 +1127,93 @@ struct MainFrame::Impl {
                          "FLAIR signatures", wxOK | wxICON_INFORMATION, &frame);
             return;
         }
-        wxFileDialog picker(&frame, "Scan FLAIR signature catalog", {}, {},
-                            "FLAIR catalogs (*.pat;*.pat.gz;*.sig)|*.pat;*.pat.gz;*.sig|All files (*.*)|*.*",
-                            wxFD_OPEN | wxFD_FILE_MUST_EXIST | wxFD_MULTIPLE);
-        if (picker.ShowModal() != wxID_OK) return;
-        wxArrayString selected_paths;
-        picker.GetPaths(selected_paths);
-        if (selected_paths.empty()) return;
-        if (selected_paths.size() > 256) {
-            wxMessageBox("Select at most 256 FLAIR catalogs.", "FLAIR signatures",
-                         wxOK | wxICON_INFORMATION, &frame);
-            return;
-        }
+        wxDialog catalog_dialog(&frame, wxID_ANY, "FLAIR catalogs", wxDefaultPosition, wxDefaultSize,
+                                wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER);
+        catalog_dialog.SetName("flair-catalog-order-dialog");
+        auto *catalog_layout = new wxBoxSizer(wxVERTICAL);
+        catalog_layout->Add(new wxStaticText(&catalog_dialog, wxID_ANY,
+            "Catalogs are scanned in the order shown. Add a file again to include it more than once."),
+            0, wxEXPAND | wxALL, catalog_dialog.FromDIP(8));
+        auto *catalog_row = new wxBoxSizer(wxHORIZONTAL);
+        auto *catalog_list = new wxListBox(&catalog_dialog, wxID_ANY);
+        catalog_list->SetName("flair-catalog-order-list");
+        catalog_list->SetMinSize(catalog_dialog.FromDIP(wxSize(560, 220)));
+        catalog_row->Add(catalog_list, 1, wxEXPAND | wxRIGHT, catalog_dialog.FromDIP(8));
+        auto *catalog_controls = new wxBoxSizer(wxVERTICAL);
+        auto *add_catalog = new wxButton(&catalog_dialog, wxID_ANY, "Add...");
+        auto *remove_catalog = new wxButton(&catalog_dialog, wxID_ANY, "Remove");
+        auto *move_catalog_up = new wxButton(&catalog_dialog, wxID_ANY, "Move Up");
+        auto *move_catalog_down = new wxButton(&catalog_dialog, wxID_ANY, "Move Down");
+        add_catalog->SetName("flair-catalog-add");
+        remove_catalog->SetName("flair-catalog-remove");
+        move_catalog_up->SetName("flair-catalog-up");
+        move_catalog_down->SetName("flair-catalog-down");
+        for (auto *button : {add_catalog, remove_catalog, move_catalog_up, move_catalog_down})
+            catalog_controls->Add(button, 0, wxEXPAND | wxBOTTOM, catalog_dialog.FromDIP(6));
+        catalog_row->Add(catalog_controls, 0, wxEXPAND);
+        catalog_layout->Add(catalog_row, 1, wxEXPAND | wxLEFT | wxRIGHT, catalog_dialog.FromDIP(8));
+        auto *catalog_buttons = new wxBoxSizer(wxHORIZONTAL);
+        auto *scan_catalogs = new wxButton(&catalog_dialog, wxID_OK, "Scan");
+        auto *cancel_catalogs = new wxButton(&catalog_dialog, wxID_CANCEL, "Cancel");
+        scan_catalogs->SetName("flair-catalog-scan");
+        catalog_buttons->Add(scan_catalogs, 0, wxRIGHT, catalog_dialog.FromDIP(8));
+        catalog_buttons->Add(cancel_catalogs, 0);
+        catalog_layout->Add(catalog_buttons, 0, wxALIGN_RIGHT | wxALL, catalog_dialog.FromDIP(8));
+        catalog_dialog.SetSizerAndFit(catalog_layout);
+        catalog_dialog.SetMinSize(catalog_dialog.FromDIP(wxSize(650, 330)));
+        catalog_dialog.CentreOnParent();
+        std::vector<wxString> selected_paths;
+        const auto refresh_catalog_controls = [&] {
+            const auto selection = catalog_list->GetSelection();
+            const bool selected = selection != wxNOT_FOUND;
+            remove_catalog->Enable(selected);
+            move_catalog_up->Enable(selected && selection > 0);
+            move_catalog_down->Enable(selected && static_cast<std::size_t>(selection + 1) < selected_paths.size());
+            scan_catalogs->Enable(!selected_paths.empty());
+        };
+        const auto show_catalogs = [&](int selection) {
+            catalog_list->Clear();
+            for (const auto &path : selected_paths) catalog_list->Append(path);
+            if (selection >= 0 && static_cast<std::size_t>(selection) < selected_paths.size())
+                catalog_list->SetSelection(selection);
+            refresh_catalog_controls();
+        };
+        catalog_list->Bind(wxEVT_LISTBOX, [&](wxCommandEvent &) { refresh_catalog_controls(); });
+        add_catalog->Bind(wxEVT_BUTTON, [&](wxCommandEvent &) {
+            wxFileDialog picker(&catalog_dialog, "Add FLAIR signature catalogs", {}, {},
+                                "FLAIR catalogs (*.pat;*.pat.gz;*.sig)|*.pat;*.pat.gz;*.sig|All files (*.*)|*.*",
+                                wxFD_OPEN | wxFD_FILE_MUST_EXIST | wxFD_MULTIPLE);
+            if (picker.ShowModal() != wxID_OK) return;
+            wxArrayString paths;
+            picker.GetPaths(paths);
+            if (paths.size() > 256 - selected_paths.size()) {
+                wxMessageBox("The list can contain at most 256 FLAIR catalogs.", "FLAIR signatures",
+                             wxOK | wxICON_INFORMATION, &catalog_dialog);
+                return;
+            }
+            const auto first_added = static_cast<int>(selected_paths.size());
+            for (const auto &path : paths) selected_paths.push_back(path);
+            show_catalogs(first_added);
+        });
+        remove_catalog->Bind(wxEVT_BUTTON, [&](wxCommandEvent &) {
+            const auto selection = catalog_list->GetSelection();
+            if (selection == wxNOT_FOUND) return;
+            selected_paths.erase(selected_paths.begin() + selection);
+            show_catalogs(selected_paths.empty() ? wxNOT_FOUND :
+                std::min(selection, static_cast<int>(selected_paths.size() - 1)));
+        });
+        const auto move_catalog = [&](int delta) {
+            const auto selection = catalog_list->GetSelection();
+            const auto target = selection + delta;
+            if (selection == wxNOT_FOUND || target < 0 || static_cast<std::size_t>(target) >= selected_paths.size())
+                return;
+            std::swap(selected_paths[static_cast<std::size_t>(selection)], selected_paths[static_cast<std::size_t>(target)]);
+            show_catalogs(target);
+        };
+        move_catalog_up->Bind(wxEVT_BUTTON, [&](wxCommandEvent &) { move_catalog(-1); });
+        move_catalog_down->Bind(wxEVT_BUTTON, [&](wxCommandEvent &) { move_catalog(1); });
+        refresh_catalog_controls();
+        if (catalog_dialog.ShowModal() != wxID_OK || selected_paths.empty()) return;
         std::vector<std::filesystem::path> catalog_paths;
         catalog_paths.reserve(selected_paths.size());
         for (const auto &path : selected_paths)

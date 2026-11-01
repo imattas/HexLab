@@ -34,8 +34,9 @@ format; callers parse each `.pat`, `.pat.gz`, or `.sig` independently. The CLI
 accepts one catalog with `--definitions` or an ordered catalog list with
 `--definitions-list`; both commands share aggregate input, pattern, candidate,
 comparison, and result limits. The desktop **Scan FLAIR Catalogs and Browse
-Results...** command also accepts an ordered multi-file selection and stores
-one evidence result for the entire set. The Python automation API accepts
+Results...** command provides an ordered list: files can be added repeatedly,
+removed, or moved before one evidence result is stored for the entire set.
+The Python automation API accepts
 ordered `(bytes, provenance)` pairs through `Project.recognize_flirt_catalogs()`
 and returns detached candidates without persisting evidence. Candidate
 `catalog_index` values refer to input order, starting at zero. Neither the

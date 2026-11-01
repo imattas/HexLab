@@ -284,8 +284,9 @@ Result<FlirtRecognition> Project::recognize_flirt_catalogs(
         if (stop.stop_requested()) return Error{ErrorCode::canceled,"FLAIR recognition canceled"};
         FlirtCatalogLimits limits;
         limits.max_bytes = static_cast<std::size_t>(max_input_bytes - consumed_input_bytes);
+        const auto remaining_inflated_bytes = limits.max_inflated_bytes - inflated_bytes;
         limits.max_inflated_bytes = static_cast<std::size_t>(std::max<std::uint64_t>(
-            1, limits.max_inflated_bytes - inflated_bytes));
+            1, remaining_inflated_bytes));
         limits.max_patterns = static_cast<std::size_t>(std::min<std::uint64_t>(
             limits.max_patterns, recognition_limits.max_patterns - pattern_count));
         const auto bytes = std::span<const std::byte>(input.bytes);
@@ -301,7 +302,7 @@ Result<FlirtRecognition> Project::recognize_flirt_catalogs(
             parsed = parse_flirt_pat(data,image.layout().architecture,image.layout().mode,
                                      input.provenance,limits,stop);
         if (!parsed) return parsed.error();
-        if (parsed.value().inflated_body_bytes > limits.max_inflated_bytes)
+        if (parsed.value().inflated_body_bytes > remaining_inflated_bytes)
             return Error{ErrorCode::resource_limit,"FLAIR catalogs exceed aggregate inflated-byte limit"};
         if (parsed.value().patterns.size() > recognition_limits.max_patterns - pattern_count)
             return Error{ErrorCode::resource_limit,"FLAIR catalogs exceed aggregate pattern limit"};

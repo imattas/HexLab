@@ -1110,8 +1110,11 @@ PyObject* call_project(PyObject*,PyObject* args){return guarded([&]()->PyObject*
         constexpr std::uint64_t max_catalog_bytes=64u*1024u*1024u;
         for(Py_ssize_t index=0;index<selected_count;++index){
             Object item(PySequence_GetItem(selection,index));
-            if(!PyTuple_Check(item)||PyTuple_Size(item)!=2)invalid("each catalog must be a (bytes, provenance) tuple");
-            PyObject *data=PyTuple_GetItem(item,0), *provenance_object=PyTuple_GetItem(item,1);
+            const bool tuple=PyTuple_Check(item);
+            if((!tuple&&!PyList_Check(item))||(tuple?PyTuple_Size(item):PyList_Size(item))!=2)
+                invalid("each catalog must be a (bytes, provenance) pair");
+            PyObject *data=tuple?PyTuple_GetItem(item,0):PyList_GetItem(item,0);
+            PyObject *provenance_object=tuple?PyTuple_GetItem(item,1):PyList_GetItem(item,1);
             if(!PyBytes_Check(data))invalid("catalog contents must be bytes");
             char *raw=nullptr;Py_ssize_t raw_size=0;
             if(PyBytes_AsStringAndSize(data,&raw,&raw_size)<0)throw PythonFailure{};
