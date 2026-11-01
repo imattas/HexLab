@@ -20,6 +20,29 @@ ELF files that use DWARF v5 supplementary type references can take an explicitly
 
 The selected path is persisted in the project load recipe. The loader validates the `.debug_sup` checksum and package type index; it never follows a filename from DWARF metadata. See [DWARF v5 import](dwarf-v5-import.md) for the supported subset.
 
+DWARF v5 programs using split debug information can select a DWP companion with
+an arbitrary local filename or location instead of relying on the adjacent
+`<binary>.dwp` convention:
+
+```powershell
+./hexlab_cli.exe inspect app --dwarf-split-package symbols/build.dwp
+./hexlab_cli.exe project create app.hxproj --input app --dwarf-split-package symbols/build.dwp
+```
+
+The shared open path resolves the selected filename to an absolute path and
+persists it in the project recipe. Before import, the package must be an ELF
+relocatable object with the primary input's machine, ELF class and byte order,
+and its CU index must supply nonempty INFO and ABBREV contributions for every
+retained primary skeleton DWO ID. Missing skeleton IDs, mismatched identities,
+missing contributions, and packages larger than 64 MiB fail the open explicitly.
+The package contents participate in the analysis fingerprint on every reopen.
+Content hashes before identity checking and after import must agree; a package
+that changes during the open is rejected.
+This option can be combined with `--dwarf-supplementary-package` when the ELF
+also needs a separately checksum-verified supplementary object. It uses the
+existing bounded DWP importer; unsupported debug data still produces its normal
+diagnostics. It does not search directories or download symbols.
+
 Segmented raw inputs use `--format raw --profile mapping.profile`; see [x86 profiles](x86-profiles.md). Project commands accept `seg:<selector>:<offset>` with hexadecimal coordinates resolved against the embedded profile. Domain identity remains separate from canonical file offsets.
 
 Portable types, source origins, and symbolic assignments can be exchanged with `project types export/import`; `project types verify` checks a bundle without opening a project. `project types export-header` writes supported definitions as an atomic C11 header and rejects existing outputs unless `--replace` is supplied. HXTL v6 file-offset assignments require an exact binary size and SHA-256 match; on mismatch or older bundles without that identity, definitions still import while assignments are skipped. Virtual-address assignments also require matching source and recipe identity. See [type libraries](type-library.md) for identity and conflict options.

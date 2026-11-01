@@ -1153,6 +1153,7 @@ void project_usage(std::ostream &out) {
            "        --slice <index> selects a Mach-O universal slice (auto or macho only)\n"
            "        PE: --pdb <file> selects a local PDB; --pdb-search <directory> adds a local search directory\n"
            "        ELF: --dwarf-supplementary-package <file> selects an explicit DWARF v5 supplementary DWP\n"
+           "             --dwarf-split-package <file> selects an exact-ID split-DWARF DWP companion\n"
            "        raw requires --arch x86-32|x86-64|a64|6502|65c02|rv32|rv32c|rv64|rv64c|mips64|ppc32le|ppc32be|ppc64le|ppc64be --base <address> [--entry <address>]\n"
            "        or --profile <file> for segmented x86-16/32 (replaces arch/base/entry)\n"
            "        or --arm-profile <file> for ARM/Thumb/data declarations\n"

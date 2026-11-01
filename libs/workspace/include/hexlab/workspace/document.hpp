@@ -37,6 +37,8 @@ struct OpenRequest {
     // session whose image came from a plugin provider. When present, the
     // recipe is validated and used without probing for a replacement provider.
     std::optional<LoadRecipe> resolved_recipe;
+    // Explicit split-DWARF DWP companion, persisted after absolute-path resolution.
+    std::optional<std::filesystem::path> dwarf_split_debug_package_path;
 };
 struct DocumentSnapshot {
     DocumentId id{0};

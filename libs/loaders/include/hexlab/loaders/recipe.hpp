@@ -30,6 +30,9 @@ struct LoadRecipe {
     // Appended to preserve existing positional aggregate initializers.
     std::vector<std::filesystem::path> minidump_pdb_paths;
     bool minidump_pdb_search_truncated = false;
+    // Exact caller-selected split-DWARF package. Its CU index must cover all
+    // retained primary skeleton DWO IDs before any contribution is imported.
+    std::optional<std::filesystem::path> dwarf_split_debug_package_path;
 };
 using PluginImageLoader = std::function<Result<LoadedImage>(
     std::shared_ptr<const ByteStorage>, std::stop_token)>;

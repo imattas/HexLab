@@ -231,7 +231,8 @@ bool valid(const LoadRecipe &recipe) {
         return false;
     if (recipe.format == Format::plugin)
         return recipe.plugin && valid_plugin_identity(*recipe.plugin) && !recipe.raw && !recipe.macho &&
-               !recipe.pdb_path && !recipe.pe_runtime_architecture && !recipe.dwarf_supplementary_package_path;
+               !recipe.pdb_path && !recipe.pe_runtime_architecture && !recipe.dwarf_supplementary_package_path &&
+               !recipe.dwarf_split_debug_package_path;
     if (recipe.plugin) return false;
     if (recipe.dwarf_supplementary_package_path &&
         (recipe.format != Format::elf || recipe.dwarf_supplementary_package_path->empty() ||
@@ -240,6 +241,12 @@ bool valid(const LoadRecipe &recipe) {
         return false;
     if (recipe.dwarf_supplementary_package_path &&
         recipe.dwarf_supplementary_package_path->u8string().size() > 32768)
+        return false;
+    if (recipe.dwarf_split_debug_package_path &&
+        (recipe.format != Format::elf || recipe.dwarf_split_debug_package_path->empty() ||
+         recipe.dwarf_split_debug_package_path->native().find(std::filesystem::path::value_type{}) !=
+             recipe.dwarf_split_debug_package_path->native().npos ||
+         recipe.dwarf_split_debug_package_path->u8string().size() > 32768))
         return false;
     if (recipe.pe_runtime_architecture && recipe.format != Format::pe)
         return false;
@@ -402,6 +409,18 @@ Result<std::vector<std::byte>> encode_recipe(const LoadRecipe &recipe) {
                 integer(out, *selected, 4);
             return out;
         }
+        if (recipe.format == Format::elf && recipe.dwarf_split_debug_package_path) {
+            const auto flags = recipe.dwarf_supplementary_package_path ? 3u : 2u;
+            std::vector<std::byte> out{std::byte{3}, std::byte{0}, std::byte{17}, std::byte(flags)};
+            for (const auto *path : {&recipe.dwarf_supplementary_package_path,
+                                     &recipe.dwarf_split_debug_package_path}) {
+                if (!*path) continue;
+                const auto encoded = (*path)->u8string();
+                integer(out, encoded.size(), 4);
+                for (auto c : encoded) out.push_back(std::byte(static_cast<unsigned char>(c)));
+            }
+            return out;
+        }
         if (recipe.format == Format::elf && recipe.dwarf_supplementary_package_path) {
             const auto encoded = recipe.dwarf_supplementary_package_path->u8string();
             if (encoded.empty() || encoded.size() > 32768)
@@ -467,6 +486,36 @@ Result<std::vector<std::byte>> encode_recipe(const LoadRecipe &recipe) {
     }
 }
 Result<LoadRecipe> decode_recipe(std::span<const std::byte> bytes) {
+    if (bytes.size() >= 4 && bytes[0] == std::byte{3} && bytes[1] == std::byte{0} &&
+        bytes[2] == std::byte{17}) {
+        const auto flags = std::to_integer<unsigned>(bytes[3]);
+        if (flags != 2 && flags != 3)
+            return Error{ErrorCode::malformed, "Invalid ELF/DWARF package recipe flags"};
+        LoadRecipe recipe{Format::elf, {}};
+        std::size_t position = 4;
+        for (const auto bit : {1u, 2u}) {
+            if (!(flags & bit)) continue;
+            if (bytes.size() - position < 4)
+                return Error{ErrorCode::malformed, "Truncated ELF/DWARF package recipe path"};
+            std::uint64_t size = 0;
+            for (std::size_t i = 0; i < 4; ++i)
+                size = (size << 8) | std::to_integer<unsigned>(bytes[position++]);
+            if (!size || size > 32768 || size > bytes.size() - position)
+                return Error{ErrorCode::malformed, "Invalid ELF/DWARF package recipe path extent"};
+            std::u8string encoded;
+            encoded.reserve(static_cast<std::size_t>(size));
+            for (std::size_t i = 0; i < size; ++i)
+                encoded.push_back(char8_t(std::to_integer<unsigned char>(bytes[position++])));
+            auto path = std::filesystem::path(encoded);
+            if (path.empty() || path.native().find(std::filesystem::path::value_type{}) != path.native().npos)
+                return Error{ErrorCode::malformed, "Invalid ELF/DWARF package recipe path"};
+            (bit == 1 ? recipe.dwarf_supplementary_package_path : recipe.dwarf_split_debug_package_path) =
+                std::move(path);
+        }
+        if (position != bytes.size() || !valid(recipe))
+            return Error{ErrorCode::malformed, "Invalid ELF/DWARF package recipe extent"};
+        return recipe;
+    }
     if (bytes.size() >= 7 && bytes[0] == std::byte{2} && bytes[1] == std::byte{0} &&
         bytes[2] == std::byte{17}) {
         std::uint64_t size = 0;
@@ -706,7 +755,7 @@ Result<LoadRecipe> resolve_load_recipe(const ByteStorage &storage, const LoadRec
         if (!plugin) return plugin.error();
         if (plugin.value()) {
             if (recipe.macho || recipe.pdb_path || recipe.pe_runtime_architecture ||
-                recipe.dwarf_supplementary_package_path)
+                recipe.dwarf_supplementary_package_path || recipe.dwarf_split_debug_package_path)
                 return Error{ErrorCode::invalid_argument, "Built-in loader options cannot be applied to a plugin image"};
             LoadRecipe selected{Format::plugin, {}};
             selected.plugin = std::move(*plugin.value());
@@ -717,6 +766,9 @@ Result<LoadRecipe> resolve_load_recipe(const ByteStorage &storage, const LoadRec
             return detected.error();
         if (recipe.pdb_path && detected.value() != DetectedFormat::pe_candidate)
             return Error{ErrorCode::invalid_argument, "A local PDB can only be selected for a PE input"};
+        if ((recipe.dwarf_supplementary_package_path || recipe.dwarf_split_debug_package_path) &&
+            detected.value() != DetectedFormat::elf_candidate)
+            return Error{ErrorCode::invalid_argument, "DWARF packages require an ELF input"};
         if (detected.value() == DetectedFormat::macho_candidate) {
             if (recipe.pe_runtime_architecture)
                 return Error{ErrorCode::invalid_argument, "PE runtime architecture selection requires a PE input"};
@@ -735,10 +787,9 @@ Result<LoadRecipe> resolve_load_recipe(const ByteStorage &storage, const LoadRec
         if (detected.value() == DetectedFormat::elf_candidate) {
             LoadRecipe selected{Format::elf, {}};
             selected.dwarf_supplementary_package_path = recipe.dwarf_supplementary_package_path;
+            selected.dwarf_split_debug_package_path = recipe.dwarf_split_debug_package_path;
             return selected;
         }
-        if (recipe.dwarf_supplementary_package_path)
-            return Error{ErrorCode::invalid_argument, "DWARF supplementary package requires an ELF input"};
         if (detected.value() == DetectedFormat::wasm_candidate)
             return LoadRecipe{Format::wasm, {}};
         if (detected.value() == DetectedFormat::dex_candidate)
@@ -808,7 +859,8 @@ Result<LoadedImage> load_image(std::shared_ptr<const ByteStorage> storage, const
     // Split-package discovery uses only the primary input's basename plus
     // `.dwp`; DW_AT_dwo_name and DW_AT_comp_dir are never used as paths.
     if (file_storage && resolved.value().format == Format::elf &&
-        !resolved.value().dwarf_supplementary_package_path && !supplementary_selected) {
+        !resolved.value().dwarf_supplementary_package_path && !supplementary_selected &&
+        !resolved.value().dwarf_split_debug_package_path) {
         const auto candidate = discover_local_split_dwp(file_storage->backing_path());
         bool split_package_selected = false;
         if (candidate) {
@@ -932,14 +984,46 @@ Result<LoadedImage> load_durable_image(std::shared_ptr<const ByteStorage> storag
         return loaded;
     }
     if (recipe.format == Format::elf) {
-        if (!recipe.dwarf_supplementary_package_path)
+        if (!recipe.dwarf_supplementary_package_path && !recipe.dwarf_split_debug_package_path)
             return load_elf(std::move(storage), stop);
-        auto package = FileStorage::open(*recipe.dwarf_supplementary_package_path);
-        if (!package) return package.error();
         ElfLoadOptions options;
-        options.dwarf_supplementary_package = std::move(package.value());
+        std::optional<Sha256Digest> split_package_fingerprint;
+        if (recipe.dwarf_split_debug_package_path) {
+            auto primary = load_elf(storage, stop);
+            if (!primary) return primary.error();
+            const auto *metadata = primary.value().metadata.elf ? &*primary.value().metadata.elf : nullptr;
+            if (!metadata || !metadata->dwarf_info || metadata->dwarf_info->split_dwo_ids.empty())
+                return Error{ErrorCode::invalid_argument,
+                    "Selected split-debug DWP requires primary ELF skeleton DWO IDs"};
+            auto package = FileStorage::open(*recipe.dwarf_split_debug_package_path);
+            if (!package) return package.error();
+            if (package.value()->size() > UINT64_C(64) * 1024 * 1024)
+                return Error{ErrorCode::resource_limit, "Selected split-debug DWP exceeds 64 MiB"};
+            auto fingerprint = hash_source(*package.value(), stop);
+            if (!fingerprint) return fingerprint.error();
+            split_package_fingerprint = fingerprint.value();
+            auto matches = elf_dwp_matches_split_units(*package.value(), metadata->header,
+                                                       metadata->dwarf_info->split_dwo_ids, stop);
+            if (!matches) return matches.error();
+            if (!matches.value())
+                return Error{ErrorCode::conflict,
+                    "Selected split-debug DWP does not cover every primary skeleton DWO ID"};
+            options.dwarf_split_debug_package = std::move(package.value());
+        }
+        if (recipe.dwarf_supplementary_package_path) {
+            auto package = FileStorage::open(*recipe.dwarf_supplementary_package_path);
+            if (!package) return package.error();
+            options.dwarf_supplementary_package = std::move(package.value());
+        }
         auto loaded = load_elf(std::move(storage), options, stop);
         if (!loaded) return loaded.error();
+        if (split_package_fingerprint) {
+            auto after = hash_source(*options.dwarf_split_debug_package, stop);
+            if (!after) return after.error();
+            if (after.value() != *split_package_fingerprint)
+                return Error{ErrorCode::conflict, "Selected split-debug DWP changed during metadata parsing"};
+        }
+        if (!options.dwarf_supplementary_package) return loaded;
         auto package_hash = hash_source(*options.dwarf_supplementary_package, stop);
         if (!package_hash) return package_hash.error();
         loaded.value().external_input_fingerprint =

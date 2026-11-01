@@ -30,6 +30,17 @@ resolver never opens `DW_AT_dwo_name`, `DW_AT_comp_dir`, `.debug_sup` filenames,
 or package paths itself. This keeps untrusted DIE strings from becoming file
 access instructions.
 
+The shared ELF open workflow also supports an explicit split-DWP selection via
+`LoadRecipe::dwarf_split_debug_package_path`,
+`OpenRequest::dwarf_split_debug_package_path`, and the CLI
+`--dwarf-split-package` option. This path is independent of a `.debug_sup`
+supplementary package. It validates ELF machine/class/byte order and requires
+the selected CU index to cover every retained skeleton DWO ID before import;
+it then persists the resolved path and retains the package's content fingerprint.
+The existing adjacent `<binary>.dwp` discovery remains the default when no
+explicit split package is selected. Neither path associates a package by its
+filename alone. See [project CLI](project-cli.md) for examples and limits.
+
 ELF import can combine its explicitly selected external, embedded, and
 checksum-verified supplementary DWP type indexes when signatures have one
 owner. This allows nested signature chains to cross packages while preserving

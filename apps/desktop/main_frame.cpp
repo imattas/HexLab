@@ -6329,6 +6329,7 @@ void MainFrame::RestoreWorkspaceSession() {
                 request.pdb_path = recipe.value().pdb_path;
                 request.pe_runtime_architecture = recipe.value().pe_runtime_architecture;
                 request.dwarf_supplementary_package_path = recipe.value().dwarf_supplementary_package_path;
+                request.dwarf_split_debug_package_path = recipe.value().dwarf_split_debug_package_path;
             }
             OpenDocument(std::move(request));
         } else {

@@ -15,7 +15,7 @@ Result<LoadRecipe> resolve_open_recipe(const OpenRequest &request, std::stop_tok
             return Error{ErrorCode::invalid_argument, "Resolved load recipe conflicts with requested format"};
         if (request.raw || request.x86_profile_path || request.arm_profile_path || request.macho ||
             request.pe_runtime_architecture || request.pdb_path || !request.pdb_search_paths.empty() ||
-            request.dwarf_supplementary_package_path)
+            request.dwarf_supplementary_package_path || request.dwarf_split_debug_package_path)
             return Error{ErrorCode::invalid_argument, "Resolved load recipe cannot be combined with loader overrides"};
         auto encoded = encode_recipe(*request.resolved_recipe);
         if (!encoded) return encoded.error();
@@ -31,12 +31,15 @@ Result<LoadRecipe> resolve_open_recipe(const OpenRequest &request, std::stop_tok
         return Error{ErrorCode::invalid_argument, "Slice options require Mach-O or automatic input format"};
     if (request.pe_runtime_architecture && request.format != Format::pe && request.format != Format::automatic)
         return Error{ErrorCode::invalid_argument, "PE runtime architecture selection requires PE or automatic input format"};
-    if (request.dwarf_supplementary_package_path &&
+    const bool has_elf_package = request.dwarf_supplementary_package_path || request.dwarf_split_debug_package_path;
+    if (has_elf_package &&
         (request.format != Format::elf && request.format != Format::automatic))
-        return Error{ErrorCode::invalid_argument, "DWARF supplementary packages require ELF or automatic input format"};
-    if (request.dwarf_supplementary_package_path &&
+        return Error{ErrorCode::invalid_argument, "DWARF packages require ELF or automatic input format"};
+    if (has_elf_package &&
         (request.pdb_path || !request.pdb_search_paths.empty()))
-        return Error{ErrorCode::invalid_argument, "PE PDB and ELF DWARF supplementary options cannot be combined"};
+        return Error{ErrorCode::invalid_argument, "PE PDB and ELF DWARF package options cannot be combined"};
+    if (has_elf_package && (request.macho || request.pe_runtime_architecture))
+        return Error{ErrorCode::invalid_argument, "ELF DWARF packages cannot be combined with another format's options"};
     if ((request.pdb_path || !request.pdb_search_paths.empty()) && request.format != Format::pe &&
         request.format != Format::minidump && request.format != Format::automatic)
         return Error{ErrorCode::invalid_argument, "Local PDB options require PE, Minidump, or automatic input format"};
@@ -48,16 +51,8 @@ Result<LoadRecipe> resolve_open_recipe(const OpenRequest &request, std::stop_tok
             return Error{ErrorCode::invalid_argument, "Local PDB options require PE, Minidump, or automatic input format"};
         auto recipe = LoadRecipe{request.format, {}, request.macho};
         recipe.pe_runtime_architecture = request.pe_runtime_architecture;
-        if (request.dwarf_supplementary_package_path) {
-            const auto &path = *request.dwarf_supplementary_package_path;
-            if (path.empty() || path.native().find(std::filesystem::path::value_type{}) != path.native().npos)
-                return Error{ErrorCode::invalid_argument, "Invalid DWARF supplementary package path"};
-            if (request.format == Format::elf) {
-                std::error_code error;
-                auto absolute = std::filesystem::absolute(path, error);
-                if (error) return Error{ErrorCode::io, "Cannot resolve DWARF supplementary package path"};
-                recipe.dwarf_supplementary_package_path = absolute.lexically_normal();
-            } else {
+        if (has_elf_package) {
+            if (request.format != Format::elf) {
                 std::shared_ptr<const ByteStorage> storage = request.input_storage;
                 if (!storage) {
                     auto opened = FileStorage::open(request.path);
@@ -67,12 +62,22 @@ Result<LoadRecipe> resolve_open_recipe(const OpenRequest &request, std::stop_tok
                 auto detected = resolve_load_recipe(*storage, LoadRecipe{Format::automatic, {}}, stop);
                 if (!detected) return detected.error();
                 if (detected.value().format != Format::elf)
-                    return Error{ErrorCode::invalid_argument, "DWARF supplementary package requires an ELF input"};
+                    return Error{ErrorCode::invalid_argument, "DWARF packages require an ELF input"};
                 recipe = std::move(detected.value());
+            }
+            for (const bool split : {false, true}) {
+                const auto &selected = split ? request.dwarf_split_debug_package_path :
+                                               request.dwarf_supplementary_package_path;
+                if (!selected) continue;
+                const auto &path = *selected;
+                if (path.empty() || path.native().find(std::filesystem::path::value_type{}) != path.native().npos ||
+                    path.u8string().size() > 32768)
+                    return Error{ErrorCode::invalid_argument, "Invalid DWARF package path"};
                 std::error_code error;
                 auto absolute = std::filesystem::absolute(path, error);
-                if (error) return Error{ErrorCode::io, "Cannot resolve DWARF supplementary package path"};
-                recipe.dwarf_supplementary_package_path = absolute.lexically_normal();
+                if (error) return Error{ErrorCode::io, "Cannot resolve DWARF package path"};
+                (split ? recipe.dwarf_split_debug_package_path : recipe.dwarf_supplementary_package_path) =
+                    absolute.lexically_normal();
             }
         }
         if (request.pdb_path && (request.pdb_path->empty() ||

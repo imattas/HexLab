@@ -479,6 +479,8 @@ Arguments parse(std::span<const std::wstring_view> args) {
         if (options.contains(L"--pdb-search")) result.input.pdb_search_paths.emplace_back(path_from_wide(options.pop(L"--pdb-search")));
         if (options.contains(L"--dwarf-supplementary-package"))
             result.input.dwarf_supplementary_package_path = path_from_wide(options.pop(L"--dwarf-supplementary-package"));
+        if (options.contains(L"--dwarf-split-package"))
+            result.input.dwarf_split_debug_package_path = path_from_wide(options.pop(L"--dwarf-split-package"));
         auto format = options.pop(L"--format", L"auto");
         require(format == L"auto" || format == L"pe" || format == L"elf" || format == L"raw" || format == L"macho" || format == L"wasm" || format == L"dex" || format == L"jvm" ||
                     format == L"ihex" || format == L"srec",

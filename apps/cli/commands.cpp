@@ -365,6 +365,8 @@ void usage(std::ostream &out) {
            "Common input options:\n"
            "  --format auto|pe|elf|raw|macho|wasm|dex|jvm\n"
            "  --plugin <module>  Load a native plugin (repeatable)\n"
+           "  --dwarf-split-package <file>  Select an exact-ID ELF split-DWARF DWP\n"
+           "  --dwarf-supplementary-package <file>  Select a checksum-bound ELF supplementary object\n"
            "  --                 End options; useful when a path begins with '-'\n\n"
            "Analysis commands accept --instruction-budget, --string-budget, and --show-strings.\n"
            "Use 'hexlab_cli <command> --help' for command-specific options.\n"
@@ -3147,7 +3149,8 @@ OpenRequest parse(std::span<const std::wstring_view> args, bool disassemble,
     std::optional<std::uint64_t> base, entry, instructions, strings, minimum, slice;
     std::optional<std::filesystem::path> profile;
     std::optional<std::filesystem::path> arm_profile;
-    std::optional<std::filesystem::path> pdb_path, pdb_search_path, dwarf_supplementary_package_path;
+    std::optional<std::filesystem::path> pdb_path, pdb_search_path, dwarf_supplementary_package_path,
+        dwarf_split_debug_package_path;
     std::optional<PeRuntimeArchitecture> pe_runtime_architecture;
     bool end_options = false;
     for (std::size_t n = 0; n < args.size(); ++n) {
@@ -3221,6 +3224,8 @@ OpenRequest parse(std::span<const std::wstring_view> args, bool disassemble,
                 option(pdb_search_path, path_from_wide(value));
             else if (item == L"--dwarf-supplementary-package")
                 option(dwarf_supplementary_package_path, path_from_wide(value));
+            else if (item == L"--dwarf-split-package")
+                option(dwarf_split_debug_package_path, path_from_wide(value));
             else if (item == L"--pe-runtime") {
                 if (value == L"arm64")
                     option(pe_runtime_architecture, PeRuntimeArchitecture::arm64);
@@ -3255,6 +3260,7 @@ OpenRequest parse(std::span<const std::wstring_view> args, bool disassemble,
     request.pe_runtime_architecture = pe_runtime_architecture;
     request.pdb_path = pdb_path;
     request.dwarf_supplementary_package_path = dwarf_supplementary_package_path;
+    request.dwarf_split_debug_package_path = dwarf_split_debug_package_path;
     if (pdb_search_path) request.pdb_search_paths.push_back(*pdb_search_path);
     if (slice) {
         if (*slice > UINT32_MAX || (request.format != Format::automatic && request.format != Format::macho))
