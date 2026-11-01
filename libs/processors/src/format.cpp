@@ -1129,23 +1129,30 @@ std::string format_instruction(const Instruction &i) {
     if (i.opcode == Opcode::dex || i.opcode == Opcode::x86_opaque || i.opcode == Opcode::opaque)
         return i.mnemonic_override;
     if (i.context.architecture == Architecture::mos6502) {
+        const auto address_text = [&](std::uint64_t value, unsigned digits) {
+            auto text = hex(value);
+            if (i.context.mode == ExecutionMode::m65c02 && text.size() < digits + 2)
+                text.insert(2, digits + 2 - text.size(), '0');
+            return text;
+        };
         std::string out = opcode_name(i.opcode, i.condition);
         if (i.operands.empty()) return out;
         out += " ";
         if ((i.opcode == Opcode::m65c02_bbr || i.opcode == Opcode::m65c02_bbs) && i.operands.size() == 2) {
             if (const auto *mem = std::get_if<MemoryOperand>(&i.operands[0]))
-                out += hex(static_cast<std::uint64_t>(mem->displacement));
+                out += address_text(static_cast<std::uint64_t>(mem->displacement), 2);
             if (const auto *rel = std::get_if<RelativeOperand>(&i.operands[1]))
-                out += ", " + (i.direct_target ? hex(i.direct_target->offset) : signed_hex(rel->displacement));
+                out += ", " + (i.direct_target ? address_text(i.direct_target->offset, 4) : signed_hex(rel->displacement));
             return out;
         }
         if (const auto *imm = std::get_if<ImmediateOperand>(&i.operands[0]))
-            out += "#" + hex(imm->value);
+            out += "#" + address_text(imm->value, 2);
         else if (const auto *rel = std::get_if<RelativeOperand>(&i.operands[0]))
-            out += i.direct_target ? hex(i.direct_target->offset) : signed_hex(rel->displacement);
+            out += i.direct_target ? address_text(i.direct_target->offset, 4) : signed_hex(rel->displacement);
         else if (const auto *mem = std::get_if<MemoryOperand>(&i.operands[0])) {
             const auto encoded = i.bytes[0];
-            const auto address = hex(static_cast<std::uint64_t>(mem->displacement));
+            const auto address = address_text(static_cast<std::uint64_t>(mem->displacement),
+                mem->displacement_encoding && mem->displacement_encoding->size == 1 ? 2 : 4);
             if (encoded == std::byte{0x6c}) out += "(" + address + ")";
             else if (i.context.mode == ExecutionMode::m65c02 && encoded == std::byte{0x7c}) out += "(" + address + ", x)";
             else if (i.context.mode == ExecutionMode::m65c02 && (std::to_integer<unsigned>(encoded) & 0x1f) == 0x12) out += "(" + address + ")";

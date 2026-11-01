@@ -46,32 +46,29 @@ constexpr std::array<std::uint8_t, 256> documented_cycles{
     // f0-ff
     2,5,0,0,0,4,6,0,2,4,2,0,0,4,7,0};
 
-bool w65c02_reserved_nop(unsigned opcode, std::uint8_t &length,
-                         std::uint8_t &cycles) noexcept {
-    // WDC W65C02S datasheet, Table 7-1. These opcodes are reserved NOPs on
-    // this silicon; their byte lengths and cycle counts differ by encoding.
-    if ((opcode & 0x0fu) == 0x03u ||
-        ((opcode & 0x0fu) == 0x0bu && (opcode <= 0xbbu || opcode >= 0xebu))) {
-        length = 1;
-        cycles = 1;
-        return true;
-    }
-    switch (opcode) {
-    case 0x02: case 0x22: case 0x42: case 0x62: case 0x82:
-    case 0xc2: case 0xe2:
-        length = 2; cycles = 2; return true;
-    case 0x44:
-        length = 2; cycles = 3; return true;
-    case 0x54: case 0xd4: case 0xf4:
-        length = 2; cycles = 4; return true;
-    case 0x5c:
-        length = 3; cycles = 8; return true;
-    case 0xdc: case 0xfc:
-        length = 3; cycles = 4; return true;
-    default:
-        return false;
-    }
-}
+// WDC W65C02S Tables 5-2 and 6-4: the 212 documented opcode assignments.
+// Zero denotes one of the 44 reserved encodings, even when current silicon
+// executes it as a NOP (Table 7-1). Keep this boundary independent of NMOS
+// timing and unofficial-opcode dispatch. BRK includes its signature byte.
+constexpr std::array<std::uint8_t, 256> w65c02_lengths{
+    2,2,0,0,2,2,2,2,1,2,1,0,3,3,3,3,
+    2,2,2,0,2,2,2,2,1,3,1,0,3,3,3,3,
+    3,2,0,0,2,2,2,2,1,2,1,0,3,3,3,3,
+    2,2,2,0,2,2,2,2,1,3,1,0,3,3,3,3,
+    1,2,0,0,0,2,2,2,1,2,1,0,3,3,3,3,
+    2,2,2,0,0,2,2,2,1,3,1,0,0,3,3,3,
+    1,2,0,0,2,2,2,2,1,2,1,0,3,3,3,3,
+    2,2,2,0,2,2,2,2,1,3,1,0,3,3,3,3,
+    2,2,0,0,2,2,2,2,1,2,1,0,3,3,3,3,
+    2,2,2,0,2,2,2,2,1,3,1,0,3,3,3,3,
+    2,2,2,0,2,2,2,2,1,2,1,0,3,3,3,3,
+    2,2,2,0,2,2,2,2,1,3,1,0,3,3,3,3,
+    2,2,0,0,2,2,2,2,1,2,1,1,3,3,3,3,
+    2,2,2,0,0,2,2,2,1,3,1,1,0,3,3,3,
+    2,2,0,0,2,2,2,2,1,2,1,0,3,3,3,3,
+    2,2,2,0,0,2,2,2,1,3,1,0,0,3,3,3};
+static_assert(std::count_if(w65c02_lengths.begin(), w65c02_lengths.end(),
+    [](auto length) { return length != 0; }) == 212);
 }
 
 static DecodeResult decode_m6502_impl(std::span<const std::byte> bytes, Address at, bool cmos) {
@@ -80,10 +77,18 @@ static DecodeResult decode_m6502_impl(std::span<const std::byte> bytes, Address 
     if (bytes.empty())
         return bad(DecodeStatus::truncated, "6502 instruction needs an opcode byte");
     const auto op = std::to_integer<unsigned>(bytes[0]);
+    if (cmos) {
+        if (!w65c02_lengths[op])
+            return bad(DecodeStatus::unsupported, "Reserved W65C02 opcode is outside the documented instruction set");
+        if (bytes.size() < w65c02_lengths[op])
+            return bad(DecodeStatus::truncated, "W65C02 operand or BRK signature bytes are truncated");
+    }
     Instruction i;
     i.context = {Architecture::mos6502, cmos ? ExecutionMode::m65c02 : ExecutionMode::m6502, ByteOrder::little};
     i.address = at;
     auto finish = [&](unsigned length) -> DecodeResult {
+        if (cmos && length != w65c02_lengths[op])
+            return bad(DecodeStatus::invalid, "W65C02 instruction length conflicts with its documented encoding");
         i.length = static_cast<std::uint8_t>(length);
         std::copy_n(bytes.begin(), length, i.bytes.begin());
         const auto base_cycles = documented_cycles[op];
@@ -91,10 +96,6 @@ static DecodeResult decode_m6502_impl(std::span<const std::byte> bytes, Address 
             M6502Timing timing;
             timing.base_cycles = base_cycles;
             if (cmos) {
-                [[maybe_unused]] std::uint8_t nop_length = 0;
-                std::uint8_t nop_cycles = 0;
-                if (w65c02_reserved_nop(op, nop_length, nop_cycles))
-                    timing.base_cycles = nop_cycles;
                 // W65C02S differs from the NMOS base table for indirect JMP,
                 // absolute-X read/modify/write, and its extension opcodes.
                 if (op == 0x6c) timing.base_cycles = 6;
@@ -123,11 +124,12 @@ static DecodeResult decode_m6502_impl(std::span<const std::byte> bytes, Address 
             if (i.flow == FlowKind::conditional_branch) {
                 timing.branch_taken_penalty = true;
                 timing.branch_page_cross_penalty = true;
-            } else if (cmos && (op == 0x80 || (op & 0x0f) == 0x0f)) {
-                // BRA is always taken (already included in its base); BBR/BBS
-                // take one additional cycle and may take another across pages.
+            } else if (cmos && op == 0x80) {
+                // BRA's always-taken cycle is already included in its base.
                 timing.branch_page_cross_penalty = true;
-                if ((op & 0x0f) == 0x0f) timing.branch_taken_penalty = true;
+            } else if (cmos && (op == 0x1e || op == 0x3e || op == 0x5e || op == 0x7e || op == 0xde || op == 0xfe)) {
+                // WDC Table 7-1: six cycles on the same page, seven across it.
+                timing.page_cross_penalty = true;
             } else if (i.memory_read && !i.memory_write) {
                 const auto *operand = i.operands.empty() ? nullptr : std::get_if<MemoryOperand>(&i.operands.front());
                 // The absolute indexed forms have a three-byte encoding. The
@@ -258,13 +260,8 @@ static DecodeResult decode_m6502_impl(std::span<const std::byte> bytes, Address 
     }
     if (cmos && (op == 0x89 || op == 0x34 || op == 0x3c)) {
         const auto mode = op == 0x89 ? Mode::immediate : op == 0x34 ? Mode::zero_page_x : Mode::absolute_x;
-        auto result = data_op(Opcode::m6502_bit, mode, a, false);
-        if (result.status == DecodeStatus::decoded) {
-            // CMOS BIT immediate changes only Z. All BIT forms preserve
-            // unaffected status bits, so the incoming P value is an input.
-            result.instruction->register_reads.push_back(p);
-        }
-        return result;
+        // data_op already records P once to preserve unaffected status bits.
+        return data_op(Opcode::m6502_bit, mode, a, false);
     }
     if (cmos && (op == 0x1a || op == 0x3a)) {
         if (!begin(op == 0x1a ? Opcode::m6502_inc : Opcode::m6502_dec, 1))
@@ -332,20 +329,9 @@ static DecodeResult decode_m6502_impl(std::span<const std::byte> bytes, Address 
         i.flow = FlowKind::jump;
         return finish(3);
     }
-    if (cmos) {
-        std::uint8_t length = 0;
-        std::uint8_t cycles = 0;
-        if (w65c02_reserved_nop(op, length, cycles)) {
-            if (!begin(Opcode::nop, length))
-                return bad(DecodeStatus::truncated, "W65C02 reserved NOP operand bytes are truncated");
-            return finish(length);
-        }
-    }
-    // Do not let the NMOS unofficial-opcode table reinterpret bytes in the
-    // CMOS profile. The supported CMOS additions above have explicit cases;
-    // remaining CMOS-only assignments and reserved bytes stay unsupported.
-    if (cmos && documented_cycles[op] == 0)
-        return bad(DecodeStatus::unsupported, "65C02 opcode is outside the implemented CMOS subset");
+    // All CMOS additions have explicit cases above. Reserved encodings were
+    // rejected before dispatch, so only the shared documented NMOS core can
+    // reach the unofficial-opcode cases below in the CMOS profile.
     auto implied = [&](Opcode opcode, unsigned length = 1) -> bool {
         if (!begin(opcode, length)) return false;
         return true;
@@ -604,8 +590,8 @@ static DecodeResult decode_m6502_impl(std::span<const std::byte> bytes, Address 
     // Stack operations and processor flags.
     case 0x48: implied(Opcode::m6502_pha); i.register_reads = {a, s}; i.register_writes = {s}; i.memory_write = true; return finish(1);
     case 0x08: implied(Opcode::m6502_php); i.register_reads = {p, s}; i.register_writes = {s}; i.memory_write = true; return finish(1);
-    case 0x68: implied(Opcode::m6502_pla); i.register_reads = {s}; i.register_writes = {a, s, p}; i.memory_read = true; return finish(1);
-    case 0x28: implied(Opcode::m6502_plp); i.register_reads = {s}; i.register_writes = {s, p}; i.memory_read = true; return finish(1);
+    case 0x68: implied(Opcode::m6502_pla); i.register_reads = {s}; if (cmos) i.register_reads.push_back(p); i.register_writes = {a, s, p}; i.memory_read = true; return finish(1);
+    case 0x28: implied(Opcode::m6502_plp); i.register_reads = {s}; if (cmos) i.register_reads.push_back(p); i.register_writes = {s, p}; i.memory_read = true; return finish(1);
     case 0x18: implied(Opcode::m6502_clc); i.register_reads = {p}; i.register_writes = {p}; return finish(1);
     case 0x38: implied(Opcode::m6502_sec); i.register_reads = {p}; i.register_writes = {p}; return finish(1);
     case 0x58: implied(Opcode::m6502_cli); i.register_reads = {p}; i.register_writes = {p}; return finish(1);
@@ -638,7 +624,7 @@ static DecodeResult decode_m6502_impl(std::span<const std::byte> bytes, Address 
         i.access = {OperandAccess::address};
         i.direct_target = Address{at.space, target};
         i.flow = op == 0x4c ? FlowKind::jump : FlowKind::call;
-        if (op == 0x20) { i.register_reads = {s}; i.register_writes = {s}; }
+        if (op == 0x20) { i.register_reads = {s}; i.register_writes = {s}; i.memory_write = cmos; }
         return finish(3);
     }
     case 0x6c: {
@@ -655,12 +641,18 @@ static DecodeResult decode_m6502_impl(std::span<const std::byte> bytes, Address 
         implied(op == 0x60 ? Opcode::m6502_rts : Opcode::m6502_rti);
         i.flow = FlowKind::ret;
         i.register_reads = {s}; i.register_writes = {s};
-        if (op == 0x40) i.register_writes.push_back(p);
+        i.memory_read = cmos;
+        if (op == 0x40) { i.register_writes.push_back(p); if (cmos) i.register_reads.push_back(p); }
         return finish(1);
     }
-    case 0x00:
-        implied(Opcode::m6502_brk); i.flow = FlowKind::trap;
-        i.register_reads = {s, p}; i.register_writes = {s, p}; return finish(1);
+    case 0x00: {
+        const auto length = cmos ? 2u : 1u;
+        if (!implied(Opcode::m6502_brk, length)) return bad(DecodeStatus::truncated, "65C02 BRK signature byte is truncated");
+        i.flow = FlowKind::trap;
+        i.register_reads = {s, p}; i.register_writes = {s, p};
+        i.memory_read = i.memory_write = cmos; // Stack writes and vector reads.
+        return finish(length);
+    }
     case 0xea: implied(Opcode::nop); return finish(1);
 
     // Relative branches. The processor status is the condition source; the

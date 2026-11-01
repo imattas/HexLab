@@ -2473,6 +2473,40 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
 
     const bool m65c02 = instruction.context.architecture == Architecture::mos6502 &&
                         instruction.context.mode == ExecutionMode::m65c02;
+    if (m65c02 && !instruction.operands.empty()) {
+        // MemoryValue has base/index/scale/displacement, but no nested pointer
+        // fetch or 8-/16-bit effective-address wrap. Keep such CMOS operands
+        // as named effects rather than treating a pointer slot as its pointee
+        // or silently carrying a zero-page index into page one.
+        const auto *memory = instruction.operands.empty() ? nullptr :
+            std::get_if<MemoryOperand>(&instruction.operands.front());
+        const auto encoded = std::to_integer<unsigned>(instruction.bytes[0]);
+        const bool zp_indirect = (encoded & 0x1fu) == 0x12u;
+        const bool indexed_indirect = (encoded & 0x1fu) == 0x01u;
+        const bool indirect_indexed = (encoded & 0x1fu) == 0x11u;
+        if (memory && (memory->index || zp_indirect)) {
+            const std::string addressing = zp_indirect ? "zero_page_indirect_wrap" :
+                indexed_indirect ? "zero_page_indexed_indirect_wrap" :
+                indirect_indexed ? "zero_page_indirect_indexed_wrap" :
+                encoded == 0x7c ? "absolute_indexed_indirect_wrap" :
+                instruction.length == 2 ? "zero_page_indexed_wrap" : "absolute_indexed_wrap";
+            if (instruction.opcode == Opcode::m6502_jmp && instruction.flow == FlowKind::jump) {
+                Branch branch;
+                branch.condition = "true";
+                branch.indirect_target = unknown_expr("m65c02_jmp_" + addressing, 16);
+                return branch;
+            }
+            std::vector<ExpressionPtr> inputs{constant_expr(
+                static_cast<std::uint64_t>(memory->displacement), 16)};
+            for (const auto reg : instruction.register_reads) inputs.push_back(reg_expr(reg));
+            Intrinsic effect{"m65c02_" + operation_name(instruction.opcode) + "_" + addressing,
+                std::move(inputs), instruction.memory_read && instruction.memory_write ? IntrinsicMemoryEffect::read_write :
+                instruction.memory_read ? IntrinsicMemoryEffect::read :
+                instruction.memory_write ? IntrinsicMemoryEffect::write : IntrinsicMemoryEffect::none};
+            effect.register_writes = instruction.register_writes;
+            return effect;
+        }
+    }
     if (m65c02) {
         const RegisterOperand accumulator{RegisterBank::mos6502, 0, 8, false};
         const RegisterOperand status{RegisterBank::mos6502, 3, 8, false};
@@ -3463,7 +3497,8 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
             auto &intrinsic = std::get<Intrinsic>(effect);
             intrinsic.register_output_values = {
                 byte_wrap(binary("sub", reg_expr(stack_pointer), constant_expr(3, 8))),
-                binary("or", status_value, constant_expr(0x04, 8))};
+                binary("or", m65c02 ? binary("and", status_value, constant_expr(0xf7, 8)) : status_value,
+                       constant_expr(0x04, 8))};
             return effect;
         }
         default: break;
