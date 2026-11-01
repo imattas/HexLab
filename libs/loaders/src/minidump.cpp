@@ -425,40 +425,58 @@ std::optional<MinidumpExecutionMode> classify_chpe_pc(const ByteStorage &storage
     std::span<const Region> regions, const MinidumpModule &module, std::uint64_t pc, std::stop_token stop) {
     constexpr std::uint64_t max_header = 64u * 1024u, max_code_map_bytes = 1024u * 1024u;
     constexpr std::uint16_t machine_amd64 = 0x8664, machine_arm64ec = 0xa641, machine_arm64x = 0xa64e;
-    if (!module.image_size || pc < module.image_base || pc - module.image_base >= module.image_size) return {};
+    if (module.image_size < 64 || module.image_base > UINT64_MAX - module.image_size ||
+        pc < module.image_base || pc - module.image_base >= module.image_size) return {};
+    const auto va_for_rva = [&](std::uint64_t rva, std::uint64_t size) -> std::optional<std::uint64_t> {
+        if (rva > module.image_size || size > module.image_size - rva ||
+            module.image_base > UINT64_MAX - rva) return {};
+        return module.image_base + rva;
+    };
     const auto dos = read_virtual(storage, regions, module.image_base, 64, stop);
     if (!dos || u(*dos, 0, 2) != 0x5a4d) return {};
     const auto nt_offset = u(*dos, 0x3c, 4);
     if (nt_offset > max_header || nt_offset + 24 > module.image_size) return {};
-    const auto nt = read_virtual(storage, regions, module.image_base + nt_offset, 24, stop);
+    const auto nt_va = va_for_rva(nt_offset, 24);
+    if (!nt_va) return {};
+    const auto nt = read_virtual(storage, regions, *nt_va, 24, stop);
     if (!nt || u(*nt, 0, 4) != 0x00004550) return {};
     const auto machine = static_cast<std::uint16_t>(u(*nt, 4, 2));
     const auto optional_size = static_cast<std::uint16_t>(u(*nt, 20, 2));
     if ((machine != machine_amd64 && machine != machine_arm64ec && machine != machine_arm64x) ||
         optional_size < 112 + 11 * 8 || optional_size > 4096 ||
         nt_offset + 24 + optional_size > module.image_size) return {};
-    const auto optional = read_virtual(storage, regions, module.image_base + nt_offset + 24, optional_size, stop);
+    const auto optional_rva = nt_offset + 24;
+    const auto optional_va = va_for_rva(optional_rva, optional_size);
+    if (!optional_va) return {};
+    const auto optional = read_virtual(storage, regions, *optional_va, optional_size, stop);
     if (!optional || u(*optional, 0, 2) != 0x20b || u(*optional, 108, 4) < 11) return {};
     const auto image_size = u(*optional, 56, 4);
     const auto load_config_rva = u(*optional, 112 + 10 * 8, 4);
     const auto load_config_size = u(*optional, 112 + 10 * 8 + 4, 4);
     if (!image_size || image_size > module.image_size || load_config_size < 208 ||
         load_config_rva >= image_size || load_config_size > image_size - load_config_rva) return {};
-    const auto load_config = read_virtual(storage, regions, module.image_base + load_config_rva, 208, stop);
+    const auto load_config_va = va_for_rva(load_config_rva, 208);
+    if (!load_config_va) return {};
+    const auto load_config = read_virtual(storage, regions, *load_config_va, 208, stop);
     if (!load_config || u(*load_config, 0, 4) < 208) return {};
     const auto chpe_va = u(*load_config, 200, 8);
     if (chpe_va < module.image_base) return {};
     const auto metadata_rva = chpe_va - module.image_base;
     if (metadata_rva > image_size || 12 > image_size - metadata_rva) return {};
-    const auto chpe = read_virtual(storage, regions, module.image_base + metadata_rva, 12, stop);
+    const auto metadata_va = va_for_rva(metadata_rva, 12);
+    if (!metadata_va) return {};
+    const auto chpe = read_virtual(storage, regions, *metadata_va, 12, stop);
     if (!chpe || (u(*chpe, 0, 4) != 1 && u(*chpe, 0, 4) != 2)) return {};
     const auto chpe_header_size = u(*chpe, 0, 4) == 1 ? 80u : 92u;
     if (chpe_header_size > image_size - metadata_rva ||
-        !read_virtual(storage, regions, module.image_base + metadata_rva, chpe_header_size, stop)) return {};
+        !va_for_rva(metadata_rva, chpe_header_size) ||
+        !read_virtual(storage, regions, *metadata_va, chpe_header_size, stop)) return {};
     const auto map_rva = u(*chpe, 4, 4), map_count = u(*chpe, 8, 4);
     if (!map_count || map_count > max_code_map_bytes / 8 || map_rva > image_size ||
         map_count * 8 > image_size - map_rva) return {};
-    const auto map = read_virtual(storage, regions, module.image_base + map_rva,
+    const auto map_va = va_for_rva(map_rva, map_count * 8);
+    if (!map_va) return {};
+    const auto map = read_virtual(storage, regions, *map_va,
                                   static_cast<std::size_t>(map_count * 8), stop);
     if (!map) return {};
     const auto pc_rva = pc - module.image_base;
@@ -1570,11 +1588,14 @@ Result<LoadedImage> load_minidump(std::shared_ptr<const ByteStorage> storage, st
             });
             if (stop.stop_requested()) return Error{ErrorCode::canceled, "Minidump ARM64EC mode resolution canceled"};
             bool indexed_regions_disjoint = true;
+            std::uint64_t max_region_end = 0;
             for (std::size_t index = 1; index < indexed_regions.size(); ++index) {
                 if ((index & 0x3ffu) == 0 && stop.stop_requested())
                     return Error{ErrorCode::canceled, "Minidump ARM64EC mode resolution canceled"};
-                const auto &previous = indexed_regions[index - 1];
-                if (previous.begin + previous.size > indexed_regions[index].begin) {
+                const auto &region = indexed_regions[index];
+                max_region_end = std::max(max_region_end,
+                    indexed_regions[index - 1].begin + indexed_regions[index - 1].size);
+                if (region.begin < max_region_end) {
                     indexed_regions_disjoint = false;
                     break;
                 }
