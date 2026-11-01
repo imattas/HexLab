@@ -175,7 +175,14 @@ specialization such as `template<> struct Box<int> { ... };` overrides the
 primary template for that exact argument identity. Partial specializations
 support direct type parameters (`Box<T>`), pointer parameters (`Box<T*>`),
 `const T*` patterns, integral non-type arguments that are direct parameter
-names, integer literals, or bounded constant expressions, and
+names, integer literals, bounded constant expressions, and bounded inversion
+of one otherwise-unbound non-type parameter through uniquely reversible `+`,
+`-`, or exact `*` expressions. The inferred value is range-checked and
+re-evaluated before the specialization is accepted; this inversion is limited
+to signed 64-bit integer parameter types and rejects unsigned-suffixed
+literals. Multiple unknowns, repeated parameter occurrences, division, bitwise
+inversion, and ambiguous zero multipliers fail explicitly. Enumerator-valued
+non-type specialization patterns remain unsupported. Also supported are
 template-template arguments that are direct
 template parameter names or fixed template names. See
 [integral non-type class-template specializations](header-non-type-specializations.md)

@@ -1408,6 +1408,172 @@ private:
         }
         return dependent;
     }
+    bool match_dependent_value_expression(
+        const std::vector<Token> &pattern,
+        const std::vector<TemplateParameter> &parameters,
+        std::map<std::string, std::uint64_t, std::less<>> &bindings,
+        const TypePtr &primary_value_type,
+        std::uint64_t argument) {
+        std::vector<const TemplateParameter *> unbound;
+        const TemplateParameter *unbound_parameter = nullptr;
+        for (const auto &parameter : parameters) {
+            if (!parameter.value_parameter || parameter.template_parameter || parameter.pack) continue;
+            std::size_t occurrences = 0;
+            for (const auto &token : pattern) occurrences += token.text == parameter.name;
+            if (!occurrences) continue;
+            if (bindings.contains(parameter.name)) continue;
+            if (occurrences != 1)
+                fail(ErrorCode::unsupported,
+                     "dependent non-type specialization inversion requires one occurrence of each parameter");
+            if (!bindings.contains(parameter.name)) {
+                unbound.push_back(&parameter);
+                unbound_parameter = &parameter;
+            }
+        }
+        if (unbound.empty()) {
+            const auto value = evaluate_integer_expression(pattern, bindings);
+            return value >= 0 && static_cast<std::uint64_t>(value) == argument;
+        }
+        if (unbound.size() != 1 || argument > static_cast<std::uint64_t>(INT64_MAX))
+            fail(ErrorCode::unsupported,
+                 "dependent non-type specialization expression has multiple unknowns or exceeds the signed expression range");
+        const auto signed_integer = [](const Type *type) {
+            type = unqualified(type);
+            return type && type->kind() == Kind::integer && type->size() &&
+                   *type->size() == 8 && type->is_signed();
+        };
+        if (!signed_integer(primary_value_type.get()))
+            fail(ErrorCode::unsupported,
+                 "dependent non-type specialization inversion requires a signed 64-bit primary integer parameter");
+        for (const auto &parameter : parameters) {
+            if (parameter.value_parameter && !parameter.template_parameter &&
+                std::any_of(pattern.begin(), pattern.end(), [&](const auto &token) {
+                    return token.text == parameter.name;
+                }) && !signed_integer(parameter.value_type.get()))
+                fail(ErrorCode::unsupported,
+                     "dependent non-type specialization inversion requires signed 64-bit integer parameters");
+        }
+        for (const auto &token : pattern)
+            if (!token.text.empty() && token.text.front() >= '0' && token.text.front() <= '9' &&
+                token.text.find_first_of("uU") != std::string::npos)
+                fail(ErrorCode::unsupported,
+                     "dependent non-type specialization inversion does not accept unsigned literals");
+
+        const auto contains_parameter = [&](std::size_t begin, std::size_t end) {
+            for (auto index = begin; index < end; ++index)
+                if (pattern[index].text == unbound_parameter->name) return true;
+            return false;
+        };
+        const auto constant = [&](std::size_t begin, std::size_t end) {
+            std::vector<Token> expression(pattern.begin() + static_cast<std::ptrdiff_t>(begin),
+                                          pattern.begin() + static_cast<std::ptrdiff_t>(end));
+            return evaluate_integer_expression(expression, bindings);
+        };
+        const auto checked_add = [](std::int64_t left, std::int64_t right, std::int64_t &result) {
+            if ((right > 0 && left > INT64_MAX - right) || (right < 0 && left < INT64_MIN - right)) return false;
+            result = left + right;
+            return true;
+        };
+        const auto checked_subtract = [](std::int64_t left, std::int64_t right, std::int64_t &result) {
+            if ((right > 0 && left < INT64_MIN + right) || (right < 0 && left > INT64_MAX + right)) return false;
+            result = left - right;
+            return true;
+        };
+        const auto solve = [&](auto &&self, std::size_t begin, std::size_t end,
+                               std::int64_t target) -> std::optional<std::int64_t> {
+            while (end > begin + 1 && pattern[begin].text == "(" && pattern[end - 1].text == ")") {
+                unsigned depth = 0;
+                bool encloses = true;
+                for (auto index = begin; index < end; ++index) {
+                    if (pattern[index].text == "(") ++depth;
+                    else if (pattern[index].text == ")") {
+                        if (!depth) { encloses = false; break; }
+                        --depth;
+                        if (!depth && index + 1 != end) { encloses = false; break; }
+                    }
+                }
+                if (!encloses || depth) break;
+                ++begin;
+                --end;
+            }
+            if (end == begin + 1 && pattern[begin].text == unbound_parameter->name) return target;
+            unsigned nesting = 0;
+            std::size_t root = end;
+            int root_precedence = 3;
+            for (auto index = begin; index < end; ++index) {
+                const auto &text = pattern[index].text;
+                if (text == "(" || text == "[") { ++nesting; continue; }
+                if (text == ")" || text == "]") { if (nesting) --nesting; continue; }
+                if (nesting || (text != "+" && text != "-" && text != "*")) continue;
+                const bool unary = index == begin || pattern[index - 1].text == "(" ||
+                    pattern[index - 1].text == "+" || pattern[index - 1].text == "-" ||
+                    pattern[index - 1].text == "*";
+                if (unary) continue;
+                const int precedence = text == "*" ? 2 : 1;
+                // All accepted operators are left-associative. Choosing the
+                // leftmost operator at the weakest precedence reproduces the
+                // parser's expression tree for forms such as N - 2 - 3.
+                if (precedence < root_precedence) { root = index; root_precedence = precedence; }
+            }
+            if (root == end)
+                fail(ErrorCode::unsupported, "dependent non-type specialization expression is not invertible");
+            const bool left_depends = contains_parameter(begin, root);
+            const bool right_depends = contains_parameter(root + 1, end);
+            if (left_depends == right_depends)
+                fail(ErrorCode::unsupported, "dependent non-type specialization expression has no unique inverse");
+            const auto operation = pattern[root].text;
+            std::int64_t inverted = 0;
+            if (left_depends) {
+                const auto right = constant(root + 1, end);
+                if (operation == "+") {
+                    if (!checked_subtract(target, right, inverted)) return {};
+                } else if (operation == "-") {
+                    if (!checked_add(target, right, inverted)) return {};
+                } else {
+                    if (!right) {
+                        if (!target) fail(ErrorCode::unsupported,
+                            "zero-multiplier non-type specialization expression does not uniquely deduce its parameter");
+                        return {};
+                    }
+                    if ((target == INT64_MIN && right == -1) || target % right) return {};
+                    inverted = target / right;
+                }
+                return self(self, begin, root, inverted);
+            }
+            const auto left = constant(begin, root);
+            if (operation == "+") {
+                if (!checked_subtract(target, left, inverted)) return {};
+            } else if (operation == "-") {
+                if (!checked_subtract(left, target, inverted)) return {};
+            } else {
+                if (!left) {
+                    if (!target) fail(ErrorCode::unsupported,
+                        "zero-multiplier non-type specialization expression does not uniquely deduce its parameter");
+                    return {};
+                }
+                if ((target == INT64_MIN && left == -1) || target % left) return {};
+                inverted = target / left;
+            }
+            return self(self, root + 1, end, inverted);
+        };
+        const auto inferred = solve(solve, 0, pattern.size(), static_cast<std::int64_t>(argument));
+        if (!inferred) return false;
+        if (*inferred < 0)
+            fail(ErrorCode::unsupported, "negative dependent non-type specialization arguments are unsupported");
+        const auto *integer = unqualified(unbound_parameter->value_type.get());
+        if (!integer || integer->kind() != Kind::integer || !integer->size() || *integer->size() > 8)
+            fail(ErrorCode::unsupported, "dependent non-type specialization parameter must use an integer type no wider than 64 bits");
+        const auto bits = static_cast<unsigned>(*integer->size() * 8);
+        const auto maximum = integer->is_signed()
+            ? (bits == 64 ? static_cast<std::uint64_t>(INT64_MAX)
+                          : (std::uint64_t{1} << (bits - 1)) - 1)
+            : (bits == 64 ? std::numeric_limits<std::uint64_t>::max()
+                          : (std::uint64_t{1} << bits) - 1);
+        if (static_cast<std::uint64_t>(*inferred) > maximum) return false;
+        bindings.emplace(unbound_parameter->name, static_cast<std::uint64_t>(*inferred));
+        const auto verified = evaluate_integer_expression(pattern, bindings);
+        return verified >= 0 && static_cast<std::uint64_t>(verified) == argument;
+    }
     bool template_template_parameter_pattern(const std::vector<Token> &pattern,
                                             const std::vector<TemplateParameter> &parameters,
                                             std::map<std::string, std::string, std::less<>> &bindings,
@@ -1575,10 +1741,11 @@ private:
                     if (is_dependent_value_expression_pattern(pattern, specialization.parameters)) {
                         dependent_value_expressions.push_back(i);
                         matched = true;
-                        // Dependent expressions are checked for equality, but
+                        // A later pass validates a bound expression or
+                        // inverts one uniquely solvable parameter. Expressions
                         // do not claim a specificity advantage over a direct
-                        // parameter pattern. This keeps overlapping or
-                        // equivalent arithmetic patterns ambiguous.
+                        // parameter pattern, keeping overlapping patterns
+                        // ambiguous rather than declaration-order dependent.
                         pattern_strength = 0;
                     } else {
                         matched = template_value_parameter_pattern(pattern, specialization.parameters,
@@ -1605,6 +1772,16 @@ private:
                 strengths[i] = specialization.parameters.empty() ? 10000u : pattern_strength;
             }
             if (!matches) continue;
+            for (const auto index : dependent_value_expressions) {
+                if (!match_dependent_value_expression(specialization.patterns[index],
+                        specialization.parameters, candidate_bindings.values,
+                        definition->second.parameters[index].value_type,
+                        *complete_arguments[index].value)) {
+                    matches = false;
+                    break;
+                }
+            }
+            if (!matches) continue;
             for (const auto &parameter : specialization.parameters)
                 if ((parameter.value_parameter && !candidate_bindings.values.contains(parameter.name)) ||
                     (parameter.template_parameter && !candidate_bindings.templates.contains(parameter.name)) ||
@@ -1612,17 +1789,6 @@ private:
                      !candidate_bindings.types.contains(parameter.name)))
                     fail(ErrorCode::unsupported,
                          "partial specialization contains a parameter that cannot be deduced");
-            for (const auto index : dependent_value_expressions) {
-                const auto evaluated = evaluate_integer_expression(specialization.patterns[index],
-                                                                   candidate_bindings.values);
-                if (evaluated < 0)
-                    fail(ErrorCode::unsupported, "negative non-type specialization patterns are unsupported");
-                if (static_cast<std::uint64_t>(evaluated) != *complete_arguments[index].value) {
-                    matches = false;
-                    break;
-                }
-            }
-            if (!matches) continue;
             matches_found.push_back({&specialization, std::move(candidate_bindings), std::move(strengths)});
         }
 

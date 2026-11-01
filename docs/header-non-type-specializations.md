@@ -53,9 +53,20 @@ template-template parameter exactly. Fixed template names use normal qualified-
 name, using-directive, and inline-namespace resolution. Compound template
 argument patterns and template-template parameter packs remain unsupported.
 
-The importer does not evaluate arithmetic or symbolic expressions in
-specialization patterns: `N + 1`, enumerators, negative values, and pointer or
-reference non-type arguments remain unsupported. Type patterns are limited to
+Bounded dependent arithmetic patterns can deduce one otherwise-unbound
+non-type parameter when it occurs once in the expression and the inverse is
+unique. The primary and specialization parameters must use signed 64-bit
+integer types, and unsigned-suffixed literals are rejected so modular arithmetic
+is not mistaken for signed arithmetic. Addition, subtraction, and exact multiplication
+by a nonzero constant are supported, including nested parentheses; the inferred
+value is range checked against its declared integral parameter type and then
+evaluated again to verify the match. For example, `Buffer<T, N + 1>` can select
+a specialization and bind `N` from the concrete extent. Expressions with
+multiple unknowns, repeated occurrences, division, bitwise operators,
+zero-multiplier ambiguity, and values outside the signed expression range
+remain unsupported. Enumerator
+expressions, negative values, and pointer or reference non-type arguments also
+remain unsupported. Type patterns are limited to
 the existing direct `T`, `T*`, `const T*`, and fixed-type forms. Template-
 template parameters and parameter packs can appear in primary class templates,
 but parameter packs remain unsupported by specializations. Scope is

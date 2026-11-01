@@ -991,6 +991,68 @@ std::vector<AbiArgumentSlot> aapcs32_vfp_prototype_slots(const types::TypePtr &p
     return slots;
 }
 
+std::vector<AbiArgumentSlot> aapcs32_prototype_slots(const types::TypePtr &prototype) {
+    std::vector<AbiArgumentSlot> slots;
+    if (!prototype || prototype->kind() != types::Kind::function || prototype->parameters().size() > 256)
+        return slots;
+    const auto classified = classify_abi_signature(CallingConvention::aapcs32, *prototype);
+    if (classified.arguments.size() != prototype->parameters().size()) return slots;
+    for (std::size_t parameter_index = 0; parameter_index < classified.arguments.size(); ++parameter_index) {
+        const auto &placement = classified.arguments[parameter_index];
+        const auto parameter_type = unqualified_type(prototype->parameters()[parameter_index].type);
+        const auto parameter_number = static_cast<std::uint16_t>(parameter_index);
+        const auto value_class = parameter_type && parameter_type->kind() == types::Kind::floating
+            ? AbiValueClass::floating : AbiValueClass::integer;
+        if (!placement.supported || placement.locations.empty() || !parameter_type || placement.indirect) {
+            slots.push_back({value_class, {}, {}, parameter_number, {}, {}, {}, false});
+            continue;
+        }
+        const bool aggregate = parameter_type->kind() == types::Kind::structure ||
+            parameter_type->kind() == types::Kind::union_type || parameter_type->kind() == types::Kind::array;
+        bool malformed = false;
+        const auto slot_begin = slots.size();
+        for (std::size_t component = 0; component < placement.locations.size(); ++component) {
+            const auto &location = placement.locations[component];
+            std::optional<RegisterOperand> reg;
+            if (location.kind == AbiLocationKind::register_)
+                reg = classified_register(location.register_name);
+            if ((location.kind == AbiLocationKind::register_ && !reg) ||
+                (location.kind == AbiLocationKind::stack &&
+                 location.stack_offset > static_cast<std::uint64_t>(INT64_MAX))) {
+                malformed = true;
+                break;
+            }
+            std::optional<std::uint8_t> offset, size, component_index;
+            if (!placement.indirect && (aggregate || placement.locations.size() > 1)) {
+                if (location.value_offset > UINT8_MAX || location.size == 0 || location.size > UINT8_MAX ||
+                    !parameter_type->size() || location.value_offset > *parameter_type->size() ||
+                    location.size > *parameter_type->size() - location.value_offset) {
+                    malformed = true;
+                    break;
+                }
+                if (aggregate || placement.locations.size() > 1 || location.value_offset != 0 ||
+                    location.size != *parameter_type->size()) {
+                    offset = static_cast<std::uint8_t>(location.value_offset);
+                    size = static_cast<std::uint8_t>(location.size);
+                    if (component > UINT8_MAX) { malformed = true; break; }
+                    component_index = static_cast<std::uint8_t>(component);
+                }
+            }
+            const bool split_piece = offset.has_value();
+            slots.push_back({split_piece ? AbiValueClass::integer : value_class, reg,
+                location.kind == AbiLocationKind::stack
+                    ? std::optional<std::int64_t>{static_cast<std::int64_t>(location.stack_offset)}
+                    : std::nullopt,
+                parameter_number, component_index, offset, size});
+        }
+        if (malformed) {
+            slots.resize(slot_begin);
+            slots.push_back({value_class, {}, {}, parameter_number, {}, {}, {}, false});
+        }
+    }
+    return slots;
+}
+
 std::vector<AbiArgumentSlot> ppc64_elfv2_prototype_slots(const types::TypePtr &prototype) {
     std::vector<AbiArgumentSlot> slots;
     if (!prototype || prototype->kind() != types::Kind::function || prototype->parameters().size() > 256)
@@ -1106,8 +1168,9 @@ std::vector<AbiArgumentSlot> sysv64_prototype_slots(const types::TypePtr &protot
     return slots;
 }
 
-std::optional<types::TypePtr> sysv64_component_type(const types::TypePtr &input,
-    std::uint8_t component_offset, std::uint8_t component_size, AbiValueClass value_class) {
+std::optional<types::TypePtr> abi_component_type(const types::TypePtr &input,
+    std::uint8_t component_offset, std::uint8_t component_size, AbiValueClass value_class,
+    types::Abi layout_abi = types::Abi::x86_64) {
     const auto root = unqualified_type(input);
     if (!root || component_size == 0 || component_offset > root->size().value_or(0) ||
         component_size > root->size().value_or(0) - component_offset)
@@ -1115,6 +1178,10 @@ std::optional<types::TypePtr> sysv64_component_type(const types::TypePtr &input,
     if (value_class == AbiValueClass::vector && root->kind() == types::Kind::vector &&
         component_offset == 0 && root->size() == component_size)
         return root;
+    if (value_class == AbiValueClass::integer && layout_abi == types::Abi::aarch32) {
+        auto value = types::Type::integer("abi_aggregate_piece", component_size, 1, false);
+        return value ? std::optional<types::TypePtr>{value.value()} : std::nullopt;
+    }
 
     struct Leaf { std::uint64_t offset; types::TypePtr type; };
     std::vector<Leaf> leaves;
@@ -1125,7 +1192,9 @@ std::optional<types::TypePtr> sysv64_component_type(const types::TypePtr &input,
         if (!valid || !candidate || depth > 8 || work++ >= 256) { valid = false; return; }
         const auto type = unqualified_type(candidate);
         if (!type || !type->size() || !*type->size()) { valid = false; return; }
-        if (type->kind() == types::Kind::floating || type->kind() == types::Kind::vector) {
+        if (type->kind() == types::Kind::floating || type->kind() == types::Kind::vector ||
+            type->kind() == types::Kind::boolean || type->kind() == types::Kind::integer ||
+            type->kind() == types::Kind::enumeration || type->kind() == types::Kind::pointer) {
             leaves.push_back({base, type});
             return;
         }
@@ -1139,8 +1208,8 @@ std::optional<types::TypePtr> sysv64_component_type(const types::TypePtr &input,
                 self(type->element(), base + index * *element->size(), depth + 1, self);
             return;
         }
-        if (type->kind() == types::Kind::structure) {
-            const auto layout = types::layout(*type, types::Abi::x86_64);
+        if (type->kind() == types::Kind::structure || type->kind() == types::Kind::union_type) {
+            const auto layout = types::layout(*type, layout_abi);
             if (!layout || type->members().size() != layout.value().members.size()) { valid = false; return; }
             for (std::size_t index = 0; index < type->members().size(); ++index) {
                 const auto &member = type->members()[index];
@@ -1170,16 +1239,6 @@ std::optional<types::TypePtr> sysv64_component_type(const types::TypePtr &input,
     std::sort(members.begin(), members.end(), [](const Leaf &left, const Leaf &right) {
         return left.offset < right.offset;
     });
-    if (value_class == AbiValueClass::integer) {
-        std::uint64_t cursor = begin;
-        for (const auto &member : members) {
-            if (member.offset != cursor || *member.type->size() > end - cursor) return {};
-            cursor += *member.type->size();
-        }
-        if (cursor != end) return {};
-        auto value = types::Type::integer("sysv_aggregate_piece", component_size, 1, false);
-        return value ? std::optional<types::TypePtr>{value.value()} : std::nullopt;
-    }
     if (members.size() == 1 && members.front().offset == begin &&
         *members.front().type->size() == component_size)
         return members.front().type;
@@ -1229,7 +1288,7 @@ std::optional<std::vector<Sysv64ReturnPiece>> sysv64_aggregate_return_pieces(
             return {};
         const auto piece_class = reg->bank == RegisterBank::xmm ? AbiValueClass::floating
                                                                  : AbiValueClass::integer;
-        const auto projected = sysv64_component_type(input,
+        const auto projected = abi_component_type(input,
             static_cast<std::uint8_t>(location.value_offset), static_cast<std::uint8_t>(location.size), piece_class);
         if (!projected) return {};
         pieces.push_back({*reg, static_cast<std::uint8_t>(location.value_offset),
@@ -2125,9 +2184,11 @@ static Result<TypeRecoveryResult> recover_types_impl(
                     const auto &placement = classified.arguments[i];
                     const auto &parameter_type = parameters[i].type;
                     const auto unqualified_parameter = unqualified_type(parameter_type);
-                    if (abi.name == "x86-64 System V" && unqualified_parameter &&
+                    if ((abi.name == "x86-64 System V" || abi.name == "ARM32 AAPCS base PCS") &&
+                        unqualified_parameter &&
                         (unqualified_parameter->kind() == types::Kind::structure ||
-                         unqualified_parameter->kind() == types::Kind::union_type))
+                         unqualified_parameter->kind() == types::Kind::union_type ||
+                         (abi.name == "ARM32 AAPCS base PCS" && unqualified_parameter->kind() == types::Kind::array)))
                         continue;
                     // A single, proven placement can constrain the matching
                     // incoming value. Split aggregates require component type
@@ -2157,7 +2218,22 @@ static Result<TypeRecoveryResult> recover_types_impl(
                 }
             }
         }
-        if (abi.name == "x86-64 System V") {
+        if (abi.name == "ARM32 AAPCS base PCS") {
+            for (const auto &slot : aapcs32_prototype_slots(prototype)) {
+                if (!slot.supported || !slot.parameter_index || *slot.parameter_index >= parameters.size()) continue;
+                const auto &parameter_type = parameters[*slot.parameter_index].type;
+                if (!parameter_type) continue;
+                auto component_type = parameter_type;
+                if (slot.component_offset && slot.component_size) {
+                    const auto projected = abi_component_type(parameter_type, *slot.component_offset,
+                        *slot.component_size, slot.value_class, types::Abi::aarch32);
+                    if (!projected) continue;
+                    component_type = *projected;
+                }
+                if (slot.reg) constrain_register(*slot.reg, component_type);
+                else if (slot.stack_offset) constrain_stack_slot(*slot.stack_offset, component_type);
+            }
+        } else if (abi.name == "x86-64 System V") {
             for (const auto &slot : sysv64_prototype_slots(prototype)) {
                 if (!slot.parameter_index || *slot.parameter_index >= parameters.size()) continue;
                 const auto &parameter_type = parameters[*slot.parameter_index].type;
@@ -2165,7 +2241,7 @@ static Result<TypeRecoveryResult> recover_types_impl(
                 if (slot.reg) {
                     auto component_type = parameter_type;
                     if (slot.component_offset && slot.component_size) {
-                        const auto projected = sysv64_component_type(parameter_type, *slot.component_offset,
+                        const auto projected = abi_component_type(parameter_type, *slot.component_offset,
                                                                      *slot.component_size, slot.value_class);
                         if (!projected) continue;
                         component_type = *projected;
@@ -3089,7 +3165,11 @@ static Result<TypeRecoveryResult> recover_types_impl(
         if (!fact.constrained && !parameter_evidence.contains(key(fact.reg, fact.version))) return {};
         if (!fact.version || *fact.version != 0) return {};
         if (prototype) {
-            if (abi.name == "AArch64 AAPCS64") {
+            if (abi.name == "ARM32 AAPCS base PCS") {
+                for (const auto &slot : aapcs32_prototype_slots(prototype))
+                    if (slot.reg && *slot.reg == fact.reg && slot.parameter_index)
+                        return static_cast<std::size_t>(*slot.parameter_index);
+            } else if (abi.name == "AArch64 AAPCS64") {
                 for (const auto &slot : aapcs64_prototype_slots(prototype))
                     if (slot.reg && *slot.reg == fact.reg && slot.parameter_index)
                         return static_cast<std::size_t>(*slot.parameter_index);
@@ -4403,6 +4483,8 @@ Result<std::vector<TypeRecoveryResult>> recover_interprocedural_types(
     };
     const auto slots_for = [](const AbiDescription &abi, const types::TypePtr &prototype = {})
         -> std::vector<AbiArgumentSlot> {
+        if (abi.name == "ARM32 AAPCS base PCS" && prototype && prototype->kind() == types::Kind::function)
+            return aapcs32_prototype_slots(prototype);
         if (abi.name == "ARM32 AAPCS VFP PCS" && prototype && prototype->kind() == types::Kind::function)
             return aapcs32_vfp_prototype_slots(prototype);
         if (abi.name == "AArch64 AAPCS64" && prototype && prototype->kind() == types::Kind::function) {
@@ -5382,7 +5464,8 @@ Result<std::vector<TypeRecoveryResult>> recover_interprocedural_types(
                     if (!register_file_match && !shared_stack) continue;
                     signature = explicit_prototypes[callee]
                         ? explicit_prototypes[callee] : current[callee].inferred_prototype;
-                    if (abis[callee].name == "AArch64 AAPCS64" && signature) {
+                    if ((abis[callee].name == "ARM32 AAPCS base PCS" ||
+                         abis[callee].name == "AArch64 AAPCS64") && signature) {
                         classified_target_slots = slots_for(abis[callee], signature);
                         target_slots = &classified_target_slots;
                     } else target_slots = &abi_slots[callee];
@@ -5443,9 +5526,10 @@ Result<std::vector<TypeRecoveryResult>> recover_interprocedural_types(
                     if (!signature) continue;
                     auto parameter_type = signature->parameters()[parameter_index].type;
                     if (argument_slot.component_offset && argument_slot.component_size) {
-                        const auto projected_component = sysv64_component_type(parameter_type,
+                        const auto projected_component = abi_component_type(parameter_type,
                             *argument_slot.component_offset, *argument_slot.component_size,
-                            argument_slot.value_class);
+                            argument_slot.value_class,
+                            target_abi->name == "ARM32 AAPCS base PCS" ? types::Abi::aarch32 : types::Abi::x86_64);
                         if (!projected_component) continue;
                         parameter_type = *projected_component;
                     } else if (argument_slot.component_index) {

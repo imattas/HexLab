@@ -75,12 +75,17 @@ heuristic is retained. This is a reviewable heuristic candidate; callers
 should not treat it as debug information or a confirmed signature. Results
 are deterministic and do not mutate the lifted function.
 An explicit prototype used with `arm32_aapcs_abi()` now uses the shared AAPCS32
-base-PCS classifier to constrain single-location scalar arguments and hidden
-aggregate-result pointers. For an aggregate result larger than four bytes, the
-hidden result buffer is the exact incoming `r0` pointer; direct calls and known
+base-PCS classifier to constrain scalar arguments, split aggregate argument
+pieces, and hidden aggregate-result pointers. Split register and stack pieces
+retain the source parameter index and byte range; each piece is propagated as
+an integer-width value through known direct calls, while the supplied callee
+prototype retains the aggregate source type. Component placement must fit the
+recorded type size and the bounded 8-bit offset/size representation. Indirect
+aggregate arguments and malformed or unsupported placements remain
+unconstrained. For an aggregate result larger than four bytes, the hidden
+result buffer is the exact incoming `r0` pointer; direct calls and known
 external prototypes can transfer that result layout to the caller's matching
-output buffer. AAPCS32 split base-PCS aggregate arguments still require
-component-aware lifting. With `arm32_aapcs_vfp_abi()`, explicit non-variadic
+output buffer. With `arm32_aapcs_vfp_abi()`, explicit non-variadic
 prototypes map scalar FP values and HFA members to classified VFP registers.
 HFAs that spill are mapped only when member starts are exact and ordered;
 arbitrary aggregate copies, partial stores, aliases between S/D register views,

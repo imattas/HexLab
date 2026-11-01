@@ -132,9 +132,11 @@ struct HeaderImportResult {
 // member/function-parameter pack expansions fail explicitly. Concrete aggregate
 // names retain their expanded arguments.
 // Explicit/partial class-template specializations support type and integral
-// non-type parameters with fixed integer literals or direct parameter binding;
-// template-template parameters and compound non-type expression patterns remain
-// unsupported. Partial specializations of a primary consisting of one type pack
+// non-type parameters with fixed integer literals or direct parameter binding.
+// One otherwise unbound signed 64-bit non-type parameter can be inverted from
+// a single-use +, -, or exact * expression when the inverse is unique;
+// repeated/multiple unknowns and other inverse operators remain unsupported.
+// Partial specializations of a primary consisting of one type pack
 // support one type-pack expansion pattern in the forms T*... and const T*...;
 // mixed primary parameters, explicit specializations of primary packs, non-type
 // packs, template-template packs, and compound pack patterns remain unsupported.
