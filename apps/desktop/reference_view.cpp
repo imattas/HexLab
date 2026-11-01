@@ -795,6 +795,8 @@ void ReferenceView::explore_call_paths() {
     const auto start = *root_neighborhood.function_entry;
     std::deque<Path> pending;
     pending.push_back(Path{{start}, {}});
+    std::map<CallAddressKey, FunctionCallNeighborhood> neighborhood_cache;
+    neighborhood_cache.emplace(call_address_key(start), root_neighborhood);
     std::vector<Path> paths;
     std::size_t expanded = 0;
     bool omitted = root_neighborhood.omitted;
@@ -803,7 +805,12 @@ void ReferenceView::explore_call_paths() {
         pending.pop_front();
         ++expanded;
         if (path.edges.size() >= max_depth) continue;
-        const auto neighborhood = function_call_neighborhood(*snapshot, path.functions.back(), image);
+        const auto key = call_address_key(path.functions.back());
+        auto neighborhood_it = neighborhood_cache.find(key);
+        if (neighborhood_it == neighborhood_cache.end())
+            neighborhood_it = neighborhood_cache.emplace(
+                key, function_call_neighborhood(*snapshot, path.functions.back(), image)).first;
+        const auto &neighborhood = neighborhood_it->second;
         omitted = omitted || neighborhood.omitted;
         for (const auto &edge : neighborhood.callees) {
             const auto already_in_path = std::any_of(path.functions.begin(), path.functions.end(), [&](Address node) {
