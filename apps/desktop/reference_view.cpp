@@ -9,6 +9,7 @@
 #include <wx/sizer.h>
 #include <wx/textctrl.h>
 #include <algorithm>
+#include <deque>
 #include <limits>
 #include <map>
 #include <tuple>
@@ -121,9 +122,15 @@ wxString target_text(const Reference &reference, const Image *image) {
     }
     return "unresolved: " + reason;
 }
-struct FunctionCallRelation { Address entry; Address call_site; };
+struct FunctionCallRelation {
+    Address entry;
+    Address call_site;
+    ReferenceId reference_id;
+    ReferenceProvenanceKind provenance = ReferenceProvenanceKind::decoded;
+};
 struct FunctionCallNeighborhood {
     std::vector<FunctionCallRelation> callees, callers;
+    std::optional<Address> function_entry;
     bool omitted = false;
 };
 using CallAddressKey = std::pair<std::uint32_t, std::uint64_t>;
@@ -178,7 +185,8 @@ FunctionCallNeighborhood function_call_neighborhood(const ProjectSnapshot &proje
     };
     const auto *containing = function_for(address);
     if (!containing) return result;
-    using CallEdgeKey = std::pair<CallAddressKey, CallAddressKey>;
+    result.function_entry = containing->entry;
+    using CallEdgeKey = std::tuple<CallAddressKey, CallAddressKey, std::uint64_t>;
     std::map<CallEdgeKey, FunctionCallRelation> callees, callers;
     const auto chunk_count = std::min(max_chunks, containing->chunks.size());
     if (containing->chunks.size() > chunk_count) result.omitted = true;
@@ -195,8 +203,10 @@ FunctionCallNeighborhood function_call_neighborhood(const ProjectSnapshot &proje
                 const auto *target = target_location ? std::get_if<Address>(target_location) : nullptr;
                 if (!source || !target || !executable(*target)) continue;
                 if (const auto *callee = function_for(*target))
-                    callees.try_emplace(CallEdgeKey{call_address_key(callee->entry), call_address_key(*source)},
-                                        FunctionCallRelation{callee->entry, *source});
+                    callees.try_emplace(CallEdgeKey{call_address_key(callee->entry), call_address_key(*source),
+                                                    reference.id.value},
+                                        FunctionCallRelation{callee->entry, *source, reference.id,
+                                                             reference.provenance.kind});
             }
             if (outgoing.value().next_offset) result.omitted = true;
         }
@@ -211,8 +221,10 @@ FunctionCallNeighborhood function_call_neighborhood(const ProjectSnapshot &proje
                 const auto *source = std::get_if<Address>(&reference.source);
                 if (source && executable(*source))
                     if (const auto *caller = function_for(*source))
-                        callers.try_emplace(CallEdgeKey{call_address_key(caller->entry), call_address_key(*source)},
-                                            FunctionCallRelation{caller->entry, *source});
+                        callers.try_emplace(CallEdgeKey{call_address_key(caller->entry), call_address_key(*source),
+                                                        reference.id.value},
+                                            FunctionCallRelation{caller->entry, *source, reference.id,
+                                                                 reference.provenance.kind});
             }
             if (incoming.value().next_offset) result.omitted = true;
         }
@@ -356,8 +368,12 @@ ReferenceView::ReferenceView(wxWindow *parent) : wxPanel(parent) {
     call_callers_ = new wxButton(this, wxID_ANY, "Go to caller");
     call_callers_->SetName("reference-call-caller");
     call_callers_->SetToolTip("Choose a resolved executable caller of the containing function.");
+    call_paths_ = new wxButton(this, wxID_ANY, "Explore call paths");
+    call_paths_->SetName("reference-call-paths");
+    call_paths_->SetToolTip("Browse bounded multi-hop paths through resolved executable calls.");
     context_bar->Add(call_callees_, 0, wxALL, pad);
     context_bar->Add(call_callers_, 0, wxALL, pad);
+    context_bar->Add(call_paths_, 0, wxALL, pad);
     stack->Add(context_bar, 0, wxEXPAND);
     context_ = new wxStaticText(this, wxID_ANY, "Select a location", wxDefaultPosition, wxDefaultSize,
                                 wxST_ELLIPSIZE_END);
@@ -483,6 +499,7 @@ ReferenceView::ReferenceView(wxWindow *parent) : wxPanel(parent) {
     });
     call_callees_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { navigate_call_relations(false); });
     call_callers_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { navigate_call_relations(true); });
+    call_paths_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { explore_call_paths(); });
     table_->SetToolTip("References for the selected location. Use Up/Down to select an item; Enter or double-click follows its current endpoint.");
     direction_->SetToolTip("Choose outgoing references from the current location or incoming references to it.");
     previous_->SetToolTip("Show the previous page of references (Alt+Left).");
@@ -516,6 +533,7 @@ ReferenceView::ReferenceView(wxWindow *parent) : wxPanel(parent) {
 }
 void ReferenceView::inspect(Location location, bool incoming) {
     if (!document_) return;
+    ++navigation_revision_;
     auto &preference = preferences_[document_->value];
     preference.pinned = location;
     preference.incoming = incoming;
@@ -552,6 +570,7 @@ void ReferenceView::update_actions() {
         location_ && std::holds_alternative<Address>(*location_) && bool(navigate);
     call_callees_->Enable(call_neighborhood_available);
     call_callers_->Enable(call_neighborhood_available);
+    call_paths_->Enable(call_neighborhood_available);
     const auto preference = document_ ? preferences_.find(document_->value) : preferences_.end();
     const bool pinned = preference != preferences_.end() && preference->second.pinned.has_value();
     pin_->SetValue(pinned);
@@ -752,6 +771,107 @@ void ReferenceView::navigate_call_relations(bool callers) {
         return;
     navigate(document, snapshot, Location{links[static_cast<std::size_t>(selection)].entry});
 }
+void ReferenceView::explore_call_paths() {
+    if (!document_ || !project_ || !project_->loaded || !project_->loaded->image || !location_ ||
+        !std::holds_alternative<Address>(*location_) || !navigate)
+        return;
+    const auto document = *document_;
+    const auto snapshot = project_;
+    const auto revision = navigation_revision_;
+    const auto *image = snapshot->loaded->image.get();
+    constexpr std::size_t max_depth = 5, max_expansions = 256, max_paths = 64;
+    struct Path {
+        std::vector<Address> functions;
+        std::vector<FunctionCallRelation> edges;
+    };
+    const auto root_neighborhood = function_call_neighborhood(*snapshot, std::get<Address>(*location_), image);
+    // The bounded neighborhood also identifies the recovered function containing the selected address.
+    if (root_neighborhood.callees.empty()) {
+        wxMessageBox("No resolved executable call paths begin at this function.", "Call paths",
+                     wxOK | wxICON_INFORMATION, this);
+        return;
+    }
+    if (!root_neighborhood.function_entry) return;
+    const auto start = *root_neighborhood.function_entry;
+    std::deque<Path> pending;
+    pending.push_back(Path{{start}, {}});
+    std::vector<Path> paths;
+    std::size_t expanded = 0;
+    bool omitted = root_neighborhood.omitted;
+    while (!pending.empty() && expanded < max_expansions && paths.size() < max_paths) {
+        auto path = std::move(pending.front());
+        pending.pop_front();
+        ++expanded;
+        if (path.edges.size() >= max_depth) continue;
+        const auto neighborhood = function_call_neighborhood(*snapshot, path.functions.back(), image);
+        omitted = omitted || neighborhood.omitted;
+        for (const auto &edge : neighborhood.callees) {
+            const auto already_in_path = std::any_of(path.functions.begin(), path.functions.end(), [&](Address node) {
+                return call_address_key(node) == call_address_key(edge.entry);
+            });
+            if (already_in_path) continue;
+            auto extended = path;
+            extended.functions.push_back(edge.entry);
+            extended.edges.push_back(edge);
+            if (extended.edges.size() >= 2) {
+                paths.push_back(extended);
+                if (paths.size() == max_paths) {
+                    omitted = true;
+                    break;
+                }
+            }
+            if (extended.edges.size() < max_depth) {
+                if (pending.size() + expanded < max_expansions)
+                    pending.push_back(std::move(extended));
+                else
+                    omitted = true;
+            }
+        }
+    }
+    if (!pending.empty() || expanded >= max_expansions) omitted = true;
+    if (paths.empty()) {
+        wxMessageBox("No multi-hop resolved executable call paths were found.", "Call paths",
+                     wxOK | wxICON_INFORMATION, this);
+        return;
+    }
+    const auto provenance_name = [](ReferenceProvenanceKind kind) -> const char * {
+        switch (kind) {
+        case ReferenceProvenanceKind::decoded: return "decoded";
+        case ReferenceProvenanceKind::import_slot: return "import slot";
+        case ReferenceProvenanceKind::user: return "user-defined";
+        case ReferenceProvenanceKind::elf_relocation: return "ELF relocation";
+        case ReferenceProvenanceKind::macho_relocation: return "Mach-O relocation";
+        case ReferenceProvenanceKind::macho_dyld: return "Mach-O dyld";
+        case ReferenceProvenanceKind::dataflow: return "dataflow";
+        case ReferenceProvenanceKind::elf_vtable_slot: return "ELF vtable slot";
+        }
+        return "unknown";
+    };
+    wxArrayString choices;
+    choices.Alloc(paths.size());
+    for (const auto &path : paths) {
+        wxString label = preview_text(presentation_name(*snapshot, Location{path.functions.front()}), 72);
+        for (std::size_t i = 0; i < path.edges.size(); ++i) {
+            const auto &edge = path.edges[i];
+            label += " -> " + preview_text(presentation_name(*snapshot, Location{edge.entry}), 72) +
+                     wxString::Format(" @ %s [ref #%llu, %s]",
+                         location_text(Location{edge.call_site}, image),
+                         static_cast<unsigned long long>(edge.reference_id.value), provenance_name(edge.provenance));
+        }
+        choices.Add(label);
+    }
+    wxString prompt = "Choose a multi-hop route. Each edge shows its call site, stable reference ID and provenance; selection navigates to the endpoint.";
+    if (omitted) prompt += "\nThe search reached a configured bound; additional paths may exist.";
+    wxSingleChoiceDialog dialog(this, prompt, "Resolved call paths", choices);
+    if (dialog.ShowModal() != wxID_OK) return;
+    const auto selection = dialog.GetSelection();
+    if (selection == wxNOT_FOUND || static_cast<std::size_t>(selection) >= paths.size() ||
+        !document_ || document_->value != document.value || project_ != snapshot ||
+        navigation_revision_ != revision || !project_->derived_key || !project_->references ||
+        project_->references->key() != project_->derived_key || !navigate)
+        return;
+    navigate(document, snapshot, Location{paths[static_cast<std::size_t>(selection)].functions.back()});
+}
 void ReferenceView::retain_documents(std::span<const DocumentInfo> docs) {
     for (auto it = preferences_.begin(); it != preferences_.end();)
         if (std::none_of(docs.begin(), docs.end(), [&](auto &doc) { return doc.id.value == it->first; }))
@@ -761,6 +881,8 @@ void ReferenceView::retain_documents(std::span<const DocumentInfo> docs) {
 }
 void ReferenceView::update(std::optional<DocumentId> id, std::shared_ptr<const ProjectSnapshot> project,
                            std::optional<Location> location) {
+    if (id != document_ || project != project_ || location != selection_)
+        ++navigation_revision_;
     selection_ = location;
     if (id) {
         auto &preference = preferences_[id->value];

@@ -6,6 +6,7 @@
 #include <wx/stattext.h>
 #include <wx/checkbox.h>
 #include <wx/textctrl.h>
+#include <cstdint>
 #include <map>
 #include <vector>
 namespace hexlab::desktop {
@@ -24,6 +25,7 @@ class ReferenceView final : public wxPanel {
     wxButton *source_, *target_, *origin_;
     wxButton *copy_selected_;
     wxButton *call_callees_, *call_callers_;
+    wxButton *call_paths_;
     wxCheckBox *pin_;
     wxCheckBox *range_;
     wxCheckBox *mapped_range_;
@@ -36,6 +38,7 @@ class ReferenceView final : public wxPanel {
     std::shared_ptr<const ProjectSnapshot> project_;
     std::optional<Location> location_;
     std::optional<Location> selection_;
+    std::uint64_t navigation_revision_ = 0;
     struct Preference {
         bool incoming = false;
         bool range = false;
@@ -55,5 +58,6 @@ class ReferenceView final : public wxPanel {
     void copy_selected_reference();
     void follow_selected(bool target);
     void navigate_call_relations(bool callers);
+    void explore_call_paths();
 };
 } // namespace hexlab::desktop

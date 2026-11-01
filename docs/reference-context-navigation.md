@@ -15,6 +15,17 @@ calls to the same function remain individually navigable. Consequently, large
 functions or incomplete reference pages can have omitted relationships; this
 is a compact context hint, not a complete call graph.
 
+Use **Explore call paths** to browse outgoing paths from the function
+containing the current address. The search follows resolved executable call
+references up to five edges, avoids cycles within a route, and caps expansion
+at 256 function paths and 64 displayed routes. Routes show at least two edges;
+each edge includes the call-site address, stable reference ID, and reference
+provenance. The chooser is built from one immutable project snapshot, and
+confirming a route navigates only if the document, snapshot, and view
+navigation revision still match. Large or incomplete analyses can omit routes
+at the configured bounds; indirect calls without a resolved address and
+targets outside recovered executable functions are not included.
+
 Use **Navigate → Incoming References** (`Ctrl+Shift+X`) or **Outgoing References** (`Ctrl+Alt+X`) to open references for the current selection. The listing context menu offers the same operations for the row under the pointer, or the selected row when opened with the keyboard. Opening this menu or a reference set leaves the workspace address and history unchanged. When an interior-byte selection falls inside a decoded instruction in the current listing page, the query uses that instruction's start without changing the selected byte. Other address and file-offset queries keep their original domain.
 
 These commands open the References page with **Pin context** enabled. The origin label identifies the queried location. Clicking an incoming row navigates to its source; clicking an outgoing row navigates to its resolved target, or to its source when the target is external or unresolved. With the context pinned, navigation updates the listing, bytes, and other context views while preserving the reference origin, direction, page, and selected reference. Use **Go to source** or **Go to target** to visit either endpoint of the selected reference, and **Go to origin** to return to the queried location. Target navigation is disabled for external and unresolved targets; no numeric destination is invented. These navigation actions use the ordinary Back/Forward history.
