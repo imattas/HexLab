@@ -2629,7 +2629,8 @@ struct MainFrame::Impl {
                            active && controller->search_pending(*active),
                            active ? controller->search_reason(*active) : wxString{},
                            active_snapshot ? active_snapshot->image : nullptr,
-                           active_snapshot ? active_snapshot->project : nullptr);
+                           active_snapshot ? active_snapshot->project : nullptr,
+                           active_snapshot ? active_snapshot->revision : 0);
         }
         if (manager.active_document() != output_document) {
             annotation_context.reset();
@@ -5694,6 +5695,12 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
     ui.listing->request_page = [this](std::shared_ptr<const DocumentSnapshot> document, Location begin) {
         auto result = impl_->controller->request_listing(std::move(document), begin);
         (void)result;
+    };
+    ui.search->source_current = [this](DocumentId id, std::uint64_t revision, const ProjectSnapshot *project) {
+        auto &manager = impl_->controller->documents();
+        const auto current = manager.active_workspace().current();
+        return manager.active_document() == id && current && current->id == id &&
+               current->revision == revision && current->project.get() == project;
     };
     ui.search->navigate = [this](DocumentId id, std::size_t index, const SearchMatch &expected) {
         auto &manager = impl_->controller->documents();

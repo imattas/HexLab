@@ -1,5 +1,6 @@
 #include "search_view.hpp"
 #include "hexlab/workspace/navigation.hpp"
+#include "hexlab/workspace/project_analysis.hpp"
 #include "hexlab/image/file_publication.hpp"
 #include <wx/choice.h>
 #include <wx/checkbox.h>
@@ -351,14 +352,20 @@ struct SearchView::CollectionWork {
     struct Request {
         std::uint64_t generation = 0;
         DocumentId document;
+        std::uint64_t document_revision = 0;
+        std::shared_ptr<const Image> image;
+        std::shared_ptr<const ProjectSnapshot> project;
         std::vector<std::shared_ptr<const SearchPage>> pages;
     };
-    struct Seed { DocumentId document; std::size_t index = 0; SearchMatch match; std::shared_ptr<const SearchPage> page; };
     struct Batch {
         std::uint64_t generation = 0;
         DocumentId document;
-        std::vector<Seed> rows;
+        std::uint64_t document_revision = 0;
+        std::shared_ptr<const Image> image;
+        std::shared_ptr<const ProjectSnapshot> project;
+        std::vector<Rows::Item> rows;
         bool done = false;
+        std::string reason;
     };
     std::atomic<std::uint64_t> generation{0};
     std::mutex mutex;
@@ -430,6 +437,8 @@ SearchView::SearchView(wxWindow *parent) : wxPanel(parent), filter_work_(std::ma
     table_->activate = [this](std::size_t row) {
         if (rows_ && visible_ && row < visible_->size()) {
             const auto item = rows_->items[(*visible_)[row]];
+            if (!all_documents_ && source_current &&
+                !source_current(item.document, document_revision_, item.project.get())) return;
             selected_document_ = item.document;
             selected_page_ = item.page;
             selected_index_ = item.index;
@@ -516,59 +525,73 @@ SearchView::SearchView(wxWindow *parent) : wxPanel(parent), filter_work_(std::ma
                 request = std::move(*collection->request);
                 collection->request.reset();
             }
+            // Only one prepared batch may wait for the GUI. Formatting, address
+            // resolution, and filter metadata belong to this immutable snapshot.
+            const auto publish = [&](std::vector<Rows::Item> rows, bool done, std::string reason = {}) {
+                CollectionWork::Batch batch{request.generation, request.document, request.document_revision,
+                    request.image, request.project, std::move(rows), done, std::move(reason)};
+                std::unique_lock lock(collection->mutex);
+                collection->ready.wait(lock, stop, [&] { return !collection->batch.has_value() ||
+                    collection->generation.load(std::memory_order_acquire) != request.generation; });
+                if (stop.stop_requested() ||
+                    collection->generation.load(std::memory_order_acquire) != request.generation) return false;
+                collection->batch = std::move(batch);
+                lock.unlock();
+                collection->ready.notify_all();
+                return true;
+            };
+            std::optional<AnalysisKey> source;
+            if (request.project) {
+                const auto key = project_analysis_key(*request.project, request.project->analysis_options);
+                if (!key) { publish({}, true, key.error().message); continue; }
+                source = key.value();
+            }
             std::size_t index = 0;
             bool canceled = false;
-            std::vector<CollectionWork::Seed> pending;
+            std::string reason;
+            std::vector<Rows::Item> pending;
             pending.reserve(256);
             for (const auto &page : request.pages) {
+                if (stop.stop_requested() ||
+                    collection->generation.load(std::memory_order_acquire) != request.generation) {
+                    canceled = true;
+                    break;
+                }
                 if (!page) continue;
+                if (source && page->source_key != *source) {
+                    reason = "Loaded search results belong to another source revision; find again";
+                    break;
+                }
+                source = page->source_key;
                 for (const auto &match : page->matches) {
-                    if ((index & 255u) == 0 && (stop.stop_requested() ||
-                        collection->generation.load(std::memory_order_acquire) != request.generation)) {
+                    if (stop.stop_requested() ||
+                        collection->generation.load(std::memory_order_acquire) != request.generation) {
                         canceled = true;
                         break;
                     }
-                    pending.push_back({request.document, index++, match, page});
+                    const auto address = match.instruction_address ? match.instruction_address : match.address;
+                    Rows::Item item{request.document, index++, match, "Active document",
+                                    request.image, request.project, page};
+                    item.cells = {item.label, location_text(match.offset),
+                                  address ? location_text(*address, request.image.get()) : wxString("file only"),
+                                  number(match.size), match.operand_index ? number(*match.operand_index) : wxString{},
+                                  number(item.index + 1)};
+                    wxString metadata;
+                    for (const auto &cell : item.cells) metadata += cell + "\n";
+                    metadata.MakeLower();
+                    const auto encoded = metadata.utf8_string();
+                    item.metadata.assign(encoded.data(), encoded.length());
+                    pending.push_back(std::move(item));
                     if (pending.size() == 256) {
-                        CollectionWork::Batch batch{request.generation, request.document, std::move(pending), false};
+                        if (!publish(std::move(pending), false)) { canceled = true; break; }
                         pending.clear();
-                        std::unique_lock lock(collection->mutex);
-                        collection->ready.wait(lock, stop, [&] { return !collection->batch.has_value() ||
-                            collection->generation.load(std::memory_order_acquire) != request.generation; });
-                        if (stop.stop_requested() || collection->generation.load(std::memory_order_acquire) != request.generation) {
-                            canceled = true;
-                            break;
-                        }
-                        collection->batch = std::move(batch);
-                        lock.unlock();
-                        collection->ready.notify_all();
+                        pending.reserve(256);
                     }
                 }
                 if (canceled) break;
             }
             if (canceled || stop.stop_requested()) continue;
-            if (!pending.empty()) {
-                CollectionWork::Batch batch{request.generation, request.document, std::move(pending), false};
-                std::unique_lock lock(collection->mutex);
-                collection->ready.wait(lock, stop, [&] { return !collection->batch.has_value() ||
-                    collection->generation.load(std::memory_order_acquire) != request.generation; });
-                if (stop.stop_requested()) return;
-                if (collection->generation.load(std::memory_order_acquire) != request.generation) continue;
-                collection->batch = std::move(batch);
-                lock.unlock();
-                collection->ready.notify_all();
-            }
-            // A per-worker scratch vector avoids retaining rows from a canceled request.
-            CollectionWork::Batch done{request.generation, request.document, {}, true};
-            std::unique_lock lock(collection->mutex);
-            collection->ready.wait(lock, stop, [&] { return !collection->batch.has_value() ||
-                collection->generation.load(std::memory_order_acquire) != request.generation; });
-            if (stop.stop_requested()) return;
-            if (collection->generation.load(std::memory_order_acquire) == request.generation) {
-                collection->batch = std::move(done);
-                lock.unlock();
-                collection->ready.notify_all();
-            }
+            publish(std::move(pending), true, std::move(reason));
         }
     });
 }
@@ -586,33 +609,62 @@ SearchView::~SearchView() {
 }
 void SearchView::update(std::optional<DocumentId> document, const SearchHistory *history, bool pending,
                         const wxString &reason, std::shared_ptr<const Image> image,
-                        std::shared_ptr<const ProjectSnapshot> project) {
+                        std::shared_ptr<const ProjectSnapshot> project, std::uint64_t document_revision) {
     std::vector<std::shared_ptr<const SearchPage>> pages;
     if (history) pages.assign(history->pages().begin(), history->pages().end());
     const auto selected_history_index = history ? history->selected_index() : std::optional<std::size_t>{};
-    if (!all_documents_ && document == document_ && pages == current_pages_ && image == collection_image_ &&
-        project == collection_project_ && reason == current_reason_ && pending == current_pending_) {
-        if (selected_history_index != history_selected_index_) {
-            history_selected_index_ = selected_history_index;
-            if (!collection_rows_ && document && selected_history_index && rows_) {
-                const auto selected = std::find_if(rows_->items.begin(), rows_->items.end(), [&](const auto &item) {
-                    return item.document == *document && item.index == *selected_history_index;
-                });
-                if (selected != rows_->items.end()) {
-                    selected_document_ = selected->document;
-                    selected_index_ = selected->index;
-                    selected_page_ = selected->page;
-                    if (visible_) for (std::size_t row = 0; row < visible_->size(); ++row)
-                        if (rows_->items[(*visible_)[row]].document == selected->document &&
-                            rows_->items[(*visible_)[row]].index == selected->index &&
-                            rows_->items[(*visible_)[row]].page == selected->page) {
-                            table_->select_row(row);
-                            break;
-                        }
-                    show_preview();
-                }
+    const bool same_source = (collection_rows_ || rows_) && !all_documents_ && document == document_ &&
+        pages == current_pages_ && image == collection_image_ && project == collection_project_ &&
+        document_revision == document_revision_;
+    if (!same_source) collection_reason_.clear();
+    const bool selection_changed = selected_history_index != history_selected_index_;
+    history_selected_index_ = selected_history_index;
+    if (selection_changed && document && selected_history_index) {
+        std::size_t begin = 0;
+        for (const auto &page : pages) {
+            if (!page) continue;
+            if (*selected_history_index >= begin && *selected_history_index - begin < page->matches.size()) {
+                selected_document_ = *document;
+                selected_page_ = page;
+                selected_index_ = *selected_history_index;
+                break;
             }
+            begin += page->matches.size();
         }
+    }
+    coverage_ = document ? wxString("Active document") : wxString("No searchable document");
+    if (pending) coverage_ += "; search pending";
+    if (!pages.empty() && pages.back()) {
+        const auto &last = pages.back();
+        coverage_ += last->complete ? "; current page complete" : "; more input remains";
+        if (!last->source_complete) coverage_ += "; partial decoded source";
+        if (!last->reason.empty()) coverage_ += "; " + text(last->reason).Left(160);
+    }
+    if (!reason.empty()) coverage_ += "; " + reason.Left(160);
+    if (!collection_reason_.empty()) coverage_ += "; " + collection_reason_;
+    more_->Enable(history && history->continuation().has_value() && !pending);
+    const bool searched = pending || (history && history->query().has_value());
+    if (same_source && current_reason_ == reason && current_pending_ == pending &&
+        (collection_rows_ ? collection_rows_->searched == searched : rows_ && rows_->searched == searched)) {
+        if (selection_changed) restore_selection();
+        return;
+    }
+    current_reason_ = reason;
+    current_pending_ = pending;
+    if (same_source) {
+        // A page may remain unchanged while the engine queues or finishes more
+        // work. Status updates must not repeatedly cancel a large collection.
+        if (collection_rows_) collection_rows_->searched = searched;
+        else if (rows_ && rows_->searched != searched) {
+            // Empty history can change from unsearched to searched without pages.
+            auto empty = std::make_shared<Rows>();
+            if (project) empty->protected_paths = project->protected_paths;
+            empty->searched = searched;
+            rows_ = empty;
+            render();
+        }
+        refresh_status();
+        if (selection_changed) restore_selection();
         return;
     }
     all_documents_ = false;
@@ -622,11 +674,9 @@ void SearchView::update(std::optional<DocumentId> document, const SearchHistory 
     }
     document_ = document;
     current_pages_ = pages;
-    current_reason_ = reason;
-    current_pending_ = pending;
     collection_image_ = image;
     collection_project_ = project;
-    history_selected_index_ = selected_history_index;
+    document_revision_ = document_revision;
     collection_timer_.Stop();
     const auto generation = collection_work_->generation.fetch_add(1, std::memory_order_acq_rel) + 1;
     {
@@ -643,25 +693,15 @@ void SearchView::update(std::optional<DocumentId> document, const SearchHistory 
         filter_work_->completion.reset();
     }
     auto rows = std::make_shared<Rows>();
-    rows->searched = pending || (history && history->query().has_value());
+    rows->searched = searched;
     if (project) rows->protected_paths = project->protected_paths;
     collection_rows_ = rows;
     visible_.reset();
     table_->populate(0, {});
     previous_->Disable(); next_->Disable(); copy_->Disable(); export_->Disable();
     std::size_t loaded = 0;
-    if (history) for (const auto &page : history->pages()) if (page) loaded += page->matches.size();
-    coverage_ = document ? wxString("Active document") : wxString("No searchable document");
-    if (pending) coverage_ += "; search pending";
-    if (history && history->pages().size()) {
-        const auto &last = history->pages().back();
-        coverage_ += last->complete ? "; current page complete" : "; more input remains";
-        if (!last->source_complete) coverage_ += "; partial decoded source";
-        if (!last->reason.empty()) coverage_ += "; " + text(last->reason).Left(160);
-    }
-    if (!reason.empty()) coverage_ += "; " + reason.Left(160);
-    more_->Enable(history && history->continuation().has_value() && !pending);
-    if (!document || !history || history->pages().empty()) {
+    for (const auto &page : pages) if (page) loaded += page->matches.size();
+    if (!document || !history || pages.empty()) {
         rows_ = collection_rows_;
         collection_rows_.reset();
         selected_document_.reset(); selected_page_.reset();
@@ -671,7 +711,10 @@ void SearchView::update(std::optional<DocumentId> document, const SearchHistory 
     CollectionWork::Request request;
     request.generation = generation;
     request.document = *document;
-    request.pages = pages;
+    request.document_revision = document_revision;
+    request.image = std::move(image);
+    request.project = std::move(project);
+    request.pages = std::move(pages);
     {
         std::lock_guard lock(collection_work_->mutex);
         collection_work_->request = std::move(request);
@@ -694,48 +737,51 @@ void SearchView::poll_collection() {
     }
     collection_work_->ready.notify_all();
     if (!batch || batch->generation != collection_work_->generation.load(std::memory_order_acquire) ||
-        all_documents_ || !document_ || *document_ != batch->document) return;
-    if (!batch->rows.empty()) {
-        if (!collection_rows_) return;
-        for (auto &seed : batch->rows) {
-            const auto address = seed.match.instruction_address ? seed.match.instruction_address : seed.match.address;
-            Rows::Item item{seed.document, seed.index, std::move(seed.match), "Active document", {}, {}, seed.page};
-            // Request context is attached to each immutable page batch below by the
-            // active document snapshot; the page remains the source identity anchor.
-            item.image = collection_image_;
-            item.project = collection_project_;
-            item.cells = {item.label, location_text(item.match.offset),
-                          address ? location_text(*address, item.image.get()) : wxString("file only"),
-                          number(item.match.size), item.match.operand_index ? number(*item.match.operand_index) : wxString{},
-                          number(item.index + 1)};
-            wxString metadata;
-            for (const auto &cell : item.cells) metadata += cell + "\n";
-            metadata.MakeLower();
-            const auto encoded = metadata.utf8_string();
-            item.metadata.assign(encoded.data(), encoded.length());
-            collection_rows_->items.push_back(std::move(item));
+        all_documents_ || !document_ || *document_ != batch->document ||
+        batch->document_revision != document_revision_ || batch->image != collection_image_ ||
+        batch->project != collection_project_ || !collection_rows_) return;
+    if (source_current && !source_current(batch->document, batch->document_revision, batch->project.get())) {
+        collection_timer_.Stop();
+        collection_work_->generation.fetch_add(1, std::memory_order_acq_rel);
+        {
+            std::lock_guard lock(collection_work_->mutex);
+            collection_work_->request.reset();
+            collection_work_->batch.reset();
         }
-        status_->SetLabel("Collected " + number(collection_rows_->items.size()) + " loaded matches...");
+        collection_work_->ready.notify_all();
+        collection_rows_.reset();
+        rows_ = std::make_shared<Rows>();
+        selected_document_.reset(); selected_page_.reset();
+        collection_reason_ = "Document changed or closed; find again";
+        coverage_ = collection_reason_;
+        render();
+        return;
     }
+    // The GUI moves at most 256 fully prepared rows per tick. No address lookup,
+    // source read, text formatting, or metadata lowercasing happens here.
+    for (auto &item : batch->rows) collection_rows_->items.push_back(std::move(item));
+    if (!batch->reason.empty()) {
+        collection_rows_->items.clear();
+        collection_reason_ = text(batch->reason).Left(160);
+        coverage_ += "; " + collection_reason_;
+    }
+    refresh_status();
     if (!batch->done) return;
     collection_timer_.Stop();
     rows_ = collection_rows_;
     collection_rows_.reset();
-    const bool retained = selected_document_ && std::any_of(rows_->items.begin(), rows_->items.end(), [&](const auto &item) {
-        return item.document == *selected_document_ && item.index == selected_index_ && item.page == selected_page_;
-    });
+    // Current-document rows retain their original contiguous history indexes.
+    const bool retained = selected_document_ && selected_index_ < rows_->items.size() &&
+        rows_->items[selected_index_].document == *selected_document_ &&
+        rows_->items[selected_index_].page == selected_page_;
     if (!retained) {
         selected_document_.reset();
         selected_page_.reset();
-    }
-    if (history_selected_index_ && !retained) {
-        const auto selected = std::find_if(rows_->items.begin(), rows_->items.end(), [&](const auto &item) {
-            return item.index == *history_selected_index_;
-        });
-        if (selected != rows_->items.end()) {
-            selected_document_ = selected->document;
-            selected_index_ = selected->index;
-            selected_page_ = selected->page;
+        if (history_selected_index_ && *history_selected_index_ < rows_->items.size()) {
+            const auto &selected = rows_->items[*history_selected_index_];
+            selected_document_ = selected.document;
+            selected_index_ = selected.index;
+            selected_page_ = selected.page;
         }
     }
     render();
@@ -744,7 +790,7 @@ void SearchView::update_all(const std::vector<SearchDocumentView> &documents) {
     collection_rows_.reset();
     current_pages_.clear();
     collection_image_.reset(); collection_project_.reset();
-    history_selected_index_.reset(); current_reason_.clear(); current_pending_ = false;
+    history_selected_index_.reset(); current_reason_.clear(); collection_reason_.clear(); current_pending_ = false;
     collection_timer_.Stop();
     collection_work_->generation.fetch_add(1, std::memory_order_acq_rel);
     {
@@ -887,29 +933,53 @@ void SearchView::poll_filter() {
         completion->rows != rows_) return;
     filter_timer_.Stop();
     auto visible = std::make_shared<std::vector<std::size_t>>(std::move(completion->visible));
-    std::optional<std::size_t> selected;
     const auto rows = rows_;
-    if (rows) for (std::size_t row = 0; row < visible->size(); ++row) {
-        const auto &item = rows->items[(*visible)[row]];
-        if (selected_document_ && item.document == *selected_document_ && item.index == selected_index_ && item.page == selected_page_)
-            selected = row;
-    }
     visible_ = visible;
     table_->populate(visible->size(), [rows, visible](std::size_t row, int column) {
         if (!rows || row >= visible->size() || column < 0 || column >= 6) return wxString{};
         return rows->items[(*visible)[row]].cells[column];
     });
     table_->fit_columns({0, 1, 2}, {});
-    if (selected) table_->select_row(*selected);
-    const auto status = number(visible->size()) + " visible / " + number(rows ? rows->items.size() : 0) +
-                        " loaded matches; " + coverage_;
-    status_->SetLabel(status);
-    status_->SetToolTip(status);
+    restore_selection();
+    refresh_status();
     copy_->Enable(rows && rows->searched);
     // An empty export is useful evidence when a metadata filter matches no loaded rows.
     export_->Enable(rows && rows->searched);
-    show_preview();
     Layout();
+}
+void SearchView::refresh_status() {
+    if (collection_rows_) {
+        status_->SetLabel("Collected " + number(collection_rows_->items.size()) + " loaded matches...");
+    } else if (visible_) {
+        status_->SetLabel(number(visible_->size()) + " visible / " + number(rows_ ? rows_->items.size() : 0) +
+                          " loaded matches; " + coverage_);
+    }
+    status_->SetToolTip(coverage_);
+}
+void SearchView::restore_selection() {
+    if (!rows_ || !visible_ || collection_rows_) return;
+    std::optional<std::size_t> selected;
+    if (selected_document_) {
+        if (!all_documents_) {
+            const auto found = std::lower_bound(visible_->begin(), visible_->end(), selected_index_);
+            if (found != visible_->end() && *found == selected_index_) {
+                const auto &item = rows_->items[*found];
+                if (item.document == *selected_document_ && item.page == selected_page_)
+                    selected = static_cast<std::size_t>(found - visible_->begin());
+            }
+        } else {
+            for (std::size_t row = 0; row < visible_->size(); ++row) {
+                const auto &item = rows_->items[(*visible_)[row]];
+                if (item.document == *selected_document_ && item.index == selected_index_ && item.page == selected_page_) {
+                    selected = row;
+                    break;
+                }
+            }
+        }
+    }
+    if (selected) table_->select_row(*selected);
+    else table_->clear_selection();
+    show_preview();
 }
 void SearchView::step(bool forward) {
     if (!visible_ || visible_->empty()) return;

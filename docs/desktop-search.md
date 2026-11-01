@@ -56,6 +56,25 @@ Previous report that they are waiting; use the command again after the page
 completes. Single-document
 search keeps its existing per-document Find Next/Previous behavior.
 
+For current-document searches, the Search pane prepares loaded result rows,
+address labels, and metadata for filtering on a cancellable background worker.
+Only one prepared batch waits for the UI, which accepts at most **256 rows**
+per timer tick. Scanning still uses the analysis pool and its existing page
+limits; preparing the result list does not read source bytes or open files.
+The pane pauses row navigation, copy, and export while collection or filtering
+is pending, then restores the selected document, page, and original history
+index. Find Next/Previous can still change that history selection while rows
+are being prepared; the completed list follows the latest selection.
+
+Changing the active document, document revision, source snapshot, loaded pages,
+or search scope retires the old collection generation. Completions must match
+the captured document ID, revision, image, project, and page source key. The
+desktop also checks the live document revision and project before accepting a
+batch or navigating a current-document result. Status-only changes do not
+restart collection. This workflow searches only the selected document unless
+the user explicitly enables the existing all-open-documents option; it adds no
+project-wide indexing or implicit file opening.
+
 Literal text searches encode their UTF-8 input as ASCII, UTF-8, UTF-16LE,
 UTF-16BE, UTF-32LE, or UTF-32BE. UTF-16 queries encode supplementary Unicode
 characters as surrogate pairs; UTF-32 queries encode each Unicode scalar in the
@@ -129,3 +148,8 @@ while other documents are pending.
 The original GUI search workflow is covered by `tests/desktop_search_tests.cpp`, including
 single-document paging/history, asynchronous cancellation and stale-source
 rejection, and combined multi-document result selection.
+
+The 2026-10-31 current-document result-preparation change was compiled with
+MSVC 19.44 in C++20 mode for `apps/desktop/search_view.cpp` and
+`apps/desktop/main_frame.cpp`. This wave did not run tests or launch the GUI;
+interactive responsiveness and cancellation remain unverified at runtime.

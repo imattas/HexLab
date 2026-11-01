@@ -27,9 +27,11 @@ class SearchView final : public wxPanel {
     explicit SearchView(wxWindow *);
     ~SearchView() override;
     void update(std::optional<DocumentId>, const SearchHistory *, bool pending, const wxString &reason,
-                std::shared_ptr<const Image> = {}, std::shared_ptr<const ProjectSnapshot> = {});
+                std::shared_ptr<const Image> = {}, std::shared_ptr<const ProjectSnapshot> = {},
+                std::uint64_t document_revision = 0);
     void update_all(const std::vector<SearchDocumentView> &);
     std::function<void(DocumentId, std::size_t, const SearchMatch &)> navigate;
+    std::function<bool(DocumentId, std::uint64_t, const ProjectSnapshot *)> source_current;
     std::function<void(DocumentId)> more;
     std::function<void()> more_all;
 
@@ -56,12 +58,16 @@ class SearchView final : public wxPanel {
     std::optional<DocumentId> document_;
     std::shared_ptr<const Image> collection_image_;
     std::shared_ptr<const ProjectSnapshot> collection_project_;
+    std::uint64_t document_revision_ = 0;
     std::optional<std::size_t> history_selected_index_;
     std::vector<std::shared_ptr<const SearchPage>> current_pages_;
     wxString current_reason_;
+    wxString collection_reason_;
     bool current_pending_ = false;
     bool all_documents_ = false;
     void render();
+    void refresh_status();
+    void restore_selection();
     void poll_filter();
     void poll_collection();
     void show_preview();
