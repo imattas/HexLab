@@ -890,6 +890,8 @@ std::string operation_name(Opcode opcode) {
     case Opcode::cmppd: return "cmppd";
     case Opcode::cmpss: return "cmpss";
     case Opcode::cmpsd: return "cmpsd";
+    case Opcode::vcmpss: return "vcmpss";
+    case Opcode::vcmpsd: return "vcmpsd";
     case Opcode::vaddps: return "vaddps";
     case Opcode::vaddpd: return "vaddpd";
     case Opcode::vsubps: return "vsubps";
@@ -5929,6 +5931,73 @@ a64_unhandled:
                 std::move(inputs), memory ? IntrinsicMemoryEffect::unknown : IntrinsicMemoryEffect::none};
             effect.register_writes = instruction.register_writes;
             if (destination) effect.result_type = integer_type(width);
+            return effect;
+        }
+    }
+    if (x86_vex_context && !instruction.x86_evex &&
+        (instruction.opcode == Opcode::vcmpss || instruction.opcode == Opcode::vcmpsd) &&
+        instruction.vector_bits == 128 && instruction.operands.size() == 4 &&
+        !instruction.x86_opmask && !instruction.x86_opmask_zeroing &&
+        !instruction.x86_evex_broadcast && !instruction.x86_evex_sae &&
+        x86_avx_detail::vex_registers_valid(instruction)) {
+        const auto lane_bits = static_cast<std::uint16_t>(instruction.opcode == Opcode::vcmpss ? 32 : 64);
+        const auto *destination = std::get_if<RegisterOperand>(&instruction.operands[0]);
+        const auto *memory = std::get_if<MemoryOperand>(&instruction.operands[2]);
+        const auto *predicate = std::get_if<ImmediateOperand>(&instruction.operands[3]);
+        const RegisterOperand mxcsr{RegisterBank::mxcsr, 0, 32, false};
+        const bool zero_upper = destination &&
+            std::find(instruction.register_writes.begin(), instruction.register_writes.end(),
+                      RegisterOperand{RegisterBank::ymm, destination->index, 256, false}) != instruction.register_writes.end();
+        if (destination && x86_avx_detail::is_xmm_or_ymm(instruction.operands[0], 128) &&
+            x86_avx_detail::is_xmm_or_ymm(instruction.operands[1], 128) &&
+            (x86_avx_detail::is_xmm_or_ymm(instruction.operands[2], 128) ||
+             (memory && memory->data_width == lane_bits)) && predicate &&
+            instruction.access == std::vector<OperandAccess>{OperandAccess::write, OperandAccess::read,
+                                                               OperandAccess::read, OperandAccess::read} &&
+            predicate->encoded_width == 8 && predicate->effective_width == 8 && !predicate->is_signed &&
+            predicate->value < 32 && (!instruction.vector_element_bits || instruction.vector_element_bits == lane_bits) &&
+            zero_upper && std::find(instruction.register_writes.begin(), instruction.register_writes.end(), *destination) != instruction.register_writes.end() &&
+            std::find(instruction.register_reads.begin(), instruction.register_reads.end(), mxcsr) != instruction.register_reads.end() &&
+            std::find(instruction.register_writes.begin(), instruction.register_writes.end(), mxcsr) != instruction.register_writes.end()) {
+            const auto source_type = vector_type(128, TypeKind::floating, lane_bits,
+                static_cast<std::uint8_t>(128 / lane_bits));
+            const auto low_type = vector_type(128, TypeKind::integer, lane_bits,
+                static_cast<std::uint8_t>(128 / lane_bits));
+            const auto full_type = vector_type(256, TypeKind::integer, lane_bits,
+                static_cast<std::uint8_t>(256 / lane_bits));
+            auto source1 = retag_expr(operands[1], source_type);
+            auto source2 = retag_expr(operands[2], memory ? floating_type(lane_bits) : source_type);
+            auto compare_pair = std::make_shared<Expression>(Expression{
+                vector_type(128, TypeKind::integer, 8, 16),
+                BinaryValue{"x86_avx_scalar_compare_ie_de_inputs_predicate" + std::to_string(predicate->value),
+                    source1, source2}});
+            auto compare_inputs = std::make_shared<Expression>(Expression{
+                vector_type(128, TypeKind::integer, 8, 16),
+                BinaryValue{"x86_avx_scalar_compare_with_mxcsr", compare_pair, reg_expr(mxcsr)}});
+            Intrinsic effect{"x86_" + operation_name(instruction.opcode) + "_f" + std::to_string(lane_bits) +
+                "_predicate" + std::to_string(predicate->value) + "_merge_src1_zero_upper_mxcsr_control_status",
+                {source1, source2, retag_expr(operands[3], integer_type(8)), reg_expr(mxcsr)},
+                memory ? IntrinsicMemoryEffect::read : IntrinsicMemoryEffect::none};
+            effect.register_writes = instruction.register_writes;
+            effect.result_type = full_type;
+            for (const auto written : effect.register_writes) {
+                if (written == *destination || (written.bank == RegisterBank::ymm && written.width == 256 &&
+                                                 written.index == destination->index)) {
+                    const auto output_type = written == *destination ? low_type : full_type;
+                    effect.register_output_values.push_back(std::make_shared<Expression>(Expression{
+                        output_type, BinaryValue{written == *destination ?
+                            "x86_avx_scalar_compare_merge_src1_if_retired_else_old" :
+                            "x86_avx_scalar_compare_merge_src1_zero_upper_if_retired_else_old",
+                            retag_expr(reg_expr(written), output_type), compare_inputs}}));
+                } else if (written == mxcsr) {
+                    effect.register_output_values.push_back(std::make_shared<Expression>(Expression{
+                        integer_type(32), BinaryValue{"x86_mxcsr_after_avx_scalar_compare_sticky_ie_de",
+                            reg_expr(mxcsr), compare_inputs}}));
+                } else {
+                    effect.register_output_values.clear();
+                    break;
+                }
+            }
             return effect;
         }
     }

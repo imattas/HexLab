@@ -3248,6 +3248,8 @@ Sha256Digest function_engine_fingerprint(const AnalysisOptions &options) {
     (void)hash.update(std::as_bytes(std::span(wasm_indirect_selector_version)));
     constexpr std::string_view x86_fsgsbase_version = "x86-fsgsbase-register-effects-v1";
     (void)hash.update(std::as_bytes(std::span(x86_fsgsbase_version)));
+    constexpr std::string_view x86_vex_scalar_compare_version = "x86-simd-compare-predicate-precedence-v1";
+    (void)hash.update(std::as_bytes(std::span(x86_vex_scalar_compare_version)));
     for (auto value : {options.min_string_characters, options.instruction_budget, options.string_budget,
                        options.string_scan_work_budget,
                        options.function_budget, options.block_budget, options.membership_budget})

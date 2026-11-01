@@ -105,7 +105,8 @@ inline std::optional<X86SseFloatCompareResult> evaluate_x86_sse_float_compare(
         result.invalid_operation |= class_a[1] || class_b[1] ||
             (signaling_predicate && unordered && !(class_a[1] || class_b[1]));
         const bool denormal = class_a[2] || class_b[2];
-        result.denormal_operand |= denormal && !daz;
+        // NaN handling outranks a denormal operand in the same lane.
+        result.denormal_operand |= denormal && !daz && !unordered;
         if (daz) {
             if (class_a[2]) a &= sign_mask;
             if (class_b[2]) b &= sign_mask;

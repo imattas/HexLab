@@ -1523,7 +1523,9 @@ inline X86EvexFloatCompareResult evaluate_float_compare_lanes(
         result.invalid_operation |= left_class[1] || right_class[1] ||
             (signaling_predicate && nan && !(left_class[1] || right_class[1]));
         const bool denormal = left_class[2] || right_class[2];
-        result.denormal_operand |= denormal && !daz;
+        // NaN handling has higher priority than #D within this lane. Other
+        // active lanes still contribute their own exception conditions.
+        result.denormal_operand |= denormal && !daz && !nan;
         if (daz) {
             if (left_class[2]) left &= sign_mask;
             if (right_class[2]) right &= sign_mask;
@@ -1580,9 +1582,9 @@ inline X86EvexFloatCompareResult evaluate_float_compare_lanes(
 }
 } // namespace x86_avx_detail
 
-// Evaluate the decoded VEX.128/.256 VCMPPS/VCMPPD forms. source1 is
-// VEX.vvvv and source2 is the register value or caller-loaded full memory
-// vector. The 32 predicates use exact IEEE encodings, with no host FP work.
+// Evaluate VEX packed VCMPPS/VCMPPD and scalar VCMPSS/VCMPSD. source1 is
+// VEX.vvvv and source2 is the register value or caller-loaded memory value.
+// The 32 predicates use exact IEEE encodings, with no host FP work.
 // MXCSR supplies DAZ and exception masks; mxcsr_after carries sticky IE/DE
 // status changes while memory faults remain caller-owned. If completed is false, neither bytes nor upper clearing
 // may be committed, including when an exception occurred in a later lane.
@@ -1593,23 +1595,27 @@ inline std::optional<X86AvxFloatCompareResult> evaluate_x86_avx_float_compare(
     if (!is_vex_context(instruction) || !vex_registers_valid(instruction) || instruction.x86_evex ||
         instruction.x86_opmask || instruction.x86_opmask_zeroing ||
         instruction.x86_evex_broadcast || instruction.x86_evex_sae ||
-        (instruction.opcode != Opcode::vcmpps && instruction.opcode != Opcode::vcmppd) ||
+        (instruction.opcode != Opcode::vcmpps && instruction.opcode != Opcode::vcmppd &&
+         instruction.opcode != Opcode::vcmpss && instruction.opcode != Opcode::vcmpsd) ||
         (instruction.vector_bits != 128 && instruction.vector_bits != 256) ||
         instruction.operands.size() != 4)
         return std::nullopt;
     const auto width = static_cast<unsigned>(instruction.vector_bits);
-    const unsigned lane_bits = instruction.opcode == Opcode::vcmpps ? 32 : 64;
+    const bool scalar = instruction.opcode == Opcode::vcmpss || instruction.opcode == Opcode::vcmpsd;
+    const unsigned lane_bits = instruction.opcode == Opcode::vcmpps || instruction.opcode == Opcode::vcmpss ? 32 : 64;
     const auto *memory = std::get_if<MemoryOperand>(&instruction.operands[2]);
     const auto *predicate = std::get_if<ImmediateOperand>(&instruction.operands[3]);
-    if ((instruction.vector_element_bits && instruction.vector_element_bits != lane_bits) ||
+    if ((scalar && width != 128) ||
+        (instruction.vector_element_bits && instruction.vector_element_bits != lane_bits) ||
         !is_xmm_or_ymm(instruction.operands[0], width) ||
         !is_xmm_or_ymm(instruction.operands[1], width) ||
-        (!is_xmm_or_ymm(instruction.operands[2], width) && (!memory || memory->data_width != width)) ||
+        (!is_xmm_or_ymm(instruction.operands[2], width) &&
+         (!memory || memory->data_width != (scalar ? lane_bits : width))) ||
         !predicate || predicate->encoded_width != 8 || predicate->effective_width != 8 ||
         predicate->is_signed || predicate->value >= 32)
         return std::nullopt;
     const auto comparison = evaluate_float_compare_lanes(width, lane_bits,
-        static_cast<std::uint8_t>(predicate->value), source1, source2, UINT64_MAX,
+        static_cast<std::uint8_t>(predicate->value), source1, source2, scalar ? UINT64_C(1) : UINT64_MAX,
         false, false, mxcsr);
     X86AvxFloatCompareResult result{};
     result.vector_bits = static_cast<std::uint16_t>(width);
@@ -1619,7 +1625,8 @@ inline std::optional<X86AvxFloatCompareResult> evaluate_x86_avx_float_compare(
     result.denormal_operand = comparison.denormal_operand;
     result.completed = comparison.completed;
     result.mxcsr_after = comparison.mxcsr_after;
-    for (unsigned lane = 0; lane < width / lane_bits; ++lane)
+    if (scalar) std::copy_n(source1.begin(), 16, result.bytes.begin());
+    for (unsigned lane = 0; lane < (scalar ? 1u : width / lane_bits); ++lane)
         store_lane(result.bytes, lane * (lane_bits / 8), lane_bits,
             comparison.mask & (UINT64_C(1) << lane) ? UINT64_MAX : 0);
     return result;

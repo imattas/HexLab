@@ -719,7 +719,9 @@ enum class Opcode {
     // Zfa/Zfh half-precision round-to-integral forms; append for stable IDs.
     rv_fround_h, rv_froundnx_h,
     // FSGSBASE uses 64-bit FS/GS base state, distinct from segment selectors.
-    rdfsbase, rdgsbase, wrfsbase, wrgsbase
+    rdfsbase, rdgsbase, wrfsbase, wrgsbase,
+    // VEX scalar floating compare predicates; append for serialized ID stability.
+    vcmpss, vcmpsd
 };
 enum class OperandAccess { read, write, read_write, address };
 // The encoded x86 group-one repeat prefix is retained separately from the

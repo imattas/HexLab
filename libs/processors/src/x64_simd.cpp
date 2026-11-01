@@ -834,8 +834,40 @@ bool vex_simd(State &state, std::uint8_t opcode, unsigned map, unsigned pp, unsi
     const auto vector_width = static_cast<std::uint16_t>(l ? 256 : 128);
     const auto bank = l ? RegisterBank::ymm : RegisterBank::xmm;
     if (map == 1 && opcode == 0xc2) {
-        if (pp > 1)
-            invalid("VCMPPS/VCMPPD requires VEX.pp=0/66");
+        if (pp >= 2) {
+            // Intel recommends L=0 for scalar VEX encodings; L=1 has
+            // generation-dependent behavior and is not modeled here.
+            if (l) unsupported("Scalar VEX VCMP with L=1 is not modeled");
+            const auto lane_bits = static_cast<std::uint16_t>(pp == 2 ? 32 : 64);
+            auto decoded = modrm(state, lane_bits, 128);
+            auto destination = decoded.reg;
+            destination.bank = RegisterBank::xmm;
+            destination.width = 128;
+            destination.high_byte = false;
+            Operand source2 = std::move(decoded.rm);
+            if (auto *reg = std::get_if<RegisterOperand>(&source2)) {
+                reg->bank = RegisterBank::xmm;
+                reg->width = 128;
+                reg->high_byte = false;
+            } else if (auto *memory = std::get_if<MemoryOperand>(&source2)) {
+                memory->data_width = lane_bits;
+            }
+            const auto predicate = state.immediate(8, 8, false);
+            if (predicate.value > 31)
+                invalid("VEX scalar VCMP immediate has reserved upper predicate bits");
+            state.i.opcode = pp == 2 ? Opcode::vcmpss : Opcode::vcmpsd;
+            state.i.vector_bits = 128;
+            state.i.vector_element_bits = lane_bits;
+            state.i.register_writes.push_back({RegisterBank::ymm, destination.index, 256, false});
+            constexpr RegisterOperand mxcsr{RegisterBank::mxcsr, 0, 32, false};
+            state.i.register_reads.push_back(mxcsr);
+            state.i.register_writes.push_back(mxcsr);
+            state.operand(destination, OperandAccess::write);
+            state.operand(RegisterOperand{RegisterBank::xmm, static_cast<std::uint8_t>(vvvv), 128, false}, OperandAccess::read);
+            state.operand(std::move(source2), OperandAccess::read);
+            state.operand(predicate, OperandAccess::read);
+            return true;
+        }
         const auto lane_bits = static_cast<std::uint16_t>(pp == 0 ? 32 : 64);
         auto decoded = modrm(state, vector_width, vector_width);
         auto destination = decoded.reg;

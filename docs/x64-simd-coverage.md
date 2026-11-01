@@ -175,8 +175,8 @@ feature availability and masked-memory fault suppression are not simulated by
 the pure lane evaluators.
 
 Predicate coverage is complete for the compare-immediate families currently
-decoded: legacy SSE `CMPPS/PD/SS/SD` accepts predicates 0-7, and VEX/EVEX
-floating `VCMPPS/PD` accepts predicates 0-31. The IEEE evaluator handles the
+decoded: legacy SSE `CMPPS/PD/SS/SD` accepts predicates 0-7, VEX/EVEX
+floating `VCMPPS/PD` and VEX scalar `VCMPSS/SD` accept predicates 0-31. The IEEE evaluator handles the
 distinct ordered/unordered results and signaling behavior for all 32 floating
 predicates; VEX/EVEX decode rejects reserved upper immediate bits. Integer
 EVEX `VPCMPB/W/D/Q` and unsigned variants accept predicates 0-7 (equal,
@@ -486,6 +486,10 @@ point. The shared signaling table includes `ORD_S` (predicate 23), correcting
 its previously missing quiet-NaN invalid exception in the EVEX helper as well.
 Both compare result types carry `mxcsr_after`, accumulating IE/DE sticky bits
 for VEX and EVEX operations; EVEX SAE suppresses those writes.
+The legacy SSE and shared VEX/EVEX compare evaluators apply per-lane
+exception precedence: a NaN operand suppresses a lower-priority denormal
+condition from the other operand in that same lane. Other active lanes still
+contribute their own exceptions.
 An unmasked invalid or denormal exception suppresses the entire vector
 write and VEX.128 upper clearing, even if the exception arose in a later lane;
 callers must check `completed` before committing either effect. Out-of-width
@@ -493,10 +497,25 @@ registers, wrong memory widths, reserved predicate bits, and EVEX-only metadata
 fail closed. The original integer/bitwise `evaluate_x86_avx_packed` helper
 continues to reject floating compares because it has no MXCSR input.
 Memory reads/faults, CPU feature checks, and delivery
-of operating-system exceptions remain the caller's responsibility. Scalar VEX
-comparisons and packed floating arithmetic execution remain unsupported.
+of operating-system exceptions remain the caller's responsibility. Packed
+floating arithmetic execution remains unsupported.
 The opcode forms and predicate width follow Intel SDM Vol. 2's `VCMPPS` and
 `VCMPPD` entries (same [manual](https://www.intel.com/content/dam/www/public/us/en/documents/manuals/64-ia-32-architectures-software-developers-manual.pdf)).
+
+VEX scalar `VCMPSS` and `VCMPSD` use the same 32 predicate and MXCSR rules,
+but compare only the low 32 or 64 bits. The result replaces that low lane,
+the rest of the low XMM register is copied from the VEX.vvvv source, and the
+modeled upper YMM half is cleared on successful retirement. Register sources
+are XMM operands; memory sources read exactly 32 or 64 bits. The typed lifter
+retains the source-1 merge and symbolic MXCSR-dependent retirement and sticky
+status outputs. The pure evaluator compares only lane zero, so NaNs or
+denormals in unused upper lanes do not raise exceptions; `completed == false`
+means callers must leave the destination unchanged. VEX.W is ignored; VEX.L=1
+remains unsupported because Intel warns that it can behave unpredictably across
+processor generations. EVEX scalar compare-to-mask, MAXVL state above YMM, CPU
+feature checks, memory faults, and actual exception delivery remain unmodeled.
+The scalar encodings and merge behavior follow Intel SDM Vol. 2's `CMPSS` and
+`CMPSD` entries ([manual](https://cdrdv2-public.intel.com/874240/325462-090-sdm-vol-1-2abcd-3abcd-4.pdf)).
 
 EVEX `VFPCLASSPS/PD` is decoded for 128/256/512-bit vectors with K0-K7
 destinations, optional `aaa` execution mask, and EVEX.b 32-/64-bit memory
