@@ -18,6 +18,21 @@ validate bootstrap method signatures against each call site, or evaluate
 dynamic constants. Bootstrap entry and aggregate argument retention are each
 capped at 8,192; oversized tables are rejected rather than partially retained.
 
+## Module descriptor references
+
+The class-level `Module`, `ModulePackages`, and `ModuleMainClass` attributes
+are decoded only on a Java 9-or-newer `module-info` class. Their constant-pool
+operands are checked against the required `CONSTANT_Module`,
+`CONSTANT_Package`, or `CONSTANT_Class` tags (and the referenced UTF-8 entry),
+and duplicate entries, reserved flag bits, invalid counts, and attribute
+length mismatches reject the class. The decoded module name, package list and
+optional main class remain available as project metadata.
+
+This is local descriptor metadata, not module resolution. It does not establish
+that the listed packages or main class exist, or that requirements can be
+satisfied. Unknown attributes remain file-backed opaque extents, and known
+attributes must consume their declared extent exactly.
+
 ## Generic type-annotation targets
 
 Declaration type annotations now bind to the owning declaration's parsed
@@ -61,6 +76,13 @@ most 255 steps for each retained annotation path. Existing class budgets cap
 signature retention at 100,000 nodes and combined annotation metadata at 65,536
 items; the binder introduces no recursive traversal or signature-text copies.
 Cancellation is checked for every annotation.
+
+Type-variable references are checked against the owning class and method
+formal declarations. Erasure checks compare resolvable field, component,
+superclass, interface and method signature types with their JVM descriptors.
+When a formal has a cyclic or otherwise unresolved bound, the signature stays
+available with a diagnostic and metadata is marked incomplete; the loader
+does not guess an erasure or claim descriptor consistency for that signature.
 
 Validation on Windows x64 Debug: configured with `BUILD_TESTING=OFF`, built and
 linked `hexlab_loaders`, and compiled all CLI translation units with MSBuild

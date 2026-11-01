@@ -372,6 +372,21 @@ std::unordered_map<std::string,std::string> generic_variable_erasures(const JvmG
     }
     return variables;
 }
+std::optional<std::string> unresolved_generic_erasure(const JvmGenericSignatureAnalysis *analysis,
+        const std::unordered_map<std::string,std::string> &variables) {
+    if(!analysis||!analysis->parsed||!analysis->diagnostic.empty())return std::nullopt;
+    const auto &tree=*analysis->parsed;
+    if(tree.nodes.empty())return std::nullopt;
+    for(const auto child:tree.nodes.front().children)if(child<tree.nodes.size()) {
+        const auto &node=tree.nodes[child];
+        if(node.kind==JvmGenericNodeKind::type_parameter&&!variables.contains(node.name))
+            return "generic type variable '"+node.name+"' has no finite erasure (cyclic or unresolved bounds)";
+    }
+    for(const auto &node:tree.nodes)
+        if(node.kind==JvmGenericNodeKind::type_variable&&!variables.contains(node.name))
+            return "generic type variable '"+node.name+"' has no finite erasure (cyclic or unresolved bounds)";
+    return std::nullopt;
+}
 bool valid_field_descriptor(std::string_view descriptor){
     if(descriptor.empty())return false;
     std::size_t position=0,dimensions=0;
@@ -1692,6 +1707,9 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage,std::stop_t
     };
     record_signature_check(md.generic_signature?&*md.generic_signature:nullptr,class_formals);
     auto class_erasure_variables=generic_variable_erasures(md.generic_signature&&md.generic_signature->parsed?&*md.generic_signature->parsed:nullptr);
+    if(md.generic_signature)if(auto diagnostic=unresolved_generic_erasure(&*md.generic_signature,class_erasure_variables)){
+        md.generic_signature->diagnostic=std::move(*diagnostic);metadata_complete=false;
+    }
     for(auto &field:md.fields)
         record_signature_check(field.generic_signature?&*field.generic_signature:nullptr,class_formals);
     for(auto &component:md.record_components)
@@ -1705,17 +1723,20 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage,std::stop_t
             for(auto &local:*method.code->local_variable_types)
                 record_signature_check(local.generic_signature?&*local.generic_signature:nullptr,scope);
     }
-    const auto check_field_erasure=[&](const JvmGenericSignatureAnalysis *analysis,std::string_view descriptor,
+    const auto check_field_erasure=[&](JvmGenericSignatureAnalysis *analysis,std::string_view descriptor,
                                        const std::unordered_map<std::string,std::string> &variables)->Result<bool>{
         if(!analysis||!analysis->parsed||!analysis->diagnostic.empty())return true;
+        if(auto diagnostic=unresolved_generic_erasure(analysis,variables)){
+            analysis->diagnostic=std::move(*diagnostic);metadata_complete=false;return true;
+        }
         const auto &tree=*analysis->parsed;
         if(tree.kind!=JvmGenericSignatureKind::field_signature||tree.nodes.empty()||tree.nodes.front().children.size()!=1)return true;
         auto erased=erased_signature_type(tree,tree.nodes.front().children.front(),variables);
         if(erased&&*erased!=descriptor)return malformed("generic field signature erasure disagrees with its descriptor");
         return true;
     };
-    for(const auto &field:md.fields){auto checked=check_field_erasure(field.generic_signature?&*field.generic_signature:nullptr,field.descriptor,class_erasure_variables);if(!checked)return checked.error();}
-    for(const auto &component:md.record_components){auto checked=check_field_erasure(component.generic_signature?&*component.generic_signature:nullptr,component.descriptor,class_erasure_variables);if(!checked)return checked.error();}
+    for(auto &field:md.fields){auto checked=check_field_erasure(field.generic_signature?&*field.generic_signature:nullptr,field.descriptor,class_erasure_variables);if(!checked)return checked.error();}
+    for(auto &component:md.record_components){auto checked=check_field_erasure(component.generic_signature?&*component.generic_signature:nullptr,component.descriptor,class_erasure_variables);if(!checked)return checked.error();}
     if(md.generic_signature&&md.generic_signature->parsed&&md.generic_signature->diagnostic.empty()){
         const auto &tree=*md.generic_signature->parsed;
         std::vector<std::uint32_t> super_types,interface_types;
@@ -1735,9 +1756,12 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage,std::stop_t
             if(erased&&*erased!="L"+md.interfaces[i]+";")return malformed("generic superinterface signature erasure disagrees with interfaces");
         }
     }
-    for(const auto &method:md.methods)if(method.generic_signature&&method.generic_signature->parsed&&method.generic_signature->diagnostic.empty()){
+    for(auto &method:md.methods)if(method.generic_signature&&method.generic_signature->parsed&&method.generic_signature->diagnostic.empty()){
         const auto &tree=*method.generic_signature->parsed;
         auto method_erasure_variables=generic_variable_erasures(&tree,class_erasure_variables);
+        if(auto diagnostic=unresolved_generic_erasure(&*method.generic_signature,method_erasure_variables)){
+            method.generic_signature->diagnostic=std::move(*diagnostic);metadata_complete=false;continue;
+        }
         if(tree.kind!=JvmGenericSignatureKind::method_signature||tree.nodes.empty())continue;
         const JvmGenericSignatureNode *params=nullptr,*result=nullptr;
         for(const auto child:tree.nodes.front().children)if(child<tree.nodes.size()){
@@ -1755,7 +1779,7 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage,std::stop_t
             if(erased_descriptor!=method.descriptor)return malformed("generic method signature erasure disagrees with its descriptor");
         }
     }
-    for(const auto &method:md.methods)if(method.code&&method.code->local_variable_types){
+    for(auto &method:md.methods)if(method.code&&method.code->local_variable_types){
         auto variables=class_erasure_variables;
         if(method.generic_signature&&method.generic_signature->parsed)
             variables=generic_variable_erasures(&*method.generic_signature->parsed,std::move(variables));
@@ -1766,8 +1790,11 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage,std::stop_t
             auto [entry,inserted]=local_descriptors.emplace(std::move(key),std::make_pair(&candidate,false));
             if(!inserted&&entry->second.first->descriptor!=candidate.descriptor)entry->second.second=true;
         }
-        for(const auto &local:*method.code->local_variable_types){
+        for(auto &local:*method.code->local_variable_types){
             if(!local.generic_signature||!local.generic_signature->parsed||!local.generic_signature->diagnostic.empty())continue;
+            if(auto diagnostic=unresolved_generic_erasure(&*local.generic_signature,variables)){
+                local.generic_signature->diagnostic=std::move(*diagnostic);metadata_complete=false;continue;
+            }
             const auto variable=local_descriptors.find({local.start_pc,local.length,local.slot,local.name});
             if(variable!=local_descriptors.end()&&!variable->second.second){
                 auto checked=check_field_erasure(&*local.generic_signature,variable->second.first->descriptor,variables);if(!checked)return checked.error();
