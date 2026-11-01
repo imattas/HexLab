@@ -3094,6 +3094,8 @@ std::optional<SwitchSite> mips64_register_absolute_switch(
         target_register->index == 0 || !facts[dispatch_index - 1])
         return {};
     bool relative_table = false;
+    bool relative_explicit_sign_extension = false;
+    std::size_t explicit_relative_entry_bytes = 0;
     std::optional<RegisterOperand> relative_base_register;
     std::size_t terminal_load_index = dispatch_index - 1;
     if (dispatch_index >= 2 && facts[dispatch_index - 1]) {
@@ -3110,24 +3112,72 @@ std::optional<SwitchSite> mips64_register_absolute_switch(
             if (relative_base_register) {
                 relative_table = true;
                 terminal_load_index = dispatch_index - 2;
+                // N64 compilers may zero-extend a narrow table entry and
+                // explicitly sign-extend it before adding the code base:
+                //   LBU/LHU target, table[index]; DSLL32 target,target,56/48;
+                //   DSRA32 target,target,56/48; DADDU target,codeBase,target.
+                if (dispatch_index >= 5 && facts[dispatch_index - 2] && facts[dispatch_index - 3]) {
+                    const auto &right_shift = facts[dispatch_index - 2]->instruction;
+                    const auto &left_shift = facts[dispatch_index - 3]->instruction;
+                    const auto exact_shift = [&](const Instruction &instruction, Opcode opcode,
+                                                 const Instruction &next, std::uint64_t amount) {
+                        const auto *destination = instruction.operands.size() == 3
+                            ? register_operand(instruction, 0) : nullptr;
+                        const auto *source = instruction.operands.size() == 3
+                            ? register_operand(instruction, 1) : nullptr;
+                        const auto *immediate = instruction.operands.size() == 3
+                            ? std::get_if<ImmediateOperand>(&instruction.operands[2]) : nullptr;
+                        const auto end = analysis_detail::continuation_address(instruction);
+                        if (relocations) {
+                            const auto word = relocations->data_at(image, instruction.address, 4, stop);
+                            if (!word || word.value().relocated()) return false;
+                        }
+                        return instruction.length == 4 && instruction.context == dispatch.context &&
+                            instruction.opcode == opcode && instruction.flow == FlowKind::fallthrough &&
+                            instruction.delay_slots == 0 && end && end.value() == next.address &&
+                            same_register(destination, target_register) && same_register(source, target_register) &&
+                            immediate && immediate->encoded_width == 6 && immediate->effective_width == 64 &&
+                            !immediate->is_signed && immediate->value == amount;
+                    };
+                    if (exact_shift(right_shift, Opcode::mips64_dsra32,
+                                    facts[dispatch_index - 1]->instruction, 56) &&
+                        exact_shift(left_shift, Opcode::mips64_dsll32, right_shift, 56)) {
+                        relative_explicit_sign_extension = true;
+                        explicit_relative_entry_bytes = 1;
+                        terminal_load_index = dispatch_index - 4;
+                    } else if (exact_shift(right_shift, Opcode::mips64_dsra32,
+                                           facts[dispatch_index - 1]->instruction, 48) &&
+                               exact_shift(left_shift, Opcode::mips64_dsll32, right_shift, 48)) {
+                        relative_explicit_sign_extension = true;
+                        explicit_relative_entry_bytes = 2;
+                        terminal_load_index = dispatch_index - 4;
+                    }
+                }
             }
         }
     }
     if (terminal_load_index >= facts.size() || !facts[terminal_load_index])
         return {};
     const auto &terminal_load = facts[terminal_load_index]->instruction;
-    const bool relative_byte_table = relative_table && terminal_load.opcode == Opcode::mips_lb;
-    const bool relative_halfword_table = relative_table && terminal_load.opcode == Opcode::mips_lh;
+    const bool relative_byte_table = relative_table &&
+        (terminal_load.opcode == Opcode::mips_lb ||
+         (relative_explicit_sign_extension && explicit_relative_entry_bytes == 1 && terminal_load.opcode == Opcode::mips_lbu));
+    const bool relative_halfword_table = relative_table &&
+        (terminal_load.opcode == Opcode::mips_lh ||
+         (relative_explicit_sign_extension && explicit_relative_entry_bytes == 2 && terminal_load.opcode == Opcode::mips_lhu));
     const std::size_t relative_entry_bytes = relative_byte_table ? 1 : relative_halfword_table ? 2 : 4;
     const auto load_end = analysis_detail::continuation_address(terminal_load);
     const auto *loaded_register = terminal_load.operands.empty() ? nullptr : register_operand(terminal_load, 0);
     const auto expected_load_end = relative_table
-        ? std::optional<Address>{facts[dispatch_index - 1]->instruction.address}
+        ? std::optional<Address>{facts[relative_explicit_sign_extension
+            ? dispatch_index - 3 : dispatch_index - 1]->instruction.address}
         : std::optional<Address>{dispatch.address};
     if (!load_end || !expected_load_end || load_end.value() != expected_load_end.value() ||
         terminal_load.context != dispatch.context ||
         terminal_load.opcode != (relative_table
-            ? (relative_byte_table ? Opcode::mips_lb : relative_halfword_table ? Opcode::mips_lh : Opcode::mips_lw)
+            ? (relative_byte_table ? (relative_explicit_sign_extension ? Opcode::mips_lbu : Opcode::mips_lb)
+                : relative_halfword_table ? (relative_explicit_sign_extension ? Opcode::mips_lhu : Opcode::mips_lh)
+                : Opcode::mips_lw)
             : Opcode::mips64_ld) ||
         terminal_load.flow != FlowKind::fallthrough ||
         !loaded_register || !same_register(loaded_register, target_register))
@@ -3221,7 +3271,8 @@ std::optional<SwitchSite> mips64_register_absolute_switch(
     // The final DADDU in a relative table transforms the loaded offset into a
     // code address; keep it out of setup-value propagation so it cannot be
     // mistaken for a table-base adjustment.
-    const auto setup_end = relative_table ? dispatch_index - 1 : dispatch_index;
+    const auto setup_end = relative_table
+        ? dispatch_index - (relative_explicit_sign_extension ? 4 : 1) : dispatch_index;
     for (std::size_t index = 0; index < setup_end; ++index) {
         if (stop.stop_requested() || !facts[index])
             return {};
@@ -3373,13 +3424,15 @@ std::optional<SwitchSite> mips64_register_absolute_switch(
             continue;
         }
         if ((instruction.opcode == Opcode::mips64_ld ||
-             (relative_table && (instruction.opcode == Opcode::mips_lb || instruction.opcode == Opcode::mips_lw ||
-                                 instruction.opcode == Opcode::mips_lh))) &&
+             (relative_table && (instruction.opcode == Opcode::mips_lb || instruction.opcode == Opcode::mips_lbu ||
+                                 instruction.opcode == Opcode::mips_lw || instruction.opcode == Opcode::mips_lh ||
+                                 instruction.opcode == Opcode::mips_lhu))) &&
             instruction.operands.size() == 2 && destination) {
             const auto *memory = std::get_if<MemoryOperand>(&instruction.operands[1]);
             std::optional<Value> value;
             const auto entry_width = instruction.opcode == Opcode::mips64_ld ? 64u
-                : instruction.opcode == Opcode::mips_lb ? 8u : instruction.opcode == Opcode::mips_lh ? 16u : 32u;
+                : instruction.opcode == Opcode::mips_lb || instruction.opcode == Opcode::mips_lbu ? 8u
+                : instruction.opcode == Opcode::mips_lh || instruction.opcode == Opcode::mips_lhu ? 16u : 32u;
             if (destination->bank == RegisterBank::mips_gpr && destination->width == 64 && destination->index != 0 &&
                 memory && memory->data_width == entry_width && memory->address_width == 64 && memory->base &&
                 memory->base->bank == RegisterBank::mips_gpr && memory->base->width == 64 &&

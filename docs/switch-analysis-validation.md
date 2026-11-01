@@ -424,6 +424,20 @@ executable MIPS64 instructions. Guarded counts still use the exact
 prefix, up to 4096 entries. Other load/sign-extension sequences and
 cross-block dynamic values remain unsupported.
 
+N64 also accepts explicit narrow sign extension after unsigned table loads:
+`LBU target, tableBase, scaledIndex; DSLL32 target,target,56; DSRA32
+target,target,56; DADDU target,codeBase,target; JR target` for signed byte
+offsets, and the same sequence with `LHU` and shifts by 48 for signed
+halfword offsets. The shift pair must use the same nonzero target register,
+be adjacent four-byte fallthrough instructions, have the exact decoded
+effective shift count, and have relocation-free instruction words. The
+unsigned load width must match the shift count. Raw slots must be file-backed
+and relocation-free; resolved targets must decode as executable MIPS64 code.
+The exact guard proof or 4096-entry verified-prefix cap, distinct code/table
+bases, and existing same-block indexed-load checks still apply. Unsupported
+or ambiguous sequences remain unresolved with the signed-byte/halfword entry
+diagnostic.
+
 The N64 recognizer also accepts signed byte offsets with the exact same-block
 sequence `LUI`/`ORI tableBase; DSLL scaledIndex, selector, 0; DADDU address,
 tableBase, scaledIndex; LB target, 0(address); DADDU target, codeBase, target;
