@@ -6133,6 +6133,71 @@ a64_unhandled:
     }
 
     if (x86 && instruction.context.mode == ExecutionMode::x86_64 && instruction.x86_evex &&
+        (instruction.opcode == Opcode::vcmpss || instruction.opcode == Opcode::vcmpsd) &&
+        instruction.vector_bits == 128 && instruction.operands.size() == 4 &&
+        !instruction.x86_opmask_zeroing && !instruction.x86_evex_broadcast &&
+        (!instruction.x86_opmask || (*instruction.x86_opmask > 0 && *instruction.x86_opmask < 8))) {
+        const auto lane_bits = static_cast<std::uint16_t>(instruction.opcode == Opcode::vcmpss ? 32 : 64);
+        const auto *destination = std::get_if<RegisterOperand>(&instruction.operands[0]);
+        const auto *source1 = std::get_if<RegisterOperand>(&instruction.operands[1]);
+        const auto *memory = std::get_if<MemoryOperand>(&instruction.operands[2]);
+        const auto *predicate = std::get_if<ImmediateOperand>(&instruction.operands[3]);
+        const auto source_vector = vector_type(128, TypeKind::floating, lane_bits,
+                                               static_cast<std::uint8_t>(128 / lane_bits));
+        const bool source2_valid = x86_avx_detail::is_evex_vector(instruction.operands[2], 128) ||
+            (memory && memory->data_width == lane_bits);
+        if (destination && destination->bank == RegisterBank::opmask && destination->index < 8 &&
+            destination->width == 64 && !destination->high_byte && source1 &&
+            source1->bank == RegisterBank::xmm && source1->width == 128 && !source1->high_byte &&
+            source2_valid && predicate && predicate->encoded_width == 8 &&
+            predicate->effective_width == 8 && !predicate->is_signed && predicate->value < 32 &&
+            (!instruction.vector_element_bits || instruction.vector_element_bits == lane_bits)) {
+            auto left = retag_expr(operands[1], source_vector);
+            auto right = memory ? retag_expr(operands[2], floating_type(lane_bits))
+                                : retag_expr(operands[2], source_vector);
+            const auto predicate_input = retag_expr(operands[3], integer_type(8));
+            std::vector<ExpressionPtr> inputs{left, right, predicate_input};
+            if (instruction.x86_opmask)
+                inputs.push_back(reg_expr({RegisterBank::opmask, *instruction.x86_opmask, 64, false}));
+            const RegisterOperand mxcsr{RegisterBank::mxcsr, 0, 32, false};
+            inputs.push_back(reg_expr(mxcsr));
+            Intrinsic effect{"x86_" + operation_name(instruction.opcode) + "_f" +
+                std::to_string(lane_bits) + "_predicate" + std::to_string(predicate->value) +
+                "_to_k" + std::to_string(destination->index) +
+                (instruction.x86_opmask ? "_masked_low_bit_zero_upper" : "_unmasked_low_bit_zero_upper") +
+                (instruction.x86_evex_sae ? "_sae" : "_mxcsr_control_status"),
+                std::move(inputs), memory ? IntrinsicMemoryEffect::read : IntrinsicMemoryEffect::none};
+            effect.register_writes = instruction.register_writes;
+            effect.result_type = integer_type(64);
+            auto compare_inputs = std::make_shared<Expression>(Expression{
+                vector_type(128, TypeKind::integer, 8, 16),
+                BinaryValue{"x86_evex_scalar_compare_ie_de_inputs_predicate" +
+                    std::to_string(predicate->value), left, right}});
+            compare_inputs = std::make_shared<Expression>(Expression{compare_inputs->type, BinaryValue{
+                "x86_evex_scalar_compare_with_mxcsr_daz", std::move(compare_inputs), reg_expr(mxcsr)}});
+            if (instruction.x86_opmask)
+                compare_inputs = std::make_shared<Expression>(Expression{compare_inputs->type, BinaryValue{
+                    "x86_evex_compare_ie_de_active_scalar_lane", std::move(compare_inputs),
+                    reg_expr({RegisterBank::opmask, *instruction.x86_opmask, 64, false})}});
+            for (const auto written : effect.register_writes) {
+                if (written == *destination)
+                    effect.register_output_values.push_back(std::make_shared<Expression>(Expression{
+                        integer_type(64), UnaryValue{"x86_evex_scalar_compare_to_mask_low_bit_zero_upper",
+                            compare_inputs}}));
+                else if (written == mxcsr && !instruction.x86_evex_sae)
+                    effect.register_output_values.push_back(std::make_shared<Expression>(Expression{
+                        integer_type(32), BinaryValue{"x86_mxcsr_after_evex_compare_sticky_ie_de",
+                            reg_expr(mxcsr), compare_inputs}}));
+                else {
+                    effect.register_output_values.clear();
+                    break;
+                }
+            }
+            return effect;
+        }
+    }
+
+    if (x86 && instruction.context.mode == ExecutionMode::x86_64 && instruction.x86_evex &&
         (instruction.opcode == Opcode::vcmpps || instruction.opcode == Opcode::vcmppd) &&
         (instruction.vector_bits == 128 || instruction.vector_bits == 256 || instruction.vector_bits == 512) &&
         instruction.operands.size() == 4 && !instruction.x86_opmask_zeroing &&

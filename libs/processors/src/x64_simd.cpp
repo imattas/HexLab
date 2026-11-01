@@ -1559,38 +1559,45 @@ bool evex_simd(State &state, std::uint8_t opcode, unsigned map, unsigned pp, uns
     if (map == 1 && opcode == 0xc2) {
         const bool packed_single = pp == 0 && !w;
         const bool packed_double = pp == 1 && w;
-        if (!packed_single && !packed_double)
-            invalid("EVEX VCMPPS/VCMPPD has an unsupported pp/W combination");
+        const bool scalar_single = pp == 2 && !w;
+        const bool scalar_double = pp == 3 && w;
+        const bool scalar = scalar_single || scalar_double;
+        if (!packed_single && !packed_double && !scalar)
+            invalid("EVEX VCMP has an unsupported pp/W combination");
         if (zeroing)
             unsupported("EVEX compare-to-mask does not support destination zeroing");
-        const auto element_bits = static_cast<std::uint16_t>(packed_single ? 32 : 64);
-        auto decoded = modrm(state, static_cast<std::uint16_t>(broadcast ? element_bits : vector_bits),
-                             static_cast<std::uint16_t>(vector_bits));
+        const auto element_bits = static_cast<std::uint16_t>(packed_single || scalar_single ? 32 : 64);
+        const auto active_vector_bits = static_cast<std::uint16_t>(scalar ? 128 : vector_bits);
+        auto decoded = modrm(state, static_cast<std::uint16_t>(scalar || broadcast ? element_bits : vector_bits),
+                             active_vector_bits);
+        const bool embedded_sae = scalar ? broadcast
+            : broadcast && std::holds_alternative<RegisterOperand>(decoded.rm);
         if (reg_high || decoded.reg.index >= 8)
             invalid("EVEX VCMP destination must encode K0-K7 without register extension");
-        const bool embedded_sae = broadcast && std::holds_alternative<RegisterOperand>(decoded.rm);
-        const bool memory_broadcast = broadcast && std::holds_alternative<MemoryOperand>(decoded.rm);
-        const auto vector_bank = vector_bits == 128 ? RegisterBank::xmm :
-                                 vector_bits == 256 ? RegisterBank::ymm : RegisterBank::zmm;
+        const bool memory_broadcast = !scalar && broadcast && std::holds_alternative<MemoryOperand>(decoded.rm);
+        const auto vector_bank = active_vector_bits == 128 ? RegisterBank::xmm :
+                                 active_vector_bits == 256 ? RegisterBank::ymm : RegisterBank::zmm;
         Operand rm = std::move(decoded.rm);
         if (auto *reg = std::get_if<RegisterOperand>(&rm)) {
             reg->bank = vector_bank;
-            reg->width = static_cast<std::uint16_t>(vector_bits);
+            reg->width = active_vector_bits;
             reg->high_byte = false;
             if (rm_high) reg->index = static_cast<std::uint8_t>(reg->index + 16);
         } else if (auto *memory = std::get_if<MemoryOperand>(&rm)) {
-            memory->data_width = static_cast<std::uint16_t>(memory_broadcast ? element_bits : vector_bits);
+            const auto memory_width = scalar || memory_broadcast ? element_bits : vector_bits;
+            memory->data_width = static_cast<std::uint16_t>(memory_width);
             if (memory->displacement_encoding && memory->displacement_encoding->size == 1)
-                memory->displacement *= static_cast<std::int64_t>((memory_broadcast ? element_bits : vector_bits) / 8);
+                memory->displacement *= static_cast<std::int64_t>(memory_width / 8);
         }
         const auto predicate = state.immediate(8, 8, false);
         if (predicate.value > 31)
             invalid("EVEX VCMP immediate has reserved upper predicate bits");
-        state.i.opcode = packed_single ? Opcode::vcmpps : Opcode::vcmppd;
+        state.i.opcode = packed_single ? Opcode::vcmpps : packed_double ? Opcode::vcmppd :
+                         scalar_single ? Opcode::vcmpss : Opcode::vcmpsd;
         state.i.x86_evex = true;
         state.i.x86_evex_broadcast = memory_broadcast;
         state.i.x86_evex_sae = embedded_sae;
-        state.i.vector_bits = static_cast<std::uint16_t>(vector_bits);
+        state.i.vector_bits = active_vector_bits;
         state.i.vector_element_bits = element_bits;
         if (mask) {
             state.i.x86_opmask = static_cast<std::uint8_t>(mask);
@@ -1604,7 +1611,7 @@ bool evex_simd(State &state, std::uint8_t opcode, unsigned map, unsigned pp, uns
         }
         state.operand(RegisterOperand{RegisterBank::opmask, decoded.reg.index, 64, false}, OperandAccess::write);
         state.operand(RegisterOperand{vector_bank, static_cast<std::uint8_t>(vvvv),
-                                      static_cast<std::uint16_t>(vector_bits), false}, OperandAccess::read);
+                                      active_vector_bits, false}, OperandAccess::read);
         state.operand(std::move(rm), OperandAccess::read);
         state.operand(predicate, OperandAccess::read);
         return true;

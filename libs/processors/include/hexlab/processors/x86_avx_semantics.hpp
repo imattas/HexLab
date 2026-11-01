@@ -1642,35 +1642,39 @@ inline std::optional<X86EvexFloatCompareResult> evaluate_x86_evex_float_compare(
     const Instruction &instruction, const std::array<std::byte, 64> &source1,
     const std::array<std::byte, 64> &source2, std::uint64_t opmask_value = UINT64_MAX,
     std::uint32_t mxcsr = 0x1f80) noexcept {
+    const bool scalar = instruction.opcode == Opcode::vcmpss || instruction.opcode == Opcode::vcmpsd;
     if (instruction.context.architecture != Architecture::x86_64 ||
         instruction.context.mode != ExecutionMode::x86_64 || !instruction.x86_evex ||
-        (instruction.opcode != Opcode::vcmpps && instruction.opcode != Opcode::vcmppd) ||
-        (instruction.vector_bits != 128 && instruction.vector_bits != 256 && instruction.vector_bits != 512) ||
+        (instruction.opcode != Opcode::vcmpps && instruction.opcode != Opcode::vcmppd && !scalar) ||
+        (scalar ? instruction.vector_bits != 128 :
+            (instruction.vector_bits != 128 && instruction.vector_bits != 256 && instruction.vector_bits != 512)) ||
         instruction.operands.size() != 4 || instruction.x86_opmask_zeroing ||
         (instruction.x86_opmask && (*instruction.x86_opmask == 0 || *instruction.x86_opmask >= 8)))
         return std::nullopt;
     const auto width = static_cast<unsigned>(instruction.vector_bits);
-    const unsigned lane_bits = instruction.opcode == Opcode::vcmpps ? 32 : 64;
+    const unsigned lane_bits = instruction.opcode == Opcode::vcmpps || instruction.opcode == Opcode::vcmpss ? 32 : 64;
     if (instruction.vector_element_bits && instruction.vector_element_bits != lane_bits) return std::nullopt;
     const auto *destination = std::get_if<RegisterOperand>(&instruction.operands[0]);
     const auto *memory = std::get_if<MemoryOperand>(&instruction.operands[2]);
     const auto *predicate = std::get_if<ImmediateOperand>(&instruction.operands[3]);
     const bool source2_vector = x86_avx_detail::is_evex_vector(instruction.operands[2], width);
     const bool source2_memory = memory && memory->data_width ==
-        (instruction.x86_evex_broadcast ? lane_bits : width);
+        (scalar || instruction.x86_evex_broadcast ? lane_bits : width);
     if (!destination || destination->bank != RegisterBank::opmask || destination->index >= 8 ||
         destination->width != 64 || destination->high_byte ||
         !x86_avx_detail::is_evex_vector(instruction.operands[1], width) ||
         (!source2_vector && !source2_memory) ||
-        (instruction.x86_evex_broadcast && !memory) || !predicate ||
+        (instruction.x86_evex_broadcast && !scalar && !memory) || !predicate ||
         predicate->encoded_width != 8 || predicate->effective_width != 8 || predicate->is_signed ||
         predicate->value >= 32)
         return std::nullopt;
 
+    const auto active_mask = scalar ? (instruction.x86_opmask ? (opmask_value & UINT64_C(1)) : UINT64_C(1))
+                                    : (instruction.x86_opmask ? opmask_value : UINT64_MAX);
     return x86_avx_detail::evaluate_float_compare_lanes(width, lane_bits,
         static_cast<std::uint8_t>(predicate->value), source1, source2,
-        instruction.x86_opmask ? opmask_value : UINT64_MAX,
-        instruction.x86_evex_broadcast, instruction.x86_evex_sae, mxcsr);
+        active_mask,
+        instruction.x86_evex_broadcast && !scalar, instruction.x86_evex_sae, mxcsr);
 }
 
 struct X86SimdMovemaskResult {

@@ -971,3 +971,14 @@ The decoder accepts the instruction family's WIG encoding and requires the
 normal EVEX packed-integer prefix rules. Memory access and CPU feature checks
 remain caller-owned. Decoder fixtures were added for all eight ZMM register
 forms; tests/builds were not run for this change.
+
+## EVEX scalar floating compares to K masks
+
+`VCMPSS` and `VCMPSD` now decode their EVEX scalar forms with 32 predicates,
+XMM register or scalar-memory sources, optional low-bit writemasking, and
+embedded SAE. The scalar lane writes K-destination bit 0; all higher K bits are
+zero. A masked-off scalar lane also writes zero. The typed decompiler retains
+that mask result and models sticky invalid/denormal MXCSR updates unless SAE is
+active. `EVEX.z` is rejected for this compare-to-mask path. Feature checks,
+memory reads, and exception delivery remain caller-owned. Encoding, predicate,
+mask, and result behavior follow Intel's [VCMPSS/VCMPSD reference](https://cdrdv2-public.intel.com/835757/325383-sdm-vol-2abcd.pdf).
