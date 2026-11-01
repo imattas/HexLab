@@ -2040,6 +2040,9 @@ bool is_producer_gpr(Architecture architecture, RegisterBank bank, std::uint32_t
     case Architecture::arm64: return bank == RegisterBank::arm64_gpr;
     case Architecture::mos6502: return bank == RegisterBank::mos6502 && index <= 2;
     case Architecture::mips32:
+        // The MIPS32 address evaluator also tracks the two HI/LO values so
+        // MULT/DIV and their transfer instructions can form producer chains.
+        return bank == RegisterBank::mips_gpr || (bank == RegisterBank::mips_hilo && index < 2);
     case Architecture::mips64: return bank == RegisterBank::mips_gpr;
     case Architecture::powerpc: return bank == RegisterBank::ppc_gpr;
     default: return false;
@@ -2052,6 +2055,14 @@ void append_unique_producers(std::vector<std::uint64_t> &target,
     for (const auto producer : source)
         if (std::find(target.begin(), target.end(), producer) == target.end() && target.size() < limit)
             target.push_back(producer);
+}
+
+bool mips_call_continuation(const BasicBlock &block, const BlockSuccessor &edge) {
+    return edge.kind == BlockEdgeKind::call_continuation &&
+        std::any_of(block.instructions.begin(), block.instructions.end(), [](const auto &fact) {
+            return fact && (fact->instruction.context.architecture == Architecture::mips32 ||
+                            fact->instruction.context.architecture == Architecture::mips64);
+        });
 }
 
 RegisterReferenceFacts non_x86_producer_facts(
@@ -2067,6 +2078,7 @@ RegisterReferenceFacts non_x86_producer_facts(
         });
     };
     std::vector<const RegisterReferenceFacts *> facts(target_facts.begin(), target_facts.end());
+    std::set<std::uint64_t> truncated_mips32_binary_producers;
     const auto is_address_target = [&](std::uint64_t instruction, std::size_t operand) {
         return has_fact(facts, {instruction, static_cast<std::uint32_t>(operand)}, false);
     };
@@ -2108,6 +2120,12 @@ RegisterReferenceFacts non_x86_producer_facts(
                 state.clear();
                 continue;
             }
+            if (architecture == Architecture::mips32 &&
+                (instruction.opcode == Opcode::opaque ||
+                 relocations.overlaps(instruction.address, instruction.length))) {
+                state.clear();
+                continue;
+            }
 
             // Consumer provenance is captured before any writes at this
             // instruction. The instruction's own ID is the graph root; its
@@ -2128,8 +2146,21 @@ RegisterReferenceFacts non_x86_producer_facts(
             }
 
             if (instruction.flow == FlowKind::call) {
-                state.clear(); // Unknown callees can clobber every caller-saved address fact.
+                if (analysis_detail::has_delay_slot(instruction)) {
+                    // The slot executes before the callee. Keep the values it
+                    // can read, apart from the newly written link register.
+                    for (const auto &reg : instruction.register_writes)
+                        if (is_producer_gpr(architecture, reg.bank, reg.index)) state.erase(register_key(reg));
+                } else state.clear();
                 continue;
+            }
+
+            // Writing one half after a multiply/divide may make the other
+            // half unpredictable on MIPS32. Do not retain a stale lineage.
+            if (architecture == Architecture::mips32 &&
+                (instruction.opcode == Opcode::mips_mthi || instruction.opcode == Opcode::mips_mtlo)) {
+                const auto other = static_cast<std::uint8_t>(instruction.opcode == Opcode::mips_mthi ? 1 : 0);
+                state.erase(register_key(RegisterOperand{RegisterBank::mips_hilo, other, 32, false}));
             }
 
             std::vector<RegisterOperand> reads, writes;
@@ -2155,6 +2186,17 @@ RegisterReferenceFacts non_x86_producer_facts(
                     address_definition = true;
                     break;
                 }
+            const bool mips32_hilo_binary = architecture == Architecture::mips32 &&
+                (instruction.opcode == Opcode::mips_mult || instruction.opcode == Opcode::mips_multu ||
+                 instruction.opcode == Opcode::mips_div || instruction.opcode == Opcode::mips_divu ||
+                 instruction.opcode == Opcode::mips_mul);
+            if (mips32_hilo_binary && address_definition) {
+                // This compact chain cannot represent two independent input
+                // branches without inventing an edge between them. Preserve
+                // the operation itself and mark omitted input ancestry.
+                parents.clear();
+                truncated_mips32_binary_producers.insert(fact->id);
+            }
             const bool a64_wide_move = architecture == Architecture::arm64 &&
                 (instruction.opcode == Opcode::a64_movn || instruction.opcode == Opcode::a64_movz ||
                  instruction.opcode == Opcode::a64_movk);
@@ -2164,10 +2206,14 @@ RegisterReferenceFacts non_x86_producer_facts(
                 evaluate_a64_wide_move_instruction(instruction).has_value();
             const bool a64_wide_move_source_valid = !a64_wide_move ||
                 instruction.opcode != Opcode::a64_movk || !parents.empty();
+            const bool mips32_hilo_move = architecture == Architecture::mips32 &&
+                (instruction.opcode == Opcode::mips_mfhi || instruction.opcode == Opcode::mips_mflo ||
+                 instruction.opcode == Opcode::mips_mthi || instruction.opcode == Opcode::mips_mtlo);
             const bool one_source_transform = reads.size() == 1 && writes.size() == 1 &&
                                               !instruction.memory_read && !instruction.memory_write &&
                                               instruction.flow == FlowKind::fallthrough &&
-                                              a64_wide_move_valid && a64_wide_move_source_valid;
+                                              a64_wide_move_valid && a64_wide_move_source_valid &&
+                                              (!mips32_hilo_move || address_definition);
             std::map<ProducerRegisterKey, std::vector<std::uint64_t>> definitions;
             const bool independent_definition = reads.empty() && writes.size() == 1 &&
                 (architecture != Architecture::mos6502 || instruction.register_reads.empty());
@@ -2177,8 +2223,13 @@ RegisterReferenceFacts non_x86_producer_facts(
                 if (std::find(chain.begin(), chain.end(), fact->id) == chain.end() && chain.size() < 32)
                     chain.push_back(fact->id);
                 if (!chain.empty()) {
-                    for (const auto &destination : writes)
+                    for (const auto &destination : writes) {
+                        // SPECIAL2 MUL makes HI/LO unpredictable. Only its
+                        // explicit GPR result is a proven definition.
+                        if (architecture == Architecture::mips32 && instruction.opcode == Opcode::mips_mul &&
+                            destination.bank == RegisterBank::mips_hilo) continue;
                         definitions[register_key(destination)] = chain;
+                    }
                     // A W write zero-extends into X; an X definition also
                     // determines its low W view. Keep both typed keys so a
                     // subsequent transform can consume only the matching
@@ -2263,7 +2314,11 @@ RegisterReferenceFacts non_x86_producer_facts(
         }
         return state;
     };
-    propagate_cfg_register_values<ProducerRegisterState>(functions, stop, result, transfer);
+    propagate_cfg_register_values<ProducerRegisterState>(functions, stop, result, transfer,
+        [](const BasicBlock &block, const BlockSuccessor &edge, ProducerRegisterState state) {
+            if (mips_call_continuation(block, edge)) state.clear();
+            return state;
+        });
     // Preserve the ordered non-x86 producer chain as a compact dependency DAG.
     // The first dependency is from the referenced instruction to its latest
     // register producer; subsequent edges follow the bounded causal chain.
@@ -2283,6 +2338,9 @@ RegisterReferenceFacts non_x86_producer_facts(
         // Producer state is capped at 32 IDs during transfer. Reaching the
         // cap may mean older ancestry was dropped, so surface that uncertainty.
         if (producers.size() >= 32) graph.truncated = true;
+        if (std::any_of(producers.begin(), producers.end(), [&](const auto producer) {
+                return truncated_mips32_binary_producers.contains(producer);
+            })) graph.truncated = true;
         if (!graph.dependencies.empty() || graph.truncated)
             result.producer_graphs.emplace(key, std::move(graph));
     }
@@ -4508,6 +4566,9 @@ RegisterReferenceFacts mips_reference_facts(const Image *image, const Relocation
     RegisterReferenceFacts result;
     if (!image)
         return result;
+    // GPR indices are byte-sized even for malformed operands. Keep HI/LO
+    // outside that entire range so they can never alias a GPR lookup.
+    constexpr std::uint32_t mips32_hi_key = UINT32_MAX - 1, mips32_lo_key = UINT32_MAX;
     using RegisterState = std::unordered_map<std::uint32_t, Address>;
     const auto process_block = [&](const BasicBlock &block, RegisterState registers) {
         for (const auto &fact : block.instructions) {
@@ -4523,6 +4584,14 @@ RegisterReferenceFacts mips_reference_facts(const Image *image, const Relocation
                 registers.clear();
                 continue;
             }
+            if (mips32 && instruction.opcode == Opcode::opaque) {
+                registers.clear();
+                continue;
+            }
+            if (mips64) {
+                registers.erase(mips32_hi_key);
+                registers.erase(mips32_lo_key);
+            }
             const auto width = static_cast<std::uint8_t>(mips64 ? 64 : 32);
             const auto *address_space = image->space(instruction.address.space);
             if (!address_space || address_space->width_bits < width) {
@@ -4530,16 +4599,19 @@ RegisterReferenceFacts mips_reference_facts(const Image *image, const Relocation
                 continue;
             }
             const auto erase_written = [&] {
-                for (const auto &reg : instruction.register_writes)
+                for (const auto &reg : instruction.register_writes) {
                     if (reg.bank == RegisterBank::mips_gpr && reg.index != 0)
                         registers.erase(reg.index);
+                    else if (reg.bank == RegisterBank::mips_hilo && reg.index < 2)
+                        registers.erase(mips32_hi_key + reg.index);
+                }
             };
             // MIPS HI16/LO16 and other instruction relocations are not
             // currently solved as semantic pairs. Never treat their encoded
             // immediate bits as a complete address; unsupported, incomplete,
             // or ambiguous relocation records remain opaque.
-            if (mips64 && relocations.overlaps(instruction.address, instruction.length)) {
-                erase_written();
+            if (relocations.overlaps(instruction.address, instruction.length)) {
+                if (mips32) registers.clear(); else erase_written();
                 if (instruction.flow == FlowKind::call) registers.clear();
                 if (mips64)
                     if (const auto link = reference_detail::mips64_link_value(*image, instruction))
@@ -4562,7 +4634,118 @@ RegisterReferenceFacts mips_reference_facts(const Image *image, const Relocation
                 }
             }
             bool propagated = false;
-            if (mips32 && (instruction.opcode == Opcode::mips_slt || instruction.opcode == Opcode::mips_sltu ||
+            const auto mips32_gpr_value = [&](const RegisterOperand *reg) -> std::optional<std::uint32_t> {
+                if (!reg || reg->bank != RegisterBank::mips_gpr || reg->index >= 32 ||
+                    reg->width != 32 || reg->high_byte) return {};
+                if (reg->index == 0) return 0;
+                const auto found = registers.find(reg->index);
+                if (found == registers.end() || found->second.space != instruction.address.space ||
+                    found->second.offset > UINT32_MAX) return {};
+                return static_cast<std::uint32_t>(found->second.offset);
+            };
+            const auto mips32_scalar_form = [&] {
+                return mips32 && instruction.length == 4 && instruction.flow == FlowKind::fallthrough &&
+                    instruction.delay_slots == 0 && !instruction.memory_read && !instruction.memory_write &&
+                    !relocations.overlaps(instruction.address, instruction.length);
+            };
+            if (mips32 && (instruction.opcode == Opcode::mips_mult || instruction.opcode == Opcode::mips_multu ||
+                           instruction.opcode == Opcode::mips_div || instruction.opcode == Opcode::mips_divu)) {
+                const auto *left = architecture_register(instruction, 0, RegisterBank::mips_gpr, 32);
+                const auto *right = architecture_register(instruction, 1, RegisterBank::mips_gpr, 32);
+                const RegisterOperand hi{RegisterBank::mips_hilo, 0, 32, false};
+                const RegisterOperand lo{RegisterBank::mips_hilo, 1, 32, false};
+                const bool valid = mips32_scalar_form() && instruction.operands.size() == 2 && left && right &&
+                    left->index < 32 && right->index < 32 && !left->high_byte && !right->high_byte &&
+                    instruction.access == std::vector<OperandAccess>{OperandAccess::read, OperandAccess::read} &&
+                    instruction.register_reads == std::vector<RegisterOperand>{*left, *right} &&
+                    instruction.register_writes == std::vector<RegisterOperand>{hi, lo};
+                const auto lhs = valid ? mips32_gpr_value(left) : std::optional<std::uint32_t>{};
+                const auto rhs = valid ? mips32_gpr_value(right) : std::optional<std::uint32_t>{};
+                std::optional<Mips32HiLoResult> folded;
+                if (lhs && rhs) {
+                    const auto operation = instruction.opcode == Opcode::mips_mult ? Mips32HiLoOperation::mult :
+                        instruction.opcode == Opcode::mips_multu ? Mips32HiLoOperation::multu :
+                        instruction.opcode == Opcode::mips_div ? Mips32HiLoOperation::div : Mips32HiLoOperation::divu;
+                    folded = evaluate_mips32_hilo(operation, *lhs, *rhs);
+                }
+                if (valid) erase_written(); else registers.clear();
+                registers.erase(mips32_hi_key);
+                registers.erase(mips32_lo_key);
+                if (folded) {
+                    registers[mips32_hi_key] = Address{instruction.address.space, folded->hi};
+                    registers[mips32_lo_key] = Address{instruction.address.space, folded->lo};
+                    result.address_definitions.insert(fact->id);
+                }
+                propagated = true;
+            } else if (mips32 && (instruction.opcode == Opcode::mips_mfhi || instruction.opcode == Opcode::mips_mflo ||
+                                  instruction.opcode == Opcode::mips_mthi || instruction.opcode == Opcode::mips_mtlo)) {
+                const bool from_hilo = instruction.opcode == Opcode::mips_mfhi || instruction.opcode == Opcode::mips_mflo;
+                const bool hi_half = instruction.opcode == Opcode::mips_mfhi || instruction.opcode == Opcode::mips_mthi;
+                const auto *gpr = architecture_register(instruction, 0, RegisterBank::mips_gpr, 32);
+                const RegisterOperand hilo{RegisterBank::mips_hilo, static_cast<std::uint8_t>(hi_half ? 0 : 1), 32, false};
+                const std::vector<RegisterOperand> reads = !gpr ? std::vector<RegisterOperand>{} :
+                    from_hilo ? std::vector<RegisterOperand>{hilo} : std::vector<RegisterOperand>{*gpr};
+                const std::vector<RegisterOperand> writes = !gpr ? std::vector<RegisterOperand>{} :
+                    from_hilo ? (gpr->index ? std::vector<RegisterOperand>{*gpr} : std::vector<RegisterOperand>{}) :
+                                std::vector<RegisterOperand>{hilo};
+                const bool valid = mips32_scalar_form() && instruction.operands.size() == 1 && gpr &&
+                    gpr->index < 32 && !gpr->high_byte &&
+                    instruction.access == std::vector<OperandAccess>{from_hilo ? OperandAccess::write : OperandAccess::read} &&
+                    instruction.register_reads == reads && instruction.register_writes == writes;
+                std::optional<std::uint32_t> source;
+                if (valid && from_hilo) {
+                    const auto found = registers.find(hi_half ? mips32_hi_key : mips32_lo_key);
+                    if (found != registers.end() && found->second.space == instruction.address.space &&
+                        found->second.offset <= UINT32_MAX)
+                        source = static_cast<std::uint32_t>(found->second.offset);
+                } else if (valid) source = mips32_gpr_value(gpr);
+                const auto moved = source ? evaluate_mips32_hilo_move_instruction(
+                    instruction, hi_half && from_hilo ? *source : 0,
+                    !hi_half && from_hilo ? *source : 0, !from_hilo ? *source : 0) :
+                    std::optional<Mips32HiLoMoveResult>{};
+                if (valid) erase_written(); else registers.clear();
+                if (from_hilo && gpr && gpr->index != 0) registers.erase(gpr->index);
+                if (!from_hilo) registers.erase(hi_half ? mips32_hi_key : mips32_lo_key);
+                // MTHI/MTLO following an unread multiply/divide result can
+                // make the opposite half unpredictable; conservatively drop it.
+                if (!from_hilo) registers.erase(hi_half ? mips32_lo_key : mips32_hi_key);
+                if (moved && ((from_hilo && moved->writes_gpr) ||
+                              (!from_hilo && (moved->writes_hi || moved->writes_lo)))) {
+                    const auto key = from_hilo ? gpr->index : (hi_half ? mips32_hi_key : mips32_lo_key);
+                    const auto value = from_hilo ? moved->gpr_value : hi_half ? moved->hi : moved->lo;
+                    registers[key] = Address{instruction.address.space, value};
+                    result.address_definitions.insert(fact->id);
+                }
+                propagated = true;
+            } else if (mips32 && instruction.opcode == Opcode::mips_mul) {
+                const auto *dst = architecture_register(instruction, 0, RegisterBank::mips_gpr, 32);
+                const auto *left = architecture_register(instruction, 1, RegisterBank::mips_gpr, 32);
+                const auto *right = architecture_register(instruction, 2, RegisterBank::mips_gpr, 32);
+                std::vector<RegisterOperand> reads, writes;
+                if (left && left->index) reads.push_back(*left);
+                if (right && right->index) reads.push_back(*right);
+                if (dst && dst->index) writes.push_back(*dst);
+                writes.push_back(RegisterOperand{RegisterBank::mips_hilo, 0, 32, false});
+                writes.push_back(RegisterOperand{RegisterBank::mips_hilo, 1, 32, false});
+                const bool valid = mips32_scalar_form() && instruction.operands.size() == 3 && dst && left && right &&
+                    dst->index < 32 && left->index < 32 && right->index < 32 &&
+                    !dst->high_byte && !left->high_byte && !right->high_byte &&
+                    instruction.access == std::vector<OperandAccess>{OperandAccess::write, OperandAccess::read, OperandAccess::read} &&
+                    instruction.register_reads == reads && instruction.register_writes == writes;
+                const auto lhs = valid ? mips32_gpr_value(left) : std::optional<std::uint32_t>{};
+                const auto rhs = valid ? mips32_gpr_value(right) : std::optional<std::uint32_t>{};
+                std::optional<std::uint32_t> value;
+                if (lhs && rhs) value = evaluate_mips32_mul_low(*lhs, *rhs);
+                if (valid) erase_written(); else registers.clear();
+                if (dst && dst->index != 0) registers.erase(dst->index);
+                registers.erase(mips32_hi_key); // MUL leaves both HI and LO unpredictable.
+                registers.erase(mips32_lo_key);
+                if (valid && dst->index != 0 && value) {
+                    registers[dst->index] = Address{instruction.address.space, *value};
+                    result.address_definitions.insert(fact->id);
+                }
+                propagated = true;
+            } else if (mips32 && (instruction.opcode == Opcode::mips_slt || instruction.opcode == Opcode::mips_sltu ||
                            instruction.opcode == Opcode::mips_slti || instruction.opcode == Opcode::mips_sltiu)) {
                 const auto *dst = architecture_register(instruction, 0, RegisterBank::mips_gpr, 32);
                 const bool immediate_compare = instruction.opcode == Opcode::mips_slti ||
@@ -5310,14 +5493,22 @@ RegisterReferenceFacts mips_reference_facts(const Image *image, const Relocation
                     registers[loaded_pointer->first] = loaded_pointer->second;
             }
             if (indirect_target) result.immediate_targets[{fact->id, 0}] = *indirect_target;
-            if (instruction.flow == FlowKind::call) registers.clear();
+            // Delayed-call slots execute before the callee. Their incoming
+            // facts remain available; the continuation edge below clears
+            // everything after the callee has run.
+            if (instruction.flow == FlowKind::call && !analysis_detail::has_delay_slot(instruction))
+                registers.clear();
             if (mips64)
                 if (const auto link = reference_detail::mips64_link_value(*image, instruction))
                     registers[link->first] = link->second;
         }
         return registers;
     };
-    propagate_cfg_register_values<RegisterState>(functions, stop, result, process_block);
+    propagate_cfg_register_values<RegisterState>(functions, stop, result, process_block,
+        [](const BasicBlock &block, const BlockSuccessor &edge, RegisterState state) {
+            if (mips_call_continuation(block, edge)) state.clear();
+            return state;
+        });
     return result;
 }
 
