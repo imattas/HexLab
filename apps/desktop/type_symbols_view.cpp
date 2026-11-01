@@ -1258,7 +1258,7 @@ void TypeSymbolsView::import_header() {
     }
     wxArrayString targets;
     targets.Add("Windows x64 (LLP64)");
-    targets.Add("Linux / macOS 64-bit (LP64)");
+    targets.Add("Linux 64-bit (LP64)");
     targets.Add("32-bit x86 (ILP32)");
     targets.Add("AArch64 (LP64)");
     targets.Add("AArch32 (AAPCS32, ILP32)");

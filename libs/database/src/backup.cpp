@@ -19,14 +19,12 @@
 #include <sys/file.h>
 #include <sys/stat.h>
 #endif
-#if defined(__linux__) || defined(__APPLE__)
+#if defined(__linux__)
 #include <fcntl.h>
 #include <unistd.h>
 #endif
 #if defined(__linux__)
 #include <sys/syscall.h>
-#elif defined(__APPLE__)
-#include <stdio.h>
 #endif
 namespace hexlab::database {
 namespace {
@@ -211,9 +209,6 @@ void publish_bundle_directory(const std::filesystem::path& stage,const std::file
 #elif defined(__linux__) && defined(SYS_renameat2)
     constexpr unsigned no_replace=1;
     if(syscall(SYS_renameat2,AT_FDCWD,stage.c_str(),AT_FDCWD,target.c_str(),no_replace)!=0)
-        throw detail::Failure{detail::native_error("Cannot publish backup bundle directory without replacement")};
-#elif defined(__APPLE__)
-    if(renamex_np(stage.c_str(),target.c_str(),RENAME_EXCL)!=0)
         throw detail::Failure{detail::native_error("Cannot publish backup bundle directory without replacement")};
 #else
     throw detail::Failure{{ErrorCode::unsupported,"Atomic no-replace directory publication is unavailable on this platform"}};
