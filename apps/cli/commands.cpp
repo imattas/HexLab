@@ -3687,7 +3687,41 @@ int run_cli(std::span<const std::wstring_view> arguments, std::ostream &out, std
             out << "Usage: hexlab_cli functions <path> [input/analysis options] [--limit <count>] [--json]\n"
                    "       Input options match `disassemble`; --show-strings is not supported here.\n"
                    "       --limit caps returned rows (default 10000, maximum 100000).\n";
-        else usage(out);
+        else if (arguments[0] == L"inspect")
+            out << "Usage: hexlab_cli inspect <path> [input options]\n"
+                   "Inspect the input format and metadata without disassembling it.\n\n"
+                   "Input options:\n"
+                   "  --format auto|pe|elf|raw|macho|wasm|dex|jvm\n"
+                   "  --pe-runtime arm64|x64-compatible  Select the ARM64X PE view\n"
+                   "  --slice <index>  Select a zero-based Mach-O universal slice\n"
+                   "  --plugin <module>  Load a native plugin (repeatable)\n"
+                   "  --pdb <file> --pdb-search <directory>  Bind local PE debug symbols\n"
+                   "  --dwarf-split-package <file>  Select an ELF split-DWARF package\n"
+                   "  --dwarf-supplementary-package <file>  Select an ELF supplementary object\n"
+                   "  --                 End options when a path begins with '-'.\n";
+        else if (arguments[0] == L"disassemble")
+            out << "Usage: hexlab_cli disassemble <path> [input options] [analysis options] [--json]\n"
+                   "Decode instructions and report bounded analysis results.\n\n"
+                   "Analysis options:\n"
+                   "  --instruction-budget <count>  Bound decoded instructions\n"
+                   "  --string-budget <count>  Bound scanned string bytes\n"
+                   "  --min-string-length <count>  Set the minimum string length\n"
+                   "  --show-strings  Include discovered strings\n"
+                   "  --json  Emit ordered instruction rows as JSON\n\n"
+                   "Input options match `inspect`; raw inputs also accept --arch, --base, --entry,\n"
+                   "--profile, and --arm-profile.\n"
+                   "Addresses and budgets accept decimal or 0x-prefixed hexadecimal values.\n";
+        else
+            out << "Usage: hexlab_cli decompile <path> [input options] [analysis options]\n"
+                   "Recover supported functions and render typed-IR pseudocode.\n\n"
+                   "Analysis options:\n"
+                   "  --instruction-budget <count>  Bound decoded instructions\n"
+                   "  --string-budget <count>  Bound scanned string bytes\n"
+                   "  --min-string-length <count>  Set the minimum string length\n"
+                   "  --show-strings  Include discovered strings\n\n"
+                   "Input options match `inspect`; raw inputs also accept --arch, --base, --entry,\n"
+                   "--profile, and --arm-profile.\n"
+                   "Addresses and budgets accept decimal or 0x-prefixed hexadecimal values.\n";
         return 0;
     }
     try {
