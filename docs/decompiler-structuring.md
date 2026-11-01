@@ -348,38 +348,45 @@ overlapping arms, malformed edges, incomplete block coverage, and larger
 graphs retain the existing fallback.
 
 An explicit-preheader post-tested loop may also use a bounded nested body-
-dispatch tree whose leaves end in distinct latches. A leaf may unconditionally
+dispatch tree with distinct backedge sources. A leaf may unconditionally
 repeat at the dispatcher header, or conditionally target that header on one
-edge and the same exit cleanup head on the other. At least two latches and one
-conditional exit latch are required. The shared cleanup may contain up to 64
-blocks including its final
-explicit return or recognized non-returning `throw`,
-`rethrow_current_exception`, or `exception_unhandled` intrinsic. The cleanup
-head's predecessors must be exactly the conditional exit latch blocks;
-unconditional continue latches contribute only to the header predecessor set.
-Every cleanup block
-after the head is register-phi-free and has exactly its preceding block
+edge and the same exit cleanup head on the other. An interior repeat guard may
+also target the header on one edge while its sibling continues into a further
+proven in-loop subtree. The sibling may follow a bounded linear chain to
+another dispatcher, repeat guard, or unconditional latch; it receives no
+header copies until its own repeat edge executes. At least two backedge sources
+and one conditional exit latch are required. The shared cleanup may contain
+up to 64 blocks including its final explicit return. Nonreturn cleanup keeps
+the explicit fallback. The cleanup head's predecessors must be exactly the
+conditional exit latch blocks;
+unconditional continue latches and interior repeat guards contribute only to
+the header predecessor set. Every cleanup block after the head is
+register-phi-free and has exactly its preceding block
 as its CFG predecessor. Nonterminal cleanup blocks have one exact unconditional
 jump or fallthrough edge and cannot contain returns or explicit exception
 transfers. The cleanup cannot overlap the loop or preheader. Internal
 dispatches and linear arm paths must have exact single-predecessor links; the
 complete function must be covered by the preheader, header, dispatch tree,
-latches, and cleanup chain. The tree is limited to 64
-latch leaves, 127 branch nodes, and at most 64 nodes along any dispatch path
-(including its latch leaf); each linear path is capped at 64 blocks, and the
-complete function at 128 blocks and 4,096 edges. Header
+latches, and cleanup chain. The tree is limited to 64 backedge sources,
+127 dispatch/latch nodes, and at most 64 nodes along any dispatch path
+(including interior repeat guards and its latch leaf); each linear path is
+capped at 64 blocks, and the complete function at 128 blocks and 4,096 edges. Header
 register phis must have exactly one initial input from the preheader and one
 recurrent input from every latch. Cleanup-head register phis must match exactly
 the conditional exit latch edges. The formatter emits the preheader once,
-applies initial phi copies, then emits each latch's repeat or exit copies before `continue` or
-`break`. Unconditional latches emit their own simultaneous header copies and
-`continue`, with the original instruction address and block ID retained on the
-transfer. Their straight-line paths require exact jump/fallthrough edges and
-unique predecessors, just like the conditional latch paths. It emits the
+applies initial phi copies, then emits each latch's repeat or exit copies
+before `continue` or `break`. Every emitted `continue` and `break` retains the
+original transfer's instruction address and block ID. Straight-line paths
+require exact jump/fallthrough edges and unique predecessors, just like the
+conditional latch paths. It emits the
 shared cleanup once after the loop, so cleanup effects execute only on exit.
 Memory phis, register phis after the cleanup head, shared
 body paths, extra exits, side entries, branched cleanup, cleanup chains beyond
 64 blocks, and malformed edge/phi sets retain the existing lossless fallback.
+The exit-versus-continuation lookahead also has a 64-block bound; exhaustion
+discards the candidate before rendering. See
+[`multi-latch-loops.md`](../libs/decompiler/docs/multi-latch-loops.md) for the
+edge-copy and ownership proof.
 
 The acyclic structurer also handles nested regions with multiple explicit
 terminal returns. An analysis-only virtual exit supplies post-dominators for

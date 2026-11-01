@@ -11041,8 +11041,9 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
     // A post-tested loop may begin at a conditional body dispatcher after a
     // straight-line function-entry/preheader chain. Bounded nested dispatch
     // trees can lead to unconditional repeat latches and conditional latches
-    // which repeat at the dispatcher or leave through one shared cleanup. Every
-    // dispatch arm, latch, and phi edge is validated before emitting this form.
+    // which repeat at the dispatcher or leave through one shared cleanup. A
+    // conditional repeat may also guard another subtree on its continuing edge.
+    // Every dispatch arm, latch, and phi edge is validated before emission.
     auto try_explicit_preheader_multi_latch_loop = [&]() -> std::optional<StructuredPseudocode> {
         if (function.blocks.size() < 5 || function.blocks.size() > 128) return {};
         std::map<std::uint64_t, std::set<std::uint64_t>> predecessors;
@@ -11054,13 +11055,12 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                 !addresses.emplace(block.begin.space.value, block.begin.offset).second ||
                 block.switch_dispatch || block.memory_phi || !block.memory_partition_phis.empty() ||
                 !has_only_simple_statements(block)) return {};
-            // Explicit exception transfers cannot masquerade as a path with
-            // a repeat edge. Only the terminal cleanup may contain one.
-            for (std::size_t i = 0; i < block.instructions.size(); ++i) {
-                const auto *intrinsic = std::get_if<Intrinsic>(&block.instructions[i].statement);
+            // This loop proof requires a returning cleanup. Explicit nonreturn
+            // transfers keep their state-machine or label/goto representation.
+            for (const auto &instruction : block.instructions) {
+                const auto *intrinsic = std::get_if<Intrinsic>(&instruction.statement);
                 if (intrinsic && (intrinsic->name == "throw" ||
-                    intrinsic->name == "rethrow_current_exception" || intrinsic->name == "exception_unhandled") &&
-                    (i + 1 != block.instructions.size() || !block.successors.empty())) return {};
+                    intrinsic->name == "rethrow_current_exception" || intrinsic->name == "exception_unhandled")) return {};
             }
             std::set<std::uint64_t> targets;
             for (const auto &edge : block.successors) {
@@ -11088,7 +11088,7 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
             if (predecessors[header->id.value] != predecessor) return {};
             header = find_block(*header->successors.front().target);
         }
-        if (!header || preheader_path.empty() || !terminal_conditional(*header) ||
+        if (!header || preheader_path.empty() || contains_return(*header) || !terminal_conditional(*header) ||
             header->successors.size() != 2 || !conditional_edges_match_targets(*header, *terminal_conditional(*header)))
             return {};
         const auto *dispatch = terminal_conditional(*header);
@@ -11101,6 +11101,7 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
             const Branch *condition = nullptr;
             bool latch = false;
             bool repeat_on_true = false;
+            std::optional<std::size_t> continuation_child;
             std::size_t true_child = 0;
             std::size_t false_child = 0;
         };
@@ -11113,6 +11114,33 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
         if (!claimed.insert(header->id.value).second) return {};
         for (const auto *block : preheader_path)
             if (!claimed.insert(block->id.value).second) return {};
+
+        // Distinguish a conditional latch's cleanup edge from an in-loop
+        // continuation without claiming either path speculatively. Only an
+        // exact, bounded unconditional chain to a terminal return proves an
+        // exit; another conditional or backedge must be traced as loop work.
+        // Ownership and predecessor/phi coverage are proved separately below.
+        enum class RepeatSibling { cleanup, continuation, unsupported };
+        const auto classify_repeat_sibling = [&](Address start) {
+            const auto *cursor = find_block(start);
+            std::set<std::uint64_t> seen;
+            for (unsigned steps = 0; cursor && steps < 64; ++steps) {
+                if (cursor == header || claimed.contains(cursor->id.value) ||
+                    !seen.insert(cursor->id.value).second) return RepeatSibling::unsupported;
+                if (has_only_terminal_return(*cursor)) return RepeatSibling::cleanup;
+                if (contains_return(*cursor)) return RepeatSibling::unsupported;
+                if (terminal_conditional(*cursor)) return RepeatSibling::continuation;
+                if (cursor->successors.size() != 1 || !cursor->successors.front().target ||
+                    (cursor->successors.front().kind != BlockEdgeKind::jump &&
+                     cursor->successors.front().kind != BlockEdgeKind::fallthrough) ||
+                    !has_unconditional_edge(*cursor, *cursor->successors.front().target))
+                    return RepeatSibling::unsupported;
+                if (*cursor->successors.front().target == header->begin)
+                    return RepeatSibling::continuation;
+                cursor = find_block(*cursor->successors.front().target);
+            }
+            return RepeatSibling::unsupported;
+        };
 
         std::function<std::optional<std::size_t>(Address, std::uint64_t, unsigned)> trace_tree;
         trace_tree = [&](Address start, std::uint64_t initial_predecessor,
@@ -11138,17 +11166,23 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                     const bool repeats_true = *condition->true_target == header->begin;
                     const bool repeats_false = *condition->false_target == header->begin;
                     if (repeats_true != repeats_false) {
-                        const auto exit_address = repeats_true ? *condition->false_target : *condition->true_target;
-                        const auto *exit = find_block(exit_address);
-                        if (!exit || exit == header || exit == preheader || current == preheader) return {};
-                        if (shared_exit_address && *shared_exit_address != exit_address) return {};
-                        shared_exit_address = exit_address;
+                        const auto sibling_address = repeats_true ? *condition->false_target : *condition->true_target;
+                        const auto sibling = classify_repeat_sibling(sibling_address);
+                        if (sibling == RepeatSibling::unsupported) return {};
                         node.latch = true;
                         node.repeat_on_true = repeats_true;
                         const auto index = tree.size();
                         tree.push_back(std::move(node));
                         if (!latch_ids.insert(current->id.value).second) return {};
-                        exit_latch_ids.insert(current->id.value);
+                        if (sibling == RepeatSibling::cleanup) {
+                            if (shared_exit_address && *shared_exit_address != sibling_address) return {};
+                            shared_exit_address = sibling_address;
+                            exit_latch_ids.insert(current->id.value);
+                        } else {
+                            const auto continuation = trace_tree(sibling_address, current->id.value, depth + 1);
+                            if (!continuation) return {};
+                            tree[index].continuation_child = *continuation;
+                        }
                         return index;
                     }
                     const auto index = tree.size();
@@ -11209,22 +11243,17 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                 (cleanup != exit && !cleanup->phis.empty()) ||
                 !claimed.insert(cleanup->id.value).second) return {};
             exit_path.push_back(cleanup);
-            if (has_only_terminal_return(*cleanup) || has_only_terminal_nonreturn(*cleanup)) break;
+            if (has_only_terminal_return(*cleanup)) break;
             if (contains_return(*cleanup) || cleanup->successors.size() != 1 ||
                 !cleanup->successors.front().target ||
                 (cleanup->successors.front().kind != BlockEdgeKind::jump &&
                  cleanup->successors.front().kind != BlockEdgeKind::fallthrough) ||
-                !has_unconditional_edge(*cleanup, *cleanup->successors.front().target) ||
-                std::any_of(cleanup->instructions.begin(), cleanup->instructions.end(), [](const auto &item) {
-                    const auto *intrinsic = std::get_if<Intrinsic>(&item.statement);
-                    return intrinsic && (intrinsic->name == "throw" ||
-                        intrinsic->name == "rethrow_current_exception" || intrinsic->name == "exception_unhandled");
-                })) return {};
+                !has_unconditional_edge(*cleanup, *cleanup->successors.front().target)) return {};
             expected_predecessors = {cleanup->id.value};
             cleanup = find_block(*cleanup->successors.front().target);
         }
-        if (exit_path.empty() || (!has_only_terminal_return(*exit_path.back()) &&
-            !has_only_terminal_nonreturn(*exit_path.back())) || claimed.size() != function.blocks.size()) return {};
+        if (exit_path.empty() || !has_only_terminal_return(*exit_path.back()) ||
+            claimed.size() != function.blocks.size()) return {};
 
         std::size_t phi_input_count = 0;
         const auto build_copies = [&](const LiftedBlock &target, const std::set<std::uint64_t> &expected,
@@ -11261,28 +11290,35 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
             for (const auto *block : node.path) emit_block(*block, indent, true);
             emit_block(*node.branch_block, indent, true);
             const std::string spaces(indent, ' ');
+            const auto origin = node.branch_block->instructions.empty()
+                ? node.branch_block->begin : node.branch_block->instructions.back().origin.address;
+            const auto emit_transfer = [&](const char *keyword, unsigned transfer_indent) {
+                out << std::string(transfer_indent, ' ') << keyword << "; // 0x" << std::hex
+                    << origin.offset << std::dec << " (block " << node.branch_block->id.value << ")\n";
+            };
             if (node.latch) {
                 if (!node.condition) {
                     emit_parallel_copies(out, header_copies[node.branch_block->id.value], indent);
-                    const auto origin = node.branch_block->instructions.empty()
-                        ? node.branch_block->begin : node.branch_block->instructions.back().origin.address;
-                    out << spaces << "continue; // 0x" << std::hex << origin.offset << std::dec
-                        << " (block " << node.branch_block->id.value << ")\n";
+                    emit_transfer("continue", indent);
                     return;
                 }
                 const auto condition = branch_condition_text(*node.condition);
                 const auto emit_repeat = [&]() {
                     emit_parallel_copies(out, header_copies[node.branch_block->id.value], indent + 4);
-                    out << std::string(indent + 4, ' ') << "continue;\n";
+                    emit_transfer("continue", indent + 4);
                 };
-                const auto emit_exit = [&]() {
-                    emit_parallel_copies(out, exit_copies[node.branch_block->id.value], indent + 4);
-                    out << std::string(indent + 4, ' ') << "break;\n";
+                const auto emit_sibling = [&]() {
+                    if (node.continuation_child) {
+                        emit_tree(*node.continuation_child, indent + 4);
+                    } else {
+                        emit_parallel_copies(out, exit_copies[node.branch_block->id.value], indent + 4);
+                        emit_transfer("break", indent + 4);
+                    }
                 };
                 out << spaces << "if (" << condition << ") {\n";
-                if (node.repeat_on_true) emit_repeat(); else emit_exit();
+                if (node.repeat_on_true) emit_repeat(); else emit_sibling();
                 out << spaces << "} else {\n";
-                if (node.repeat_on_true) emit_exit(); else emit_repeat();
+                if (node.repeat_on_true) emit_sibling(); else emit_repeat();
                 out << spaces << "}\n";
                 return;
             }
