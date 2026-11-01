@@ -162,6 +162,11 @@ target); x86/x64 cannot distinguish read-only accesses, so read-only watchpoints
 return `unsupported`. Changes require a pending debug event. Updates check the
 debugger-owned slot state on every current target thread and apply
 transactionally, rolling back earlier threads if a later thread update fails.
+Each native or WOW64 update reads back DR0-DR3 and the DR7 slot controls.
+If Windows does not retain the requested state or readback fails, HexLab
+restores the prior comparator state and verifies its addresses and slot controls;
+an unverified or failed rollback is reported explicitly. Windows may normalize debug-register
+bits while setting a context ([Microsoft documentation](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-setthreadcontext)).
 New threads receive the active configuration before their creation event is
 returned. DR6 identifies hit slots and the backend clears the hit bits before
 the event is continued. Removing breakpoints and detaching clears owned slots;

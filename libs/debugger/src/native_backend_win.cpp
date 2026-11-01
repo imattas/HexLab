@@ -3596,8 +3596,23 @@ private:
         if (target_architecture() == Architecture::x86) {
             WOW64_CONTEXT c{}; c.ContextFlags = WOW64_CONTEXT_DEBUG_REGISTERS;
             if (!Wow64GetThreadContext(thread, &c)) return win_error("Wow64GetThreadContext for hardware breakpoint");
+            const auto original = c;
             detail::DebugRegisters prior; (void)detail::encode_hardware_breakpoints(expected_current, 4, prior);
             constexpr DWORD slot_mask = 0xffff00ffu; // DR0-DR3 enables and RW/LEN fields only.
+            const auto same_slots = [](const WOW64_CONTEXT &a, const WOW64_CONTEXT &b) {
+                return (a.Dr7 & slot_mask) == (b.Dr7 & slot_mask) &&
+                    a.Dr0 == b.Dr0 && a.Dr1 == b.Dr1 && a.Dr2 == b.Dr2 && a.Dr3 == b.Dr3;
+            };
+            const auto restore_original = [&](Error failure) -> Status {
+                if (!Wow64SetThreadContext(thread, &original))
+                    return Error{ErrorCode::io, failure.message + "; failed to restore prior WOW64 debug registers"};
+                WOW64_CONTEXT restored{}; restored.ContextFlags = WOW64_CONTEXT_DEBUG_REGISTERS;
+                if (!Wow64GetThreadContext(thread, &restored))
+                    return Error{ErrorCode::io, failure.message + "; WOW64 debug-register rollback could not be verified"};
+                if (!same_slots(original, restored))
+                    return Error{ErrorCode::io, failure.message + "; WOW64 debug-register rollback did not retain the prior state"};
+                return failure;
+            };
             const std::array<DWORD, 4> addresses{c.Dr0, c.Dr1, c.Dr2, c.Dr3};
             bool current_matches = (c.Dr7 & slot_mask) == (static_cast<DWORD>(prior.dr7) & slot_mask);
             for (std::size_t i = 0; current_matches && i < expected_current.size(); ++i)
@@ -3616,7 +3631,14 @@ private:
                 // Preserve every debug-address register outside our owned slots.
             }
             c.Dr7 = (c.Dr7 & ~slot_mask) | (static_cast<DWORD>(dr.dr7) & slot_mask);
-            if (!Wow64SetThreadContext(thread, &c)) return win_error("Wow64SetThreadContext for hardware breakpoint");
+            if (!Wow64SetThreadContext(thread, &c))
+                return restore_original(win_error("Wow64SetThreadContext for hardware breakpoint"));
+            WOW64_CONTEXT observed{}; observed.ContextFlags = WOW64_CONTEXT_DEBUG_REGISTERS;
+            if (!Wow64GetThreadContext(thread, &observed))
+                return restore_original(win_error("Wow64GetThreadContext verifying hardware breakpoint"));
+            if (!same_slots(c, observed))
+                return restore_original(Error{ErrorCode::unsupported,
+                    "Windows did not retain the requested WOW64 hardware breakpoint state"});
             return std::monostate{};
         }
 #endif
@@ -3625,9 +3647,24 @@ private:
 #else
         CONTEXT c{}; c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
         if (!GetThreadContext(thread, &c)) return win_error("GetThreadContext for hardware breakpoint");
+        const auto original = c;
         detail::DebugRegisters prior; (void)detail::encode_hardware_breakpoints(expected_current, static_cast<std::uint8_t>(ptr), prior);
         using DebugWord = decltype(c.Dr0);
         constexpr DebugWord slot_mask = static_cast<DebugWord>(0xffff00ffu); // DR0-DR3 enables and RW/LEN fields only.
+        const auto same_slots = [](const CONTEXT &a, const CONTEXT &b) {
+            return (a.Dr7 & slot_mask) == (b.Dr7 & slot_mask) &&
+                a.Dr0 == b.Dr0 && a.Dr1 == b.Dr1 && a.Dr2 == b.Dr2 && a.Dr3 == b.Dr3;
+        };
+        const auto restore_original = [&](Error failure) -> Status {
+            if (!SetThreadContext(thread, &original))
+                return Error{ErrorCode::io, failure.message + "; failed to restore prior x86/x64 debug registers"};
+            CONTEXT restored{}; restored.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+            if (!GetThreadContext(thread, &restored))
+                return Error{ErrorCode::io, failure.message + "; x86/x64 debug-register rollback could not be verified"};
+            if (!same_slots(original, restored))
+                return Error{ErrorCode::io, failure.message + "; x86/x64 debug-register rollback did not retain the prior state"};
+            return failure;
+        };
         const std::array<DebugWord, 4> addresses{c.Dr0, c.Dr1, c.Dr2, c.Dr3};
         bool current_matches = (c.Dr7 & slot_mask) == (prior.dr7 & slot_mask);
         for (std::size_t i = 0; current_matches && i < expected_current.size(); ++i)
@@ -3646,7 +3683,14 @@ private:
             // Preserve every debug-address register outside our owned slots.
         }
         c.Dr7 = static_cast<decltype(c.Dr7)>((c.Dr7 & ~slot_mask) | (dr.dr7 & slot_mask));
-        if (!SetThreadContext(thread, &c)) return win_error("SetThreadContext for hardware breakpoint");
+        if (!SetThreadContext(thread, &c))
+            return restore_original(win_error("SetThreadContext for hardware breakpoint"));
+        CONTEXT observed{}; observed.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+        if (!GetThreadContext(thread, &observed))
+            return restore_original(win_error("GetThreadContext verifying hardware breakpoint"));
+        if (!same_slots(c, observed))
+            return restore_original(Error{ErrorCode::unsupported,
+                "Windows did not retain the requested x86/x64 hardware breakpoint state"});
         return std::monostate{};
 #endif
     }
