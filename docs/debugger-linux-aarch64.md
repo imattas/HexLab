@@ -112,10 +112,9 @@ kernel implementation: [`user_sve_header` and `NT_ARM_SVE` layout](https://githu
 [`encode_ctrl_reg`](https://github.com/torvalds/linux/blob/master/arch/arm64/include/asm/hw_breakpoint.h),
 and [watchpoint hit attribution](https://github.com/torvalds/linux/blob/master/arch/arm64/kernel/hw_breakpoint.c).
 
-Earlier source passed syntax-only and object compilation with the AArch64
-backend guard enabled under x86_64 WSL, using host Linux headers and emitting
-host code. The deferred-resume owner-order and signal changes have not been
-compiled: the available WSL Clang cannot find an AArch64 C++ standard library,
-and no AArch64 GCC toolchain is installed. Native AArch64 code generation,
-ptrace UAPI behavior, and runtime breakpoint handling remain unverified.
-No tests or target runtime checks have been run for these changes.
+The current backend, including deferred-resume owner ordering and signal
+handling, passed GCC 13.3 syntax checking under x86-64 WSL with the AArch64
+guard defined and host Linux headers. This checks the source only; it does not
+generate AArch64 code. Native AArch64 compilation, ptrace UAPI behavior, and
+runtime breakpoint handling remain unverified. No tests or target runtime
+checks have been run for these changes.
