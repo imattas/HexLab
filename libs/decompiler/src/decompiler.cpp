@@ -516,6 +516,8 @@ std::string register_name(RegisterOperand reg) {
         return reg.index == 0 ? "HI" : reg.index == 1 ? "LO" : "HILO" + std::to_string(reg.index);
     if (reg.bank == RegisterBank::segment)
         return "seg" + std::to_string(reg.index);
+    if (reg.bank == RegisterBank::x86_segment_base)
+        return reg.index == 0 ? "fsbase" : reg.index == 1 ? "gsbase" : "segmentbase" + std::to_string(reg.index);
     return "r" + std::to_string(reg.index);
 }
 std::string register_name(RegisterOperand reg, std::optional<std::uint32_t> version) {
@@ -1283,6 +1285,31 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
 
     const bool x86_context = instruction.context.architecture == Architecture::x86 ||
                              instruction.context.architecture == Architecture::x86_64;
+    if (instruction.opcode == Opcode::rdfsbase || instruction.opcode == Opcode::rdgsbase ||
+        instruction.opcode == Opcode::wrfsbase || instruction.opcode == Opcode::wrgsbase) {
+        const auto shape = x86_fsgsbase_operands(instruction);
+        if (!shape) {
+            Intrinsic effect{"x86_fsgsbase_malformed", operands, IntrinsicMemoryEffect::unknown};
+            effect.register_writes = instruction.register_writes;
+            return effect;
+        }
+        const auto name = instruction.opcode == Opcode::rdfsbase ? "rdfsbase" :
+                          instruction.opcode == Opcode::rdgsbase ? "rdgsbase" :
+                          instruction.opcode == Opcode::wrfsbase ? "wrfsbase" : "wrgsbase";
+        auto input = reg_expr(shape->reads_base ? shape->segment_base : shape->gpr);
+        ExpressionPtr low = input;
+        if (shape->gpr.width == 32 && shape->reads_base)
+            low = std::make_shared<Expression>(Expression{integer_type(32), UnaryValue{"trunc32", input}});
+        ExpressionPtr full = low;
+        if (shape->gpr.width == 32)
+            full = std::make_shared<Expression>(Expression{integer_type(64), UnaryValue{"zext", low}});
+        Intrinsic effect{std::string("x86_") + name, {input}, IntrinsicMemoryEffect::none};
+        effect.register_writes = instruction.register_writes;
+        if (shape->reads_base) effect.result_type = integer_type(shape->gpr.width);
+        for (const auto written : effect.register_writes)
+            effect.register_output_values.push_back(written.width == 32 ? low : full);
+        return effect;
+    }
     if (x86_context && instruction.opcode == Opcode::cpuid) {
         const auto malformed = [&]() -> Statement {
             Intrinsic effect{"x86_cpuid_malformed", {}, IntrinsicMemoryEffect::unknown};

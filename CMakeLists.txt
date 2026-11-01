@@ -300,6 +300,7 @@ configure_file(cmake/package-manifest.json.in
 install(FILES "${PROJECT_BINARY_DIR}/package-manifest.json"
   DESTINATION "${CMAKE_INSTALL_DATADIR}/hexlab")
 install(FILES docs/package-manifest.md DESTINATION "${CMAKE_INSTALL_DATADIR}/hexlab/docs")
+install(FILES docs/x86-fsgsbase.md DESTINATION "${CMAKE_INSTALL_DATADIR}/hexlab/docs")
 install(FILES docs/linux-ptrace-debugging.md DESTINATION "${CMAKE_INSTALL_DATADIR}/hexlab/docs")
 install(FILES docs/unix-distribution.md DESTINATION "${CMAKE_INSTALL_DATADIR}/hexlab/docs")
 # Record hashes of the concrete installed files only after all install rules

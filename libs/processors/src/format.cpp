@@ -204,6 +204,8 @@ std::string register_name(const RegisterOperand &r) {
         return r.width == 16 ? "flags" : r.width == 32 ? "eflags" : "rflags";
     if (r.bank == RegisterBank::segment)
         return r.index < 6 ? segments[r.index] : "?segment";
+    if (r.bank == RegisterBank::x86_segment_base)
+        return r.index == 0 ? "fsbase" : r.index == 1 ? "gsbase" : "?segmentbase";
     if (r.high_byte)
         return r.index < 4 ? high[r.index] : "?high";
     if (r.index >= 16)
@@ -274,6 +276,10 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
     case Opcode::rdtsc: return "rdtsc";
     case Opcode::rdtscp: return "rdtscp";
     case Opcode::rdpmc: return "rdpmc";
+    case Opcode::rdfsbase: return "rdfsbase";
+    case Opcode::rdgsbase: return "rdgsbase";
+    case Opcode::wrfsbase: return "wrfsbase";
+    case Opcode::wrgsbase: return "wrgsbase";
     case Opcode::crc32: return "crc32";
     case Opcode::comiss: return "comiss";
     case Opcode::ucomiss: return "ucomiss";

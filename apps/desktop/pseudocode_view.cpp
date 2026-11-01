@@ -60,6 +60,8 @@ std::string register_token(RegisterOperand reg, std::optional<std::uint32_t> ver
     if (reg.bank == RegisterBank::flags || reg.bank == RegisterBank::arm_flags) result = "flags";
     else if (reg.bank == RegisterBank::ip) result = "ip";
     else if (reg.bank == RegisterBank::segment) result = "seg" + std::to_string(reg.index);
+    else if (reg.bank == RegisterBank::x86_segment_base)
+        result = reg.index == 0 ? "fsbase" : reg.index == 1 ? "gsbase" : "segmentbase" + std::to_string(reg.index);
     else result = "r" + std::to_string(reg.index);
     if (version) result += "_" + std::to_string(*version);
     return result;

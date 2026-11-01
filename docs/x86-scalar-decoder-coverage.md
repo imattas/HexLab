@@ -5,6 +5,10 @@ The native VEX integer subset includes the BMI1 `ANDN`, `BEXTR`, `BLSI`,
 formatting, typed decompiler intrinsics, and caller-driven result/flag
 evaluation. See [BMI1 coverage and boundaries](x86-bmi1.md).
 
+The x86-64 FSGSBASE register family models reads and writes of the FS/GS base
+state, including 32-bit zero extension. See [FS/GS base transfers](x86-fsgsbase.md)
+for execution and TLS-address limitations.
+
 ## String port I/O
 
 INS/INSB/INSW/INSD (`6C/6D`) and OUTS/OUTSB/OUTSW/OUTSD (`6E/6F`) decode

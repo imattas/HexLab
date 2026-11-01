@@ -79,6 +79,33 @@ bool stack_flow(State &s, std::uint8_t opcode, bool extended) {
                 if (s.rules.long_mode()) s.i.register_writes.push_back(gpr(index, 64));
                 s.i.register_writes.push_back(gpr(index, 32));
             }
+        } else if (opcode == 0xae && s.group1 == 0xf3) {
+            const auto encoded = s.peek();
+            const auto extension = (encoded >> 3) & 7;
+            if ((encoded >> 6) != 3 || extension > 3)
+                return false; // Other 0F AE families are not FSGSBASE.
+            if (!s.rules.long_mode())
+                invalid("FSGSBASE instructions require 64-bit mode");
+            if (s.operand_override)
+                unsupported("FSGSBASE with an operand-size override is not covered");
+            const std::uint16_t width = (s.rex & 8) ? 64 : 32;
+            const auto m = modrm(s, width);
+            const bool read_base = extension < 2;
+            const RegisterOperand base{RegisterBank::x86_segment_base,
+                                       static_cast<std::uint16_t>(extension & 1), 64, false};
+            s.i.opcode = extension == 0 ? Opcode::rdfsbase : extension == 1 ? Opcode::rdgsbase :
+                         extension == 2 ? Opcode::wrfsbase : Opcode::wrgsbase;
+            s.operand(m.rm, read_base ? OperandAccess::write : OperandAccess::read);
+            if (read_base) {
+                s.i.register_reads.push_back(base);
+                // A 32-bit destination also clears the upper half in long mode.
+                if (width == 32) {
+                    const auto &dest = std::get<RegisterOperand>(m.rm);
+                    s.i.register_writes.push_back(gpr(static_cast<std::uint8_t>(dest.index), 64));
+                }
+            } else {
+                s.i.register_writes.push_back(base);
+            }
         } else if (opcode == 0x1f) {
             auto m = modrm(s, s.width());
             if (m.group != 0)

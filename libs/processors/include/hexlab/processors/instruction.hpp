@@ -12,7 +12,7 @@
 namespace hexlab {
 enum class DecodeStatus { decoded, unsupported, invalid, truncated };
 enum class FlowKind { fallthrough, call, conditional_branch, jump, ret, trap, switch_dispatch, data };
-enum class RegisterBank { gpr, ip, flags, segment, arm32_gpr, arm64_gpr, arm64_sp, arm64_zero, arm_flags, riscv_gpr, mips_gpr, mos6502, mips_hilo, mips_cp0, x87, ppc_gpr, ppc_cr, ppc_lr, ppc_ctr, xmm, riscv_fpr, riscv_fstatus, mips_fpr, mips_fcsr, cil_stack, ymm, riscv_vpr, riscv_vcsr, cil_continuation, ppc_xer, x87_status, x87_control, x87_tag, arm64_simd, dex_vreg, jvm_local, wasm_stack, mxcsr, zmm, opmask, ppc_fpr, jvm_stack, ppc_fpscr, ppc_vr, wasm_local, ppc_crbit, arm32_vfp, arm_saved_flags };
+enum class RegisterBank { gpr, ip, flags, segment, arm32_gpr, arm64_gpr, arm64_sp, arm64_zero, arm_flags, riscv_gpr, mips_gpr, mos6502, mips_hilo, mips_cp0, x87, ppc_gpr, ppc_cr, ppc_lr, ppc_ctr, xmm, riscv_fpr, riscv_fstatus, mips_fpr, mips_fcsr, cil_stack, ymm, riscv_vpr, riscv_vcsr, cil_continuation, ppc_xer, x87_status, x87_control, x87_tag, arm64_simd, dex_vreg, jvm_local, wasm_stack, mxcsr, zmm, opmask, ppc_fpr, jvm_stack, ppc_fpscr, ppc_vr, wasm_local, ppc_crbit, arm32_vfp, arm_saved_flags, x86_segment_base };
 enum class Opcode {
     mov,
     movzx,
@@ -717,7 +717,9 @@ enum class Opcode {
     mips64_cache, mips64_synci, mips64_rdhwr, mips64_di, mips64_ei,
     mips64_ssnop, mips64_ehb, mips64_pause,
     // Zfa/Zfh half-precision round-to-integral forms; append for stable IDs.
-    rv_fround_h, rv_froundnx_h
+    rv_fround_h, rv_froundnx_h,
+    // FSGSBASE uses 64-bit FS/GS base state, distinct from segment selectors.
+    rdfsbase, rdgsbase, wrfsbase, wrgsbase
 };
 enum class OperandAccess { read, write, read_write, address };
 // The encoded x86 group-one repeat prefix is retained separately from the

@@ -11,6 +11,56 @@
 
 namespace hexlab {
 
+// The two bases are modeled independently from the 16-bit FS/GS selectors.
+struct X86FsgsbaseOperands {
+    RegisterOperand gpr;
+    RegisterOperand segment_base;
+    bool reads_base;
+};
+
+// Check the public instruction facts before evaluating or lifting the family.
+inline std::optional<X86FsgsbaseOperands> x86_fsgsbase_operands(const Instruction &instruction) noexcept {
+    const bool reads_base = instruction.opcode == Opcode::rdfsbase || instruction.opcode == Opcode::rdgsbase;
+    const bool writes_base = instruction.opcode == Opcode::wrfsbase || instruction.opcode == Opcode::wrgsbase;
+    if ((!reads_base && !writes_base) || instruction.context.architecture != Architecture::x86_64 ||
+        instruction.context.mode != ExecutionMode::x86_64 || instruction.context.order != ByteOrder::little ||
+        instruction.flow != FlowKind::fallthrough || instruction.lock_prefix || instruction.memory_read ||
+        instruction.memory_write || instruction.operands.size() != 1 || instruction.access.size() != 1 ||
+        instruction.access[0] != (reads_base ? OperandAccess::write : OperandAccess::read))
+        return {};
+    const auto *gpr = std::get_if<RegisterOperand>(&instruction.operands[0]);
+    if (!gpr || gpr->bank != RegisterBank::gpr || gpr->index >= 16 || gpr->high_byte ||
+        (gpr->width != 32 && gpr->width != 64)) return {};
+    const bool gs = instruction.opcode == Opcode::rdgsbase || instruction.opcode == Opcode::wrgsbase;
+    const RegisterOperand base{RegisterBank::x86_segment_base, static_cast<std::uint16_t>(gs), 64, false};
+    if (reads_base) {
+        if (instruction.register_reads.size() != 1 || instruction.register_reads[0] != base) return {};
+        if (gpr->width == 32) {
+            const RegisterOperand full{RegisterBank::gpr, gpr->index, 64, false};
+            if (instruction.register_writes.size() != 2 || instruction.register_writes[0] != full ||
+                instruction.register_writes[1] != *gpr) return {};
+        } else if (instruction.register_writes.size() != 1 || instruction.register_writes[0] != *gpr) return {};
+    } else if (instruction.register_reads.size() != 1 || instruction.register_reads[0] != *gpr ||
+               instruction.register_writes.size() != 1 || instruction.register_writes[0] != base) return {};
+    return X86FsgsbaseOperands{*gpr, base, reads_base};
+}
+
+struct X86FsgsbaseResult {
+    bool writes_segment_base;
+    std::uint64_t value;
+};
+
+// This computes the successful transfer only. The caller owns feature and
+// CR4 checks, canonical-address validation, fault delivery and machine state.
+inline std::optional<X86FsgsbaseResult> evaluate_x86_fsgsbase_instruction(
+    const Instruction &instruction, std::uint64_t gpr, std::uint64_t segment_base) noexcept {
+    const auto operands = x86_fsgsbase_operands(instruction);
+    if (!operands) return {};
+    auto value = operands->reads_base ? segment_base : gpr;
+    if (operands->gpr.width == 32) value &= UINT64_C(0xffffffff);
+    return X86FsgsbaseResult{!operands->reads_base, value};
+}
+
 namespace x64_instruction_semantics_detail {
 inline unsigned operand_width(const Operand &operand) noexcept {
     return std::visit([](const auto &value) -> unsigned {

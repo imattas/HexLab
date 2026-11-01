@@ -458,7 +458,7 @@ DecodeResult decode_scalar(std::span<const std::byte> input, Address address, De
             (opcode >= 0xa4 && opcode <= 0xaf && !(opcode >= 0xa8 && opcode <= 0xa9)));
         const bool simd_form = simd(state, opcode, extended);
         if (!simd_form && ((state.group1 == 0xf2 && !string_form) ||
-            (state.group1 == 0xf3 && !f3_bit_count && !string_form &&
+            (state.group1 == 0xf3 && !f3_bit_count && !string_form && !(extended && opcode == 0xae) &&
              !((!extended && (opcode == 0x90 || opcode == 0xc3)) || (extended && opcode == 0x1e)))))
             unsupported("Repeat/mandatory prefix form is not yet covered");
         if (!conditional_data && !simd_form && !(string_form && string_operation(state, opcode)) && !(!extended && x87(state, opcode)) &&
