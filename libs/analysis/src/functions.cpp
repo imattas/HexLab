@@ -2,6 +2,7 @@
 #include "instruction_flow.hpp"
 #include "dex_switch_internal.hpp"
 #include "control_target.hpp"
+#include "wasm_selector.hpp"
 #include "hexlab/analysis/relocations.hpp"
 #include "hexlab/core/byte_reader.hpp"
 #include "hexlab/analysis/switches.hpp"
@@ -2976,15 +2977,14 @@ void Recovery::resolve_wasm_indirect_calls() {
             table_index->effective_width != 32 || table_index->value != 0)
             continue;
         if (ambiguous_ends.contains(call.source)) continue;
-        const auto previous = instruction_ends.find(call.source);
-        if (previous == instruction_ends.end()) continue;
-        const auto &constant = previous->second->instruction;
-        if (constant.address.space != call.source.space || constant.mnemonic_override != "i32.const" ||
-            constant.operands.size() != 1)
-            continue;
-        const auto *slot_operand = std::get_if<ImmediateOperand>(&constant.operands.front());
-        if (!slot_operand || !slot_operand->is_signed || slot_operand->effective_width != 32) continue;
-        const auto slot = static_cast<std::uint32_t>(slot_operand->value);
+        std::vector<const Instruction *> selector_instructions;
+        for (const auto &[end, fact] : instruction_ends) {
+            if (end.space == call.source.space && end.offset <= call.source.offset && fact)
+                selector_instructions.push_back(&fact->instruction);
+        }
+        const auto selector = analysis_detail::wasm_constant_selector(std::move(selector_instructions), call.source);
+        if (!selector) continue;
+        const auto slot = *selector;
         if (slot >= wasm.initial_table_element_count) continue;
         const auto element = table_elements.find(slot);
         if (element == table_elements.end()) continue;
@@ -3163,6 +3163,8 @@ Sha256Digest function_engine_fingerprint(const AnalysisOptions &options) {
         "macho-reference-provenance-v1/macho-dyld-data-provenance-v1/macho-dyld-flow-v1/macho-export-roots-v1/macho-code-policy-v1/elf-unwind-personality-roots-v1/elf-unwind-roots-v1/macho-eh-frame-roots-v1/pe-tls-callback-roots-v1/pe-arm64-pdata-provenance-v1/mips64-cop1-condition-predicates-v1/riscv-v-vector-comparisons-v1/riscv-vfclass-vfsqrt-v1/x86-vex128-zero-upper-v1/powerpc-xform-logical-clz-signext-v1/x87-status-control-tag-effects-v1/pe-safe-seh-function-roots-v1/macho-mod-term-function-roots-v1/elf-dwarf-subprogram-roots-v1/thumb2-movw-movt-reference-v1/riscv-addiw-address-reference-v1/aapcs32-stack-argument-slots-v1/mips-o32-stack-argument-slots-v1/mips-n64-stack-argument-slots-v1/a64-32bit-pointer-load-references-v1/ebcdic-cp037-string-candidates-v1/mips64-special2-mul-address-reference-v1/ppc32-rlwinm-address-reference-v1/ppc64-rldimi-address-reference-v1/riscv-outgoing-stack-store-provenance-v1/thumb-tbb-aligned-pc-target-v1/mips64-word-rotr-address-reference-v1/native-import-slot-call-identities-v1/windows932-string-candidates-v1/windows950-string-candidates-v1/m6502-decimal-stack-alias-guard-v1/mips32-derived-stack-aliases-v1/a64-etrel-cross-section-branch-v1/m65c02-index-stack-and-accumulator-alias-v1/a64-division-reference-v1/a64-logical-encoded-extent-v1/mips32-logical-immediate-reference-v1/mips32-merge-load-reference-v1/a64-signed-narrow-load-reference-v1/mips64-set-less-than-reference-v1/a64-orr-zero-stack-copies-v1"
         "/mips64-full-width-switch-bases-v1/windows1251-after-unicode-strings-v1";
     (void)hash.update(std::as_bytes(std::span(version)));
+    constexpr std::string_view wasm_indirect_selector_version = "wasm-indirect-constant-selector-v1";
+    (void)hash.update(std::as_bytes(std::span(wasm_indirect_selector_version)));
     for (auto value : {options.min_string_characters, options.instruction_budget, options.string_budget,
                        options.string_scan_work_budget,
                        options.function_budget, options.block_budget, options.membership_budget})

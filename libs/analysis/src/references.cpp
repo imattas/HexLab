@@ -2,6 +2,7 @@
 #include "instruction_flow.hpp"
 #include "control_target.hpp"
 #include "mips64_reference_helpers.hpp"
+#include "wasm_selector.hpp"
 #include "a64_fields.hpp"
 #include "hexlab/analysis/relocations.hpp"
 #include "hexlab/processors/arm32_semantics.hpp"
@@ -6629,23 +6630,15 @@ derive_reference_values(const Image *image, const FunctionSnapshot &functions, c
             if (seen_wasm_spaces.size() != wasm.defined_functions)
                 return {};
 
-            if (call.address.offset == 0)
-                return {};
-            const auto previous = std::find_if(functions.instructions.begin(), functions.instructions.end(),
-                [&](const auto &candidate) {
-                    return candidate && candidate->instruction.address.space == call.address.space &&
-                           candidate->instruction.address.offset < call.address.offset &&
-                           candidate->instruction.address.offset + candidate->instruction.length == call.address.offset;
-                });
-            if (previous == functions.instructions.end())
-                return {};
-            const auto &constant = (*previous)->instruction;
-            if (constant.mnemonic_override != "i32.const" || constant.operands.size() != 1)
-                return {};
-            const auto *slot_operand = std::get_if<ImmediateOperand>(&constant.operands[0]);
-            if (!slot_operand || !slot_operand->is_signed || slot_operand->effective_width != 32)
-                return {};
-            const auto slot = static_cast<std::uint32_t>(slot_operand->value);
+            std::vector<const Instruction *> selector_instructions;
+            for (const auto &candidate : functions.instructions) {
+                if (candidate && candidate->instruction.address.space == call.address.space &&
+                    candidate->instruction.address.offset < call.address.offset)
+                    selector_instructions.push_back(&candidate->instruction);
+            }
+            const auto selector = analysis_detail::wasm_constant_selector(std::move(selector_instructions), call.address);
+            if (!selector) return {};
+            const auto slot = *selector;
             if (slot >= wasm.initial_table_element_count)
                 return {};
             const auto element = std::find_if(wasm.initial_table_elements.begin(), wasm.initial_table_elements.end(),

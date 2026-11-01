@@ -50,6 +50,19 @@ direct and indirect WebAssembly calls as calls, preserving their continuation
 edges. Imported calls retain their exact module/name, function-space index, and
 optional symbolic host binding in the function call record and reference index.
 Function-call graph JSON emits them as symbolic external nodes with no code
-address. `call_indirect` target resolution still needs stack-index and
-runtime-table analysis. The start root is still only an analysis root: module
-instantiation order and host callbacks are not executed or modeled.
+address. `call_indirect` target resolution accepts a bounded constant selector
+expression immediately before the call: `i32.const` and MVP `i32` unary and
+binary arithmetic are evaluated from a contiguous postfix instruction suffix
+(at most 64 instructions and 32 expression levels). It still requires the
+complete local fixed-table evidence described in `wasm-analysis.md`; dynamic
+selectors, imported or exported tables, table mutation, opaque instructions,
+and unknown slots remain unresolved. Import targets remain symbolic
+module/name/index identities, with an optional caller-supplied host label; they
+are never treated as executable code.
+
+The start seed identifies the local defined function that the validated start
+section requests the runtime to invoke during instantiation. An imported start
+function has no local code seed; its module/name and optional host binding stay
+on import metadata and do not prove that a host callback was found. Start and
+element seeds expose actionable local code to analysis but do not perform
+instantiation, execute initialization, or resolve host callbacks.
