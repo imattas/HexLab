@@ -70,6 +70,7 @@ class SearchView final : public wxPanel {
     void restore_selection();
     void poll_filter();
     void poll_collection();
+    void retire_source();
     void show_preview();
     void step(bool forward);
     wxString export_text() const;

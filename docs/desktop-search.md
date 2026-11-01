@@ -45,6 +45,15 @@ for every document with a continuation. Closing a document removes its rows;
 editing a source invalidates only that document's cached matches. Search work
 continues on the analysis pool, not the GUI thread.
 
+Each Find request owns a cancellation state in addition to the analysis pool's
+session cancellation. Replacing a query, invalidating its source/query, retiring
+a closed document's request, or shutting down the controller requests a stop
+even if its replacement is still waiting for analysis work before submission.
+The worker observes either cancellation through the search engine's existing
+bounded scan checkpoints. Retiring a search request does not cancel unrelated
+analysis for that document. The desktop Cancel action also stops its active
+search request explicitly.
+
 With all-open-documents search active, **Find Next** advances through the
 active document's loaded results, then checks the other open searchable
 documents in tab order. It loads the next page of the first document that has
@@ -70,7 +79,10 @@ Changing the active document, document revision, source snapshot, loaded pages,
 or search scope retires the old collection generation. Completions must match
 the captured document ID, revision, image, project, and page source key. The
 desktop also checks the live document revision and project before accepting a
-batch or navigating a current-document result. Status-only changes do not
+batch, accepting a metadata-filter completion, or navigating a current-document
+result. A stale completion retires both pane workers, clears selectable rows,
+and disables navigation, copy, export, and continuation until the pane receives
+a current document update. Status-only changes do not
 restart collection. This workflow searches only the selected document unless
 the user explicitly enables the existing all-open-documents option; it adds no
 project-wide indexing or implicit file opening.
@@ -153,3 +165,7 @@ The 2026-10-31 current-document result-preparation change was compiled with
 MSVC 19.44 in C++20 mode for `apps/desktop/search_view.cpp` and
 `apps/desktop/main_frame.cpp`. This wave did not run tests or launch the GUI;
 interactive responsiveness and cancellation remain unverified at runtime.
+
+The subsequent request-cancellation and stale-filter retirement changes were
+compiled with the same MSVC C++20 configuration for `search_view.cpp`,
+`session_search.cpp`, and `session_controller.cpp`. No tests or GUI were run.

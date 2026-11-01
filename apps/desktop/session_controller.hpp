@@ -155,6 +155,19 @@ class SessionController final : public wxEvtHandler {
                                        bool watch_write = true);
     void poll();
     struct SearchJob {
+        // The worker copies only the stop state. Retiring or replacing its
+        // owner must cancel the scan even when the pool is busy with new work.
+        struct Cancellation {
+            std::stop_source source;
+            Cancellation() = default;
+            Cancellation(Cancellation &&) = default;
+            Cancellation &operator=(Cancellation &&other) noexcept {
+                source.request_stop();
+                source = std::move(other.source);
+                return *this;
+            }
+            ~Cancellation() { source.request_stop(); }
+        } cancellation;
         AnalysisKey key;
         SearchQuery query;
         SearchLimits limits;

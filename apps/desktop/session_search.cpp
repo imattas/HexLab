@@ -218,6 +218,7 @@ bool SessionController::poll_search() {
         auto &request = it->second;
         auto key = source_key(*project);
         if (!key || key.value() != request.key || !history->query() || *history->query() != request.query) {
+            request.cancellation.source.request_stop();
             request.job.reset();
             request.pending = false;
             std::string reason = "Input or query changed; find again";
@@ -241,13 +242,18 @@ bool SessionController::poll_search() {
             auto limits = request.limits;
             auto session = actor->view().session;
             auto source = request.key;
+            auto cancellation = request.cancellation.source;
             auto submitted = pool_->submit(
                 session, source, AnalysisPriority::foreground,
                 [project, query = std::move(query), cursor, limits, session,
-                 source](std::stop_token stop) -> Result<AnalysisPayload> {
+                 source, cancellation](std::stop_token stop) -> Result<AnalysisPayload> {
+                    // A newer query can be waiting for project/listing work
+                    // before it submits to the pool. Stop its predecessor now,
+                    // without canceling unrelated work for the same session.
+                    std::stop_callback forward_stop(stop, [cancellation]() mutable { cancellation.request_stop(); });
                     workspace_testing::actor_checkpoint(
                         {session, workspace_testing::ActorPhase::search_started, 0, source});
-                    auto page = search(*project, query, cursor, limits, stop);
+                    auto page = search(*project, query, cursor, limits, cancellation.get_token());
                     if (!page)
                         return page.error();
                     workspace_testing::actor_checkpoint(

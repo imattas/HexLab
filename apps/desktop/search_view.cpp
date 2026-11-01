@@ -438,7 +438,10 @@ SearchView::SearchView(wxWindow *parent) : wxPanel(parent), filter_work_(std::ma
         if (rows_ && visible_ && row < visible_->size()) {
             const auto item = rows_->items[(*visible_)[row]];
             if (!all_documents_ && source_current &&
-                !source_current(item.document, document_revision_, item.project.get())) return;
+                !source_current(item.document, document_revision_, item.project.get())) {
+                retire_source();
+                return;
+            }
             selected_document_ = item.document;
             selected_page_ = item.page;
             selected_index_ = item.index;
@@ -741,20 +744,7 @@ void SearchView::poll_collection() {
         batch->document_revision != document_revision_ || batch->image != collection_image_ ||
         batch->project != collection_project_ || !collection_rows_) return;
     if (source_current && !source_current(batch->document, batch->document_revision, batch->project.get())) {
-        collection_timer_.Stop();
-        collection_work_->generation.fetch_add(1, std::memory_order_acq_rel);
-        {
-            std::lock_guard lock(collection_work_->mutex);
-            collection_work_->request.reset();
-            collection_work_->batch.reset();
-        }
-        collection_work_->ready.notify_all();
-        collection_rows_.reset();
-        rows_ = std::make_shared<Rows>();
-        selected_document_.reset(); selected_page_.reset();
-        collection_reason_ = "Document changed or closed; find again";
-        coverage_ = collection_reason_;
-        render();
+        retire_source();
         return;
     }
     // The GUI moves at most 256 fully prepared rows per tick. No address lookup,
@@ -785,6 +775,34 @@ void SearchView::poll_collection() {
         }
     }
     render();
+}
+void SearchView::retire_source() {
+    collection_timer_.Stop();
+    collection_work_->generation.fetch_add(1, std::memory_order_acq_rel);
+    {
+        std::lock_guard lock(collection_work_->mutex);
+        collection_work_->request.reset();
+        collection_work_->batch.reset();
+    }
+    collection_work_->ready.notify_all();
+    filter_timer_.Stop();
+    filter_work_->generation.fetch_add(1, std::memory_order_acq_rel);
+    {
+        std::lock_guard lock(filter_work_->mutex);
+        filter_work_->request.reset();
+        filter_work_->completion.reset();
+    }
+    collection_rows_.reset();
+    rows_.reset();
+    visible_.reset();
+    selected_document_.reset(); selected_page_.reset();
+    table_->populate(0, {});
+    previous_->Disable(); next_->Disable(); copy_->Disable(); export_->Disable(); more_->Disable();
+    collection_reason_ = "Document changed or closed; find again";
+    coverage_ = collection_reason_;
+    status_->SetLabel(coverage_);
+    status_->SetToolTip(coverage_);
+    preview_->ChangeValue(coverage_);
 }
 void SearchView::update_all(const std::vector<SearchDocumentView> &documents) {
     collection_rows_.reset();
@@ -931,6 +949,11 @@ void SearchView::poll_filter() {
     }
     if (!completion || completion->generation != filter_work_->generation.load(std::memory_order_acquire) ||
         completion->rows != rows_) return;
+    if (!all_documents_ && document_ && source_current &&
+        !source_current(*document_, document_revision_, collection_project_.get())) {
+        retire_source();
+        return;
+    }
     filter_timer_.Stop();
     auto visible = std::make_shared<std::vector<std::size_t>>(std::move(completion->visible));
     const auto rows = rows_;

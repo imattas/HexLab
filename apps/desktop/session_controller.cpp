@@ -49,6 +49,7 @@ SessionController::SessionController(std::function<void()> changed)
 }
 SessionController::~SessionController() {
     timer_.Stop();
+    searches_.clear();
     if (backup_restore_)
         backup_restore_->cancellation->request_stop();
     if (backup_restore_ && backup_restore_->result.valid())
@@ -128,6 +129,7 @@ void SessionController::cancel() {
             found->second.reason = "Canceled";
         }
         if (auto found = searches_.find(id->value); found != searches_.end()) {
+            found->second.cancellation.source.request_stop();
             found->second.pending = false;
             found->second.job.reset();
             found->second.reason = "Canceled";
