@@ -98,7 +98,7 @@ bool dex_opcode_may_throw(std::uint8_t opcode) {
         opcode == 0x93 || opcode == 0x94 || opcode == 0x9e || opcode == 0x9f ||
         opcode == 0xb3 || opcode == 0xb4 || opcode == 0xbe || opcode == 0xbf ||
         opcode == 0xd3 || opcode == 0xd4 || opcode == 0xde || opcode == 0xdf ||
-        opcode == 0xfa || opcode == 0xfb || opcode == 0xfc || opcode == 0xfd ||
+        opcode == 0xf0 || opcode == 0xfa || opcode == 0xfb || opcode == 0xfc || opcode == 0xfd ||
         opcode == 0xfe || opcode == 0xff)
         return true;
     return false;
@@ -1279,6 +1279,14 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
                 if(method_idx>=methods.size()||methods[method_idx].owner!=class_type)return Error{ErrorCode::malformed,"DEX encoded method index is invalid for its defining class"};
                 declared_method_indices.push_back(static_cast<std::uint32_t>(method_idx));
                 const auto &method_id = methods[method_idx];
+                const auto &defined_method_name = strings[method_id.name];
+                if (defined_method_name == "<init>" &&
+                    ((flags & 0x8u) || types[protos[method_id.proto].return_type] != "V"))
+                    return Error{ErrorCode::malformed, "DEX instance constructor must be non-static and return void"};
+                if (defined_method_name == "<clinit>" &&
+                    (!(flags & 0x8u) || types[protos[method_id.proto].return_type] != "V" ||
+                     !protos[method_id.proto].parameters.empty()))
+                    return Error{ErrorCode::malformed, "DEX class initializer must be static with prototype ()V"};
                 const auto name_bytes = strings[method_id.name].size();
                 if (++total_class_members > max_items ||
                     !account_class_model_bytes(sizeof(DexDeclaredMethod) + name_bytes))
@@ -1755,15 +1763,18 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
                             "Aggregate DEX verifier register-state budget exceeded"};
                     total_type_flow_cells += cells;
                     enum class RegType : std::uint8_t {
-                        unknown, conflict, zero, int32, float32, scalar32, reference, wide_low, wide_high,
+                        unknown, conflict, zero, int32, float32, scalar32, reference, uninitialized_reference, wide_low, wide_high,
                         wide_int_low, wide_int_high, wide_float_low, wide_float_high
                     };
+                    constexpr std::uint32_t uninitialized_this = UINT32_MAX - 1;
                     struct TypeState {
                         std::vector<RegType> categories;
                         std::vector<std::uint32_t> references;
+                        std::vector<std::uint32_t> allocations;
+                        bool this_initialized = true;
                         TypeState() = default;
                         TypeState(std::size_t count, RegType initial)
-                            : categories(count, initial), references(count, UINT32_MAX) {}
+                            : categories(count, initial), references(count, UINT32_MAX), allocations(count, UINT32_MAX) {}
                         std::size_t size() const { return categories.size(); }
                         RegType &operator[](std::size_t index) { return categories[index]; }
                         RegType operator[](std::size_t index) const { return categories[index]; }
@@ -1779,6 +1790,10 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
                     const auto merge_type = [](RegType a, RegType b) {
                         if (a == b) return a;
                         if (a == RegType::conflict || b == RegType::conflict) return RegType::conflict;
+                        // Never turn a possibly uninitialized object into a
+                        // permissive unknown at a join.
+                        if (a == RegType::uninitialized_reference || b == RegType::uninitialized_reference)
+                            return RegType::conflict;
                         if (a == RegType::unknown || b == RegType::unknown) return RegType::unknown;
                         // Constants carry a set of permitted interpretations.
                         // Joining with a typed value constrains that set; it
@@ -1815,7 +1830,12 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
                         prototype_words += types[parameter_type] == "J" || types[parameter_type] == "D" ? 2u : 1u;
                     std::uint32_t parameter_register = registers - ins;
                     if (ins == prototype_words + 1 && parameter_register < registers) {
-                        initial[parameter_register] = RegType::reference;
+                        const bool needs_initialization = strings[methods[method_idx].name] == "<init>" &&
+                            types[methods[method_idx].owner] != "Ljava/lang/Object;";
+                        initial.this_initialized = !needs_initialization;
+                        initial[parameter_register] = needs_initialization
+                            ? RegType::uninitialized_reference : RegType::reference;
+                        if (needs_initialization) initial.allocations[parameter_register] = uninitialized_this;
                         initial.references[parameter_register++] = methods[method_idx].owner;
                     }
                     for (const auto parameter_type : prototype.parameters) {
@@ -1865,8 +1885,20 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
                         const auto reg8 = (first >> 8) & 0xff;
                         const auto reg4a = (first >> 8) & 0xf;
                         const auto reg4b = (first >> 12) & 0xf;
+                        const auto initialization_error = [&](std::string_view message) {
+                            std::ostringstream provenance;
+                            provenance << message << " (method_idx=" << method_idx
+                                << ", code_item_file_offset=0x" << std::hex << code_off
+                                << ", instruction_code_unit_offset=0x" << (offset / 2)
+                                << ", opcode=0x" << static_cast<unsigned>(opcode) << ')';
+                            return Error{ErrorCode::malformed, provenance.str()};
+                        };
                         const auto set_type = [&](std::uint32_t reg, RegType type) {
-                            if (reg < state.size()) { state[reg] = type; state.references[reg] = UINT32_MAX; }
+                            if (reg < state.size()) {
+                                state[reg] = type;
+                                state.references[reg] = UINT32_MAX;
+                                state.allocations[reg] = UINT32_MAX;
+                            }
                         };
                         const auto expect_type = [&](std::uint32_t reg, RegType expected) {
                             if (reg >= before.size()) return false;
@@ -1920,6 +1952,40 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
                         auto decoded_for_flow = decode_dex(instruction_bytes, {{0}, offset});
                         if (!decoded_for_flow.instruction)
                             return Error{ErrorCode::malformed, "DEX verifier could not decode an instruction boundary"};
+                        const bool ordinary_invoke = (opcode >= 0x6e && opcode <= 0x72) ||
+                            (opcode >= 0x74 && opcode <= 0x78);
+                        const bool method_id_invoke = ordinary_invoke || opcode == 0xf0 || opcode == 0xfa || opcode == 0xfb;
+                        const bool calls_constructor = method_id_invoke && word(1) < methods.size() &&
+                            strings[methods[word(1)].name] == "<init>";
+                        if (calls_constructor && opcode != 0x70 && opcode != 0x76 && opcode != 0xf0)
+                            return initialization_error("DEX constructor must be invoked with invoke-direct");
+                        if (calls_constructor && types[protos[methods[word(1)].proto].return_type] != "V")
+                            return initialization_error("DEX constructor invocation has a non-void prototype");
+                        if (method_id_invoke && strings[methods[word(1)].name] == "<clinit>")
+                            return initialization_error("DEX class initializer cannot be invoked explicitly");
+                        const auto constructor_receiver = calls_constructor
+                            ? (opcode == 0x76 || (opcode == 0xf0 && reg8 == 1)
+                                ? std::uint32_t(word(2)) : std::uint32_t(word(2) & 0xf))
+                            : UINT32_MAX;
+                        // Even instruction families with otherwise opaque
+                        // transfer functions cannot consume an uninitialized
+                        // object. Copies, reference comparisons, initialization
+                        // and own-class fields of uninitialized-this are the
+                        // deliberately narrow exceptions.
+                        for (const auto read : decoded_for_flow.instruction->register_reads) {
+                            if (before[read.index] == RegType::conflict)
+                                return initialization_error("DEX instruction consumes conflicting register types");
+                            if (before[read.index] != RegType::uninitialized_reference) continue;
+                            const bool object_copy = opcode >= 0x07 && opcode <= 0x09;
+                            const bool reference_compare = opcode == 0x32 || opcode == 0x33 ||
+                                opcode == 0x38 || opcode == 0x39;
+                            const bool own_field_receiver = opcode >= 0x52 && opcode <= 0x5f &&
+                                read.index == reg4b && before.allocations[read.index] == uninitialized_this &&
+                                fields[word(1)].owner == methods[method_idx].owner;
+                            if (!object_copy && !reference_compare && !own_field_receiver &&
+                                read.index != constructor_receiver)
+                                return initialization_error("DEX instruction consumes an uninitialized object");
+                        }
                         const auto &writes = decoded_for_flow.instruction->register_writes;
                         const auto writes_slot = [&](std::uint32_t reg) {
                             return std::any_of(writes.begin(), writes.end(), [&](const auto &written) {
@@ -1958,12 +2024,21 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
                         } else if (opcode == 0x1c) {
                             set_descriptor(reg8, "Ljava/lang/Class;");
                         } else if (opcode == 0x22) {
-                            set_descriptor(reg8, types[word(1)]);
+                            // Re-executing a static allocation site creates a
+                            // different object. Old aliases must not become
+                            // initialized when the new object is initialized.
+                            for (std::uint32_t reg = 0; reg < state.size(); ++reg)
+                                if (before[reg] == RegType::uninitialized_reference &&
+                                    before.allocations[reg] == offset)
+                                    set_type(reg, RegType::conflict);
+                            set_type(reg8, RegType::uninitialized_reference);
+                            state.references[reg8] = word(1);
+                            state.allocations[reg8] = offset;
                         } else if (opcode >= 0x01 && opcode <= 0x03) {
                             const auto destination = opcode == 0x01 ? reg4a : opcode == 0x02 ? reg8 : word(1);
                             const auto source = opcode == 0x01 ? reg4b : opcode == 0x02 ? word(1) : word(2);
                             const auto type = before[source];
-                            if (type == RegType::reference || type == RegType::wide_int_low ||
+                            if (type == RegType::reference || type == RegType::uninitialized_reference || type == RegType::wide_int_low ||
                                 type == RegType::wide_int_high || type == RegType::wide_float_low ||
                                 type == RegType::wide_float_high || type == RegType::wide_low ||
                                 type == RegType::wide_high || type == RegType::conflict)
@@ -1984,11 +2059,13 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
                         } else if (opcode >= 0x07 && opcode <= 0x09) {
                             const auto destination = opcode == 0x07 ? reg4a : opcode == 0x08 ? reg8 : word(1);
                             const auto source = opcode == 0x07 ? reg4b : opcode == 0x08 ? word(1) : word(2);
-                            if (!expect_type(source, RegType::reference))
+                            if (!expect_type(source, RegType::reference) && before[source] != RegType::uninitialized_reference)
                                 return Error{ErrorCode::malformed, "DEX move-object source is not a reference"};
                             set_type(destination, before[source]);
-                            if (before[source] == RegType::reference)
+                            if (before[source] == RegType::reference || before[source] == RegType::uninitialized_reference) {
                                 state.references[destination] = before.references[source];
+                                state.allocations[destination] = before.allocations[source];
+                            }
                         } else if (opcode >= 0x0a && opcode <= 0x0c && move_result_descriptors.contains(offset)) {
                             set_descriptor(reg8, move_result_descriptors.at(offset));
                         } else if (opcode == 0x0b) {
@@ -2108,7 +2185,11 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
                             const auto value = instance ? reg4a : reg8;
                             const auto receiver = reg4b;
                             const auto field_index = word(1);
-                            if (instance && !expect_type(receiver, RegType::reference))
+                            const bool own_uninitialized_this = instance &&
+                                before[receiver] == RegType::uninitialized_reference &&
+                                before.allocations[receiver] == uninitialized_this &&
+                                fields[field_index].owner == methods[method_idx].owner;
+                            if (instance && !own_uninitialized_this && !expect_type(receiver, RegType::reference))
                                 return Error{ErrorCode::malformed, "DEX instance field receiver is not a reference"};
                             if (field_index < fields.size()) {
                                 if (instance && before[receiver] == RegType::reference &&
@@ -2198,7 +2279,7 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
                             set_type(destination, RegType::int32);
                         } else if ((opcode >= 0x6e && opcode <= 0x72) ||
                                    (opcode >= 0x74 && opcode <= 0x78) ||
-                                   opcode == 0xfa || opcode == 0xfb || opcode == 0xfc || opcode == 0xfd) {
+                                   opcode == 0xf0 || opcode == 0xfa || opcode == 0xfb || opcode == 0xfc || opcode == 0xfd) {
                             std::optional<std::uint32_t> proto_index;
                             bool receiver = false;
                             std::optional<std::uint32_t> receiver_owner;
@@ -2216,6 +2297,10 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
                                     receiver_owner = methods[method_index].owner;
                                 }
                                 receiver = opcode != 0x77;
+                            } else if (opcode == 0xf0) {
+                                proto_index = methods[word(1)].proto;
+                                receiver_owner = methods[word(1)].owner;
+                                receiver = true;
                             } else if (opcode == 0xfa || opcode == 0xfb) {
                                 proto_index = word(3);
                                 receiver = true;
@@ -2233,6 +2318,7 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
                             }
                             if (proto_index && *proto_index < protos.size()) {
                                 const bool range = opcode == 0xfb || opcode == 0xfd ||
+                                    (opcode == 0xf0 && reg8 == 1) ||
                                     (opcode >= 0x74 && opcode <= 0x78);
                                 const auto first_word = word(0);
                                 const auto packed = word(2);
@@ -2247,16 +2333,23 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
                                 std::uint32_t word_index = 0;
                                 if (receiver) {
                                     const auto receiver_reg = argument_reg(word_index++);
-                                    if (!expect_type(receiver_reg, RegType::reference))
+                                    const bool uninitialized = before[receiver_reg] == RegType::uninitialized_reference;
+                                    if (calls_constructor && before[receiver_reg] != RegType::unknown && !uninitialized)
+                                        return initialization_error("DEX constructor receiver is already initialized or is not an object");
+                                    if (!(calls_constructor && uninitialized) &&
+                                        !expect_type(receiver_reg, RegType::reference))
                                         return Error{ErrorCode::malformed, "DEX invoke receiver is not a reference"};
-                                    if (before[receiver_reg] == RegType::reference && receiver_owner &&
+                                    if ((before[receiver_reg] == RegType::reference || uninitialized) && receiver_owner &&
                                         before.references[receiver_reg] != UINT32_MAX) {
                                         const auto relation = reference_assignability(
                                             before.references[receiver_reg], *receiver_owner);
-                                        if (relation == Assignability::no)
+                                        if (relation == Assignability::no) {
+                                            if (uninitialized)
+                                                return initialization_error("DEX constructor receiver is not assignable to the method owner");
                                             return Error{ErrorCode::malformed,
                                                 "DEX invoke receiver is not assignable to the method owner"};
-                                        if (relation == Assignability::unresolved)
+                                        }
+                                        if (relation == Assignability::unresolved && !uninitialized)
                                             state.references[receiver_reg] = UINT32_MAX;
                                     }
                                 }
@@ -2267,6 +2360,16 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
                                         !expect_assignable_reference(reg, descriptor))
                                         return Error{ErrorCode::malformed, "DEX invoke argument disagrees with its prototype"};
                                     word_index += descriptor == "J" || descriptor == "D" ? 2u : 1u;
+                                }
+                                if (calls_constructor && before[constructor_receiver] == RegType::uninitialized_reference) {
+                                    const auto allocation = before.allocations[constructor_receiver];
+                                    for (std::uint32_t reg = 0; reg < state.size(); ++reg) {
+                                        if (before[reg] != RegType::uninitialized_reference ||
+                                            before.allocations[reg] != allocation) continue;
+                                        set_type(reg, RegType::reference);
+                                        state.references[reg] = before.references[reg];
+                                    }
+                                    if (allocation == uninitialized_this) state.this_initialized = true;
                                 }
                             }
                         } else if (opcode >= 0x2d && opcode <= 0x31) {
@@ -2287,7 +2390,8 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
                             if (opcode <= 0x33) {
                                 const auto comparable = [](RegType type) {
                                     return type == RegType::unknown || type == RegType::zero || type == RegType::int32 ||
-                                        type == RegType::scalar32 || type == RegType::reference;
+                                        type == RegType::scalar32 || type == RegType::reference ||
+                                        type == RegType::uninitialized_reference;
                                 };
                                 const auto integer_like = [](RegType type) {
                                     return type == RegType::int32 || type == RegType::scalar32;
@@ -2298,7 +2402,8 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
                                     (left_type != RegType::unknown && right_type != RegType::unknown &&
                                      left_type != RegType::zero && right_type != RegType::zero &&
                                      !((integer_like(left_type) && integer_like(right_type)) ||
-                                       (left_type == RegType::reference && right_type == RegType::reference))))
+                                       ((left_type == RegType::reference || left_type == RegType::uninitialized_reference) &&
+                                        (right_type == RegType::reference || right_type == RegType::uninitialized_reference)))))
                                     return Error{ErrorCode::malformed,
                                         "DEX equality branch operands have incompatible register types"};
                             } else if (!expect_type(left, RegType::int32) ||
@@ -2313,7 +2418,7 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
                                 if (before[compared] != RegType::unknown && before[compared] != RegType::zero &&
                                     before[compared] != RegType::int32 &&
                                     before[compared] != RegType::float32 && before[compared] != RegType::scalar32 &&
-                                    before[compared] != RegType::reference)
+                                    before[compared] != RegType::reference && before[compared] != RegType::uninitialized_reference)
                                     return Error{ErrorCode::malformed, "DEX if-eqz/if-nez operand has an incompatible type"};
                             } else if (!expect_type(compared, RegType::int32)) {
                                 return Error{ErrorCode::malformed, "DEX ordered zero-branch operand is not an integer"};
@@ -2339,14 +2444,25 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
                             }
                         }
 
+                        if (control.flow == FlowKind::ret && !state.this_initialized)
+                            return initialization_error("DEX constructor returns before this is initialized");
+
                         const auto merge_into = [&](std::uint32_t successor, const TypeState &incoming_state) {
                             auto [target, inserted] = incoming_states.try_emplace(successor, incoming_state);
                             if (inserted) { type_work.push_back(successor); return; }
                             bool changed = false;
+                            if (target->second.this_initialized && !incoming_state.this_initialized) {
+                                target->second.this_initialized = false;
+                                changed = true;
+                            }
                             for (std::size_t reg = 0; reg < incoming_state.size(); ++reg) {
                                 const auto old = target->second[reg];
                                 const auto incoming = incoming_state[reg];
-                                const auto merged = merge_type(old, incoming);
+                                auto merged = merge_type(old, incoming);
+                                if (merged == RegType::uninitialized_reference &&
+                                    (target->second.allocations[reg] != incoming_state.allocations[reg] ||
+                                     target->second.references[reg] != incoming_state.references[reg]))
+                                    merged = RegType::conflict;
                                 if (merged != target->second[reg]) { target->second[reg] = merged; changed = true; }
                                 auto merged_reference = UINT32_MAX;
                                 if (merged == RegType::reference) {
@@ -2357,9 +2473,17 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
                                         merged_reference = incoming_state.references[reg];
                                     else if (incoming == RegType::zero && old == RegType::reference)
                                         merged_reference = target->second.references[reg];
+                                } else if (merged == RegType::uninitialized_reference) {
+                                    merged_reference = incoming_state.references[reg];
                                 }
                                 if (target->second.references[reg] != merged_reference) {
                                     target->second.references[reg] = merged_reference;
+                                    changed = true;
+                                }
+                                const auto merged_allocation = merged == RegType::uninitialized_reference
+                                    ? incoming_state.allocations[reg] : UINT32_MAX;
+                                if (target->second.allocations[reg] != merged_allocation) {
+                                    target->second.allocations[reg] = merged_allocation;
                                     changed = true;
                                 }
                             }

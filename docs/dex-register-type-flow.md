@@ -34,8 +34,9 @@ halves admit the same long/double interpretation.
 
 This remains partial category validation. Unknown facts are permissive and do
 not prove definite assignment. Unsupported writes erase their own category
-facts. Handlers start with unknown registers because instruction-level
-exceptional type propagation is not implemented. Known reference identities are
+facts. Throwing instructions propagate their incoming register state to covered
+handlers, before normal register writes or constructor initialization complete.
+Known reference identities are
 checked for assignability at ordinary invoke receivers and instance field
 receivers using the class definitions and array rules present in this DEX.
 When two known reference types meet at a control-flow join, the verifier keeps
@@ -45,9 +46,12 @@ This preserves useful facts for later receiver, argument, field-store, and
 return checks. If the hierarchy is incomplete or the bounded walk cannot find
 a common type, the joined identity becomes unknown and remains permissive.
 External or incomplete hierarchy paths remain unresolved and are accepted
-conservatively; they do not establish assignability. Array element descriptors,
-constructor initialization, and path-dependent null refinement are not
-modeled. A successful load is not a complete Dalvik verification certificate.
+conservatively; they do not establish assignability. Path-dependent null
+refinement remains unmodeled. Known array
+components are checked as described in `dex-verifier-array-components.md`;
+allocation identities and constructor initialization are checked as described in
+`dex-verifier-constructors.md`. A successful load is not a complete Dalvik
+verification certificate.
 
 An instance-field receiver rejected by a known hierarchy contradiction reports
 the method identifier-table index, code-item file offset, method-relative
