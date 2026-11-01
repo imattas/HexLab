@@ -197,6 +197,18 @@ HEXLAB_SYMBOLS_EXPORT DwarfCrossContributionDieResolver make_dwarf_package_cross
     std::span<const std::uint8_t> strings = {},
     std::span<const std::uint8_t> line_strings = {},
     std::stop_token stop = {}, DwarfPackageTypeResolutionLimits limits = {});
+// As above, while allowing a referenced CU's type graph to use a separately
+// identity-verified, bounded TU-index signature resolver. The two resolvers
+// retain their own request and byte limits; backing spans must outlive both.
+// Split-unit DW_FORM_ref_addr is a producer-compatibility extension, not a
+// standard DWARF 5 split-object reference.
+HEXLAB_SYMBOLS_EXPORT DwarfCrossContributionDieResolver make_dwarf_package_cross_contribution_die_resolver(
+    std::shared_ptr<const DwarfPackageIndex> index,
+    std::vector<DwarfPackageSectionData> sections,
+    std::span<const std::uint8_t> strings,
+    std::span<const std::uint8_t> line_strings,
+    std::stop_token stop, DwarfPackageTypeResolutionLimits limits, bool little_endian,
+    DwarfTypeSignatureResolver type_signature_resolver);
 
 // Bounded section bundle for the practical DWARF v4/v5 DIE importer. Indexed
 // v5 forms use the matching contribution sections when supplied.

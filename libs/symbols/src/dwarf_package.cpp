@@ -806,7 +806,8 @@ HEXLAB_SYMBOLS_EXPORT DwarfCrossContributionDieResolver make_dwarf_package_cross
     std::vector<DwarfPackageSectionData> sections,
     std::span<const std::uint8_t> strings,
     std::span<const std::uint8_t> line_strings,
-    std::stop_token stop, DwarfPackageTypeResolutionLimits limits, bool little_endian) {
+    std::stop_token stop, DwarfPackageTypeResolutionLimits limits, bool little_endian,
+    DwarfTypeSignatureResolver type_signature_resolver) {
     if (!index || index->kind != DwarfPackageIndexKind::compile_units)
         return [](std::uint64_t) -> hexlab::Result<DwarfCrossContributionDie> {
             return hexlab::Error{hexlab::ErrorCode::invalid_argument,
@@ -818,6 +819,7 @@ HEXLAB_SYMBOLS_EXPORT DwarfCrossContributionDieResolver make_dwarf_package_cross
         std::span<const std::uint8_t> strings, line_strings;
         std::stop_token stop;
         DwarfPackageTypeResolutionLimits limits;
+        DwarfTypeSignatureResolver type_signature_resolver;
         bool little_endian = true;
         std::recursive_mutex invocation_mutex;
         std::mutex mutex;
@@ -832,6 +834,7 @@ HEXLAB_SYMBOLS_EXPORT DwarfCrossContributionDieResolver make_dwarf_package_cross
     state->strings = strings; state->line_strings = line_strings;
     state->stop = stop; state->limits = limits;
     state->little_endian = little_endian;
+    state->type_signature_resolver = std::move(type_signature_resolver);
     const std::weak_ptr<State> weak_state = state;
     state->resolve = [weak_state](std::uint64_t absolute_offset) -> hexlab::Result<DwarfCrossContributionDie> {
         const auto state = weak_state.lock();
@@ -917,7 +920,7 @@ HEXLAB_SYMBOLS_EXPORT DwarfCrossContributionDieResolver make_dwarf_package_cross
         };
         auto imported = import_dwarf_package_unit(*state->index, *owner, state->sections, state->strings,
                                                    state->stop, state->line_strings, address_size,
-                                                   state->little_endian, {},
+                                                   state->little_endian, state->type_signature_resolver,
                                                    recursive_resolver);
         if (!imported) return imported.error();
         DwarfCrossContributionDie result;
@@ -958,6 +961,16 @@ HEXLAB_SYMBOLS_EXPORT DwarfCrossContributionDieResolver make_dwarf_package_cross
         return result;
     };
     return [state](std::uint64_t absolute_offset) { return state->resolve(absolute_offset); };
+}
+
+HEXLAB_SYMBOLS_EXPORT DwarfCrossContributionDieResolver make_dwarf_package_cross_contribution_die_resolver(
+    std::shared_ptr<const DwarfPackageIndex> index,
+    std::vector<DwarfPackageSectionData> sections,
+    std::span<const std::uint8_t> strings,
+    std::span<const std::uint8_t> line_strings,
+    std::stop_token stop, DwarfPackageTypeResolutionLimits limits, bool little_endian) {
+    return make_dwarf_package_cross_contribution_die_resolver(
+        std::move(index), std::move(sections), strings, line_strings, stop, limits, little_endian, {});
 }
 
 HEXLAB_SYMBOLS_EXPORT DwarfCrossContributionDieResolver make_dwarf_package_cross_contribution_die_resolver(

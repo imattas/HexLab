@@ -119,6 +119,15 @@ Capture a parsed index and package section views in the existing `DwarfSplitUnit
 
 The default index limit is 64 MiB, with at most 8 columns, 1,000,000 rows and 2,000,000 hash slots; callers may lower these limits. Table-size arithmetic is checked before allocation, and cancellation is checked while walking hash slots and rows. Nonzero trailing bytes, malformed empty slots, duplicate rows/signatures/section IDs, unsupported section IDs, and contribution slices outside the provided package section fail explicitly. A missing package signature returns `unsupported`; the resolver may convert that into its normal partial-load diagnostic. The standalone `make_dwarf_package_type_signature_resolver` API does not discover or open external `.dwp` paths, validate package filenames, or apply ELF relocations. It accepts a parsed TU index and package section views, preserves index row signatures while importing each referenced contribution on demand, and resolves `DW_FORM_ref_sig8` across split type-unit contributions. It enforces request and aggregate byte limits, verifies each row against the embedded type-unit signature and target DIE offset, caches completed signatures, and rejects active-signature cycles, missing or ambiguous signatures, out-of-contribution offsets, and non-type targets. Cross-contribution `DW_FORM_ref_addr` remains unavailable through this standalone TU-only resolver. ELF package-backed CU imports can resolve `DW_FORM_ref_addr` across selected DWP contributions when the CU index provides a unique owner and the loader supplies its identity-verifying cross-contribution resolver; the target must be a supported type DIE. Other cross-contribution reference forms remain unsupported. Package-backed ELF supplementary imports use the TU resolver automatically when a verified DWP package is selected. Any failed reference aborts the current import; no partial `ImportResult` is published.
 
+For producer extensions using package-offset `DW_FORM_ref_addr` in split
+units, when the selected or embedded DWP has both indexes, an ELF package-backed
+cross-CU target can itself depend on a same-package TU via
+`DW_FORM_ref_sig8`. The target CU and TU retain separate bounded resolvers;
+the CU's signature and DIE offset remain in the cross-contribution summary.
+TU-to-CU dependencies in this composition and nested TU provenance in that
+summary remain unsupported. This is a compatibility path outside the DWARF 5
+split-object rules. See [cross-unit references](dwarf-cross-unit-references.md).
+
 The package index parser follows the fixed-width DWARF v2/v5 format, whose
 contribution offset and size cells are 32-bit values. It does not implement the
 DWARF v6 offset-size-flag extension or reconstruct GNU/LLVM DWP64 `.debug_info`

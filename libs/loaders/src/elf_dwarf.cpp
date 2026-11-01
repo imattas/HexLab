@@ -480,7 +480,8 @@ DwarfEmbeddedPackageResolvers read_dwp_resolvers(const ByteStorage &storage, con
         for (const auto &[id, bytes] : package->sections) source_sections.push_back({id, bytes});
         auto resolver = symbols::make_dwarf_package_cross_contribution_die_resolver(
             package->index, std::move(source_sections), package->strings, package->line_strings,
-            stop, {budget.limit - budget.used, 4096}, metadata.header.order == ByteOrder::little);
+            stop, {budget.limit - budget.used, 4096}, metadata.header.order == ByteOrder::little,
+            result.type_signature);
         result.cross_contribution = [package, resolver = std::move(resolver)](std::uint64_t offset) {
             (void)package; // Keep the package buffers borrowed by the resolver alive.
             return resolver(offset);
