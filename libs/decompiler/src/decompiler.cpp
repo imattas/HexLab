@@ -2473,6 +2473,40 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
 
     const bool m65c02 = instruction.context.architecture == Architecture::mos6502 &&
                         instruction.context.mode == ExecutionMode::m65c02;
+    // Handle the CMOS JMP (abs,X) before the generic indexed-memory fallback
+    // below, which intentionally preserves other indexed control transfers as
+    // unresolved named effects.
+    if (m65c02 && instruction.opcode == Opcode::m6502_jmp && instruction.flow == FlowKind::jump &&
+        !instruction.direct_target && instruction.operands.size() == 1 && !instruction.bytes.empty() &&
+        std::to_integer<unsigned>(instruction.bytes[0]) == 0x7c) {
+        const auto *pointer = std::get_if<MemoryOperand>(&instruction.operands.front());
+        if (pointer && !pointer->base && pointer->index &&
+            pointer->index->bank == RegisterBank::mos6502 && pointer->index->index == 1 &&
+            pointer->index->width == 8 && !pointer->ip_relative && pointer->displacement >= 0 &&
+            pointer->displacement <= UINT16_MAX) {
+            const auto byte_load = [&](std::int64_t displacement) -> ExpressionPtr {
+                MemoryValue value;
+                value.type = integer_type(8);
+                value.index = *pointer->index;
+                value.displacement = displacement;
+                value.address_wrap_bits = 16;
+                return std::make_shared<Expression>(Expression{value.type, std::move(value)});
+            };
+            const auto low = byte_load(pointer->displacement);
+            const auto high = byte_load(pointer->displacement + 1);
+            const auto high_word = std::make_shared<Expression>(Expression{integer_type(16),
+                UnaryValue{"zext", high}});
+            const auto shifted_high = std::make_shared<Expression>(Expression{integer_type(16),
+                BinaryValue{"shl", high_word, constant_expr(8, 16)}});
+            Branch branch;
+            branch.condition = "true";
+            branch.indirect_target = std::make_shared<Expression>(Expression{integer_type(16),
+                BinaryValue{"or",
+                    std::make_shared<Expression>(Expression{integer_type(16), UnaryValue{"zext", low}}),
+                    shifted_high}});
+            return branch;
+        }
+    }
     if (m65c02 && !instruction.operands.empty()) {
         // MemoryValue has base/index/scale/displacement, but no nested pointer
         // fetch or 8-/16-bit effective-address wrap. Keep such CMOS operands
@@ -2968,35 +3002,6 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
         if (instruction.opcode == Opcode::m6502_jmp && instruction.flow == FlowKind::jump &&
             !instruction.direct_target && instruction.operands.size() == 1) {
             const auto *pointer = std::get_if<MemoryOperand>(&instruction.operands.front());
-            // JMP (abs,X) reads a 16-bit destination pointer from the
-            // 16-bit-wrapped address abs+X. Preserve that address expression
-            // as two typed byte loads rather than leaving an opaque target.
-            if (m65c02 && pointer && !pointer->base && pointer->index &&
-                pointer->index->bank == RegisterBank::mos6502 &&
-                pointer->index->index == 1 && pointer->index->width == 8 &&
-                !pointer->ip_relative && pointer->displacement >= 0 &&
-                pointer->displacement <= UINT16_MAX && instruction.bytes.size() >= 1 &&
-                std::to_integer<unsigned>(instruction.bytes[0]) == 0x7c) {
-                const auto byte_load = [&](std::int64_t displacement) -> ExpressionPtr {
-                    MemoryValue value;
-                    value.type = integer_type(8);
-                    value.index = *pointer->index;
-                    value.displacement = displacement;
-                    value.address_wrap_bits = 16;
-                    return std::make_shared<Expression>(Expression{value.type, std::move(value)});
-                };
-                const auto low = byte_load(pointer->displacement);
-                const auto high = byte_load(pointer->displacement + 1);
-                const auto high_word = std::make_shared<Expression>(Expression{integer_type(16),
-                    UnaryValue{"zext", high}});
-                const auto shifted_high = binary("shl", high_word, constant_expr(8, 16), 16);
-                Branch branch;
-                branch.condition = "true";
-                branch.indirect_target = binary("or",
-                    std::make_shared<Expression>(Expression{integer_type(16), UnaryValue{"zext", low}}),
-                    shifted_high, 16);
-                return branch;
-            }
             if (pointer && !pointer->base && !pointer->index && !pointer->ip_relative &&
                 pointer->displacement >= 0 && pointer->displacement <= UINT16_MAX) {
                 const auto slot = static_cast<std::uint16_t>(pointer->displacement);
