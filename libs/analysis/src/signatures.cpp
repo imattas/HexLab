@@ -296,11 +296,26 @@ Result<SignatureScan> scan_executable_signatures(const Image &image, const ByteS
                         definition.provenance.size() <= 256 && !definition.pattern.empty() &&
                         definition.pattern.size() <= 256 && definition.exclusions.size() <= 16,
                     "Invalid signature definition", ErrorCode::invalid_argument);
-            const auto anchored = std::any_of(definition.pattern.begin(), definition.pattern.end(),
-                                              [](const auto &b) { return b.mask == std::byte{0xff}; });
-            require(anchored, "Signature pattern requires at least one exact byte");
-            for (const auto &negative : definition.exclusions)
+            const auto validate_pattern = [](const std::vector<SignatureByte> &pattern,
+                                             std::string_view description) {
+                bool anchored = false;
+                for (const auto &byte : pattern) {
+                    const auto mask = std::to_integer<unsigned>(byte.mask);
+                    const auto value = std::to_integer<unsigned>(byte.value);
+                    require((value & ~mask) == 0,
+                            std::string(description) + " contains value bits outside its mask");
+                    anchored |= mask == 0xff;
+                }
+                require(anchored, std::string(description) + " requires at least one exact byte");
+            };
+            validate_pattern(definition.pattern, "Signature pattern");
+            for (const auto &negative : definition.exclusions) {
                 require(!negative.empty() && negative.size() <= 256, "Invalid signature exclusion");
+                // API callers can construct definitions without going through the text
+                // parser. Keep their exclusions just as selective and canonical as
+                // parsed patterns: an all-wildcard exclusion would veto every hit.
+                validate_pattern(negative, "Signature exclusion");
+            }
             std::uint32_t constrained_bits = 0;
             for (const auto &byte : definition.pattern)
                 constrained_bits += std::popcount(std::to_integer<unsigned>(byte.mask));

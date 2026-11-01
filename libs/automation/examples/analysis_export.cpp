@@ -25,6 +25,10 @@ namespace fs = std::filesystem;
 using namespace hexlab;
 
 namespace {
+// Function records also carry nested block/stop metadata, so keep their outer
+// pages smaller than the flat tables even when a project has many functions.
+constexpr std::size_t function_page_size = 128;
+
 void json_string(std::ostream &out, std::string_view value) {
     constexpr char hex[] = "0123456789abcdef";
     out << '"';
@@ -101,6 +105,130 @@ bool write_vector_pages(std::ostream &out, Fetch fetch, Emit emit, std::string &
     }
 }
 
+template<class Emit>
+bool write_function_pages(std::ostream &out, const automation::Project &project,
+                          Emit emit, std::string &error) {
+    std::size_t start = 0;
+    bool first = true;
+    for (;;) {
+        auto page = project.functions(start, function_page_size);
+        if (!page) { error = page.error().message; return false; }
+        if (page.value().size() > function_page_size) {
+            error = "SDK returned an oversized function page";
+            return false;
+        }
+        for (const auto &row : page.value()) {
+            if (!first) out << ',';
+            emit(out, row);
+            first = false;
+        }
+        if (!out) { error = "writing function JSON failed"; return false; }
+        if (page.value().size() < function_page_size) return true;
+        if (start > std::numeric_limits<std::size_t>::max() - page.value().size()) {
+            error = "function page cursor overflow";
+            return false;
+        }
+        start += page.value().size();
+    }
+}
+
+template<class Emit>
+bool write_function_block_pages(std::ostream &out, const automation::Project &project,
+                                Emit emit, std::string &error) {
+    constexpr std::size_t page_size = 4096;
+    std::size_t function_start = 0;
+    bool first = true;
+    for (;;) {
+        auto functions = project.functions(function_start, function_page_size);
+        if (!functions) { error = functions.error().message; return false; }
+        if (functions.value().size() > function_page_size) { error = "SDK returned an oversized function page"; return false; }
+        for (const auto &function : functions.value()) {
+            std::size_t block_start = 0;
+            for (;;) {
+                auto blocks = project.function_blocks(function.entry, block_start, page_size);
+                if (!blocks) { error = blocks.error().message; return false; }
+                if (blocks.value().size() > page_size) { error = "SDK returned an oversized CFG block page"; return false; }
+                for (const auto &block : blocks.value()) {
+                    if (!first) out << ',';
+                    emit(out, function, block);
+                    first = false;
+                }
+                if (!out) { error = "writing CFG JSON failed"; return false; }
+                if (blocks.value().size() < page_size) break;
+                if (block_start > std::numeric_limits<std::size_t>::max() - blocks.value().size()) {
+                    error = "CFG block page cursor overflow";
+                    return false;
+                }
+                block_start += blocks.value().size();
+            }
+        }
+        if (functions.value().size() < function_page_size) return true;
+        if (function_start > std::numeric_limits<std::size_t>::max() - functions.value().size()) {
+            error = "function page cursor overflow";
+            return false;
+        }
+        function_start += functions.value().size();
+    }
+}
+
+bool write_cfg_edges(std::ostream &out, const automation::Project &project, std::string &error) {
+    constexpr std::size_t page_size = 4096;
+    std::size_t function_start = 0;
+    bool first = true;
+    for (;;) {
+        auto functions = project.functions(function_start, function_page_size);
+        if (!functions) { error = functions.error().message; return false; }
+        if (functions.value().size() > function_page_size) { error = "SDK returned an oversized function page"; return false; }
+        for (const auto &function : functions.value()) {
+            std::size_t block_start = 0;
+            for (;;) {
+                auto blocks = project.function_blocks(function.entry, block_start, page_size);
+                if (!blocks) { error = blocks.error().message; return false; }
+                if (blocks.value().size() > page_size) { error = "SDK returned an oversized CFG block page"; return false; }
+                for (const auto &block : blocks.value()) {
+                    std::size_t edge_start = 0;
+                    for (;;) {
+                        auto edges = project.block_successors(block.id, edge_start, page_size);
+                        if (!edges) { error = edges.error().message; return false; }
+                        if (edges.value().size() > page_size) { error = "SDK returned an oversized CFG edge page"; return false; }
+                        for (const auto &edge : edges.value()) {
+                            if (!first) out << ',';
+                            first = false;
+                            out << "{\"function_id\":" << function.id.value
+                                << ",\"block_id\":" << block.id.value << ",\"source\":";
+                            address_json(out, edge.source);
+                            out << ",\"target\":";
+                            if (edge.target) address_json(out, *edge.target); else out << "null";
+                            out << ",\"target_block_id\":";
+                            if (edge.block) out << edge.block->value; else out << "null";
+                            out << ",\"kind\":" << static_cast<unsigned>(edge.kind) << '}';
+                        }
+                        if (!out) { error = "writing CFG edge JSON failed"; return false; }
+                        if (edges.value().size() < page_size) break;
+                        if (edge_start > std::numeric_limits<std::size_t>::max() - edges.value().size()) {
+                            error = "CFG edge page cursor overflow";
+                            return false;
+                        }
+                        edge_start += edges.value().size();
+                    }
+                }
+                if (blocks.value().size() < page_size) break;
+                if (block_start > std::numeric_limits<std::size_t>::max() - blocks.value().size()) {
+                    error = "CFG block page cursor overflow";
+                    return false;
+                }
+                block_start += blocks.value().size();
+            }
+        }
+        if (functions.value().size() < function_page_size) return true;
+        if (function_start > std::numeric_limits<std::size_t>::max() - functions.value().size()) {
+            error = "function page cursor overflow";
+            return false;
+        }
+        function_start += functions.value().size();
+    }
+}
+
 bool write_report(std::ostream &out, const automation::Project &project, std::string &error) {
     auto snapshot = project.snapshot();
     if (!snapshot) { error = snapshot.error().message; return false; }
@@ -124,7 +252,7 @@ bool write_report(std::ostream &out, const automation::Project &project, std::st
         << "},\"analysis_complete\":" << (analysis_complete ? "true" : "false")
         << ",\"functions\":[";
 
-    if (!write_vector_pages(out, [&](auto start, auto count) { return project.functions(start, count); },
+    if (!write_function_pages(out, project,
         [](auto &stream, const FunctionRecord &row) {
             stream << "{\"id\":" << row.id.value << ",\"entry\":";
             address_json(stream, row.entry);
@@ -132,6 +260,25 @@ bool write_report(std::ostream &out, const automation::Project &project, std::st
                    << ",\"thunk\":" << (row.thunk ? "true" : "false")
                    << ",\"block_count\":" << row.blocks.size() << ",\"stop_count\":" << row.stops.size() << '}';
         }, error)) return false;
+    out << "],\"blocks\":[";
+    if (!write_function_block_pages(out, project,
+        [](auto &stream, const FunctionRecord &function, const FunctionBlock &block) {
+            stream << "{\"function_id\":" << function.id.value << ",\"id\":" << block.id.value
+                   << ",\"begin\":";
+            address_json(stream, block.begin);
+            stream << ",\"instruction_count\":" << block.instruction_count
+                   << ",\"successor_count\":" << block.successor_count << ",\"stop\":";
+            if (block.stop) {
+                stream << "{\"address\":";
+                address_json(stream, block.stop->address);
+                stream << ",\"reason\":" << static_cast<unsigned>(block.stop->reason) << ",\"detail\":";
+                json_string(stream, block.stop->detail);
+                stream << '}';
+            } else stream << "null";
+            stream << '}';
+        }, error)) return false;
+    out << "],\"edges\":[";
+    if (!write_cfg_edges(out, project, error)) return false;
     out << "],\"instructions\":[";
     if (!write_vector_pages(out, [&](auto start, auto count) { return project.instructions(start, count); },
         [](auto &stream, const Instruction &row) {
@@ -195,6 +342,38 @@ bool write_report(std::ostream &out, const automation::Project &project, std::st
                    << ",\"file_offset\":" << row.file_offset.value << ",\"address\":";
             if (row.address) address_json(stream, *row.address); else stream << "null";
             stream << ",\"terminated\":" << (row.terminated ? "true" : "false") << '}';
+        }, error)) return false;
+    out << "],\"annotations\":[";
+    if (!write_vector_pages(out, [&](auto start, auto count) { return project.annotations(start, count); },
+        [](auto &stream, const database::Annotation &row) {
+            stream << "{\"id\":" << row.id << ",\"location\":";
+            location_json(stream, row.location);
+            stream << ",\"name\":";
+            json_string(stream, row.name);
+            stream << ",\"comment\":";
+            json_string(stream, row.comment);
+            stream << '}';
+        }, error)) return false;
+    out << "],\"types\":[";
+    if (!write_vector_pages(out, [&](auto start, auto count) { return project.types(start, count); },
+        [](auto &stream, const database::TypeDefinition &row) {
+            stream << "{\"id\":" << row.id << ",\"name\":";
+            json_string(stream, row.name);
+            stream << ",\"declaration_kind\":" << static_cast<unsigned>(row.declaration_kind)
+                   << ",\"type_id\":" << (row.type ? row.type->id() : 0)
+                   << ",\"type_kind\":" << (row.type ? static_cast<unsigned>(row.type->kind()) : 0)
+                   << ",\"type_size\":";
+            if (row.type && row.type->size()) stream << *row.type->size(); else stream << "null";
+            stream << ",\"type\":";
+            if (row.type) json_string(stream, types::format(*row.type)); else stream << "null";
+            stream << '}';
+        }, error)) return false;
+    out << "],\"type_assignments\":[";
+    if (!write_vector_pages(out, [&](auto start, auto count) { return project.type_assignments(start, count); },
+        [](auto &stream, const database::TypeAssignment &row) {
+            stream << "{\"id\":" << row.id << ",\"location\":";
+            location_json(stream, row.location);
+            stream << ",\"type_id\":" << row.type_id << '}';
         }, error)) return false;
     out << "]}\n";
     if (!out) { error = "writing analysis JSON failed"; return false; }

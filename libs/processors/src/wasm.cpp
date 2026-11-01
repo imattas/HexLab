@@ -138,8 +138,9 @@ DecodeResult decode_wasm(std::span<const std::byte> bytes, Address at) {
         operands.push_back(ImmediateOperand{type, 8, 8, false, {}});
     } else if (op == 0x0b || op == 0x0f || op == 0x1a || op == 0x1b) {
         mnemonic = op == 0x0b ? "end" : op == 0x0f ? "return" : op == 0x1a ? "drop" : "select";
-    } else if (op == 0x0c || op == 0x0d || op == 0x10 || (op >= 0x20 && op <= 0x24)) {
+    } else if (op == 0x0c || op == 0x0d || op == 0x10 || op == 0x12 || (op >= 0x20 && op <= 0x24)) {
         mnemonic = op == 0x0c ? "br" : op == 0x0d ? "br_if" : op == 0x10 ? "call" :
+                   op == 0x12 ? "return_call" :
                    op == 0x20 ? "local.get" : op == 0x21 ? "local.set" : op == 0x22 ? "local.tee" : op == 0x23 ? "global.get" : "global.set";
         if (!require_u(32)) return decode_leb_result(last_leb_result);
     } else if (op == 0x0e) {
@@ -156,12 +157,12 @@ DecodeResult decode_wasm(std::span<const std::byte> bytes, Address at) {
             operands.push_back(ImmediateOperand{label, 32, 32, false, {}});
             if (position > 15) return fail(DecodeStatus::unsupported, "br_table instruction exceeds 15 encoded bytes");
         }
-    } else if (op == 0x11) {
-        mnemonic = "call_indirect";
+    } else if (op == 0x11 || op == 0x13) {
+        mnemonic = op == 0x11 ? "call_indirect" : "return_call_indirect";
         if (!require_u(32) || !require_u(32)) return decode_leb_result(last_leb_result);
         const auto *table_index = std::get_if<ImmediateOperand>(&operands.back());
         if (!table_index || table_index->value != 0)
-            return fail(DecodeStatus::invalid, "WebAssembly 1.0 call_indirect reserved table index must be zero");
+            return fail(DecodeStatus::invalid, "WebAssembly call_indirect table index must be zero in the supported single-table decoder");
     } else if (op >= 0x28 && op <= 0x3e) {
         mnemonic = memory_names[op - 0x28];
         const auto align = add_u(32);
@@ -522,6 +523,8 @@ DecodeResult decode_wasm(std::span<const std::byte> bytes, Address at) {
     // direct target.
     if (instruction.mnemonic_override == "call" || instruction.mnemonic_override == "call_indirect")
         instruction.flow = FlowKind::call;
+    else if (instruction.mnemonic_override == "return_call" || instruction.mnemonic_override == "return_call_indirect")
+        instruction.flow = FlowKind::jump;
     return {DecodeStatus::decoded, std::move(instruction), {}};
 }
 } // namespace hexlab

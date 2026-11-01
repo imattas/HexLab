@@ -57,6 +57,13 @@ Example.Runtime|internal catalog|48 8B ?? ?? 48 85 C0|48 8B 05 10 00 00 00
 
 Pattern tokens are two hexadecimal digits, `??` for a full-byte wildcard, or nibble masks such as `A?` and `?F`. A definition needs at least one exact byte. Exclusions are matched at the same start offset as the positive pattern; if any exclusion matches, that candidate is suppressed. Blank lines and lines beginning with `#` are ignored.
 
+The scanner applies the same pattern validation to definitions built directly
+through the C++ API as it does to parsed catalogs. Positive and exclusion
+patterns must each contain at least one exact byte, and masked-off value bits
+must be zero. This prevents a broad, accidental exclusion (such as `?? ??`)
+from silently suppressing every positive match, and keeps in-memory catalogs
+canonical when callers bypass the text parser.
+
 The parser caps a definition file at 1 MiB, 4,096 definitions, 128-byte names, 256-byte provenance fields and patterns, and 16 exclusions per definition. For each executable segment, the scanner indexes definitions by the leading byte of each pattern's longest exact-byte run, then verifies only offsets where that run matches. This keeps output deterministic (definition order, then ascending file offset) while avoiding full-pattern checks at every byte. The candidate budget counts anchor hits that proceed to full-pattern verification; the comparison budget includes anchor checks, full patterns, and exclusions; the indexed-byte budget bounds the linear pass over executable bytes. Cancellation is checked throughout. Patterns never cross segment boundaries, and non-executable or non-file-backed segment tails are not scanned.
 
 API callers can set `SignatureLimits::file_range` to scan one bounded file-coordinate window rather than every executable segment. The range must be nonempty and fit inside the effective byte source; scanning is clipped to its intersection with executable, file-backed segments. Positive patterns and exclusions must fit completely inside both the intersection and their segment, so a match cannot borrow bytes outside the requested range. Work budgets count only bytes and candidates inside the selected window. This field is also honored by catalog-set and recovered-function-entry recognition overloads.

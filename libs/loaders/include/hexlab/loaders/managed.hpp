@@ -124,7 +124,7 @@ enum class ManagedResourceImplementationKind : std::uint8_t { embedded, file, as
 enum class ManagedResourceResolutionState : std::uint8_t {
   embedded, unresolved, resolved_file, resolved_assembly, ambiguous, hash_mismatch, unsupported_hash
 };
-enum class ManagedResourcePayloadFormat : std::uint8_t { opaque, dotnet_resources_v2, unsupported_dotnet_resources };
+enum class ManagedResourcePayloadFormat : std::uint8_t { opaque, dotnet_resources_v2, unsupported_dotnet_resources, dotnet_resources_v1 };
 enum class ManagedResourceValueKind : std::uint8_t {
   null_value, string_value, boolean, character, signed_integer, unsigned_integer,
   single, double_value, decimal, date_time, time_span, byte_array, stream, user_type, unsupported

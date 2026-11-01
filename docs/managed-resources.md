@@ -71,16 +71,24 @@ reports its omitted detail count, and overall completeness becomes false when
 details are omitted.
 
 For an embedded payload beginning with the .NET resources magic, inspection
-also parses ResourceManager header version 1 and RuntimeResourceSet version 2.
+also parses ResourceManager header version 1 and RuntimeResourceSet versions 1
+and 2. Both versions share the validated type table, aligned hash and position
+tables, UTF-16LE names, and record bounds.
 It validates the header strings, type-name strings, aligned hash/position
 tables, signed hash ordering and each hash against its UTF-16LE resource name,
 name-section offsets, UTF-16LE resource names, UTF-8 strings, and each record's
 data extent. `ManagedResource::payload` always retains the original
 bytes. Parsed records are exposed in `ManagedResource::records`; `data_offset`
 and `data_size` on each record refer to byte spans in that owning payload.
-Primitive values (null, strings, Boolean, character, integer, floating point,
-decimal, DateTime, and TimeSpan) and byte arrays/streams are identified by
-their resource type code. Scalar records expose the low 64 serialized bits in
+For version 2, primitive values (null, strings, Boolean, character, integer,
+floating point, decimal, DateTime, and TimeSpan) and byte arrays/streams are
+identified by their resource type code. Version 1 type indexes are resolved
+against the type-name table; core-library string, integer, floating-point,
+decimal, DateTime, and TimeSpan types that v1 stores as raw values use the same
+bounded scalar/string decoders. Version 1 Boolean, character, arrays, streams,
+and custom serialized objects remain opaque because their v1 representation
+uses object serialization. Null and custom types retain their original type
+index semantics. Scalar records expose the low 64 serialized bits in
 `scalar_bits`; their complete original bytes, including 128-bit decimals, stay
 available through the payload span. Byte-array and stream values point to
 their raw payload bytes. Strings are returned as validated UTF-8. User-defined type records retain their type name

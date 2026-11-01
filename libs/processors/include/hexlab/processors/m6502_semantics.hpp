@@ -115,6 +115,13 @@ struct M6502ShiftResult {
 // selection remain caller-owned.
 HEXLAB_PROCESSORS_EXPORT std::optional<M6502ShiftResult>
 evaluate_m6502_shift(Opcode opcode, std::uint8_t value, std::uint8_t status) noexcept;
+// Bind an already-fetched value to one of the documented NMOS ASL/LSR/ROL/ROR
+// encodings. The adapter validates the instruction mode, bytes, operand form,
+// register effects, and memory effects before returning the byte/flag result.
+// The caller still performs the fetch and (for memory forms) the write.
+HEXLAB_PROCESSORS_EXPORT std::optional<M6502ShiftResult>
+evaluate_m6502_shift_instruction(const Instruction &instruction,
+                                 std::uint8_t value, std::uint8_t status) noexcept;
 
 struct M6502IncrementResult {
     std::uint8_t value = 0;

@@ -381,6 +381,81 @@ evaluate_m6502_shift(Opcode opcode, std::uint8_t value, std::uint8_t status) noe
     return M6502ShiftResult{result, updated};
 }
 
+std::optional<M6502ShiftResult>
+evaluate_m6502_shift_instruction(const Instruction &instruction,
+                                 std::uint8_t value, std::uint8_t status) noexcept {
+    if (instruction.context.architecture != Architecture::mos6502 ||
+        instruction.context.mode != ExecutionMode::m6502 ||
+        instruction.flow != FlowKind::fallthrough || instruction.direct_target ||
+        instruction.address.offset > UINT16_MAX ||
+        instruction.length < 1 || instruction.length > 3 || instruction.length > instruction.bytes.size() ||
+        instruction.operands.size() != 1 || instruction.access.size() != 1 ||
+        instruction.access[0] != OperandAccess::read_write)
+        return {};
+
+    const auto encoded = std::to_integer<std::uint8_t>(instruction.bytes[0]);
+    Opcode expected_opcode{};
+    switch (encoded & 0x60u) {
+    case 0x00: expected_opcode = Opcode::m6502_asl; break;
+    case 0x20: expected_opcode = Opcode::m6502_rol; break;
+    case 0x40: expected_opcode = Opcode::m6502_lsr; break;
+    case 0x60: expected_opcode = Opcode::m6502_ror; break;
+    }
+    if (instruction.opcode != expected_opcode) return {};
+
+    enum class Form { accumulator, zero_page, absolute, zero_page_x, absolute_x };
+    Form form;
+    std::uint8_t expected_length = 0;
+    switch (encoded & 0x1fu) {
+    case 0x0a: form = Form::accumulator; expected_length = 1; break;
+    case 0x06: form = Form::zero_page; expected_length = 2; break;
+    case 0x0e: form = Form::absolute; expected_length = 3; break;
+    case 0x16: form = Form::zero_page_x; expected_length = 2; break;
+    case 0x1e: form = Form::absolute_x; expected_length = 3; break;
+    default: return {};
+    }
+    if (instruction.length != expected_length) return {};
+
+    const RegisterOperand a{RegisterBank::mos6502, 0, 8, false};
+    const RegisterOperand x{RegisterBank::mos6502, 1, 8, false};
+    const RegisterOperand p{RegisterBank::mos6502, 3, 8, false};
+    const auto contains = [](const auto &registers, RegisterOperand reg) {
+        return std::find(registers.begin(), registers.end(), reg) != registers.end();
+    };
+    if (!contains(instruction.register_reads, p) || !contains(instruction.register_writes, p)) return {};
+
+    if (form == Form::accumulator) {
+        const auto *operand = std::get_if<RegisterOperand>(&instruction.operands[0]);
+        if (!operand || *operand != a || instruction.memory_read || instruction.memory_write ||
+            instruction.register_reads.size() != 2 || instruction.register_writes.size() != 2 ||
+            !contains(instruction.register_reads, a) || !contains(instruction.register_writes, a))
+            return {};
+    } else {
+        const auto *operand = std::get_if<MemoryOperand>(&instruction.operands[0]);
+        if (!operand || !instruction.memory_read || !instruction.memory_write ||
+            instruction.register_writes.size() != 1 || operand->data_width != 8 || operand->address_width != 16 ||
+            operand->segment || operand->base || operand->scale != 1 || operand->ip_relative ||
+            operand->writeback || operand->post_index || operand->writeback_displacement != 0 ||
+            !operand->index_extend.empty() || operand->index_shift_amount != 0)
+            return {};
+
+        const bool indexed = form == Form::zero_page_x || form == Form::absolute_x;
+        if (instruction.register_reads.size() != (indexed ? 2u : 1u) ||
+            (indexed ? (operand->index != x || !contains(instruction.register_reads, x)) : operand->index.has_value()))
+            return {};
+        const auto address = expected_length == 2
+            ? std::uint16_t(std::to_integer<std::uint8_t>(instruction.bytes[1]))
+            : std::uint16_t(std::to_integer<std::uint8_t>(instruction.bytes[1]) |
+                (std::uint16_t(std::to_integer<std::uint8_t>(instruction.bytes[2])) << 8));
+        if (operand->displacement != address ||
+            operand->displacement_encoding != EncodedField{1, static_cast<std::uint8_t>(expected_length - 1)} ||
+            (indexed ? operand->resolved_address.has_value()
+                     : operand->resolved_address != Address{instruction.address.space, address}))
+            return {};
+    }
+    return evaluate_m6502_shift(instruction.opcode, value, status);
+}
+
 std::optional<M6502IncrementResult>
 evaluate_m6502_increment_decrement(Opcode opcode, std::uint8_t value,
                                    std::uint8_t status) noexcept {

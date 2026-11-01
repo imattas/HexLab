@@ -1675,9 +1675,9 @@ public:
     }
     Status write_memory(std::uint64_t address, std::span<const std::byte> bytes) override {
         if (!process_) return Error{ErrorCode::invalid_argument, "no debug target is attached"};
+        if (exited_ || !pending_)
+            return Error{ErrorCode::busy, "Windows memory writes require a stopped target with a pending debug event"};
         if (arm32_step_) return Error{ErrorCode::busy, "ARM32 step patch restoration is pending"};
-        if (target_architecture() == Architecture::arm && !pending_)
-            return Error{ErrorCode::busy, "ARM32 memory writes require a stopped debug event"};
         const auto maximum_address = static_cast<std::uint64_t>((std::numeric_limits<std::uintptr_t>::max)());
         if (bytes.size() > max_inspection_read || address > UINT64_MAX - bytes.size() ||
             address > maximum_address || bytes.size() > maximum_address - address)
