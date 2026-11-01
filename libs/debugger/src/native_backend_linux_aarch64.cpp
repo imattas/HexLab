@@ -860,9 +860,22 @@ public:
                             step_breakpoint_.reset(); step_thread_ = 0; step_pending_ = false;
                             if (trace_trap) {
                                 e.kind = EventKind::single_step;
+                                // TRAP_TRACE completes the displaced instruction;
+                                // it is not a signal to inject when this event
+                                // is continued after a deferred-resume failure.
+                                pending_signal_ = 0;
                                 if (deferred_breakpoint_resumes_) {
+                                    // Keep the completed step owner stopped until
+                                    // every peer continuation has succeeded. A
+                                    // failed peer must not advance the owner past
+                                    // the instruction reported by this event.
+                                    auto& resumes = deferred_breakpoint_resumes_->threads;
+                                    const auto owner = std::find_if(resumes.begin(), resumes.end(), [&](const auto& resume) {
+                                        return resume.first == tid;
+                                    });
+                                    if (owner != resumes.end()) std::rotate(owner, owner + 1, resumes.end());
                                     std::vector<pid_t> resumed;
-                                    for (const auto& [resume_tid, signal] : deferred_breakpoint_resumes_->threads) {
+                                    for (const auto& [resume_tid, signal] : resumes) {
                                         if (ptrace(PTRACE_CONT, resume_tid, nullptr,
                                                    reinterpret_cast<void*>(static_cast<std::intptr_t>(signal))) == 0) {
                                             stopped_.erase(resume_tid);

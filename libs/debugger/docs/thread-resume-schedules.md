@@ -121,6 +121,12 @@ peer `PTRACE_CONT` fails, the backend returns that completed owner step as a
 resumed and blocks future resumes only if rollback cannot restore the stopped
 state. Signal delivery consumed by a successful peer continuation is not
 redelivered on retry; queued peer stop events remain available.
+Deferred software-breakpoint continuations resume the AArch64 owner last even
+when it appears first in the submitted actions. Thus a peer failure cannot run
+the owner beyond the completed instruction whose event is returned. The
+confirmed owner `TRAP_TRACE` does not become a pending signal to redeliver on
+retry. Failed and unattempted peers retain their queued signals, while BRK and
+the owned original-instruction bookkeeping remain intact during rollback.
 
 If a Linux x86/x64 peer continuation fails after the displaced owner instruction
 has completed and the trap has been rearmed, the backend still returns the

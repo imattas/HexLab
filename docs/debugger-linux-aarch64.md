@@ -28,6 +28,13 @@ peer `PTRACE_CONT` fails, the backend returns the completed owner step as a
 `single_step` event with the peer-resume error attached. It stops peers already
 resumed and blocks later resumes only if rollback cannot restore the stopped
 state. Signal, clone, exit, and other racing peer statuses remain deferred.
+Deferred continuations run peers before the owner, regardless of action order,
+so a failed peer continuation leaves the completed owner instruction and PC
+intact. The confirmed `TRAP_TRACE` is debugger-owned and is not retained as a
+pending signal for a later resume of that `single_step` event. Signals consumed
+by successful peer continuations are removed; failed or unattempted peers keep
+their queued signals. The rearmed owned BRK and its original-instruction
+bookkeeping remain in place throughout peer rollback.
 An owner single-step at an owned software breakpoint may also select peer
 continuations. Those peers remain stopped while the instruction is displaced,
 then resume with their requested signals only after a confirmed `TRAP_TRACE`
@@ -105,8 +112,10 @@ kernel implementation: [`user_sve_header` and `NT_ARM_SVE` layout](https://githu
 [`encode_ctrl_reg`](https://github.com/torvalds/linux/blob/master/arch/arm64/include/asm/hw_breakpoint.h),
 and [watchpoint hit attribution](https://github.com/torvalds/linux/blob/master/arch/arm64/kernel/hw_breakpoint.c).
 
-The updated source passed syntax-only and object compilation with the AArch64
-backend guard enabled under x86_64 WSL, using the host Linux headers. This
-checks the guarded C++ source but emits host code; it does not validate native
-AArch64 code generation, ptrace UAPI behavior, or runtime breakpoint handling.
-No tests or target runtime checks have been run.
+Earlier source passed syntax-only and object compilation with the AArch64
+backend guard enabled under x86_64 WSL, using host Linux headers and emitting
+host code. The deferred-resume owner-order and signal changes have not been
+compiled: the available WSL Clang cannot find an AArch64 C++ standard library,
+and no AArch64 GCC toolchain is installed. Native AArch64 code generation,
+ptrace UAPI behavior, and runtime breakpoint handling remain unverified.
+No tests or target runtime checks have been run for these changes.
