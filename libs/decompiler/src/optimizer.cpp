@@ -922,6 +922,7 @@ ExpressionPtr expand_pure_ssa(const ExpressionPtr &expression, const PureDefinit
     constexpr std::size_t max_depth = 32;
     if (!expression || ++nodes > max_nodes || depth > max_depth) return {};
     if (const auto *reg = std::get_if<RegisterValue>(&expression->value)) {
+        if (reg->reg.bank == RegisterBank::mips_fpr) return {};
         if (!reg->version || !reg->reg.width || reg->reg.width != expression->type.bits) return {};
         const auto id = key(reg->reg, *reg->version);
         const auto definition = definitions.find(id);
@@ -959,6 +960,7 @@ std::optional<ConstantValue> evaluate_symbolic(const ExpressionPtr &expression,
     if (const auto *constant = std::get_if<ConstantValue>(&expression->value))
         return constant->type == expression->type ? std::optional<ConstantValue>(*constant) : std::nullopt;
     if (const auto *reg = std::get_if<RegisterValue>(&expression->value)) {
+        if (reg->reg.bank == RegisterBank::mips_fpr) return {};
         if (!reg->version) return {};
         const auto found = inputs.find(key(reg->reg, *reg->version));
         return found != inputs.end() ? std::optional<ConstantValue>(found->second) : std::nullopt;
@@ -1032,6 +1034,11 @@ ExpressionPtr simplify_expression(const ExpressionPtr &expression,
     if (!expression) return {};
     auto copy = std::make_shared<Expression>(*expression);
     if (const auto *reg = std::get_if<RegisterValue>(&copy->value)) {
+        // Generic maps describe logical SSA versions but do not model S/D
+        // writes to overlapping FPR storage. Preserve these leaves in every
+        // carrier, including transfer assignments; the local payload helpers
+        // alone may bind them after applying the physical-index alias barrier.
+        if (reg->reg.bank == RegisterBank::mips_fpr) return copy;
         if (allow_register_propagation && reg->version) {
             const auto found = constants.find(key(reg->reg, *reg->version));
             if (found != constants.end() && (!require_matching_type || found->second.type == copy->type))
@@ -1366,7 +1373,8 @@ class LoopConstantResolver {
                     expression->type.bits == definition->second.assignment->destination.width)
                     result = {LoopConstantValue::Kind::constant, *constant};
                 else if (const auto *copy = std::get_if<RegisterValue>(&expression->value);
-                         copy && copy->version && copy->reg.width == expression->type.bits &&
+                         copy && copy->reg.bank != RegisterBank::mips_fpr &&
+                         copy->version && copy->reg.width == expression->type.bits &&
                          expression->type.bits == definition->second.assignment->destination.width) {
                     result = resolve(key(copy->reg, *copy->version));
                     if (result.kind == LoopConstantValue::Kind::constant && result.value.type != expression->type)
@@ -1483,6 +1491,7 @@ SccpValue sccp_evaluate(const ExpressionPtr &expression, const std::map<Key, Scc
     if (const auto *constant = std::get_if<ConstantValue>(&expression->value))
         return sccp_constant(*expression, *constant);
     if (const auto *reg = std::get_if<RegisterValue>(&expression->value)) {
+        if (reg->reg.bank == RegisterBank::mips_fpr) return sccp_overdefined();
         if (!reg->version || !reg->reg.width || reg->reg.width != expression->type.bits)
             return sccp_overdefined();
         const auto id = key(reg->reg, *reg->version);

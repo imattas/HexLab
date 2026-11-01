@@ -338,6 +338,10 @@ Generic SCCP/global expression propagation preserves numeric FPR source
 register reads; only the alias-aware local binder substitutes their payloads.
 Explicit literal payloads still fold. The separate 32-bit FCSR SSA input can
 use ordinary strict-type propagation because it has no S/D width alias.
+Generic Assign, return, call, store, and intrinsic-output expressions likewise
+preserve MIPS FPR register leaves, preventing transfer bitcasts from laundering
+stale payloads into numeric sources. Generic SCCP, copy resolution, and symbolic
+proof also decline FPR reads. Local transfer folding remains alias-aware.
 MIPS32 evaluators and its existing word-conversion folder are unchanged.
 
 The operation and rounding basis is the existing [MIPS64 instruction
