@@ -38,6 +38,11 @@ facts. Handlers start with unknown registers because instruction-level
 exceptional type propagation is not implemented. Known reference identities are
 checked for assignability at ordinary invoke receivers and instance field
 receivers using the class definitions and array rules present in this DEX.
+When two known reference types meet at a control-flow join, the verifier keeps
+a common in-image supertype when a bounded hierarchy walk can establish one.
+This preserves useful facts for later receiver, argument, field-store, and
+return checks. If the hierarchy is incomplete or the bounded walk cannot find
+a common type, the joined identity becomes unknown and remains permissive.
 External or incomplete hierarchy paths remain unresolved and are accepted
 conservatively; they do not establish assignability. Array element descriptors,
 constructor initialization, and path-dependent null refinement are not

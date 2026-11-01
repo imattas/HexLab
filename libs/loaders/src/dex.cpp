@@ -1124,6 +1124,28 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
         }
         return Assignability::no;
     };
+    const auto common_reference_type = [&](std::uint32_t left, std::uint32_t right) -> std::uint32_t {
+        if (left >= types.size() || right >= types.size()) return UINT32_MAX;
+        if (left == right) return left;
+        std::vector<std::uint32_t> pending{left};
+        std::unordered_set<std::uint32_t> visited;
+        visited.reserve(64);
+        std::size_t steps = 0;
+        for (std::size_t next = 0; next < pending.size() && steps++ < 4096; ++next) {
+            const auto candidate = pending[next];
+            if (!visited.insert(candidate).second) continue;
+            if (reference_assignability(right, candidate) == Assignability::yes) return candidate;
+            if (const auto found = local_hierarchy.find(candidate); found != local_hierarchy.end()) {
+                if (found->second.superclass) pending.push_back(*found->second.superclass);
+                pending.insert(pending.end(), found->second.interfaces.begin(), found->second.interfaces.end());
+            }
+            if (candidate == left || candidate == right) {
+                const auto object = type_id_lookup.find("Ljava/lang/Object;");
+                if (object != type_id_lookup.end() && object->second != candidate) pending.push_back(object->second);
+            }
+        }
+        return UINT32_MAX;
+    };
     std::uint64_t total_class_model_bytes = 0, total_class_interfaces = 0, total_class_members = 0;
     const auto account_class_model_bytes = [&](std::uint64_t amount) {
         constexpr std::uint64_t max_class_model_bytes = 64ull * 1024 * 1024;
@@ -2320,9 +2342,9 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
                                 if (merged != target->second[reg]) { target->second[reg] = merged; changed = true; }
                                 auto merged_reference = UINT32_MAX;
                                 if (merged == RegType::reference) {
-                                    if (old == RegType::reference && incoming == RegType::reference &&
-                                        target->second.references[reg] == incoming_state.references[reg])
-                                        merged_reference = target->second.references[reg];
+                                    if (old == RegType::reference && incoming == RegType::reference)
+                                        merged_reference = common_reference_type(
+                                            target->second.references[reg], incoming_state.references[reg]);
                                     else if (old == RegType::zero && incoming == RegType::reference)
                                         merged_reference = incoming_state.references[reg];
                                     else if (incoming == RegType::zero && old == RegType::reference)
