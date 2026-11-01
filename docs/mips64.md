@@ -342,7 +342,10 @@ Generic Assign, return, call, store, and intrinsic-output expressions likewise
 preserve MIPS FPR register leaves, preventing transfer bitcasts from laundering
 stale payloads into numeric sources. Generic SCCP, copy resolution, and symbolic
 proof also decline FPR reads. Local transfer folding remains alias-aware.
-MIPS32 evaluators and its existing word-conversion folder are unchanged.
+MIPS32 evaluator semantics are unchanged. Its existing word-conversion folder
+receives only same-width, same-type FPR constants through a dedicated binder
+in the alias-invalidated call-summary environment; generic FPR substitution
+remains blocked and no new MIPS32 numerical operation is introduced.
 
 The operation and rounding basis is the existing [MIPS64 instruction
 reference, revision 5.04](https://wiki.chuang.ac.cn/_media/md00087-2b-mips64bis-afp-05.04.pdf).

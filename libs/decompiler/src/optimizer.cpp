@@ -2342,6 +2342,27 @@ std::optional<Mips32WordConversionResult> fold_mips32_word_conversion(Intrinsic 
     return evaluate_mips32_word_conversion(is_double, rounding, source->value, static_cast<std::uint32_t>(fcsr->value));
 }
 
+void bind_mips32_word_conversion_payload(Intrinsic &effect, const std::map<Key, ConstantValue> &constants) {
+    static constexpr std::string_view names[]{"mips.cvt.w.s", "mips.cvt.w.d",
+        "mips.round.w.s", "mips.trunc.w.s", "mips.ceil.w.s", "mips.floor.w.s",
+        "mips.round.w.d", "mips.trunc.w.d", "mips.ceil.w.d", "mips.floor.w.d"};
+    if (std::find(std::begin(names), std::end(names), effect.name) == std::end(names) ||
+        effect.memory_effect != IntrinsicMemoryEffect::none || effect.operands.size() != 3 ||
+        effect.register_writes.size() != 2 || effect.register_writes[0].bank != RegisterBank::mips_fpr ||
+        effect.register_writes[0].width != 32 || effect.register_writes[0].index > 31 ||
+        effect.register_writes[0].high_byte ||
+        effect.register_writes[1] != RegisterOperand{RegisterBank::mips_fcsr, 0, 32, false}) return;
+    const ValueType expected{TypeKind::floating, static_cast<std::uint16_t>(effect.name.ends_with(".d") ? 64 : 32), false};
+    const auto *source = effect.operands[1] ? std::get_if<RegisterValue>(&effect.operands[1]->value) : nullptr;
+    if (!source || !source->version || source->reg.bank != RegisterBank::mips_fpr ||
+        source->reg.width != expected.bits || source->reg.index > 31 || source->reg.high_byte ||
+        effect.operands[1]->type != expected) return;
+    const auto value = constants.find(key(source->reg, *source->version));
+    if (value != constants.end() && value->second.type == expected &&
+        (expected.bits == 64 || value->second.value <= UINT32_MAX))
+        effect.operands[1] = constant_expression(value->second);
+}
+
 struct SummaryWorker {
     std::span<const CallSummaryInput> inputs;
     SummaryBudget &budget;
@@ -2391,7 +2412,12 @@ struct SummaryWorker {
             if (std::holds_alternative<Call>(statement)) constants.clear();
             return;
         }
-        if (auto *effect = std::get_if<Intrinsic>(&statement)) bind_mips64_fp_payloads(*effect, constants);
+        if (auto *effect = std::get_if<Intrinsic>(&statement)) {
+            bind_mips64_fp_payloads(*effect, constants);
+            // Preserve the existing MIPS32 folder through this same alias-
+            // invalidated local environment, never through a global FPR map.
+            bind_mips32_word_conversion_payload(*effect, constants);
+        }
         simplify_statement(statement, constants, true, true);
         if (const auto *call = std::get_if<Call>(&statement)) call_constants(*call, constants);
         else if (const auto *intrinsic = std::get_if<Intrinsic>(&statement)) {
