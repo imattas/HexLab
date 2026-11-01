@@ -54,6 +54,8 @@ with these types:
 | AArch64 | `R_AARCH64_JUMP_SLOT` | 1026 | `S` |
 | PPC64 | `R_PPC64_ADDR32` | 1 | `S + A` (signed-or-unsigned 32-bit field) |
 | PPC64 | `R_PPC64_ADDR64` | 38 | `S + A` (low 64 bits) |
+| PPC64 | `R_PPC64_REL32` | 26 | `S + A - P` (signed 32-bit field) |
+| PPC64 | `R_PPC64_REL64` | 44 | `S + A - P` (low 64 bits) |
 | PPC64 | `R_PPC64_GLOB_DAT` | 20 | `S + A` (low 64 bits) |
 | PPC64 | `R_PPC64_JMP_SLOT` | 21 | `S` |
 | PPC64 | `R_PPC64_RELATIVE` | 22 | `B + A` |
@@ -142,7 +144,8 @@ the separate AArch64 P32/ELF32 profile. These formulas and overflow ranges
 follow the [AAELF64 data relocation table](https://github.com/ARM-software/abi-aa/blob/main/aaelf64/aaelf64.rst#static-data-relocations).
 
 The PPC64 ELF64 profile applies `R_PPC64_RELATIVE`,
-`R_PPC64_ADDR32`, `R_PPC64_ADDR64`, `R_PPC64_GLOB_DAT`, and `R_PPC64_JMP_SLOT` from dynamic RELA tables. Relative
+`R_PPC64_ADDR32`, `R_PPC64_ADDR64`, `R_PPC64_REL32`, `R_PPC64_REL64`,
+`R_PPC64_GLOB_DAT`, and `R_PPC64_JMP_SLOT` from dynamic RELA tables. Relative
 records use `B + A` and require symbol index zero. `ADDR32` and `ADDR64` use
 `S + A`; `ADDR32` must fit `[-2^31, 2^32-1]` and writes the low 32 bits; `ADDR64` writes the
 low 64 bits. `GLOB_DAT` also uses `S + A` and writes the low 64 bits; its
@@ -155,6 +158,23 @@ supported symbol relocations. These bounded data and pointer relocations are
 handled in either ELF byte order, with patch fields encoded using the ELF
 header's byte order. PPC64 instruction-field, TLS, COPY, IFUNC, and other
 dynamic relocation types remain skipped.
+
+PPC64 `REL32` and `REL64` use the rebased relocation place `P` and the resolved
+runtime symbol address `S`. `REL32` requires the mathematical `S + A - P`
+result to fit signed 32 bits and writes four bytes; `REL64` writes the low 64
+bits to eight bytes. Both require an available explicit RELA addend, a
+validated nonzero symbol index, exact original file backing, and four-byte or
+eight-byte target alignment respectively. An unavailable or overflowing place,
+out-of-range `REL32` result, unresolved symbol, or unsafe target leaves the row
+unapplied with a diagnostic. The original image and relocation rows remain
+unchanged; successful external bindings retain their caller binding index.
+The formulas follow the PowerPC64 ABI relocation table; the signed `REL32`
+range also matches [LLVM's PPC64 relocation implementation](https://github.com/llvm/llvm-project/blob/main/lld/ELF/Arch/PPC64.cpp).
+This data-field support does not relocate instruction sequences, TOC/PLT
+references, TLS, COPY, or IFUNC records. PPC64 REL records remain unsupported.
+The 2026-10-31 `REL32`/`REL64` extension was verified by compiling
+`elf_dynamic_relocations.cpp` with MSVC C++20 and running `git diff --check`.
+No tests or integrated link/runtime validation were run for this extension.
 
 The s390x profile applies big-endian ELF64 `ET_DYN` dynamic RELA records for
 `R_390_8/16/32`, `R_390_PC16/PC16DBL/PC32/PC32DBL/PC64`, `R_390_RELATIVE`,
