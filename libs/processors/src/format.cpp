@@ -413,6 +413,14 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
     case Opcode::mips64_sdl: return "sdl";
     case Opcode::mips64_sdr: return "sdr";
     case Opcode::mips64_pref: return "pref";
+    case Opcode::mips64_cache: return "cache";
+    case Opcode::mips64_synci: return "synci";
+    case Opcode::mips64_rdhwr: return "rdhwr";
+    case Opcode::mips64_di: return "di";
+    case Opcode::mips64_ei: return "ei";
+    case Opcode::mips64_ssnop: return "ssnop";
+    case Opcode::mips64_ehb: return "ehb";
+    case Opcode::mips64_pause: return "pause";
     default: break;
     }
     if (op >= Opcode::ppc_addi && op <= Opcode::ppc_nop) {

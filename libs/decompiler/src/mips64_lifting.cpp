@@ -70,6 +70,89 @@ std::optional<Statement> lift_mips64_instruction(const Instruction &instruction)
         return Assign{*destination, std::move(value)};
     };
 
+    if (op == Opcode::mips_syscall || op == Opcode::mips_break) {
+        const auto *code = items.size() == 1 ? std::get_if<ImmediateOperand>(&items[0]) : nullptr;
+        if (!code || code->is_signed || code->encoded_width != 20 || code->effective_width != 32 ||
+            code->value > 0xfffff || instruction.flow != FlowKind::trap || instruction.delay_slots ||
+            instruction.access != std::vector<OperandAccess>{OperandAccess::read})
+            return Intrinsic{"mips64_malformed_exception", {}, IntrinsicMemoryEffect::unknown};
+        return intrinsic(instruction, op == Opcode::mips_syscall ? "mips64_syscall_exception" :
+            "mips64_break_exception", IntrinsicMemoryEffect::unknown);
+    }
+    if (op == Opcode::mips64_ssnop || op == Opcode::mips64_ehb || op == Opcode::mips64_pause) {
+        if (!items.empty() || !instruction.access.empty() || instruction.delay_slots ||
+            instruction.flow != FlowKind::fallthrough)
+            return Intrinsic{"mips64_malformed_execution_hint", {}, IntrinsicMemoryEffect::unknown};
+        // Keep these as effects even though they do not alter logical GPR or
+        // memory contents. In particular PAUSE observes the reservation state.
+        return intrinsic(instruction, op == Opcode::mips64_ssnop ? "mips64_ssnop" :
+            op == Opcode::mips64_ehb ? "mips64_execution_hazard_barrier" :
+            "mips64_pause_until_reservation_cleared", IntrinsicMemoryEffect::none);
+    }
+    if (op == Opcode::mips_sync) {
+        const auto *type = items.size() == 1 ? std::get_if<ImmediateOperand>(&items[0]) : nullptr;
+        if (items.size() > 1 || (!items.empty() && (!type || type->is_signed || type->value > 31)) ||
+            instruction.access.size() != items.size())
+            return Intrinsic{"mips64_malformed_sync", {}, IntrinsicMemoryEffect::unknown};
+        // The IR has no ordering token. Conservatively sequence memory SSA
+        // across the barrier while retaining its implementation-defined stype.
+        return intrinsic(instruction, "mips64_sync", IntrinsicMemoryEffect::unknown);
+    }
+    if (op == Opcode::mips64_cache || op == Opcode::mips64_synci || op == Opcode::mips64_pref) {
+        const bool synci = op == Opcode::mips64_synci;
+        const auto index = synci ? 0u : 1u;
+        const auto *memory = items.size() == index + 1 ? std::get_if<MemoryOperand>(&items[index]) : nullptr;
+        const auto *selector = !synci && !items.empty() ? std::get_if<ImmediateOperand>(&items[0]) : nullptr;
+        const auto expected_access = synci ? std::vector<OperandAccess>{OperandAccess::address} :
+            std::vector<OperandAccess>{OperandAccess::read, OperandAccess::address};
+        if (!memory || memory->data_width || memory->address_width != 64 || !memory->base ||
+            memory->base->bank != RegisterBank::mips_gpr || memory->base->width != 64 ||
+            memory->base->index > 31 || memory->index || memory->displacement < -32768 ||
+            memory->displacement > 32767 || instruction.access != expected_access ||
+            instruction.memory_read || instruction.memory_write ||
+            (!synci && (!selector || selector->is_signed || selector->value > 31)))
+            return Intrinsic{"mips64_malformed_cache_address", {}, IntrinsicMemoryEffect::unknown};
+        auto address = binary("add", reg(*memory->base),
+            constant(static_cast<std::uint64_t>(memory->displacement), 64), 64);
+        Intrinsic effect{synci ? "mips64_synci" : op == Opcode::mips64_cache ? "mips64_cache" : "mips64_pref",
+            {}, op == Opcode::mips64_pref ? IntrinsicMemoryEffect::none : IntrinsicMemoryEffect::unknown};
+        if (!synci) effect.operands.push_back(operand(items[0]));
+        effect.operands.push_back(std::move(address));
+        return effect;
+    }
+    if (op == Opcode::mips64_rdhwr) {
+        const auto *selector = items.size() == 2 ? std::get_if<ImmediateOperand>(&items[1]) : nullptr;
+        if (!destination || destination->bank != RegisterBank::mips_gpr || destination->width != 64 ||
+            destination->index > 31 || !selector || selector->is_signed || selector->value > 31 ||
+            instruction.access != std::vector<OperandAccess>{OperandAccess::write, OperandAccess::read})
+            return Intrinsic{"mips64_malformed_rdhwr", {}, IntrinsicMemoryEffect::unknown};
+        Intrinsic effect{"mips64_rdhwr", {operand(items[1])}, IntrinsicMemoryEffect::none};
+        effect.register_writes = instruction.register_writes;
+        effect.result_type = integer(64);
+        return effect;
+    }
+    if (op == Opcode::mips64_di || op == Opcode::mips64_ei) {
+        const RegisterOperand status{RegisterBank::mips_cp0, 12, 32, false};
+        if (items.size() != 1 || !destination || destination->bank != RegisterBank::mips_gpr ||
+            destination->width != 64 || destination->index > 31 ||
+            instruction.access != std::vector<OperandAccess>{OperandAccess::write} ||
+            instruction.register_reads != std::vector<RegisterOperand>{status})
+            return Intrinsic{"mips64_malformed_interrupt_control", {}, IntrinsicMemoryEffect::unknown};
+        std::vector<RegisterOperand> writes;
+        if (destination->index) writes.push_back(*destination);
+        writes.push_back(status);
+        if (instruction.register_writes != writes)
+            return Intrinsic{"mips64_malformed_interrupt_control", {}, IntrinsicMemoryEffect::unknown};
+        Intrinsic effect{op == Opcode::mips64_di ? "mips64_di" : "mips64_ei",
+            {reg(status)}, IntrinsicMemoryEffect::none};
+        effect.register_writes = std::move(writes);
+        // Outputs read the same pre-instruction Status, even when rt is zero.
+        if (destination->index) effect.register_output_values.push_back(unary("sext", reg(status), 64));
+        effect.register_output_values.push_back(binary(op == Opcode::mips64_di ? "and" : "or",
+            reg(status), constant(op == Opcode::mips64_di ? UINT32_C(0xfffffffe) : 1, 32), 32));
+        return effect;
+    }
+
     if ((op == Opcode::mips_jr || op == Opcode::mips64_jr_hb) && instruction.flow == FlowKind::ret)
         return Return{items.empty() ? ExpressionPtr{} : operand(items.front())};
     if ((op == Opcode::mips_jr || op == Opcode::mips64_jr_hb) && instruction.flow == FlowKind::jump) {

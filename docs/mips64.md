@@ -215,3 +215,63 @@ classic conditional moves are not claimed as Release 6 instructions.
 ## Release 2 word rotates
 
 SPECIAL fixed and variable shifts now recognize the Release 2 `rotr` and `rotrv` aliases. Their distinguishing encoding fields are validated: `rotr` uses `rs=1`, while `rotrv` uses the rotate selector in `shamt=1`; ordinary `srl`/`srlv` retain their reserved-zero checks. Both operations rotate the low 32 bits and sign-extend the result into the 64-bit GPR. Decoder effects record the data and amount reads and destination write, and the lifter models the rotate with width-limited shifts so rotation by zero is defined. Other MIPS32 Release 2 operations remain outside this slice.
+
+
+## Base exceptions, ordering, and hardware control
+
+The classic MIPS64 decoder now recognizes `SYSCALL` and `BREAK`, `CACHE`,
+`SYNCI`, `RDHWR`, `DI`/`EI`, and the exact `SSNOP`, `EHB`, and `PAUSE` SLL
+idioms. `SYNC` retains its optional five-bit stype. The architectural basis
+is the [MIPS64 instruction reference, revision 5.04](https://wiki.chuang.ac.cn/_media/md00087-2b-mips64bis-afp-05.04.pdf).
+The Release 2 `DI`/`EI` and `SYNCI` encodings are also cross-checked against
+the [GNU simulator instruction definitions](https://gnu.googlesource.com/binutils-gdb/+/cbe950e9fe8a56f788bcf985cc51733f18abb45b/sim/mips/mips3264r2.igen).
+No third-party implementation code was copied.
+
+* `SYSCALL`/`BREAK` preserve all 20 software-code bits as an unsigned
+  immediate, including an explicit zero. They terminate normal analysis
+  flow without a delay slot. Lifted blocks carry a named exception effect
+  and an unconditional trap edge; there is no invented OS call target or
+  handler continuation.
+* `CACHE` retains the complete five-bit operation selector, `SYNCI` retains
+  its signed offset and base, and `PREF` retains its hint. These use 64-bit
+  address-only operands with explicit base reads. They neither claim an
+  ordinary data load nor a full-width store. Big-endian displacement byte
+  locations are recorded correctly. The lifter passes the modulo-64
+  effective-address expression to the intrinsic, avoiding a fictitious
+  load of cache-line contents.
+* `RDHWR` retains the hardware-register number as a selector rather than a
+  GPR source and defines a 64-bit destination. Its value stays an opaque
+  hardware observation. The classic fixed-zero fields are validated;
+  Release 6 selector forms are not accepted by this path.
+* `DI`/`EI` expose the old 32-bit CP0 Status value, sign-extended into the
+  selected 64-bit GPR, and clear/set Status.IE. The lifter produces both
+  outputs from the same pre-instruction Status. Selecting GPR0 discards the
+  old-Status result and still updates Status.
+* Exact `SLL $zero,$zero,1/3/5` words format as `ssnop`, `ehb`, and `pause`.
+  They have no fictitious GPR definitions. Named effects retain issue,
+  execution-hazard, and reservation-wait intent. Neighboring SLL encodings
+  keep their existing ordinary shift behavior.
+
+The processor inventory advertises this bounded group and the function
+fingerprint includes `mips64-base-exceptions-cache-hardware-control-v1`, so
+persisted analysis from before these decodes is not reused. MIPS32 decoding
+and formatting remain unchanged. The related MIPS64 CP0 transfer guard now
+rejects nonzero selects consistently with the documented select-zero scope;
+nonzero `SYNC` stype operands now have matching read access metadata.
+
+The shared IR has no dedicated hardware-ordering token. `SYNC`, `CACHE`,
+and `SYNCI` therefore conservatively sequence opaque memory SSA effects.
+`PREF` has no logical memory effect. Cache contents, CP0 TagLo/TagHi effects,
+address translation, privilege checks, hardware-register availability,
+interrupt delivery/latency, and the LLBit wait are not evaluated. These
+instructions have no delay slot of their own. Existing branch/jump slots
+and annul rules are preserved; terminal traps in a slot still fail closed
+as unsupported rather than acquiring a fabricated post-slot transfer.
+Exception EPC/Cause updates, OS syscall ABIs, handler dispatch/resumption,
+compressed modes, and ISA revision selection remain outside this slice.
+
+Validation for this expansion passed an isolated MSVC Debug headless build
+with `BUILD_TESTING=OFF`, targeting `hexlab_processors`, `hexlab_analysis`,
+and `hexlab_decompiler`, plus `git diff --check`. No tests were added or run;
+there is no new independent instruction-oracle evidence. Capability status
+remains partial.

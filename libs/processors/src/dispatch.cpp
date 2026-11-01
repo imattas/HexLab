@@ -383,7 +383,8 @@ std::span<const ProcessorVariantInfo> processor_variant_inventory() noexcept {
     static constexpr std::string_view mips32_families[]{"integer", "loads-and-stores", "control-flow-delay-slots",
         "hilo", "cop1-s-d-w"};
     static constexpr std::string_view mips64_families[]{"integer-and-selected-doubleword", "loads-and-stores",
-        "control-flow-delay-slots", "hilo-and-special-registers", "selected-cop1"};
+        "control-flow-delay-slots", "hilo-and-special-registers", "selected-cop1",
+        "base-exceptions-cache-order-and-hardware-control"};
     static constexpr std::string_view ppc_families[]{"integer", "loads-and-stores", "control-flow",
         "condition-register", "selected-vmx-integer-and-scalar-floating"};
     static constexpr std::string_view m6502_families[]{"documented-nmos-151-opcodes", "selected-undocumented-nmos"};

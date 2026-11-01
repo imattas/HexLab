@@ -2143,6 +2143,15 @@ Node &Recovery::node(Address address, ThumbITState incoming_it) {
     const auto fact_owner = value.fact;
     const auto &instruction = fact_owner->instruction;
     if (delayed_slots.contains(address)) {
+        if (instruction.context.architecture == Architecture::mips64 &&
+            (instruction.opcode == Opcode::mips_syscall || instruction.opcode == Opcode::mips_break)) {
+            value.stop = FunctionStop{address, FunctionStopReason::unsupported,
+                "MIPS64 exception in a delay slot requires unmodeled EPC/BD handling"};
+            // A trapping slot cannot complete the owner's delayed transfer.
+            // Keep the slot boundary explicit without publishing its targets.
+            value.edges.clear();
+            return finish();
+        }
         if ((instruction.opcode == Opcode::opaque && instruction.operands.empty()) || instruction.opcode == Opcode::x86_opaque ||
             instruction.flow != FlowKind::fallthrough || instruction.delay_slots) {
             value.stop = FunctionStop{address, FunctionStopReason::unsupported,
@@ -3167,6 +3176,8 @@ Sha256Digest function_engine_fingerprint(const AnalysisOptions &options) {
     (void)hash.update(std::as_bytes(std::span(riscv_compressed_version)));
     constexpr std::string_view riscv_compressed_switch_version = "riscv-compressed-switch-analysis-v1";
     (void)hash.update(std::as_bytes(std::span(riscv_compressed_switch_version)));
+    constexpr std::string_view mips64_base_control_version = "mips64-base-exceptions-cache-hardware-control-v1";
+    (void)hash.update(std::as_bytes(std::span(mips64_base_control_version)));
     constexpr std::string_view wasm_indirect_selector_version = "wasm-indirect-constant-selector-v1";
     (void)hash.update(std::as_bytes(std::span(wasm_indirect_selector_version)));
     for (auto value : {options.min_string_characters, options.instruction_budget, options.string_budget,

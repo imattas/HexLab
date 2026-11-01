@@ -55,10 +55,22 @@ DecodeResult decode_mips64(std::span<const std::byte> bytes, Address at, ByteOrd
     const RegisterOperand hi{RegisterBank::mips_hilo, 0, 64, false};
     const RegisterOperand lo{RegisterBank::mips_hilo, 1, 64, false};
     if (op == 0x10) {
+        if (rs == 11) { // MFMC0: DI/EI, Status select zero.
+            if (rd != 12 || shamt || (funct != 0 && funct != 0x20))
+                return invalid("Reserved MIPS64 DI/EI encoding");
+            const RegisterOperand status{RegisterBank::mips_cp0, 12, 32, false};
+            i.opcode = funct == 0 ? Opcode::mips64_di : Opcode::mips64_ei;
+            i.operands = {reg(rt)};
+            i.access = {OperandAccess::write};
+            i.register_reads = {status};
+            if (rt) i.register_writes.push_back(reg(rt));
+            i.register_writes.push_back(status);
+            return {DecodeStatus::decoded, std::move(i), {}};
+        }
         // MFC0/MTC0 and their MIPS64 doubleword counterparts support only
         // select zero. Other selects remain distinct unsupported encodings.
         if (rs == 0 || rs == 1 || rs == 4 || rs == 5) {
-            if ((word & 0x7f8u) != 0)
+            if ((word & 0x7ffu) != 0)
                 return {DecodeStatus::unsupported, {}, "MIPS64 CP0 register selects are not implemented"};
             const bool from_cp0 = rs == 0 || rs == 1;
             const bool doubleword = rs == 1 || rs == 5;
@@ -263,6 +275,13 @@ DecodeResult decode_mips64(std::span<const std::byte> bytes, Address at, ByteOrd
         if (load) i.register_writes = {fp}; else i.register_reads = {fp};
     } else if (op == 0) {
         switch (funct) {
+        case 0x0c: case 0x0d: { // All 20 code bits are software-defined.
+            i.opcode = funct == 0x0c ? Opcode::mips_syscall : Opcode::mips_break;
+            i.operands = {ImmediateOperand{(word >> 6) & 0xfffffu, 20, 32, false, {}}};
+            i.access = {OperandAccess::read};
+            i.flow = FlowKind::trap;
+            break;
+        }
         case 0x01: { // MOVCI: integer MOVF / MOVT, selected by an FCC bit.
             if (shamt || (rt & 2)) return invalid("Reserved MIPS64 MOVCI encoding");
             const auto cc = static_cast<std::uint8_t>((rt >> 2) & 7);
@@ -352,6 +371,14 @@ DecodeResult decode_mips64(std::span<const std::byte> bytes, Address at, ByteOrd
             break;
         case 0x00: case 0x02: case 0x03: case 0x38: case 0x3a: case 0x3b:
         case 0x3c: case 0x3e: case 0x3f: {
+            // These exact SLL-to-zero idioms have architectural issue/hazard
+            // or LLBit waiting effects. Ordinary SLL encodings stay unchanged.
+            if (funct == 0 && rs == 0 && rt == 0 && rd == 0 &&
+                (shamt == 1 || shamt == 3 || shamt == 5)) {
+                i.opcode = shamt == 1 ? Opcode::mips64_ssnop :
+                           shamt == 3 ? Opcode::mips64_ehb : Opcode::mips64_pause;
+                break;
+            }
             const bool rotate = (funct == 0x3a || funct == 0x3e) && rs == 1;
             const bool word_rotate = funct == 0x02 && rs == 1;
             if (rs && !rotate && !word_rotate) return invalid("Reserved MIPS64 fixed-shift encoding");
@@ -413,7 +440,10 @@ DecodeResult decode_mips64(std::span<const std::byte> bytes, Address at, ByteOrd
         case 0x0f:
             if (rs || rt || rd) return invalid("Reserved MIPS64 SYNC encoding");
             i.opcode = Opcode::mips_sync;
-            if (shamt) i.operands = {ImmediateOperand{shamt, 5, 32, false, EncodedField{0, 2}}};
+            if (shamt) {
+                i.operands = {ImmediateOperand{shamt, 5, 32, false, {}}};
+                i.access = {OperandAccess::read};
+            }
             break;
         default: return invalid("Reserved or unsupported MIPS64 SPECIAL function");
         }
@@ -458,6 +488,14 @@ DecodeResult decode_mips64(std::span<const std::byte> bytes, Address at, ByteOrd
         if (rd) i.register_writes = {reg(rd)};
         }
     } else if (op == 0x1f) {
+        if (funct == 0x3b) { // Classic RDHWR has no Release 6 selector.
+            if (rs || shamt) return invalid("Reserved MIPS64 RDHWR encoding");
+            i.opcode = Opcode::mips64_rdhwr;
+            i.operands = {reg(rt), ImmediateOperand{rd, 5, 32, false, {}}};
+            i.access = {OperandAccess::write, OperandAccess::read};
+            if (rt) i.register_writes = {reg(rt)};
+            return {DecodeStatus::decoded, std::move(i), {}};
+        }
         // SPECIAL3 byte/halfword shuffles and sign extension. These fields
         // are distinct from the DEXT/DINS function family below.
         if (rs == 0 && funct == 0x20) { // BSHFL
@@ -577,7 +615,13 @@ DecodeResult decode_mips64(std::span<const std::byte> bytes, Address at, ByteOrd
         i.operands = {reg(rs)}; i.access = {OperandAccess::read}; i.register_reads = {reg(rs)};
         i.flow = FlowKind::conditional_branch; target(i, signed16(word)); i.access.push_back(OperandAccess::address); i.delay_slots = 1;
     } else if (op == 1) {
-        if (rt == 8 || rt == 9 || rt == 10 || rt == 11 || rt == 12 || rt == 14) {
+        if (rt == 31) { // SYNCI uses the REGIMM selector, not a branch.
+            i.opcode = Opcode::mips64_synci;
+            i.operands = {MemoryOperand{0, 64, {}, reg(rs), {}, 1, signed16(word), false, {},
+                EncodedField{static_cast<std::uint8_t>(order == ByteOrder::little ? 0 : 2), 2}}};
+            i.access = {OperandAccess::address};
+            if (rs) i.register_reads = {reg(rs)};
+        } else if (rt == 8 || rt == 9 || rt == 10 || rt == 11 || rt == 12 || rt == 14) {
             static constexpr Opcode trap_operations[]{Opcode::mips64_tgei, Opcode::mips64_tgeiu,
                 Opcode::mips64_tlti, Opcode::mips64_tltiu, Opcode::mips64_teqi, Opcode::mips64_tnei};
             const unsigned index = rt == 8 ? 0 : rt == 9 ? 1 : rt == 10 ? 2 :
@@ -616,9 +660,10 @@ DecodeResult decode_mips64(std::span<const std::byte> bytes, Address at, ByteOrd
         i.operands = {reg(rt), ImmediateOperand{word & 0xffffu, 16, 16, false, EncodedField{2, 2}}};
         i.access = {OperandAccess::write, OperandAccess::read};
         if (rt) i.register_writes = {reg(rt)};
-    } else if (op == 0x33) { // PREF: a nonbinding hint with an effective address.
-        i.opcode = Opcode::mips64_pref;
-        MemoryOperand address{0, 64, {}, reg(rs), {}, 1, signed16(word), false, {}, EncodedField{0, 2}};
+    } else if (op == 0x33 || op == 0x2f) { // PREF/CACHE consume an address, not a loaded value.
+        i.opcode = op == 0x33 ? Opcode::mips64_pref : Opcode::mips64_cache;
+        MemoryOperand address{0, 64, {}, reg(rs), {}, 1, signed16(word), false, {},
+            EncodedField{static_cast<std::uint8_t>(order == ByteOrder::little ? 0 : 2), 2}};
         i.operands = {ImmediateOperand{rt, 5, 5, false, {}}, address};
         i.access = {OperandAccess::read, OperandAccess::address};
         if (rs) i.register_reads = {reg(rs)};

@@ -8887,6 +8887,11 @@ Result<LiftedFunction> lift_function(const FunctionRecord &function, const Funct
                 block.instructions.push_back({origin, std::move(statement)});
                 continue;
             }
+            if (decoded.context.architecture == Architecture::mips64 && decoded.flow == FlowKind::trap &&
+                (decoded.opcode == Opcode::mips_syscall || decoded.opcode == Opcode::mips_break)) {
+                block.trap_edges.push_back({decoded.address, TrapEdgeKind::unconditional,
+                    decoded.opcode == Opcode::mips_syscall ? "mips64_syscall_exception" : "mips64_break_exception", {}});
+            }
             if (decoded.context.architecture == Architecture::mips64 &&
                 (decoded.opcode == Opcode::mips64_tge || decoded.opcode == Opcode::mips64_tgeu ||
                  decoded.opcode == Opcode::mips64_tlt || decoded.opcode == Opcode::mips64_tltu ||
@@ -8924,6 +8929,11 @@ Result<LiftedFunction> lift_function(const FunctionRecord &function, const Funct
             return candidate.begin == *delayed_edge->target && (!delayed_edge->block || candidate.id == *delayed_edge->block);
         });
         if (slot == result.blocks.end() || source.instructions.empty()) continue;
+        if (std::any_of(slot->trap_edges.begin(), slot->trap_edges.end(), [](const TrapEdge &edge) {
+                return edge.kind == TrapEdgeKind::unconditional;
+            }))
+            return Error{ErrorCode::unsupported,
+                "MIPS64 exception in a delay slot requires unmodeled EPC/BD handling"};
         const auto is_transfer = [](const Statement &statement) {
             return std::holds_alternative<Branch>(statement) || std::holds_alternative<Call>(statement) ||
                    std::holds_alternative<Return>(statement);

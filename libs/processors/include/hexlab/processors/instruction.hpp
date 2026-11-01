@@ -712,7 +712,10 @@ enum class Opcode {
     // PowerPC floating-point D-form update memory operations; appended for cache stability.
     ppc_lfsu, ppc_lfdu, ppc_stfsu, ppc_stfdu,
     // AArch64 signed byte/halfword loads; appended to preserve serialized IDs.
-    a64_ldrsb, a64_ldrsh
+    a64_ldrsb, a64_ldrsh,
+    // Classic MIPS64 base control/cache forms; append for persisted ID stability.
+    mips64_cache, mips64_synci, mips64_rdhwr, mips64_di, mips64_ei,
+    mips64_ssnop, mips64_ehb, mips64_pause
 };
 enum class OperandAccess { read, write, read_write, address };
 // The encoded x86 group-one repeat prefix is retained separately from the
