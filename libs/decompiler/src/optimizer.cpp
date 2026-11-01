@@ -1076,9 +1076,16 @@ void simplify_statement(Statement &statement, const std::map<Key, ConstantValue>
             const auto numeric_inventory = mips64_fp_numeric_inventory();
             const bool typed_mips64_numeric = std::any_of(numeric_inventory.begin(), numeric_inventory.end(),
                 [&](const auto &item) { return item.intrinsic_name == value.name; });
-            for (auto &operand : value.operands)
-                operand = simplify_expression(operand, constants, allow_register_propagation,
+            for (std::size_t n = 0; n < value.operands.size(); ++n) {
+                // Global/SCCP environments do not track intervening S/D
+                // writes. Only the alias-aware local binder may replace a
+                // numeric payload register read; explicit literals still fold.
+                // The final FCSR input is an independent fixed-width SSA value.
+                const bool numeric_payload = typed_mips64_numeric && n + 1 < value.operands.size();
+                value.operands[n] = simplify_expression(value.operands[n], constants,
+                    allow_register_propagation && !numeric_payload,
                     require_matching_type || typed_mips64_numeric);
+            }
             for (auto &output : value.register_output_values)
                 output = simplify_expression(output, constants, allow_register_propagation, require_matching_type);
         }

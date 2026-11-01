@@ -334,6 +334,10 @@ physical S/D register aliasing is not inferred. Call-summary propagation also
 invalidates every width of an unversioned FPR destination without publishing
 a new constant. These barriers apply after RHS evaluation, including writes
 whose new payload is unknown.
+Generic SCCP/global expression propagation preserves numeric FPR source
+register reads; only the alias-aware local binder substitutes their payloads.
+Explicit literal payloads still fold. The separate 32-bit FCSR SSA input can
+use ordinary strict-type propagation because it has no S/D width alias.
 MIPS32 evaluators and its existing word-conversion folder are unchanged.
 
 The operation and rounding basis is the existing [MIPS64 instruction
