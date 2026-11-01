@@ -108,7 +108,7 @@
 
 namespace hexlab::desktop {
 namespace {
-constexpr int move_pane_id_base = python_console_id + 1;
+constexpr int move_pane_id_base = main_frame_command_end;
 // Keep persisted restore work bounded while supporting large multi-document
 // sessions. The same cap validates the serialized count and limits saves.
 constexpr long maximum_restored_documents = 1024;
@@ -192,6 +192,13 @@ constexpr std::array<const char *, 7> movable_pane_labels{
 #endif
 constexpr int dock_floating_panes_id = move_pane_id_base + static_cast<int>(movable_pane_names.size());
 constexpr int focus_pane_id_base = dock_floating_panes_id + 1;
+constexpr int save_layout_id = focus_pane_id_base + static_cast<int>(movable_pane_names.size());
+constexpr int restore_layout_id = save_layout_id + 1;
+constexpr int delete_layout_id = restore_layout_id + 1;
+static_assert(delete_layout_id < project_action_first);
+constexpr std::size_t maximum_saved_layouts = 16;
+constexpr std::size_t maximum_layout_name_characters = 80;
+constexpr std::size_t maximum_layout_perspective_characters = 65536;
 
 struct ContextRowKey {
     bool file_offset = false;
@@ -223,7 +230,8 @@ bool document_token_matches(const DocumentSnapshot& document, std::uint64_t open
         token.byte_revision == (state ? state->revisions.bytes : 0) &&
         token.decision_revision == (state ? state->revisions.decisions : 0);
 }
-std::optional<wxRect> fit_frame_rect_to_display(const wxRect &candidate) {
+std::optional<wxRect> fit_frame_rect_to_display(const wxRect &candidate,
+                                               wxSize minimum_size = wxSize(640, 400)) {
     const auto count = wxDisplay::GetCount();
     if (count == 0) return {};
     std::optional<wxRect> best_bounds;
@@ -252,8 +260,8 @@ std::optional<wxRect> fit_frame_rect_to_display(const wxRect &candidate) {
     }
     if (!best_bounds) return {};
     const auto bounds = *best_bounds;
-    const int width = std::clamp(candidate.width, std::min(640, bounds.width), bounds.width);
-    const int height = std::clamp(candidate.height, std::min(400, bounds.height), bounds.height);
+    const int width = std::clamp(candidate.width, std::min(minimum_size.x, bounds.width), bounds.width);
+    const int height = std::clamp(candidate.height, std::min(minimum_size.y, bounds.height), bounds.height);
     const int x = std::clamp(candidate.x, bounds.x, bounds.GetRight() - width + 1);
     const int y = std::clamp(candidate.y, bounds.y, bounds.GetBottom() - height + 1);
     return wxRect(x, y, width, height);
@@ -1006,6 +1014,11 @@ struct MainFrame::Impl {
         annotation_rows, bookmark_rows;
     std::string reported_error;
     bool compact = false;
+    struct SavedLayout {
+        wxString name;
+        wxString perspective;
+    };
+    std::vector<SavedLayout> saved_layouts;
     struct NavigationEntry {
         DocumentId document;
         std::uint64_t document_revision = 0;
@@ -4576,6 +4589,11 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
     menus->Append(analysis, "&Analysis");
     auto *view = new wxMenu;
     view->Append(reset_layout_id, "&Reset Layout\tCtrl+Shift+R");
+    auto *layouts_menu = new wxMenu;
+    layouts_menu->Append(save_layout_id, "Save Current Layout...");
+    layouts_menu->Append(restore_layout_id, "Restore Saved Layout...");
+    layouts_menu->Append(delete_layout_id, "Delete Saved Layout...");
+    view->AppendSubMenu(layouts_menu, "Saved Layouts");
     auto *focus_menu = new wxMenu;
     for (std::size_t i = 0; i < movable_pane_names.size(); ++i) {
         const auto command_id = focus_pane_id_base + static_cast<int>(i);
@@ -5972,6 +5990,16 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
     });
     Bind(wxEVT_MENU, [this](wxCommandEvent &) { Close(); }, wxID_EXIT);
     Bind(wxEVT_MENU, [this](wxCommandEvent &) { ResetLayout(); }, reset_layout_id);
+    Bind(wxEVT_MENU, [this](wxCommandEvent &) { SaveNamedLayout(); }, save_layout_id);
+    Bind(wxEVT_MENU, [this](wxCommandEvent &) { RestoreNamedLayout(); }, restore_layout_id);
+    Bind(wxEVT_MENU, [this](wxCommandEvent &) { DeleteNamedLayout(); }, delete_layout_id);
+    Bind(wxEVT_UPDATE_UI, [](wxUpdateUIEvent &event) {
+        event.Enable(wxConfigBase::Get() != nullptr);
+    }, save_layout_id);
+    for (const auto command_id : {restore_layout_id, delete_layout_id})
+        Bind(wxEVT_UPDATE_UI, [this](wxUpdateUIEvent &event) {
+            event.Enable(!impl_->saved_layouts.empty());
+        }, command_id);
     for (std::size_t i = 0; i < movable_pane_names.size(); ++i) {
         const int command_id = move_pane_id_base + static_cast<int>(i);
         Bind(wxEVT_MENU, [this, i](wxCommandEvent &) {
@@ -6234,6 +6262,117 @@ void MainFrame::ResetLayout() {
     impl_->compact = false;
     AdaptLayout();
 }
+void MainFrame::FitFloatingPanesToDisplays() {
+    auto &panes = docking_.GetAllPanes();
+    for (std::size_t index = 0; index < panes.GetCount(); ++index) {
+        auto &pane = panes.Item(index);
+        if (!pane.IsFloating()) continue;
+        const auto fallback = pane.window ? pane.window->GetSize() : FromDIP(wxSize(480, 320));
+        const wxRect candidate(
+            std::clamp(pane.floating_pos.x, -32768, 32768),
+            std::clamp(pane.floating_pos.y, -32768, 32768),
+            std::clamp(pane.floating_size.x > 0 ? pane.floating_size.x : fallback.x, 1, 16384),
+            std::clamp(pane.floating_size.y > 0 ? pane.floating_size.y : fallback.y, 1, 16384));
+        if (const auto fitted = fit_frame_rect_to_display(candidate, FromDIP(wxSize(200, 120))))
+            pane.FloatingPosition(fitted->GetPosition()).FloatingSize(fitted->GetSize());
+    }
+}
+bool MainFrame::PersistNamedLayouts() {
+    auto *config = wxConfigBase::Get();
+    if (!config) return false;
+    const auto previous_path = config->GetPath();
+    config->SetPath("/Desktop");
+    config->DeleteGroup("WorkspaceLayouts");
+    config->SetPath("WorkspaceLayouts");
+    bool written = config->Write("Count", static_cast<long>(impl_->saved_layouts.size()));
+    for (std::size_t index = 0; index < impl_->saved_layouts.size(); ++index) {
+        config->SetPath(wxString::Format("%zu", index));
+        written = config->Write("Name", impl_->saved_layouts[index].name) && written;
+        written = config->Write("Perspective", impl_->saved_layouts[index].perspective) && written;
+        config->SetPath("..");
+    }
+    config->SetPath(previous_path);
+    return config->Flush() && written;
+}
+void MainFrame::SaveNamedLayout() {
+    wxTextEntryDialog dialog(this, "Name this pane arrangement (up to 80 characters).",
+                             "Save Workspace Layout");
+    if (dialog.ShowModal() != wxID_OK) return;
+    auto name = dialog.GetValue();
+    name.Trim(true).Trim(false);
+    if (name.empty() || name.length() > maximum_layout_name_characters ||
+        name.find_first_of("\r\n\t") != wxString::npos) {
+        wxMessageBox("Enter a layout name of 1 to 80 characters without line breaks or tabs.",
+                     "Save Workspace Layout", wxOK | wxICON_INFORMATION, this);
+        return;
+    }
+    auto existing = std::find_if(impl_->saved_layouts.begin(), impl_->saved_layouts.end(),
+        [&](const Impl::SavedLayout &layout) { return layout.name.CmpNoCase(name) == 0; });
+    if (existing != impl_->saved_layouts.end()) {
+        if (wxMessageBox(wxString::Format("Replace the saved layout '%s'?", existing->name),
+                         "Save Workspace Layout", wxYES_NO | wxNO_DEFAULT | wxICON_QUESTION,
+                         this) != wxYES) return;
+    } else if (impl_->saved_layouts.size() >= maximum_saved_layouts) {
+        wxMessageBox("All 16 layout slots are in use. Replace a named layout or delete one first.",
+                     "Save Workspace Layout", wxOK | wxICON_INFORMATION, this);
+        return;
+    }
+    auto perspective = docking_.SavePerspective();
+    if (perspective.empty() || perspective.length() > maximum_layout_perspective_characters) {
+        wxMessageBox("This pane arrangement exceeds the saved layout size limit.",
+                     "Save Workspace Layout", wxOK | wxICON_WARNING, this);
+        return;
+    }
+    if (existing != impl_->saved_layouts.end())
+        *existing = {name, std::move(perspective)};
+    else
+        impl_->saved_layouts.push_back({name, std::move(perspective)});
+    if (PersistNamedLayouts())
+        SetStatusText(wxString::Format("Saved workspace layout '%s'.", name));
+    else
+        wxMessageBox("The layout is available for this session, but the saved layouts could not be written to the user configuration.",
+                     "Save Workspace Layout", wxOK | wxICON_WARNING, this);
+}
+void MainFrame::RestoreNamedLayout() {
+    if (impl_->saved_layouts.empty()) return;
+    wxArrayString choices;
+    for (const auto &layout : impl_->saved_layouts) choices.Add(layout.name);
+    wxSingleChoiceDialog dialog(this, "Choose a saved pane arrangement.", "Restore Workspace Layout", choices);
+    if (dialog.ShowModal() != wxID_OK) return;
+    const auto selected = dialog.GetSelection();
+    if (selected < 0 || static_cast<std::size_t>(selected) >= impl_->saved_layouts.size()) return;
+    const auto &layout = impl_->saved_layouts[static_cast<std::size_t>(selected)];
+    const auto previous = docking_.SavePerspective();
+    if (!docking_.LoadPerspective(layout.perspective, false)) {
+        docking_.LoadPerspective(previous, true);
+        wxMessageBox("The saved pane arrangement could not be restored. The current layout was retained.",
+                     "Restore Workspace Layout", wxOK | wxICON_WARNING, this);
+        return;
+    }
+    // A layout changes the panes, not the active document or its notebook page.
+    docking_.GetPane("workspace").Show();
+    FitFloatingPanesToDisplays();
+    impl_->compact = GetClientSize().x < FromDIP(1050);
+    docking_.Update();
+    SetStatusText(wxString::Format("Restored workspace layout '%s'.", layout.name));
+}
+void MainFrame::DeleteNamedLayout() {
+    if (impl_->saved_layouts.empty()) return;
+    wxArrayString choices;
+    for (const auto &layout : impl_->saved_layouts) choices.Add(layout.name);
+    wxSingleChoiceDialog dialog(this, "Choose the saved layout to delete. The current pane arrangement is kept.",
+                                 "Delete Workspace Layout", choices);
+    if (dialog.ShowModal() != wxID_OK) return;
+    const auto selected = dialog.GetSelection();
+    if (selected < 0 || static_cast<std::size_t>(selected) >= impl_->saved_layouts.size()) return;
+    const auto name = impl_->saved_layouts[static_cast<std::size_t>(selected)].name;
+    impl_->saved_layouts.erase(impl_->saved_layouts.begin() + selected);
+    if (PersistNamedLayouts())
+        SetStatusText(wxString::Format("Deleted saved workspace layout '%s'.", name));
+    else
+        wxMessageBox("The layout was removed for this session, but the saved layouts could not be written to the user configuration.",
+                     "Delete Workspace Layout", wxOK | wxICON_WARNING, this);
+}
 void MainFrame::RestoreDesktopState() {
     restoring_desktop_state_ = true;
     normal_frame_rect_ = GetRect();
@@ -6241,6 +6380,25 @@ void MainFrame::RestoreDesktopState() {
     if (config) {
         const auto previous_path = config->GetPath();
         config->SetPath("/Desktop");
+        long layout_count = 0;
+        impl_->saved_layouts.clear();
+        if (config->Read("WorkspaceLayouts/Count", &layout_count) && layout_count > 0) {
+            const auto bounded_count = std::min(layout_count, static_cast<long>(maximum_saved_layouts));
+            for (long index = 0; index < bounded_count; ++index) {
+                const auto prefix = wxString::Format("WorkspaceLayouts/%ld/", index);
+                wxString name, perspective;
+                if (!config->Read(prefix + "Name", &name) ||
+                    !config->Read(prefix + "Perspective", &perspective)) continue;
+                name.Trim(true).Trim(false);
+                if (name.empty() || name.length() > maximum_layout_name_characters ||
+                    name.find_first_of("\r\n\t") != wxString::npos ||
+                    perspective.length() > maximum_layout_perspective_characters ||
+                    !perspective.StartsWith("layout2|") || !perspective.Contains("name=workspace;")) continue;
+                const auto duplicate = std::any_of(impl_->saved_layouts.begin(), impl_->saved_layouts.end(),
+                    [&](const Impl::SavedLayout &layout) { return layout.name.CmpNoCase(name) == 0; });
+                if (!duplicate) impl_->saved_layouts.push_back({std::move(name), std::move(perspective)});
+            }
+        }
         long x = 0, y = 0, width = 0, height = 0, maximized = 0;
         impl_->restore_persisted_navigation(*config);
         wxString imports_filter, exports_filter, segments_filter, symbols_filter;
@@ -6274,6 +6432,7 @@ void MainFrame::RestoreDesktopState() {
         }
         const bool restore_maximized = config->Read("FrameMaximized", &maximized) && maximized != 0;
         config->SetPath(previous_path);
+        FitFloatingPanesToDisplays();
         docking_.Update();
         AdaptLayout();
         if (restore_maximized) Maximize(true);

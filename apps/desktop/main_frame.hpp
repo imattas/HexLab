@@ -48,7 +48,8 @@ enum Command {
     cross_document_jump_id,
     python_console_id,
     browse_image_entries_id,
-    export_navigation_history_id
+    export_navigation_history_id,
+    main_frame_command_end
 };
 class MainFrame final : public wxFrame {
   public:
@@ -76,6 +77,11 @@ class MainFrame final : public wxFrame {
     bool OpenComparisonSession(const std::filesystem::path &, bool show_error);
     void TrackComparisonSession(CompareView *, const std::filesystem::path &);
     void AdaptLayout();
+    void FitFloatingPanesToDisplays();
+    void SaveNamedLayout();
+    void RestoreNamedLayout();
+    void DeleteNamedLayout();
+    bool PersistNamedLayouts();
     void RestoreDesktopState();
     void SaveDesktopState();
     void RestoreWorkspaceSession();
