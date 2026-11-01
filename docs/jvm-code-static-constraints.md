@@ -38,12 +38,14 @@ the same class-context scan when it needs instruction boundaries.
 
 These checks implement part of the
 [JVMS static and structural constraints](https://docs.oracle.com/javase/specs/jvms/se25/html/jvms-4.html#jvms-4.9),
-not a complete verifier. A separate bounded [operand-stack analysis](jvm-operand-stack-verification.md)
-checks reachable stack heights, category layout and primitive transfers across
-CFG and exception edges. A successful load does not prove local initialization,
-reference assignability, constructor alias transitions, required stack-map
-coverage, access control or runtime member resolution. An `areturn` category
-match does not prove assignability. A class-name match does not prove a defining
-loader or an available hierarchy. Consumers that require those facts must keep
-missing, ambiguous or incomplete hierarchy evidence unresolved and reject an
-operation whose safety requires such a proof.
+not a complete verifier. A separate bounded [stack and local analysis](jvm-operand-stack-verification.md)
+checks reachable stack transfers and primitive/reference local categories
+across CFG and exception edges. It tracks descriptor-initialized parameter
+slots, stores, category-2 overlap and uninitialized local reads for the
+implemented transfer subset. A successful load still does not prove reference
+assignability, constructor alias transitions, required stack-map coverage,
+access control or runtime member resolution. An `areturn` category match does
+not prove assignability. A class-name match does not prove a defining loader or
+an available hierarchy. Consumers that require those facts must keep missing,
+ambiguous or incomplete hierarchy evidence unresolved and reject an operation
+whose safety requires such a proof.

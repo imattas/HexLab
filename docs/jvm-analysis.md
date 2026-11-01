@@ -22,13 +22,15 @@ These checks apply without stack-map metadata. See [Code static operand
 constraints](jvm-code-static-constraints.md) for the bounds and remaining verifier
 and hierarchy limitations.
 
-A bounded [operand-stack verifier](jvm-operand-stack-verification.md) propagates
-primitive/reference stack categories through ordinary CFG edges and reachable
-exception handlers. It rejects underflow, max-stack overflow, split category-2
-values, incompatible merges, primitive transfer mismatches and provable
-stack-map conflicts. References remain coarse when hierarchy or initialization
-facts are unavailable. Legacy subroutines and exhausted work budgets retain
-static checks and report partial analysis.
+A bounded [stack and local verifier](jvm-operand-stack-verification.md)
+propagates primitive/reference stack categories and local-slot categories
+through ordinary CFG edges and reachable exception handlers. It rejects
+underflow, max-stack overflow, split category-2 values, incompatible stack
+merges, uninitialized local reads, primitive transfer mismatches and provable
+stack-map conflicts. Local joins degrade disagreeing slots to unusable `top`;
+references remain coarse when hierarchy or initialization facts are
+unavailable. Legacy subroutines and exhausted work budgets retain static checks
+and report partial analysis.
 
 `Code` metadata also retains bounded, expanded verifier frames from `StackMapTable` and pre-version-50 `StackMap`, including object constant-pool identities and uninitialized-object offsets. See [JVM stack-map metadata](jvm-stack-map-tables.md) for the public model, instruction-boundary checks, resource bounds, and distinction between parsed frames and full verification.
 

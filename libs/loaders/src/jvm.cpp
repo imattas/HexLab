@@ -1413,7 +1413,7 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage,std::stop_t
                     if(e.catch_type){auto c=class_name(e.catch_type);if(!c)return c.error();}code.exception_table.push_back(e);}
                 auto nested=attributes(false,member,false,&code,nullptr);local_variable_entries_seen.erase(&code);if(!nested)return nested.error();
                 if(r.p!=start+len)return malformed("Code attribute length does not match its parsed structure");
-                auto stack_checked=jvm_detail::verify_operand_stack(code_bytes,code_scan.value(),code,md,stop,operand_stack_work);
+                auto stack_checked=jvm_detail::verify_operand_stack(code_bytes,code_scan.value(),code,*member,md,stop,operand_stack_work);
                 if(!stack_checked)return stack_checked.error();
                 if(!stack_checked.value()){operand_stack_partial=true;metadata_complete=false;}
                 member->code=std::move(code);

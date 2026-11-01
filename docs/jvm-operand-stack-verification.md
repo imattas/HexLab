@@ -1,11 +1,13 @@
 # Bounded JVM operand-stack verification
 
 After parsing a method's Code, exception clauses and stack maps, the classfile
-loader runs a worklist analysis from its empty method-entry operand stack.
-Each reachable instruction carries an ordered vector of logical int, float,
-long, double or reference values. Long and double remain indivisible values
-with a physical depth of two slots. Reference values deliberately carry no
-class identity, array component type or initialized/uninitialized identity.
+loader runs a worklist analysis from the method's descriptor-derived locals and
+an empty operand stack. Each reachable instruction carries an ordered vector
+of logical int, float, long, double or reference stack values plus its local
+slot categories. Long and double remain indivisible stack values with a
+physical depth of two slots; locals use an explicit category-2 tail slot.
+Reference values deliberately carry no class identity, array component type
+or initialized/uninitialized identity.
 
 The pass rejects definite stack violations with `ErrorCode::malformed` and the
 method-relative bytecode offset:
@@ -19,33 +21,44 @@ method-relative bytecode offset:
   the same instruction through ordinary CFG edges.
 - A reachable primitive/reference stack that disagrees with a declared
   StackMapTable or legacy StackMap frame, where that frame has no `top` entries.
+- A reachable local load or `iinc` that reads an unusable local, a category or
+  type mismatch, category-2 half-slot use, or disagreement with a declared
+  StackMapTable/legacy StackMap local type.
 - Reachable normal fallthrough beyond the Code array.
 
-Transfers cover standard non-subroutine bytecodes: constants and local loads/
-stores; arrays; scalar arithmetic, shifts, conversions and comparisons; branches,
+Transfers cover standard non-subroutine bytecodes: constants and typed local
+loads/stores/`iinc`; arrays; scalar arithmetic, shifts, conversions and comparisons; branches,
 switches and returns; descriptor-driven fields and calls, including dynamic
 constants and invokedynamic; allocation, casts, monitors and athrow. Arguments
 are popped in reverse descriptor order, category-2 results use two slots, and
 instance calls/fields consume a reference receiver. A return discards any
 remaining stack after consuming its required top value, as the JVM specifies.
-Local loads use the opcode's stack type; the pass does not establish that a
-local was initialized or actually holds that type.
+The entry locals are initialized from `this` (when non-static) and the method
+descriptor. Stores invalidate overlapping category-2 values before writing;
+local joins retain a category only when every incoming edge agrees and
+otherwise degrade to unusable `top` slots. This detects uninitialized local
+reads and primitive category mistakes without attempting reference
+assignability.
 
 Every reachable protected instruction contributes an exceptional edge to each
-covering handler. Its incoming stack is replaced with exactly one reference,
-independent of the protected instruction's ordinary stack. Handler states then
-participate in ordinary transfer and merge checks, including max_stack and
-stack-map consistency. Catch assignability, constructor aliases and exceptional
-local-variable states require richer analysis and remain unresolved.
+covering handler using the pre-instruction locals. Its incoming stack is
+replaced with exactly one reference, independent of the protected instruction's
+ordinary stack. Handler states then participate in ordinary transfer and merge
+checks, including max_stack and stack-map consistency. Reachable `new`
+instructions mark the analysis partial: allocation identities and
+`invokespecial <init>` alias initialization are not tracked, so a coarse
+reference category cannot prove that an uninitialized allocation is used
+legally. Constructor alias initialization, catch assignability and
+hierarchy-dependent local reference assignability remain unresolved.
 
 Work is capped at eight million units per class, charging byte scans, stack
 copies/comparisons, descriptor text, frame checks and handler-edge visits. At
-most 1,048,576 logical stack entries are retained per method; instruction states
-are bounded by the existing 65,535-byte Code limit. Cancellation is checked
+most 1,048,576 retained stack/local entries are stored per method; instruction
+states are bounded by the existing 65,535-byte Code limit. Cancellation is checked
 during the pre-scan and worklist traversal. Legacy jsr/ret requires a
 context-sensitive return-address model, so a method containing one keeps its
-static checks but skips this stack pass. Exhausted budgets, unsupported evidence
-and reachable `top` frame entries leave the class's analysis partial, with an
+static checks but skips this pass. Exhausted budgets, unsupported evidence and
+reachable stack-map `top` entries leave the class's analysis partial, with an
 explicit loader diagnostic and `metadata_complete == false`; these cases do not
 turn otherwise loadable input into a malformed-bytecode error.
 
@@ -56,5 +69,5 @@ coarse reference category; the loader does not invent a common superclass or
 prove assignment compatibility through missing hierarchy metadata. Consumers
 must still reject operations that require an unavailable hierarchy proof.
 Unreachable blocks are not seeded from stack maps, required frame coverage is
-not established, and local initialization, constructor initialization, member
-access, array component compatibility and runtime linkage remain outside scope.
+not established, constructor initialization, member access, array component
+compatibility and runtime linkage remain outside scope.
