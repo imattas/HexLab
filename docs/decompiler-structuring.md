@@ -339,12 +339,16 @@ overlapping arms, malformed edges, incomplete block coverage, and larger
 graphs retain the existing fallback.
 
 An explicit-preheader post-tested loop may also use a bounded nested body-
-dispatch tree whose leaves end in distinct conditional latches. Each latch must
-target the dispatcher header on one edge and the same exit cleanup head on
-the other. The shared cleanup may contain up to 64 blocks including its final
+dispatch tree whose leaves end in distinct latches. A leaf may unconditionally
+repeat at the dispatcher header, or conditionally target that header on one
+edge and the same exit cleanup head on the other. At least two latches and one
+conditional exit latch are required. The shared cleanup may contain up to 64
+blocks including its final
 explicit return or recognized non-returning `throw`,
 `rethrow_current_exception`, or `exception_unhandled` intrinsic. The cleanup
-head's predecessors must be exactly all latch blocks. Every cleanup block
+head's predecessors must be exactly the conditional exit latch blocks;
+unconditional continue latches contribute only to the header predecessor set.
+Every cleanup block
 after the head is register-phi-free and has exactly its preceding block
 as its CFG predecessor. Nonterminal cleanup blocks have one exact unconditional
 jump or fallthrough edge and cannot contain returns or explicit exception
@@ -357,10 +361,14 @@ latch leaves, 127 branch nodes, and at most 64 nodes along any dispatch path
 complete function at 128 blocks and 4,096 edges. Header
 register phis must have exactly one initial input from the preheader and one
 recurrent input from every latch. Cleanup-head register phis must match exactly
-the latch edges. The formatter emits the preheader once, applies initial phi
-copies, then emits each latch's repeat or exit copies before `continue` or
-`break`. It emits the shared cleanup once after the loop, so cleanup effects
-execute only on exit. Memory phis, register phis after the cleanup head, shared
+the conditional exit latch edges. The formatter emits the preheader once,
+applies initial phi copies, then emits each latch's repeat or exit copies before `continue` or
+`break`. Unconditional latches emit their own simultaneous header copies and
+`continue`, with the original instruction address and block ID retained on the
+transfer. Their straight-line paths require exact jump/fallthrough edges and
+unique predecessors, just like the conditional latch paths. It emits the
+shared cleanup once after the loop, so cleanup effects execute only on exit.
+Memory phis, register phis after the cleanup head, shared
 body paths, extra exits, side entries, branched cleanup, cleanup chains beyond
 64 blocks, and malformed edge/phi sets retain the existing lossless fallback.
 

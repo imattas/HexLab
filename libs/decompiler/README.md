@@ -235,9 +235,11 @@ with one condition header, a single-successor chain of straight-line body
 blocks, and one terminal exit; and a post-tested `do ... while` whose latch
 branches back to its body or exits. A bounded post-tested form also handles
 binary conditional dispatch trees with up to 64 latch leaves and 127
-dispatch/latch nodes. Every latch must share the same repeat destination and
-terminal return exit, and exact predecessor sets must prove dispatch and exit
-coverage. Header and return register phis are accepted only with exact edge
+dispatch/latch nodes. Every latch shares the same repeat destination; leaves
+may repeat unconditionally or branch between repeat and a shared terminal
+cleanup chain. At least one conditional exit latch is required. Exact
+predecessor sets prove dispatch, repeat, and exit coverage separately. Header
+and cleanup-head register phis are accepted only with exact edge
 coverage; memory phis remain unsupported. The whole function is limited to
 128 blocks, with at most 64 blocks on each traced path. The proof and fallback
 cases are described in
