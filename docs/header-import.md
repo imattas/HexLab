@@ -44,15 +44,19 @@ attribute metadata. Other standard attributes, attribute namespaces such as
 for `nodiscard` or `deprecated` are rejected explicitly.
 
 During template instantiation, a function or method prototype parameter may
-expand one bound type pack with `Ts... values`, `const Ts*... values`, or
-`Wrapper<Ts>... values`. Each element is substituted into the type pattern and
-parsed using the existing type and function rules, in source pack order.
+expand one bound type or integral pack with `Ts... values`, `const Ts*... values`,
+`Wrapper<Ts>... values`, or `Buffer<(Counts + 1)>... values`. Integral packs
+must occur inside template type patterns, where the existing bounded integer
+expression evaluator and destination parameter-width checks prove each concrete
+argument. Unknown or unsupported dependent expressions fail explicitly. Each
+element is substituted into the type pattern and parsed using the existing
+type and function rules, in source pack order.
 Repeated occurrences of the same pack use the same element. Expanded parameter
-names are `values__pack0`, `values__pack1`, and so on. Empty type packs produce
-no parameters. Signatures containing an expansion are capped at 32 concrete
-parameters, including ordinary parameters before and after expansions.
-Integral/template-name packs (including empty ones), multiple distinct packs
-in a pattern, nested ellipses, default arguments on an expanded pack,
+names are `values__pack0`, `values__pack1`, and so on. Empty type or integral
+packs produce no parameters. Signatures containing an expansion are capped at
+32 concrete parameters, including ordinary parameters before and after expansions.
+Template-name packs (including empty ones), integral packs used directly as types,
+multiple distinct packs in a pattern, nested ellipses, defaults on an expanded pack,
 reference/parenthesized/array pack declarators, suffixes after the pack name,
 and parameter-pack expansions in function definitions are unsupported.
 Supported aliases can still supply array/callback types, with ordinary array

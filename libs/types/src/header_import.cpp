@@ -151,6 +151,7 @@ struct TemplateBindings {
     std::map<std::string, std::vector<TemplateArgument>, std::less<>> packs;
     // Preserve kind information when a bound pack has no elements.
     std::set<std::string, std::less<>> type_packs;
+    std::set<std::string, std::less<>> value_packs;
 };
 struct TemplateAlias { std::vector<TemplateParameter> parameters; std::vector<Token> target; };
 struct AggregateSpecialization {
@@ -457,6 +458,7 @@ public:
           template_template_bindings_(context.template_template_bindings_),
           template_pack_bindings_(context.template_pack_bindings_),
           template_type_packs_(context.template_type_packs_),
+          template_value_packs_(context.template_value_packs_),
           template_depth_(static_cast<std::uint16_t>(context.template_depth_ + 1)) {
         install_scalars();
         for (const auto &[name, type] : context.names_) names_.insert_or_assign(name, type);
@@ -504,6 +506,7 @@ private:
     std::map<std::string, std::string, std::less<>> template_template_bindings_;
     std::map<std::string, std::vector<TemplateArgument>, std::less<>> template_pack_bindings_;
     std::set<std::string, std::less<>> template_type_packs_;
+    std::set<std::string, std::less<>> template_value_packs_;
     std::string template_instance_name_;
     std::string template_instance_base_name_;
     std::uint16_t template_depth_ = 0;
@@ -901,7 +904,8 @@ private:
                               const std::map<std::string, std::uint64_t, std::less<>> &value_bindings = {},
                               const std::map<std::string, std::string, std::less<>> &template_bindings = {},
                               const std::map<std::string, std::vector<TemplateArgument>, std::less<>> &pack_bindings = {},
-                              const std::set<std::string, std::less<>> &type_packs = {}) {
+                              const std::set<std::string, std::less<>> &type_packs = {},
+                              const std::set<std::string, std::less<>> &value_packs = {}) {
         if (template_depth_ >= o_.max_nesting)
             fail(ErrorCode::resource_limit, "template type expansion exceeds configured nesting limit");
         Parser nested(tokens_with_eof(tokens), o_, *this);
@@ -914,6 +918,8 @@ private:
             nested.template_pack_bindings_.insert_or_assign(name, value);
             if (type_packs.contains(name)) nested.template_type_packs_.insert(name);
             else nested.template_type_packs_.erase(name);
+            if (value_packs.contains(name)) nested.template_value_packs_.insert(name);
+            else nested.template_value_packs_.erase(name);
         }
         auto base = nested.parse_base();
         if (base.is_typedef || base.is_static) syntax("storage specifiers are invalid in a template type argument");
@@ -1089,6 +1095,7 @@ private:
                 auto &pack = bindings.packs[parameter.name];
                 if (!parameter.value_parameter && !parameter.template_parameter)
                     bindings.type_packs.insert(parameter.name);
+                if (parameter.value_parameter) bindings.value_packs.insert(parameter.name);
                 while (argument_index < arguments.size()) {
                     const auto &argument = arguments[argument_index++];
                     if (parameter.value_parameter != argument.value.has_value() ||
@@ -1145,7 +1152,7 @@ private:
                 TypePtr type;
                 if (argument) type = argument->type;
                 else if (!parameter.default_type.empty())
-                    type = parse_type_tokens(parameter.default_type, bindings.types, bindings.values, bindings.templates, bindings.packs, bindings.type_packs);
+                    type = parse_type_tokens(parameter.default_type, bindings.types, bindings.values, bindings.templates, bindings.packs, bindings.type_packs, bindings.value_packs);
                 else fail(ErrorCode::malformed, "too few type arguments for template");
                 if (!type || (argument && (argument->value || !argument->template_name.empty())))
                     fail(ErrorCode::malformed, "template argument '" + parameter.name + "' must be a type");
@@ -1194,7 +1201,7 @@ private:
         if (!active_template_aliases_.insert(key).second)
             fail(ErrorCode::conflict, "recursive type alias template instantiation '" + key + "'");
         auto type = parse_type_tokens(definition->second.target, bindings.types, bindings.values,
-                                      bindings.templates, bindings.packs, bindings.type_packs);
+                                      bindings.templates, bindings.packs, bindings.type_packs, bindings.value_packs);
         active_template_aliases_.erase(key);
         return type;
     }
@@ -1655,6 +1662,8 @@ private:
             nested.template_pack_bindings_.insert_or_assign(parameter, pack);
             if (bindings.type_packs.contains(parameter)) nested.template_type_packs_.insert(parameter);
             else nested.template_type_packs_.erase(parameter);
+            if (bindings.value_packs.contains(parameter)) nested.template_value_packs_.insert(parameter);
+            else nested.template_value_packs_.erase(parameter);
         }
         nested.template_instances_.insert_or_assign(instance_name, incomplete.value());
         // Class templates are stored at namespace scope; instantiation from a
@@ -3080,11 +3089,29 @@ private:
                         const auto &name=pattern.type[index].text;
                         if((index&&pattern.type[index-1].text=="::")||!template_pack_bindings_.contains(name))continue;
                         if(!pattern.pack.empty()&&pattern.pack!=name)
-                            fail(ErrorCode::unsupported,"parameter expansion patterns support one distinct bound type pack");
+                            fail(ErrorCode::unsupported,"parameter expansion patterns support one distinct bound type or integral pack");
                         pattern.pack=name;
                     }
-                    if(pattern.pack.empty()||!template_type_packs_.contains(pattern.pack))
-                        fail(ErrorCode::unsupported,"parameter expansion requires one bound type pack in its pattern");
+                    if(pattern.pack.empty()||(!template_type_packs_.contains(pattern.pack)&&
+                                              !template_value_packs_.contains(pattern.pack)))
+                        fail(ErrorCode::unsupported,"parameter expansion requires one bound type or integral pack in its pattern");
+                    if(template_value_packs_.contains(pattern.pack)) {
+                        // Integral elements must occur inside a template type
+                        // pattern, never in the position of a type themselves.
+                        // Check this even when there are no elements to parse.
+                        std::size_t template_angles=0,expression_parens=0,expression_brackets=0;
+                        for(std::size_t index=0;index<pattern.type.size();++index) {
+                            const auto &part=pattern.type[index].text;
+                            if(part==pattern.pack&&!(index&&pattern.type[index-1].text=="::")&&!template_angles)
+                                fail(ErrorCode::unsupported,"integral parameter packs require a nested template type pattern");
+                            if(part=="(")++expression_parens;
+                            else if(part==")")--expression_parens;
+                            else if(part=="[")++expression_brackets;
+                            else if(part=="]")--expression_brackets;
+                            else if(!expression_parens&&!expression_brackets&&part=="<")++template_angles;
+                            else if(!expression_parens&&!expression_brackets&&part==">")--template_angles;
+                        }
+                    }
                     pos_=cursor+2;
                     return pattern;
                 }
@@ -3143,8 +3170,11 @@ private:
                         if(pack.size()>32||params.size()>32-pack.size())
                             fail(ErrorCode::resource_limit,"expanded function parameter count exceeds 32");
                         for(std::size_t pack_index=0;pack_index<pack.size();++pack_index) {
-                            if(!pack[pack_index].type||pack[pack_index].value||!pack[pack_index].template_name.empty())
-                                fail(ErrorCode::unsupported,"function parameter-pack expansion supports type arguments only");
+                            const auto &element=pack[pack_index];
+                            const bool type_pack=template_type_packs_.contains(pattern->pack);
+                            if(!element.template_name.empty()||
+                               (type_pack?(!element.type||element.value):(element.type||!element.value)))
+                                fail(ErrorCode::unsupported,"function parameter-pack element does not match its type or integral pack kind");
                             auto expanded_type=expand_template_pack_argument(pattern->type,pattern->pack,
                                                                            pack[pack_index],TemplateParameter{}).type;
                             if(expanded_type->kind()==Kind::array) {

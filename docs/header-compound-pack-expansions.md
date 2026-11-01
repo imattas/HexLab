@@ -95,7 +95,8 @@ pattern is instantiated only when its enclosing declaration is referenced;
 an empty pack does not parse hypothetical element types.
 
 Function and method prototype parameter lists can also expand a single bound
-**type** pack inside a type pattern, including pointers and nested templates:
+type or integral pack inside a type pattern, including pointers and nested
+templates:
 
 ```cpp
 template <typename... Types>
@@ -120,18 +121,54 @@ type parser, target ABI options, function calling-convention rules, array-to-
 pointer parameter adjustment, and function-type validation. It records concrete
 signatures without retaining pack source metadata or adding object members.
 
+An integral pack can supply non-type arguments in a nested template type
+pattern. The same element replaces every occurrence of that pack before the
+ordinary constant-expression parser and destination parameter-width checks run:
+
+```cpp
+template <unsigned Count>
+struct Buffer { unsigned char bytes[Count]; };
+
+template <unsigned... Counts>
+struct Receiver {
+    void buffers(unsigned first, Buffer<(Counts + 1)>... values);
+    void pairs(Pair<Buffer<Counts>, Buffer<(Counts + 2)>>... values);
+};
+using Receivers = Receiver<2, 4>;
+
+template <unsigned... Counts>
+using BufferCallback = void (*)(const Buffer<(Counts + 1)>*... values);
+using ReceiveCallback = BufferCallback<2, 4>;
+```
+
+`Receivers::buffers` has an ordinary `unsigned` parameter followed by
+`Buffer<3>` and `Buffer<5>` parameters. `pairs` substitutes two and four into
+both nested argument positions in source order. `ReceiveCallback` takes
+pointers to const `Buffer<3>` and const `Buffer<5>`. Nested aliases can also
+use the integral element as an array extent, with the ordinary array-to-pointer
+parameter adjustment. Integral packs must occur inside template type patterns;
+`Counts... values` and `Counts*... values` cannot use integral values as types
+and are rejected even for empty packs.
+
+Expressions must evaluate completely using the bounded signed integer subset.
+Unknown names, unsupported dependent member/call expressions, fold expressions,
+overflow, division by zero, negative final arguments, and values outside a
+destination non-type parameter's width fail explicitly. No expression inversion,
+symbolic signature, or general C++ evaluation is attempted. Operators containing
+`<` or `>` in non-type arguments must remain parenthesized.
+
 The accepted parameter spelling is `type-pattern... name`; the name is required.
 Direct `Types... name` remains supported. A signature containing an expansion is
 capped at 32 total concrete parameters, including ordinary parameters before
-and after every expansion. Empty type packs contribute no parameters and do not
-parse hypothetical element types. Pack kind is checked even for empty packs:
-integral and template-name packs are unsupported in parameter expansions.
+and after every expansion. Empty type or integral packs contribute no parameters
+and do not parse hypothetical element types. Pack kind is checked even for empty
+packs: template-name packs are unsupported in parameter expansions.
 Default arguments, references, parenthesized/array pack declarators, suffixes
 after the pack name, nested ellipses, and function definitions remain unsupported.
 A nested supported alias may still supply an array or callback type, subject to
 the ordinary parameter rules. Source/token/input limits and configured parser
-and template nesting bounds remain in force; substitution binds types rather
-than generating additional source text.
+and template nesting bounds remain in force; substitution binds types or values
+rather than generating additional source text.
 
 Each pattern must reference exactly one distinct bound pack. Repeated use of
 that same pack is supported; zipping two different packs, nested ellipses in
