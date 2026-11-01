@@ -77,9 +77,10 @@ DecodeResult decode_mips32(ByteOrder order, std::span<const std::byte> bytes, Ad
     };
     if (op == 0) {
         switch (funct) {
-        case 0x00: case 0x02: case 0x03: // fixed shifts
-            if (rs != 0) return invalid("Reserved fixed-shift encoding");
-            i.opcode = funct == 0 ? Opcode::mips_sll : funct == 2 ? Opcode::mips_srl : Opcode::mips_sra;
+        case 0x00: case 0x02: case 0x03: // fixed shifts (SRL rs=1 is ROTR)
+            if (rs != 0 && !(funct == 2 && rs == 1)) return invalid("Reserved fixed-shift encoding");
+            i.opcode = funct == 0 ? Opcode::mips_sll : funct == 2
+                ? (rs == 1 ? Opcode::mips32_rotr : Opcode::mips_srl) : Opcode::mips_sra;
             i.operands = {reg(rd), reg(rt), ImmediateOperand{shamt, 5, 32, false, EncodedField{3, 1}}};
             i.access = {OperandAccess::write, OperandAccess::read, OperandAccess::read};
             i.register_reads = {reg(rt)}; if (rd) i.register_writes = {reg(rd)}; break;
@@ -92,8 +93,10 @@ DecodeResult decode_mips32(ByteOrder order, std::span<const std::byte> bytes, Ad
             if (rd) i.register_writes = {reg(rd)};
             break;
         case 0x04: case 0x06: case 0x07:
-            if (shamt != 0) return invalid("Reserved variable-shift encoding");
-            i.opcode = funct == 4 ? Opcode::mips_sllv : funct == 6 ? Opcode::mips_srlv : Opcode::mips_srav;
+            if (shamt != 0 && !(funct == 0x06 && shamt == 1))
+                return invalid("Reserved variable-shift encoding");
+            i.opcode = funct == 4 ? Opcode::mips_sllv : funct == 6
+                ? (shamt == 1 ? Opcode::mips32_rotrv : Opcode::mips_srlv) : Opcode::mips_srav;
             i.operands = {reg(rd), reg(rt), reg(rs)};
             i.access = {OperandAccess::write, OperandAccess::read, OperandAccess::read};
             i.register_reads = {reg(rt), reg(rs)}; if (rd) i.register_writes = {reg(rd)}; break;

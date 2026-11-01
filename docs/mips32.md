@@ -4,6 +4,13 @@ HexLab recognizes ELF `e_machine=EM_MIPS` (`8`) for ELF32 inputs in both byte or
 
 The fixed-width decoder covers selected SPECIAL shifts and register jumps, integer add/subtract/logic/compare, immediate forms, J/JAL, BEQ/BNE/BLEZ/BGTZ/BLTZ/BGEZ and their BEQL/BNEL/BLEZL/BGTZL/BLTZL/BGEZL likely forms, the REGIMM `BLTZAL`/`BGEZAL` conditional-link forms and `BLTZALL`/`BGEZALL` conditional-link-likely forms, and common byte/halfword/word loads and stores including LWL/LWR/SWL/SWR. Instruction-word and encoded low-halfword fields follow the ELF byte order. It also decodes the integer HI/LO path: MULT/MULTU and DIV/DIVU read two GPRs and write the special HI and LO registers; MFHI/MFLO transfer one special register to a GPR; MTHI/MTLO transfer a GPR to a special register. These operands have explicit access directions and format as `hi` and `lo`. A pure helper evaluates the 32-bit multiply/divide result pair; divide-by-zero and signed quotient overflow have no concrete helper result. The bounded native COP1 subset includes `MFC1`/`MTC1` and `CFC1`/`CTC1` for FCCR25/FEXR26/FENR28/FCSR31, as described below; unsupported encodings may still be decoded opaquely through the generic Capstone fallback. Reserved encodings, bad fixed fields, and unaligned addresses report `invalid`; fewer than four bytes report `truncated`.
 
+The decoder recognizes MIPS32 Release 2 `ROTR` as the `SRL` encoding with
+`rs=1`, and `ROTRV` as the `SRLV` encoding with `shamt=1`. Other nonzero
+reserved fields remain invalid. The semantic helper rotates within 32 bits;
+variable counts use the low five bits. These operations feed bounded address
+propagation and typed decompiler `rotr` expressions. This does not imply broad
+MIPS32 Release 2 instruction coverage.
+
 MIPS32 Release 2 SPECIAL3 `EXT` and `INS` decode as `ext rt, rs, pos, size` and
 `ins rt, rs, pos, size`. `EXT` accepts positions 0–31 and sizes 1–32 only when
 `pos + size <= 32`; its `rd` field encodes `size - 1`. `INS` requires the

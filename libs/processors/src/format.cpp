@@ -245,6 +245,8 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
     case Opcode::mips_bc1fl: return "bc1fl";
     case Opcode::mips_clz: return "clz";
     case Opcode::mips_clo: return "clo";
+    case Opcode::mips32_rotr: return "rotr";
+    case Opcode::mips32_rotrv: return "rotrv";
     case Opcode::mips_mul: return "mul";
     case Opcode::mips64_dclz: return "dclz";
     case Opcode::mips64_dclo: return "dclo";

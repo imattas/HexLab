@@ -721,7 +721,9 @@ enum class Opcode {
     // FSGSBASE uses 64-bit FS/GS base state, distinct from segment selectors.
     rdfsbase, rdgsbase, wrfsbase, wrgsbase,
     // VEX scalar floating compare predicates; append for serialized ID stability.
-    vcmpss, vcmpsd
+    vcmpss, vcmpsd,
+    // MIPS32 Release 2 rotate-right aliases of SRL/SRLV; append for stable IDs.
+    mips32_rotr, mips32_rotrv
 };
 enum class OperandAccess { read, write, read_write, address };
 // The encoded x86 group-one repeat prefix is retained separately from the

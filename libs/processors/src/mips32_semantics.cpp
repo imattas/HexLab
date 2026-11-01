@@ -950,9 +950,9 @@ evaluate_mips32_shift_instruction(const Instruction &instruction,
                                   std::uint32_t source,
                                   std::uint32_t amount_value) noexcept {
     const bool fixed = instruction.opcode == Opcode::mips_sll || instruction.opcode == Opcode::mips_srl ||
-                       instruction.opcode == Opcode::mips_sra;
+                       instruction.opcode == Opcode::mips_sra || instruction.opcode == Opcode::mips32_rotr;
     const bool variable = instruction.opcode == Opcode::mips_sllv || instruction.opcode == Opcode::mips_srlv ||
-                          instruction.opcode == Opcode::mips_srav;
+                          instruction.opcode == Opcode::mips_srav || instruction.opcode == Opcode::mips32_rotrv;
     if ((!fixed && !variable) || instruction.context.architecture != Architecture::mips32 ||
         instruction.context.mode != ExecutionMode::mips32 || instruction.operands.size() != 3 ||
         instruction.access.size() != 3 || instruction.access[0] != OperandAccess::write ||
@@ -986,6 +986,7 @@ evaluate_mips32_shift_instruction(const Instruction &instruction,
     switch (instruction.opcode) {
     case Opcode::mips_sll: case Opcode::mips_sllv: return source << amount;
     case Opcode::mips_srl: case Opcode::mips_srlv: return source >> amount;
+    case Opcode::mips32_rotr: case Opcode::mips32_rotrv: return std::rotr(source, static_cast<int>(amount));
     case Opcode::mips_sra: case Opcode::mips_srav:
         if (amount == 0) return source;
         return (source >> amount) | ((source & 0x80000000u) ? (UINT32_MAX << (32 - amount)) : 0u);

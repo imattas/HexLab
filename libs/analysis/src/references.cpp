@@ -4885,13 +4885,15 @@ RegisterReferenceFacts mips_reference_facts(const Image *image, const Relocation
             } else if (mips32 && instruction.operands.size() == 3 &&
                 (instruction.opcode == Opcode::mips_sll || instruction.opcode == Opcode::mips_srl ||
                  instruction.opcode == Opcode::mips_sra || instruction.opcode == Opcode::mips_sllv ||
-                 instruction.opcode == Opcode::mips_srlv || instruction.opcode == Opcode::mips_srav)) {
+                 instruction.opcode == Opcode::mips_srlv || instruction.opcode == Opcode::mips_srav ||
+                 instruction.opcode == Opcode::mips32_rotr || instruction.opcode == Opcode::mips32_rotrv)) {
                 const auto *dst = architecture_register(instruction, 0, RegisterBank::mips_gpr, 32);
                 const auto *src = architecture_register(instruction, 1, RegisterBank::mips_gpr, 32);
                 std::optional<std::uint32_t> source_value;
                 std::optional<std::uint32_t> amount_value;
                 const bool variable = instruction.opcode == Opcode::mips_sllv ||
-                    instruction.opcode == Opcode::mips_srlv || instruction.opcode == Opcode::mips_srav;
+                    instruction.opcode == Opcode::mips_srlv || instruction.opcode == Opcode::mips_srav ||
+                    instruction.opcode == Opcode::mips32_rotrv;
                 if (src) {
                     if (src->index == 0) source_value = 0;
                     else if (const auto value = registers.find(src->index);

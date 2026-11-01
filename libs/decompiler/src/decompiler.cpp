@@ -4714,7 +4714,8 @@ a64_unhandled:
                  op == Opcode::mips_or || op == Opcode::mips_xor || op == Opcode::mips_nor ||
                  op == Opcode::mips_slt || op == Opcode::mips_sltu || op == Opcode::mips_sll ||
                  op == Opcode::mips_srl || op == Opcode::mips_sra || op == Opcode::mips_sllv ||
-                 op == Opcode::mips_srlv || op == Opcode::mips_srav || op == Opcode::mips_addiu ||
+                 op == Opcode::mips_srlv || op == Opcode::mips_srav || op == Opcode::mips32_rotr ||
+                 op == Opcode::mips32_rotrv || op == Opcode::mips_addiu ||
                  op == Opcode::mips_slti || op == Opcode::mips_sltiu || op == Opcode::mips_andi ||
                  op == Opcode::mips_ori || op == Opcode::mips_xori || op == Opcode::mips_lui)) {
                 if (destination->index == 0) return Intrinsic{"nop", {}, IntrinsicMemoryEffect::none};
@@ -4739,6 +4740,7 @@ a64_unhandled:
                     case Opcode::mips_sltu: case Opcode::mips_sltiu: operation = "ult"; break;
                     case Opcode::mips_sll: case Opcode::mips_sllv: operation = "shl"; break;
                     case Opcode::mips_srl: case Opcode::mips_srlv: operation = "shr"; break;
+                    case Opcode::mips32_rotr: case Opcode::mips32_rotrv: operation = "rotr"; break;
                     case Opcode::mips_sra: case Opcode::mips_srav: operation = "sar"; break;
                     default: break;
                     }

@@ -191,8 +191,8 @@ HEXLAB_PROCESSORS_EXPORT std::optional<std::uint32_t>
 evaluate_mips32_count_leading_instruction(const Instruction &instruction,
                                           std::uint32_t source) noexcept;
 
-// Evaluate MIPS32 fixed and variable word shifts from caller-supplied GPR
-// values. Variable amounts use the low five bits of the amount register.
+// Evaluate MIPS32 fixed and variable word shifts and Release 2 rotates from
+// caller-supplied GPR values. Variable amounts use the low five bits.
 HEXLAB_PROCESSORS_EXPORT std::optional<std::uint32_t>
 evaluate_mips32_shift_instruction(const Instruction &instruction,
                                   std::uint32_t source,
