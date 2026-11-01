@@ -1521,34 +1521,65 @@ bool transfer(const Instruction &instruction, FlowState &state) {
             state.arm64_stack_alias_depths[first->index] = {};
     }
 
-    // Pair and scalar load/store writeback through SP is a common AArch64
-    // prologue/epilogue form (for example STP/LDP x29,x30,[sp,#-16]!). The
-    // memory operand carries the exact architectural writeback amount; track
-    // it in entry-SP coordinates instead of treating the SP write as unknown.
+    // Scalar and pair load/store writeback through SP or a tracked x29 frame
+    // pointer is common in AArch64 prologues and epilogues. The memory operand
+    // carries the exact architectural writeback amount; retain the relation
+    // for whichever tracked base was updated.
     if (instruction.context.architecture == Architecture::arm64) {
         const MemoryOperand *stack_writeback = nullptr;
         bool alias_writeback = false;
+        bool frame_writeback = false;
         for (const auto &operand : instruction.operands) {
             const auto *memory = std::get_if<MemoryOperand>(&operand);
             if (!memory || !memory->base || !memory->writeback)
                 continue;
             const bool stack_base = memory->base->bank == RegisterBank::arm64_sp;
             const bool alias_base = memory->base->bank == RegisterBank::arm64_gpr &&
+                                    memory->base->index != 29 &&
                                     memory->base->index < state.arm64_stack_alias_depths.size() &&
                                     state.arm64_stack_alias_depths[memory->base->index].known;
-            if (!stack_base && !alias_base) continue;
+            const bool frame_base = memory->base->bank == RegisterBank::arm64_gpr &&
+                                    memory->base->index == 29;
+            if (!stack_base && !alias_base && !frame_base) continue;
             if (stack_writeback || memory->address_width != 64 || memory->index || memory->scale != 1) {
-                state.stack_depth = {};
+                if (stack_base)
+                    state.stack_depth = {};
+                if (frame_base) {
+                    state.frame_depth = {};
+                    state.arm64_frame_pointer = false;
+                }
+                if (alias_base)
+                    state.arm64_stack_alias_depths[memory->base->index] = {};
+                if (stack_writeback) {
+                    if (stack_writeback->base->bank == RegisterBank::arm64_sp)
+                        state.stack_depth = {};
+                    else if (stack_writeback->base->bank == RegisterBank::arm64_gpr &&
+                             stack_writeback->base->index == 29) {
+                        state.frame_depth = {};
+                        state.arm64_frame_pointer = false;
+                    } else if (stack_writeback->base->bank == RegisterBank::arm64_gpr &&
+                               stack_writeback->base->index < state.arm64_stack_alias_depths.size())
+                        state.arm64_stack_alias_depths[stack_writeback->base->index] = {};
+                }
                 state.supported = false;
                 return true;
             }
             stack_writeback = memory;
             alias_writeback = alias_base;
+            frame_writeback = frame_base;
         }
         if (stack_writeback) {
-            FlowValue *depth = &state.stack_depth;
+            FlowValue *depth = frame_writeback ? &state.frame_depth : &state.stack_depth;
             if (alias_writeback) {
                 depth = &state.arm64_stack_alias_depths[stack_writeback->base->index];
+            }
+            if (frame_writeback && (!state.arm64_frame_pointer || !depth->known)) {
+                state.frame_depth = {};
+                state.arm64_frame_pointer = false;
+                state.supported = false;
+                return true;
+            }
+            if (alias_writeback || frame_writeback) {
                 const auto base_index = stack_writeback->base->index;
                 bool destination_overlap = false;
                 for (std::size_t index = 0; index < instruction.operands.size() &&
@@ -1562,6 +1593,8 @@ bool transfer(const Instruction &instruction, FlowState &state) {
                 }
                 if (destination_overlap) {
                     *depth = {};
+                    if (frame_writeback)
+                        state.arm64_frame_pointer = false;
                     state.supported = false;
                     return true;
                 }
@@ -1573,7 +1606,7 @@ bool transfer(const Instruction &instruction, FlowState &state) {
                 if (reg.bank == RegisterBank::arm64_gpr && reg.index < state.arm64_stack_alias_depths.size() &&
                     (!alias_writeback || reg.index != stack_writeback->base->index))
                     state.arm64_stack_alias_depths[reg.index] = {};
-            if (std::any_of(instruction.register_writes.begin(), instruction.register_writes.end(),
+            if (!frame_writeback && std::any_of(instruction.register_writes.begin(), instruction.register_writes.end(),
                     [](const RegisterOperand &reg) {
                         return reg.bank == RegisterBank::arm64_gpr && reg.index == 29;
                     })) {
@@ -2569,6 +2602,7 @@ Result<StackFrameAnalysis> analyze_stack_frame(const FunctionRecord &function, c
                                  pair_memory->base->index == 29;
             const bool pair_alias = pair_memory && pair_memory->base &&
                                     pair_memory->base->bank == RegisterBank::arm64_gpr &&
+                                    pair_memory->base->index != 29 &&
                                     pair_memory->base->index < state.arm64_stack_alias_depths.size() &&
                                     state.arm64_stack_alias_depths[pair_memory->base->index].known;
             if (arm64_pair && (!pair_memory || !pair_memory->base)) {

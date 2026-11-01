@@ -26,6 +26,10 @@ memory operands based on SP or x29. `LDP`/`STP` pair operands based on a tracked
 SP or x29 produce two adjacent typed slots, each with the instruction's read or
 write provenance. Scalar and pair load/store writeback through SP updates the
 entry-relative depth, covering common `STP`/`LDP` prologue and epilogue forms.
+Writeback through a tracked x29 adjusts its entry-SP-relative frame relation,
+so later x29-relative accesses continue to resolve to the right slots. An
+untracked x29 writeback or a load that overwrites its own base invalidates the
+frame relation and marks the result partial.
 Post-indexed accesses use the pre-writeback address; pre-indexed accesses use
 the adjusted address.
 
