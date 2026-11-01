@@ -1,5 +1,6 @@
 #include "hexlab/loaders/jvm.hpp"
 #include "hexlab/processors/decoder.hpp"
+#include "jvm_stack_verifier.hpp"
 #include <algorithm>
 #include <charconv>
 #include <cstring>
@@ -982,6 +983,8 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage,std::stop_t
     if(!r.u2(n)||n>4096)return malformed("invalid interface count");md.interfaces.reserve(n);
     for(unsigned i=0;i<n;++i){std::uint16_t ix=0;if(!r.u2(ix))return malformed("truncated interface list");auto name=class_name(ix);if(!name)return name.error();md.interfaces.push_back(std::move(name.value()));}
     std::uint64_t attribute_bytes=0;bool metadata_complete=true;
+    std::size_t operand_stack_work=0;
+    bool operand_stack_partial=false;
     std::size_t retained_opaque_attributes=0,retained_opaque_name_bytes=0;
     std::size_t generic_attempts=0,generic_text_bytes=0,generic_nodes=0;
     const auto generic_analysis=[&](std::string_view text,std::uint16_t index,std::size_t reference,
@@ -1410,6 +1413,9 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage,std::stop_t
                     if(e.catch_type){auto c=class_name(e.catch_type);if(!c)return c.error();}code.exception_table.push_back(e);}
                 auto nested=attributes(false,member,false,&code,nullptr);local_variable_entries_seen.erase(&code);if(!nested)return nested.error();
                 if(r.p!=start+len)return malformed("Code attribute length does not match its parsed structure");
+                auto stack_checked=jvm_detail::verify_operand_stack(code_bytes,code_scan.value(),code,md,stop,operand_stack_work);
+                if(!stack_checked)return stack_checked.error();
+                if(!stack_checked.value()){operand_stack_partial=true;metadata_complete=false;}
                 member->code=std::move(code);
             }else if(class_level&&an.value()=="SourceFile"){
                 if(md.source_file)return malformed("duplicate SourceFile attribute");
@@ -1914,6 +1920,8 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage,std::stop_t
     auto image=Image::create(storage,std::move(layout));if(!image)return image.error();
     LoadedImage loaded;loaded.image=std::move(image.value());loaded.metadata.format="Java classfile";loaded.metadata.header_size=10;loaded.metadata.image_size=size;loaded.metadata.jvm=std::move(md);loaded.metadata_complete=metadata_complete;
     loaded.diagnostics.push_back({DiagnosticSeverity::info,"JVM method Code arrays use independent big-endian bytecode address spaces",{}});
+    if(operand_stack_partial)loaded.diagnostics.push_back({DiagnosticSeverity::info,
+        "JVM operand-stack analysis is partial for legacy subroutines, unsupported evidence or exhausted analysis budgets",{}});
     auto tracked=loaded.metadata_reads.include({0},size);if(!tracked)return tracked.error();loaded.metadata_reads_complete=true;
     return loaded;
 }
