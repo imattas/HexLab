@@ -129,6 +129,60 @@ std::uint64_t bsd_word(std::span<const std::byte> bytes, std::size_t at, std::si
     }
     return value;
 }
+struct CoffLinkerIndex {
+    std::vector<std::uint64_t> member_offsets;
+    std::vector<PendingSymbol> symbols;
+};
+// COFF's second linker member is named "/" like the first, but uses
+// little-endian member offsets and one-based 16-bit symbol-to-member indexes.
+std::optional<CoffLinkerIndex> decode_coff_second_index(std::span<const std::byte> bytes,
+                                                        std::size_t max_members, std::size_t max_symbols,
+                                                        std::size_t max_name_bytes, std::stop_token stop) {
+    try {
+        require(bytes.size() >= 8, "truncated COFF second linker member");
+        const auto count = bsd_word(bytes, 0, 4, true);
+        require(count <= max_members && count <= (bytes.size() - 8) / 4,
+                "invalid COFF linker member count");
+        CoffLinkerIndex result;
+        result.member_offsets.reserve(static_cast<std::size_t>(count));
+        for (std::size_t i = 0; i < count; ++i) {
+            canceled(stop);
+            const auto offset = bsd_word(bytes, 4 + i * 4, 4, true);
+            require(result.member_offsets.empty() || offset > result.member_offsets.back(),
+                    "COFF linker member offsets are not ordered");
+            result.member_offsets.push_back(offset);
+        }
+        const auto count_at = 4 + static_cast<std::size_t>(count) * 4;
+        const auto symbol_count = bsd_word(bytes, count_at, 4, true);
+        require(symbol_count <= max_symbols && symbol_count <= (bytes.size() - count_at - 4) / 2,
+                "invalid COFF linker symbol count");
+        const auto indices_at = count_at + 4;
+        std::size_t names_at = indices_at + static_cast<std::size_t>(symbol_count) * 2;
+        result.symbols.reserve(static_cast<std::size_t>(symbol_count));
+        for (std::size_t i = 0; i < symbol_count; ++i) {
+            canceled(stop);
+            const auto at = indices_at + i * 2;
+            const auto member = std::to_integer<std::uint16_t>(bytes[at]) |
+                                (std::to_integer<std::uint16_t>(bytes[at + 1]) << 8);
+            require(member != 0 && member <= result.member_offsets.size(), "invalid COFF linker member index");
+            const auto begin = bytes.begin() + static_cast<std::ptrdiff_t>(names_at);
+            const auto end = std::find(begin, bytes.end(), std::byte{0});
+            require(end != bytes.end(), "unterminated COFF linker symbol name");
+            const auto length = static_cast<std::size_t>(end - begin);
+            require(length != 0 && length <= max_name_bytes, "invalid COFF linker symbol name length");
+            auto name = field(bytes.subspan(names_at, length));
+            require(result.symbols.empty() || result.symbols.back().name <= name,
+                    "COFF linker symbols are not ordered");
+            result.symbols.push_back({std::move(name), result.member_offsets[member - 1]});
+            names_at += length + 1;
+        }
+        require(names_at == bytes.size(), "unexpected trailing bytes in COFF second linker member");
+        return result;
+    } catch (const Failure &failure) {
+        if (failure.error.code == ErrorCode::canceled) throw;
+        return {};
+    }
+}
 std::optional<std::vector<PendingSymbol>> decode_bsd_index(std::span<const std::byte> bytes,
                                                            std::size_t width, bool little_endian,
                                                            std::size_t max_symbols, std::size_t max_name_bytes,
@@ -574,6 +628,10 @@ Result<ArArchive> read_ar_archive(const ByteStorage &storage, std::stop_token st
         archive.thin = signature_text == thin_magic;
         std::vector<std::byte> long_names;
         std::vector<PendingSymbol> pending_symbols;
+        std::vector<std::uint64_t> coff_member_offsets;
+        bool coff_archive = false;
+        bool coff_index_candidate = false;
+        bool coff_long_names = false;
         std::uint64_t symbol_index_bytes = 0;
         std::map<std::uint64_t, std::size_t> member_by_header;
         constexpr std::uint64_t max_symbol_index_bytes = 256ULL * 1024 * 1024;
@@ -617,13 +675,17 @@ Result<ArArchive> read_ar_archive(const ByteStorage &storage, std::stop_token st
                 const auto offset = number(std::as_bytes(std::span(raw_name.data() + 1, raw_name.size() - 1)), 10,
                                            "invalid GNU ar long-name offset");
                 require(offset < long_names.size(), "GNU ar long-name offset out of range");
-                require(offset == 0 || long_names[static_cast<std::size_t>(offset - 1)] == std::byte{'\n'},
-                        "GNU ar long-name offset does not point to an entry boundary");
+                require(offset == 0 || long_names[static_cast<std::size_t>(offset - 1)] ==
+                        (coff_long_names ? std::byte{0} : std::byte{'\n'}),
+                        "ar long-name offset does not point to an entry boundary");
                 auto end = offset;
-                while (end < long_names.size() && long_names[end] != std::byte{'\n'} &&
-                       !(long_names[end] == std::byte{'/'} && end + 1 < long_names.size() &&
-                         long_names[end + 1] == std::byte{'\n'}))
-                    ++end;
+                if (coff_long_names) {
+                    while (end < long_names.size() && long_names[end] != std::byte{0}) ++end;
+                } else {
+                    while (end < long_names.size() && long_names[end] != std::byte{'\n'} &&
+                           !(long_names[end] == std::byte{'/'} && end + 1 < long_names.size() &&
+                             long_names[end + 1] == std::byte{'\n'})) ++end;
+                }
                 require(end < long_names.size() && end > offset && end - offset <= limits.max_name_bytes,
                         "unterminated or oversized GNU ar long name");
                 name = field(std::span(long_names).subspan(static_cast<std::size_t>(offset), static_cast<std::size_t>(end - offset)));
@@ -642,22 +704,40 @@ Result<ArArchive> read_ar_archive(const ByteStorage &storage, std::stop_token st
             if (kind == ArMemberKind::long_name_table) {
                 require(raw_size <= 64ULL * 1024 * 1024, "GNU ar long-name table exceeds metadata budget", ErrorCode::resource_limit);
                 long_names = reader.read(data_start, raw_size);
+                // Preserve browsing for a malformed second COFF linker member
+                // when its following long-name table is clearly NUL-delimited.
+                coff_long_names = coff_archive || (coff_index_candidate &&
+                    std::find(long_names.begin(), long_names.end(), std::byte{0}) != long_names.end() &&
+                    std::find(long_names.begin(), long_names.end(), std::byte{'\n'}) == long_names.end());
             } else if (kind == ArMemberKind::symbol_index && raw_name == "/") {
                 archive.has_symbol_index = true;
+                coff_index_candidate = index == 1 && archive.members[0].name == "/" && !archive.thin;
                 if (raw_size > max_symbol_index_bytes - symbol_index_bytes) {
                     archive.symbol_index_complete = false;
                     archive.diagnostics.emplace_back("GNU ar symbol index exceeds the cumulative metadata budget; member listing and extraction remain available");
                 } else {
                     symbol_index_bytes += raw_size;
                     const auto bytes = reader.read(data_start, raw_size);
-                    auto decoded = decode_gnu_index(bytes, 4, limits.max_symbols - pending_symbols.size(), limits.max_name_bytes, stop);
-                    if (decoded) {
-                        pending_symbols.insert(pending_symbols.end(),
-                                               std::make_move_iterator(decoded->begin()),
-                                               std::make_move_iterator(decoded->end()));
+                    // A COFF library's second archive member has the same
+                    // name as its first, with a distinct little-endian layout.
+                    auto coff = coff_index_candidate
+                        ? decode_coff_second_index(bytes, limits.max_members, limits.max_symbols,
+                                                   limits.max_name_bytes, stop)
+                        : std::optional<CoffLinkerIndex>{};
+                    if (coff) {
+                        coff_archive = true;
+                        coff_member_offsets = std::move(coff->member_offsets);
+                        pending_symbols = std::move(coff->symbols);
                     } else {
-                        archive.symbol_index_complete = false;
-                        archive.diagnostics.emplace_back("GNU ar symbol index has a malformed or unsupported layout; member listing and extraction remain available");
+                        auto decoded = decode_gnu_index(bytes, 4, limits.max_symbols - pending_symbols.size(), limits.max_name_bytes, stop);
+                        if (decoded) {
+                            pending_symbols.insert(pending_symbols.end(),
+                                                   std::make_move_iterator(decoded->begin()),
+                                                   std::make_move_iterator(decoded->end()));
+                        } else {
+                            archive.symbol_index_complete = false;
+                            archive.diagnostics.emplace_back("GNU ar or COFF linker symbol index has a malformed or unsupported layout; member listing and extraction remain available");
+                        }
                     }
                 }
             } else if (kind == ArMemberKind::symbol_index && raw_name == "/SYM64/") {
@@ -709,6 +789,15 @@ Result<ArArchive> read_ar_archive(const ByteStorage &storage, std::stop_token st
             }
         }
         require(cursor == storage.size(), "ar archive has trailing partial member");
+        for (const auto offset : coff_member_offsets) {
+            canceled(stop);
+            const auto found = member_by_header.find(offset);
+            if (found == member_by_header.end() || archive.members[found->second].kind != ArMemberKind::regular) {
+                archive.symbol_index_complete = false;
+                archive.diagnostics.emplace_back("COFF linker member references an unknown or special member; member listing and extraction remain available");
+                break;
+            }
+        }
         bool invalid_symbol_reference_reported = false;
         for (auto &symbol : pending_symbols) {
             canceled(stop);

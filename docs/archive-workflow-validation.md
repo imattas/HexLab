@@ -10,9 +10,27 @@ validation remain pending, and no tests were run.
 
 `hexlab_cli archive list <path>` prints every ar member with its stable zero-based member index, decoded name, size, and member kind. Special index and long-name-table records remain visible so indices match the loader's archive model. Diagnostics reported by the loader are printed after the listing.
 
+`hexlab_cli archive lookup <path> --symbol <name>` searches the parsed archive
+symbol index for an exact, case-sensitive name. It lists every unique indexed
+member in archive order with its name, header offset and size, and reports index
+presence, completeness and loader diagnostics. A match from a complete index
+returns exit status 0; a missing symbol, absent index or incomplete index
+returns 1. Lookup reads embedded metadata only, so GNU thin archives do not need
+`--thin-root` for this action. An index row is a claim by the archive: lookup
+does not inspect the object to prove that the named definition still exists.
+Use `archive index-audit` for its supported ELF object validation.
+
 `hexlab_cli archive extract <path> --member <index> --output <path> [--replace]` copies one regular member to the explicit output path. Output creation is exclusive by default, so an existing file is preserved; `--replace` opts into truncating/replacing that path. Special records and out-of-range indices are rejected, and the library's extraction-size limit still applies. The output filename is supplied by the caller; archive member names are never joined to an extraction directory.
 
 `hexlab_cli archive open <path> --member <index> --project <path.hxproj> [--replace]` selects a regular member and imports it through the normal project actor. The project embeds the selected member bytes and resolves a durable image recipe from those bytes; the archive is not treated as a single image. Non-regular members and out-of-range indices are rejected before project creation. The command stages the selected bytes in a uniquely reserved system temporary file because the current project import request is file-backed. The temporary file is removed on both success and failure after import/save-as returns, while the resulting project retains its embedded input and the selected member name/index is reported to the caller.
+
+Both `open` and `extract` also accept `--symbol <name>` in place of `--member`.
+They select the earliest indexed candidate in archive order and report the
+candidate count before reading the member. They reject an absent or incomplete
+index rather than treating a partial result as the first provider; an explicit
+member index remains available in that case. As with lookup, this selection
+trusts the index and does not verify the member's actual definitions. Thin
+member reads still require `--thin-root <directory>`.
 
 The desktop workflow is available from **File > Browse ar Archive...**. The browser displays stable member indices, names, sizes, and special-record kinds; only regular members can be opened. Opening a member passes its bounded storage view through the normal workspace/project import path, so the resulting untitled project embeds the member and can be saved normally. Its provenance label includes the archive path and member name. No extraction temporary file is needed by the desktop workflow.
 

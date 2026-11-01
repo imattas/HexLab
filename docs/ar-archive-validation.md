@@ -1,5 +1,19 @@
 # ar archive validation
 
+## COFF linker index and long names
+
+Microsoft COFF libraries use two leading `/` linker members. The first uses the
+GNU-compatible big-endian symbol/offset layout; the second uses little-endian
+member offsets and one-based 16-bit member indices followed by sorted symbol
+names. HexLab recognizes the bounded second layout, uses its symbol rows in
+preference to the first, and resolves its member offsets against validated
+regular member headers. Invalid counts, ordering, names, indices, and offsets
+mark the index incomplete. COFF long-name tables use NUL-terminated entries;
+referenced offsets must be entry boundaries. The ordinary GNU `/\n` long-name
+layout remains supported. This parses index claims; it does not independently
+verify the member's definitions or compare the two linker directories. Format
+reference: [Microsoft PE/COFF archive format](https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#archive-library-file-format).
+
 ## AIX big archive listing
 
 The loader also recognizes the AIX `<bigaf>\n` format. It validates the

@@ -1903,6 +1903,7 @@ int archive_command(std::span<const std::wstring_view> args, std::ostream &out, 
     using project_detail::take;
     if (args.size() < 2 || (args.size() == 2 && args[1] == L"--help")) {
         out << "Usage: hexlab_cli archive list <archive> [--thin-root <directory>]\n"
+               "       hexlab_cli archive lookup <archive> --symbol <name>\n"
                "       hexlab_cli archive index-audit <archive> [--thin-root <directory>]\n"
                "       hexlab_cli archive link-select <archive> --root-object <ET_REL|XCOFF32|XCOFF64>\n"
                "       hexlab_cli archive link-audit <archive> --root-object <ET_REL|XCOFF64>\n"
@@ -1910,8 +1911,8 @@ int archive_command(std::span<const std::wstring_view> args, std::ostream &out, 
                "       hexlab_cli archive link-exec <archive> --root-object <ET_REL> --entry <symbol> --output <ET_EXEC>\n"
                "       hexlab_cli archive link-pe <archive> --root-object <COFF .obj> --entry <symbol> --output <PE .exe>\n"
                "       hexlab_cli archive link-macho <archive> --root-object <Mach-O .o> --entry <symbol> --output <Mach-O executable>\n"
-               "       hexlab_cli archive extract <archive> --member <index> --output <path> [--replace]\n"
-               "       hexlab_cli archive open <archive> --member <index> --project <project.hxproj> [--replace]\n"
+               "       hexlab_cli archive extract <archive> (--member <index> | --symbol <name>) --output <path> [--replace]\n"
+               "       hexlab_cli archive open <archive> (--member <index> | --symbol <name>) --project <project.hxproj> [--replace]\n"
                "Thin archive reads/link actions require --thin-root <directory>; member paths stay under that explicit root.\n";
         return 0;
     }
@@ -1933,9 +1934,28 @@ int archive_command(std::span<const std::wstring_view> args, std::ostream &out, 
         if(thin_root){
             resolver=take(make_ar_thin_member_resolver(*thin_root));
         }
-        if(archive.thin&&action!=L"list"&&!resolver)
+        if(archive.thin&&action!=L"list"&&action!=L"lookup"&&!resolver)
             argument_error("Thin archive reads/link actions require --thin-root <directory>");
         const auto open_member=[&](const ArMember& member){return open_ar_member(storage,member,resolver);};
+        if (action == L"lookup") {
+            if (args.size() != 4 || args[2] != L"--symbol")
+                argument_error("archive lookup requires --symbol <name>");
+            const auto name = wide_to_utf8(args[3]);
+            const auto lookup = take(lookup_ar_member_by_symbol(archive, name));
+            out << "Archive symbol: name=" << safe_text(name)
+                << " index-present=" << (lookup.has_symbol_index ? "true" : "false")
+                << " index-complete=" << (lookup.index_complete ? "true" : "false")
+                << " candidates=" << lookup.candidate_member_indices.size() << '\n';
+            for (const auto index : lookup.candidate_member_indices) {
+                const auto &member = archive.members[index];
+                out << "Candidate: member=" << index << " member-name=" << safe_text(member.name)
+                    << " header-offset=" << member.header_offset.value
+                    << " size=" << member.size << '\n';
+            }
+            for (const auto &diagnostic : archive.diagnostics)
+                out << "Diagnostic: " << safe_text(diagnostic) << '\n';
+            return lookup.has_symbol_index && lookup.index_complete && lookup.member_index ? 0 : 1;
+        }
         if (action == L"index-audit") {
             if (args.size() != 2) argument_error("archive index-audit takes one archive path");
             constexpr std::size_t max_members = 4096;
@@ -2414,25 +2434,42 @@ int archive_command(std::span<const std::wstring_view> args, std::ostream &out, 
         }
         if (action != L"open" && action != L"extract") argument_error("Unknown archive action");
         std::optional<std::uint64_t> selected;
+        std::optional<std::string> selected_symbol;
         std::filesystem::path project_path;
         std::filesystem::path output_path;
         bool replace = false;
         for (std::size_t i = 2; i < args.size(); ++i) {
             if (args[i] == L"--replace") { replace = true; continue; }
-            if ((args[i] == L"--member" || args[i] == L"--project" || args[i] == L"--output") && i + 1 < args.size()) {
+            if ((args[i] == L"--member" || args[i] == L"--symbol" || args[i] == L"--project" || args[i] == L"--output") && i + 1 < args.size()) {
                 const auto value = args[++i];
-                if (args[i - 1] == L"--member") selected = project_detail::take(parse_address(value));
+                if (args[i - 1] == L"--member") {
+                    if (selected || selected_symbol) argument_error("Specify exactly one --member or --symbol");
+                    selected = project_detail::take(parse_address(value));
+                } else if (args[i - 1] == L"--symbol") {
+                    if (selected || selected_symbol) argument_error("Specify exactly one --member or --symbol");
+                    selected_symbol = wide_to_utf8(value);
+                }
                 else if (args[i - 1] == L"--project") project_path = path_from_wide(value);
                 else output_path = path_from_wide(value);
                 continue;
             }
             argument_error("Unknown or incomplete archive option");
         }
-        if (!selected) argument_error("archive action requires --member");
+        if (!selected && !selected_symbol) argument_error("archive action requires --member or --symbol");
         if (action == L"open" && (project_path.empty() || !output_path.empty()))
             argument_error("archive open requires --project and does not accept --output");
         if (action == L"extract" && (output_path.empty() || !project_path.empty()))
             argument_error("archive extract requires --output and does not accept --project");
+        if (selected_symbol) {
+            const auto lookup = take(lookup_ar_member_by_symbol(archive, *selected_symbol));
+            if (!lookup.has_symbol_index || !lookup.index_complete)
+                throw Failure{Error{ErrorCode::integrity, "Archive symbol index is absent or incomplete; select a member explicitly"}};
+            if (!lookup.member_index)
+                throw Failure{Error{ErrorCode::out_of_bounds, "Symbol has no indexed archive member"}};
+            selected = *lookup.member_index;
+            out << "Symbol selection: name=" << safe_text(*selected_symbol)
+                << " member=" << *selected << " candidates=" << lookup.candidate_member_indices.size() << '\n';
+        }
         if (*selected >= archive.members.size()) argument_error("Archive member index is out of range");
         const auto &member = archive.members[static_cast<std::size_t>(*selected)];
         if (member.kind != ArMemberKind::regular && member.kind != ArMemberKind::thin_external)

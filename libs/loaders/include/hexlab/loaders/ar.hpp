@@ -121,9 +121,11 @@ struct ArThinResolverLimits {
 HEXLAB_LOADERS_EXPORT Result<ArThinMemberResolver> make_ar_thin_member_resolver(
     std::filesystem::path root, ArThinResolverLimits = {});
 
-// Supports standard ar headers, GNU long-name tables and 32-/64-bit GNU symbol
-// indexes, plus BSD #1/ extended member names. BSD ranlib indexes are reported
-// as unsupported while the archive's regular members remain available.
+// Supports standard and thin ar headers, GNU long-name tables and 32-/64-bit
+// GNU symbol indexes, BSD #1/ extended member names and bounded 32-/64-bit BSD
+// ranlib indexes, COFF second linker members and NUL-terminated long names,
+// plus AIX big archives. Unsupported or malformed index rows leave the member
+// listing available and mark the index incomplete.
 HEXLAB_LOADERS_EXPORT Result<ArArchive> read_ar_archive(const ByteStorage &, std::stop_token = {},
                                                        ArLimits = {});
 HEXLAB_LOADERS_EXPORT Result<ArSymbolSelection> select_ar_members(
