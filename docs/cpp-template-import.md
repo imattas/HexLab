@@ -11,7 +11,11 @@ Class, struct, union, and alias templates accept type parameters, integral non-t
 parameters, template-template parameters, defaults, and a trailing pack. The
 importer can instantiate these declarations from concrete type, non-negative
 integer, and template-name arguments. Integral arguments are checked against
-their declared width. A non-type parameter can drive a member array extent. A
+their declared width; unsigned 64-bit parameters accept the full `uint64_t`
+range, while signed parameters accept only non-negative values through their
+signed maximum. Direct literal arguments retain this range even though compound
+constant expressions remain limited to the importer's signed 64-bit evaluator.
+A non-type parameter can drive a member array extent. A
 template-template parameter can instantiate a previously declared class or
 alias template inside an aggregate body or alias target. It can also be forwarded
 as a template-name argument. Concrete aggregate instance names include every

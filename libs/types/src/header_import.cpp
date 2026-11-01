@@ -1107,9 +1107,11 @@ private:
                         if (!integer || integer->kind() != Kind::integer || !integer->size() || *integer->size() > 8)
                             fail(ErrorCode::unsupported, "template non-type parameter pack must use an integer type no wider than 64 bits");
                         const auto bits = static_cast<unsigned>(*integer->size() * 8);
-                        const auto maximum = integer->is_signed() && bits < 64
-                            ? (std::uint64_t{1} << (bits - 1)) - 1
-                            : bits == 64 ? static_cast<std::uint64_t>(INT64_MAX) : (std::uint64_t{1} << bits) - 1;
+                        const auto maximum = integer->is_signed()
+                            ? (bits == 64 ? static_cast<std::uint64_t>(INT64_MAX)
+                                          : (std::uint64_t{1} << (bits - 1)) - 1)
+                            : (bits == 64 ? std::numeric_limits<std::uint64_t>::max()
+                                          : (std::uint64_t{1} << bits) - 1);
                         if (*argument.value > maximum)
                             fail(ErrorCode::malformed, "template integer argument is outside its parameter type");
                     }
@@ -1136,9 +1138,11 @@ private:
                 if (!integer || integer->kind() != Kind::integer || !integer->size() || *integer->size() > 8)
                     fail(ErrorCode::unsupported, "template non-type parameter must use an integer type no wider than 64 bits");
                 const auto bits = static_cast<unsigned>(*integer->size() * 8);
-                const auto maximum = integer->is_signed() && bits < 64
-                    ? (std::uint64_t{1} << (bits - 1)) - 1
-                    : bits == 64 ? static_cast<std::uint64_t>(INT64_MAX) : (std::uint64_t{1} << bits) - 1;
+                const auto maximum = integer->is_signed()
+                    ? (bits == 64 ? static_cast<std::uint64_t>(INT64_MAX)
+                                  : (std::uint64_t{1} << (bits - 1)) - 1)
+                    : (bits == 64 ? std::numeric_limits<std::uint64_t>::max()
+                                  : (std::uint64_t{1} << bits) - 1);
                 if (*value > maximum)
                     fail(ErrorCode::malformed, "template integer argument is outside its parameter type");
                 bindings.values.emplace(parameter.name, *value);
