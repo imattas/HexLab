@@ -276,7 +276,7 @@ std::optional<std::int64_t> flat_address_constant(PointerValueKey value,
 std::optional<DynamicMemoryRange> dynamic_memory_range(const MemoryValue &memory, const PointerOrigins &origins,
                                                        const IntegerConstants &constants,
                                                        const IntegerRanges &integer_ranges) {
-    if (!memory.base || memory.absolute || !memory.type.bits || memory.type.bits % 8 ||
+    if (memory.address_wrap_bits || !memory.base || memory.absolute || !memory.type.bits || memory.type.bits % 8 ||
         !memory.base_version) return {};
     const auto found = origins.find({key(*memory.base), *memory.base_version});
     if (found == origins.end()) return {};
@@ -362,7 +362,7 @@ bool is_absolute_memory_partition(const std::string &partition) {
 }
 
 std::optional<AbsoluteMemoryRange> absolute_memory_range(const MemoryValue &memory) {
-    if (!memory.absolute || memory.base || memory.index || !memory.type.bits || memory.type.bits % 8)
+    if (memory.address_wrap_bits || !memory.absolute || memory.base || memory.index || !memory.type.bits || memory.type.bits % 8)
         return {};
     const auto bytes = static_cast<std::uint64_t>(memory.type.bits / 8);
     if (!bytes || bytes > 256 || memory.absolute->offset > std::numeric_limits<std::uint64_t>::max() - bytes)

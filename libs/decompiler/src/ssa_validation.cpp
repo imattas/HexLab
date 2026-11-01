@@ -313,6 +313,10 @@ Result<SsaRegisterValidation> validate_register_ssa(const LiftedFunction &functi
             if constexpr (std::is_same_v<T, RegisterValue>) {
                 return check_use(value.reg, value.version, block, instruction);
             } else if constexpr (std::is_same_v<T, MemoryValue>) {
+                if (value.address_wrap_bits != 0 && value.address_wrap_bits != 8 &&
+                    value.address_wrap_bits != 16 && value.address_wrap_bits != 32 &&
+                    value.address_wrap_bits != 64)
+                    return invalid("SSA memory address has an unsupported wrap width");
                 if (!value.memory_version)
                     return invalid("SSA memory load has no whole-memory version");
                 auto memory_checked = check_memory_use(*value.memory_version, block, instruction);

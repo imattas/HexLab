@@ -76,6 +76,10 @@ struct MemoryValue {
     std::optional<std::uint32_t> stack_frame_version;
     std::optional<std::int64_t> stack_frame_offset;
     std::string index_extend;
+    // Address arithmetic is reduced to this many low bits before the memory
+    // access. Zero leaves the architecture's ordinary address width in force.
+    // Used for pointer-byte reads whose indexed slot wraps at its address width.
+    std::uint8_t address_wrap_bits = 0;
 };
 struct UnaryValue;
 struct BinaryValue;

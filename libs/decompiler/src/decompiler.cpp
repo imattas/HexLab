@@ -2968,6 +2968,35 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
         if (instruction.opcode == Opcode::m6502_jmp && instruction.flow == FlowKind::jump &&
             !instruction.direct_target && instruction.operands.size() == 1) {
             const auto *pointer = std::get_if<MemoryOperand>(&instruction.operands.front());
+            // JMP (abs,X) reads a 16-bit destination pointer from the
+            // 16-bit-wrapped address abs+X. Preserve that address expression
+            // as two typed byte loads rather than leaving an opaque target.
+            if (m65c02 && pointer && !pointer->base && pointer->index &&
+                pointer->index->bank == RegisterBank::mos6502 &&
+                pointer->index->index == 1 && pointer->index->width == 8 &&
+                !pointer->ip_relative && pointer->displacement >= 0 &&
+                pointer->displacement <= UINT16_MAX && instruction.bytes.size() >= 1 &&
+                std::to_integer<unsigned>(instruction.bytes[0]) == 0x7c) {
+                const auto byte_load = [&](std::int64_t displacement) -> ExpressionPtr {
+                    MemoryValue value;
+                    value.type = integer_type(8);
+                    value.index = *pointer->index;
+                    value.displacement = displacement;
+                    value.address_wrap_bits = 16;
+                    return std::make_shared<Expression>(Expression{value.type, std::move(value)});
+                };
+                const auto low = byte_load(pointer->displacement);
+                const auto high = byte_load(pointer->displacement + 1);
+                const auto high_word = std::make_shared<Expression>(Expression{integer_type(16),
+                    UnaryValue{"zext", high}});
+                const auto shifted_high = binary("shl", high_word, constant_expr(8, 16), 16);
+                Branch branch;
+                branch.condition = "true";
+                branch.indirect_target = binary("or",
+                    std::make_shared<Expression>(Expression{integer_type(16), UnaryValue{"zext", low}}),
+                    shifted_high, 16);
+                return branch;
+            }
             if (pointer && !pointer->base && !pointer->index && !pointer->ip_relative &&
                 pointer->displacement >= 0 && pointer->displacement <= UINT16_MAX) {
                 const auto slot = static_cast<std::uint16_t>(pointer->displacement);
@@ -7460,10 +7489,20 @@ std::string arm_condition_text(unsigned condition, const std::string &flags) {
     }
 }
 std::string address_text(const MemoryValue &memory) {
+    const auto wrapped = [&](std::string address) {
+        if (!memory.address_wrap_bits) return address;
+        return "((" + address + ") & 0x" + [&] {
+            std::ostringstream mask;
+            const auto mask_value = memory.address_wrap_bits >= 64 ? UINT64_MAX :
+                ((std::uint64_t{1} << memory.address_wrap_bits) - 1);
+            mask << std::hex << mask_value;
+            return mask.str();
+        }() + ")";
+    };
     if (memory.absolute) {
         std::ostringstream out;
         out << "0x" << std::hex << memory.absolute->offset;
-        return out.str();
+        return wrapped(out.str());
     }
     std::ostringstream out;
     bool has_term = false;
@@ -7498,10 +7537,10 @@ std::string address_text(const MemoryValue &memory) {
         if (memory.displacement < 0) out << " - " << std::uint64_t(-(memory.displacement + 1)) + 1;
         else out << (has_term ? "0x" : "0x") << std::hex << std::uint64_t(memory.displacement);
     }
-    return out.str();
+    return wrapped(out.str());
 }
 std::optional<std::string> typed_member_access(const MemoryValue &memory) {
-    if (!memory.base || memory.absolute || memory.displacement < 0 ||
+    if (memory.address_wrap_bits || !memory.base || memory.absolute || memory.displacement < 0 ||
         !memory.type.bits || memory.type.bits % 8) return {};
     const auto *base_type = detail::expression_register_type(*memory.base, memory.base_version);
     if (!base_type || !*base_type) return {};
@@ -7644,7 +7683,7 @@ std::string expression_text(const Expression &expression) {
         } else if constexpr (std::is_same_v<T, MemoryValue>) {
             if (value.stack_variable) return *value.stack_variable;
             const auto access_bytes = static_cast<std::uint16_t>((value.type.bits + 7u) / 8u);
-            if (value.base && value.index && value.index_add && value.index_shift.empty() &&
+            if (!value.address_wrap_bits && value.base && value.index && value.index_add && value.index_shift.empty() &&
                 value.index_shift_amount == 0 && value.index_extend.empty() && value.scale &&
                 value.type.bits && value.type.bits % 8 == 0 && value.scale == access_bytes &&
                 value.displacement % static_cast<std::int64_t>(value.scale) == 0) {
