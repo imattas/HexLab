@@ -981,7 +981,8 @@ std::optional<SwitchBound> guarded_case_bound(const Image &image, const Function
                 compared_register = register_operand(compare, 0);
                 immediate = std::get_if<ImmediateOperand>(&compare.operands[1]);
                 exclusive_upper_bound = branch.condition == 8;
-            } else if (((context.architecture == Architecture::riscv64 && context.mode == ExecutionMode::rv64) ||
+            } else if (((context.architecture == Architecture::riscv64 &&
+                         (context.mode == ExecutionMode::rv64 || context.mode == ExecutionMode::rv64c)) ||
                         (context.architecture == Architecture::riscv32 && is_riscv32_mode(context.mode))) &&
                        compare.opcode == Opcode::rv_sltiu && compare.operands.size() == 3 &&
                        branch.opcode == Opcode::rv_beq && branch.operands.size() == 3) {
@@ -2591,9 +2592,28 @@ std::optional<std::int64_t> riscv_switch_immediate(const Instruction &instructio
     if (index >= instruction.operands.size())
         return {};
     const auto *value = std::get_if<ImmediateOperand>(&instruction.operands[index]);
-    if (!value || value->encoded_width != encoded_width || !value->is_signed)
+    if (!value || !value->is_signed)
         return {};
+    if (instruction.length == 2 && is_riscv_compressed_mode(instruction.context.mode)) {
+        const bool upper = instruction.opcode == Opcode::rv_lui && index == 1 && encoded_width == 20;
+        const bool arithmetic = index == 2 && encoded_width == 12 &&
+            (instruction.opcode == Opcode::rv_addi || instruction.opcode == Opcode::rv_addiw);
+        if ((!upper && !arithmetic) || value->encoded_width != 6) return {};
+    } else if (value->encoded_width != encoded_width) return {};
     return std::bit_cast<std::int64_t>(value->value);
+}
+
+std::optional<std::uint64_t> riscv_switch_shift_amount(const Instruction &instruction, unsigned xlen) {
+    if (instruction.opcode != Opcode::rv_slli || instruction.operands.size() != 3)
+        return {};
+    const auto *value = std::get_if<ImmediateOperand>(&instruction.operands[2]);
+    // C.SLLI retains its six-bit field even in RV32C, where shamt[5] must be zero.
+    const auto encoded_width = instruction.length == 2 && is_riscv_compressed_mode(instruction.context.mode)
+        ? 6u : xlen == 32 ? 5u : 6u;
+    if (!value || value->encoded_width != encoded_width || value->effective_width != xlen ||
+        value->is_signed || value->value >= xlen)
+        return {};
+    return value->value;
 }
 
 std::optional<Address> riscv_table_base(const Image &image,
@@ -2617,7 +2637,7 @@ std::optional<Address> riscv_table_base(const Image &image,
     if (!definition || !facts[*definition])
         return {};
     const auto &last = facts[*definition]->instruction;
-    const auto xlen = last.context.mode == ExecutionMode::rv64 ? 64u
+    const auto xlen = (last.context.mode == ExecutionMode::rv64 || last.context.mode == ExecutionMode::rv64c) ? 64u
         : is_riscv32_mode(last.context.mode) ? 32u : 0u;
     const bool matching_architecture = xlen == 64
         ? last.context.architecture == Architecture::riscv64
@@ -2663,7 +2683,8 @@ std::optional<Address> riscv_table_base(const Image &image,
         // sign-extended to XLEN by LUI.
         return lui_address(*high);
     }
-    if (last.opcode != Opcode::rv_addi || last.operands.size() != 3 || *definition == 0)
+    const bool word_add = xlen == 64 && last.opcode == Opcode::rv_addiw;
+    if ((last.opcode != Opcode::rv_addi && !word_add) || last.operands.size() != 3 || *definition == 0)
         return {};
     const auto *source = register_operand(last, 1);
     const auto low = riscv_switch_immediate(last, 2, 12);
@@ -2689,12 +2710,23 @@ std::optional<Address> riscv_table_base(const Image &image,
     if (relocated) {
         if (xlen == 32 && relocated->offset > std::numeric_limits<std::uint32_t>::max())
             return {};
+        // An ADDIW result must be a sign-extended 32-bit address, including
+        // when the paired relocation supplies the final target directly.
+        if (word_add && relocated->offset != static_cast<std::uint64_t>(static_cast<std::int64_t>(
+                std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(relocated->offset)))))
+            return {};
         return relocated;
     }
     const auto high_address = high_instruction.opcode == Opcode::rv_auipc
         ? add_xlen_signed(high_instruction.address, *high)
         : std::optional<Address>(lui_address(*high));
-    return high_address ? add_xlen_signed(*high_address, *low) : std::nullopt;
+    if (!high_address) return {};
+    if (word_add) {
+        const auto result = static_cast<std::uint32_t>(high_address->offset) + static_cast<std::uint32_t>(*low);
+        return Address{high_address->space,
+            static_cast<std::uint64_t>(static_cast<std::int64_t>(std::bit_cast<std::int32_t>(result)))};
+    }
+    return add_xlen_signed(*high_address, *low);
 }
 
 std::optional<SwitchSite> riscv_indexed_absolute_switch(
@@ -2717,7 +2749,7 @@ std::optional<SwitchSite> riscv_indexed_absolute_switch(
     const auto &dispatch = dispatch_fact->instruction;
     const auto &load = load_fact->instruction;
     const auto &address_add = address_add_fact->instruction;
-    const auto xlen = dispatch.context.mode == ExecutionMode::rv64 ? 64u
+    const auto xlen = (dispatch.context.mode == ExecutionMode::rv64 || dispatch.context.mode == ExecutionMode::rv64c) ? 64u
         : is_riscv32_mode(dispatch.context.mode) ? 32u : 0u;
     const auto entry_bytes = xlen / 8;
     const auto scale_shift = xlen == 64 ? 3u : 2u;
@@ -2776,11 +2808,10 @@ std::optional<SwitchSite> riscv_indexed_absolute_switch(
             continue;
         const auto *scaled = register_operand(instruction, 0);
         const auto *source = register_operand(instruction, 1);
-        const auto *amount = std::get_if<ImmediateOperand>(&instruction.operands[2]);
+        const auto amount = riscv_switch_shift_amount(instruction, xlen);
         if (!scaled || scaled->bank != RegisterBank::riscv_gpr || scaled->width != xlen || scaled->index == 0 ||
             !source || source->bank != RegisterBank::riscv_gpr || source->width != xlen || source->index == 0 ||
-            !amount || amount->encoded_width != (xlen == 64 ? 6 : 5) || amount->effective_width != xlen ||
-            amount->is_signed || amount->value != scale_shift)
+            !amount || *amount != scale_shift)
             continue;
         const auto *candidate_base = same_register(add_left, scaled) ? add_right : add_left;
         if (!candidate_base || candidate_base->bank != RegisterBank::riscv_gpr ||
@@ -4368,20 +4399,22 @@ std::optional<SwitchSite> riscv_indexed_relative_switch(
     const bool rv32 = branch_instruction.context.architecture == Architecture::riscv32 &&
                       is_riscv32_mode(branch_instruction.context.mode);
     const bool rv64 = branch_instruction.context.architecture == Architecture::riscv64 &&
-                      branch_instruction.context.mode == ExecutionMode::rv64;
+                      (branch_instruction.context.mode == ExecutionMode::rv64 ||
+                       branch_instruction.context.mode == ExecutionMode::rv64c);
     const unsigned xlen = rv32 ? 32u : rv64 ? 64u : 0u;
     if (xlen == 0 || branch_instruction.opcode != Opcode::rv_jalr || branch_instruction.flow != FlowKind::jump ||
         target_instruction.opcode != Opcode::rv_add ||
         (load_instruction.opcode != Opcode::rv_lw && !halfword_offsets) ||
         address_instruction.opcode != Opcode::rv_add || scale_instruction.opcode != Opcode::rv_slli ||
-        (setup_instruction.opcode != Opcode::rv_auipc && setup_instruction.opcode != Opcode::rv_addi) ||
+        (setup_instruction.opcode != Opcode::rv_auipc && setup_instruction.opcode != Opcode::rv_addi &&
+         !(rv64 && setup_instruction.opcode == Opcode::rv_addiw)) ||
         branch_instruction.operands.size() != 2 || target_instruction.operands.size() != 3 ||
         load_instruction.operands.size() != 2 || address_instruction.operands.size() != 3 ||
         scale_instruction.operands.size() != 3)
         return {};
 
     std::size_t first = dispatch_index - 5;
-    if (setup_instruction.opcode == Opcode::rv_addi) {
+    if (setup_instruction.opcode == Opcode::rv_addi || setup_instruction.opcode == Opcode::rv_addiw) {
         if (first == 0 || !facts[first - 1] ||
             facts[first - 1]->instruction.opcode != Opcode::rv_auipc)
             return {};
@@ -4411,7 +4444,7 @@ std::optional<SwitchSite> riscv_indexed_relative_switch(
     const auto *address_right = register_operand(address_instruction, 2);
     const auto *scaled_index = register_operand(scale_instruction, 0);
     const auto *selector = register_operand(scale_instruction, 1);
-    const auto *amount = std::get_if<ImmediateOperand>(&scale_instruction.operands[2]);
+    const auto amount = riscv_switch_shift_amount(scale_instruction, xlen);
     const auto gpr = [xlen](const RegisterOperand *reg) {
         return reg && reg->bank == RegisterBank::riscv_gpr && reg->width == xlen && reg->index != 0;
     };
@@ -4421,8 +4454,7 @@ std::optional<SwitchSite> riscv_indexed_relative_switch(
         !gpr(target_destination) || !gpr(loaded_offset) || !load_memory ||
         !gpr(address_destination) || !address_left || !address_right ||
         !gpr(scaled_index) || !gpr(selector) ||
-        !amount || amount->encoded_width != (xlen == 32 ? 5 : 6) || amount->effective_width != xlen ||
-        amount->is_signed || amount->value != scale_shift ||
+        !amount || *amount != scale_shift ||
         !same_register(branch_memory->base ? &*branch_memory->base : nullptr, target_destination) ||
         branch_memory->segment || branch_memory->index || branch_memory->ip_relative ||
         branch_memory->displacement != 0 || branch_memory->address_width != xlen ||
@@ -4795,7 +4827,7 @@ static Result<SwitchAnalysis> analyze_switch_tables_impl(const Image &image, con
             const bool riscv32_jalr = instruction.context.architecture == Architecture::riscv32 &&
                 is_riscv32_mode(instruction.context.mode);
             const bool riscv64_jalr = instruction.context.architecture == Architecture::riscv64 &&
-                instruction.context.mode == ExecutionMode::rv64;
+                (instruction.context.mode == ExecutionMode::rv64 || instruction.context.mode == ExecutionMode::rv64c);
             if ((riscv32_jalr || riscv64_jalr) && instruction.opcode == Opcode::rv_jalr &&
                 instruction.flow == FlowKind::jump) {
                 auto riscv_switch = riscv_indexed_absolute_switch(image, function, snapshot,

@@ -60,6 +60,14 @@ conservative register-state clearing. The separate raw-byte backward
 AUIPC/JALR resolver remains restricted to fixed-width contexts because it
 cannot establish a preceding instruction boundary in mixed-width code.
 
+Recovered-instruction switch analysis accepts RV32C and RV64C, including
+compressed ADDI/LUI table-base immediates and the six-bit C.SLLI field.
+RV64 ADDIW/C.ADDIW table-base adjustments truncate to 32 bits and sign-extend
+the result; relocated targets must also fit that representation. Existing
+adjacency, register-alias and guard proofs still apply. In particular, the
+absolute-pointer matcher still requires distinct selector and scaled-index
+registers, so an in-place C.SLLI alone does not make that pattern recoverable.
+
 Compressed floating-point forms, RV128C, Zc extension instructions,
 custom-extension shift behavior, and distinct named hint extensions remain
 outside this integer C implementation. An unsupported compressed encoding
@@ -95,6 +103,8 @@ Validation: Windows MSVC Debug processor build and focused analysis/plugin
 (`main_frame`, `open_dialogs`, `pseudocode_view`, `type_editor`,
 `debugger_view` and `debugger_locals`) also passed a focused Debug `ClCompile`
 check. The final processor-inventory source compiled successfully.
+The compressed switch-analysis follow-up also passed a focused MSVC Debug
+`ClCompile` of `switches.cpp`.
 The broad headless CLI dependency build was stopped in favor of focused
 compile checks. No tests were added or run,
 as instructed for this repository. Encoding and HINT boundaries were audited
