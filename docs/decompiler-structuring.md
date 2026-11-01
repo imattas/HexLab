@@ -72,15 +72,24 @@ the conservative fallback.
 
 A post-tested loop's exit cleanup may end in one terminal conditional whose two
 arms are bounded straight-line paths ending in explicit returns. Direct return
-arms remain supported. Each arm path is capped at 64 blocks, phi-free (including
-memory-partition phis), and every block must have exactly its preceding cleanup
-block as its CFG predecessor. The loop exit must enter the cleanup chain
+arms remain supported. Each arm path is capped at 64 blocks; intermediate
+blocks are phi-free (including memory-partition phis), and every block must
+have exactly its preceding cleanup block as its CFG predecessor. The loop exit
+must enter the cleanup chain
 uniquely; the conditional must have exactly the two validated arm edges, and the
 arm paths cannot share blocks, except that they may converge on one terminal
 return block. That shared block must have exactly the two arm tails as
-predecessors and no register or memory phis; it is duplicated into each guarded
-arm. The formatter emits the cleanup chain once after the `do ... while`, then
-emits the conditional and each return path. Additional cleanup branches, other
+predecessors; it is duplicated into each guarded arm. A direct cleanup return or
+either arm's terminal return may contain register phis when every phi has exactly
+one input per actual predecessor and each destination is unique. The formatter
+emits simultaneous phi copies on the corresponding incoming edge immediately
+before the return block's instructions. Whole-memory and partition-memory phis
+on terminal returns are checked against the same predecessor set, with unique,
+nonempty partition names; they require no C assignment because the original
+memory operations are preserved. It accepts at most 4,096 register phis and
+4,096 partition phis per return, and 65,536 combined phi inputs. The formatter
+emits the cleanup chain once after the `do ... while`, then emits the
+conditional and each return path. Additional cleanup branches, other
 shared blocks, cleanup joins, side entries, and non-return leaves retain the
 existing fallback.
 

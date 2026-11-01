@@ -13880,7 +13880,46 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
             const LiftedBlock *cleanup_branch = nullptr;
             std::vector<const LiftedBlock *> cleanup_true_path;
             std::vector<const LiftedBlock *> cleanup_false_path;
+            std::vector<std::pair<std::string, std::string>> cleanup_direct_return_copies;
+            std::vector<std::pair<std::string, std::string>> cleanup_true_return_copies;
+            std::vector<std::pair<std::string, std::string>> cleanup_false_return_copies;
             const Branch *cleanup_condition = nullptr;
+            // Return phis are edge assignments. Validate the entire incoming
+            // set before duplicating a shared return into guarded arms.
+            const auto return_phi_copies = [&](const LiftedBlock &terminal,
+                const std::set<std::uint64_t> &incoming,
+                std::map<std::uint64_t, std::vector<std::pair<std::string, std::string>>> &copies) {
+                if (!has_only_terminal_return(terminal) || terminal.switch_dispatch ||
+                    incoming.empty() || incoming.size() > 2 ||
+                    predecessors[terminal.id.value] != incoming || terminal.phis.size() > 4096 ||
+                    terminal.memory_partition_phis.size() > 4096)
+                    return false;
+                std::size_t input_count = 0;
+                const auto valid_inputs = [&](const auto &phi) {
+                    if (phi.inputs.size() != incoming.size() ||
+                        phi.inputs.size() > 65536 - input_count) return false;
+                    input_count += phi.inputs.size();
+                    std::set<std::uint64_t> seen;
+                    for (const auto &input : phi.inputs)
+                        if (!incoming.contains(input.predecessor.value) ||
+                            !seen.insert(input.predecessor.value).second) return false;
+                    return seen == incoming;
+                };
+                std::set<std::string> destinations;
+                for (const auto &phi : terminal.phis) {
+                    const auto destination = register_name(phi.destination, phi.version);
+                    if (!destinations.insert(destination).second || !valid_inputs(phi)) return false;
+                    for (const auto &input : phi.inputs)
+                        copies[input.predecessor.value].emplace_back(
+                            destination, register_name(phi.destination, input.version));
+                }
+                if (terminal.memory_phi && !valid_inputs(*terminal.memory_phi)) return false;
+                std::set<std::string> partitions;
+                for (const auto &phi : terminal.memory_partition_phis)
+                    if (phi.partition.empty() || !partitions.insert(phi.partition).second ||
+                        !valid_inputs(phi)) return false;
+                return true;
+            };
             auto *exit_cursor = exit_block;
             auto expected_exit_predecessor = latch ? latch->id.value : 0;
             bool exit_path_valid = true;
@@ -13888,12 +13927,19 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                    exit_path_ids.insert(exit_cursor->id.value).second &&
                    exit_cursor != entry && exit_cursor != latch &&
                    !do_body_ids.contains(exit_cursor->id.value) &&
-                   exit_cursor->phis.empty() && !exit_cursor->memory_phi &&
-                   exit_cursor->memory_partition_phis.empty() &&
+                   ((exit_cursor->phis.empty() && !exit_cursor->memory_phi &&
+                     exit_cursor->memory_partition_phis.empty()) || has_only_terminal_return(*exit_cursor)) &&
+                   !exit_cursor->switch_dispatch &&
                    has_only_simple_statements(*exit_cursor) &&
                    predecessors[exit_cursor->id.value] == std::set<std::uint64_t>{expected_exit_predecessor}) {
                 exit_path.push_back(exit_cursor);
-                if (has_only_terminal_return(*exit_cursor)) break;
+                if (has_only_terminal_return(*exit_cursor)) {
+                    std::map<std::uint64_t, std::vector<std::pair<std::string, std::string>>> copies;
+                    if (!return_phi_copies(*exit_cursor, {expected_exit_predecessor}, copies))
+                        exit_path_valid = false;
+                    else cleanup_direct_return_copies = std::move(copies[expected_exit_predecessor]);
+                    break;
+                }
                 if (const auto *candidate = terminal_conditional(*exit_cursor);
                     candidate && candidate->true_target && candidate->false_target &&
                     *candidate->true_target != *candidate->false_target) {
@@ -13906,8 +13952,9 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                                !do_body_ids.contains(cursor->id.value) &&
                                !exit_path_ids.contains(cursor->id.value) &&
                                path.size() < 64 && seen.insert(cursor->id.value).second &&
-                               cursor->phis.empty() && !cursor->memory_phi &&
-                               cursor->memory_partition_phis.empty() &&
+                               ((cursor->phis.empty() && !cursor->memory_phi &&
+                                 cursor->memory_partition_phis.empty()) || has_only_terminal_return(*cursor)) &&
+                               !cursor->switch_dispatch &&
                                has_only_simple_statements(*cursor) &&
                                (predecessors[cursor->id.value] == std::set<std::uint64_t>{predecessor} ||
                                 has_only_terminal_return(*cursor))) {
@@ -13958,14 +14005,28 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                         std::count_if(exit_cursor->successors.begin(), exit_cursor->successors.end(), [&](const auto &edge) {
                             return edge_targets(edge, *candidate->false_target);
                         }) == 1;
+                    std::map<std::uint64_t, std::vector<std::pair<std::string, std::string>>> true_copies;
+                    std::map<std::uint64_t, std::vector<std::pair<std::string, std::string>>> false_copies;
+                    const auto true_tail = path_tail(true_path);
+                    const auto false_tail = path_tail(false_path);
+                    const std::set<std::uint64_t> true_incoming = shared_return
+                        ? std::set<std::uint64_t>{true_tail, false_tail}
+                        : std::set<std::uint64_t>{true_tail};
+                    const std::set<std::uint64_t> false_incoming = shared_return
+                        ? true_incoming : std::set<std::uint64_t>{false_tail};
+                    const bool return_phis_valid = !true_path.empty() && !false_path.empty() &&
+                        return_phi_copies(*true_path.back(), true_incoming, true_copies) &&
+                        return_phi_copies(*false_path.back(), false_incoming, false_copies);
                     if (!true_path.empty() && !false_path.empty() && exact_edges &&
-                        shared_return_predecessors_valid && terminal_predecessors_valid &&
+                        shared_return_predecessors_valid && terminal_predecessors_valid && return_phis_valid &&
                         disjoint_path(true_path, shared_return) &&
                         disjoint_path(false_path, shared_return)) {
                         cleanup_branch = exit_cursor;
                         cleanup_condition = candidate;
                         cleanup_true_path = std::move(true_path);
                         cleanup_false_path = std::move(false_path);
+                        cleanup_true_return_copies = std::move(true_copies[true_tail]);
+                        cleanup_false_return_copies = std::move(false_copies[false_tail]);
                         break;
                     }
                 }
@@ -14075,15 +14136,24 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                     for (const auto *block : backedge_cleanup) emit_block(*block, 12, true);
                     out << "            continue;\n        } else {\n            break;\n        }\n    }\n";
                 }
-                for (const auto *block : exit_path)
+                for (const auto *block : exit_path) {
+                    if (block == exit_path.back() && block != cleanup_branch)
+                        emit_parallel_copies(out, cleanup_direct_return_copies, 4);
                     emit_block(*block, 4, block == cleanup_branch || block != exit_path.back());
+                }
                 if (cleanup_branch && cleanup_condition && !cleanup_true_path.empty() && !cleanup_false_path.empty()) {
                     out << "    if (" << branch_condition_text(*cleanup_condition) << ") {\n";
-                    for (const auto *block : cleanup_true_path)
+                    for (const auto *block : cleanup_true_path) {
+                        if (block == cleanup_true_path.back())
+                            emit_parallel_copies(out, cleanup_true_return_copies, 8);
                         emit_block(*block, 8, block != cleanup_true_path.back());
+                    }
                     out << "    } else {\n";
-                    for (const auto *block : cleanup_false_path)
+                    for (const auto *block : cleanup_false_path) {
+                        if (block == cleanup_false_path.back())
+                            emit_parallel_copies(out, cleanup_false_return_copies, 8);
                         emit_block(*block, 8, block != cleanup_false_path.back());
+                    }
                     out << "    }\n";
                 }
                 out << "}\n";
