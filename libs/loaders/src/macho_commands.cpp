@@ -142,8 +142,13 @@ void dynamic_symbols(const Reader &reader, const MachOLoadCommand &command, cons
                         module.external_relocation_count = static_cast<std::uint32_t>(reader.value(record.bytes, 32, 4));
                         module.init_term_start = static_cast<std::uint32_t>(reader.value(record.bytes, 36, 4));
                         module.init_term_count = static_cast<std::uint32_t>(reader.value(record.bytes, 40, 4));
-                        module.module_info_size = static_cast<std::uint32_t>(reader.value(record.bytes, 44, 4));
-                        module.module_info_address = reader.value(record.bytes, 48, slice.header.is_64 ? 8 : 4);
+                        if (slice.header.is_64) {
+                            module.module_info_size = static_cast<std::uint32_t>(reader.value(record.bytes, 44, 4));
+                            module.module_info_address = reader.value(record.bytes, 48, 8);
+                        } else {
+                            module.module_info_address = reader.value(record.bytes, 44, 4);
+                            module.module_info_size = static_cast<std::uint32_t>(reader.value(record.bytes, 48, 4));
+                        }
                         const auto check_range = [&](std::uint32_t begin, std::uint32_t count, std::uint32_t limit, const char *message) {
                             require(begin <= limit && count <= limit - begin, message);
                         };

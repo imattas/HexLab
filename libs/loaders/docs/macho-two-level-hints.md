@@ -34,9 +34,13 @@ load-command order with command and file-offset provenance.
 `LC_DYSYMTAB` contents (TOC) and module rows are decoded into the dynamic
 symbol-table metadata. TOC rows retain symbol and module indices. Module rows
 retain the nlist/reference/relocation/init-term ranges and ObjC module-info
-size/address. Reads are bounded by the existing count, storage, file-extent,
-cancellation and cumulative loader budgets. TOC symbol indices and module
-indices and module ranges are validated against their declared tables.
+size/address. The 32-bit module record stores the ObjC module-info address at
+offset 44 and size at offset 48; the 64-bit record stores size at offset 44
+and its 64-bit address at offset 48, matching Apple's [`dylib_module` and
+`dylib_module_64` layouts](https://github.com/apple-oss-distributions/xnu/blob/main/EXTERNAL_HEADERS/mach-o/loader.h#L988-L1034).
+Reads are bounded by the existing count, storage, file-extent, cancellation and
+cumulative loader budgets. TOC symbol indices and module indices and module
+ranges are validated against their declared tables.
 
 `resolve_macho_two_level_hints` resolves an associated hint only against an
 explicit caller-supplied provider keyed by the import library ordinal and
