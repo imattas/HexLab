@@ -3344,11 +3344,10 @@ RegisterReferenceFacts a64_reference_facts(const Image *image, const RelocationC
                     std::uint64_t value = subtract ? (*lhs - *rhs - (carry ? 0u : 1u)) & mask
                                                    : (*lhs + *rhs + (carry ? 1u : 0u)) & mask;
                     const auto candidate = Address{instruction.address.space, value};
-                    const auto *segment = image->segment_at(candidate);
-                    if (segment && segment->executable && candidate.offset >= segment->begin.offset &&
-                        candidate.offset - segment->begin.offset < segment->size) {
+                    if (riscv_target_segment(*image, candidate, OperandAccess::address)) {
                         registers[dst->index] = candidate;
                         result.immediate_targets[{fact->id, 0}] = candidate;
+                        result.address_definitions.insert(fact->id);
                     }
                 }
                 propagated = true;
