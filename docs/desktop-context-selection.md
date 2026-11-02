@@ -143,3 +143,13 @@ overlap. Filter preferences are local to the desktop profile rather than
 portable project data; context bars have no portable preference store, and
 cross-view inferred call relationships and original-text mappings for decoded
 inputs remain outside this slice.
+
+Imports and Exports also provide **Find references** for a selected metadata
+row. Imports query incoming references to the IAT slot; mapped exports query
+incoming references to the exported address. Forwarded exports have no local
+address, so the action stays disabled for them. The query uses the active
+document's current immutable project reference snapshot and opens the References
+page at that address; selecting a different table row immediately refreshes
+the action state. This does not infer a target when the loader supplied no
+mapped address, and incomplete reference analysis remains labeled by the
+References page.

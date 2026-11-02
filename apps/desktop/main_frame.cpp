@@ -968,6 +968,7 @@ struct MainFrame::Impl {
     std::vector<std::uint64_t> document_symbol_filter_order;
     wxTextCtrl *import_filter = nullptr, *export_filter = nullptr;
     wxButton *import_pin_selected = nullptr, *export_pin_selected = nullptr;
+    wxButton *import_references_selected = nullptr, *export_references_selected = nullptr;
     wxCheckBox *imports_pinned_only = nullptr, *exports_pinned_only = nullptr;
     std::map<std::uint64_t, std::pair<wxString, wxString>> document_import_export_filters;
     std::vector<std::uint64_t> document_import_export_filter_order;
@@ -2574,6 +2575,29 @@ struct MainFrame::Impl {
         };
         update_button(import_pin_selected, imports, visible_import_rows, true);
         update_button(export_pin_selected, exports, visible_export_rows, false);
+        const bool references_ready = document && shown == document &&
+            controller->documents().active_document() == document->id &&
+            controller->state().current() == document &&
+            controller->documents().project(document->id) == document->project &&
+            document->project && document->project->references &&
+            (document->project->status == DerivedStatus::fresh ||
+             document->project->status == DerivedStatus::incomplete);
+        const auto update_reference_button = [&](wxButton *button, VirtualTable *table,
+                                                 const std::vector<std::size_t> &visible_rows,
+                                                 bool imports_table) {
+            if (!button) return;
+            bool enabled = false;
+            const auto selected = table ? table->selected_row() : std::nullopt;
+            if (references_ready && selected && *selected < visible_rows.size()) {
+                const auto source_row = visible_rows[*selected];
+                if (imports_table) enabled = source_row < document->metadata_view().imports.size();
+                else if (source_row < document->metadata_view().exports.size())
+                    enabled = document->metadata_view().exports[source_row].address.has_value();
+            }
+            button->Enable(enabled);
+        };
+        update_reference_button(import_references_selected, imports, visible_import_rows, true);
+        update_reference_button(export_references_selected, exports, visible_export_rows, false);
         if (imports_pinned_only) {
             imports_pinned_only->Enable(document && pins);
             imports_pinned_only->SetValue(document && pins ? pins->imports_only : false);
@@ -4415,6 +4439,39 @@ struct MainFrame::Impl {
         if (location == state().selection()) location = reference_origin(*location);
         browse_references(*id, *location, incoming);
     }
+    void browse_selected_metadata_references(bool imports_table) {
+        const auto document = shown;
+        if (!document || controller->documents().active_document() != document->id ||
+            controller->state().current() != document ||
+            controller->documents().project(document->id) != document->project || closer->closing_window())
+            return;
+        const auto *table = imports_table ? imports : exports;
+        const auto &visible_rows = imports_table ? visible_import_rows : visible_export_rows;
+        const auto selected = table ? table->selected_row() : std::nullopt;
+        if (!selected || *selected >= visible_rows.size()) {
+            log(imports_table ? "Select an import row first." : "Select an export row first.");
+            return;
+        }
+        const auto source_row = visible_rows[*selected];
+        std::optional<Address> address;
+        if (imports_table) {
+            if (source_row < document->metadata_view().imports.size())
+                address = document->metadata_view().imports[source_row].iat;
+        } else if (source_row < document->metadata_view().exports.size()) {
+            address = document->metadata_view().exports[source_row].address;
+        }
+        if (!address) {
+            log("The selected export is a forwarder and has no mapped address to inspect.");
+            return;
+        }
+        const auto project = controller->documents().project(document->id);
+        if (!project || !project->references ||
+            (project->status != DerivedStatus::fresh && project->status != DerivedStatus::incomplete)) {
+            log("References are unavailable until current project analysis is ready.");
+            return;
+        }
+        browse_references(document->id, Location{*address}, true);
+    }
     std::optional<Address> follow_target() {
         const auto *row = selected_row();
         if (!row || !row->instruction)
@@ -5166,9 +5223,14 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
     ui.import_pin_selected->SetName("import-pin-selected");
     ui.import_pin_selected->SetToolTip("Pin or unpin the selected import for this project or open document. Each table is limited to 256 pins.");
     ui.import_pin_selected->Enable(false);
+    ui.import_references_selected = new wxButton(imports_panel, wxID_ANY, "Find references");
+    ui.import_references_selected->SetName("import-references-selected");
+    ui.import_references_selected->SetToolTip("Show incoming code references to the selected import address table slot.");
+    ui.import_references_selected->Enable(false);
     ui.imports_pinned_only = new wxCheckBox(imports_panel, wxID_ANY, "Show pinned only");
     ui.imports_pinned_only->SetName("imports-pinned-only");
     import_pin_actions->Add(ui.import_pin_selected, 0, wxRIGHT, FromDIP(8));
+    import_pin_actions->Add(ui.import_references_selected, 0, wxRIGHT, FromDIP(8));
     import_pin_actions->Add(ui.imports_pinned_only, 0, wxALIGN_CENTER_VERTICAL);
     ui.import_context = new MetadataContextBar(imports_panel, "import-context", true);
     ui.import_context->navigate = metadata_context_navigate;
@@ -5199,9 +5261,14 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
     ui.export_pin_selected->SetName("export-pin-selected");
     ui.export_pin_selected->SetToolTip("Pin or unpin the selected export for this project or open document. Each table is limited to 256 pins.");
     ui.export_pin_selected->Enable(false);
+    ui.export_references_selected = new wxButton(exports_panel, wxID_ANY, "Find references");
+    ui.export_references_selected->SetName("export-references-selected");
+    ui.export_references_selected->SetToolTip("Show incoming code references to the selected mapped export address.");
+    ui.export_references_selected->Enable(false);
     ui.exports_pinned_only = new wxCheckBox(exports_panel, wxID_ANY, "Show pinned only");
     ui.exports_pinned_only->SetName("exports-pinned-only");
     export_pin_actions->Add(ui.export_pin_selected, 0, wxRIGHT, FromDIP(8));
+    export_pin_actions->Add(ui.export_references_selected, 0, wxRIGHT, FromDIP(8));
     export_pin_actions->Add(ui.exports_pinned_only, 0, wxALIGN_CENTER_VERTICAL);
     ui.export_context = new MetadataContextBar(exports_panel, "export-context", true);
     ui.export_context->navigate = metadata_context_navigate;
@@ -6009,9 +6076,22 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
     ui.import_pin_selected->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) {
         impl_->toggle_metadata_pin(true);
     });
+    ui.import_references_selected->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) {
+        impl_->browse_selected_metadata_references(true);
+    });
     ui.export_pin_selected->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) {
         impl_->toggle_metadata_pin(false);
     });
+    ui.export_references_selected->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) {
+        impl_->browse_selected_metadata_references(false);
+    });
+    const auto update_metadata_selection_actions = [this](wxListEvent &) {
+        impl_->update_metadata_pin_controls(impl_->shown);
+    };
+    ui.imports->Bind(wxEVT_LIST_ITEM_SELECTED, update_metadata_selection_actions);
+    ui.imports->Bind(wxEVT_LIST_ITEM_DESELECTED, update_metadata_selection_actions);
+    ui.exports->Bind(wxEVT_LIST_ITEM_SELECTED, update_metadata_selection_actions);
+    ui.exports->Bind(wxEVT_LIST_ITEM_DESELECTED, update_metadata_selection_actions);
     ui.imports_pinned_only->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent &) {
         if (!impl_->shown) return;
         impl_->ensure_metadata_pins(impl_->shown);
