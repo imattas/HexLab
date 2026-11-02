@@ -53,7 +53,7 @@ inline std::optional<WasmV128> evaluate_wasm_simd_integer_binary_instruction(
         return value;
     };
     // Conversion uses explicit two's-complement magnitude for narrow lanes
-    // and preserves all bits with bit_cast for signed 64-bit comparisons.
+    // and preserves all bits with bit_cast for signed 64-bit lane conversions.
     const auto signed_lane = [bits, mask](std::uint64_t value) -> std::int64_t {
         if (bits == 64) return std::bit_cast<std::int64_t>(value);
         return value & (UINT64_C(1) << (bits - 1)) ?
