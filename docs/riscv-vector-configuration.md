@@ -258,10 +258,31 @@ The operand classes and rounding dependency follow the
 [RISC-V V specification, vector conversion instructions](https://docs.riscv.org/reference/isa/unpriv/v-st-ext.html#vector-conversion-instructions).
 
 Other conversions, reciprocal and reciprocal-square-root estimates,
-widening floating-point arithmetic, half-precision
-vector operations, and all other vector floating-point encodings remain
-unsupported. A recognized FP funct6 with a reserved operand class is invalid;
-FP funct6 values outside this slice remain unsupported.
+widening floating-point arithmetic, and half-precision vector operations
+remain unsupported here. All other vector floating-point encodings remain
+unsupported except the separately described slide-one forms below. A
+recognized FP funct6 with a reserved operand class is invalid; FP funct6
+values outside this slice remain unsupported.
+
+## Scalar-insert slide-one operations
+
+`vslide1up.vx`, `vslide1down.vx`, `vfslide1up.vf`, and `vfslide1down.vf`
+decode and format with their integer or floating scalar-register operand
+classes preserved. The integer forms evaluate for SEW 8/16/32/64 and XLEN
+32/64. When XLEN is narrower than SEW, the inserted integer is sign-extended;
+when XLEN is wider, its low SEW bits are used. The floating forms evaluate for
+SEW 32/64 and copy the low SEW scalar bits without floating-point arithmetic
+or FFLAGS effects.
+
+Both evaluators preserve prestart, masked-off, and tail destination lanes.
+Active `vslide1up` lanes copy `vs2[i-1]`, except lane zero receives the scalar;
+active `vslide1down` lanes copy `vs2[i+1]`, except lane `vl-1` receives the
+scalar. The helpers require caller-supplied lane spans and vector configuration;
+they do not validate physical vector-register overlap or apply tail/mask
+agnostic policies. Generic lifting keeps the operations as named vector
+intrinsics with vector configuration, predicate, and old-destination inputs.
+The decode equations and lane rules follow the ratified
+[RVV 1.0 slide-one instructions](https://docs.riscv.org/reference/isa/unpriv/v-st-ext.html#vector-slide-1-up).
 
 The decoder and lane evaluator also support the non-widening integer
 multiply-accumulate/subtract forms `vmacc.vv/vx`, `vnmsac.vv/vx`,

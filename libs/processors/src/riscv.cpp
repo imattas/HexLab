@@ -534,11 +534,19 @@ bool decode_vector_permutation(std::uint32_t w, RiscvInstruction &i) {
     const unsigned funct6 = w >> 26, vm = (w >> 25) & 1;
     const unsigned vs2 = (w >> 20) & 31, vs1 = (w >> 15) & 31;
     const unsigned funct3 = (w >> 12) & 7, vd = (w >> 7) & 31;
+    const bool slide_up = funct6 == 0x0e;
+    const bool slide_down = funct6 == 0x0f;
+    const bool slide1_integer = (slide_up || slide_down) && funct3 == 6;
+    const bool slide1_floating = (slide_up || slide_down) && funct3 == 5;
     const unsigned form = funct3 == 0 ? 0 : funct3 == 4 ? 1 : funct3 == 3 ? 2 : 3;
-    if (form > 2) return false;
+    if (form > 2 && !slide1_integer && !slide1_floating) return false;
 
     RiscvOpcode op;
-    if (funct6 == 0x0c) {
+    if (slide1_integer) {
+        op = slide_up ? RiscvOpcode::vslide1up_vx : RiscvOpcode::vslide1down_vx;
+    } else if (slide1_floating) {
+        op = slide_up ? RiscvOpcode::vfslide1up_vf : RiscvOpcode::vfslide1down_vf;
+    } else if (funct6 == 0x0c) {
         op = form == 0 ? RiscvOpcode::vrgather_vv
              : form == 1 ? RiscvOpcode::vrgather_vx
                          : RiscvOpcode::vrgather_vi;
@@ -558,7 +566,9 @@ bool decode_vector_permutation(std::uint32_t w, RiscvInstruction &i) {
     operand(i, RiscvRegister{static_cast<std::uint8_t>(vs2), false, true}, RiscvOperandAccess::read);
     if (form == 0)
         operand(i, RiscvRegister{static_cast<std::uint8_t>(vs1), false, true}, RiscvOperandAccess::read);
-    else if (form == 1)
+    else if (slide1_floating)
+        operand(i, RiscvRegister{static_cast<std::uint8_t>(vs1), true, false}, RiscvOperandAccess::read);
+    else if (form == 1 || slide1_integer)
         operand(i, RiscvRegister{static_cast<std::uint8_t>(vs1)}, RiscvOperandAccess::read);
     else
         // Gather/slide offsets are unsigned and zero-extended, unlike the

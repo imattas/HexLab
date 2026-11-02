@@ -1012,6 +1012,10 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
             "vslideup.vx", "vslideup.vi", "vslidedown.vx", "vslidedown.vi"};
         return names[static_cast<std::size_t>(op) - static_cast<std::size_t>(Opcode::rv_vrgather_vv)];
     }
+    if (op == Opcode::rv_vslide1up_vx) return "vslide1up.vx";
+    if (op == Opcode::rv_vslide1down_vx) return "vslide1down.vx";
+    if (op == Opcode::rv_vfslide1up_vf) return "vfslide1up.vf";
+    if (op == Opcode::rv_vfslide1down_vf) return "vfslide1down.vf";
     if (op == Opcode::mul)
         return "mul";
     if (op == Opcode::div)

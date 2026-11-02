@@ -744,6 +744,8 @@ enum class Opcode {
     rv_fli_h,
     // RVV vector integer-to-floating conversions; appended for stable IDs.
     rv_vfcvt_f_xu_v, rv_vfcvt_f_x_v,
+    // RVV scalar-insert single-element slides; append for stable stored IDs.
+    rv_vslide1up_vx, rv_vslide1down_vx, rv_vfslide1up_vf, rv_vfslide1down_vf,
     // AVX lane permutation family; append to preserve persisted opcode values.
     vpermilps, vpermilpd, vperm2f128, vperm2i128
 };

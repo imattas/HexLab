@@ -133,7 +133,9 @@ enum class RiscvOpcode {
     // Zfa half-precision immediate load; append to preserve serialized IDs.
     fli_h,
     // RVV signed and unsigned integer-to-floating vector conversions.
-    vfcvt_f_xu_v, vfcvt_f_x_v
+    vfcvt_f_xu_v, vfcvt_f_x_v,
+    // RVV scalar-insert single-element slides; appended for opcode stability.
+    vslide1up_vx, vslide1down_vx, vfslide1up_vf, vfslide1down_vf
 };
 
 struct RiscvRegister {

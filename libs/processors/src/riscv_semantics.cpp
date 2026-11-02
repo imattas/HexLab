@@ -2002,8 +2002,12 @@ evaluate_riscv_vector_integer_operation(RiscvOpcode opcode, const RiscvVectorInt
     const bool slide_up_vi = opcode == RiscvOpcode::vslideup_vi;
     const bool slide_down_vx = opcode == RiscvOpcode::vslidedown_vx;
     const bool slide_down_vi = opcode == RiscvOpcode::vslidedown_vi;
+    const bool slide1_up_vx = opcode == RiscvOpcode::vslide1up_vx;
+    const bool slide1_down_vx = opcode == RiscvOpcode::vslide1down_vx;
     if (gather_vv || gather_vx || gather_vi || slide_up_vx || slide_up_vi ||
-        slide_down_vx || slide_down_vi) {
+        slide_down_vx || slide_down_vi || slide1_up_vx || slide1_down_vx) {
+        if (config.masked && std::any_of(operands.predicate_mask.begin(), operands.predicate_mask.end(),
+                                         [](std::uint8_t bit) { return bit > 1; })) return {};
         if (gather_vv && operands.vs1.size() != vlmax) return {};
         if ((gather_vi || slide_up_vi || slide_down_vi) &&
             (operands.immediate < 0 || operands.immediate > 31))
@@ -2013,6 +2017,10 @@ evaluate_riscv_vector_integer_operation(RiscvOpcode opcode, const RiscvVectorInt
             ? operands.scalar & xlen_mask
             : static_cast<std::uint64_t>(operands.immediate);
         const auto element_mask = width_mask(sew);
+        std::uint64_t scalar_value = operands.scalar & xlen_mask;
+        if (sew > xlen && (scalar_value & (UINT64_C(1) << (xlen - 1))))
+            scalar_value |= ~xlen_mask;
+        scalar_value &= element_mask;
         RiscvVectorIntegerResult result;
         result.vlmax = vlmax;
         result.element_bits = static_cast<std::uint8_t>(sew);
@@ -2032,10 +2040,16 @@ evaluate_riscv_vector_integer_operation(RiscvOpcode opcode, const RiscvVectorInt
                 const auto source_lane = lane - encoded_index;
                 if (source_lane < vlmax)
                     value = operands.vs2[static_cast<std::size_t>(source_lane)] & element_mask;
-            } else {
+            } else if (slide_down_vx || slide_down_vi) {
                 // An out-of-range slide-down source element is architecturally zero.
                 if (encoded_index < vlmax - lane)
                     value = operands.vs2[static_cast<std::size_t>(lane + encoded_index)] & element_mask;
+            } else if (slide1_up_vx) {
+                value = lane == 0 ? scalar_value :
+                    operands.vs2[static_cast<std::size_t>(lane - 1)] & element_mask;
+            } else {
+                value = lane + 1 == config.vl ? scalar_value :
+                    operands.vs2[static_cast<std::size_t>(lane + 1)] & element_mask;
             }
             result.lanes[static_cast<std::size_t>(lane)] = value;
         }
@@ -2341,6 +2355,7 @@ evaluate_riscv_vector_floating_operation(RiscvOpcode opcode, const RiscvVectorIn
         return {};
 
     enum class Operation { classification, reciprocal_estimate, reciprocal_sqrt_estimate,
+                           slide1_up, slide1_down,
                            add, subtract, multiply, divide, reverse_divide,
                            fma_accumulate, fma_negate_accumulate, fma_subtract_accumulate,
                            fma_negate_subtract_accumulate, fma_add, fma_negate_add,
@@ -2357,6 +2372,8 @@ evaluate_riscv_vector_floating_operation(RiscvOpcode opcode, const RiscvVectorIn
     case RiscvOpcode::vfclass_v: operation = Operation::classification; break;
     case RiscvOpcode::vfrec7_v: operation = Operation::reciprocal_estimate; break;
     case RiscvOpcode::vfrsqrt7_v: operation = Operation::reciprocal_sqrt_estimate; break;
+    case RiscvOpcode::vfslide1up_vf: operation = Operation::slide1_up; break;
+    case RiscvOpcode::vfslide1down_vf: operation = Operation::slide1_down; break;
 #define RV_FLOAT_PAIR(vv, vf, name) \
     case RiscvOpcode::vv: operation = Operation::name; vector_rhs = true; break; \
     case RiscvOpcode::vf: operation = Operation::name; break
@@ -2407,6 +2424,10 @@ evaluate_riscv_vector_floating_operation(RiscvOpcode opcode, const RiscvVectorIn
         operation == Operation::reduce_widen_ordered_sum;
     if (widening_reduction && (sew != 32 || config.lmul_log2 > 2))
         return {}; // Only FP32-to-FP64 with destination EMUL <= 8 is represented.
+    const bool slide_one = operation == Operation::slide1_up || operation == Operation::slide1_down;
+    if (slide_one && config.masked &&
+        std::any_of(operands.predicate_mask.begin(), operands.predicate_mask.end(),
+                    [](std::uint8_t bit) { return bit > 1; })) return {};
     if (reduction && (config.vstart != 0 || operands.vs1.size() != vlmax ||
         (config.masked && std::any_of(operands.predicate_mask.begin(), operands.predicate_mask.end(),
                                       [](std::uint8_t bit) { return bit > 1; })))) return {};
@@ -2687,6 +2708,14 @@ evaluate_riscv_vector_floating_operation(RiscvOpcode opcode, const RiscvVectorIn
         const bool any_signaling_nan = is_signaling_nan(lhs) || is_signaling_nan(rhs);
         std::uint64_t value = 0;
         switch (operation) {
+        case Operation::slide1_up:
+            value = lane == 0 ? operands.scalar & element_mask :
+                operands.vs2[static_cast<std::size_t>(lane - 1)] & element_mask;
+            break;
+        case Operation::slide1_down:
+            value = lane + 1 == config.vl ? operands.scalar & element_mask :
+                operands.vs2[static_cast<std::size_t>(lane + 1)] & element_mask;
+            break;
         case Operation::classification: {
             const auto magnitude = lhs & ~sign_mask;
             const auto exponent = magnitude & exponent_mask;
