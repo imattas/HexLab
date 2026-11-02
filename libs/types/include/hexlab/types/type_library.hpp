@@ -92,6 +92,15 @@ HEXLAB_TYPES_EXPORT Result<LibraryBundle> decode_library_bundle(
 HEXLAB_TYPES_EXPORT Result<std::vector<LibraryEntry>> merge_library_definitions(
     std::span<const LibraryBundle>, const std::set<std::string, std::less<>> &available_names = {},
     std::size_t max_type_nodes = 1'000'000);
+// Extracts exact roots and their transitive symbolic dependencies, sorted by
+// name. Bundled definitions take precedence over available external names.
+// Roots must exist in the bundle; repeated roots coalesce. Empty roots return
+// no definitions. Assignments and source identities are deliberately omitted.
+// Type pointers and origin metadata are retained, rather than deep-cloned.
+HEXLAB_TYPES_EXPORT Result<std::vector<LibraryEntry>> extract_library_definitions(
+    const LibraryBundle &, std::span<const std::string> root_names,
+    const std::set<std::string, std::less<>> &available_names = {},
+    std::size_t max_type_nodes = 1'000'000);
 // Renders a self-contained C11 header from bundle definitions. Symbolic
 // references must resolve in the bundle; unsupported C/layout constructs fail
 // closed. Source-specific assignments and origins are intentionally omitted.

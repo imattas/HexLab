@@ -596,6 +596,18 @@ evaluate_ppc_count_leading_zeros(Opcode opcode, std::uint64_t value, unsigned re
     return static_cast<std::uint64_t>(std::countl_zero(value));
 }
 
+std::optional<std::uint64_t>
+evaluate_ppc_count_trailing_zeros(Opcode opcode, std::uint64_t value, unsigned register_width) noexcept {
+    const bool word = opcode == Opcode::ppc_cnttzw || opcode == Opcode::ppc_cnttzw_dot;
+    const bool doubleword = opcode == Opcode::ppc_cnttzd || opcode == Opcode::ppc_cnttzd_dot;
+    if ((!word && !doubleword) || (register_width != 32 && register_width != 64) ||
+        (doubleword && register_width != 64))
+        return {};
+    if (word)
+        return static_cast<std::uint64_t>(std::countr_zero(static_cast<std::uint32_t>(value)));
+    return static_cast<std::uint64_t>(std::countr_zero(value));
+}
+
 std::optional<PpcSignExtendResult>
 evaluate_ppc_sign_extend_instruction(const Instruction &instruction,
                                      std::uint64_t source, bool xer_so) noexcept {

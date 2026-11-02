@@ -692,6 +692,8 @@ enum class Opcode {
     rv_vfwredusum, rv_vfwredosum,
     // PowerPC FPSCR transfer/control forms; append to preserve serialized IDs.
     ppc_mffs, ppc_mtfsb0, ppc_mtfsb1, ppc_mtfsfi, ppc_mtfsf,
+    // PowerPC trailing-zero counts; appended to preserve serialized IDs.
+    ppc_cnttzw, ppc_cnttzw_dot, ppc_cnttzd, ppc_cnttzd_dot,
     ppc_mcrfs,
     // MIPS64 doubleword CP0 transfers; append to preserve serialized IDs.
     mips64_dmfc0, mips64_dmtc0,
@@ -727,7 +729,9 @@ enum class Opcode {
     // MIPS32 Release 2 SPECIAL2 multiply-accumulate forms; appended for stable IDs.
     mips32_madd, mips32_maddu, mips32_msub, mips32_msubu,
     // Legacy unpacked decimal adjustment; append for persisted ID stability.
-    aaa, aas
+    aaa, aas,
+    // AArch64 variable shifts; append so persisted opcode values remain stable.
+    a64_lslv, a64_lsrv, a64_asrv, a64_rorv
 };
 enum class OperandAccess { read, write, read_write, address };
 // The encoded x86 group-one repeat prefix is retained separately from the

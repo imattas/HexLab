@@ -1085,12 +1085,15 @@ std::optional<Statement> lift_ppc_instruction(const Instruction &i, std::vector<
     if (ops.size() >= 2 && dst && dst->bank == RegisterBank::ppc_gpr) {
         const auto op = i.opcode;
         const bool record = op == Opcode::ppc_cntlzw_dot || op == Opcode::ppc_cntlzd_dot ||
+            op == Opcode::ppc_cnttzw_dot || op == Opcode::ppc_cnttzd_dot ||
             op == Opcode::ppc_extsb_dot || op == Opcode::ppc_extsh_dot || op == Opcode::ppc_extsw_dot;
         std::uint16_t source_bits = width;
         const char *operation = nullptr;
         switch (op) {
         case Opcode::ppc_cntlzw: case Opcode::ppc_cntlzw_dot: source_bits = 32; operation = "clz"; break;
         case Opcode::ppc_cntlzd: case Opcode::ppc_cntlzd_dot: source_bits = 64; operation = "clz"; break;
+        case Opcode::ppc_cnttzw: case Opcode::ppc_cnttzw_dot: source_bits = 32; operation = "ctz"; break;
+        case Opcode::ppc_cnttzd: case Opcode::ppc_cnttzd_dot: source_bits = 64; operation = "ctz"; break;
         case Opcode::ppc_extsb: case Opcode::ppc_extsb_dot: source_bits = 8; operation = "sext"; break;
         case Opcode::ppc_extsh: case Opcode::ppc_extsh_dot: source_bits = 16; operation = "sext"; break;
         case Opcode::ppc_extsw: case Opcode::ppc_extsw_dot: source_bits = 32; operation = "sext"; break;

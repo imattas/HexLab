@@ -206,3 +206,16 @@ count only the low 32 bits and return 32 for zero; doubleword forms count all
 64 bits and are rejected for PPC32. The helper returns only the GPR result;
 record-form CR0 updates, XER.SO, register sampling, and instruction dispatch
 remain outside this evaluator.
+
+## Count trailing zeros
+
+The X-form `cnttzw`/`cnttzw.` (XO 538) counts trailing zero bits in the low
+32 bits and decodes in PPC32 and PPC64. `cnttzd`/`cnttzd.` (XO 570) counts all
+64 bits and is restricted to PPC64. Both require the encoded RB field to be
+zero. A zero source returns the operand width. Record forms preserve the GPR
+count and model CR0 from that result with the current symbolic XER.SO bit.
+The typed lift uses `ctz`; `evaluate_ppc_count_trailing_zeros` validates the
+opcode/profile and evaluates the result from a caller-supplied GPR value. As
+with the other processor profiles, decoding does not check CPU-generation
+availability. The encodings and ISA 3.0 feature annotation follow
+[LLVM's PowerPC definitions](https://llvm.googlesource.com/llvm-project/%2B/5dc2d668e68613e8898c5c42960d792129453e9d/llvm/lib/Target/PowerPC/PPCInstrInfo.td) and [64-bit PowerPC definitions](https://llvm.googlesource.com/llvm-project/%2B/refs/tags/llvmorg-20.1.4/llvm/lib/Target/PowerPC/PPCInstr64Bit.td).

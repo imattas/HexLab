@@ -35,6 +35,10 @@ std::string mnemonic(Opcode opcode, std::uint8_t condition) {
     if (opcode == Opcode::a64_csneg) return "csneg";
     if (opcode == Opcode::a64_udiv) return "udiv";
     if (opcode == Opcode::a64_sdiv) return "sdiv";
+    if (opcode == Opcode::a64_lslv) return "lslv";
+    if (opcode == Opcode::a64_lsrv) return "lsrv";
+    if (opcode == Opcode::a64_asrv) return "asrv";
+    if (opcode == Opcode::a64_rorv) return "rorv";
     if (opcode == Opcode::a64_ccmp) return "ccmp";
     if (opcode == Opcode::a64_ccmn) return "ccmn";
     if (opcode == Opcode::a64_vadd) return "add";

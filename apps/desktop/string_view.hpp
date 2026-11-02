@@ -68,6 +68,7 @@ class StringBrowserView final : public wxPanel {
     wxButton *next_references_ = nullptr;
     wxButton *copy_reference_ = nullptr;
     wxButton *copy_reference_page_ = nullptr;
+    wxButton *export_selected_ = nullptr;
     wxTimer filter_timer_;
     std::vector<std::size_t> visible_strings_;
     std::optional<std::size_t> selected_string_;
@@ -101,7 +102,8 @@ class StringBrowserView final : public wxPanel {
     void refresh_cursor_context();
     void reset_filters(bool reset_order = true);
     void refresh_references();
-    void export_strings(bool filtered);
+    enum class StringExportScope { filtered, all, selected };
+    void export_strings(StringExportScope);
     void export_standalone_notes();
     void import_standalone_notes();
     void copy_selected_row();

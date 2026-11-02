@@ -62,6 +62,30 @@ rejected so callers must select and apply assignments through the identity
 policy separately. Source and binary identities likewise do not carry into
 the returned definition list.
 
+Consumers can export a focused public interface with
+`extract_library_definitions(bundle, root_names, available_names)`. Roots are
+exact, case-sensitive bundled names; repeated roots coalesce, unknown roots
+fail even if listed as externally available, and an empty root list returns an
+empty list. The result contains the roots plus every transitively referenced
+bundled definition, sorted by exact name. Traversal covers element and result
+types, fields, parameters, method signatures and `this` types, virtual-base
+pointer types, and static-data types. Recursive named definitions terminate
+without duplicating entries. Bundled dependencies always take precedence over
+external names. Missing dependencies fail unless declared in `available_names`;
+with its default empty value, successful extraction is self-contained.
+
+All input entries must have valid, unique names and valid metadata, but unrelated
+definitions do not need to resolve their symbolic references. Extraction accepts
+at most 4096 entries and 4096 root requests, and bounds the selected traversal to
+the caller's node budget (one million by default) and four million edges. Input
+metadata validation also retains its existing per-entry bounds. The returned
+entries retain declaration kinds, origins and shared type pointers; extraction
+does not rename, clone or translate types. It intentionally returns definitions
+only, leaving source identities and assignments behind. To serialize the result,
+place it in a fresh `LibraryBundle` and call `encode_library_bundle`. The encoder
+still enforces its byte limit. Extraction is a library API, with no new CLI
+command or project mutation.
+
 `project types verify <file>` validates a portable bundle without opening a
 project. It checks the size bound, version, record extents, unique names,
 assignment locations, every embedded type record, and the v4/v5 checksum when

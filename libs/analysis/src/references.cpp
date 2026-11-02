@@ -3442,6 +3442,61 @@ RegisterReferenceFacts a64_reference_facts(const Image *image, const RelocationC
                     }
                 }
                 propagated = true;
+            } else if (instruction.opcode == Opcode::a64_lslv || instruction.opcode == Opcode::a64_lsrv ||
+                       instruction.opcode == Opcode::a64_asrv || instruction.opcode == Opcode::a64_rorv) {
+                const auto *destination = instruction.operands.empty() ? nullptr :
+                    std::get_if<RegisterOperand>(&instruction.operands[0]);
+                std::optional<std::uint64_t> value;
+                if (instruction.context == DecodeContext{Architecture::arm64, ExecutionMode::a64, ByteOrder::little} &&
+                    instruction.length == 4 && instruction.extended_bytes.empty() &&
+                    instruction.flow == FlowKind::fallthrough && !instruction.memory_read && !instruction.memory_write &&
+                    !relocations.overlaps(instruction.address, instruction.length)) {
+                    const auto decoded = decode_a64(std::span(instruction.bytes).first(4), instruction.address);
+                    const auto *canonical = decoded.instruction ? &*decoded.instruction : nullptr;
+                    bool valid = canonical && canonical->opcode == instruction.opcode &&
+                        instruction.operands.size() == 3 && canonical->operands.size() == 3 &&
+                        instruction.access == canonical->access &&
+                        instruction.register_reads == canonical->register_reads &&
+                        instruction.register_writes == canonical->register_writes;
+                    for (std::size_t index = 0; valid && index < 3; ++index) {
+                        const auto *actual = std::get_if<RegisterOperand>(&instruction.operands[index]);
+                        const auto *expected = std::get_if<RegisterOperand>(&canonical->operands[index]);
+                        valid = actual && expected && *actual == *expected;
+                    }
+                    if (valid && destination && destination->bank == RegisterBank::arm64_gpr &&
+                        destination->index < 31 && (destination->width == 32 || destination->width == 64)) {
+                        const auto width = destination->width;
+                        const auto lhs = read_flag_operand(std::get_if<RegisterOperand>(&instruction.operands[1]), width);
+                        const auto rhs = read_flag_operand(std::get_if<RegisterOperand>(&instruction.operands[2]), width);
+                        if (lhs && rhs) {
+                            const unsigned shift = static_cast<unsigned>(*rhs & (width - 1));
+                            if (instruction.opcode == Opcode::a64_lslv) {
+                                value = (*lhs << shift) & (width == 32 ? UINT64_C(0xffffffff) : UINT64_MAX);
+                            } else if (instruction.opcode == Opcode::a64_lsrv) {
+                                value = *lhs >> shift;
+                            } else if (instruction.opcode == Opcode::a64_rorv) {
+                                const auto mask = width == 32 ? UINT64_C(0xffffffff) : UINT64_MAX;
+                                const auto source = *lhs & mask;
+                                value = shift ? ((source >> shift) | (source << (width - shift))) & mask : source;
+                            } else if (width == 32) {
+                                const auto source = std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(*lhs));
+                                value = static_cast<std::uint32_t>(source >> shift);
+                            } else {
+                                const auto source = std::bit_cast<std::int64_t>(*lhs);
+                                value = static_cast<std::uint64_t>(source >> shift);
+                            }
+                        }
+                    }
+                }
+                erase_written();
+                if (destination && destination->bank == RegisterBank::arm64_gpr && destination->index < 31) {
+                    registers.erase(destination->index);
+                    if (value) {
+                        registers[destination->index] = Address{instruction.address.space, *value};
+                        result.address_definitions.insert(fact->id);
+                    }
+                }
+                propagated = true;
             }
             if ((instruction.opcode == Opcode::a64_csel || instruction.opcode == Opcode::a64_csinc ||
                  instruction.opcode == Opcode::a64_csinv || instruction.opcode == Opcode::a64_csneg) &&

@@ -658,12 +658,16 @@ void AnalysisIssuesView::rebuild() {
           (file_inspection_strings ? std::min(max_loader_rows, file_inspection_strings->size()) : 0);
     const auto active_type = document_ && type_diagnostics_.contains(document_->value) ? &type_diagnostics_.at(document_->value) : nullptr;
     const auto active_decompiler = document_ && decompiler_diagnostics_.contains(document_->value) ? &decompiler_diagnostics_.at(document_->value) : nullptr;
-    const auto durable_type_count = !active_type && durable_type_import ? std::count_if(durable_type_import->begin(), durable_type_import->end(), [](const auto &item){return item.source!="Decompiler" && item.source!="Minidump register context" && item.source!="Project analysis";}) : 0;
-    const auto durable_analysis_count = !project_string_diagnostics && durable_type_import ? std::count_if(durable_type_import->begin(), durable_type_import->end(), [](const auto& item){return item.source=="Project analysis";}) : 0;
-    const auto durable_context_count = durable_type_import ? std::count_if(durable_type_import->begin(),durable_type_import->end(),[](const auto& item){return item.source=="Minidump register context";}) : 0;
+    const auto durable_type_count = !active_type && durable_type_import
+        ? static_cast<std::size_t>(std::count_if(durable_type_import->begin(), durable_type_import->end(), [](const auto &item){return item.source!="Decompiler" && item.source!="Minidump register context" && item.source!="Project analysis";})) : std::size_t{0};
+    const auto durable_analysis_count = !project_string_diagnostics && durable_type_import
+        ? static_cast<std::size_t>(std::count_if(durable_type_import->begin(), durable_type_import->end(), [](const auto& item){return item.source=="Project analysis";})) : std::size_t{0};
+    const auto durable_context_count = durable_type_import
+        ? static_cast<std::size_t>(std::count_if(durable_type_import->begin(),durable_type_import->end(),[](const auto& item){return item.source=="Minidump register context";})) : std::size_t{0};
     const auto current_decompiler_function = active_decompiler && !active_decompiler->empty() ? active_decompiler->front().function_entry : std::optional<Address>{};
     const auto is_superseded_decompiler = [&](const auto &item) { return active_decompiler && item.source=="Decompiler" && current_decompiler_function && item.function_entry==current_decompiler_function && item.source_key && project_ && project_->derived_key && *item.source_key==*project_->derived_key; };
-    const auto durable_decompiler_count = durable_type_import ? std::count_if(durable_type_import->begin(), durable_type_import->end(), [&](const auto &item){return item.source=="Decompiler"&&!is_superseded_decompiler(item);}) : 0;
+    const auto durable_decompiler_count = durable_type_import
+        ? static_cast<std::size_t>(std::count_if(durable_type_import->begin(), durable_type_import->end(), [&](const auto &item){return item.source=="Decompiler"&&!is_superseded_decompiler(item);})) : std::size_t{0};
     const auto producer_count = std::min(max_loader_rows, active_type ? active_type->size() : durable_type_count) +
                                 std::min(max_loader_rows, durable_analysis_count) +
                                 std::min(max_loader_rows, active_decompiler ? active_decompiler->size() : durable_decompiler_count);

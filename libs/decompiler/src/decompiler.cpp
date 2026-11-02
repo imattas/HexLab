@@ -756,6 +756,10 @@ std::string operation_name(Opcode opcode) {
     case Opcode::sub: case Opcode::a64_sub: case Opcode::a32_sub: case Opcode::t32_subw: return "sub";
     case Opcode::a64_bfm: return "a64_bfm";
     case Opcode::a64_extr: return "extr";
+    case Opcode::a64_lslv: return "lslv";
+    case Opcode::a64_lsrv: return "lsrv";
+    case Opcode::a64_asrv: return "asrv";
+    case Opcode::a64_rorv: return "rorv";
     case Opcode::a32_rsb: return "rsb";
     case Opcode::a32_adc: return "adc";
     case Opcode::a32_sbc: return "sbc";
@@ -3735,6 +3739,28 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
                             operand_expr(instruction.operands[1]), operand_expr(instruction.operands[2])}});
             return destination.bank == RegisterBank::arm64_zero ? ignored_write() : Assign{destination, std::move(value)};
         }
+        if (destination_operand && instruction.operands.size() == 3 &&
+            (instruction.opcode == Opcode::a64_lslv || instruction.opcode == Opcode::a64_lsrv ||
+             instruction.opcode == Opcode::a64_asrv || instruction.opcode == Opcode::a64_rorv)) {
+            const auto destination = *destination_operand;
+            const auto *left = std::get_if<RegisterOperand>(&instruction.operands[1]);
+            const auto *right = std::get_if<RegisterOperand>(&instruction.operands[2]);
+            const auto valid_gpr = [&](const RegisterOperand *reg) {
+                return reg && (reg->bank == RegisterBank::arm64_gpr || reg->bank == RegisterBank::arm64_zero) &&
+                    reg->width == destination.width && (reg->width == 32 || reg->width == 64);
+            };
+            if (!valid_gpr(&destination) || !valid_gpr(left) || !valid_gpr(right))
+                goto a64_unhandled;
+            const auto width = static_cast<unsigned>(destination.width);
+            auto count = std::make_shared<Expression>(Expression{integer_type(width),
+                BinaryValue{"and", operand_expr(instruction.operands[2]), constant_expr(width - 1, width)}});
+            const char *operation = instruction.opcode == Opcode::a64_lslv ? "shl" :
+                instruction.opcode == Opcode::a64_asrv ? "sar" :
+                instruction.opcode == Opcode::a64_rorv ? "ror" : "shr";
+            auto value = std::make_shared<Expression>(Expression{integer_type(width),
+                BinaryValue{operation, operand_expr(instruction.operands[1]), std::move(count)}});
+            return destination.bank == RegisterBank::arm64_zero ? ignored_write() : Assign{destination, std::move(value)};
+        }
         if (destination_operand && instruction.operands.size() == 4 &&
             (instruction.opcode == Opcode::a64_madd || instruction.opcode == Opcode::a64_msub)) {
             const auto destination = *destination_operand;
@@ -5908,6 +5934,10 @@ a64_unhandled:
                 constant_expr(chain_bit, flags.width));
             const auto carry_in = std::make_shared<Expression>(Expression{
                 integer_type(width), UnaryValue{"zext", incoming_chain}});
+            const auto binary = [](std::string operation, ExpressionPtr left, ExpressionPtr right) {
+                return std::make_shared<Expression>(Expression{
+                    left->type, BinaryValue{std::move(operation), std::move(left), std::move(right)}});
+            };
             const auto partial = binary("add", lhs, rhs);
             const auto value = binary("add", partial, carry_in);
             const auto carry_out = boolean_binary("bool_or", boolean_binary("carry_add", lhs, rhs),
@@ -9232,6 +9262,8 @@ Result<LiftedFunction> lift_function(const FunctionRecord &function, const Funct
                                 decoded.opcode == Opcode::a64_extr ||
                                 decoded.opcode == Opcode::a64_bfm ||
                                 decoded.opcode == Opcode::a64_udiv || decoded.opcode == Opcode::a64_sdiv ||
+                                decoded.opcode == Opcode::a64_lslv || decoded.opcode == Opcode::a64_lsrv ||
+                                decoded.opcode == Opcode::a64_asrv || decoded.opcode == Opcode::a64_rorv ||
                                 decoded.opcode == Opcode::a64_csel || decoded.opcode == Opcode::a64_csinc ||
                                 decoded.opcode == Opcode::a64_csinv || decoded.opcode == Opcode::a64_csneg)) {
                 const auto *destination = decoded.operands.empty()

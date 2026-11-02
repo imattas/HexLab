@@ -208,6 +208,77 @@ Result<std::vector<LibraryEntry>> merge_library_definitions(
         return Error{ErrorCode::resource_limit, "Portable type definition merge exceeds host limits"};
     }
 }
+Result<std::vector<LibraryEntry>> extract_library_definitions(
+    const LibraryBundle &bundle, std::span<const std::string> root_names,
+    const std::set<std::string, std::less<>> &available_names,
+    std::size_t max_type_nodes) {
+    try {
+        if (bundle.entries.size() > max_entries || root_names.size() > max_entries)
+            return Error{ErrorCode::resource_limit, "Type library extraction exceeds 4096 definitions or roots"};
+        if (!max_type_nodes)
+            return Error{ErrorCode::resource_limit, "Type library extraction has no node budget"};
+
+        std::map<std::string, const LibraryEntry *, std::less<>> definitions;
+        for (const auto &entry : bundle.entries) {
+            if (!valid_entry(entry) || !definitions.emplace(entry.name, &entry).second)
+                return invalid("Type library extraction requires valid unique definitions");
+        }
+        std::set<std::string, std::less<>> selected;
+        std::unordered_set<const Type *> visited;
+        std::vector<const Type *> pending;
+        constexpr std::size_t max_type_edges = 4'000'000;
+        std::size_t edges = 0;
+        const auto schedule = [&](const Type *type) {
+            if (!type) return;
+            if (edges == max_type_edges)
+                throw std::length_error("Type library extraction exceeds edge budget");
+            ++edges;
+            pending.push_back(type);
+        };
+        const auto select = [&](const LibraryEntry &entry) {
+            if (selected.insert(entry.name).second) schedule(entry.type.get());
+        };
+        for (const auto &name : root_names) {
+            const auto root = definitions.find(name);
+            if (root == definitions.end())
+                return invalid("Type library extraction names missing root " + name);
+            select(*root->second);
+        }
+        while (!pending.empty()) {
+            const auto *type = pending.back();
+            pending.pop_back();
+            if (!visited.insert(type).second) continue;
+            if (visited.size() > max_type_nodes)
+                return Error{ErrorCode::resource_limit, "Type library extraction exceeds node budget"};
+            if (type->kind() == Kind::named_reference) {
+                const auto dependency = definitions.find(type->name());
+                if (dependency != definitions.end()) select(*dependency->second);
+                else if (!available_names.contains(type->name()))
+                    return invalid("Type library extraction refers to missing definition " + type->name());
+            }
+            schedule(type->element().get());
+            schedule(type->result_type().get());
+            for (const auto &member : type->members()) {
+                schedule(member.type.get());
+                if (member.virtual_base) schedule(member.virtual_base->vbptr_type.get());
+            }
+            for (const auto &parameter : type->parameters()) schedule(parameter.type.get());
+            for (const auto &method : type->methods()) {
+                schedule(method.signature.get());
+                schedule(method.this_type.get());
+            }
+            for (const auto &member : type->static_data_members()) schedule(member.type.get());
+        }
+        std::vector<LibraryEntry> result;
+        result.reserve(selected.size());
+        for (const auto &name : selected) result.push_back(*definitions.at(name));
+        return result;
+    } catch (const std::bad_alloc &) {
+        return Error{ErrorCode::resource_limit, "Cannot extract portable type definitions"};
+    } catch (const std::length_error &error) {
+        return Error{ErrorCode::resource_limit, error.what()};
+    }
+}
 Result<LibraryAssignmentSelection> select_library_assignments(
     const LibraryBundle &bundle, const std::optional<LibrarySourceIdentity> &destination_source,
     const std::optional<LibraryBinaryIdentity> &destination_binary,

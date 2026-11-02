@@ -145,6 +145,21 @@ bool integer(Instruction &i, std::uint32_t word) {
             i.register_writes.push_back(reg(destination, 64));
         return true;
     }
+    // AArch64 two-source variable shifts. Rm supplies the architectural
+    // modulo-width shift count; W-form writes also zero-extend into the X view.
+    if (division_encoding == 0x1ac02000u || division_encoding == 0x1ac02400u ||
+        division_encoding == 0x1ac02800u || division_encoding == 0x1ac02c00u) {
+        i.opcode = division_encoding == 0x1ac02000u ? Opcode::a64_lslv :
+            division_encoding == 0x1ac02400u ? Opcode::a64_lsrv :
+            division_encoding == 0x1ac02800u ? Opcode::a64_asrv : Opcode::a64_rorv;
+        operand(i, reg(word & 31, width), OperandAccess::write);
+        operand(i, reg((word >> 5) & 31, width), OperandAccess::read);
+        operand(i, reg((word >> 16) & 31, width), OperandAccess::read);
+        const unsigned destination = word & 31;
+        if (width == 32 && destination != 31)
+            i.register_writes.push_back(reg(destination, 64));
+        return true;
+    }
     // Integer data-processing (three source): Rd = Ra +/- (Rn * Rm).
     // Bit 15 selects subtraction; all other fixed/reserved bits are checked by
     // this mask while sf (bit 31) remains available for the W/X width.

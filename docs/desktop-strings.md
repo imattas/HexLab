@@ -79,6 +79,21 @@ is still active before opening the destination. If a tab switch or snapshot
 publication replaced it while the dialog was open, export is canceled with a
 retry prompt so the file cannot silently contain strings from an older view.
 
+**Export selected CSV...** in the references pane exports just the selected
+string, including every indexed incoming reference across all pages. Its CSV
+columns match the filtered and all-string exports, with one row per reference
+and the string's metadata and comment repeated on each row. A string without
+references still gets a metadata row; unavailable and partial analysis are
+explicitly labeled in `reference_status`. This action is also available for
+standalone strings whose references cannot be indexed. It starts at the first
+reference regardless of the page currently displayed and streams pages of 128
+through the same protected, atomic publication path. It cancels before opening
+the destination if the active snapshot or selected string changes during the
+save dialog. Pending filter changes are applied before export; if they hide
+the selected string, select a visible row and retry. A successful export reports
+the number of strings and indexed references written, with an unavailable or
+partial-analysis qualifier when applicable.
+
 ## Per-document preferences and session restoration
 
 Each open document retains its text query, exact encoding/mapping/termination

@@ -136,6 +136,12 @@ HEXLAB_PROCESSORS_EXPORT std::optional<std::uint64_t>
 evaluate_ppc_count_leading_zeros(Opcode opcode, std::uint64_t value,
                                  unsigned register_width) noexcept;
 
+// Evaluate CNTTZW/CNTTZD, including record-form opcodes for their GPR result.
+// CNTTZW observes the low 32 bits; CNTTZD requires a 64-bit register profile.
+HEXLAB_PROCESSORS_EXPORT std::optional<std::uint64_t>
+evaluate_ppc_count_trailing_zeros(Opcode opcode, std::uint64_t value,
+                                  unsigned register_width) noexcept;
+
 struct PpcSignExtendResult {
     std::uint64_t value = 0;
     std::optional<std::uint8_t> cr0;

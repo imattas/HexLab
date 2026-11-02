@@ -386,6 +386,11 @@ StringBrowserView::StringBrowserView(wxWindow *parent) : wxPanel(parent), filter
     reference_summary_ = new wxStaticText(reference_panel, wxID_ANY, "Select a string to browse incoming references");
     reference_summary_->SetName("string-reference-summary");
     reference_layout->Add(reference_summary_, 0, wxEXPAND | wxALL, FromDIP(4));
+    export_selected_ = new wxButton(reference_panel, wxID_ANY, "Export selected CSV...");
+    export_selected_->SetName("strings-export-selected");
+    export_selected_->SetToolTip("Export the selected string and all its indexed incoming references, across every page.");
+    export_selected_->Enable(false);
+    reference_layout->Add(export_selected_, 0, wxLEFT | wxRIGHT | wxBOTTOM, FromDIP(4));
     references_ = new VirtualTable(reference_panel, "string-references", {"Source", "Kind", "Operand"});
     reference_layout->Add(references_, 1, wxEXPAND);
     auto *paging = new wxBoxSizer(wxHORIZONTAL);
@@ -438,8 +443,9 @@ StringBrowserView::StringBrowserView(wxWindow *parent) : wxPanel(parent), filter
             filter_timer_.StartOnce(120);
         });
     reset->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { reset_filters(); });
-    export_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { export_strings(true); });
-    export_all_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { export_strings(false); });
+    export_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { export_strings(StringExportScope::filtered); });
+    export_all_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { export_strings(StringExportScope::all); });
+    export_selected_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { export_strings(StringExportScope::selected); });
     copy_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { copy_selected_row(); });
     copy_byte_preview_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { copy_byte_preview(); });
     copy_text_preview_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { copy_text_preview(); });
@@ -1539,14 +1545,21 @@ void StringBrowserView::refresh_byte_preview() {
         rendered, static_cast<unsigned long long>(record.byte_length), encoding_text(record.encoding)));
 }
 
-void StringBrowserView::export_strings(bool filtered) {
+void StringBrowserView::export_strings(StringExportScope scope) {
     if (!document_)
         return;
     filter_timer_.Stop();
     refresh_strings();
     const auto document = document_;
+    const auto selection = selected_string_;
     std::vector<std::size_t> records;
-    if (filtered) {
+    if (scope == StringExportScope::selected) {
+        if (!selection || *selection >= document->strings().records.size()) {
+            action_status_->SetLabel("Select a visible string before exporting its incoming references");
+            return;
+        }
+        records.push_back(*selection);
+    } else if (scope == StringExportScope::filtered) {
         records = visible_strings_;
     } else {
         records.resize(document->strings().records.size());
@@ -1560,9 +1573,12 @@ void StringBrowserView::export_strings(bool filtered) {
         ? document->project->protected_paths : std::vector<std::filesystem::path>{};
     if (const auto file = std::dynamic_pointer_cast<const FileStorage>(document->input_storage))
         protected_paths.push_back(file->backing_path());
-    const auto title = filtered ? "Export filtered strings and incoming references" :
-                                  "Export all strings and incoming references";
-    wxFileDialog dialog(this, title, {}, filtered ? "strings-filtered.csv" : "strings-all.csv",
+    const auto title = scope == StringExportScope::selected ? "Export selected string and all incoming references" :
+        scope == StringExportScope::filtered ? "Export filtered strings and incoming references" :
+                                              "Export all strings and incoming references";
+    const auto filename = scope == StringExportScope::selected ? "string-selected.csv" :
+        scope == StringExportScope::filtered ? "strings-filtered.csv" : "strings-all.csv";
+    wxFileDialog dialog(this, title, {}, filename,
                         "CSV files (*.csv)|*.csv|All files (*.*)|*.*", wxFD_SAVE | wxFD_OVERWRITE_PROMPT);
     if (dialog.ShowModal() != wxID_OK)
         return;
@@ -1573,6 +1589,12 @@ void StringBrowserView::export_strings(bool filtered) {
         wxMessageBox("The active document or its analysis changed while the save dialog was open. "
                      "No strings were exported; review the current document and try again.",
                      "Export strings", wxOK | wxICON_WARNING, this);
+        return;
+    }
+    if (scope == StringExportScope::selected && selected_string_ != selection) {
+        wxMessageBox("The selected string changed while the save dialog was open. "
+                     "No strings were exported; select the intended string and try again.",
+                     "Export selected string", wxOK | wxICON_WARNING, this);
         return;
     }
     auto publication = FilePublication::create(std::filesystem::path(dialog.GetPath().ToStdWstring()),
@@ -1608,6 +1630,7 @@ void StringBrowserView::export_strings(bool filtered) {
         status == DerivedStatus::file_only ? "unavailable: file-only document" :
         "unavailable: reference index is not current";
     constexpr std::size_t export_page_size = 128;
+    std::uint64_t exported_references = 0;
     for (const auto record_index : records) {
         if (record_index >= document->strings().records.size())
             continue;
@@ -1640,6 +1663,7 @@ void StringBrowserView::export_strings(bool filtered) {
             }
             for (const auto &reference : page.value().rows) {
                 wrote_reference = true;
+                ++exported_references;
                 auto fields = prefix;
                 fields.push_back(utf8(location_text(reference.source, document->image.get())));
                 fields.push_back(utf8(reference_kind_text(reference.kind)));
@@ -1668,6 +1692,11 @@ void StringBrowserView::export_strings(bool filtered) {
     const auto published = publication.value()->publish();
     if (!published)
         wxMessageBox(text(published.error().message), "Export strings", wxOK | wxICON_ERROR, this);
+    else
+        action_status_->SetLabel(wxString::Format("Exported %zu strings and %llu indexed incoming references%s",
+            records.size(), static_cast<unsigned long long>(exported_references),
+            !references_available ? " (reference data unavailable; see CSV status)" :
+            partial_references ? " (partial analysis; see CSV status)" : ""));
 }
 
 void StringBrowserView::choose_string(std::size_t record_index, bool navigate_to_string) {
@@ -1701,6 +1730,8 @@ void StringBrowserView::refresh_references() {
     copy_reference_page_->Enable(false);
     previous_references_->Enable(false);
     next_references_->Enable(false);
+    export_selected_->Enable(document_ && selected_string_ &&
+                             *selected_string_ < document_->strings().records.size());
     if (!document_ || !selected_string_ || *selected_string_ >= document_->strings().records.size()) {
         reference_summary_->SetLabel("Select a string to browse incoming references");
         return;

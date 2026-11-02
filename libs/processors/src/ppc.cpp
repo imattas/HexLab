@@ -508,18 +508,22 @@ DecodeResult decode_powerpc(DecodeContext context, std::span<const std::byte> by
             i.access = {OperandAccess::write, OperandAccess::read};
             i.register_writes = {gpr(ra, width)};
             i.register_reads = {gpr(rt, source_width)};
-        } else if (xo == 26 || xo == 58 || xo == 954 || xo == 922 || xo == 986) {
+        } else if (xo == 26 || xo == 58 || xo == 538 || xo == 570 ||
+                   xo == 954 || xo == 922 || xo == 986) {
             if (rb != 0)
                 return fail(DecodeStatus::invalid, "PowerPC count/extend instruction has a reserved source field");
-            if ((xo == 58 || xo == 986) && !ppc64)
+            if ((xo == 58 || xo == 570 || xo == 986) && !ppc64)
                 return fail(DecodeStatus::unsupported, "PowerPC doubleword count/extend requires PPC64 mode");
             const bool record = rc != 0;
             i.opcode = xo == 26 ? (record ? Opcode::ppc_cntlzw_dot : Opcode::ppc_cntlzw) :
                        xo == 58 ? (record ? Opcode::ppc_cntlzd_dot : Opcode::ppc_cntlzd) :
+                       xo == 538 ? (record ? Opcode::ppc_cnttzw_dot : Opcode::ppc_cnttzw) :
+                       xo == 570 ? (record ? Opcode::ppc_cnttzd_dot : Opcode::ppc_cnttzd) :
                        xo == 954 ? (record ? Opcode::ppc_extsb_dot : Opcode::ppc_extsb) :
                        xo == 922 ? (record ? Opcode::ppc_extsh_dot : Opcode::ppc_extsh) :
                                    (record ? Opcode::ppc_extsw_dot : Opcode::ppc_extsw);
-            const auto source_width = xo == 26 || xo == 58 ? (xo == 26 ? 32u : 64u) :
+            const auto source_width = xo == 26 || xo == 58 || xo == 538 || xo == 570 ?
+                                      ((xo == 26 || xo == 538) ? 32u : 64u) :
                                       xo == 954 ? 8u : xo == 922 ? 16u : 32u;
             i.operands = {gpr(ra, width), gpr(rt, width)};
             i.access = {OperandAccess::write, OperandAccess::read};
