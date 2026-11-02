@@ -41,6 +41,10 @@ struct Xcoff32Object {
         std::uint16_t type = 0;
         std::uint8_t storage_class = 0, auxiliary_count = 0;
         std::string name;
+        // Decoded from the final csect auxiliary entry when present.
+        std::uint32_t csect_length = 0;
+        std::uint8_t csect_alignment_log2 = 0, csect_type = 0, storage_mapping_class = 0;
+        bool has_csect_aux = false;
     };
     // Primary rows only, in slot order. Names are interpreted only for
     // C_EXT, C_HIDEXT, C_WEAKEXT and C_STAT; debug names remain absent.
@@ -63,11 +67,11 @@ HEXLAB_LOADERS_EXPORT Result<Xcoff32Object> inspect_xcoff32_object(
     const ByteStorage &, std::stop_token = {}, Xcoff32ObjectLimits = {});
 
 // Maps common initialized and zero-fill sections of a relocatable object into
-// deterministic synthetic section bases. Applies bounded data-field R_POS,
-// R_NEG, and R_REL relocations to locally defined symbols. Unsupported section
-// kinds, relocation encodings, common symbols, and unresolved external symbols
-// remain explicitly diagnosed; no AIX library binding or csect linker layout
-// is inferred.
+// deterministic synthetic section bases. Decodes csect aux entries, validates
+// declared csect boundaries/alignment while preserving input section order,
+// binds uniquely named definitions within this object, and applies bounded
+// full-field R_POS/R_NEG/R_REL/R_TOC relocations. No archive/library binding or
+// instruction-modified relocation encoding is inferred.
 HEXLAB_LOADERS_EXPORT Result<LoadedImage> load_xcoff32_relocatable(
     std::shared_ptr<const ByteStorage>, std::stop_token = {}, Xcoff32ObjectLimits = {});
 

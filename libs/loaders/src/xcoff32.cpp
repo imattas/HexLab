@@ -256,6 +256,18 @@ Result<Xcoff32Object> inspect_xcoff32_object(const ByteStorage &storage,
                     symbol.name.assign(reinterpret_cast<const char *>(name_bytes.data() + begin), end - begin);
                 }
             }
+            if ((symbol.storage_class == 2 || symbol.storage_class == 107 ||
+                 symbol.storage_class == 111) && symbol.auxiliary_count) {
+                // XCOFF32 convention puts the csect auxiliary record last.
+                const auto aux_at = std::size_t{i + symbol.auxiliary_count} * 18;
+                const auto aux = std::span<const std::byte>(symbols).subspan(aux_at, 18);
+                const auto smtyp = static_cast<std::uint8_t>(be(aux, 10, 1));
+                symbol.csect_length = be(aux, 0, 4);
+                symbol.csect_alignment_log2 = smtyp >> 3;
+                symbol.csect_type = smtyp & 7;
+                symbol.storage_mapping_class = static_cast<std::uint8_t>(be(aux, 11, 1));
+                symbol.has_csect_aux = true;
+            }
             result.symbols.push_back(std::move(symbol));
             i += 1 + result.symbols.back().auxiliary_count;
         }
@@ -322,7 +334,27 @@ Result<LoadedImage> load_xcoff32_relocatable(std::shared_ptr<const ByteStorage> 
                             type == 0x400 || type == 0x800;
         if (type == 0x8000u) continue; // Overflow headers describe another section's tables.
         if (!mapped || !section.size) continue;
-        total = (total + 0xfff) & ~UINT64_C(0xfff);
+        // Keep the input section's csect order and offsets. This is a safe
+        // bounded layout subset: validate every defining csect's declared
+        // alignment, then align the containing section to the strongest one.
+        std::uint8_t section_alignment = 12;
+        for (const auto &symbol : object.symbols) {
+            if (!symbol.has_csect_aux || symbol.section_number != static_cast<std::int16_t>(section.index) ||
+                symbol.csect_type != 0 /* XTY_SD */) continue;
+            require(symbol.csect_alignment_log2 <= 31,
+                    "XCOFF32 csect alignment exceeds supported address width", ErrorCode::unsupported);
+            require(symbol.value >= section.physical_address &&
+                        std::uint64_t{symbol.value} - section.physical_address <= section.size &&
+                        symbol.csect_length <= section.size - (symbol.value - section.physical_address),
+                    "XCOFF32 csect definition exceeds its section");
+            const auto source_offset = symbol.value - section.physical_address;
+            const auto csect_alignment = UINT64_C(1) << symbol.csect_alignment_log2;
+            require((source_offset & (csect_alignment - 1)) == 0,
+                    "XCOFF32 input csect violates its declared alignment", ErrorCode::unsupported);
+            section_alignment = std::max(section_alignment, symbol.csect_alignment_log2);
+        }
+        const auto alignment = UINT64_C(1) << section_alignment;
+        total = (total + alignment - 1) & ~(alignment - 1);
         require(total <= UINT32_MAX && section.size <= (UINT64_C(1) << 32) - total,
                 "XCOFF32 synthetic section layout exceeds 32-bit address space", ErrorCode::resource_limit);
         mappings[section.index - 1] = {static_cast<std::uint32_t>(total), true};
@@ -370,7 +402,7 @@ Result<LoadedImage> load_xcoff32_relocatable(std::shared_ptr<const ByteStorage> 
             [](const auto &candidate, auto index) { return candidate.index < index; });
         return it != object.symbols.end() && it->index == slot ? &*it : nullptr;
     };
-    auto symbol_address = [&](const Xcoff32Object::Symbol &symbol) -> std::optional<std::uint64_t> {
+    auto defined_symbol_address = [&](const Xcoff32Object::Symbol &symbol) -> std::optional<std::uint64_t> {
         if (symbol.section_number == -1) return symbol.value;
         if (symbol.section_number <= 0 || static_cast<std::size_t>(symbol.section_number) > object.sections.size())
             return {};
@@ -380,6 +412,43 @@ Result<LoadedImage> load_xcoff32_relocatable(std::shared_ptr<const ByteStorage> 
             std::uint64_t{symbol.value} - section.physical_address > section.size) return {};
         return std::uint64_t{mapping.address} + symbol.value - section.physical_address;
     };
+    auto symbol_address = [&](const Xcoff32Object::Symbol &symbol) -> std::optional<std::uint64_t> {
+        if (symbol.section_number != 0) return defined_symbol_address(symbol);
+        if (symbol.name.empty() || (symbol.storage_class != 2 && symbol.storage_class != 107 &&
+                                    symbol.storage_class != 111)) return {};
+        const Xcoff32Object::Symbol *strong = nullptr;
+        const Xcoff32Object::Symbol *weak = nullptr;
+        bool duplicate_strong = false, duplicate_weak = false;
+        for (const auto &candidate : object.symbols) {
+            if (candidate.name != symbol.name ||
+                (candidate.section_number <= 0 && candidate.section_number != -1) ||
+                (candidate.storage_class != 2 && candidate.storage_class != 107 &&
+                 candidate.storage_class != 111)) continue;
+            if (candidate.storage_class == 111) {
+                duplicate_weak |= weak != nullptr;
+                if (!weak) weak = &candidate;
+            } else {
+                duplicate_strong |= strong != nullptr;
+                if (!strong) strong = &candidate;
+            }
+        }
+        if (duplicate_strong || (!strong && duplicate_weak)) return {};
+        return defined_symbol_address(strong ? *strong : weak ? *weak : symbol);
+    };
+    // XMC_TC0 (15) marks the zero-length TOC anchor. Retain its resolved
+    // address for R_TOC evaluation; instruction-modified forms remain rejected.
+    std::optional<std::uint64_t> toc_anchor;
+    for (const auto &symbol : object.symbols) {
+        if (!symbol.has_csect_aux || symbol.storage_mapping_class != 15) continue;
+        if (toc_anchor) {
+            loaded.metadata_complete = false;
+            loaded.diagnostics.push_back({DiagnosticSeverity::warning,
+                "Multiple XCOFF32 TOC anchors are unsupported", {}});
+            toc_anchor.reset();
+            break;
+        }
+        toc_anchor = defined_symbol_address(symbol);
+    }
     for (const auto &symbol : object.symbols) {
         if (symbol.name.empty()) continue;
         const auto address = symbol_address(symbol);
@@ -393,7 +462,7 @@ Result<LoadedImage> load_xcoff32_relocatable(std::shared_ptr<const ByteStorage> 
             canceled(stop);
             const auto type = reloc.type;
             if (type == 0x0f) continue; // R_REF records a reference without patching bytes.
-            if (type != 0x00 && type != 0x01 && type != 0x02) {
+            if (type != 0x00 && type != 0x01 && type != 0x02 && type != 0x03) {
                 loaded.metadata_complete = false;
                 loaded.diagnostics.push_back({DiagnosticSeverity::warning,
                     "XCOFF32 " + std::string(xcoff32_relocation_type_name(type)) +
@@ -403,10 +472,11 @@ Result<LoadedImage> load_xcoff32_relocatable(std::shared_ptr<const ByteStorage> 
             }
             const auto width_bits = (reloc.size_info & 0x3fu) + 1u;
             if ((width_bits != 8 && width_bits != 16 && width_bits != 32) ||
-                (reloc.size_info & 0x40u) != 0) {
+                (reloc.size_info & 0x40u) != 0 ||
+                (type == 0x03 && (width_bits == 8 || !toc_anchor))) {
                 loaded.metadata_complete = false;
                 loaded.diagnostics.push_back({DiagnosticSeverity::warning,
-                    "XCOFF32 relocation uses an unsupported bit-field or instruction encoding",
+                    "XCOFF32 relocation uses an unsupported bit-field/instruction encoding or lacks a unique TOC anchor",
                     Address{{0}, std::uint64_t{mapping.address} + reloc.virtual_address - section.physical_address}});
                 continue;
             }
@@ -432,7 +502,9 @@ Result<LoadedImage> load_xcoff32_relocatable(std::shared_ptr<const ByteStorage> 
             const std::int64_t addend = (reloc.size_info & 0x80u) &&
                 (old & (UINT32_C(1) << (width_bits - 1)))
                 ? static_cast<std::int64_t>(old) - (INT64_C(1) << width_bits) : old;
-            const std::int64_t value = type == 0x00 ? addend + static_cast<std::int64_t>(*resolved) :
+            const std::int64_t value = type == 0x03 ? addend + static_cast<std::int64_t>(*resolved) -
+                    static_cast<std::int64_t>(*toc_anchor) :
+                type == 0x00 ? addend + static_cast<std::int64_t>(*resolved) :
                 type == 0x01 ? addend - static_cast<std::int64_t>(*resolved) :
                 addend + static_cast<std::int64_t>(*resolved) - static_cast<std::int64_t>(place);
             const std::int64_t minimum = (reloc.size_info & 0x80u) ? -(INT64_C(1) << (width_bits - 1)) : 0;

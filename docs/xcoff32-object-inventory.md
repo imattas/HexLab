@@ -49,22 +49,34 @@ The subset rejects executable (`F_EXEC`) objects, optional headers, deleted
 section headers and line-number overflow. Loader-section payloads
 and their embedded loader relocation tables remain uninterpreted. Line-number
 rows are extent-checked only. It does not validate overlap between payload
-tables, decode auxiliary csect or line records, implement csect linking,
-archive member selection, or external library binding.
+tables or decode line records. Csect auxiliary records are decoded by the
+relocatable loader as described below; archive member selection and external
+library binding remain unsupported.
 
 `load_xcoff32_relocatable` maps common `STYP_TEXT`, `STYP_DATA`, `STYP_BSS`,
 `STYP_TDATA`, and `STYP_TBSS` sections into deterministic synthetic 32-bit
-addresses beginning at `0x10000`, page-aligning each nonempty section.
+addresses beginning at `0x10000`, aligning each nonempty section to at least a
+page and to the strongest csect alignment declared within it. The final
+auxiliary record for C_EXT, C_WEAKEXT, and C_HIDEXT symbols is decoded for
+csect length, alignment, type, and storage-mapping class. Defining csects must
+fit within their section, and their original section-relative offsets must
+satisfy declared alignment. The loader preserves the input section/csect order
+and offsets; it does not reorder csects, merge sections, implement archive
+selection, or perform AIX's full link-edit layout.
 Initialized bytes are copied into bounded owned storage and BSS/TBSS are
 zero-filled. Section permissions reflect text versus writable data. No entry
 point is inferred. Defined symbols in mapped sections and absolute symbols are
-resolved; external/common or unsupported-section targets remain unresolved
-diagnostics. The loader applies only full-byte `R_POS`, `R_NEG`, and `R_REL`
-fields of 8, 16, or 32 bits with checked field range. `R_REF` is validated but
-has no patch. Instruction-modified fields, bit fields, TOC/TLS, and other
-relocation kinds remain unapplied and mark metadata incomplete. This is an
-analysis view, not an AIX link: csect alignment, TOC setup, archive extraction,
-import libraries and runtime binding are not implemented.
+resolved. Undefined external references bind by exact name to a unique
+definition in the same object; duplicate strong definitions and ambiguous
+weak-only definitions remain unresolved. No archive extraction or external
+library binding is performed. The loader applies checked full-field 8-, 16-,
+and 32-bit `R_POS`, `R_NEG`, and `R_REL` relocations, plus data-field `R_TOC`
+displacements relative to a unique `XMC_TC0` csect anchor. `R_REF` is validated
+but has no patch. Instruction-modified fields, bit fields, TOC instruction
+encodings, TLS, and other relocation kinds remain unapplied and mark metadata
+incomplete. This is an analysis view, not a complete AIX link: csects are not
+reordered, archive members and libraries are not selected, and runtime
+binding/startup are not implemented.
 
 Automatic open now routes both executable and relocatable XCOFF32 inputs to the
 format loader. `hexlab_cli inspect object.o` (or
