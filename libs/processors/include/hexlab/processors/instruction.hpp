@@ -743,7 +743,9 @@ enum class Opcode {
     // Zfa half-precision immediate load; append to preserve serialized IDs.
     rv_fli_h,
     // RVV vector integer-to-floating conversions; appended for stable IDs.
-    rv_vfcvt_f_xu_v, rv_vfcvt_f_x_v
+    rv_vfcvt_f_xu_v, rv_vfcvt_f_x_v,
+    // AVX lane permutation family; append to preserve persisted opcode values.
+    vpermilps, vpermilpd, vperm2f128, vperm2i128
 };
 enum class OperandAccess { read, write, read_write, address };
 // The encoded x86 group-one repeat prefix is retained separately from the

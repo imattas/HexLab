@@ -614,16 +614,19 @@ inline std::optional<X86AvxPackedResult> evaluate_x86_avx_packed(
     const bool move = instruction.opcode == Opcode::vmovups;
     const bool shuffle = instruction.opcode == Opcode::vshufps || instruction.opcode == Opcode::vshufpd;
     const bool immediate_shuffle = instruction.opcode == Opcode::vpshufd;
+    const bool immediate_permute = instruction.opcode == Opcode::vpermilps || instruction.opcode == Opcode::vpermilpd;
+    const bool cross_lane_permute = instruction.opcode == Opcode::vperm2f128 || instruction.opcode == Opcode::vperm2i128;
     const bool immediate_blend = instruction.opcode == Opcode::vpblendd;
     const auto immediate_shift = immediate_shift_shape(instruction.opcode);
     const auto absolute = absolute_lane_width(instruction.opcode);
-    if (!move && !shuffle && !immediate_shuffle && !immediate_blend && !immediate_shift && !absolute &&
-        !is_avx_integer_bitwise_or_compare(instruction.opcode))
+    if (!move && !shuffle && !immediate_shuffle && !immediate_permute && !cross_lane_permute &&
+        !immediate_blend && !immediate_shift && !absolute && !is_avx_integer_bitwise_or_compare(instruction.opcode))
         return std::nullopt;
     if (shuffle && instruction.operands.size() != 4) return std::nullopt;
-    if ((!move && !shuffle && !immediate_shuffle && !immediate_blend && !absolute && instruction.operands.size() != 3) ||
-        (immediate_shuffle && instruction.operands.size() != 3)) return std::nullopt;
-    if (immediate_blend && instruction.operands.size() != 4) return std::nullopt;
+    if ((!move && !shuffle && !immediate_shuffle && !immediate_permute && !cross_lane_permute &&
+         !immediate_blend && !absolute && instruction.operands.size() != 3) ||
+        ((immediate_shuffle || immediate_permute) && instruction.operands.size() != 3)) return std::nullopt;
+    if ((immediate_blend || cross_lane_permute) && instruction.operands.size() != 4) return std::nullopt;
     if (move && instruction.operands.size() != 2) return std::nullopt;
 
     const bool store = move && std::holds_alternative<MemoryOperand>(instruction.operands[0]);
@@ -679,6 +682,46 @@ inline std::optional<X86AvxPackedResult> evaluate_x86_avx_packed(
             return std::nullopt;
         }
         const auto *selector = std::get_if<ImmediateOperand>(&instruction.operands[2]);
+        if (!selector || selector->encoded_width != 8 || selector->effective_width != 8 ||
+            selector->is_signed || selector->value > 0xff)
+            return std::nullopt;
+    } else if (immediate_permute) {
+        const auto *destination = std::get_if<RegisterOperand>(&instruction.operands[0]);
+        if (!destination || (destination->bank != RegisterBank::xmm && destination->bank != RegisterBank::ymm))
+            return std::nullopt;
+        bits = destination->width;
+        const unsigned lane_bits = instruction.opcode == Opcode::vpermilps ? 32u : 64u;
+        if ((bits != 128 && bits != 256) || !is_xmm_or_ymm(instruction.operands[0], bits) ||
+            (instruction.vector_bits && instruction.vector_bits != bits) ||
+            (instruction.vector_element_bits && instruction.vector_element_bits != lane_bits))
+            return std::nullopt;
+        register_destination = destination->index;
+        const auto &source = instruction.operands[1];
+        if (const auto *memory = std::get_if<MemoryOperand>(&source)) {
+            if (memory->data_width != bits) return std::nullopt;
+        } else if (!is_xmm_or_ymm(source, bits)) {
+            return std::nullopt;
+        }
+        const auto *selector = std::get_if<ImmediateOperand>(&instruction.operands[2]);
+        if (!selector || selector->encoded_width != 8 || selector->effective_width != 8 ||
+            selector->is_signed || selector->value > 0xff)
+            return std::nullopt;
+    } else if (cross_lane_permute) {
+        const auto *destination = std::get_if<RegisterOperand>(&instruction.operands[0]);
+        if (!destination || destination->bank != RegisterBank::ymm || destination->width != 256 ||
+            !is_xmm_or_ymm(instruction.operands[1], 256) ||
+            (instruction.vector_bits && instruction.vector_bits != 256) ||
+            (instruction.vector_element_bits && instruction.vector_element_bits != 128))
+            return std::nullopt;
+        bits = 256;
+        register_destination = destination->index;
+        const auto &source = instruction.operands[2];
+        if (const auto *memory = std::get_if<MemoryOperand>(&source)) {
+            if (memory->data_width != 256) return std::nullopt;
+        } else if (!is_xmm_or_ymm(source, 256)) {
+            return std::nullopt;
+        }
+        const auto *selector = std::get_if<ImmediateOperand>(&instruction.operands[3]);
         if (!selector || selector->encoded_width != 8 || selector->effective_width != 8 ||
             selector->is_signed || selector->value > 0xff)
             return std::nullopt;
@@ -743,6 +786,7 @@ inline std::optional<X86AvxPackedResult> evaluate_x86_avx_packed(
     if (instruction.opcode == Opcode::vpcmpgtq && instruction.vector_element_bits &&
         instruction.vector_element_bits != 64) return std::nullopt;
     if (instruction.opcode == Opcode::vpermd && bits != 256) return std::nullopt;
+    if (cross_lane_permute && bits != 256) return std::nullopt;
     if (shuffle) {
         const auto *selector = std::get_if<ImmediateOperand>(&instruction.operands[3]);
         const auto lane_bits = instruction.opcode == Opcode::vshufps ? 32u : 64u;
@@ -770,6 +814,39 @@ inline std::optional<X86AvxPackedResult> evaluate_x86_avx_packed(
     const auto bytes = static_cast<unsigned>(bits / 8);
     if (move) {
         for (unsigned i = 0; i < bytes; ++i) result.bytes[i] = source1[i];
+        return result;
+    }
+
+    if (immediate_permute) {
+        const auto selector = static_cast<unsigned>(std::get<ImmediateOperand>(instruction.operands[2]).value);
+        const unsigned lane_bytes = instruction.opcode == Opcode::vpermilps ? 4u : 8u;
+        const unsigned lanes_per_128 = 16u / lane_bytes;
+        for (unsigned lane_base = 0; lane_base < bytes; lane_base += 16) {
+            for (unsigned lane = 0; lane < lanes_per_128; ++lane) {
+                const unsigned selector_bit = instruction.opcode == Opcode::vpermilps
+                    ? lane * 2u : (lane_base / 16u) * 2u + lane;
+                const unsigned source_lane = (selector >> selector_bit) & (lanes_per_128 - 1u);
+                const unsigned source_offset = lane_base + source_lane * lane_bytes;
+                const unsigned destination_offset = lane_base + lane * lane_bytes;
+                for (unsigned byte = 0; byte < lane_bytes; ++byte)
+                    result.bytes[destination_offset + byte] = source1[source_offset + byte];
+            }
+        }
+        return result;
+    }
+
+    if (cross_lane_permute) {
+        const auto selector = static_cast<unsigned>(std::get<ImmediateOperand>(instruction.operands[3]).value);
+        for (unsigned destination_lane = 0; destination_lane < 2; ++destination_lane) {
+            const unsigned control_bit = destination_lane ? 4u : 0u;
+            const unsigned zero_bit = destination_lane ? 7u : 3u;
+            if ((selector >> zero_bit) & 1u) continue;
+            const unsigned source_selector = (selector >> control_bit) & 3u;
+            const auto &source = source_selector < 2u ? source1 : source2;
+            const unsigned source_lane = source_selector & 1u;
+            std::copy_n(source.begin() + source_lane * 16u, 16u,
+                        result.bytes.begin() + destination_lane * 16u);
+        }
         return result;
     }
 

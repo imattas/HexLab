@@ -239,6 +239,7 @@ families:
 | AVX2 horizontal integer arithmetic | VEX.128/.256 `vphaddw/d/sw`, `vphsubw/d/sw` |
 | AVX2 lane routing and narrowing | VEX.128/.256 `vpunpcklbw/lwd/ldq/lqdq`, `vpunpckhbw/hwd/hdq/hqdq`, `vpacksswb/ssdw/uswb/usdw`, `vpshufb` |
 | AVX2 immediate dword shuffle | VEX.128/.256 `vpshufd`, with independent 128-bit-lane selectors |
+| AVX lane permutations | VEX.128/.256 `vpermilps/pd` immediate lane-local permutations; VEX.256 cross-lane `vperm2f128/i128` |
 | AVX-512 packed compare to mask | EVEX.128/.256/.512 `vpcmpb/w/d/q` and `vpcmpub/uw/ud/uq`, with immediate predicates 0-7; floating `vcmpps/pd` supports broadcast memory input or register-source SAE |
 | AVX-512 floating classification to mask | EVEX.128/.256/.512 `vfpclassps/pd`, all eight immediate class selectors, optional `aaa` mask, and EVEX.b memory broadcast |
 | AVX-512 AND-NOT | EVEX.128/.256/.512 `vpandnd/q` with merge/zero masking and upper-ZMM clearing |
@@ -785,6 +786,26 @@ exceptions because these instructions only rearrange bits. EVEX forms and
 other AVX shuffle instructions remain outside this slice. See Intel's
 [VSHUFPD instruction pseudocode](https://cdrdv2-public.intel.com/835757/325383-sdm-vol-2abcd.pdf)
 and [VSHUFPS instruction reference](https://cdrdv2-public.intel.com/835757/325383-sdm-vol-2abcd.pdf).
+
+## AVX lane permutations
+
+VEX.128/.256 `VPERMILPS` and `VPERMILPD` immediate forms decode map `0F3A`
+opcodes `04` and `05` with `pp=66`, `W=0`, and reserved `vvvv`. Each uses
+its imm8 selector within each 128-bit lane: `VPERMILPS` uses four two-bit
+selectors for dwords, repeated for each YMM half. `VPERMILPD` uses one selector
+bit per qword, with bits 0-1 selecting the low half and bits 2-3 the high half. `VPERM2F128` and
+AVX2 `VPERM2I128` decode opcodes `06` and `46` only with VEX.256, `pp=66`, and
+`W=0`; `vvvv` and ModRM r/m supply two YMM sources. Immediate bits 1:0 and
+5:4 select either source's low or high 128-bit field for the destination low
+and high halves. Bits 3 and 7 independently zero those halves; the other
+immediate bits do not affect the selection. These operations move payload bits
+without floating-point arithmetic. The pure evaluator applies
+the exact selectors to caller-supplied bytes, and typed decompiler intrinsics
+retain the memory-read, immediate, vector shape, and VEX.128 upper-YMM clearing
+effects. Variable-control `VPERMILPS/PD`, EVEX forms, CPU feature checks, and
+runtime memory-fault behavior remain outside this slice. The encodings and
+selection rules follow Intel's [VPERM2F128 operation](https://cdrdv2-public.intel.com/774492/325383-sdm-vol-2abcd.pdf)
+and the Intel SDM [VPERMILPS operation](https://cdrdv2-public.intel.com/774492/325383-sdm-vol-2abcd.pdf).
 
 AVX2 `VPERMD` decodes only the VEX.256 form of map `0F38`, opcode `36`,
 with mandatory `66` and `W=0`. The VEX.vvvv operand supplies one index per

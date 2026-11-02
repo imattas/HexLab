@@ -1018,6 +1018,10 @@ std::string operation_name(Opcode opcode) {
     case Opcode::vshufps: return "vshufps";
     case Opcode::vshufpd: return "vshufpd";
     case Opcode::vpshufd: return "vpshufd";
+    case Opcode::vpermilps: return "vpermilps";
+    case Opcode::vpermilpd: return "vpermilpd";
+    case Opcode::vperm2f128: return "vperm2f128";
+    case Opcode::vperm2i128: return "vperm2i128";
     case Opcode::vpblendd: return "vpblendd";
     case Opcode::vpsadbw: return "vpsadbw";
     case Opcode::vpermd: return "vpermd";
@@ -7017,6 +7021,8 @@ a64_unhandled:
     const bool avx_move = instruction.opcode == Opcode::vmovups;
     const bool avx_shuffle = instruction.opcode == Opcode::vshufps || instruction.opcode == Opcode::vshufpd;
     const bool avx_immediate_shuffle = instruction.opcode == Opcode::vpshufd;
+    const bool avx_immediate_permute = instruction.opcode == Opcode::vpermilps || instruction.opcode == Opcode::vpermilpd;
+    const bool avx_cross_lane_permute = instruction.opcode == Opcode::vperm2f128 || instruction.opcode == Opcode::vperm2i128;
     const bool avx_immediate_blend = instruction.opcode == Opcode::vpblendd;
     const bool avx_float_arithmetic = instruction.opcode == Opcode::vaddps || instruction.opcode == Opcode::vaddpd ||
         instruction.opcode == Opcode::vsubps || instruction.opcode == Opcode::vsubpd ||
@@ -7071,7 +7077,8 @@ a64_unhandled:
         instruction.opcode == Opcode::vpandq || instruction.opcode == Opcode::vpord ||
         instruction.opcode == Opcode::vporq || instruction.opcode == Opcode::vpxord ||
         instruction.opcode == Opcode::vpxorq;
-    if (x86 && (avx_move || avx_shuffle || avx_immediate_shuffle || avx_immediate_blend || avx_float_arithmetic ||
+    if (x86 && (avx_move || avx_shuffle || avx_immediate_shuffle || avx_immediate_permute ||
+                avx_cross_lane_permute || avx_immediate_blend || avx_float_arithmetic ||
                 avx_bitwise || avx_integer_lanes || avx_integer_bitwise)) {
         const auto destination = instruction.operands.empty() ? std::optional<RegisterOperand>{} : as_register(instruction.operands[0]);
         const auto move_source = avx_move && instruction.operands.size() == 2 ? as_register(instruction.operands[1]) : std::optional<RegisterOperand>{};
@@ -7166,6 +7173,49 @@ a64_unhandled:
                         ? IntrinsicMemoryEffect::read : IntrinsicMemoryEffect::none};
                 effect.register_writes = instruction.register_writes;
                 effect.result_type = result_type;
+                return effect;
+            }
+        } else if (supported_width && avx_immediate_permute && instruction.operands.size() == 3) {
+            const auto *selector = std::get_if<ImmediateOperand>(&instruction.operands[2]);
+            const bool source_valid = valid_vector_operand(instruction.operands[1], true);
+            const auto lane_bits = static_cast<std::uint16_t>(instruction.vector_element_bits);
+            if (!instruction.x86_evex && source_valid && selector &&
+                selector->encoded_width == 8 && selector->effective_width == 8 && !selector->is_signed &&
+                instruction.vector_bits == vector_width &&
+                lane_bits == (instruction.opcode == Opcode::vpermilps ? 32 : 64)) {
+                const auto input_type = vector_type(vector_width, TypeKind::floating, lane_bits,
+                    static_cast<std::uint8_t>(vector_width / lane_bits));
+                const auto result_type = vector_type(result_width, TypeKind::floating, lane_bits,
+                    static_cast<std::uint8_t>(result_width / lane_bits));
+                Intrinsic effect{"x86_" + operation_name(instruction.opcode) + "_f" +
+                    std::to_string(lane_bits) + "x" + std::to_string(vector_width / lane_bits) +
+                    "_imm8_lane128" + (zero_upper ? "_zero_upper" : ""),
+                    {retag_expr(operands[1], input_type), constant_expr(selector->value, 8)},
+                    std::holds_alternative<MemoryOperand>(instruction.operands[1])
+                        ? IntrinsicMemoryEffect::read : IntrinsicMemoryEffect::none};
+                effect.register_writes = instruction.register_writes;
+                effect.result_type = result_type;
+                return effect;
+            }
+        } else if (supported_width && avx_cross_lane_permute && instruction.operands.size() == 4) {
+            const auto first = as_register(instruction.operands[1]);
+            const auto *selector = std::get_if<ImmediateOperand>(&instruction.operands[3]);
+            const bool source2_valid = valid_vector_operand(instruction.operands[2], true);
+            if (!instruction.x86_evex && vector_width == 256 && first && first->bank == RegisterBank::ymm &&
+                first->width == 256 && source2_valid && selector && selector->encoded_width == 8 &&
+                selector->effective_width == 8 && !selector->is_signed && instruction.vector_bits == 256 &&
+                instruction.vector_element_bits == 128) {
+                const bool floating = instruction.opcode == Opcode::vperm2f128;
+                const auto element_kind = floating ? TypeKind::floating : TypeKind::integer;
+                const auto input_type = vector_type(256, element_kind, 64, 4);
+                Intrinsic effect{"x86_" + operation_name(instruction.opcode) +
+                    (floating ? "_f64x4_lane128" : "_i64x4_lane128") + "_imm8",
+                    {retag_expr(operands[1], input_type), retag_expr(operands[2], input_type),
+                     constant_expr(selector->value, 8)},
+                    std::holds_alternative<MemoryOperand>(instruction.operands[2])
+                        ? IntrinsicMemoryEffect::read : IntrinsicMemoryEffect::none};
+                effect.register_writes = instruction.register_writes;
+                effect.result_type = input_type;
                 return effect;
             }
         } else if (supported_width && avx_immediate_blend && instruction.operands.size() == 4) {

@@ -464,6 +464,54 @@ bool vex_simd(State &state, std::uint8_t opcode, unsigned map, unsigned pp, unsi
         state.operand(state.immediate(8, 8, false), OperandAccess::read);
         return true;
     }
+    if (map == 3 && (opcode == 0x04 || opcode == 0x05 || opcode == 0x06 || opcode == 0x46)) {
+        const bool in_lane_permute = opcode == 0x04 || opcode == 0x05;
+        if (pp != 1)
+            invalid("AVX lane permutations require VEX.pp=66");
+        if (w)
+            invalid("AVX lane permutations require VEX.W=0");
+        if (in_lane_permute && vvvv != 0)
+            invalid("VPERMIL immediate forms require the reserved VEX.vvvv encoding");
+        if (!in_lane_permute && !l)
+            invalid("VPERM2F128/VPERM2I128 require VEX.L=1");
+
+        const auto vector_width = static_cast<std::uint16_t>(in_lane_permute ? (l ? 256 : 128) : 256);
+        const auto bank = vector_width == 128 ? RegisterBank::xmm : RegisterBank::ymm;
+        auto decoded = modrm(state, vector_width, vector_width);
+        auto destination = decoded.reg;
+        destination.bank = bank;
+        destination.width = vector_width;
+        destination.high_byte = false;
+        Operand source = std::move(decoded.rm);
+        if (auto *reg = std::get_if<RegisterOperand>(&source)) {
+            reg->bank = bank;
+            reg->width = vector_width;
+            reg->high_byte = false;
+        } else if (auto *memory = std::get_if<MemoryOperand>(&source)) {
+            memory->data_width = vector_width;
+        }
+
+        if (opcode == 0x04) {
+            state.i.opcode = Opcode::vpermilps;
+            state.i.vector_element_bits = 32;
+        } else if (opcode == 0x05) {
+            state.i.opcode = Opcode::vpermilpd;
+            state.i.vector_element_bits = 64;
+        } else {
+            state.i.opcode = opcode == 0x06 ? Opcode::vperm2f128 : Opcode::vperm2i128;
+            state.i.vector_element_bits = 128;
+        }
+        state.i.vector_bits = vector_width;
+        if (vector_width == 128)
+            state.i.register_writes.push_back({RegisterBank::ymm, destination.index, 256, false});
+        state.operand(destination, OperandAccess::write);
+        if (!in_lane_permute)
+            state.operand(RegisterOperand{RegisterBank::ymm, static_cast<std::uint8_t>(vvvv), 256, false},
+                          OperandAccess::read);
+        state.operand(std::move(source), OperandAccess::read);
+        state.operand(state.immediate(8, 8, false), OperandAccess::read);
+        return true;
+    }
     if (map == 1 && opcode >= 0x90 && opcode <= 0x93) {
         if (l || vvvv != 0)
             invalid("VEX KMOV requires L=0 and the reserved vvvv encoding");
