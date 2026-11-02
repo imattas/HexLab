@@ -3141,10 +3141,17 @@ RegisterReferenceFacts a64_reference_facts(const Image *image, const RelocationC
     if (!image)
         return result;
     using RegisterState = std::unordered_map<std::uint32_t, Address>;
+    // Keep the exact NZCV nibble inside the shared bounded must-analysis so
+    // conditional selects in a successor block can consume it. This key is
+    // outside the architectural GPR range.
+    constexpr std::uint32_t nzcv_state_key = UINT32_MAX;
     const auto process_block = [&](const BasicBlock &block, RegisterState registers) {
-        // NZCV is kept only within this basic block. Unknown incoming flags or
-        // a CFG join therefore cannot turn an uncertain select into a target.
         std::optional<std::uint8_t> nzcv;
+        if (const auto found = registers.find(nzcv_state_key); found != registers.end()) {
+            if (found->second.space == block.begin.space && found->second.offset <= 15)
+                nzcv = static_cast<std::uint8_t>(found->second.offset);
+            registers.erase(found);
+        }
         const auto condition_holds = [](std::uint8_t condition, std::uint8_t flags) -> std::optional<bool> {
             const bool n = (flags & 8u) != 0, z = (flags & 4u) != 0;
             const bool c = (flags & 2u) != 0, v = (flags & 1u) != 0;
@@ -3213,7 +3220,8 @@ RegisterReferenceFacts a64_reference_facts(const Image *image, const RelocationC
             };
             if ((instruction.opcode == Opcode::a64_adds || instruction.opcode == Opcode::a64_subs ||
                  instruction.opcode == Opcode::a64_adcs || instruction.opcode == Opcode::a64_sbcs) &&
-                instruction.operands.size() == 3) {
+                instruction.operands.size() == 3 &&
+                !relocations.overlaps(instruction.address, instruction.length)) {
                 const auto *left = instruction.operands.size() > 1
                     ? std::get_if<RegisterOperand>(&instruction.operands[1]) : nullptr;
                 const auto *right_reg = instruction.operands.size() > 2
@@ -3229,7 +3237,8 @@ RegisterReferenceFacts a64_reference_facts(const Image *image, const RelocationC
                         !with_carry || ((*incoming_nzcv & 2u) != 0));
                 else nzcv.reset();
                 nzcv_updated = true;
-            } else if (instruction.opcode == Opcode::a64_ccmp || instruction.opcode == Opcode::a64_ccmn) {
+            } else if ((instruction.opcode == Opcode::a64_ccmp || instruction.opcode == Opcode::a64_ccmn) &&
+                       !relocations.overlaps(instruction.address, instruction.length)) {
                 const auto *left = instruction.operands.size() > 0
                     ? std::get_if<RegisterOperand>(&instruction.operands[0]) : nullptr;
                 const auto *right_reg = instruction.operands.size() > 1
@@ -4693,6 +4702,10 @@ RegisterReferenceFacts a64_reference_facts(const Image *image, const RelocationC
             if (instruction.flow == FlowKind::call)
                 registers.clear(); // BL/BLR callees may clobber every propagated GPR.
         }
+        if (nzcv)
+            registers[nzcv_state_key] = Address{block.begin.space, *nzcv};
+        else
+            registers.erase(nzcv_state_key);
         return registers;
     };
     propagate_cfg_register_values<RegisterState>(functions, stop, result, process_block);

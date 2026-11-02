@@ -309,7 +309,8 @@ struct RiscvVectorIntegerResult {
 
 // Floating vector operands are raw IEEE-754 element bit patterns. For `.vf`,
 // scalar is the low SEW bits of the source F register after any XLEN-specific
-// NaN unboxing performed by the caller.
+// NaN unboxing performed by the caller. For the supported widening reductions,
+// `vs2` contains binary32 source lanes while `vs1[0]` is the binary64 seed.
 struct RiscvVectorFloatingOperands {
     std::span<const std::uint64_t> vs2;
     std::span<const std::uint64_t> vs1;
@@ -324,7 +325,7 @@ struct RiscvVectorFloatingResult {
     std::vector<std::uint64_t> lanes; // compare results are 0/1 mask bits
     std::uint64_t vlmax = 0;
     bool mask_result = false;
-    std::uint8_t element_bits = 0; // 1 for masks, SEW for vector values.
+    std::uint8_t element_bits = 0; // 1 for masks, SEW normally, 2*SEW for widening sums.
     std::uint8_t fflags_set = 0; // accrued IEEE exception bits: NX=1, UF=2, OF=4, DZ=8, NV=16.
 };
 
@@ -374,9 +375,10 @@ evaluate_riscv_vector_integer_operation(RiscvOpcode opcode, const RiscvVectorInt
 
 // Evaluates bit-exact RVV reciprocal estimates, floating classification, sign
 // injection, min/max, comparisons, reductions, and ordered/unordered sums for
-// SEW=32 or 64. vfrec7 and both sum reductions require operands.frm to supply
-// a valid rounding mode (0..4). fflags_set contains exception bits raised by
-// active lanes only; callers merge these into fflags.
+// SEW=32 or 64. Widening floating sums additionally evaluate FP32-to-FP64
+// accumulation with SEW=32. vfrec7 and all sum reductions require operands.frm
+// to supply a valid rounding mode (0..4). fflags_set contains exception bits
+// raised by active lanes only; callers merge these into fflags.
 HEXLAB_PROCESSORS_EXPORT std::optional<RiscvVectorFloatingResult>
 evaluate_riscv_vector_floating_operation(RiscvOpcode opcode, const RiscvVectorIntegerConfig &config,
                                          const RiscvVectorFloatingOperands &operands);

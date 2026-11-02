@@ -19,7 +19,6 @@ RiscvVectorFloatAddResult add_riscv_float_bits(std::uint64_t lhs, std::uint64_t 
                                                unsigned width, unsigned rounding_mode) noexcept {
     const unsigned fraction_bits = width == 32 ? 23 : 52;
     const unsigned exponent_bits = width == 32 ? 8 : 11;
-    const int bias = width == 32 ? 127 : 1023;
     const auto element_mask = width_mask(width);
     const auto sign_mask = UINT64_C(1) << (width - 1);
     const auto fraction_mask = (UINT64_C(1) << fraction_bits) - 1;
@@ -136,6 +135,36 @@ RiscvVectorFloatAddResult add_riscv_float_bits(std::uint64_t lhs, std::uint64_t 
     if (subnormal && inexact) flags |= 0x02; // tininess after rounding
     return {(result_negative ? sign_mask : 0) |
             (static_cast<std::uint64_t>(encoded_exponent) << fraction_bits) | encoded_fraction, flags};
+}
+
+struct RiscvWidenF32Result {
+    std::uint64_t bits = 0;
+    std::uint8_t fflags = 0;
+};
+
+// Widen one binary32 lane to binary64 without host floating-point. Finite
+// values are exact. A signaling NaN is quieted and raises NV; the subsequent
+// reduction addition canonicalizes either NaN operand as required by the
+// existing RISC-V arithmetic helper.
+RiscvWidenF32Result widen_riscv_f32_bits(std::uint64_t value) noexcept {
+    const auto source = static_cast<std::uint32_t>(value);
+    const auto sign = static_cast<std::uint64_t>(source & UINT32_C(0x80000000)) << 32;
+    const auto exponent = (source >> 23) & 0xffu;
+    const auto fraction = source & UINT32_C(0x007fffff);
+    if (exponent == 0xffu) {
+        if (fraction == 0) return {sign | UINT64_C(0x7ff0000000000000), 0};
+        const bool signaling = (fraction & UINT32_C(0x00400000)) == 0;
+        return {UINT64_C(0x7ff8000000000000), static_cast<std::uint8_t>(signaling ? 0x10 : 0)};
+    }
+    if (exponent != 0)
+        return {sign | (static_cast<std::uint64_t>(exponent + 896u) << 52) |
+                      (static_cast<std::uint64_t>(fraction) << 29), 0};
+    if (fraction == 0) return {sign, 0};
+    const unsigned highest = std::bit_width(fraction) - 1u;
+    const auto normalized_fraction = fraction ^ (UINT32_C(1) << highest);
+    const auto double_exponent = static_cast<std::uint64_t>(highest + 874u);
+    const auto double_fraction = static_cast<std::uint64_t>(normalized_fraction) << (52u - highest);
+    return {sign | (double_exponent << 52) | double_fraction, 0};
 }
 
 std::uint64_t multiply_high_unsigned(std::uint64_t a, std::uint64_t b) noexcept {
@@ -1726,6 +1755,7 @@ evaluate_riscv_vector_floating_operation(RiscvOpcode opcode, const RiscvVectorIn
     enum class Operation { classification, reciprocal_estimate, reciprocal_sqrt_estimate,
                            sign_copy, sign_invert, sign_xor, min, max,
                            reduce_min, reduce_max, reduce_unordered_sum, reduce_ordered_sum,
+                           reduce_widen_unordered_sum, reduce_widen_ordered_sum,
                            equal, not_equal, less, less_equal, greater, greater_equal };
     Operation operation;
     bool vector_rhs = false, mask_result = false;
@@ -1752,12 +1782,20 @@ evaluate_riscv_vector_floating_operation(RiscvOpcode opcode, const RiscvVectorIn
     case RiscvOpcode::vfredmax: operation = Operation::reduce_max; break;
     case RiscvOpcode::vfredusum: operation = Operation::reduce_unordered_sum; break;
     case RiscvOpcode::vfredosum: operation = Operation::reduce_ordered_sum; break;
+    case RiscvOpcode::vfwredusum: operation = Operation::reduce_widen_unordered_sum; break;
+    case RiscvOpcode::vfwredosum: operation = Operation::reduce_widen_ordered_sum; break;
     default: return {};
     }
     const bool reduction = operation == Operation::reduce_min || operation == Operation::reduce_max ||
-        operation == Operation::reduce_unordered_sum || operation == Operation::reduce_ordered_sum;
+        operation == Operation::reduce_unordered_sum || operation == Operation::reduce_ordered_sum ||
+        operation == Operation::reduce_widen_unordered_sum || operation == Operation::reduce_widen_ordered_sum;
     const bool sum_reduction = operation == Operation::reduce_unordered_sum ||
-        operation == Operation::reduce_ordered_sum;
+        operation == Operation::reduce_ordered_sum || operation == Operation::reduce_widen_unordered_sum ||
+        operation == Operation::reduce_widen_ordered_sum;
+    const bool widening_reduction = operation == Operation::reduce_widen_unordered_sum ||
+        operation == Operation::reduce_widen_ordered_sum;
+    if (widening_reduction && (sew != 32 || config.lmul_log2 > 2))
+        return {}; // Only FP32-to-FP64 with destination EMUL <= 8 is represented.
     if (reduction && (config.vstart != 0 || operands.vs1.size() != vlmax ||
         (config.masked && std::any_of(operands.predicate_mask.begin(), operands.predicate_mask.end(),
                                       [](std::uint8_t bit) { return bit > 1; })))) return {};
@@ -1873,16 +1911,25 @@ evaluate_riscv_vector_floating_operation(RiscvOpcode opcode, const RiscvVectorIn
     RiscvVectorFloatingResult result;
     result.vlmax = vlmax;
     result.mask_result = mask_result;
-    result.element_bits = mask_result ? 1 : static_cast<std::uint8_t>(sew);
+    result.element_bits = mask_result ? 1 : static_cast<std::uint8_t>(widening_reduction ? 2 * sew : sew);
     result.lanes.assign(operands.old_destination.begin(), operands.old_destination.end());
     if (reduction) {
-        auto accumulator = operands.vs1[0] & element_mask;
+        // Vector reductions with vl=0 do not update the destination. For a
+        // nonzero vl with no active lanes, the seed is copied to lane zero.
+        if (config.vl == 0) return result;
+        auto accumulator = operands.vs1[0] & width_mask(widening_reduction ? 2 * sew : sew);
         const bool maximum = operation == Operation::reduce_max;
         for (std::uint64_t lane = 0; lane < config.vl; ++lane) {
             if (config.masked && operands.predicate_mask[static_cast<std::size_t>(lane)] == 0) continue;
             if (sum_reduction) {
-                const auto added = add_riscv_float_bits(accumulator,
-                    operands.vs2[static_cast<std::size_t>(lane)], sew, *operands.frm);
+                std::uint64_t addend = operands.vs2[static_cast<std::size_t>(lane)] & element_mask;
+                if (widening_reduction) {
+                    const auto widened = widen_riscv_f32_bits(addend);
+                    addend = widened.bits;
+                    result.fflags_set |= widened.fflags;
+                }
+                const auto added = add_riscv_float_bits(accumulator, addend,
+                    widening_reduction ? 2 * sew : sew, *operands.frm);
                 accumulator = added.bits;
                 result.fflags_set |= added.fflags;
             } else {
@@ -1951,6 +1998,10 @@ evaluate_riscv_vector_floating_operation(RiscvOpcode opcode, const RiscvVectorIn
             break;
         case Operation::reduce_min:
         case Operation::reduce_max:
+        case Operation::reduce_unordered_sum:
+        case Operation::reduce_ordered_sum:
+        case Operation::reduce_widen_unordered_sum:
+        case Operation::reduce_widen_ordered_sum:
             // Handled by the scalar reduction path above.
             break;
         case Operation::equal:

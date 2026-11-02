@@ -36,11 +36,20 @@ carry tail-agnostic policy. Host floating arithmetic is not used.
 
 The widening forms `vfwredusum.vs` and `vfwredosum.vs` are decoded and formatted
 as well. Their vector operands and floating control dependencies are retained,
-and they lower to named typed intrinsics. They widen SEW elements to a double-
-width accumulator, but are not concretely evaluated. The supported static
-decoder does not carry the live SEW setting, so it cannot validate the
-runtime-required FP32-to-FP64 configuration; wider FP formats and half
-precision remain unsupported.
+and they lower to named typed intrinsics. The semantics evaluator now accepts
+only SEW=32, reads binary32 `vs2` lanes, widens each exactly to binary64, and
+folds into the binary64 `vs1[0]` seed using the caller-supplied `frm`. It uses
+an ordered fold for both opcodes; this is a permitted implementation of the
+unordered reduction. The sum requires `vstart=0`, skips masked lanes, leaves
+destination lanes after lane zero unchanged, and accumulates `fflags` from
+active additions; signaling binary32 NaNs raise NV during widening. The result
+reports 64-bit elements and rejects `LMUL > 4` because the wide accumulator
+would have `EMUL > 8`. A zero `vl` preserves the old destination; a nonzero `vl`
+with no active lanes copies the seed to lane zero without canonicalizing or
+raising flags. The helper receives runtime SEW explicitly, so callers must
+validate the vector instruction's FP32-to-FP64 configuration and register-group
+alignment. Half precision, wider source formats and physical vector-register
+overlap validation remain unsupported.
 
 The opcode assignments follow the RVV OPFVV encoding table: funct6 `110001`
 for `vfwredusum` and `110011` for `vfwredosum`. Reduction instructions require

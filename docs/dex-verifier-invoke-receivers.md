@@ -17,3 +17,19 @@ Known reference values are also checked against object field-store, invocation
 parameter, and method return descriptors. The bounded in-image hierarchy and
 array rules reject only a proven incompatible assignment; unknown values,
 null, and unresolved external hierarchy relationships remain conservative.
+
+## Instance field owners
+
+For standard instance field gets and puts (`iget*`/`iput*`), a known
+initialized receiver descriptor is checked against the declaring class of the
+referenced field. The same bounded in-image class/interface walk and array
+assignability rules used for method receivers apply. A proven mismatch rejects
+the method with method index, code-item file offset, instruction code-unit
+offset, and field index in the diagnostic. A null/unknown receiver or an
+unresolved external hierarchy relation is not rejected; when a known relation
+is unresolved, only the receiver's exact descriptor fact is discarded.
+
+The existing constructor-only exception for `uninitialized-this` accessing a
+field declared by its own class remains intact. Other uninitialized references
+are not accepted as instance-field receivers. Optimized quick/volatile field
+opcodes do not have resolved field-owner checks in this pass.

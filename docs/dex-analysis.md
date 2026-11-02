@@ -414,10 +414,17 @@ call and only its broad reference category remains; the receiver is therefore
 unverified at that call. Unknown register types remain conservative; reference
 joins retain an exact type only when both incoming facts agree or one fact is
 null. External hierarchy gaps are kept unresolved instead of being treated as
-either a proven match or a malformed DEX. The pass does not resolve
-external class definitions, infer common supertypes at joins, validate
-field-owner receivers, or prove access, dispatch target identity, constructor
-uninitialized-object rules, or quick/inline call signatures. Exceptional
+either a proven match or a malformed DEX. Standard instance field gets and
+puts also validate a known initialized receiver against the field's declaring
+class using the same bounded hierarchy and array assignability rules. A
+proven mismatch is malformed with method and code-unit provenance; unknown,
+null, or unresolved external relations remain conservative, and unresolved
+relations discard only the receiver's exact type fact. The narrow
+uninitialized-`this` own-class field exception is preserved. The pass does not
+resolve external class definitions, infer common supertypes at joins, prove
+access, dispatch target identity, constructor uninitialized-object rules, or
+quick/inline call signatures; optimized quick/volatile field forms also lack
+field-owner checks. Exceptional
 state propagation covers standard array and field access, invokes, object and
 array allocation, type/string resolution, monitors, throw, and integer/long
 division and remainder. It sends each covered instruction's pre-state to
