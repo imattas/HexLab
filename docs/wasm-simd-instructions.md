@@ -73,3 +73,6 @@ binary arithmetic and vector comparisons have concrete semantics helpers; see
 [integer lane arithmetic](wasm-simd-integer-lane-arithmetic.md) and
 [SIMD comparisons](wasm-simd-comparisons.md). Other SIMD arithmetic operations
 still require their own typed lifting.
+
+The concrete integer SIMD unary helper and its exact lane semantics are
+documented in [integer unary operations](wasm-simd-integer-unary.md).

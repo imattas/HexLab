@@ -157,6 +157,102 @@ inline std::optional<WasmV128> evaluate_wasm_simd_integer_shift_instruction(
     return result;
 }
 
+struct WasmSimdIntegerUnaryResult {
+    WasmV128 vector{};
+    std::uint32_t scalar = 0;
+    bool scalar_result = false;
+    bool operator==(const WasmSimdIntegerUnaryResult &) const = default;
+};
+
+// Evaluate integer SIMD abs/neg/popcnt/all_true/bitmask operations. abs and
+// neg are lane-local wrapping operations (including the signed minimum); the
+// scalar reductions produce an i32 value.
+inline std::optional<WasmSimdIntegerUnaryResult> evaluate_wasm_simd_integer_unary_instruction(
+    const Instruction &instruction, const WasmV128 &input) noexcept {
+    if (instruction.context.architecture != Architecture::wasm ||
+        instruction.context.mode != ExecutionMode::wasm32 || instruction.opcode != Opcode::wasm ||
+        instruction.flow != FlowKind::fallthrough || instruction.length < 2 || instruction.length > 6 ||
+        instruction.bytes[0] != std::byte{0xfd} || !instruction.operands.empty() ||
+        !instruction.access.empty() || instruction.memory_read || instruction.memory_write)
+        return std::nullopt;
+
+    std::uint32_t subopcode = 0;
+    bool terminated = false;
+    for (unsigned index = 1; index < instruction.length; ++index) {
+        const auto byte = std::to_integer<std::uint8_t>(instruction.bytes[index]);
+        const auto payload = static_cast<std::uint32_t>(byte & 0x7f);
+        if (index == 5 && payload > 15) return std::nullopt;
+        subopcode |= payload << ((index - 1) * 7);
+        if (!(byte & 0x80)) {
+            if (index + 1 != instruction.length) return std::nullopt;
+            terminated = true;
+            break;
+        }
+    }
+    if (!terminated) return std::nullopt;
+
+    unsigned lane_bits = 0;
+    std::string_view operation;
+    switch (subopcode) {
+    case 0x60: lane_bits = 8; operation = "abs"; break;
+    case 0x61: lane_bits = 8; operation = "neg"; break;
+    case 0x62: lane_bits = 8; operation = "popcnt"; break;
+    case 0x63: lane_bits = 8; operation = "all_true"; break;
+    case 0x64: lane_bits = 8; operation = "bitmask"; break;
+    case 0x80: lane_bits = 16; operation = "abs"; break;
+    case 0x81: lane_bits = 16; operation = "neg"; break;
+    case 0x83: lane_bits = 16; operation = "all_true"; break;
+    case 0x84: lane_bits = 16; operation = "bitmask"; break;
+    case 0xa0: lane_bits = 32; operation = "abs"; break;
+    case 0xa1: lane_bits = 32; operation = "neg"; break;
+    case 0xa3: lane_bits = 32; operation = "all_true"; break;
+    case 0xa4: lane_bits = 32; operation = "bitmask"; break;
+    case 0xc0: lane_bits = 64; operation = "abs"; break;
+    case 0xc1: lane_bits = 64; operation = "neg"; break;
+    case 0xc3: lane_bits = 64; operation = "all_true"; break;
+    case 0xc4: lane_bits = 64; operation = "bitmask"; break;
+    default: return std::nullopt;
+    }
+    const auto prefix = lane_bits == 8 ? "i8x16." : lane_bits == 16 ? "i16x8." :
+                        lane_bits == 32 ? "i32x4." : "i64x2.";
+    if (instruction.mnemonic_override != std::string(prefix) + std::string(operation)) return std::nullopt;
+
+    const unsigned lane_bytes = lane_bits / 8;
+    const unsigned lane_count = 16 / lane_bytes;
+    const std::uint64_t mask = lane_bits == 64 ? UINT64_MAX : (UINT64_C(1) << lane_bits) - 1;
+    WasmSimdIntegerUnaryResult result;
+    if (operation == "all_true" || operation == "bitmask") {
+        result.scalar_result = true;
+        for (unsigned lane = 0; lane < lane_count; ++lane) {
+            std::uint64_t value = 0;
+            for (unsigned byte = 0; byte < lane_bytes; ++byte)
+                value |= static_cast<std::uint64_t>(input[lane * lane_bytes + byte]) << (byte * 8);
+            if (operation == "all_true") {
+                if (value == 0) return result;
+            } else if (value & (UINT64_C(1) << (lane_bits - 1))) {
+                result.scalar |= UINT32_C(1) << lane;
+            }
+        }
+        if (operation == "all_true") result.scalar = 1;
+        return result;
+    }
+    for (unsigned lane = 0; lane < lane_count; ++lane) {
+        std::uint64_t value = 0;
+        for (unsigned byte = 0; byte < lane_bytes; ++byte)
+            value |= static_cast<std::uint64_t>(input[lane * lane_bytes + byte]) << (byte * 8);
+        if (operation == "popcnt") {
+            value = std::popcount(static_cast<std::uint8_t>(value));
+        } else if (operation == "neg") {
+            value = (UINT64_C(0) - value) & mask;
+        } else if (operation == "abs" && (value & (UINT64_C(1) << (lane_bits - 1)))) {
+            value = (UINT64_C(0) - value) & mask;
+        }
+        for (unsigned byte = 0; byte < lane_bytes; ++byte)
+            result.vector[lane * lane_bytes + byte] = static_cast<std::uint8_t>(value >> (byte * 8));
+    }
+    return result;
+}
+
 struct WasmSimdLogicalResult {
     WasmV128 vector{};
     std::uint32_t scalar = 0; // Used by v128.any_true; result is 0 or 1.
