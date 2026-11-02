@@ -572,11 +572,26 @@ The exact guard proof, 4096-entry prefix cap, executable-target decoding and per
 overlap validation are unchanged. Variable shifts, shifted symbolic addresses,
 PIC/GOT and runtime bases remain unsupported.
 
-Validation passed on local Windows/MSVC 19.44 Debug and Ubuntu 24.04
-WSL/Clang 18 Debug builds of `hexlab_processors`, `hexlab_analysis`, and
-`hexlab_cli` with `BUILD_TESTING=OFF`. Fresh builds and final incremental
-rebuilds after the provenance guards each exited 0 on both platforms. No tests
-were added or run; runtime recognition remains unverified. The function-engine
+O32 switch setup also accepts `SLLV` when its shift-count register has one
+proven constant value. For a dynamic selector, the low five count bits determine
+the scale; the existing final table-width check accepts only scales matching
+the entry width (1, 2, or 4 bytes). The bounded predecessor proof applies the
+same rule when all incoming paths agree on the scaled register's definition
+and count. For constant table or code bases, same-block and path-complete
+constant propagation evaluate `SLLV` with the exact low-five-bit count and
+32-bit wrap. Selector-scale recovery spends at most 128 separate shift-count
+constant proofs per recognizer, in addition to its existing graph budget. The
+complete instruction word must be relocation-free; unknown,
+conflicting, or relocated shift counts and attempts to shift an already
+symbolic base remain unresolved. Existing CFG/work limits, guard proof,
+relocation-aware table reader, executable-target decoding, and 4096-entry bound
+are unchanged. The function-engine fingerprint includes
+`mips32-known-sllv-switch-reference-v1`.
+
+For this change, `hexlab_analysis` built successfully with Windows/MSVC 19.44
+Debug and `BUILD_TESTING=OFF`. The WSL build could not be run in the current
+environment because `cmake` is unavailable in the WSL PATH. No tests were
+added or run; runtime recognition remains unverified. The function-engine
 fingerprint changes so older cached switch-derived function results are not
 reused.
 

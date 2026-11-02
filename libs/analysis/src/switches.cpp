@@ -3677,6 +3677,17 @@ std::optional<std::uint32_t> mips32_path_complete_constant(
             const auto amount = mips32_fixed_left_shift_amount(image, instruction, relocations, stop);
             const auto base = amount ? incoming(current, source->index) : std::nullopt;
             if (base && amount) result = static_cast<std::uint32_t>(*base << *amount);
+        } else if (instruction.opcode == Opcode::mips_sllv && instruction.operands.size() == 3 &&
+                   source && source->bank == RegisterBank::mips_gpr && source->width == 32 &&
+                   source->index < 32 &&
+                   mips32_raw_setup_word(image, instruction, relocations, stop)) {
+            const auto *amount_register = register_operand(instruction, 2);
+            if (amount_register && amount_register->bank == RegisterBank::mips_gpr &&
+                amount_register->width == 32 && amount_register->index < 32) {
+                const auto amount = incoming(current, static_cast<std::uint8_t>(amount_register->index));
+                const auto base = incoming(current, static_cast<std::uint8_t>(source->index));
+                if (base && amount) result = static_cast<std::uint32_t>(*base << (*amount & 31u));
+            }
         } else if (instruction.opcode == Opcode::mips_addu && instruction.operands.size() == 3 &&
                    mips32_raw_setup_word(image, instruction, relocations, stop)) {
             const auto *left = register_operand(instruction, 1);
@@ -3698,10 +3709,11 @@ std::optional<std::uint32_t> mips32_path_complete_constant(
 struct Mips32ScaledSelector {
     RegisterOperand selector;
     Address instruction{};
+    std::uint64_t scale = 4;
     friend bool operator==(const Mips32ScaledSelector &, const Mips32ScaledSelector &) = default;
 };
 
-std::optional<Mips32ScaledSelector> mips32_path_complete_word_scale(
+std::optional<Mips32ScaledSelector> mips32_path_complete_selector_scale(
     const Image &image, const FunctionRecord &function, const FunctionSnapshot &snapshot, const SwitchGuardGraph &graph,
     Address before, RegisterOperand wanted, Address dispatch, bool control_flow_closed,
     const RelocationResolver *relocations, std::stop_token stop) {
@@ -3724,6 +3736,9 @@ std::optional<Mips32ScaledSelector> mips32_path_complete_word_scale(
     std::map<Key, std::optional<Mips32ScaledSelector>> memo;
     std::set<Key> active;
     std::size_t remaining_work = max_work;
+    std::size_t remaining_shift_constant_proofs = 128;
+    using ShiftKey = std::tuple<std::uint32_t, std::uint64_t, std::uint8_t>;
+    std::map<ShiftKey, std::optional<std::uint32_t>> shift_constant_cache;
     std::function<std::optional<Mips32ScaledSelector>(std::size_t)> incoming;
     std::function<std::optional<Mips32ScaledSelector>(std::size_t)> after;
     incoming = [&](std::size_t current) -> std::optional<Mips32ScaledSelector> {
@@ -3787,15 +3802,46 @@ std::optional<Mips32ScaledSelector> mips32_path_complete_word_scale(
         }
         const auto *destination = instruction.operands.size() == 3 ? register_operand(instruction, 0) : nullptr;
         const auto *selector = instruction.operands.size() == 3 ? register_operand(instruction, 1) : nullptr;
-        const auto amount = mips32_fixed_left_shift_amount(image, instruction, relocations, stop);
+        std::optional<unsigned> amount;
+        if (instruction.opcode == Opcode::mips_sll)
+            amount = mips32_fixed_left_shift_amount(image, instruction, relocations, stop);
+        else if (instruction.opcode == Opcode::mips_sllv &&
+                 mips32_raw_setup_word(image, instruction, relocations, stop)) {
+            const auto *amount_register = instruction.operands.size() == 3
+                ? register_operand(instruction, 2) : nullptr;
+            if (amount_register && amount_register->bank == RegisterBank::mips_gpr &&
+                amount_register->width == 32 && amount_register->index < 32) {
+                if (amount_register->index == 0) {
+                    amount = 0;
+                } else {
+                    const ShiftKey shift_key{instruction.address.space.value, instruction.address.offset,
+                        static_cast<std::uint8_t>(amount_register->index)};
+                    auto proven = shift_constant_cache.find(shift_key);
+                    if (proven == shift_constant_cache.end()) {
+                        if (remaining_shift_constant_proofs == 0) {
+                            active.erase(key);
+                            memo.emplace(key, std::nullopt);
+                            return {};
+                        }
+                        --remaining_shift_constant_proofs;
+                        const RegisterOperand shift_operand{RegisterBank::mips_gpr,
+                            static_cast<std::uint8_t>(amount_register->index), 32, false};
+                        const auto constant = mips32_path_complete_constant(image, function, snapshot, graph,
+                            instruction.address, shift_operand, relocations, dispatch, control_flow_closed, stop);
+                        proven = shift_constant_cache.emplace(shift_key, constant).first;
+                    }
+                    if (proven->second) amount = static_cast<unsigned>(*proven->second & 31u);
+                }
+            }
+        }
         std::optional<Mips32ScaledSelector> result;
-        if (instruction.opcode == Opcode::mips_sll && destination && selector && amount &&
+        if ((instruction.opcode == Opcode::mips_sll || instruction.opcode == Opcode::mips_sllv) &&
+            destination && selector && amount &&
             instruction.flow == FlowKind::fallthrough &&
             destination->bank == RegisterBank::mips_gpr && destination->width == 32 &&
             destination->index == wanted.index && selector->bank == RegisterBank::mips_gpr &&
-            selector->width == 32 && selector->index != 0 && selector->index != wanted.index &&
-            *amount == 2)
-            result = Mips32ScaledSelector{*selector, instruction.address};
+            selector->width == 32 && selector->index != 0 && selector->index != wanted.index)
+            result = Mips32ScaledSelector{*selector, instruction.address, UINT64_C(1) << *amount};
         active.erase(key);
         memo.emplace(key, result);
         return result;
@@ -3991,9 +4037,9 @@ std::optional<SwitchSite> mips32_register_absolute_switch(
                 if (stop.stop_requested()) return {};
                 if (registers.contains(reg)) continue;
                 const RegisterOperand operand{RegisterBank::mips_gpr, reg, 32, false};
-                if (const auto scale = mips32_path_complete_word_scale(image, function, snapshot, *guards.graph,
+                if (const auto scale = mips32_path_complete_selector_scale(image, function, snapshot, *guards.graph,
                         block_entry, operand, dispatch.address, control_flow_closed, relocations, stop))
-                    remember(reg, Value{{}, {}, scale->selector, 4, scale->instruction, true});
+                    remember(reg, Value{{}, {}, scale->selector, scale->scale, scale->instruction, true});
             }
         }
     }
@@ -4081,9 +4127,24 @@ std::optional<SwitchSite> mips32_register_absolute_switch(
             if (value) remember(destination->index, std::move(*value));
             continue;
         }
-        if (instruction.opcode == Opcode::mips_sll && instruction.operands.size() == 3 && destination) {
+        if ((instruction.opcode == Opcode::mips_sll || instruction.opcode == Opcode::mips_sllv) &&
+            instruction.operands.size() == 3 && destination) {
             const auto *source = register_operand(instruction, 1);
-            const auto amount = mips32_fixed_left_shift_amount(image, instruction, relocations, stop);
+            std::optional<unsigned> amount;
+            if (instruction.opcode == Opcode::mips_sll) {
+                amount = mips32_fixed_left_shift_amount(image, instruction, relocations, stop);
+            } else if (mips32_raw_setup_word(image, instruction, relocations, stop)) {
+                const auto *amount_register = register_operand(instruction, 2);
+                if (amount_register && amount_register->bank == RegisterBank::mips_gpr &&
+                    amount_register->width == 32 && amount_register->index < 32) {
+                    if (amount_register->index == 0) amount = 0;
+                    else if (const auto found = registers.find(amount_register->index);
+                             found != registers.end() && found->second.constant &&
+                             found->second.constant->space == dispatch.address.space &&
+                             found->second.constant->offset <= UINT32_MAX)
+                        amount = static_cast<unsigned>(found->second.constant->offset & 31u);
+                }
+            }
             std::optional<Value> value;
             if (destination->bank == RegisterBank::mips_gpr && destination->width == 32 && destination->index != 0 &&
                 source && source->bank == RegisterBank::mips_gpr && source->width == 32 && amount) {
