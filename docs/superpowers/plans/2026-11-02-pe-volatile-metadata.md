@@ -87,3 +87,26 @@ WSL Ubuntu Clang 18.1.3 configure and Debug `hexlab_loaders` build both exited
 `BUILD_TESTING:BOOL=OFF`, and `HEXLAB_BUILD_DESKTOP:BOOL=OFF`. No tests added or
 run. Final source review covered all five Review Focus cases; no implementation
 changes were required after either build. The parent owns integration review.
+
+## Review follow-up: explicit target traversal progress
+
+Parent review requested a local nonzero initialized-extent guard in
+`pe_volatile.cpp::validate_code`. Source inspection confirms the current shared
+`ImageReader::initialized_extent` already throws for zero-filled tails and can
+only return a positive extent. Add the defensive local check anyway so the
+loop's progress requirement remains explicit if the helper changes. This does
+not broaden the format contract or change the documented malformed-tail rule.
+
+- [x] Store the initialized extent, require it nonzero, then advance `done`.
+- [x] Rebuild Windows Release and WSL Debug `hexlab_loaders` using the existing `BUILD_TESTING=OFF` configurations.
+- [x] Check the patch and record a local follow-up commit; do not add or run tests.
+
+Follow-up verification: Windows
+`cmake --build out/build/windows-headless --config Release --target hexlab_loaders --parallel 2`
+exited 0 and linked `hexlab_loaders.dll`; WSL
+`cmake --build /tmp/hexlab-pe-volatile-nov02 --target hexlab_loaders --parallel 2`
+exited 0 and linked `libhexlab_loaders.so`. Both caches still confirm
+`BUILD_TESTING:BOOL=OFF`. Logs: worktree `build-pe-volatile-progress-windows.log`
+and Ubuntu `/tmp/hexlab-pe-volatile-progress-build.log`. `git diff --check`
+passed. No tests added or run; the format/proof-boundary documentation is
+unchanged because the existing malformed-tail contract already covers this.

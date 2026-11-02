@@ -65,7 +65,9 @@ PeVolatileMetadata read_volatile_metadata(const Image &image, const ImageMetadat
                 const auto *segment = image.segment_at(reader.address(at));
                 require(segment && segment->executable,
                         "PE volatile target references unmapped or non-executable bytes");
-                done += std::min<std::uint64_t>(size - done, reader.initialized_extent(at));
+                const auto initialized = reader.initialized_extent(at);
+                require(initialized != 0, "PE volatile target has no initialized extent");
+                done += std::min<std::uint64_t>(size - done, initialized);
             }
         };
         std::vector<PeVolatileAccess> accesses;
