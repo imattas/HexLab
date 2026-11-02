@@ -54,11 +54,23 @@ XCOFF32 executables with `F_EXEC` and the standard 72-byte AIX auxiliary
 header. It maps `STYP_TEXT`, `STYP_DATA`, `STYP_BSS`, `STYP_TDATA`, and
 `STYP_TBSS` by each section's declared virtual address. Initialized sections
 map their exact file-backed extent; BSS/TBSS map as zero-fill. The auxiliary
-header entry must point into initialized executable text. A loader section is
-extent checked but uninterpreted, and makes metadata explicitly incomplete
-with a diagnostic. Loader relocations, import binding, AIX TOC initialization,
-other section types, and process runtime behavior remain unsupported. This is
-a mapped linked image for static inspection, not an AIX execution environment.
+header entry and entry section must identify initialized executable text. When
+present, the loader section's version, symbol table, relocation table, import
+file ID strings, and symbol name strings are bounded and decoded. Exported
+loader symbols are retained in generic export metadata; their `ordinal` field
+contains the corresponding XCOFF loader symbol reference index (`row + 3`).
+The implicit section references use separate indexes and are not export rows.
+Imported symbols are identified by `l_smtype` and their import file ID, then
+reported as unresolved diagnostics. Loader relocation rows validate the
+section, virtual address, and implicit/explicit symbol index, then each is
+reported as unapplied. Diagnostics expand at most 64 imports and 128 loader
+relocations, with a count for the remainder. No external AIX library resolver
+is provided, so imports cannot be bound and loader relocations are never
+applied. The auxiliary header TOC anchor and section are checked and surfaced
+as an informational diagnostic; HexLab does not initialize the PowerPC `r2`
+register or emulate AIX process startup. Other section types remain unsupported.
+This is a mapped linked image for static inspection, not an AIX execution
+environment.
 Automatic open detects `F_EXEC` XCOFF32 files and routes them through this
 loader; relocatable objects are separately identified and rejected with an
 object-specific message. AIX archive magic is detected first and continues to
@@ -66,5 +78,6 @@ use the archive member workflow. CLI image commands also accept
 `--format xcoff32` for an explicit selection.
 
 Record layouts and section/name rules follow IBM's [AIX XCOFF object file
-format](https://www.ibm.com/docs/en/aix/7.3.0?topic=formats-xcoff-object-file-format)
-and LLVM's [XCOFF object structures](https://llvm.org/doxygen/XCOFFObjectFile_8h_source.html).
+format](https://www.ibm.com/docs/en/aix/7.3.0?topic=formats-xcoff-object-file-format),
+including its `.loader` table definitions. The fixed record layouts are also
+cross-checked against LLVM's [XCOFF object structures](https://llvm.org/doxygen/XCOFFObjectFile_8h_source.html).

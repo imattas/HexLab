@@ -718,10 +718,85 @@ std::optional<Mips32ArithmeticDResult> evaluate_mips32_arithmetic_d(
     };
     flush_input(lhs_bits);
     if (operation != Mips32DArithmeticOperation::square_root) flush_input(rhs_bits);
-    if ((lhs_bits & exponent_mask) == exponent_mask ||
-        (operation != Mips32DArithmeticOperation::square_root &&
-         (rhs_bits & exponent_mask) == exponent_mask))
-        return {}; // NaN and infinity propagation is intentionally not guessed.
+    constexpr std::uint64_t canonical_qnan = UINT64_C(0x7ff8000000000000);
+    constexpr std::uint64_t quiet_bit = UINT64_C(0x0008000000000000);
+    const auto classify = [&](std::uint64_t bits) {
+        const bool exponent_all_ones = (bits & exponent_mask) == exponent_mask;
+        const auto fraction = bits & fraction_mask;
+        return std::array<bool, 4>{exponent_all_ones && fraction != 0,
+            exponent_all_ones && fraction != 0 && (fraction & quiet_bit) == 0,
+            exponent_all_ones && fraction == 0, (bits & sign_mask) != 0};
+    };
+    const auto left_class = classify(lhs_bits);
+    const auto right_class = operation == Mips32DArithmeticOperation::square_root
+        ? std::array<bool, 4>{} : classify(rhs_bits);
+    // Arithmetic NaNs are canonicalized in this bounded model. Signaling NaNs
+    // raise Invalid; quiet NaNs do not. A preceding FS input flush may already
+    // have accrued Inexact, which is retained alongside Invalid.
+    if (left_class[0] || right_class[0]) {
+        result.value_bits = canonical_qnan;
+        if (left_class[1] || right_class[1]) result.exception_bits |= fp_invalid;
+        mips32_finalize_d(result, fcsr);
+        return result;
+    }
+
+    const bool left_inf = left_class[2];
+    const bool right_inf = right_class[2];
+    const bool left_zero = (lhs_bits & ~sign_mask) == 0;
+    const bool right_zero = (rhs_bits & ~sign_mask) == 0;
+    if (operation == Mips32DArithmeticOperation::square_root) {
+        if (left_inf) {
+            if (left_class[3]) {
+                result.value_bits = canonical_qnan;
+                result.exception_bits |= fp_invalid;
+            } else result.value_bits = lhs_bits;
+            mips32_finalize_d(result, fcsr);
+            return result;
+        }
+        // Signed zero and negative finite cases are handled below after exact
+        // finite decoding; negative infinity was handled above.
+    } else if (operation == Mips32DArithmeticOperation::add ||
+               operation == Mips32DArithmeticOperation::subtract) {
+        const bool effective_right_sign = right_class[3] ^
+            (operation == Mips32DArithmeticOperation::subtract);
+        if (left_inf || right_inf) {
+            if (left_inf && right_inf && left_class[3] != effective_right_sign) {
+                result.value_bits = canonical_qnan;
+                result.exception_bits |= fp_invalid;
+            } else {
+                const bool negative = left_inf ? left_class[3] : effective_right_sign;
+                result.value_bits = (negative ? sign_mask : 0) | exponent_mask;
+            }
+            mips32_finalize_d(result, fcsr);
+            return result;
+        }
+    } else if (operation == Mips32DArithmeticOperation::multiply) {
+        if ((left_inf && right_zero) || (right_inf && left_zero)) {
+            result.value_bits = canonical_qnan;
+            result.exception_bits |= fp_invalid;
+            mips32_finalize_d(result, fcsr);
+            return result;
+        }
+        if (left_inf || right_inf) {
+            result.value_bits = ((left_class[3] ^ right_class[3]) ? sign_mask : 0) | exponent_mask;
+            mips32_finalize_d(result, fcsr);
+            return result;
+        }
+    } else if (operation == Mips32DArithmeticOperation::divide) {
+        const auto sign = (left_class[3] ^ right_class[3]) ? sign_mask : 0;
+        if ((left_inf && right_inf) || (left_zero && right_zero)) {
+            result.value_bits = canonical_qnan;
+            result.exception_bits |= fp_invalid;
+        } else if (left_inf || right_zero) {
+            result.value_bits = sign | exponent_mask;
+            if (!left_inf) result.exception_bits |= fp_divide_by_zero;
+        } else if (right_inf || left_zero) result.value_bits = sign;
+        else goto finite_d_operands;
+        mips32_finalize_d(result, fcsr);
+        return result;
+    }
+
+finite_d_operands:
 
     struct Operand { std::uint64_t significand; int scale; bool negative; };
     const auto decode = [=](std::uint64_t bits) {
@@ -737,7 +812,6 @@ std::optional<Mips32ArithmeticDResult> evaluate_mips32_arithmetic_d(
     if (operation != Mips32DArithmeticOperation::square_root) rhs = decode(rhs_bits);
     if (operation == Mips32DArithmeticOperation::subtract) rhs.negative = !rhs.negative;
     if (operation == Mips32DArithmeticOperation::square_root) {
-        constexpr std::uint64_t canonical_qnan = UINT64_C(0x7ff8000000000000);
         if (!lhs.significand) {
             result.value_bits = lhs.negative ? sign_mask : 0;
             mips32_finalize_d(result, fcsr);
@@ -793,7 +867,6 @@ std::optional<Mips32ArithmeticDResult> evaluate_mips32_arithmetic_d(
     if (operation == Mips32DArithmeticOperation::divide) {
         const bool negative = lhs.negative != rhs.negative;
         const auto sign = negative ? sign_mask : UINT64_C(0);
-        constexpr std::uint64_t canonical_qnan = UINT64_C(0x7ff8000000000000);
         if (!rhs.significand) {
             if (!lhs.significand) {
                 result.value_bits = canonical_qnan;

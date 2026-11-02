@@ -1,8 +1,10 @@
 #include "hexlab/processors/riscv_semantics.hpp"
 #include "riscv_estimate_tables.hpp"
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <limits>
+#include <utility>
 
 namespace hexlab {
 namespace {
@@ -282,6 +284,407 @@ RiscvVectorFloatResult multiply_riscv_float_bits(std::uint64_t lhs, std::uint64_
     const auto encoded_exponent = static_cast<std::uint64_t>(result_exponent + bias);
     return {sign | (encoded_exponent << fraction_bits) | (rounded & fraction_mask),
             static_cast<std::uint8_t>(inexact ? 0x01 : 0)};
+}
+
+RiscvVectorFloatResult divide_riscv_float_bits(std::uint64_t lhs, std::uint64_t rhs,
+                                               unsigned width, unsigned rounding_mode) noexcept {
+    const unsigned fraction_bits = width == 32 ? 23 : 52;
+    const unsigned exponent_bits = width == 32 ? 8 : 11;
+    const auto element_mask = width_mask(width);
+    const auto sign_mask = UINT64_C(1) << (width - 1);
+    const auto fraction_mask = (UINT64_C(1) << fraction_bits) - 1;
+    const auto exponent_field_mask = (UINT64_C(1) << exponent_bits) - 1;
+    const auto exponent_mask = exponent_field_mask << fraction_bits;
+    const auto quiet_mask = UINT64_C(1) << (fraction_bits - 1);
+    const auto canonical_nan = width == 32 ? UINT64_C(0x7fc00000) : UINT64_C(0x7ff8000000000000);
+    lhs &= element_mask;
+    rhs &= element_mask;
+    const auto exponent = [&](std::uint64_t value) {
+        return static_cast<unsigned>((value & exponent_mask) >> fraction_bits);
+    };
+    const auto fraction = [&](std::uint64_t value) { return value & fraction_mask; };
+    const auto is_nan = [&](std::uint64_t value) {
+        return exponent(value) == exponent_field_mask && fraction(value) != 0;
+    };
+    const auto is_signaling_nan = [&](std::uint64_t value) {
+        return is_nan(value) && (fraction(value) & quiet_mask) == 0;
+    };
+    if (is_nan(lhs) || is_nan(rhs))
+        return {canonical_nan, static_cast<std::uint8_t>(is_signaling_nan(lhs) || is_signaling_nan(rhs) ? 0x10 : 0)};
+
+    const bool negative = ((lhs ^ rhs) & sign_mask) != 0;
+    const auto sign = negative ? sign_mask : UINT64_C(0);
+    const auto lhs_exponent = exponent(lhs), rhs_exponent = exponent(rhs);
+    const auto lhs_fraction = fraction(lhs), rhs_fraction = fraction(rhs);
+    const bool lhs_infinite = lhs_exponent == exponent_field_mask;
+    const bool rhs_infinite = rhs_exponent == exponent_field_mask;
+    const bool lhs_zero = lhs_exponent == 0 && lhs_fraction == 0;
+    const bool rhs_zero = rhs_exponent == 0 && rhs_fraction == 0;
+    if ((lhs_infinite && rhs_infinite) || (lhs_zero && rhs_zero))
+        return {canonical_nan, 0x10};
+    if (lhs_infinite) return {sign | exponent_mask, 0};
+    if (rhs_infinite || lhs_zero) return {sign, 0};
+    if (rhs_zero) return {sign | exponent_mask, 0x08}; // finite nonzero / zero: DZ
+
+    const int bias = static_cast<int>((1u << (exponent_bits - 1)) - 1u);
+    const int minimum_exponent = 1 - bias;
+    const int maximum_exponent = bias;
+    const auto normalize = [&](std::uint64_t significand, unsigned field) {
+        int unbiased = field ? static_cast<int>(field) - bias : minimum_exponent;
+        const auto hidden = UINT64_C(1) << fraction_bits;
+        while (significand < hidden) {
+            significand <<= 1;
+            --unbiased;
+        }
+        return std::pair{significand, unbiased};
+    };
+    const auto [lhs_significand, lhs_scale] = normalize(
+        (lhs_exponent ? (UINT64_C(1) << fraction_bits) : 0) | lhs_fraction, lhs_exponent);
+    const auto [rhs_significand, rhs_scale] = normalize(
+        (rhs_exponent ? (UINT64_C(1) << fraction_bits) : 0) | rhs_fraction, rhs_exponent);
+    std::uint64_t numerator = lhs_significand;
+    const std::uint64_t denominator = rhs_significand;
+    int result_exponent = lhs_scale - rhs_scale;
+    if (numerator < denominator) {
+        numerator <<= 1;
+        --result_exponent;
+    }
+    std::uint64_t remainder = numerator - denominator;
+    // Keep three rounding bits beyond the target significand and preserve the
+    // exact remainder as sticky information. A doubled 53-bit remainder fits
+    // safely in uint64_t.
+    std::uint64_t extended = UINT64_C(1) << (fraction_bits + 3);
+    for (int bit = static_cast<int>(fraction_bits + 2); bit >= 0; --bit) {
+        remainder <<= 1;
+        if (remainder >= denominator) {
+            remainder -= denominator;
+            extended |= UINT64_C(1) << static_cast<unsigned>(bit);
+        }
+    }
+    const auto hidden = UINT64_C(1) << fraction_bits;
+    const auto overflow_result = [&]() {
+        const bool to_infinity = rounding_mode == 0 || rounding_mode == 4 ||
+            (rounding_mode == 2 && negative) || (rounding_mode == 3 && !negative);
+        const auto magnitude = to_infinity ? exponent_mask
+            : ((exponent_mask - (UINT64_C(1) << fraction_bits)) | fraction_mask);
+        return RiscvVectorFloatResult{sign | magnitude, 0x05};
+    };
+    if (result_exponent > maximum_exponent) return overflow_result();
+    const bool subnormal = result_exponent < minimum_exponent;
+    const unsigned dropped_bits = subnormal
+        ? static_cast<unsigned>(3 + (minimum_exponent - result_exponent)) : 3u;
+    const std::uint64_t truncated = dropped_bits < 64 ? extended >> dropped_bits : 0;
+    const bool guard = dropped_bits > 0 && dropped_bits <= 64 &&
+        ((extended >> (dropped_bits - 1)) & 1u) != 0;
+    const std::uint64_t low_mask = dropped_bits <= 1 ? 0 :
+        dropped_bits < 64 ? ((UINT64_C(1) << (dropped_bits - 1)) - 1) : extended;
+    const bool sticky = (low_mask != 0 && (extended & low_mask) != 0) || remainder != 0;
+    const bool inexact = guard || sticky;
+    bool increment = false;
+    switch (rounding_mode) {
+    case 0: increment = guard && (sticky || (truncated & 1u)); break; // RNE
+    case 1: break; // RTZ
+    case 2: increment = negative && inexact; break; // RDN
+    case 3: increment = !negative && inexact; break; // RUP
+    case 4: increment = guard; break; // RMM
+    default: return {};
+    }
+    std::uint64_t rounded = truncated + static_cast<std::uint64_t>(increment);
+    if (subnormal) {
+        if (rounded >= hidden)
+            return {sign | (UINT64_C(1) << fraction_bits), static_cast<std::uint8_t>(inexact ? 0x01 : 0)};
+        return {sign | rounded, static_cast<std::uint8_t>((inexact ? 0x01 : 0) |
+                                                          (inexact ? 0x02 : 0))};
+    }
+    if (rounded >= (hidden << 1)) {
+        rounded >>= 1;
+        ++result_exponent;
+        if (result_exponent > maximum_exponent) return overflow_result();
+    }
+    return {sign | (static_cast<std::uint64_t>(result_exponent + bias) << fraction_bits) |
+                  (rounded & fraction_mask), static_cast<std::uint8_t>(inexact ? 0x01 : 0)};
+}
+
+using RiscvExactFloatMagnitude = std::array<std::uint64_t, 66>;
+struct RiscvWideFloatProduct { std::uint64_t low = 0, high = 0; };
+constexpr int riscv_exact_float_base_scale = -2148; // twice the minimum binary64 subnormal scale.
+
+RiscvWideFloatProduct multiply_riscv_float_significands(std::uint64_t lhs,
+                                                        std::uint64_t rhs) noexcept {
+    const auto a0 = static_cast<std::uint32_t>(lhs), a1 = static_cast<std::uint32_t>(lhs >> 32);
+    const auto b0 = static_cast<std::uint32_t>(rhs), b1 = static_cast<std::uint32_t>(rhs >> 32);
+    const std::uint64_t p00 = std::uint64_t{a0} * b0;
+    const std::uint64_t p01 = std::uint64_t{a0} * b1;
+    const std::uint64_t p10 = std::uint64_t{a1} * b0;
+    const std::uint64_t p11 = std::uint64_t{a1} * b1;
+    std::uint64_t low = p00;
+    const auto shifted_a = p01 << 32, shifted_b = p10 << 32;
+    low += shifted_a;
+    const bool carry_a = low < shifted_a;
+    const auto before_b = low;
+    low += shifted_b;
+    const bool carry_b = low < before_b;
+    const std::uint64_t high = (p01 >> 32) + (p10 >> 32) + p11 +
+        static_cast<std::uint64_t>(carry_a) + static_cast<std::uint64_t>(carry_b);
+    return {low, high};
+}
+
+void add_riscv_exact_word(RiscvExactFloatMagnitude &value, std::size_t word,
+                          std::uint64_t addend) noexcept {
+    while (addend && word < value.size()) {
+        const auto previous = value[word];
+        value[word] += addend;
+        addend = value[word] < previous ? 1 : 0;
+        ++word;
+    }
+}
+
+void add_riscv_exact_shifted(RiscvExactFloatMagnitude &destination, std::uint64_t low,
+                             std::uint64_t high, unsigned shift) noexcept {
+    const auto word = static_cast<std::size_t>(shift / 64);
+    const unsigned offset = shift % 64;
+    add_riscv_exact_word(destination, word, low << offset);
+    add_riscv_exact_word(destination, word + 1,
+        offset ? (low >> (64 - offset)) | (high << offset) : high);
+    if (offset) add_riscv_exact_word(destination, word + 2, high >> (64 - offset));
+}
+
+int compare_riscv_exact_magnitude(const RiscvExactFloatMagnitude &lhs,
+                                  const RiscvExactFloatMagnitude &rhs) noexcept {
+    for (std::size_t i = lhs.size(); i-- > 0;) {
+        if (lhs[i] < rhs[i]) return -1;
+        if (lhs[i] > rhs[i]) return 1;
+    }
+    return 0;
+}
+
+void add_riscv_exact_magnitude(RiscvExactFloatMagnitude &lhs,
+                               const RiscvExactFloatMagnitude &rhs) noexcept {
+    std::uint64_t carry = 0;
+    for (std::size_t i = 0; i < lhs.size(); ++i) {
+        const auto first = lhs[i] + rhs[i];
+        const bool carry_first = first < lhs[i];
+        const auto second = first + carry;
+        const bool carry_second = second < first;
+        lhs[i] = second;
+        carry = static_cast<std::uint64_t>(carry_first || carry_second);
+    }
+}
+
+void subtract_riscv_exact_magnitude(RiscvExactFloatMagnitude &lhs,
+                                   const RiscvExactFloatMagnitude &rhs) noexcept {
+    std::uint64_t borrow = 0;
+    for (std::size_t i = 0; i < lhs.size(); ++i) {
+        const auto first = lhs[i] - rhs[i];
+        const bool borrow_first = lhs[i] < rhs[i];
+        const auto second = first - borrow;
+        const bool borrow_second = first < borrow;
+        lhs[i] = second;
+        borrow = static_cast<std::uint64_t>(borrow_first || borrow_second);
+    }
+}
+
+bool riscv_exact_bit(const RiscvExactFloatMagnitude &value, unsigned bit) noexcept {
+    const auto word = static_cast<std::size_t>(bit / 64);
+    return word < value.size() && ((value[word] >> (bit % 64)) & 1u) != 0;
+}
+
+bool riscv_exact_any_below(const RiscvExactFloatMagnitude &value, unsigned bit_count) noexcept {
+    const auto full_words = std::min<std::size_t>(bit_count / 64, value.size());
+    for (std::size_t i = 0; i < full_words; ++i) if (value[i]) return true;
+    const unsigned remaining = bit_count % 64;
+    if (remaining && full_words < value.size())
+        return (value[full_words] & ((UINT64_C(1) << remaining) - 1)) != 0;
+    return false;
+}
+
+std::uint64_t shift_riscv_exact_to_u64(const RiscvExactFloatMagnitude &value,
+                                      unsigned shift) noexcept {
+    const auto word = static_cast<std::size_t>(shift / 64);
+    const unsigned offset = shift % 64;
+    if (word >= value.size()) return 0;
+    auto result = value[word] >> offset;
+    if (offset && word + 1 < value.size()) result |= value[word + 1] << (64 - offset);
+    return result;
+}
+
+RiscvVectorFloatResult round_riscv_exact_float(const RiscvExactFloatMagnitude &value,
+                                               bool negative, unsigned width,
+                                               unsigned rounding_mode) noexcept {
+    const unsigned fraction_bits = width == 32 ? 23 : 52;
+    const unsigned exponent_bits = width == 32 ? 8 : 11;
+    const auto sign_mask = UINT64_C(1) << (width - 1);
+    const auto fraction_mask = (UINT64_C(1) << fraction_bits) - 1;
+    const auto exponent_field_mask = (UINT64_C(1) << exponent_bits) - 1;
+    const auto exponent_mask = exponent_field_mask << fraction_bits;
+    const int bias = static_cast<int>((1u << (exponent_bits - 1)) - 1u);
+    const int minimum_exponent = 1 - bias;
+    const int maximum_exponent = bias;
+    const auto sign = negative ? sign_mask : UINT64_C(0);
+    std::size_t top_word = value.size();
+    while (top_word && value[top_word - 1] == 0) --top_word;
+    if (!top_word) return {sign, 0};
+    const unsigned top_bit = static_cast<unsigned>((top_word - 1) * 64) +
+        static_cast<unsigned>(std::bit_width(value[top_word - 1]) - 1u);
+    int result_exponent = riscv_exact_float_base_scale + static_cast<int>(top_bit);
+    const auto overflow_result = [&]() {
+        const bool to_infinity = rounding_mode == 0 || rounding_mode == 4 ||
+            (rounding_mode == 2 && negative) || (rounding_mode == 3 && !negative);
+        const auto magnitude = to_infinity ? exponent_mask
+            : ((exponent_mask - (UINT64_C(1) << fraction_bits)) | fraction_mask);
+        return RiscvVectorFloatResult{sign | magnitude, 0x05}; // OF | NX
+    };
+    if (result_exponent > maximum_exponent) return overflow_result();
+    const bool subnormal = result_exponent < minimum_exponent;
+    const int target_exponent = std::max(result_exponent, minimum_exponent);
+    const unsigned shift = static_cast<unsigned>(target_exponent -
+        static_cast<int>(fraction_bits) - riscv_exact_float_base_scale);
+    const auto truncated = shift_riscv_exact_to_u64(value, shift);
+    const bool guard = shift && riscv_exact_bit(value, shift - 1);
+    const bool sticky = shift > 1 && riscv_exact_any_below(value, shift - 1);
+    const bool inexact = guard || sticky;
+    bool increment = false;
+    switch (rounding_mode) {
+    case 0: increment = guard && (sticky || (truncated & 1u)); break; // RNE
+    case 1: break; // RTZ
+    case 2: increment = negative && inexact; break; // RDN
+    case 3: increment = !negative && inexact; break; // RUP
+    case 4: increment = guard; break; // RMM
+    default: return {};
+    }
+    auto rounded = truncated + static_cast<std::uint64_t>(increment);
+    const auto hidden = UINT64_C(1) << fraction_bits;
+    if (subnormal) {
+        if (rounded >= hidden)
+            return {sign | (UINT64_C(1) << fraction_bits), static_cast<std::uint8_t>(inexact ? 0x01 : 0)};
+        return {sign | rounded, static_cast<std::uint8_t>((inexact ? 0x01 : 0) |
+                                                          (inexact ? 0x02 : 0))};
+    }
+    if (rounded >= (hidden << 1)) {
+        rounded >>= 1;
+        ++result_exponent;
+        if (result_exponent > maximum_exponent) return overflow_result();
+    }
+    return {sign | (static_cast<std::uint64_t>(result_exponent + bias) << fraction_bits) |
+                  (rounded & fraction_mask), static_cast<std::uint8_t>(inexact ? 0x01 : 0)};
+}
+
+RiscvVectorFloatResult fused_riscv_float_bits(RiscvOpcode opcode, std::uint64_t vs2,
+                                              std::uint64_t vs1, std::uint64_t old_destination,
+                                              unsigned width, unsigned rounding_mode) noexcept {
+    bool product_negate = false, addend_negate = false;
+    bool old_destination_is_product_operand = false, vs2_is_addend = false;
+    switch (opcode) {
+    case RiscvOpcode::vfmacc_vv: case RiscvOpcode::vfmacc_vf: break;
+    case RiscvOpcode::vfnmacc_vv: case RiscvOpcode::vfnmacc_vf:
+        product_negate = addend_negate = true; break;
+    case RiscvOpcode::vfmsac_vv: case RiscvOpcode::vfmsac_vf:
+        addend_negate = true; break;
+    case RiscvOpcode::vfnmsac_vv: case RiscvOpcode::vfnmsac_vf:
+        product_negate = true; break;
+    case RiscvOpcode::vfmadd_vv: case RiscvOpcode::vfmadd_vf:
+        old_destination_is_product_operand = vs2_is_addend = true; break;
+    case RiscvOpcode::vfnmadd_vv: case RiscvOpcode::vfnmadd_vf:
+        product_negate = old_destination_is_product_operand = vs2_is_addend = true; break;
+    case RiscvOpcode::vfmsub_vv: case RiscvOpcode::vfmsub_vf:
+        old_destination_is_product_operand = vs2_is_addend = true; addend_negate = true; break;
+    case RiscvOpcode::vfnmsub_vv: case RiscvOpcode::vfnmsub_vf:
+        product_negate = old_destination_is_product_operand = vs2_is_addend = addend_negate = true; break;
+    default: return {};
+    }
+    const unsigned fraction_bits = width == 32 ? 23 : 52;
+    const unsigned exponent_bits = width == 32 ? 8 : 11;
+    const auto element_mask = width_mask(width);
+    const auto sign_mask = UINT64_C(1) << (width - 1);
+    const auto fraction_mask = (UINT64_C(1) << fraction_bits) - 1;
+    const auto exponent_field_mask = (UINT64_C(1) << exponent_bits) - 1;
+    const auto exponent_mask = exponent_field_mask << fraction_bits;
+    const auto quiet_mask = UINT64_C(1) << (fraction_bits - 1);
+    const auto canonical_nan = width == 32 ? UINT64_C(0x7fc00000) : UINT64_C(0x7ff8000000000000);
+    const int bias = static_cast<int>((1u << (exponent_bits - 1)) - 1u);
+    const int minimum_exponent = 1 - bias;
+    struct Decoded {
+        bool negative = false, zero = false, infinite = false, nan = false, signaling = false;
+        std::uint64_t significand = 0;
+        int scale = 0;
+    };
+    const auto decode = [&](std::uint64_t value) {
+        value &= element_mask;
+        Decoded decoded;
+        decoded.negative = (value & sign_mask) != 0;
+        const auto exponent = static_cast<unsigned>((value & exponent_mask) >> fraction_bits);
+        const auto fraction = value & fraction_mask;
+        decoded.nan = exponent == exponent_field_mask && fraction != 0;
+        decoded.signaling = decoded.nan && (fraction & quiet_mask) == 0;
+        decoded.infinite = exponent == exponent_field_mask && fraction == 0;
+        decoded.zero = exponent == 0 && fraction == 0;
+        decoded.significand = (exponent ? (UINT64_C(1) << fraction_bits) : 0) | fraction;
+        decoded.scale = exponent ? static_cast<int>(exponent) - bias - static_cast<int>(fraction_bits)
+                                 : minimum_exponent - static_cast<int>(fraction_bits);
+        return decoded;
+    };
+    const auto product_lhs = decode(old_destination_is_product_operand ? old_destination : vs1);
+    const auto product_rhs = decode(old_destination_is_product_operand ? vs1 : vs2);
+    const auto addend = decode(vs2_is_addend ? vs2 : old_destination);
+    const bool product_negative = product_lhs.negative ^ product_rhs.negative ^ product_negate;
+    const bool addend_negative = addend.negative != addend_negate;
+    const bool invalid_product = (product_lhs.infinite && product_rhs.zero) ||
+                                 (product_rhs.infinite && product_lhs.zero);
+    if (product_lhs.nan || product_rhs.nan || addend.nan || invalid_product) {
+        const bool invalid = product_lhs.signaling || product_rhs.signaling || addend.signaling || invalid_product;
+        return {canonical_nan, static_cast<std::uint8_t>(invalid ? 0x10 : 0)};
+    }
+    const bool product_infinite = product_lhs.infinite || product_rhs.infinite;
+    if (product_infinite || addend.infinite) {
+        if (product_infinite && addend.infinite && product_negative != addend_negative)
+            return {canonical_nan, 0x10};
+        const bool result_negative = product_infinite ? product_negative : addend_negative;
+        return {(result_negative ? sign_mask : 0) | exponent_mask, 0};
+    }
+    const bool product_zero = product_lhs.zero || product_rhs.zero;
+    if (product_zero && addend.zero) {
+        const bool result_negative = product_negative == addend_negative
+            ? product_negative : rounding_mode == 2;
+        return {result_negative ? sign_mask : 0, 0};
+    }
+
+    RiscvExactFloatMagnitude product_magnitude{}, addend_magnitude{};
+    if (!product_zero) {
+        const auto product = multiply_riscv_float_significands(product_lhs.significand,
+                                                               product_rhs.significand);
+        const auto shift = product_lhs.scale + product_rhs.scale - riscv_exact_float_base_scale;
+        if (shift < 0) return {};
+        add_riscv_exact_shifted(product_magnitude, product.low, product.high,
+                                static_cast<unsigned>(shift));
+    }
+    if (!addend.zero) {
+        const auto shift = addend.scale - riscv_exact_float_base_scale;
+        if (shift < 0) return {};
+        add_riscv_exact_shifted(addend_magnitude, addend.significand, 0,
+                                static_cast<unsigned>(shift));
+    }
+    const bool result_negative = [&]() {
+        if (product_zero) return addend_negative;
+        if (addend.zero) return product_negative;
+        if (product_negative == addend_negative) {
+            add_riscv_exact_magnitude(product_magnitude, addend_magnitude);
+            return product_negative;
+        }
+        const int order = compare_riscv_exact_magnitude(product_magnitude, addend_magnitude);
+        if (order == 0) {
+            product_magnitude = {};
+            return rounding_mode == 2;
+        }
+        if (order > 0) {
+            subtract_riscv_exact_magnitude(product_magnitude, addend_magnitude);
+            return product_negative;
+        }
+        subtract_riscv_exact_magnitude(addend_magnitude, product_magnitude);
+        product_magnitude = addend_magnitude;
+        return addend_negative;
+    }();
+    if (product_zero && !addend.zero) product_magnitude = addend_magnitude;
+    return round_riscv_exact_float(product_magnitude, result_negative, width, rounding_mode);
 }
 
 struct RiscvWidenF32Result {
@@ -1900,7 +2303,10 @@ evaluate_riscv_vector_floating_operation(RiscvOpcode opcode, const RiscvVectorIn
         return {};
 
     enum class Operation { classification, reciprocal_estimate, reciprocal_sqrt_estimate,
-                           add, subtract, multiply,
+                           add, subtract, multiply, divide, reverse_divide,
+                           fma_accumulate, fma_negate_accumulate, fma_subtract_accumulate,
+                           fma_negate_subtract_accumulate, fma_add, fma_negate_add,
+                           fma_subtract, fma_negate_subtract,
                            sign_copy, sign_invert, sign_xor, min, max,
                            reduce_min, reduce_max, reduce_unordered_sum, reduce_ordered_sum,
                            reduce_widen_unordered_sum, reduce_widen_ordered_sum,
@@ -1917,6 +2323,7 @@ evaluate_riscv_vector_floating_operation(RiscvOpcode opcode, const RiscvVectorIn
     RV_FLOAT_PAIR(vfadd_vv, vfadd_vf, add);
     RV_FLOAT_PAIR(vfsub_vv, vfsub_vf, subtract);
     RV_FLOAT_PAIR(vfmul_vv, vfmul_vf, multiply);
+    RV_FLOAT_PAIR(vfdiv_vv, vfdiv_vf, divide);
     RV_FLOAT_PAIR(vfsgnj_vv, vfsgnj_vf, sign_copy);
     RV_FLOAT_PAIR(vfsgnjn_vv, vfsgnjn_vf, sign_invert);
     RV_FLOAT_PAIR(vfsgnjx_vv, vfsgnjx_vf, sign_xor);
@@ -1929,6 +2336,15 @@ evaluate_riscv_vector_floating_operation(RiscvOpcode opcode, const RiscvVectorIn
 #undef RV_FLOAT_PAIR
     case RiscvOpcode::vmfgt_vf: operation = Operation::greater; break;
     case RiscvOpcode::vmfge_vf: operation = Operation::greater_equal; break;
+    case RiscvOpcode::vfrdiv_vf: operation = Operation::reverse_divide; break;
+    case RiscvOpcode::vfmacc_vv: case RiscvOpcode::vfmacc_vf: operation = Operation::fma_accumulate; break;
+    case RiscvOpcode::vfnmacc_vv: case RiscvOpcode::vfnmacc_vf: operation = Operation::fma_negate_accumulate; break;
+    case RiscvOpcode::vfmsac_vv: case RiscvOpcode::vfmsac_vf: operation = Operation::fma_subtract_accumulate; break;
+    case RiscvOpcode::vfnmsac_vv: case RiscvOpcode::vfnmsac_vf: operation = Operation::fma_negate_subtract_accumulate; break;
+    case RiscvOpcode::vfmadd_vv: case RiscvOpcode::vfmadd_vf: operation = Operation::fma_add; break;
+    case RiscvOpcode::vfnmadd_vv: case RiscvOpcode::vfnmadd_vf: operation = Operation::fma_negate_add; break;
+    case RiscvOpcode::vfmsub_vv: case RiscvOpcode::vfmsub_vf: operation = Operation::fma_subtract; break;
+    case RiscvOpcode::vfnmsub_vv: case RiscvOpcode::vfnmsub_vf: operation = Operation::fma_negate_subtract; break;
     case RiscvOpcode::vfredmin: operation = Operation::reduce_min; break;
     case RiscvOpcode::vfredmax: operation = Operation::reduce_max; break;
     case RiscvOpcode::vfredusum: operation = Operation::reduce_unordered_sum; break;
@@ -1951,8 +2367,14 @@ evaluate_riscv_vector_floating_operation(RiscvOpcode opcode, const RiscvVectorIn
         (config.masked && std::any_of(operands.predicate_mask.begin(), operands.predicate_mask.end(),
                                       [](std::uint8_t bit) { return bit > 1; })))) return {};
     if (sum_reduction && (!operands.frm || *operands.frm > 4)) return {};
+    const bool fused_operation = operation == Operation::fma_accumulate ||
+        operation == Operation::fma_negate_accumulate || operation == Operation::fma_subtract_accumulate ||
+        operation == Operation::fma_negate_subtract_accumulate || operation == Operation::fma_add ||
+        operation == Operation::fma_negate_add || operation == Operation::fma_subtract ||
+        operation == Operation::fma_negate_subtract;
     const bool rounded_arithmetic = operation == Operation::add || operation == Operation::subtract ||
-                                    operation == Operation::multiply;
+        operation == Operation::multiply || operation == Operation::divide ||
+        operation == Operation::reverse_divide || fused_operation;
     if (rounded_arithmetic && (!operands.frm || *operands.frm > 4)) return {};
     if (vector_rhs && operands.vs1.size() != vlmax) return {};
     mask_result = operation == Operation::equal || operation == Operation::not_equal ||
@@ -2135,6 +2557,29 @@ evaluate_riscv_vector_floating_operation(RiscvOpcode opcode, const RiscvVectorIn
         }
         case Operation::multiply: {
             const auto arithmetic = multiply_riscv_float_bits(lhs, rhs, sew, *operands.frm);
+            value = arithmetic.bits;
+            result.fflags_set |= arithmetic.fflags;
+            break;
+        }
+        case Operation::divide:
+        case Operation::reverse_divide: {
+            const auto numerator = operation == Operation::reverse_divide ? rhs : lhs;
+            const auto denominator = operation == Operation::reverse_divide ? lhs : rhs;
+            const auto arithmetic = divide_riscv_float_bits(numerator, denominator, sew, *operands.frm);
+            value = arithmetic.bits;
+            result.fflags_set |= arithmetic.fflags;
+            break;
+        }
+        case Operation::fma_accumulate:
+        case Operation::fma_negate_accumulate:
+        case Operation::fma_subtract_accumulate:
+        case Operation::fma_negate_subtract_accumulate:
+        case Operation::fma_add:
+        case Operation::fma_negate_add:
+        case Operation::fma_subtract:
+        case Operation::fma_negate_subtract: {
+            const auto arithmetic = fused_riscv_float_bits(opcode, lhs, rhs,
+                operands.old_destination[static_cast<std::size_t>(lane)], sew, *operands.frm);
             value = arithmetic.bits;
             result.fflags_set |= arithmetic.fflags;
             break;

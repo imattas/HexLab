@@ -348,6 +348,7 @@ bool decode_vector_floating(std::uint32_t w, RiscvInstruction &i) {
     case 0x00: op = scalar ? RiscvOpcode::vfadd_vf : RiscvOpcode::vfadd_vv; uses_rounding = flags = true; break;
     case 0x02: op = scalar ? RiscvOpcode::vfsub_vf : RiscvOpcode::vfsub_vv; uses_rounding = flags = true; break;
     case 0x20: op = scalar ? RiscvOpcode::vfdiv_vf : RiscvOpcode::vfdiv_vv; uses_rounding = flags = true; break;
+    case 0x21: if (!scalar) return false; op = RiscvOpcode::vfrdiv_vf; uses_rounding = flags = true; break;
     case 0x24: op = scalar ? RiscvOpcode::vfmul_vf : RiscvOpcode::vfmul_vv; uses_rounding = flags = true; break;
     case 0x29: op = scalar ? RiscvOpcode::vfmacc_vf : RiscvOpcode::vfmacc_vv; uses_rounding = flags = true; break;
     case 0x2b: op = scalar ? RiscvOpcode::vfnmacc_vf : RiscvOpcode::vfnmacc_vv; uses_rounding = flags = true; break;

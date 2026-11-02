@@ -244,7 +244,10 @@ Result<LoadedImage> load_xcoff32_executable(std::shared_ptr<const ByteStorage> s
     require(optional_size == 72,
             "Unsupported XCOFF32 executable auxiliary-header size", ErrorCode::unsupported);
     const auto auxiliary = read(*storage, 20, optional_size, budget, limits, stop);
-    const auto entry_value = be(auxiliary, 20, 4);
+    const auto entry_value = be(auxiliary, 16, 4);
+    const auto toc_value = be(auxiliary, 28, 4);
+    const auto toc_section_number = be(auxiliary, 38, 2);
+    const auto entry_section_number = be(auxiliary, 32, 2);
     require(section_count && section_count <= limits.max_sections,
             "XCOFF32 executable section count exceeds configured limit", ErrorCode::resource_limit);
     const std::uint64_t section_headers_offset = 20 + optional_size;
@@ -263,6 +266,11 @@ Result<LoadedImage> load_xcoff32_executable(std::shared_ptr<const ByteStorage> s
     bool loader_section_seen = false;
     bool other_section_seen = false;
     bool has_text = false;
+    struct MappedSection { std::uint32_t address, size; std::uint32_t flags; };
+    std::vector<MappedSection> section_map;
+    charge(std::uint64_t{section_count} * sizeof(MappedSection), budget, limits);
+    section_map.reserve(section_count);
+    std::uint32_t loader_file_offset = 0, loader_size = 0;
     std::uint64_t low = UINT64_MAX, high = 0;
     for (std::uint32_t i = 0; i < section_count; ++i) {
         canceled(stop);
@@ -290,9 +298,15 @@ Result<LoadedImage> load_xcoff32_executable(std::shared_ptr<const ByteStorage> s
                         "XCOFF32 initialized section data exceeds file extent or overlaps headers");
             }
         }
-        if (type == 0x1000) loader_section_seen = true;
+        if (type == 0x1000) {
+            require(!loader_section_seen, "Multiple XCOFF32 loader sections are unsupported", ErrorCode::unsupported);
+            loader_section_seen = true;
+            loader_file_offset = raw_offset;
+            loader_size = size;
+        }
         else if (!mapped && size && type != 0x10 && type != 0x200)
             other_section_seen = true;
+        section_map.push_back({address, size, section_flags});
         if (!mapped || !size) continue;
         const bool executable = type == 0x20;
         const bool writable = type == 0x40 || bss || type == 0x400;
@@ -312,16 +326,254 @@ Result<LoadedImage> load_xcoff32_executable(std::shared_ptr<const ByteStorage> s
     const auto *entry_segment = image.value()->segment_at(entry);
     require(entry_segment && entry_segment->executable && image.value()->to_file_offset(entry),
             "XCOFF32 executable entry is not in initialized text");
+    if (entry_section_number) {
+        require(entry_section_number <= section_count &&
+                    (section_map[entry_section_number - 1].flags & 0xffffu) == 0x20 &&
+                    section_map[entry_section_number - 1].address <= entry_value &&
+                    std::uint64_t{entry_value} - section_map[entry_section_number - 1].address <
+                        section_map[entry_section_number - 1].size,
+                "XCOFF32 auxiliary-header entry section does not contain the entry point");
+    }
     layout.entries.push_back(entry);
     image = Image::create(storage, std::move(layout));
     if (!image) throw Failure{image.error()};
     loaded.image = std::move(image.value());
     loaded.metadata.preferred_base = low;
     loaded.metadata.image_size = high - low;
+    if (toc_value || toc_section_number) {
+        const bool toc_valid = toc_section_number && toc_section_number <= section_count &&
+            ((section_map[toc_section_number - 1].flags & 0xffffu) == 0x20 ||
+             (section_map[toc_section_number - 1].flags & 0xffffu) == 0x40 ||
+             (section_map[toc_section_number - 1].flags & 0xffffu) == 0x80 ||
+             (section_map[toc_section_number - 1].flags & 0xffffu) == 0x400 ||
+             (section_map[toc_section_number - 1].flags & 0xffffu) == 0x800) &&
+            section_map[toc_section_number - 1].address <= toc_value &&
+            std::uint64_t{toc_value} - section_map[toc_section_number - 1].address <
+                section_map[toc_section_number - 1].size;
+        const auto message = toc_valid
+            ? "AIX TOC anchor at address " + std::to_string(toc_value) + " is in section " +
+                std::to_string(toc_section_number) + "; runtime r2 setup is not performed"
+            : "XCOFF32 auxiliary-header TOC anchor/section is inconsistent";
+        charge(sizeof(Diagnostic) + message.size(), budget, limits);
+        loaded.diagnostics.push_back({toc_valid ? DiagnosticSeverity::info : DiagnosticSeverity::warning,
+                                      message, {}});
+        if (!toc_valid) loaded.metadata_complete = false;
+    }
     if (loader_section_seen) {
-        loaded.metadata_complete = false;
-        loaded.diagnostics.push_back({DiagnosticSeverity::warning,
-            "XCOFF32 loader section is not interpreted; imports and loader relocations remain unresolved", {}});
+        // AIX loader.h defines a 32-byte header, 24-byte symbol rows, and
+        // 12-byte relocation rows. LLVM's LoaderSectionHeader32 and related
+        // structs use the same layout; see the references in the XCOFF32 doc.
+        constexpr std::uint64_t loader_header_size = 32;
+        constexpr std::uint64_t loader_symbol_size = 24;
+        constexpr std::uint64_t loader_relocation_size = 12;
+        require(loader_size >= loader_header_size, "Truncated XCOFF32 loader section");
+        auto loader_data = read(*storage, loader_file_offset, loader_size, budget, limits, stop);
+        const auto loader = std::span<const std::byte>(loader_data);
+        const auto version = be(loader, 0, 4);
+        const auto symbol_count = be(loader, 4, 4);
+        const auto relocation_count = be(loader, 8, 4);
+        const auto import_string_size = be(loader, 12, 4);
+        const auto import_count = be(loader, 16, 4);
+        const auto import_offset = be(loader, 20, 4);
+        const auto string_size = be(loader, 24, 4);
+        const auto string_offset = be(loader, 28, 4);
+        require(version == 1, "Unsupported XCOFF32 loader-section version", ErrorCode::unsupported);
+        require(symbol_count <= limits.max_symbols && import_count <= limits.max_symbols &&
+                    relocation_count <= limits.max_relocations,
+                "XCOFF32 loader table count exceeds configured limits", ErrorCode::resource_limit);
+        const std::uint64_t symbols_offset = loader_header_size;
+        const std::uint64_t symbols_size = std::uint64_t{symbol_count} * loader_symbol_size;
+        const std::uint64_t relocations_offset = symbols_offset + symbols_size;
+        const std::uint64_t relocations_size = std::uint64_t{relocation_count} * loader_relocation_size;
+        require(contains(loader.size(), symbols_offset, symbols_size) &&
+                    contains(loader.size(), relocations_offset, relocations_size),
+                "XCOFF32 loader symbol or relocation table exceeds section extent");
+        require((import_count == 0 && import_string_size == 0) ||
+                    (import_count != 0 && import_string_size != 0 &&
+                     contains(loader.size(), import_offset, import_string_size)),
+                "XCOFF32 import-file ID table exceeds loader section");
+        require((string_size == 0 && string_offset == 0) ||
+                    (string_size != 0 && contains(loader.size(), string_offset, string_size)),
+                "XCOFF32 loader string table exceeds section extent");
+        const auto disjoint = [](std::uint64_t a, std::uint64_t as,
+                                 std::uint64_t b, std::uint64_t bs) {
+            return as == 0 || bs == 0 || a + as <= b || b + bs <= a;
+        };
+        require(disjoint(symbols_offset, symbols_size, import_offset, import_string_size) &&
+                    disjoint(symbols_offset, symbols_size, string_offset, string_size) &&
+                    disjoint(relocations_offset, relocations_size, import_offset, import_string_size) &&
+                    disjoint(relocations_offset, relocations_size, string_offset, string_size) &&
+                    disjoint(import_offset, import_string_size, string_offset, string_size),
+                "XCOFF32 loader tables overlap");
+        require(disjoint(0, loader_header_size, import_offset, import_string_size) &&
+                    disjoint(0, loader_header_size, string_offset, string_size),
+                "XCOFF32 loader string tables overlap the loader header");
+
+        struct ImportFileId { std::string path, base, member; };
+        std::vector<ImportFileId> import_ids;
+        charge(std::uint64_t{import_count} * sizeof(ImportFileId), budget, limits);
+        import_ids.reserve(import_count);
+        std::uint64_t import_cursor = import_offset;
+        const std::uint64_t import_end = import_cursor + import_string_size;
+        const auto loader_string = [&](std::uint64_t &cursor, std::uint64_t end,
+                                       const char *description) -> std::string {
+            require(cursor < end, description);
+            const auto begin = cursor;
+            while (cursor < end && loader[static_cast<std::size_t>(cursor)] != std::byte{0} &&
+                   cursor - begin <= limits.max_name_bytes) ++cursor;
+            require(cursor < end && cursor - begin <= limits.max_name_bytes, description,
+                    cursor - begin > limits.max_name_bytes ? ErrorCode::resource_limit : ErrorCode::malformed);
+            const auto length = static_cast<std::size_t>(cursor - begin);
+            charge(length, budget, limits);
+            std::string value(reinterpret_cast<const char *>(loader.data() + begin), length);
+            ++cursor;
+            return value;
+        };
+        for (std::uint32_t i = 0; i < import_count; ++i) {
+            canceled(stop);
+            ImportFileId id;
+            id.path = loader_string(import_cursor, import_end, "Truncated XCOFF32 import path");
+            id.base = loader_string(import_cursor, import_end, "Truncated XCOFF32 import base name");
+            id.member = loader_string(import_cursor, import_end, "Truncated XCOFF32 import member name");
+            import_ids.push_back(std::move(id));
+        }
+        require(import_cursor == import_end, "XCOFF32 import-file ID count does not consume its declared table");
+
+        const auto symbol_name = [&](std::span<const std::byte> row) -> std::string {
+            const auto zeroes = be(row, 0, 4);
+            std::uint64_t begin = 0, end = 8;
+            std::span<const std::byte> names = row;
+            if (zeroes == 0) {
+                const auto offset = be(row, 4, 4);
+                require(offset < string_size, "XCOFF32 loader symbol name offset is outside string table");
+                begin = offset;
+                end = string_size;
+                names = loader.subspan(string_offset, string_size);
+            }
+            auto terminator = begin;
+            while (terminator < end && names[static_cast<std::size_t>(terminator)] != std::byte{0} &&
+                   terminator - begin <= limits.max_name_bytes) ++terminator;
+            require(terminator - begin <= limits.max_name_bytes,
+                    "XCOFF32 loader symbol name exceeds limit", ErrorCode::resource_limit);
+            require(zeroes != 0 || terminator < end, "Unterminated XCOFF32 loader symbol name");
+            const auto length = static_cast<std::size_t>(terminator - begin);
+            charge(length, budget, limits);
+            return {reinterpret_cast<const char *>(names.data() + begin), length};
+        };
+        constexpr std::uint8_t loader_import = 0x40, loader_export = 0x10;
+        constexpr std::int32_t implicit_text = 0, implicit_data = 1, implicit_bss = 2,
+                                implicit_tdata = -1, implicit_tbss = -2;
+        std::uint64_t imports_seen = 0, exports_seen = 0;
+        std::uint64_t import_diagnostics = 0, relocation_diagnostics = 0;
+        std::vector<std::string> names;
+        charge(std::uint64_t{symbol_count} * sizeof(std::string), budget, limits);
+        names.reserve(symbol_count);
+        for (std::uint32_t i = 0; i < symbol_count; ++i) {
+            canceled(stop);
+            const auto row = loader.subspan(static_cast<std::size_t>(symbols_offset +
+                std::uint64_t{i} * loader_symbol_size), loader_symbol_size);
+            auto name = symbol_name(row);
+            const auto value = be(row, 8, 4);
+            const auto raw_section = be(row, 12, 2);
+            const auto section_number = static_cast<std::int32_t>(raw_section >= 0x8000 ?
+                static_cast<std::int32_t>(raw_section) - 0x10000 : raw_section);
+            const auto symbol_type = static_cast<std::uint8_t>(be(row, 14, 1));
+            const auto import_id = be(row, 16, 4);
+            const bool imported = (symbol_type & loader_import) != 0;
+            require(!imported || (section_number == 0 && import_id < import_ids.size()),
+                    "XCOFF32 imported loader symbol has invalid section or import-file ID");
+            require(imported || (section_number >= -2 && section_number <= static_cast<std::int32_t>(section_count)),
+                    "XCOFF32 loader symbol section number is invalid");
+            if (imported) {
+                ++imports_seen;
+                const auto &id = import_ids[import_id];
+                std::string library = id.path;
+                if (!id.base.empty()) {
+                    if (!library.empty()) library.push_back(':');
+                    library += id.base;
+                }
+                if (!id.member.empty()) library += "(" + id.member + ")";
+                if (import_diagnostics < 64) {
+                    auto message = "Unresolved XCOFF32 import " + (name.empty() ? std::string("<unnamed>") : name) +
+                        (library.empty() ? std::string{} : " from " + library);
+                    charge(sizeof(Diagnostic) + message.size(), budget, limits);
+                    loaded.diagnostics.push_back({DiagnosticSeverity::warning, std::move(message), {}});
+                    ++import_diagnostics;
+                }
+                loaded.metadata_complete = false;
+            }
+            if ((symbol_type & loader_export) != 0 && !imported && section_number > 0) {
+                const auto &section = section_map[static_cast<std::size_t>(section_number - 1)];
+                require(value >= section.address && std::uint64_t{value} - section.address < section.size,
+                        "XCOFF32 exported loader symbol lies outside its section");
+                charge(sizeof(ExportSymbol) + name.size(), budget, limits);
+                loaded.metadata.exports.push_back({i + 3,
+                    name.empty() ? std::nullopt : std::optional<std::string>{name},
+                    Address{{0}, value}, std::nullopt});
+                ++exports_seen;
+            }
+            names.push_back(std::move(name));
+        }
+        if (imports_seen > import_diagnostics) {
+            const auto message = std::to_string(imports_seen - import_diagnostics) +
+                " additional XCOFF32 imports were not expanded in diagnostics";
+            charge(sizeof(Diagnostic) + message.size(), budget, limits);
+            loaded.diagnostics.push_back({DiagnosticSeverity::warning, message, {}});
+        }
+        for (std::uint32_t i = 0; i < relocation_count; ++i) {
+            canceled(stop);
+            const auto row = loader.subspan(static_cast<std::size_t>(relocations_offset +
+                std::uint64_t{i} * loader_relocation_size), loader_relocation_size);
+            const auto address = be(row, 0, 4);
+            const auto symbol_raw = be(row, 4, 4);
+            const auto symbol_index = static_cast<std::int32_t>(symbol_raw >= 0x80000000u ?
+                static_cast<std::int64_t>(symbol_raw) - 0x100000000LL : symbol_raw);
+            const auto relocation_type = be(row, 8, 2);
+            const auto raw_target_section = be(row, 10, 2);
+            const auto target_section = static_cast<std::int32_t>(raw_target_section >= 0x8000 ?
+                static_cast<std::int32_t>(raw_target_section) - 0x10000 : raw_target_section);
+            require(target_section > 0 && target_section <= static_cast<std::int32_t>(section_count),
+                    "XCOFF32 loader relocation section number is invalid");
+            const auto &target = section_map[static_cast<std::size_t>(target_section - 1)];
+            const auto target_type = target.flags & 0xffffu;
+            require(target_type == 0x20 || target_type == 0x40 || target_type == 0x80 ||
+                        target_type == 0x400 || target_type == 0x800,
+                    "XCOFF32 loader relocation targets a section this loader does not map",
+                    ErrorCode::unsupported);
+            require(address >= target.address && std::uint64_t{address} - target.address < target.size,
+                    "XCOFF32 loader relocation address lies outside its target section");
+            require(symbol_index < 0 ? symbol_index == implicit_tdata || symbol_index == implicit_tbss
+                                     : symbol_index < 3 || static_cast<std::uint32_t>(symbol_index - 3) < symbol_count,
+                    "XCOFF32 loader relocation symbol index is invalid");
+            std::string symbol;
+            if (symbol_index >= 3) symbol = names[static_cast<std::size_t>(symbol_index - 3)];
+            else if (symbol_index == implicit_text) symbol = ".text";
+            else if (symbol_index == implicit_data) symbol = ".data";
+            else if (symbol_index == implicit_bss) symbol = ".bss";
+            else if (symbol_index == implicit_tdata) symbol = ".tdata";
+            else symbol = ".tbss";
+            if (relocation_diagnostics < 128) {
+                const auto message = "Unapplied XCOFF32 loader relocation " + std::to_string(i) +
+                    " at address " + std::to_string(address) + " (type " + std::to_string(relocation_type) +
+                    ", symbol " + (symbol.empty() ? std::string("<unnamed>") : symbol) + ")";
+                charge(sizeof(Diagnostic) + message.size(), budget, limits);
+                loaded.diagnostics.push_back({DiagnosticSeverity::warning, message, {}});
+                ++relocation_diagnostics;
+            }
+            loaded.metadata_complete = false;
+        }
+        if (relocation_count > relocation_diagnostics) {
+            const auto message = std::to_string(relocation_count - relocation_diagnostics) +
+                " additional XCOFF32 loader relocations were not expanded in diagnostics";
+            charge(sizeof(Diagnostic) + message.size(), budget, limits);
+            loaded.diagnostics.push_back({DiagnosticSeverity::warning, message, {}});
+        }
+        if (imports_seen || relocation_count) loaded.metadata_complete = false;
+        if (exports_seen) {
+            const auto message = "Retained " + std::to_string(exports_seen) + " XCOFF32 exported loader symbols";
+            charge(sizeof(Diagnostic) + message.size(), budget, limits);
+            loaded.diagnostics.push_back({DiagnosticSeverity::info, message, {}});
+        }
     }
     if (other_section_seen) {
         loaded.metadata_complete = false;

@@ -6,9 +6,11 @@ an empty operand stack. Each reachable instruction carries an ordered vector
 of logical int, float, long, double or reference stack values plus its local
 slot categories. Long and double remain indivisible stack values with a
 physical depth of two slots; locals use an explicit category-2 tail slot.
-Reference values carry no class identity or array component type. Uninitialized
-references additionally retain their `new` bytecode offset (or the distinct
-`uninitializedThis` identity) across operand-stack and local movement.
+Reference values retain known object/array descriptors, with null kept distinct;
+optional loader-qualified hierarchy metadata can prove bounded subtype relations.
+Uninitialized references additionally retain their `new` bytecode offset (or
+the distinct `uninitializedThis` identity) across operand-stack and local
+movement.
 
 The pass rejects definite stack violations with `ErrorCode::malformed` and the
 method-relative bytecode offset:
@@ -27,6 +29,9 @@ method-relative bytecode offset:
   StackMapTable/legacy StackMap local type.
 - A reachable return opcode whose value category or void/non-void form does not
   match the method descriptor's declared result category.
+- A reference return, field store, invocation argument/receiver, `athrow`, or
+  StackMapTable edge whose known type is definitely not assignable to its
+  required descriptor, owner, catch type, or frame type.
 - Use of an uninitialized reference as an ordinary operand, invocation
   receiver, field receiver, return value, monitor or array value; mismatched
   allocation identities at a stack/local merge; or a constructor returning
@@ -43,9 +48,10 @@ remaining stack after consuming its required top value, as the JVM specifies.
 The entry locals are initialized from `this` (when non-static) and the method
 descriptor. Stores invalidate overlapping category-2 values before writing;
 local joins retain a category only when every incoming edge agrees and
-otherwise degrade to unusable `top` slots; different uninitialized identities
-at a local join also degrade to `top`, while different operand-stack identities
-remain an error. `new` gives each allocation site a stable verifier identity.
+otherwise degrade to unusable `top` slots; differing initialized reference
+types join at a proven subtype or `java/lang/Object`. Different uninitialized
+identities at a local join degrade to `top` and remain an error on the operand
+stack. `new` gives each allocation site a stable verifier identity.
 Before repeating the same allocation site, same-identity local aliases become
 `top` and the same identity may not already be on the operand stack. `aload`,
 `astore`, and legal stack permutations otherwise keep that identity. A matching
@@ -57,21 +63,23 @@ Before that constructor call completes, the only allowed field receiver use is
 edges make aliases of the attempted receiver unusable, because normal
 initialization did not complete. This identity tracking detects uninitialized
 local reads and primitive category mistakes without attempting general
-reference assignability.
+reference assignability when the identity or hierarchy evidence is unavailable.
 
 Every reachable protected instruction contributes an exceptional edge to each
 covering handler using the pre-instruction locals. An exceptional edge from
 `invokespecial <init>` makes aliases of that receiver unusable, while keeping
 `this` uninitialized in a constructor handler. Its incoming stack is
 replaced with exactly one reference, independent of the protected instruction's
-ordinary stack. Handler states then participate in ordinary transfer and merge
+ordinary stack, typed from its catch class or as `java/lang/Throwable` for a
+catch-all. Handler states then participate in ordinary transfer and merge
 checks, including max_stack and stack-map consistency. Reachable `new`
 instructions no longer make the analysis partial by themselves. A no-StackMap
 `java/lang/Object.<init>` begins with initialized `this`, as specified.
 Unsupported stack-map `top` states, budgets and subroutines still make the
 analysis partial. Constructor owner checks use resolved constant-pool class
-names and the current class's direct superclass; catch assignability and
-hierarchy-dependent local reference assignability remain unresolved.
+names and the current class's direct superclass. Catch dispatch source types,
+full bytecode verification, and relationships requiring absent hierarchy nodes
+remain unresolved.
 
 Work is capped at eight million units per class, charging byte scans, stack
 copies/comparisons, descriptor text, frame checks and handler-edge visits. At
@@ -87,9 +95,18 @@ turn otherwise loadable input into a malformed-bytecode error.
 This is a projection of the
 [JVMS verification rules](https://docs.oracle.com/javase/specs/jvms/se25/html/jvms-4.html#jvms-4.10.2.1),
 not full bytecode verification. Different reference classes merge to the same
-coarse reference category; the loader does not invent a common superclass or
-prove assignment compatibility through missing hierarchy metadata. Consumers
-must still reject operations that require an unavailable hierarchy proof.
+coarse `java/lang/Object` category when no narrower common type is proven. The
+loader-qualified `JvmMetadata::known_hierarchy` graph is bounded to 16,384
+classes, 65,536 direct edges and 262,144 query steps. Only complete ancestry
+paths prove class/interface assignability; missing or incomplete paths retain
+an unknown result and leave metadata incomplete. Exact descriptor identity,
+the current class's direct superclass/interfaces, null compatibility, array
+covariance, and the JVM array supertypes are checked without guessing. Consumers
+must still reject operations that require an unavailable hierarchy proof; the
+loader preserves an unknown result as incomplete rather than accepting it as a
+verified assignment.
 Unreachable blocks are not seeded from stack maps, required frame coverage is
-not established, member access, array component compatibility and runtime
-linkage remain outside scope.
+not established, primitive array component checks, member access rules, and
+runtime linkage remain outside scope. `aastore` checks reference component
+assignability when the array descriptor is known; an unknown array shape keeps
+the analysis incomplete.

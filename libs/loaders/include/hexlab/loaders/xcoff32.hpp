@@ -62,8 +62,9 @@ HEXLAB_LOADERS_EXPORT Result<Xcoff32Object> inspect_xcoff32_object(
     const ByteStorage &, std::stop_token = {}, Xcoff32ObjectLimits = {});
 
 // Maps an already linked, big-endian XCOFF32 executable into its declared
-// virtual addresses. This does not perform AIX loader relocations or resolve
-// imports; such files are returned with incomplete metadata diagnostics.
+// virtual addresses and inventories the bounded AIX loader tables. Imports
+// and loader relocations are reported as unresolved: no runtime binding or
+// relocation is performed.
 HEXLAB_LOADERS_EXPORT Result<LoadedImage> load_xcoff32_executable(
     std::shared_ptr<const ByteStorage>, std::stop_token = {}, Xcoff32ObjectLimits = {});
 

@@ -165,6 +165,8 @@ DecodeResult decode_riscv_context(DecodeContext context, std::span<const std::by
         opcode = Opcode::rv_fence_i;
     else if (source.opcode == RiscvOpcode::fence_tso)
         opcode = Opcode::rv_fence_tso;
+    else if (source.opcode == RiscvOpcode::vfrdiv_vf)
+        opcode = Opcode::rv_vfrdiv_vf;
     else if (source.opcode >= RiscvOpcode::andn && source.opcode <= RiscvOpcode::roriw)
         opcode = std::array{Opcode::rv_andn, Opcode::rv_orn, Opcode::rv_xnor, Opcode::rv_min,
             Opcode::rv_minu, Opcode::rv_max, Opcode::rv_maxu, Opcode::rv_rol, Opcode::rv_ror,

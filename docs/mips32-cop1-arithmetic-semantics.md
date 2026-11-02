@@ -15,8 +15,8 @@ effects rather than assume host floating-point propagation matches MIPS.
 `evaluate_mips32_arithmetic_s_instruction` additionally checks the decoded
 FPR/FCSR read and write facts before evaluating `ADD.S`, `SUB.S`, or `MUL.S`.
 
-`evaluate_mips32_arithmetic_d` covers finite binary64 `ADD.D`, `SUB.D`, `MUL.D`,
-`DIV.D`, and finite `SQRT.D`. Square root computes an integer radicand and
+`evaluate_mips32_arithmetic_d` covers binary64 `ADD.D`, `SUB.D`, `MUL.D`,
+`DIV.D`, and `SQRT.D`, including NaNs and infinities. Square root computes an integer radicand and
 remainder, then rounds without host floating point; negative finite input
 returns the canonical quiet NaN and raises Invalid, while signed zero is
 preserved. Addition/subtraction preserve their exact aligned significands;
@@ -36,13 +36,18 @@ behavior; the decoder does not select an ISA revision. Enabled exceptions
 update Cause and suppress the destination write; unenabled exceptions accrue
 sticky Flags.
 
+NaN results are canonical quiet NaNs; signaling NaN inputs raise Invalid.
+Infinity addition/subtraction, multiplication, and division follow the IEEE
+invalid cases (`+Inf + -Inf`, `Inf * 0`, `Inf / Inf`, and `0 / 0`) and preserve
+the operation sign where the result is infinite or zero. Positive infinity
+square-roots to itself; negative infinity raises Invalid.
+
 `evaluate_mips32_arithmetic_d_instruction` also validates the MIPS32 context,
 exact register/FCSR effects, and even-numbered FPR pairs for every D-format
 source and destination, including unary `SQRT.D`. The decompiler applies the same even-pair restriction to D-format
 loads/stores, moves, comparisons, arithmetic, and conversions. This bounded
 model assumes the paired 32-bit FPR view; it does not infer runtime Status.FR.
 
-NaN and infinity propagation, signaling-NaN behavior, exact COP1 exception
-delivery, and the runtime FR=1 register view remain unsupported.
-Those instructions retain typed but unknown effects in decompilation; the
-numeric evaluator returns no result for unsupported D arithmetic.
+Exact COP1 exception delivery and the runtime FR=1 register view remain
+unsupported. Those instructions retain typed but unknown effects in
+decompilation.

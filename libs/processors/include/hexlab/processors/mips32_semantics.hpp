@@ -118,11 +118,11 @@ struct Mips32ArithmeticDResult {
     bool operator==(const Mips32ArithmeticDResult &) const = default;
 };
 
-// Exact binary64 ADD.D/SUB.D/MUL.D/DIV.D/SQRT.D for supported inputs. All four FCSR rounding
+// Exact binary64 ADD.D/SUB.D/MUL.D/DIV.D/SQRT.D. All four FCSR rounding
 // modes, gradual underflow, FS input/output flushing, and the Cause/Flag/Enable
-// fields are modeled. DIV.D handles zero operands and divide-by-zero; SQRT.D
-// handles finite inputs and negative finite inputs as Invalid. NaN/infinity
-// propagation remains outside this slice.
+// fields are modeled. NaNs are canonicalized and signaling NaNs raise Invalid;
+// infinity arithmetic, invalid combinations, divide-by-zero, and square root
+// of negative values are handled explicitly.
 HEXLAB_PROCESSORS_EXPORT std::optional<Mips32ArithmeticDResult>
 evaluate_mips32_arithmetic_d(Mips32DArithmeticOperation operation,
                              std::uint64_t lhs_bits, std::uint64_t rhs_bits,
