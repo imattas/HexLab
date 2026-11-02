@@ -28,9 +28,11 @@ execution mode before reading bytes, then performs one combined scan. Candidate,
 comparison, result, and indexed-byte limits therefore apply to the whole set,
 not once per catalog. Sets are limited to 256 catalogs and 4,096 definitions in
 total. Version-1 unscoped catalogs can be included; their definitions remain
-unscoped and are evaluated against the image selected by the caller. This is an
-in-memory API composition only; it does not define a new catalog-set file
-format or change the CLI's single `--definitions` input.
+unscoped and are evaluated against the image selected by the caller. The API
+composition is in memory and does not define a new catalog-set file format.
+For CLI workflows, `signatures` and `signature-apply` separately accept an
+ordered `--definitions-list` of catalog paths in addition to a single
+`--definitions` file.
 
 `SignatureLimits::minimum_constrained_bits` optionally excludes masked
 byte-pattern definitions whose positive pattern has fewer constrained bits

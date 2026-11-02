@@ -35,7 +35,14 @@ accepts one catalog with `--definitions` or an ordered catalog list with
 `--definitions-list`; both commands share aggregate input, pattern, candidate,
 comparison, and result limits. The desktop **Scan FLAIR Catalogs and Browse
 Results...** command provides an ordered list: files can be added repeatedly,
-removed, or moved before one evidence result is stored for the entire set.
+removed, or moved before one evidence result is stored for the entire set. It
+accepts at most 256 entries, 64 MiB of total source bytes, 64 MiB of inflated
+catalog bodies, and 65,536 patterns. Each file is parsed independently under
+the remaining aggregate budgets, and its filename is retained as provenance.
+Reading and hashing files checks the worker's cancellation request in bounded
+chunks; parsing and recognition receive the same stop token. The ordered digest
+includes each length-prefixed filename provenance and raw file content, so
+catalog order and duplicate selections remain distinct evidence inputs.
 The Python automation API accepts
 ordered `(bytes, provenance)` pairs through `Project.recognize_flirt_catalogs()`
 and returns detached candidates without persisting evidence. Candidate

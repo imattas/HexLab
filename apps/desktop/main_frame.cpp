@@ -1285,6 +1285,20 @@ struct MainFrame::Impl {
                             updated = identity_hash.update(std::as_bytes(std::span(field.data(), field.size())));
                             if (!updated) throw std::runtime_error(updated.error().message);
                         };
+                        const auto append_identity_content = [&](std::string_view content) {
+                            const auto length = encode_u64(static_cast<std::uint64_t>(content.size()));
+                            auto updated = identity_hash.update(length);
+                            if (!updated) throw std::runtime_error(updated.error().message);
+                            constexpr std::size_t chunk_size = 64 * 1024;
+                            for (std::size_t offset = 0; offset < content.size(); offset += chunk_size) {
+                                if (stop.stop_requested())
+                                    throw std::runtime_error("FLAIR recognition canceled.");
+                                const auto count = std::min(chunk_size, content.size() - offset);
+                                updated = identity_hash.update(std::as_bytes(
+                                    std::span(content.data() + offset, count)));
+                                if (!updated) throw std::runtime_error(updated.error().message);
+                            }
+                        };
                         std::uint64_t input_bytes = 0, inflated_bytes = 0, pattern_count = 0;
                         FlirtRecognitionLimits recognition_limits;
                         for (const auto &catalog_path : catalog_paths) {
@@ -1296,8 +1310,16 @@ struct MainFrame::Impl {
                             std::ifstream input(catalog_path, std::ios::binary);
                             if (!input) throw std::runtime_error("Could not open FLAIR catalog.");
                             std::string text(static_cast<std::size_t>(size), '\0');
-                            if (size && !input.read(text.data(), static_cast<std::streamsize>(size)))
-                                throw std::runtime_error("Could not read FLAIR catalog.");
+                            constexpr std::size_t read_chunk_size = 1024 * 1024;
+                            for (std::size_t offset = 0; offset < text.size();) {
+                                if (stop.stop_requested())
+                                    throw std::runtime_error("FLAIR recognition canceled.");
+                                const auto count = std::min(read_chunk_size, text.size() - offset);
+                                input.read(text.data() + offset, static_cast<std::streamsize>(count));
+                                if (input.gcount() != static_cast<std::streamsize>(count))
+                                    throw std::runtime_error("Could not read FLAIR catalog.");
+                                offset += count;
+                            }
                             input_bytes += size;
                             const auto u8name = catalog_path.filename().u8string();
                             const std::string provenance = "FLAIR " +
@@ -1328,7 +1350,7 @@ struct MainFrame::Impl {
                             inflated_bytes += parsed.value().inflated_body_bytes;
                             pattern_count += parsed.value().patterns.size();
                             append_identity_field(provenance);
-                            append_identity_field(text);
+                            append_identity_content(text);
                             catalog_labels.push_back(provenance + " (" + std::to_string(parsed.value().patterns.size()) + " patterns)");
                             catalogs.push_back(std::move(parsed.value()));
                         }
