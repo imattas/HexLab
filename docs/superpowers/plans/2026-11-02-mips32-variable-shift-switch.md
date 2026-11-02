@@ -25,5 +25,4 @@
 ## Verification results
 
 Windows/MSVC 19.44 Debug `hexlab_analysis` build passed with `BUILD_TESTING=OFF`.
-WSL build was unavailable because `cmake` is absent from the WSL PATH. `git
-diff --check` passed. Tests were not run as requested.
+WSL Ubuntu 24.04 Clang 18 Debug `hexlab_analysis` build passed with `BUILD_TESTING=OFF`. `git diff --check` passed. Tests were not run as requested.
