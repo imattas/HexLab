@@ -81,15 +81,22 @@ The partitioner recognizes three bounded forms:
 
 Pointer-typed values loaded from an identical explicit absolute byte range at
 the same whole-memory SSA version share a root, even when the destination
-registers differ. The whole-memory version is captured before each
-instruction and advances across every modeled store, call, and write-capable
-intrinsic, so an intervening modeled write prevents this equality fact. This
-models stable sequential memory represented by the IR; it does not cover
-asynchronous external mutation or volatile/device memory, which the current
-`MemoryValue` does not distinguish. Loads from dynamic source addresses,
-non-pointer values, or different versions retain opaque roots. Equal loaded
-roots permit same-root byte-range reasoning only; distinct opaque roots remain
-may-alias and stores through them continue to invalidate each other's
+registers differ. The same rule applies to pointer-relative loads when the
+source base has a proven root and the computed source range spans exactly one
+access width. Thus an exact constant displacement or exact index can identify
+the source address; an interval covering multiple possible source addresses
+cannot. This exactness check prevents equal enclosing intervals from being
+mistaken for equal runtime addresses. Dynamic source identities are solved
+alongside pointer provenance, allowing an address base to be another proven
+pointer load. The whole-memory version is captured before each instruction and
+advances across every modeled store, call, and write-capable intrinsic, so an
+intervening modeled write prevents this equality fact. This models stable
+sequential memory represented by the IR; it does not cover asynchronous
+external mutation or volatile/device memory, which the current `MemoryValue`
+does not distinguish. Non-pointer values, unresolved or multi-address dynamic
+loads, and loads from different memory versions retain opaque roots. Equal
+loaded roots permit same-root byte-range reasoning only; distinct opaque roots
+remain may-alias and stores through them continue to invalidate each other's
 partitions.
 
 The alias rule is byte-range based. A store advances its exact stack or

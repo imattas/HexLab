@@ -1430,9 +1430,41 @@ Result<LiftedFunction> to_ssa(const LiftedFunction &input,
                 pointer_load_value_roots[destination] = root->second;
                 pointer_origins[destination] = PointerOrigin{root->second, 0, 0};
             }
+        // Dynamic-address pointer loads can establish the same equality fact
+        // when the source address is one exact byte range. Do this inside the
+        // provenance fixed point: a source base may itself be a pointer loaded
+        // from an absolute or another dynamic location.
+        using DynamicPointerLoadSource = std::tuple<DynamicMemoryRange, std::uint32_t, unsigned>;
+        std::map<DynamicPointerLoadSource, PointerRoot> dynamic_pointer_load_roots;
         bool provenance_changed = true;
         for (std::size_t iteration = 0; provenance_changed && iteration < 64; ++iteration) {
             provenance_changed = false;
+            for (auto block_index : reachable) for (const auto &instruction : partitioned.blocks[block_index].instructions)
+                if (const auto *assign = std::get_if<Assign>(&instruction.statement);
+                    assign && assign->destination_version && assign->value &&
+                    assign->destination.width == assign->value->type.bits &&
+                    assign->value->type.kind == TypeKind::pointer) {
+                    const auto *load = std::get_if<MemoryValue>(&assign->value->value);
+                    if (!load || !load->memory_version || load->effective_address ||
+                        load->type.kind != TypeKind::pointer) continue;
+                    const auto source_range = dynamic_memory_range(*load, pointer_origins, integer_constants,
+                                                                   integer_ranges);
+                    const auto bytes = static_cast<std::int64_t>(load->type.bits / 8);
+                    // An interval covering multiple possible source addresses
+                    // cannot prove that independently executed loads read the
+                    // same pointer, even when their enclosing ranges match.
+                    if (!source_range || bytes <= 0 ||
+                        std::get<2>(*source_range) - std::get<1>(*source_range) != bytes) continue;
+                    const DynamicPointerLoadSource source{*source_range, *load->memory_version,
+                                                          assign->destination.width};
+                    const PointerValueKey destination{key(assign->destination), *assign->destination_version};
+                    const PointerRoot value_root{key(assign->destination), *assign->destination_version};
+                    const auto [root, inserted] = dynamic_pointer_load_roots.emplace(source, value_root);
+                    (void)inserted;
+                    const PointerOrigin canonical{root->second, 0, 0};
+                    auto &origin = pointer_origins[destination];
+                    if (origin != canonical) { origin = canonical; provenance_changed = true; }
+                }
             for (auto block_index : reachable) {
                 for (const auto &phi : partitioned.blocks[block_index].phis) {
                     if (phi.inputs.empty()) continue;
