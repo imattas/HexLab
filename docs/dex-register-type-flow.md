@@ -49,6 +49,39 @@ receivers using the class definitions and array rules present in this DEX.
 Thrown values with known non-null types must also be assignable to
 `Ljava/lang/Throwable;`; literal null and unknown or unresolved reference types
 remain conservative.
+Before flow begins, a bounded class-data index records in-image class, field,
+and method access flags independent of class-definition order. Standard field
+opcodes are checked against the resolved static/instance field declaration.
+Field and method declaration lookup follows in-image superclasses and
+interfaces using exact name/type or name/prototype signatures. Resolved members
+are checked against public/private/protected/package visibility; both the
+symbolic reference owner and resolved declaring class must be accessible.
+Method invoke opcodes
+are checked against in-image method staticness and class/interface owner kind;
+`invoke-super` must name a strict in-image superclass or implemented interface.
+DEX 037+ permits interface `invoke-super` and interface static/private-direct
+targets when their metadata proves the permitted kind; earlier versions retain
+class-owner restrictions for those invoke forms. In-image `invoke-direct`
+owners must be the current class or a superclass, and non-constructor special
+names are rejected.
+The invoke-kind and special-name constraints follow the Android
+[Dalvik bytecode instruction reference](https://source.android.com/docs/core/runtime/dalvik-bytecode)
+and [runtime verification constraints](https://source.android.com/docs/core/runtime/constraints).
+Cross-package protected instance access also requires a known receiver type to
+be assignable to the accessing class; unresolved receiver identity remains
+conservative. Interface `invoke-super` remains available for a known implemented
+interface default method.
+Checks preserve method index, code-item offset, instruction code-unit offset,
+and member index when reporting malformed references.
+
+The declaration index is bounded by the existing DEX item limits and retains
+only identifier-indexed access flags. Member lookup visits at most 4,096 types
+per reference and one million aggregate hierarchy steps; a capped or incomplete
+lookup remains unresolved. It does not infer member declarations through
+external classpaths or optimized/quickened references. A field or method
+identifier whose in-image declaration cannot be established remains
+unresolved. Access checks use the encoded identifier owner and do not implement
+runtime-specific nestmate access, hidden-API policy, or optimized dispatch.
 When two known reference types meet at a control-flow join, the verifier keeps
 a common in-image supertype when a hierarchy walk of at most 4,096 queued and
 visited types can establish one.

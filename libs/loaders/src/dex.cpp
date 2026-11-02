@@ -1074,6 +1074,107 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
         std::vector<std::uint32_t> interfaces;
     };
     std::unordered_map<std::uint32_t, DexLocalHierarchy> local_hierarchy;
+    // Index declaration flags before method flow runs. The flow pass is
+    // interleaved with class_data decoding, so without this bounded prepass
+    // references to later class_defs would lose provable dispatch/access facts.
+    std::unordered_map<std::uint32_t, std::uint32_t> local_field_flags;
+    std::unordered_map<std::uint32_t, std::uint32_t> local_method_flags;
+    std::unordered_map<std::uint32_t, std::uint32_t> local_class_flags;
+    std::uint64_t indexed_interfaces = 0, indexed_members = 0;
+    for (std::uint32_t ci = 0; ci < class_count; ++ci) {
+        if (stop.stop_requested()) return Error{ErrorCode::canceled, "DEX declaration index canceled"};
+        Reader row{bytes};
+        std::uint32_t class_type = 0, flags = 0, super = 0, interfaces = 0, source = 0, annotations = 0, data = 0, values = 0;
+        if (!row.seek(class_off + std::size_t(ci) * 32) || !row.u32(class_type) || !row.u32(flags) ||
+            !row.u32(super) || !row.u32(interfaces) || !row.u32(source) || !row.u32(annotations) ||
+            !row.u32(data) || !row.u32(values))
+            return Error{ErrorCode::malformed, "DEX class_def declaration index is truncated"};
+        local_class_flags.emplace(class_type, flags);
+        DexLocalHierarchy hierarchy;
+        if (super != UINT32_MAX) hierarchy.superclass = super;
+        if (interfaces) {
+            Reader list{bytes};
+            std::uint32_t count = 0;
+            if (!list.seek(interfaces) || !list.u32(count) || !extent(list.pos, count, 2, bytes.size()))
+                return Error{ErrorCode::malformed, "DEX interface list is invalid during declaration indexing"};
+            if (count > max_items - indexed_interfaces)
+                return Error{ErrorCode::resource_limit, "DEX declaration index exceeds the interface-row budget"};
+            indexed_interfaces += count;
+            hierarchy.interfaces.reserve(count);
+            for (std::uint32_t i = 0; i < count; ++i) {
+                if ((i & 0xfffu) == 0 && stop.stop_requested())
+                    return Error{ErrorCode::canceled, "DEX declaration index canceled"};
+                std::uint16_t type = 0;
+                if (!list.u16(type)) return Error{ErrorCode::malformed, "DEX interface list is truncated"};
+                hierarchy.interfaces.push_back(type);
+            }
+        }
+        local_hierarchy.emplace(class_type, std::move(hierarchy));
+        if (!data) continue;
+        Reader class_data{bytes.first(static_cast<std::size_t>(data_end))};
+        if (!class_data.seek(data)) return Error{ErrorCode::malformed, "DEX class_data offset is invalid during declaration indexing"};
+        std::uint32_t counts[4]{};
+        for (auto &count : counts)
+            if (!class_data.uleb(count) || count > max_items)
+                return Error{ErrorCode::malformed, "DEX class_data counts are invalid during declaration indexing"};
+        for (unsigned group = 0; group != 2; ++group) {
+            std::uint32_t index = 0;
+            for (std::uint32_t i = 0; i < counts[group]; ++i) {
+                if ((i & 0xfffu) == 0 && stop.stop_requested())
+                    return Error{ErrorCode::canceled, "DEX declaration index canceled"};
+                std::uint32_t delta = 0, member_flags = 0;
+                if (!class_data.uleb(delta) || !class_data.uleb(member_flags) ||
+                    delta > UINT32_MAX - index || (index += delta) >= fields.size())
+                    return Error{ErrorCode::malformed, "DEX field declaration is invalid during declaration indexing"};
+                local_field_flags.emplace(index, member_flags);
+                if (++indexed_members > max_items)
+                    return Error{ErrorCode::resource_limit, "DEX declaration index exceeds the member-row budget"};
+            }
+        }
+        for (unsigned group = 2; group != 4; ++group) {
+            std::uint32_t index = 0;
+            for (std::uint32_t i = 0; i < counts[group]; ++i) {
+                if ((i & 0xfffu) == 0 && stop.stop_requested())
+                    return Error{ErrorCode::canceled, "DEX declaration index canceled"};
+                std::uint32_t delta = 0, member_flags = 0, code_offset = 0;
+                if (!class_data.uleb(delta) || !class_data.uleb(member_flags) || !class_data.uleb(code_offset) ||
+                    delta > UINT32_MAX - index || (index += delta) >= methods.size())
+                    return Error{ErrorCode::malformed, "DEX method declaration is invalid during declaration indexing"};
+                local_method_flags.emplace(index, member_flags);
+                if (++indexed_members > max_items)
+                    return Error{ErrorCode::resource_limit, "DEX declaration index exceeds the member-row budget"};
+            }
+        }
+    }
+    struct MemberSignature {
+        std::uint32_t owner = 0, name = 0, type_or_proto = 0;
+        bool operator==(const MemberSignature &) const = default;
+    };
+    struct MemberSignatureHash {
+        std::size_t operator()(const MemberSignature &key) const noexcept {
+            std::size_t hash = std::hash<std::uint32_t>{}(key.owner);
+            hash ^= std::hash<std::uint32_t>{}(key.name) + 0x9e3779b9u + (hash << 6) + (hash >> 2);
+            hash ^= std::hash<std::uint32_t>{}(key.type_or_proto) + 0x9e3779b9u + (hash << 6) + (hash >> 2);
+            return hash;
+        }
+    };
+    const auto member_signature = [](std::uint32_t owner, std::uint32_t name, std::uint32_t type_or_proto) {
+        return MemberSignature{owner, name, type_or_proto};
+    };
+    std::unordered_map<MemberSignature, std::pair<std::uint32_t, std::uint32_t>, MemberSignatureHash> declared_fields_by_signature;
+    std::unordered_map<MemberSignature, std::pair<std::uint32_t, std::uint32_t>, MemberSignatureHash> declared_methods_by_signature;
+    declared_fields_by_signature.reserve(local_field_flags.size());
+    declared_methods_by_signature.reserve(local_method_flags.size());
+    for (const auto &[index, flags] : local_field_flags) {
+        const auto &field = fields[index];
+        declared_fields_by_signature.emplace(member_signature(field.owner, field.name, field.type),
+            std::pair{field.owner, flags});
+    }
+    for (const auto &[index, flags] : local_method_flags) {
+        const auto &method = methods[index];
+        declared_methods_by_signature.emplace(member_signature(method.owner, method.name, method.proto),
+            std::pair{method.owner, flags});
+    }
     std::uint64_t hierarchy_walk_steps = 0;
     std::unordered_map<std::string_view, std::uint32_t> type_id_lookup;
     type_id_lookup.reserve(types.size());
@@ -1127,6 +1228,56 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
             return unresolved ? Assignability::unresolved : Assignability::no;
         }
         return Assignability::no;
+    };
+    std::uint64_t member_resolution_steps = 0;
+    const auto resolve_member_flags = [&](std::uint32_t owner, std::uint32_t name,
+                                           std::uint32_t prototype_or_type, bool method)
+        -> std::optional<std::pair<std::uint32_t, std::uint32_t>> {
+        const auto &declarations = method ? declared_methods_by_signature : declared_fields_by_signature;
+        std::vector<std::uint32_t> pending{owner};
+        std::unordered_set<std::uint32_t> visited;
+        while (!pending.empty() && visited.size() < 4096 && member_resolution_steps < 1'000'000) {
+            if (stop.stop_requested()) return std::nullopt;
+            const auto current = pending.back(); pending.pop_back();
+            if (!visited.insert(current).second) continue;
+            ++member_resolution_steps;
+            if (const auto found = declarations.find(member_signature(current, name, prototype_or_type));
+                found != declarations.end()) return found->second;
+            const auto hierarchy = local_hierarchy.find(current);
+            if (hierarchy == local_hierarchy.end()) continue;
+            const auto interface_limit = hierarchy->second.superclass ? 4095u : 4096u;
+            for (const auto interface_type : hierarchy->second.interfaces) {
+                if (pending.size() >= interface_limit) break;
+                pending.push_back(interface_type);
+            }
+            // Prefer class-chain declarations over interface defaults.
+            if (hierarchy->second.superclass && pending.size() < 4096)
+                pending.push_back(*hierarchy->second.superclass);
+        }
+        return std::nullopt;
+    };
+    const auto same_package = [&](std::uint32_t left, std::uint32_t right) {
+        if (left >= types.size() || right >= types.size()) return false;
+        const auto package = [&](std::string_view descriptor) {
+            const auto slash = descriptor.rfind('/');
+            return slash == std::string_view::npos ? descriptor.substr(0, 1) : descriptor.substr(0, slash + 1);
+        };
+        return package(types[left]) == package(types[right]);
+    };
+    const auto class_accessible = [&](std::uint32_t owner, std::uint32_t caller) {
+        const auto owner_flags = local_class_flags.find(owner);
+        return owner_flags == local_class_flags.end() || (owner_flags->second & 0x0001u) != 0 ||
+            same_package(owner, caller);
+    };
+    const auto member_accessible = [&](std::uint32_t owner, std::uint32_t flags,
+                                       std::uint32_t caller, std::uint32_t symbolic_owner) {
+        if (!class_accessible(owner, caller) || !class_accessible(symbolic_owner, caller)) return false;
+        if ((flags & 0x0002u) != 0) return owner == caller;
+        if ((flags & 0x0001u) != 0) return true;
+        if (same_package(owner, caller)) return true;
+        if ((flags & 0x0004u) != 0)
+            return reference_assignability(caller, owner) == Assignability::yes;
+        return false;
     };
     const auto common_reference_type = [&](std::uint32_t left, std::uint32_t right) -> std::uint32_t {
         if (left >= types.size() || right >= types.size()) return UINT32_MAX;
@@ -1900,6 +2051,15 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
                                 << ", opcode=0x" << static_cast<unsigned>(opcode) << ')';
                             return Error{ErrorCode::malformed, provenance.str()};
                         };
+                        const auto member_error = [&](std::string_view message, const char *kind,
+                                                      std::uint32_t member_index) {
+                            std::ostringstream provenance;
+                            provenance << message << " (method_idx=" << method_idx
+                                << ", code_item_file_offset=0x" << std::hex << code_off
+                                << ", instruction_code_unit_offset=0x" << (offset / 2)
+                                << ", " << kind << "_idx=" << std::dec << member_index << ')';
+                            return Error{ErrorCode::malformed, provenance.str()};
+                        };
                         const auto set_type = [&](std::uint32_t reg, RegType type) {
                             if (reg < state.size()) {
                                 state[reg] = type;
@@ -2191,6 +2351,34 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
                             if (instance && !own_uninitialized_this && !expect_type(receiver, RegType::reference))
                                 return Error{ErrorCode::malformed, "DEX instance field receiver is not a reference"};
                             if (field_index < fields.size()) {
+                                const auto declaration = resolve_member_flags(fields[field_index].owner,
+                                    fields[field_index].name, fields[field_index].type, false);
+                                const auto caller_owner = methods[method_idx].owner;
+                                if (!class_accessible(fields[field_index].owner, caller_owner))
+                                    return member_error("DEX field reference owner class is inaccessible",
+                                        "field", field_index);
+                                if (declaration) {
+                                    const bool declared_static = (declaration->second & 0x0008u) != 0;
+                                    if (declared_static == instance) {
+                                        std::ostringstream provenance;
+                                        provenance << "DEX field opcode disagrees with the declared static/instance field kind"
+                                            << " (method_idx=" << method_idx << ", code_item_file_offset=0x"
+                                            << std::hex << code_off << ", instruction_code_unit_offset=0x"
+                                            << (offset / 2) << ", field_idx=" << std::dec << field_index << ')';
+                                        return Error{ErrorCode::malformed, provenance.str()};
+                                    }
+                                    if (!member_accessible(declaration->first, declaration->second, caller_owner,
+                                                           fields[field_index].owner))
+                                        return member_error("DEX field reference violates in-image member access flags",
+                                            "field", field_index);
+                                    if (instance && (declaration->second & 0x0004u) != 0 &&
+                                        !same_package(declaration->first, caller_owner) &&
+                                        before[receiver] == RegType::reference &&
+                                        before.references[receiver] < types.size() &&
+                                        reference_assignability(before.references[receiver], caller_owner) == Assignability::no)
+                                        return member_error("DEX protected field receiver is not assignable to the accessing class",
+                                            "field", field_index);
+                                }
                                 if (instance && before[receiver] == RegType::reference &&
                                     before.references[receiver] != UINT32_MAX) {
                                     const auto relation = reference_assignability(
@@ -2315,6 +2503,63 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
                                         proto_index = static_cast<std::uint32_t>(site.values[2].payload);
                                 }
                             }
+                            if (method_id_invoke && word(1) < methods.size()) {
+                                const auto method_index = static_cast<std::uint32_t>(word(1));
+                                const auto &referenced = methods[method_index];
+                                const auto &referenced_name = strings[referenced.name];
+                                const auto declaration = resolve_member_flags(referenced.owner, referenced.name,
+                                    referenced.proto, true);
+                                const auto owner_flags = local_class_flags.find(referenced.owner);
+                                const bool has_receiver = opcode != 0x71 && opcode != 0x77;
+                                if (!class_accessible(referenced.owner, methods[method_idx].owner))
+                                    return member_error("DEX method reference owner class is inaccessible",
+                                        "method", method_index);
+                                if (declaration) {
+                                    const bool declared_static = (declaration->second & 0x0008u) != 0;
+                                    const bool declared_private = (declaration->second & 0x0002u) != 0;
+                                    if (declared_static == has_receiver)
+                                        return member_error("DEX invoke kind disagrees with the declared static/instance method kind",
+                                            "method", method_index);
+                                    const bool direct_invoke = opcode == 0x70 || opcode == 0x76;
+                                    const bool constructor_target = strings[referenced.name] == "<init>";
+                                    if ((declared_private && !direct_invoke) ||
+                                        (!declared_private && direct_invoke && !constructor_target))
+                                        return member_error("DEX invoke kind disagrees with the declared private/virtual method kind",
+                                            "method", method_index);
+                                    if (!member_accessible(declaration->first, declaration->second, methods[method_idx].owner,
+                                                           referenced.owner))
+                                        return member_error("DEX method reference violates in-image member access flags",
+                                            "method", method_index);
+                                }
+                                if (owner_flags != local_class_flags.end()) {
+                                    const bool owner_is_interface = (owner_flags->second & 0x0200u) != 0;
+                                    if (((opcode == 0x72 || opcode == 0x78) && !owner_is_interface) ||
+                                        ((opcode == 0x6e || opcode == 0x74) && owner_is_interface) ||
+                                        (owner_is_interface && version < 37 &&
+                                            (opcode == 0x6f || opcode == 0x71 || opcode == 0x75 || opcode == 0x77)))
+                                        return member_error("DEX invoke opcode disagrees with the in-image owner class/interface kind",
+                                            "method", method_index);
+                                    if (owner_is_interface && (opcode == 0x70 || opcode == 0x76) &&
+                                        (version < 37 || !declaration || (declaration->second & 0x0002u) == 0))
+                                        return member_error("DEX direct invoke of an in-image interface requires a resolved private method",
+                                            "method", method_index);
+                                    if ((opcode == 0x70 || opcode == 0x76) &&
+                                        referenced.owner != methods[method_idx].owner &&
+                                        (referenced_name != "<init>" ||
+                                         reference_assignability(methods[method_idx].owner, referenced.owner) != Assignability::yes))
+                                        return member_error("DEX invoke-direct owner must be the current class or a superclass",
+                                            "method", method_index);
+                                    if (!referenced_name.empty() && referenced_name.front() == '<' &&
+                                        referenced_name != "<init>" && referenced_name != "<clinit>")
+                                        return member_error("DEX invocation uses a forbidden special method name",
+                                            "method", method_index);
+                                    if ((opcode == 0x6f || opcode == 0x75) &&
+                                        (methods[method_idx].owner == referenced.owner ||
+                                         reference_assignability(methods[method_idx].owner, referenced.owner) != Assignability::yes))
+                                        return member_error("DEX invoke-super target is not an in-image superclass or implemented interface",
+                                            "method", method_index);
+                                }
+                            }
                             if (proto_index && *proto_index < protos.size()) {
                                 const bool range = opcode == 0xfb || opcode == 0xfd ||
                                     (opcode == 0xf0 && reg8 == 1) ||
@@ -2333,6 +2578,16 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
                                 if (receiver) {
                                     const auto receiver_reg = argument_reg(word_index++);
                                     const bool uninitialized = before[receiver_reg] == RegType::uninitialized_reference;
+                                    const auto receiver_method_flags = resolve_member_flags(methods[word(1)].owner,
+                                        methods[word(1)].name, methods[word(1)].proto, true);
+                                    if (receiver_method_flags &&
+                                        (receiver_method_flags->second & 0x0004u) != 0 &&
+                                        !same_package(receiver_method_flags->first, methods[method_idx].owner) &&
+                                        before[receiver_reg] == RegType::reference &&
+                                        before.references[receiver_reg] < types.size() &&
+                                        reference_assignability(before.references[receiver_reg], methods[method_idx].owner) == Assignability::no)
+                                        return member_error("DEX protected method receiver is not assignable to the accessing class",
+                                            "method", word(1));
                                     if (calls_constructor && before[receiver_reg] != RegType::unknown && !uninitialized)
                                         return initialization_error("DEX constructor receiver is already initialized or is not an object");
                                     if (calls_constructor && uninitialized && receiver_owner &&
@@ -2625,20 +2880,6 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
     // Method-handle kinds encode static/instance dispatch independently of
     // the identifier table. Cross-check locally defined targets against their
     // class_data access flags, while leaving external references unresolved.
-    std::unordered_map<std::uint32_t, std::uint32_t> local_field_flags;
-    std::unordered_map<std::uint32_t, std::uint32_t> local_method_flags;
-    std::unordered_map<std::uint32_t, std::uint32_t> local_class_flags;
-    for (const auto &class_definition : decoded_classes) {
-        local_class_flags.emplace(class_definition.class_index, class_definition.access_flags);
-        for (const auto &field : class_definition.static_fields)
-            local_field_flags.emplace(field.field_index, field.access_flags);
-        for (const auto &field : class_definition.instance_fields)
-            local_field_flags.emplace(field.field_index, field.access_flags);
-        for (const auto &method : class_definition.direct_methods)
-            local_method_flags.emplace(method.method_index, method.access_flags);
-        for (const auto &method : class_definition.virtual_methods)
-            local_method_flags.emplace(method.method_index, method.access_flags);
-    }
     for (const auto &handle : decoded_method_handles) {
         if (stop.stop_requested())
             return Error{ErrorCode::canceled, "DEX method-handle target validation canceled"};
