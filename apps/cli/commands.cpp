@@ -3723,6 +3723,132 @@ int macho_chained_targets_command(std::span<const std::wstring_view> args, std::
     if (targets.value().size() > count) out << "  ... " << targets.value().size() - count << " rows omitted\n";
     return 0;
 }
+int macho_bind_targets_command(std::span<const std::wstring_view> args, std::ostream &out, std::ostream &err) {
+    const auto usage = [&] {
+        out << "Usage: hexlab_cli macho bind-targets <image> [--image-slide <address>] "
+               "[--import <library-ordinal> <symbol> <runtime-address>]...\n"
+               "Only classic bind and lazy-bind streams are resolved; image bytes are never modified.\n";
+        return 0;
+    };
+    if (args.empty() || (args.size() == 1 && args[0] == L"--help")) return usage();
+    if (args.size() < 2 || args[0] != L"bind-targets") {
+        err << "Expected macho bind-targets <image>\n";
+        return 2;
+    }
+    const auto parse_address = [](std::wstring_view text) -> std::optional<std::uint64_t> {
+        if (text.empty()) return {};
+        std::string digits;
+        digits.reserve(text.size());
+        for (const auto ch : text) {
+            if (ch > 0x7f) return {};
+            digits.push_back(static_cast<char>(ch));
+        }
+        int base = 10;
+        if (digits.starts_with("0x") || digits.starts_with("0X")) {
+            digits.erase(0, 2);
+            base = 16;
+        }
+        if (digits.empty()) return {};
+        std::uint64_t value = 0;
+        const auto [end, error] = std::from_chars(digits.data(), digits.data() + digits.size(), value, base);
+        if (error != std::errc{} || end != digits.data() + digits.size()) return {};
+        return value;
+    };
+    std::uint64_t image_slide = 0;
+    std::uint64_t supplied_symbol_bytes = 0;
+    bool slide_seen = false;
+    std::vector<MachODyldImportAddress> imports;
+    for (std::size_t index = 2; index < args.size();) {
+        if (args[index] == L"--image-slide") {
+            if (index + 1 >= args.size() || slide_seen) {
+                err << "--image-slide requires one address and may appear once\n";
+                return 2;
+            }
+            const auto parsed = parse_address(args[index + 1]);
+            if (!parsed) { err << "Invalid image slide\n"; return 2; }
+            image_slide = *parsed;
+            slide_seen = true;
+            index += 2;
+        } else if (args[index] == L"--import") {
+            if (index + 3 >= args.size()) {
+                err << "--import requires a library ordinal, symbol, and runtime address\n";
+                return 2;
+            }
+            std::string ordinal_text;
+            for (const auto ch : args[index + 1]) {
+                if (ch > 0x7f) { ordinal_text.clear(); break; }
+                ordinal_text.push_back(static_cast<char>(ch));
+            }
+            std::int32_t ordinal = 0;
+            const auto [ordinal_end, ordinal_error] = std::from_chars(
+                ordinal_text.data(), ordinal_text.data() + ordinal_text.size(), ordinal, 10);
+            const auto symbol = wide_to_utf8(args[index + 2]);
+            const auto address = parse_address(args[index + 3]);
+            if (ordinal_text.empty() || ordinal_error != std::errc{} ||
+                ordinal_end != ordinal_text.data() + ordinal_text.size() || symbol.empty() || !address) {
+                err << "Invalid --import tuple\n";
+                return 2;
+            }
+            if (imports.size() >= 1'000'000 || symbol.size() > 16 * 1024 * 1024 -
+                (std::min<std::uint64_t>)(16 * 1024 * 1024, supplied_symbol_bytes)) {
+                err << "Mach-O bind import count or name bytes exceed the CLI limit\n";
+                return 2;
+            }
+            supplied_symbol_bytes += symbol.size();
+            imports.push_back({ordinal, symbol, *address});
+            index += 4;
+        } else {
+            err << "Unexpected Mach-O bind-targets option\n";
+            return 2;
+        }
+    }
+    auto storage = FileStorage::open(path_from_wide(args[1]));
+    if (!storage) { err << storage.error().message << '\n'; return 2; }
+    auto loaded = load_macho(storage.value(), MachOOptions{}, {});
+    if (!loaded) { err << loaded.error().message << '\n'; return 2; }
+    if (!loaded.value().metadata.macho) { err << "Selected input is not a Mach-O image\n"; return 2; }
+    auto targets = resolve_macho_dyld_binds(*loaded.value().metadata.macho, imports, image_slide);
+    if (!targets) { err << targets.error().message << '\n'; return 2; }
+    const auto status_name = [](MachODyldBindStatus status) {
+        switch (status) {
+        case MachODyldBindStatus::resolved: return "resolved";
+        case MachODyldBindStatus::missing_import: return "missing-import";
+        case MachODyldBindStatus::ambiguous_import: return "ambiguous-import";
+        case MachODyldBindStatus::invalid_encoding: return "invalid-encoding";
+        case MachODyldBindStatus::unsupported_type: return "unsupported-type";
+        case MachODyldBindStatus::overflow: return "overflow";
+        }
+        return "unknown";
+    };
+    out << "Mach-O classic bind targets: " << targets.value().size() << " row(s)\n";
+    constexpr std::size_t output_limit = 1024;
+    const auto count = (std::min)(targets.value().size(), output_limit);
+    for (std::size_t index = 0; index < count; ++index) {
+        const auto &row = targets.value()[index];
+        out << "  fixup=" << row.fixup_index << " stream=" << row.stream << " operation=" << row.operation
+            << " repeat=" << row.repeat_index << " status=" << status_name(row.status)
+            << " ordinal=" << row.library_ordinal << " symbol=" << macho_text(row.symbol)
+            << " type=" << unsigned(row.type) << " width=" << unsigned(row.field_size)
+            << " addend=" << row.addend << " weak=" << row.weak_import
+            << " record=file:" << macho_hex(row.record_file_offset);
+        if (row.place) out << " address=" << format_location(*row.place, loaded.value().image.get());
+        if (row.file_place) out << " place=file:" << macho_hex(row.file_place->value);
+        if (row.import_address) out << " import=" << macho_hex(*row.import_address);
+        if (row.target_address) out << " target=" << macho_hex(*row.target_address);
+        if (row.value_to_write) out << " value=" << macho_hex(*row.value_to_write);
+        out << '\n';
+    }
+    if (targets.value().size() > count) out << "  ... " << targets.value().size() - count << " rows omitted\n";
+    return 0;
+}
+int macho_command(std::span<const std::wstring_view> args, std::ostream &out, std::ostream &err) {
+    if (!args.empty() && args[0] == L"chained-targets")
+        return macho_chained_targets_command(args, out, err);
+    if (!args.empty() && args[0] == L"bind-targets")
+        return macho_bind_targets_command(args, out, err);
+    out << "Usage: hexlab_cli macho chained-targets|bind-targets <image> [options]\n";
+    return args.empty() || (args.size() == 1 && args[0] == L"--help") ? 0 : 2;
+}
 } // namespace
 int run_cli(std::span<const std::wstring_view> arguments, std::ostream &out, std::ostream &err) {
     if (arguments.empty() || (arguments.size() == 1 && arguments[0] == L"--help")) {
@@ -3748,7 +3874,7 @@ int run_cli(std::span<const std::wstring_view> arguments, std::ostream &out, std
     if (arguments[0] == L"dex")
         return dex_command(arguments.subspan(1), out, err);
     if (arguments[0] == L"macho")
-        return macho_chained_targets_command(arguments.subspan(1), out, err);
+        return macho_command(arguments.subspan(1), out, err);
     if (arguments[0] == L"elf")
         return run_elf_debug_companion_cli(arguments.subspan(1), out, err);
     if (arguments[0] == L"firmware")

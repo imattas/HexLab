@@ -94,6 +94,41 @@ HEXLAB_LOADERS_EXPORT Result<std::vector<MachOChainedBindTarget>> resolve_macho_
     const MachOMetadata &, std::span<const std::optional<std::uint64_t>> import_addresses,
     std::stop_token = {}, MachOChainedBindResolutionLimits = {});
 
+enum class MachODyldBindStatus : std::uint8_t {
+    resolved, missing_import, ambiguous_import, invalid_encoding, unsupported_type, overflow
+};
+struct MachODyldImportAddress {
+    std::int32_t library_ordinal = 0;
+    std::string symbol;
+    std::uint64_t address = 0;
+};
+struct MachODyldBindTarget {
+    std::size_t fixup_index = 0;
+    std::uint32_t stream = 0, operation = 0, repeat_index = 0;
+    std::uint64_t record_file_offset = 0;
+    std::uint8_t type = 0, field_size = 0, symbol_flags = 0;
+    std::int32_t library_ordinal = 0;
+    std::string symbol;
+    std::int64_t addend = 0;
+    bool weak_import = false;
+    std::optional<Address> place;
+    std::optional<FileOffset> file_place;
+    std::optional<std::uint64_t> import_address, target_address, value_to_write;
+    MachODyldBindStatus status = MachODyldBindStatus::missing_import;
+};
+struct MachODyldBindResolutionLimits {
+    std::size_t max_fixups = 1'000'000;
+    std::size_t max_imports = 1'000'000;
+    std::uint64_t max_symbol_bytes = 16 * 1024 * 1024;
+    std::uint64_t max_result_bytes = 64 * 1024 * 1024;
+};
+// Computes classic dyld bind values from caller-supplied runtime symbol
+// addresses, without mutating image bytes. PC-relative binds use the supplied
+// image slide to compute their runtime place. Weak binds are inventory-only.
+HEXLAB_LOADERS_EXPORT Result<std::vector<MachODyldBindTarget>> resolve_macho_dyld_binds(
+    const MachOMetadata &, std::span<const MachODyldImportAddress>, std::uint64_t image_slide = 0,
+    std::stop_token = {}, MachODyldBindResolutionLimits = {});
+
 // Provider images are supplied by the caller. `source` records provenance
 // (normally the selected file path); this resolver never searches host paths.
 struct MachOTwoLevelProvider {
