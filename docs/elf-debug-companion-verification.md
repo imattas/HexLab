@@ -24,11 +24,18 @@ candidate files and debug directories. The API never imports or merges DWARF.
 hexlab_cli elf debug-companions ./sdk/usr/bin/app --sysroot ./sdk \
   --debug-dir ./sdk/usr/lib/debug --json
 hexlab_cli elf debug-companions ./app --candidate ./symbols/app.debug
+hexlab_cli elf debug-alt-companions ./app --debug-dir ./symbols --json
 ```
 
 For a valid basename in `.gnu_debuglink`, the search checks the primary's
-directory and its `.debug` subdirectory. Each supplied debug directory also
-contributes the primary's mirrored directory followed by that basename. With
+directory and its `.debug` subdirectory. `.gnu_debugaltlink` discovery uses
+its alternate build ID and searches its safe relative filename beside the
+primary, including nested relative paths that do not contain `.` or `..`.
+Absolute or traversal paths from that section are never followed; explicit
+candidates and build-ID-directory paths are still checked. Both commands
+consider the supplied debug directories and build-ID layout.
+Each supplied debug directory also contributes the primary's mirrored
+directory followed by the retained filename. With
 `--sysroot`, the mirrored path is relative to the canonical sysroot; the
 primary must be inside it. Without a sysroot it is the physical absolute
 parent with its filesystem root removed. Windows drive letters become a
@@ -48,7 +55,8 @@ spelled paths to the same canonical file are inspected once; separate
 canonical paths, including separate hard-link names, remain distinct.
 
 The candidate ELF must match the primary's machine, class, byte order,
-object type, `e_flags`, OSABI and ABI version. It must declare a nonempty,
+`e_flags`, OSABI and ABI version. GNU debuglink candidates must also match the
+primary's object type; DWZ alternate files may be `ET_REL`. It must declare a nonempty,
 file-backed ordinary DWARF info/type/line section or static symbol table.
 These declarations are reported separately; their payloads are not imported
 or validated as debug records by this catalog. All retained GNU build-ID notes
@@ -61,6 +69,9 @@ build-ID directory. This intentionally requires all supplied identities to
 agree. SHA-256 hashes before and after verification must also agree; a changing
 file makes the search incomplete. Matching a CRC/build ID associates files
 with the same declared build; it is not publisher or code-signature validation.
+For `.gnu_debugaltlink`, the candidate must carry the alternate build ID from
+that record; the primary executable's own build ID and `.gnu_debuglink` CRC do
+not substitute for it.
 
 The report retains source kind, original and canonical paths, status, observed
 size, build ID, and the SHA-256 of matched content. Missing paths, nonregular
@@ -81,9 +92,11 @@ roots have hard ceilings of 4,096 and 128. Aggregate budget exhaustion is an
 error rather than a truncated selection. Cancellation is checked throughout
 the query, file hashing and CRC work.
 
-CLI text and JSON output expose the same report. Exit 0 means one selected
+CLI text and JSON output expose the same report. `debug-alt-companions` uses
+the same explicit candidate and directory limits while matching the
+`.gnu_debugaltlink` identity. Exit 0 means one selected
 identity match; exit 3 means no selection, including missing/ambiguous or
 incomplete searches; argument, input and budget errors use exit 2. JSON paths
-must be representable as UTF-8. `.gnu_debugaltlink` supplementary association,
+must be representable as UTF-8. DWARF supplementary-reference association,
 external DWARF import, package-manager lookup and runtime debugger symbol
 binding remain separate work.

@@ -65,19 +65,24 @@ std::string bytes_hex(std::span<const std::byte> bytes) {
 }
 void usage(std::ostream &out) {
     out << "Usage: hexlab_cli elf debug-companions <primary> [--candidate <file> ...]\n"
+           "       hexlab_cli elf debug-alt-companions <primary> [--candidate <file> ...]\n"
            "       [--debug-dir <directory> ...] [--sysroot <root>] [--json]\n"
-           "Checks adjacent GNU debuglink files and explicit roots with mirrored/debug-ID paths.\n"
+           "Checks GNU debuglink or alternate-DWARF identities in adjacent files and explicit roots.\n"
            "Exit 0 selects one local identity match; exit 3 means missing, ambiguous, or incomplete.\n";
 }
 } // namespace
 
 int run_elf_debug_companion_cli(std::span<const std::wstring_view> args, std::ostream &out, std::ostream &err) {
     if (args.empty() || (args.size() == 1 && args[0] == L"--help") ||
-        (args.size() == 2 && args[0] == L"debug-companions" && args[1] == L"--help")) {
+        (args.size() == 2 && (args[0] == L"debug-companions" || args[0] == L"debug-alt-companions") &&
+         args[1] == L"--help")) {
         usage(out); return 0;
     }
-    if (args.size() < 2 || args[0] != L"debug-companions") { usage(err); return 2; }
+    if (args.size() < 2 || (args[0] != L"debug-companions" && args[0] != L"debug-alt-companions")) {
+        usage(err); return 2;
+    }
     try {
+        const bool altlink = args[0] == L"debug-alt-companions";
         const auto input = path_from_wide(args[1]);
         ElfDebugCompanionSearch search;
         bool json = false;
@@ -109,12 +114,16 @@ int run_elf_debug_companion_cli(std::span<const std::wstring_view> args, std::os
         const auto loaded = load_elf(storage.value(), {});
         if (!loaded) { err << loaded.error().message << '\n'; return 2; }
         if (!loaded.value().metadata.elf) { err << "Input has no ELF metadata\n"; return 2; }
-        const auto found = discover_elf_debug_companions(*loaded.value().metadata.elf, input, search);
+        const auto found = altlink
+            ? discover_elf_debug_alt_companions(*loaded.value().metadata.elf, input, search)
+            : discover_elf_debug_companions(*loaded.value().metadata.elf, input, search);
         if (!found) { err << found.error().message << '\n'; return 2; }
         const auto &report = found.value();
         std::ostringstream rendered;
         if (json) {
-            rendered << "{\"schema\":\"hexlab.elf.debug-companions.v1\",\"primary\":" << quote(path_text(input))
+            rendered << "{\"schema\":\"hexlab.elf."
+                     << (altlink ? "debug-alt-companions" : "debug-companions")
+                     << ".v1\",\"primary\":" << quote(path_text(input))
                      << ",\"complete\":" << (report.complete ? "true" : "false") << ",\"selected\":";
             if (report.selected) rendered << *report.selected; else rendered << "null";
             rendered << ",\"inspected_file_bytes\":" << report.inspected_file_bytes << ",\"candidates\":[";
@@ -141,7 +150,8 @@ int run_elf_debug_companion_cli(std::span<const std::wstring_view> args, std::os
             }
             rendered << "]}\n";
         } else {
-            rendered << "ELF local debug companions: complete=" << (report.complete ? "yes" : "no")
+            rendered << (altlink ? "ELF local alternate debug companions: complete=" : "ELF local debug companions: complete=")
+                     << (report.complete ? "yes" : "no")
                      << " candidates=" << report.candidates.size() << " inspected-file-bytes=" << report.inspected_file_bytes << '\n';
             if (report.selected) rendered << "Selected [" << *report.selected << "] "
                 << quote(path_text(*report.candidates[*report.selected].canonical_path)) << '\n';

@@ -53,4 +53,11 @@ struct ElfDebugCompanionReport {
 HEXLAB_LOADERS_EXPORT Result<ElfDebugCompanionReport> discover_elf_debug_companions(
     const ElfMetadata &, const std::filesystem::path &primary_path,
     const ElfDebugCompanionSearch & = {}, std::stop_token = {});
+// Resolves the supplementary DWARF file named by .gnu_debugaltlink. Candidate
+// identity is the alternate build ID stored in the section, not the primary
+// object's own build ID. Discovery remains local and explicit; no DWARF is
+// imported by this catalog.
+HEXLAB_LOADERS_EXPORT Result<ElfDebugCompanionReport> discover_elf_debug_alt_companions(
+    const ElfMetadata &, const std::filesystem::path &primary_path,
+    const ElfDebugCompanionSearch & = {}, std::stop_token = {});
 } // namespace hexlab

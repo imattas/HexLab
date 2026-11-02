@@ -11,6 +11,7 @@ four-byte CRC boundary, and exactly one 32-bit CRC in the file's byte order.
 bounded nonempty build-ID byte sequence. Names are capped at 4 KiB and
 alternate build IDs at 4 KiB; malformed extents are omitted with diagnostics.
 
-The CRC and build ID are metadata for matching debug artifacts. HexLab does
-not verify the CRC, resolve paths, or load the referenced files. This avoids
-turning untrusted object metadata into filesystem access.
+The CRC and build ID are metadata for matching debug artifacts. The ELF loader
+retains them without opening referenced files. Callers may explicitly invoke
+the bounded GNU debug companion catalog; it only searches caller-supplied roots
+and never imports DWARF implicitly.

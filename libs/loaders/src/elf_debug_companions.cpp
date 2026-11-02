@@ -23,6 +23,20 @@ std::string hex_id(std::span<const std::byte> bytes) {
     }
     return result;
 }
+bool safe_altlink_relative_name(std::string_view name) {
+    if (name.empty() || name.find_first_of(":\0", 0, 2) != std::string_view::npos ||
+        name.front() == '/' || name.front() == '\\') return false;
+    std::size_t begin = 0;
+    while (begin < name.size()) {
+        const auto end = name.find_first_of("/\\", begin);
+        const auto length = (end == std::string_view::npos ? name.size() : end) - begin;
+        const auto component = name.substr(begin, length);
+        if (component.empty() || component == "." || component == "..") return false;
+        if (end == std::string_view::npos) return true;
+        begin = end + 1;
+    }
+    return false;
+}
 Result<std::vector<std::byte>> unique_build_id(const ElfMetadata &metadata, std::stop_token stop) {
     if (metadata.gnu_build_ids.size() > 4096)
         return Error{ErrorCode::resource_limit, "ELF debug-companion identity exceeds 4096 build-ID notes"};
@@ -44,9 +58,11 @@ struct Probe {
 };
 } // namespace
 
-Result<ElfDebugCompanionReport> discover_elf_debug_companions(
+static Result<ElfDebugCompanionReport> discover_elf_debug_companions_impl(
     const ElfMetadata &primary, const std::filesystem::path &primary_path,
-    const ElfDebugCompanionSearch &options, std::stop_token stop) {
+    const ElfDebugCompanionSearch &options, std::stop_token stop,
+    std::optional<std::vector<std::byte>> identity_override = {},
+    std::optional<std::string> filename_override = {}, bool altlink = false) {
     using namespace elf_detail;
     try {
         canceled(stop);
@@ -61,11 +77,12 @@ Result<ElfDebugCompanionReport> discover_elf_debug_companions(
                 "Separate-debug companion discovery requires an ELF executable or shared object",
                 ErrorCode::unsupported);
         ElfDebugCompanionReport result;
-        const auto build_id = take(unique_build_id(primary, stop));
+        const auto build_id = identity_override ? std::move(*identity_override) : take(unique_build_id(primary, stop));
         require(primary.gnu_debug_links.size() <= 4096,
                 "ELF debug-companion identity exceeds 4096 debuglinks", ErrorCode::resource_limit);
         const ElfGnuDebugLink *link = nullptr;
         for (const auto &value : primary.gnu_debug_links) {
+            if (altlink) break;
             canceled(stop);
             require(value.filename.size() <= options.max_path_bytes,
                     "GNU debuglink filename exceeds path-byte limit", ErrorCode::resource_limit);
@@ -74,14 +91,29 @@ Result<ElfDebugCompanionReport> discover_elf_debug_companions(
                         "Primary ELF has conflicting GNU debuglink identities", ErrorCode::conflict);
             else link = &value;
         }
+        const auto filename = filename_override ? filename_override :
+            (link ? std::optional<std::string>{link->filename} : std::nullopt);
         if (!link && build_id.empty()) {
-            result.diagnostics.push_back("Primary ELF has no GNU debuglink or GNU build-ID identity");
+            result.diagnostics.push_back(altlink ? "Primary ELF has no GNU debugaltlink identity" :
+                "Primary ELF has no GNU debuglink or GNU build-ID identity");
             return result;
         }
-        if (link)
-            require(!link->filename.empty() && link->filename != "." && link->filename != ".." &&
-                    link->filename.find_first_of("/\\:\0", 0, 4) == std::string::npos,
-                    "GNU debuglink filename is not a safe basename", ErrorCode::malformed);
+        if (filename) {
+            require(filename->find_first_of(":\0", 0, 2) == std::string::npos,
+                    "GNU debug companion filename contains a forbidden character", ErrorCode::malformed);
+            const auto name = std::filesystem::path(std::u8string(filename->begin(), filename->end()));
+            require(!name.empty() && !name.is_absolute() && !name.has_root_name() && !name.has_root_directory(),
+                    "GNU debug companion filename must be a relative path", ErrorCode::malformed);
+            std::size_t components = 0;
+            for (const auto &component : name) {
+                require(component != "." && component != "..",
+                        "GNU debug companion filename escapes its containing directory", ErrorCode::malformed);
+                ++components;
+            }
+            require(components && (altlink || components == 1), altlink ?
+                    "GNU debugaltlink filename is empty" : "GNU debuglink filename is not a safe basename",
+                    ErrorCode::malformed);
+        }
 
         std::size_t path_bytes = 0;
         const auto count_path = [&](const std::filesystem::path &path) {
@@ -113,7 +145,7 @@ Result<ElfDebugCompanionReport> discover_elf_debug_companions(
             mirrored_parent = parent.lexically_relative(root);
         }
 #ifdef _WIN32
-        else if (link && !options.debug_directories.empty() && !parent.root_name().empty()) {
+        else if (filename && !options.debug_directories.empty() && !parent.root_name().empty()) {
             const auto drive = parent.root_name().native();
             require(drive.size() == 2 && drive[1] == L':' &&
                     ((drive[0] >= L'A' && drive[0] <= L'Z') || (drive[0] >= L'a' && drive[0] <= L'z')),
@@ -137,8 +169,8 @@ Result<ElfDebugCompanionReport> discover_elf_debug_companions(
             canceled(stop);
             add_probe(path, {}, ElfDebugCompanionSource::explicit_path);
         }
-        if (link) {
-            const auto name = std::filesystem::path(std::u8string(link->filename.begin(), link->filename.end()));
+        if (filename) {
+            const auto name = std::filesystem::path(std::u8string(filename->begin(), filename->end()));
             add_probe(parent / name, parent, ElfDebugCompanionSource::adjacent);
             add_probe(parent / ".debug" / name, parent, ElfDebugCompanionSource::adjacent_debug_directory);
         }
@@ -154,8 +186,8 @@ Result<ElfDebugCompanionReport> discover_elf_debug_companions(
                 add_probe(root / ".build-id" / id.substr(0, 2) / (id.substr(2) + ".debug"), root,
                           ElfDebugCompanionSource::build_id_directory);
             }
-            if (link) {
-                const auto name = std::filesystem::path(std::u8string(link->filename.begin(), link->filename.end()));
+            if (filename) {
+                const auto name = std::filesystem::path(std::u8string(filename->begin(), filename->end()));
                 add_probe(root / mirrored_parent / name, root, ElfDebugCompanionSource::debug_directory);
             }
         }
@@ -238,8 +270,10 @@ Result<ElfDebugCompanionReport> discover_elf_debug_companions(
                      header.error().code == ErrorCode::resource_limit || header.error().code == ErrorCode::io);
                 continue;
             }
+            const bool object_type_matches = header.value().object_type == primary.header.object_type ||
+                (altlink && header.value().object_type == 1); // DWZ alternate files may be ET_REL.
             if (header.value().machine != primary.header.machine || header.value().is_64 != primary.header.is_64 ||
-                header.value().order != primary.header.order || header.value().object_type != primary.header.object_type ||
+                header.value().order != primary.header.order || !object_type_matches ||
                 header.value().flags != primary.header.flags || header.value().os_abi != primary.header.os_abi ||
                 header.value().abi_version != primary.header.abi_version) {
                 fail(ElfDebugCompanionStatus::incompatible_elf, "Candidate ELF header identity differs from the primary");
@@ -278,11 +312,15 @@ Result<ElfDebugCompanionReport> discover_elf_debug_companions(
             }
             row.build_id = candidate_id.value();
             if (!build_id.empty() && row.build_id.empty()) {
-                fail(ElfDebugCompanionStatus::missing_build_id, "Candidate has no GNU build ID declared by the primary");
+                fail(ElfDebugCompanionStatus::missing_build_id, altlink ?
+                    "Candidate has no GNU build ID declared by .gnu_debugaltlink" :
+                    "Candidate has no GNU build ID declared by the primary");
                 continue;
             }
             if (!build_id.empty() && row.build_id != build_id) {
-                fail(ElfDebugCompanionStatus::build_id_mismatch, "Candidate GNU build ID differs from the primary"); continue;
+                fail(ElfDebugCompanionStatus::build_id_mismatch, altlink ?
+                    "Candidate GNU build ID differs from .gnu_debugaltlink" :
+                    "Candidate GNU build ID differs from the primary"); continue;
             }
             if (link) {
                 const auto crc = verify_elf_gnu_debuglink_crc(*link, *storage.value(), stop, options.max_file_bytes);
@@ -311,12 +349,49 @@ Result<ElfDebugCompanionReport> discover_elf_debug_companions(
             result.selected = matched_index;
             result.selected_storage = std::move(matched_storage);
         }
-        if (match_count > 1) result.diagnostics.push_back("Multiple canonical files match the primary debug identities");
+        if (match_count > 1) result.diagnostics.push_back(altlink ?
+            "Multiple canonical files match the .gnu_debugaltlink identity" :
+            "Multiple canonical files match the primary debug identities");
         if (!result.complete) result.diagnostics.push_back("Incomplete search: a unique companion was not selected");
         return result;
     } catch (const Failure &failure) { return failure.error; }
     catch (const std::filesystem::filesystem_error &error) { return Error{ErrorCode::io, error.what()}; }
     catch (const std::bad_alloc &) { return Error{ErrorCode::resource_limit, "Cannot allocate ELF debug-companion catalog"}; }
     catch (const std::length_error &) { return Error{ErrorCode::resource_limit, "ELF debug-companion catalog exceeds container limits"}; }
+}
+
+Result<ElfDebugCompanionReport> discover_elf_debug_companions(
+    const ElfMetadata &primary, const std::filesystem::path &primary_path,
+    const ElfDebugCompanionSearch &options, std::stop_token stop) {
+    return discover_elf_debug_companions_impl(primary, primary_path, options, stop);
+}
+
+Result<ElfDebugCompanionReport> discover_elf_debug_alt_companions(
+    const ElfMetadata &primary, const std::filesystem::path &primary_path,
+    const ElfDebugCompanionSearch &options, std::stop_token stop) {
+    if (primary.gnu_debug_altlinks.size() > 4096)
+        return Error{ErrorCode::resource_limit, "ELF alternate debug identity exceeds 4096 .gnu_debugaltlink records"};
+    const ElfGnuDebugAltLink *identity = nullptr;
+    for (const auto &link : primary.gnu_debug_altlinks) {
+        if (stop.stop_requested()) return Error{ErrorCode::canceled, "ELF alternate debug discovery canceled"};
+        if (link.filename.size() > options.max_path_bytes)
+            return Error{ErrorCode::resource_limit, "GNU debugaltlink filename exceeds path-byte limit"};
+        if (link.build_id.empty() || link.build_id.size() > 64)
+            return Error{ErrorCode::unsupported, "GNU debugaltlink build ID must contain 1 through 64 bytes"};
+        if (identity && (identity->filename != link.filename || identity->build_id != link.build_id))
+            return Error{ErrorCode::conflict, "Primary ELF has conflicting GNU debugaltlink identities"};
+        identity = &link;
+    }
+    if (!identity) {
+        ElfDebugCompanionReport result;
+        result.diagnostics.push_back("Primary ELF has no GNU debugaltlink identity");
+        return result;
+    }
+    const bool safe_filename = safe_altlink_relative_name(identity->filename);
+    auto result = discover_elf_debug_companions_impl(primary, primary_path, options, stop,
+        identity->build_id, safe_filename ? std::optional<std::string>{identity->filename} : std::nullopt, true);
+    if (result && !safe_filename)
+        result.value().diagnostics.push_back("Unsafe .gnu_debugaltlink filename was not followed; explicit candidates and build-ID paths were still checked");
+    return result;
 }
 } // namespace hexlab
