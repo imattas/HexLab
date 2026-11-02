@@ -1,4 +1,4 @@
-﻿# Capability Inventory Completion Plan
+# Capability Inventory Completion Plan
 
 > **For agentic workers:** Use the repository's established subsystem patterns; keep each verified feature bounded and evidence-backed.
 
@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Current inventory has 89 `partial` rows; recount before and after each work wave.
+- Current inventory has 90 `partial` rows after restoring the separate `loader.uefi_fv` row; recount before and after each work wave.
 - Preserve the multi-target monorepo architecture and use existing subsystem APIs.
 - Keep local commits only; do not push to GitHub.
 - Never stage or modify `.build/` artifacts.
@@ -35,4 +35,4 @@
 - [ ] Desktop and search/editing: close persisted issue triage, navigation, plugin, context, source, and editing gaps.
 - [ ] Debugging and automation: close backend, thread-control, SDK, Python and extension gaps.
 - [ ] Projects and delivery: close reliability, exchange/collaboration, platform build, packaging, performance and accessibility gaps.
-- [ ] Reconcile all 89 rows against implementation evidence and rebuild supported configurations.
+- [ ] Reconcile all 90 rows against implementation evidence and rebuild supported configurations.

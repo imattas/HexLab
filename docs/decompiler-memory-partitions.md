@@ -40,12 +40,23 @@ The partitioner recognizes three bounded forms:
   checked same-width `add`, `sub`, or `mul` tree with no intermediate wrap, or
   exact same-width `and`, `or`, and `xor` trees, all bounded to 32 expression
   levels. It can also use a bounded unsigned interval proven by `index & mask`
-  when the same-width mask is a contiguous run of low bits, or a complete phi
+  for any canonical same-width constant mask, or a complete phi
   whose incoming values all have known intervals. Same-width `add`, `sub`, and
   `mul` preserve intervals when endpoint checks prove every possible result
   stays within the bit width without wrap; subtraction additionally requires
   every possible left operand to be at least every possible right operand.
   Multiplication bounds the maximum product before computing either endpoint.
+  Nonconstant intervals survive same-width SSA register copies and supported
+  expression trees. Unsigned `udiv` and `urem` with a proven nonzero constant
+  divisor bound an arbitrary same-width numerator: division uses the unsigned
+  endpoint quotients, and remainder stays within `[0, divisor - 1]`. If the
+  numerator already has a range contained in one quotient bucket, remainder
+  preserves its tighter endpoint range; ranges crossing a divisor multiple
+  use the enclosing zero-based interval. Divisor zero, variable divisors,
+  mixed widths, and signed division/remainder do not produce these facts.
+  A noncontiguous AND mask can leave holes; `[0, mask]` is a conservative
+  envelope, not a claim that every offset is reachable. Available input
+  intervals can further cap that envelope's upper endpoint.
   An interval widens the partition to include every possible indexed byte; it
   does not assert one runtime offset. Same-width unextended indices use
   nonnegative values.
@@ -83,6 +94,19 @@ partition events and 65,536 phi inputs. If these bounds are exceeded, or a
 range cannot be mapped to a proven partition, that access falls back to
 whole-memory SSA. If whole-function partition construction exceeds its budget,
 the function keeps only whole-memory SSA.
+
+Constant and interval expression evaluations each visit at most 1,024 nodes
+and descend at most 32 expression levels; a range evaluation shares these
+limits with its constant subevaluations. Unsupported or over-budget
+subexpressions yield no input interval; a mask or nonzero constant divisor can
+still establish its independent enclosing bound. The existing 64-iteration
+convergence gate discards nonconstant intervals on exhaustion.
+
+For example, `slot = index % 12; copy = slot; address = base + copy * 4`
+can prove offsets `[0, 44]` even when `index` has no known range. A four-byte
+access covers `[0, 48)` relative to the same pointer root. A store at
+`base + 64` may preserve that partition when the existing root/overlap checks
+succeed. No object extent or safety of either runtime access is inferred.
 
 This does not partition heap or global accesses whose address cannot be proven,
 aliases reached through unrelated roots as disjoint, variable indices without

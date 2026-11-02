@@ -96,13 +96,15 @@ std::optional<PointerOrigin> pointer_origin(const ExpressionPtr &expression, con
     return origin;
 }
 
-std::optional<std::uint64_t> integer_constant(const ExpressionPtr &expression,
-                                              const IntegerConstants &constants) {
+std::optional<std::uint64_t> integer_constant_impl(const ExpressionPtr &expression,
+                                                 const IntegerConstants &constants,
+                                                 unsigned initial_depth, std::size_t &remaining_nodes) {
     const auto evaluate = [&](const auto &self, const ExpressionPtr &node, unsigned depth)
         -> std::optional<std::uint64_t> {
         constexpr unsigned max_constant_expression_depth = 32;
-        if (depth > max_constant_expression_depth || !node ||
+        if (!remaining_nodes || depth > max_constant_expression_depth || !node ||
             node->type.kind != TypeKind::integer || !node->type.bits || node->type.bits > 64) return {};
+        --remaining_nodes;
         const auto width = node->type.bits;
         const auto mask = width == 64 ? std::numeric_limits<std::uint64_t>::max()
                                       : (std::uint64_t{1} << width) - 1;
@@ -163,15 +165,41 @@ std::optional<std::uint64_t> integer_constant(const ExpressionPtr &expression,
         if (*right && *left > mask / *right) return {};
         return *left * *right;
     };
-    return evaluate(evaluate, expression, 0);
+    return evaluate(evaluate, expression, initial_depth);
 }
 
-std::optional<IntegerRange> integer_range(const ExpressionPtr &expression,
-                                          const IntegerConstants &constants,
-                                          const IntegerRanges &ranges) {
-    if (const auto value = integer_constant(expression, constants)) return IntegerRange{*value, *value};
+std::optional<std::uint64_t> integer_constant(const ExpressionPtr &expression,
+                                              const IntegerConstants &constants) {
+    std::size_t remaining_nodes = 1024;
+    return integer_constant_impl(expression, constants, 0, remaining_nodes);
+}
+
+std::optional<IntegerRange> integer_range_impl(const ExpressionPtr &expression,
+                                              const IntegerConstants &constants,
+                                              const IntegerRanges &ranges,
+                                              unsigned depth, std::size_t &remaining_nodes) {
+    if (!remaining_nodes || depth > 32) return {};
+    --remaining_nodes;
+    if (const auto value = integer_constant_impl(expression, constants, depth, remaining_nodes))
+        return IntegerRange{*value, *value};
     if (!expression || expression->type.kind != TypeKind::integer || !expression->type.bits ||
         expression->type.bits > 64) return {};
+    const auto width_mask = expression->type.bits == 64
+        ? std::numeric_limits<std::uint64_t>::max()
+        : (std::uint64_t{1} << expression->type.bits) - 1;
+    if (const auto *reg = std::get_if<RegisterValue>(&expression->value)) {
+        if (!reg->version || reg->reg.width != expression->type.bits) return {};
+        const auto found = ranges.find({key(reg->reg), *reg->version});
+        if (found != ranges.end() && found->second.first <= found->second.second &&
+            found->second.second <= width_mask) return found->second;
+        return {};
+    }
+    const auto child_range = [&](const ExpressionPtr &child) {
+        return integer_range_impl(child, constants, ranges, depth + 1, remaining_nodes);
+    };
+    const auto child_constant = [&](const ExpressionPtr &child) {
+        return integer_constant_impl(child, constants, depth + 1, remaining_nodes);
+    };
     if (const auto *unary = std::get_if<UnaryValue>(&expression->value)) {
         if ((unary->operation != "zext" && unary->operation != "sext") || !unary->operand ||
             unary->operand->type.kind != TypeKind::integer || !unary->operand->type.bits ||
@@ -179,7 +207,7 @@ std::optional<IntegerRange> integer_range(const ExpressionPtr &expression,
         const auto source_width = unary->operand->type.bits;
         const auto source_mask = source_width == 64 ? std::numeric_limits<std::uint64_t>::max()
                                                     : (std::uint64_t{1} << source_width) - 1;
-        const auto source = integer_range(unary->operand, constants, ranges);
+        const auto source = child_range(unary->operand);
         if (!source || source->first > source->second || source->second > source_mask) return {};
         if (unary->operation == "zext") return source;
         const auto target_mask = expression->type.bits == 64 ? std::numeric_limits<std::uint64_t>::max()
@@ -200,9 +228,9 @@ std::optional<IntegerRange> integer_range(const ExpressionPtr &expression,
         binary->left->type.bits != expression->type.bits || binary->right->type.bits != expression->type.bits)
         return {};
     if (binary->operation == "shl" || binary->operation == "shr" || binary->operation == "sar") {
-        const auto amount = integer_constant(binary->right, constants);
+        const auto amount = child_constant(binary->right);
         if (!amount || *amount >= expression->type.bits) return {};
-        const auto source = integer_range(binary->left, constants, ranges);
+        const auto source = child_range(binary->left);
         if (!source || source->first > source->second) return {};
         const auto shift = static_cast<unsigned>(*amount);
         if (!shift) return source;
@@ -228,13 +256,10 @@ std::optional<IntegerRange> integer_range(const ExpressionPtr &expression,
         return IntegerRange{0, mask};
     }
     if (binary->operation == "add" || binary->operation == "sub" || binary->operation == "mul") {
-        const auto left = integer_range(binary->left, constants, ranges);
-        const auto right = integer_range(binary->right, constants, ranges);
+        const auto left = child_range(binary->left);
+        const auto right = child_range(binary->right);
         if (!left || !right || left->first > left->second || right->first > right->second)
             return {};
-        const auto width_mask = expression->type.bits == 64
-            ? std::numeric_limits<std::uint64_t>::max()
-            : (std::uint64_t{1} << expression->type.bits) - 1;
         if (left->second > width_mask || right->second > width_mask) return {};
         if (binary->operation == "mul") {
             if (left->second && right->second > width_mask / left->second) return {};
@@ -250,22 +275,43 @@ std::optional<IntegerRange> integer_range(const ExpressionPtr &expression,
         if (left->first < right->second || left->second < right->first) return {};
         return IntegerRange{left->first - right->second, left->second - right->first};
     }
+    if (binary->operation == "udiv" || binary->operation == "urem") {
+        // A nonzero constant divisor bounds even an otherwise unknown
+        // numerator. This is an unsigned bit-vector proof; signed division
+        // and variable divisors stay outside the interval model.
+        const auto divisor = child_constant(binary->right);
+        if (!divisor || !*divisor || *divisor > width_mask) return {};
+        const auto source = child_range(binary->left);
+        const auto numerator = source.value_or(IntegerRange{0, width_mask});
+        if (numerator.first > numerator.second || numerator.second > width_mask) return {};
+        const auto quotient_min = numerator.first / *divisor;
+        const auto quotient_max = numerator.second / *divisor;
+        if (binary->operation == "udiv") return IntegerRange{quotient_min, quotient_max};
+        // Remainders are monotone only within one quotient bucket. Crossing
+        // a multiple of the divisor wraps the remainder back to zero.
+        if (quotient_min == quotient_max)
+            return IntegerRange{numerator.first % *divisor, numerator.second % *divisor};
+        return IntegerRange{0, std::min(numerator.second, *divisor - 1)};
+    }
     if (binary->operation != "and") return {};
-    const auto left_constant = integer_constant(binary->left, constants);
-    const auto right_constant = integer_constant(binary->right, constants);
+    const auto left_constant = child_constant(binary->left);
+    const auto right_constant = child_constant(binary->right);
     const auto mask = left_constant ? left_constant : right_constant;
     const auto &operand = left_constant ? binary->right : binary->left;
     if (!mask || (left_constant && right_constant)) return {};
-    // A contiguous low-bit mask bounds an arbitrary same-width input to
-    // [0, mask]. Other masks can clear bits but do not define one interval.
-    if ((*mask & (*mask + 1)) != 0) return {};
-    if (const auto *reg = std::get_if<RegisterValue>(&operand->value)) {
-        if (!reg->version || reg->reg.width != expression->type.bits) return {};
-        const auto found = ranges.find({key(reg->reg), *reg->version});
-        if (found != ranges.end() && found->second.first <= found->second.second)
-            return IntegerRange{0, std::min(found->second.second, *mask)};
-    }
+    // Noncontiguous masks leave holes, but [0, mask] still encloses every
+    // possible unsigned result. Partitions use envelopes, not exact sets.
+    if (const auto source = child_range(operand); source && source->first <= source->second &&
+        source->second <= width_mask)
+        return IntegerRange{0, std::min(source->second, *mask)};
     return IntegerRange{0, *mask};
+}
+
+std::optional<IntegerRange> integer_range(const ExpressionPtr &expression,
+                                          const IntegerConstants &constants,
+                                          const IntegerRanges &ranges) {
+    std::size_t remaining_nodes = 1024;
+    return integer_range_impl(expression, constants, ranges, 0, remaining_nodes);
 }
 
 std::optional<std::int64_t> flat_address_constant(PointerValueKey value,
