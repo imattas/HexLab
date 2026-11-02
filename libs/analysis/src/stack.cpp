@@ -788,6 +788,44 @@ void mark_incoming_x86_64_argument(StackFrameAnalysis &result, std::int64_t offs
     }
 }
 
+// Windows x64 reserves four eight-byte home slots for RCX, RDX, R8, and R9
+// at entry-SP+8..+39. A prologue commonly spills a register argument there
+// before the first use. Treat that store as incoming-argument evidence only
+// when it is an exact MOV from the corresponding untouched entry register;
+// arbitrary writes to caller-provided home space are not enough.
+void mark_windows_x64_home_spill(StackFrameAnalysis &result, const Instruction &instruction,
+                                 std::int64_t offset, std::uint16_t width,
+                                 const std::array<bool, 16> &argument_register_clobbered) {
+    if (instruction.context.architecture != Architecture::x86_64 ||
+        instruction.context.mode != ExecutionMode::x86_64 || instruction.opcode != Opcode::mov ||
+        instruction.flow != FlowKind::fallthrough || !instruction.memory_write || instruction.memory_read ||
+        instruction.operands.size() != 2 ||
+        instruction.access != std::vector<OperandAccess>{OperandAccess::write, OperandAccess::read})
+        return;
+    const auto *memory = std::get_if<MemoryOperand>(&instruction.operands[0]);
+    const auto *source = std::get_if<RegisterOperand>(&instruction.operands[1]);
+    if (!memory || !source || memory->data_width != width || !width || width > 64 || width % 8 ||
+        memory->address_width != 64 || memory->segment || !memory->base || memory->ip_relative ||
+        memory->index || memory->writeback || memory->post_index ||
+        source->bank != RegisterBank::gpr || source->high_byte || source->width != width)
+        return;
+    static constexpr std::array<std::uint16_t, 4> argument_registers{1, 2, 8, 9};
+    const auto argument = std::find(argument_registers.begin(), argument_registers.end(), source->index);
+    if (argument == argument_registers.end()) return;
+    const auto argument_index = static_cast<std::size_t>(argument - argument_registers.begin());
+    if (argument_register_clobbered[source->index] || offset != 8 + static_cast<std::int64_t>(argument_index * 8) ||
+        std::find(instruction.register_reads.begin(), instruction.register_reads.end(), *source) ==
+            instruction.register_reads.end() || !instruction.register_writes.empty())
+        return;
+    const auto slot = std::find_if(result.slots.begin(), result.slots.end(), [&](const auto &candidate) {
+        return candidate.offset_from_entry_sp == offset && candidate.width == width;
+    });
+    if (slot != result.slots.end()) {
+        slot->incoming_argument = true;
+        slot->incoming_argument_abi = StackArgumentAbi::windows_x64;
+    }
+}
+
 // Transfer only the x86 stack operations whose meaning is explicit in the
 // decoded operands. Any other write to SP/BP invalidates that register's
 // symbolic relation instead of guessing from mnemonic text.
@@ -2164,6 +2202,8 @@ Result<StackFrameAnalysis> analyze_stack_frame(const FunctionRecord &function, c
         if (block == blocks.end() || input == inputs.end() || !input->second.reachable)
             continue;
         auto state = input->second;
+        const bool entry_block = block->second->begin == function.entry;
+        std::array<bool, 16> windows_x64_argument_register_clobbered{};
         const bool m6502_block = !block->second->instructions.empty() && block->second->instructions.front() &&
             block->second->instructions.front()->instruction.context.architecture == Architecture::mos6502;
         observe_stack_depth(state.stack_depth, m6502_block);
@@ -3212,6 +3252,9 @@ Result<StackFrameAnalysis> analyze_stack_frame(const FunctionRecord &function, c
                         (*image_default_convention == CallingConvention::sysv_x86_64 ||
                          *image_default_convention == CallingConvention::windows_x64))
                         mark_incoming_x86_64_argument(result, offset, width, read, *image_default_convention);
+                    if (entry_block && windows_x64_abi)
+                        mark_windows_x64_home_spill(result, instruction, offset, width,
+                                                    windows_x64_argument_register_clobbered);
                     if (instruction.context.architecture == Architecture::arm64)
                         mark_incoming_aarch64_argument(result, offset, width, read);
                     if (instruction.context.architecture == Architecture::arm &&
@@ -3414,6 +3457,15 @@ Result<StackFrameAnalysis> analyze_stack_frame(const FunctionRecord &function, c
             } else if (!transfer(instruction, state)) {
                 state.stack_depth = {};
                 state.supported = false;
+            }
+            if (entry_block && windows_x64_abi) {
+                if (instruction.flow == FlowKind::call) {
+                    for (const auto index : {1u, 2u, 8u, 9u})
+                        windows_x64_argument_register_clobbered[index] = true;
+                }
+                for (const auto &reg : instruction.register_writes)
+                    if (reg.bank == RegisterBank::gpr && reg.index < windows_x64_argument_register_clobbered.size())
+                        windows_x64_argument_register_clobbered[reg.index] = true;
             }
             if (!pending_arm64_stores.empty() &&
                 (!stack_depth_before_instruction.known || !state.stack_depth.known ||

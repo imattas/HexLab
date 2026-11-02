@@ -343,8 +343,14 @@ known image-default ABI. PE selects Windows x64, where entry-SP offsets below
 `+40` are excluded for the return address and 32-byte shadow space; ELF and
 Mach-O select SysV AMD64, where offsets below `+8` are excluded for the return
 address. Raw and unknown image formats do not classify x86-64 incoming
-arguments. This mapping is image-level only: per-function ABI overrides are
-not supplied to stack derivation, so mixed-ABI functions do not receive
+arguments. Windows x64 also recognizes an entry-block spill into one of the
+four home slots at `+8`, `+16`, `+24`, or `+32` when an exact `MOV` stores the
+corresponding untouched incoming `RCX`, `RDX`, `R8`, or `R9` register. This
+captures common prologue spills while leaving unrelated shadow-space stores
+unclassified. The recognition is deliberately limited to the entry block and
+does not infer arguments from copies, partial control-flow paths, or later
+register values. This mapping is image-level only: per-function ABI overrides
+are not supplied to stack derivation, so mixed-ABI functions do not receive
 override-aware classification.
 
 RV32 and RV64 base-integer psABI stack overflow arguments are tagged when a
