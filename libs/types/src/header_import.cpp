@@ -143,6 +143,8 @@ struct TemplateParameter {
     std::vector<Token> default_value_expression;
     std::string default_template;
     std::vector<TemplateParameter> nested_parameters;
+    std::vector<std::string> default_namespace_stack;
+    std::vector<std::string> default_aggregate_scopes;
 };
 struct TemplateArgument { TypePtr type; std::optional<std::uint64_t> value; std::string template_name; };
 struct TemplateBindings {
@@ -198,12 +200,8 @@ public:
                             std::uint16_t max_nesting,
                             const std::map<std::string, std::vector<TemplateArgument>, std::less<>> &packs,
                             NameResolver name_resolver = {}, TypeQuery type_query = {})
-        : tokens_(tokens), max_nesting_(max_nesting), name_resolver_(std::move(name_resolver)), type_query_(std::move(type_query)) {
-        for (const auto &[name, value] : bindings) {
-            if (value > static_cast<std::uint64_t>(INT64_MAX))
-                fail(ErrorCode::overflow, "bound integer exceeds the signed expression range");
-            bindings_.emplace(name, static_cast<std::int64_t>(value));
-        }
+        : tokens_(tokens), unsigned_bindings_(bindings), name_resolver_(std::move(name_resolver)),
+          type_query_(std::move(type_query)), max_nesting_(max_nesting) {
         for (const auto &[name, arguments] : packs)
             pack_sizes_.emplace(name, static_cast<std::int64_t>(arguments.size()));
     }
@@ -223,7 +221,7 @@ public:
         if (tokens_.empty()) fail(ErrorCode::malformed, "empty integer constant expression");
         if (tokens_.size() > max_tokens)
             fail(ErrorCode::resource_limit, "integer constant expression exceeds its token limit");
-        const auto value = parse_binary(1, 0, true);
+        const auto value = parse_conditional(0, true);
         if (position_ != tokens_.size())
             fail(ErrorCode::unsupported, "unsupported token in integer constant expression");
         return value;
@@ -253,6 +251,18 @@ private:
         if (peek() != value) return false;
         ++position_;
         return true;
+    }
+
+    std::int64_t parse_conditional(unsigned depth, bool evaluate) {
+        enter(depth);
+        const auto condition = parse_binary(1, depth + 1, evaluate);
+        if (!take("?")) return condition;
+        if (++operations_ > max_operations)
+            fail(ErrorCode::resource_limit, "integer constant expression exceeds its operation limit");
+        const auto when_true = parse_conditional(depth + 1, evaluate && condition != 0);
+        if (!take(":")) fail(ErrorCode::malformed, "conditional integer expression requires ':'");
+        const auto when_false = parse_conditional(depth + 1, evaluate && condition == 0);
+        return evaluate ? (condition != 0 ? when_true : when_false) : 0;
     }
 
     std::int64_t parse_binary(int minimum, unsigned depth, bool evaluate) {
@@ -288,13 +298,14 @@ private:
             return -value;
         }
         if (take("~")) { const auto value = parse_unary(depth + 1, evaluate); return evaluate ? ~value : 0; }
+        if (take("!")) { const auto value = parse_unary(depth + 1, evaluate); return evaluate ? !value : 0; }
         return parse_primary(depth + 1, evaluate);
     }
 
     std::int64_t parse_primary(unsigned depth, bool evaluate) {
         enter(depth);
         if (take("(")) {
-            const auto value = parse_binary(1, depth + 1, evaluate);
+            const auto value = parse_conditional(depth + 1, evaluate);
             if (!take(")")) fail(ErrorCode::malformed, "unclosed parenthesis in integer constant expression");
             return value;
         }
@@ -302,19 +313,19 @@ private:
         auto token = tokens_[position_++].text;
         if (token == "sizeof" || token == "alignof" || token == "_Alignof") {
             const bool alignment = token != "sizeof";
+            if (token == "sizeof" && take("...")) {
+                if (!take("(") || done() || !ident_start(tokens_[position_].text.front()) ||
+                    !std::all_of(tokens_[position_].text.begin(), tokens_[position_].text.end(), ident_continue))
+                    fail(ErrorCode::malformed, "sizeof... requires a parenthesized template parameter pack name");
+                const auto name = tokens_[position_++].text;
+                if (!take(")")) fail(ErrorCode::malformed, "unclosed sizeof... expression");
+                const auto pack = pack_sizes_.find(name);
+                if (pack == pack_sizes_.end())
+                    fail(ErrorCode::unsupported, "sizeof... refers to an unbound template parameter pack: '" + name + "'");
+                return evaluate ? pack->second : 0;
+            }
             if (!take("("))
                 fail(ErrorCode::unsupported, "sizeof and alignof require a parenthesized type-id in integer constant expressions");
-            if (token == "sizeof" && take("...")) {
-            if (done() || !ident_start(tokens_[position_].text.front()) ||
-                !std::all_of(tokens_[position_].text.begin(), tokens_[position_].text.end(), ident_continue))
-                fail(ErrorCode::malformed, "sizeof... requires a template parameter pack name");
-            const auto name = tokens_[position_++].text;
-            if (!take(")")) fail(ErrorCode::malformed, "unclosed sizeof... expression");
-            const auto pack = pack_sizes_.find(name);
-            if (pack == pack_sizes_.end())
-                fail(ErrorCode::unsupported, "sizeof... refers to an unbound template parameter pack: '" + name + "'");
-            return evaluate ? pack->second : 0;
-            }
             std::vector<Token> type_tokens;
             unsigned parens = 0, brackets = 0;
             while (!done()) {
@@ -359,6 +370,12 @@ private:
         const auto lookup_name = global_qualified ? "::" + token : token;
         if (const auto binding = bindings_.find(lookup_name); binding != bindings_.end())
             return evaluate ? binding->second : 0;
+        if (const auto binding = unsigned_bindings_.find(lookup_name); binding != unsigned_bindings_.end()) {
+            if (!evaluate) return 0;
+            if (binding->second > static_cast<std::uint64_t>(INT64_MAX))
+                fail(ErrorCode::overflow, "bound integer exceeds the signed expression range");
+            return static_cast<std::int64_t>(binding->second);
+        }
         if (name_resolver_)
             if (const auto value = name_resolver_(lookup_name)) return evaluate ? *value : 0;
         fail(ErrorCode::unsupported, "unbound name in integer constant expression: '" + lookup_name + "'");
@@ -426,6 +443,7 @@ private:
 
     const std::vector<Token> &tokens_;
     std::map<std::string, std::int64_t, std::less<>> bindings_;
+    std::map<std::string, std::uint64_t, std::less<>> unsigned_bindings_;
     NameResolver name_resolver_;
     TypeQuery type_query_;
     std::map<std::string, std::int64_t, std::less<>> pack_sizes_;
@@ -452,6 +470,7 @@ public:
           inline_namespace_children_(context.inline_namespace_children_),
           inline_namespace_paths_(context.inline_namespace_paths_),
           using_namespaces_(context.using_namespaces_), namespaces_(context.namespaces_), names_(context.names_),
+          enum_value_bindings_(context.enum_value_bindings_),
           template_aliases_(context.template_aliases_), aggregate_templates_(context.aggregate_templates_),
           template_instances_(context.template_instances_), active_template_aliases_(context.active_template_aliases_),
           template_type_bindings_(context.template_type_bindings_),
@@ -979,9 +998,8 @@ private:
             return {{},{},std::move(resolved)};
         }
         if(parameter.value_parameter){
-            const auto value=expanded.evaluate_integer_expression(pattern,expanded.template_value_bindings_);
-            if(value<0)fail(ErrorCode::unsupported,"negative expanded non-type template arguments are unsupported");
-            return {{},static_cast<std::uint64_t>(value),{}};
+            const auto value=expanded.evaluate_template_integer_argument(pattern,expanded.template_value_bindings_);
+            return {{},value,{}};
         }
         auto base=expanded.parse_base();
         if(base.is_typedef||base.is_static||base.is_inline)
@@ -1056,10 +1074,7 @@ private:
                 append({{}, {}, std::move(template_name)});
             } else if (parameter->value_parameter) {
                 const auto expression = take_integer_expression_until_template_delimiter();
-                const auto evaluated = evaluate_integer_expression(expression, template_value_bindings_);
-                if (evaluated < 0)
-                    fail(ErrorCode::unsupported, "negative non-type template arguments are unsupported");
-                append({{}, static_cast<std::uint64_t>(evaluated), {}});
+                append({{}, evaluate_template_integer_argument(expression, template_value_bindings_), {}});
             } else {
                 auto base = parse_base();
                 if (base.is_typedef || base.is_static) syntax("storage specifiers are invalid in template arguments");
@@ -1085,6 +1100,25 @@ private:
         for (std::size_t nested = 0; nested < actual_parameters->size(); ++nested)
             if (!same_template_parameter_shape(parameter.nested_parameters[nested], (*actual_parameters)[nested]))
                 fail(ErrorCode::malformed, "template argument parameter kinds do not match template-template parameter '" + parameter.name + "'");
+    }
+    Parser template_default_context(const TemplateParameter &parameter, const TemplateBindings &bindings) {
+        if (template_depth_ >= o_.max_nesting)
+            fail(ErrorCode::resource_limit, "template default expansion exceeds configured nesting limit");
+        Parser defaults(tokens_with_eof({}), o_, *this);
+        // Cloning a binding environment is not a type expansion. The actual
+        // type-id parser/instantiator accounts for expansion depth normally.
+        defaults.template_depth_ = template_depth_;
+        defaults.namespace_stack_ = parameter.default_namespace_stack;
+        defaults.aggregate_scopes_ = parameter.default_aggregate_scopes;
+        // Defaults belong to the destination declaration. An unrelated caller
+        // template parameter with the same spelling must not capture a name.
+        defaults.template_type_bindings_ = bindings.types;
+        defaults.template_value_bindings_ = bindings.values;
+        defaults.template_template_bindings_ = bindings.templates;
+        defaults.template_pack_bindings_ = bindings.packs;
+        defaults.template_type_packs_ = bindings.type_packs;
+        defaults.template_value_packs_ = bindings.value_packs;
+        return defaults;
     }
     TemplateBindings bind_template_parameters(const std::vector<TemplateParameter> &parameters,
                                                const std::vector<TemplateArgument> &arguments) {
@@ -1127,10 +1161,11 @@ private:
             if (parameter.value_parameter) {
                 std::optional<std::uint64_t> value = argument ? argument->value : std::nullopt;
                 if (!argument && !parameter.default_value_expression.empty()) {
-                    const auto evaluated = evaluate_integer_expression(parameter.default_value_expression, bindings.values);
-                    if (evaluated < 0)
-                        fail(ErrorCode::unsupported, "negative non-type template defaults are unsupported");
-                    value = static_cast<std::uint64_t>(evaluated);
+                    // Defaults see every preceding binding, including types
+                    // queried by sizeof/alignof and templates used by a type-id.
+                    auto defaults = template_default_context(parameter, bindings);
+                    value = defaults.evaluate_template_integer_argument(parameter.default_value_expression,
+                                                                         defaults.template_value_bindings_);
                 }
                 if (!value) fail(ErrorCode::malformed, "template requires an integer argument for '" + parameter.name + "'");
                 if (argument && (argument->type || !argument->template_name.empty()))
@@ -1149,6 +1184,10 @@ private:
                 bindings.values.emplace(parameter.name, *value);
             } else if (parameter.template_parameter) {
                 std::string template_name = argument ? argument->template_name : parameter.default_template;
+                if (!argument) {
+                    if (const auto preceding = bindings.templates.find(template_name); preceding != bindings.templates.end())
+                        template_name = preceding->second;
+                }
                 if (template_name.empty() || (argument && (argument->type || argument->value)))
                     fail(ErrorCode::malformed, "template requires a template argument for '" + parameter.name + "'");
                 validate_template_template_argument(parameter, template_name);
@@ -1156,8 +1195,10 @@ private:
             } else {
                 TypePtr type;
                 if (argument) type = argument->type;
-                else if (!parameter.default_type.empty())
-                    type = parse_type_tokens(parameter.default_type, bindings.types, bindings.values, bindings.templates, bindings.packs, bindings.type_packs, bindings.value_packs);
+                else if (!parameter.default_type.empty()) {
+                    auto defaults = template_default_context(parameter, bindings);
+                    type = defaults.parse_type_tokens(parameter.default_type, {});
+                }
                 else fail(ErrorCode::malformed, "too few type arguments for template");
                 if (!type || (argument && (argument->value || !argument->template_name.empty())))
                     fail(ErrorCode::malformed, "template argument '" + parameter.name + "' must be a type");
@@ -1256,6 +1297,8 @@ private:
             if (take("=")) {
                 if (parameter.pack) fail(ErrorCode::malformed, "a template parameter pack cannot have a default");
                 saw_default = true;
+                parameter.default_namespace_stack = namespace_stack_;
+                parameter.default_aggregate_scopes = aggregate_scopes_;
                 if (parameter.value_parameter) {
                     parameter.default_value_expression = take_integer_expression_until_template_delimiter();
                 } else {
@@ -1276,9 +1319,16 @@ private:
                 if (parameter.template_parameter) {
                     std::string default_name;
                     for (const auto &token : parameter.default_type) default_name += token.text;
-                    parameter.default_template = resolve_template_name(default_name);
+                    const auto preceding = std::find_if(parameters.begin(), parameters.end(), [&](const auto &item) {
+                        return item.name == default_name;
+                    });
+                    if (preceding != parameters.end()) {
+                        if (!preceding->template_parameter || preceding->pack)
+                            fail(ErrorCode::malformed, "template-template default must name a template parameter or template");
+                        parameter.default_template = default_name;
+                    } else parameter.default_template = resolve_template_name(default_name);
                     if (parameter.default_template.empty())
-                        fail(ErrorCode::unsupported, "template-template default must name a previously declared template");
+                        fail(ErrorCode::unsupported, "template-template default must name a preceding template parameter or declared template");
                 }
                 }
             } else if (saw_default && !parameter.pack) {
@@ -3081,7 +3131,25 @@ private:
         const auto type_query = [this](const std::vector<Token> &tokens, bool alignment) {
             return query_type_extent(tokens, alignment);
         };
-        return IntegerExpressionParser(expression, bindings, o_.max_nesting, template_pack_bindings_, {}, type_query).parse();
+        const auto name_resolver = [this](std::string_view name) {
+            return resolve_enum_expression_name(name, enum_value_bindings_);
+        };
+        return IntegerExpressionParser(expression, bindings, o_.max_nesting, template_pack_bindings_, name_resolver, type_query).parse();
+    }
+    std::uint64_t evaluate_template_integer_argument(
+        const std::vector<Token> &expression,
+        const std::map<std::string, std::uint64_t, std::less<>> &bindings) {
+        // Direct literal arguments and direct forwarding preserve the full
+        // nonnegative range. Compound arithmetic uses the signed evaluator.
+        if (expression.size() == 1) {
+            const auto &token = expression.front().text;
+            if (!token.empty() && token.front() >= '0' && token.front() <= '9')
+                return integer_token_magnitude(token, std::numeric_limits<std::uint64_t>::max());
+            if (const auto binding = bindings.find(token); binding != bindings.end()) return binding->second;
+        }
+        const auto value = evaluate_integer_expression(expression, bindings);
+        if (value < 0) fail(ErrorCode::unsupported, "negative non-type template arguments are unsupported");
+        return static_cast<std::uint64_t>(value);
     }
     std::int64_t evaluate_integer_expression(
         const std::vector<Token> &expression,

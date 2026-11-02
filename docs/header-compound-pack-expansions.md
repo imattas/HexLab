@@ -151,6 +151,11 @@ parameter adjustment. Integral packs must occur inside template type patterns;
 and are rejected even for empty packs.
 
 Expressions must evaluate completely using the bounded signed integer subset.
+This includes unary `!` and conditional `?:`, for example
+`Buffer<(Counts ? Counts : 1)>...` chooses a nonzero size for each element.
+Only the selected branch performs arithmetic; both branches must still parse
+and resolve names/types. Direct forwarding retains the full unsigned integral
+range, while compound arithmetic remains signed 64-bit.
 Unknown names, unsupported dependent member/call expressions, fold expressions,
 overflow, division by zero, negative final arguments, and values outside a
 destination non-type parameter's width fail explicitly. No expression inversion,

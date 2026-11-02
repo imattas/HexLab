@@ -15,11 +15,45 @@ their declared width; unsigned 64-bit parameters accept the full `uint64_t`
 range, while signed parameters accept only non-negative values through their
 signed maximum. Direct literal arguments retain this range even though compound
 constant expressions remain limited to the importer's signed 64-bit evaluator.
+Direct forwarding of a bound integral argument and direct literal defaults also
+preserve the full unsigned range. An unrelated high-bit bound value does not
+prevent another signed expression from evaluating; an evaluated use of that
+value in compound arithmetic still fails the signed-range check.
 A non-type parameter can drive a member array extent. A
 template-template parameter can instantiate a previously declared class or
 alias template inside an aggregate body or alias target. It can also be forwarded
 as a template-name argument. Concrete aggregate instance names include every
 expanded pack argument, so different packs produce distinct modeled types.
+
+Defaults bind from left to right using preceding type, integral, and
+template-template arguments. Integral defaults can query supported concrete
+type-ids with `sizeof` / `alignof`, including a type instantiated through a
+preceding template-template parameter. A template-template default may name an
+earlier template-template parameter; the concrete template must satisfy the
+destination's exact nested parameter shape.
+Unqualified names in type/integral defaults resolve in the template's declaration
+namespace even when a caller uses its qualified name from another namespace.
+Only that template's preceding arguments bind its defaults; unrelated caller
+template parameters with matching names do not capture those names.
+
+```cpp
+template <typename T> struct Box { T value; };
+template <typename T,
+          template <typename> class Container = Box,
+          template <typename> class Copy = Container,
+          unsigned Bytes = sizeof(Copy<T>),
+          unsigned Count = (Bytes > 2 ? Bytes : 2)>
+using Storage = unsigned char[Count];
+using ShortStorage = Storage<unsigned short>;
+```
+
+The ordinary target ABI determines `Bytes`; `Count` is at least two. Bounded
+integer expressions support unary `!` and right-associative `?:` as well as
+the existing arithmetic, comparison, bitwise and logical operators. Conditional
+branches are both parsed and names/types must resolve in both; arithmetic in
+the unselected branch is not evaluated. The same evaluator serves non-type
+arguments, array extents, static assertions, enumerators and integral pack
+patterns. Parenthesize comparisons/shifts in template argument/default lists.
 
 An argument consisting of a bound pack name followed by `...` expands that pack
 into the destination template's argument list. Type, integral, and template-name
@@ -94,8 +128,9 @@ or additional layout rules.
 already supported by the importer, including array extents and integer
 non-type template arguments. `EmptyPackSized` therefore has a one-byte array and
 `ThreePackSized` has a four-byte array. The expression requires a bound pack
-from the current template instantiation; it does not evaluate arbitrary
-`sizeof` expressions over C++ types.
+from the current template instantiation. Type-form `sizeof(T)` is a separate
+query over the ordinary supported complete object types; expression-form
+`sizeof` remains unsupported.
 
 Concrete aggregate instances can contain member typedefs, ordinary type aliases,
 and uninitialized static data declarations. Their aliases export qualified keys
@@ -133,9 +168,9 @@ and `Box<Types>...`, with synthetic `name__packN` names in source order.
 Signatures containing parameter expansion are capped at 32 concrete parameters;
 empty type packs contribute none. Integral/template-name packs, defaults on
 expanded parameters, references, and parenthesized/array pack declarators are
-unsupported. Fold expressions and
-general `sizeof` expressions remain unsupported; only `sizeof...(Pack)` is
-recognized as a bounded integer expression.
+unsupported. Fold expressions and expression-form `sizeof` remain unsupported;
+`sizeof...(Pack)` and parenthesized type-id `sizeof` / `alignof` queries are
+recognized as bounded integer expressions.
 A trailing pack can be declared without using it in the body. Explicit and
 partial class-template specializations support the documented direct type,
 pointer, and integral patterns, but still reject template-template parameters

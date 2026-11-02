@@ -184,18 +184,21 @@ An integer constant-expression evaluator supports decimal, octal, and
 hexadecimal literals; previously bound integral template parameters;
 `true`/`false`; type-id `sizeof(T)`, `alignof(T)`, and `_Alignof(T)` using
 already imported ABI sizes and alignments; `sizeof...(Pack)` for a bound
-template parameter pack; parentheses; unary `+`, `-`, `~`; arithmetic `+`, `-`, `*`,
+template parameter pack; parentheses; unary `+`, `-`, `~`, `!`; arithmetic `+`, `-`, `*`,
 `/`, `%`; shifts `<<`, `>>`; relational `<`, `>`, `<=`, `>=`; equality `==`,
-`!=`; logical `&&`, `||`; and bitwise `&`, `^`, `|`, with C++-style operator
+`!=`; logical `&&`, `||`; bitwise `&`, `^`, `|`; and conditional `?:`, with C++-style operator
 precedence. It is used for non-type template
 arguments, non-type defaults (which may refer to earlier parameters), and
 fixed array extents in instantiated templates. Final non-type values and array
 extents must be non-negative; negative results, division by zero, overflow,
 unknown names, and unsupported operators fail explicitly. Each expression is
 limited to 4096 tokens and operations and the configured parser nesting limit.
-Logical operators evaluate both operands; conditional `?:`, comma expressions,
-unsigned expression arithmetic, and general C++ constant evaluation are not
-implemented. In template argument and default expressions, operators spelled
+Logical operators and `?:` short-circuit arithmetic evaluation, while all
+operands/branches are still parsed and names/types must resolve. Comma expressions,
+unsigned compound arithmetic and general C++ constant evaluation are not
+implemented. Direct literal non-type arguments/defaults and direct bound-value
+forwarding preserve the full uint64 range before destination-width checking.
+In template argument and default expressions, operators spelled
 with `<` or `>` must be parenthesized so they are not confused with template
 delimiters. No compiler is invoked.
 
@@ -225,7 +228,10 @@ template-template arguments that are direct
 template parameter names or fixed template names. See
 [integral non-type class-template specializations](header-non-type-specializations.md)
 for examples. Specializations must follow a previously declared primary
-template. Default arguments are applied from left to right. A direct `Pack...`
+template. Default arguments are applied from left to right, retaining preceding
+type, integral and template-template bindings for dependent defaults such as
+`unsigned N = sizeof(T)`. A template-template default can name an earlier
+template-template parameter and retains normal exact shape validation. A direct `Pack...`
 argument forwards a bound type, integral, or template-name pack into a nested
 template argument list, checking every expanded argument against its destination
 parameter. Compound argument patterns such as `const Types*...`,
@@ -490,8 +496,9 @@ declarations are checked using the bounded integer-constant-expression parser.
 Assertions may use previously imported enum constants, expanded object-like
 macros, type-id `sizeof`/`alignof` queries, and an optional adjacent
 string-literal message. A false assertion returns a conflict with its source
-line and message. Expression-form `sizeof`, conditional expressions, and
-general C++ constant evaluation remain outside the supported subset.
+line and message. Unary `!` and right-associative conditional `?:` expressions
+are supported by the shared evaluator. Expression-form `sizeof` and general
+C++ constant evaluation remain outside the supported subset.
 
 Enum assignments accept bounded integer constant expressions using the
 supported evaluator above, including references to earlier
@@ -510,6 +517,10 @@ example, `false && (1 / 0)` and `true || (1 / 0)` are accepted as `false` and
 `true`; both operands are still parsed, and names in a skipped operand must
 still resolve. This prevents an unevaluated divide-by-zero from rejecting an
 otherwise valid enumerator expression.
+Conditional `?:` expressions similarly evaluate only the selected branch,
+while still parsing both branches and resolving their names and type-ids.
+For example, `true ? 4 : (1 / 0)` evaluates to four. Signed 64-bit arithmetic,
+4096 expression tokens/operations and configured nesting limits still apply.
 References must name an enumerator already declared in the same enum or a
 previously parsed enum visible through the current/enclosing namespace or its
 explicit qualified name.
