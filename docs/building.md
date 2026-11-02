@@ -77,9 +77,8 @@ If it detects an earlier installation, it offers to uninstall that version
 before proceeding with the new install.
 The ZIP remains the default when this option is disabled.
 
-Windows and portability GitHub workflows are manual-dispatch only. They do not
-run on pushes or pull requests. Local release builds and publishing are the
-normal release path:
+HexLab has no GitHub Actions workflows. Configure and package the Windows
+release locally with:
 
 ```powershell
 cmake --preset windows-desktop
@@ -94,10 +93,11 @@ cmake --build --preset linux-desktop --target package --parallel 6
 ```
 
 The Windows ZIP and Linux TGZ/DEB are written under their preset's
-`out/build/<preset>/packages/` directory. After reviewing the local artifacts,
-create and push a version tag, then publish those files manually with `gh
-release create TAG ARTIFACT... --title TITLE --notes-file NOTES_FILE --verify-tag`.
-Do not use a GitHub Actions run to build or publish releases.
+`out/build/<preset>/packages/` directory. Build and review these artifacts
+locally on Windows and WSL. To publish a release, create and push its version
+tag, then upload the local files manually with `gh release create TAG
+ARTIFACT... --title TITLE --notes-file NOTES_FILE --verify-tag`. Do not use
+GitHub Actions for builds, tests, or release publishing.
 
 Linux desktop builds produce both a relocatable TGZ and an installable Debian
 package. Linux packages include the GUI,
@@ -116,8 +116,7 @@ automation remains disabled by default.
 
 Build and package Windows and Linux releases locally. Review the resulting
 artifacts on each host, then publish them manually with `gh release create` as
-described above. HexLab does not use GitHub Actions to build, test, or publish
-releases.
+described above.
 
 Validate the installed files and both tools with:
 
