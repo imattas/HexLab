@@ -34,7 +34,9 @@ The status reports the current occurrence number and total non-overlapping
 matches in the complete file, along with the source line and mapped address
 when available.
 Files above that bound retain mapped excerpt browsing while search is disabled.
-Editing has a separate 1 MiB limit. Search reads and decodes the whole file
+Editing has a separate 64 MiB encoded-file limit. Edit source reloads and
+decodes the entire file in the cancellable background loader, then appends
+UTF-8-boundary chunks to the editor. Search reads and decodes the whole file
 within its bound, so a reported no-match means the complete file was scanned.
 A match recenters the excerpt and refreshes the mapped-address table for that
 source line in the active address space. The status reports the line and mapped
@@ -50,7 +52,8 @@ document also requests cancellation. Results are applied only while the same
 document snapshot, source path, and selected address remain active. Selecting
 a mapped line in the complete file navigates to its machine address. **Show
 mapped excerpt** returns to the bounded mapped window. The complete view is
-read-only; source editing retains its separate 1 MiB limit. **Copy excerpt**
+read-only; source editing retains its separate 64 MiB encoded-file limit and
+uses the same bounded background loading and rendering path. **Copy excerpt**
 rejects complete-file contents above the 1 MiB clipboard limit before making
 an encoded copy.
 
@@ -80,7 +83,7 @@ index when one exists; lines beyond the original newline sequence use the
 dominant original style, with LF on a tie. Inserting or deleting lines shifts
 text relative to this positional rule; line-ending identity is not matched by
 text content. Malformed UTF-8 or UTF-16
-remains view-only. The 1 MiB limit applies to the encoded file after editing.
+remains view-only. The 64 MiB limit applies to the encoded file after editing.
 **Save** writes through a temporary sibling file and atomically replaces the selected local
 file. The replacement retains Windows file
 ACLs through `ReplaceFile`; on POSIX it preserves owner, group, and mode, and
@@ -161,7 +164,7 @@ checkpoint belongs to the exact captured document snapshot; a changed project
 publication or document cannot receive an older continuation's result. These
 checks do not lock a source file against an active external writer. No source
 or project bytes are changed by scanning. Full-file search is bounded at 64 MiB;
-editing remains bounded at 1 MiB.
+editing remains bounded at 64 MiB.
 
 Source text with a UTF-8 BOM is displayed without the marker. UTF-16LE and
 UTF-16BE files are decoded when they have the matching byte-order mark; invalid

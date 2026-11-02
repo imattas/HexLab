@@ -9,6 +9,7 @@
 #include <wx/choice.h>
 #include <wx/timer.h>
 #include <functional>
+#include <cstddef>
 #include <memory>
 #include <optional>
 #include <cstdint>
@@ -40,6 +41,12 @@ struct SourceSearchResult {
 struct SourceFileLoadResult {
     std::string failure;
     std::string utf8_text;
+    std::vector<std::byte> original_bytes;
+    std::vector<bool> line_endings_crlf;
+    bool utf8_bom = false;
+    bool utf16 = false;
+    bool utf16_little_endian = true;
+    bool default_crlf = false;
 };
 struct SourceRevisionCheckResult {
     std::string status;
@@ -155,8 +162,15 @@ class SourceView final : public wxPanel {
     bool source_load_running_ = false;
     bool source_load_rendering_ = false;
     std::string source_load_render_buffer_;
+    std::vector<std::byte> source_load_original_bytes_;
+    std::vector<bool> source_load_line_endings_crlf_;
     std::size_t source_load_render_offset_ = 0;
     std::size_t source_load_next_progress_ = 0;
+    bool source_load_for_edit_ = false;
+    bool source_load_utf8_bom_ = false;
+    bool source_load_utf16_ = false;
+    bool source_load_utf16_little_endian_ = true;
+    bool source_load_default_crlf_ = false;
     std::future<SourceExcerptLoadResult> source_excerpt_future_;
     std::stop_source source_excerpt_stop_;
     bool source_excerpt_running_ = false;
@@ -227,7 +241,7 @@ class SourceView final : public wxPanel {
     std::optional<std::int64_t> focused_source_line() const;
     void find_source_text(bool next);
     void poll_source_search();
-    void load_or_cancel_full_source();
+    void load_or_cancel_full_source(bool for_edit = false);
     void poll_full_source_load();
     void start_source_excerpt(SourceExcerptRequest);
     void poll_source_excerpt();

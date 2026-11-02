@@ -53,6 +53,7 @@ struct SourceScanCheckpoint {
 namespace {
 constexpr std::uintmax_t max_source_bytes = 1024u * 1024u;
 constexpr std::uintmax_t max_source_search_bytes = 64u * 1024u * 1024u;
+constexpr std::uintmax_t max_source_edit_bytes = 64u * 1024u * 1024u;
 constexpr std::uintmax_t max_source_excerpt_scan_bytes = 64u * 1024u * 1024u;
 constexpr std::int64_t context_lines = 20;
 constexpr std::size_t max_source_path_bytes = 32u * 1024u;
@@ -188,8 +189,9 @@ std::optional<std::filesystem::path> resolve_source(const std::filesystem::path 
         return {};
     }
     if (limit && size > *limit) {
-        failure = *limit == max_source_bytes ? "Source file exceeds the 1 MiB search/edit limit"
-                                            : "Source file exceeds the configured source limit";
+        failure = *limit == max_source_edit_bytes ? "Source file exceeds the 64 MiB edit limit"
+            : *limit == max_source_search_bytes ? "Source file exceeds the 64 MiB search limit"
+            : "Source file exceeds the configured source limit";
         return {};
     }
     return resolved;
@@ -270,12 +272,12 @@ SourceRevisionCheckResult verify_pdb_source_sha256(const std::filesystem::path &
 }
 
 std::vector<std::byte> read_source(const std::filesystem::path &path, std::string &failure) {
-    const auto resolved = resolve_source(path, max_source_bytes, failure);
+    const auto resolved = resolve_source(path, max_source_edit_bytes, failure);
     if (!resolved) return {};
     std::error_code error;
     const auto size = std::filesystem::file_size(*resolved, error);
-    if (error || size > max_source_bytes) {
-        failure = "Source file changed or exceeds the 1 MiB search/edit limit";
+    if (error || size > max_source_edit_bytes) {
+        failure = "Source file changed or exceeds the 64 MiB edit limit";
         return {};
     }
     std::ifstream input(*resolved, std::ios::binary);
@@ -294,7 +296,7 @@ std::vector<std::byte> read_source(const std::filesystem::path &path, std::strin
         bytes.resize(static_cast<std::size_t>(count));
     }
     if (input.peek() != std::char_traits<char>::eof()) {
-        failure = "Source file changed or exceeds the 1 MiB search/edit limit";
+        failure = "Source file changed or exceeds the 64 MiB edit limit";
         return {};
     }
     return bytes;
@@ -368,7 +370,7 @@ bool append_utf8(std::string &output, std::uint32_t value) {
 }
 
 bool append_utf16_unit(std::vector<std::byte> &output, std::uint16_t unit, bool little_endian) {
-    if (output.size() > max_source_bytes - 2) return false;
+    if (output.size() > max_source_edit_bytes - 2) return false;
     const auto first = static_cast<std::uint8_t>(unit & 0xff);
     const auto second = static_cast<std::uint8_t>(unit >> 8);
     output.push_back(static_cast<std::byte>(little_endian ? first : second));
@@ -480,7 +482,15 @@ bool valid_source_utf8(std::string_view text_value, std::stop_token stop) {
     return !stop.stop_requested();
 }
 
-SourceFileLoadResult load_source_file(const std::filesystem::path &path, std::stop_token stop) {
+struct SourceNewlineStyle {
+    std::vector<bool> line_crlf;
+    bool default_crlf = false;
+};
+
+SourceNewlineStyle inspect_newlines(std::string_view decoded, std::stop_token stop);
+
+SourceFileLoadResult load_source_file(const std::filesystem::path &path, std::stop_token stop,
+                                     bool retain_original) {
     SourceFileLoadResult result;
     auto bytes = read_source_search(path, stop, result.failure);
     if (!result.failure.empty()) {
@@ -497,19 +507,33 @@ SourceFileLoadResult load_source_file(const std::filesystem::path &path, std::st
             "Source file contains malformed UTF-8";
         return result;
     }
+    result.utf8_bom = bytes.size() >= 3 && std::to_integer<unsigned char>(bytes[0]) == 0xef &&
+        std::to_integer<unsigned char>(bytes[1]) == 0xbb && std::to_integer<unsigned char>(bytes[2]) == 0xbf;
+    result.utf16 = bytes.size() >= 2 &&
+        ((std::to_integer<unsigned char>(bytes[0]) == 0xff &&
+          std::to_integer<unsigned char>(bytes[1]) == 0xfe) ||
+         (std::to_integer<unsigned char>(bytes[0]) == 0xfe &&
+          std::to_integer<unsigned char>(bytes[1]) == 0xff));
+    result.utf16_little_endian = !result.utf16 || std::to_integer<unsigned char>(bytes[0]) == 0xff;
+    if (retain_original) {
+        auto newline_style = inspect_newlines(*decoded, stop);
+        if (stop.stop_requested()) {
+            result.failure = "Full-file source load canceled";
+            return result;
+        }
+        result.line_endings_crlf = std::move(newline_style.line_crlf);
+        result.default_crlf = newline_style.default_crlf;
+        result.original_bytes = std::move(bytes);
+    }
     result.utf8_text = std::move(*decoded);
     return result;
 }
 
-struct SourceNewlineStyle {
-    std::vector<bool> line_crlf;
-    bool default_crlf = false;
-};
-
-SourceNewlineStyle inspect_newlines(std::string_view decoded) {
+SourceNewlineStyle inspect_newlines(std::string_view decoded, std::stop_token stop) {
     SourceNewlineStyle result;
     std::size_t crlf_count = 0, lf_count = 0;
     for (std::size_t i = 0; i < decoded.size(); ++i) {
+        if ((i & 0xffffu) == 0 && stop.stop_requested()) return {};
         if (decoded[i] != '\n') continue;
         const bool crlf = i > 0 && decoded[i - 1] == '\r';
         result.line_crlf.push_back(crlf);
@@ -641,7 +665,7 @@ std::optional<SourceExcerpt> read_source_excerpt(const std::filesystem::path &pa
                              : static_cast<std::uint16_t>((*first << 8) | *second);
     };
     SourceExcerpt excerpt;
-    excerpt.full_file_available = size <= max_source_bytes;
+    excerpt.full_file_available = size <= max_source_edit_bytes;
     excerpt.first_line = std::max<std::int64_t>(1, focus_line - context_lines);
     excerpt.lines = std::move(checkpoint.lines);
     const auto last_line = focus_line + context_lines;
@@ -929,6 +953,7 @@ SourceView::SourceView(wxWindow *parent)
     toggle_breakpoint_->SetToolTip("Add or remove a saved software breakpoint at the selected mapped address.");
     edit_source_ = new wxButton(this, wxID_ANY, "Edit source");
     edit_source_->SetName("source-edit");
+    edit_source_->SetToolTip("Load and edit the complete UTF-8 or BOM-marked UTF-16 source file (maximum 64 MiB encoded)");
     save_source_ = new wxButton(this, wxID_ANY, "Save");
     save_source_->SetName("source-save");
     discard_source_ = new wxButton(this, wxID_ANY, "Discard edits");
@@ -1653,7 +1678,7 @@ void SourceView::apply_source_excerpt(const SourceExcerptRequest &request,
         status_->SetLabel(status_->GetLabel() + "; additional unique addresses omitted by the 4096-address limit");
     if (!selected.scope.empty()) status_->SetLabel(status_->GetLabel() + " / " + text(selected.scope));
     if (!source_full_file_available_)
-        status_->SetLabel(status_->GetLabel() + "; editing requires at most 1 MiB");
+        status_->SetLabel(status_->GetLabel() + "; editing requires at most 64 MiB");
     if (!source_search_available_)
         status_->SetLabel(status_->GetLabel() + "; full-file search unavailable above 64 MiB");
     if (!visible_lines_.empty())
@@ -2328,17 +2353,20 @@ void SourceView::update_mapping_controls() {
                                   source_line_index_->offset < source_line_index_->size);
 }
 
-void SourceView::load_or_cancel_full_source() {
+void SourceView::load_or_cancel_full_source(bool for_edit) {
     if (source_load_running_) {
         if (source_load_rendering_) {
             source_load_timer_.Stop();
             source_load_rendering_ = false;
             source_load_running_ = false;
             std::string{}.swap(source_load_render_buffer_);
+            std::vector<std::byte>{}.swap(source_load_original_bytes_);
+            std::vector<bool>{}.swap(source_load_line_endings_crlf_);
             source_load_render_offset_ = source_load_next_progress_ = 0;
             source_load_document_.reset();
             source_load_path_.clear();
             source_load_selection_.reset();
+            source_load_for_edit_ = false;
             source_->Enable(true);
             update_source_edit_controls();
             if (displayed_source_row_)
@@ -2350,7 +2378,7 @@ void SourceView::load_or_cancel_full_source() {
         status_->SetLabel("Canceling full-file source load...");
         return;
     }
-    if (full_file_display_) {
+    if (full_file_display_ && !for_edit) {
         if (displayed_source_row_)
             render_source_row(*displayed_source_row_, displayed_context_);
         return;
@@ -2367,23 +2395,29 @@ void SourceView::load_or_cancel_full_source() {
     source_load_path_ = rendered_path_;
     source_load_selection_ = selection_address_;
     source_load_stop_ = std::stop_source{};
+    source_load_for_edit_ = for_edit;
+    source_load_original_bytes_.clear();
+    source_load_line_endings_crlf_.clear();
     const auto stop = source_load_stop_.get_token();
     const auto load_path = *path;
     try {
-        source_load_future_ = std::async(std::launch::async, [load_path, stop] {
-            return load_source_file(load_path, stop);
+        source_load_future_ = std::async(std::launch::async, [load_path, stop, for_edit] {
+            return load_source_file(load_path, stop, for_edit);
         });
     } catch (const std::exception &error) {
         source_load_document_.reset();
         source_load_path_.clear();
         source_load_selection_.reset();
+        source_load_for_edit_ = false;
         status_->SetLabel("Could not start full-file source load: " + text(error.what()));
         return;
     }
     source_load_running_ = true;
     update_source_edit_controls();
     source_->Enable(false);
-    status_->SetLabel("Loading and decoding the complete source file in the background (64 MiB cap)...");
+    status_->SetLabel(for_edit
+        ? "Loading complete source file for editing in the background (64 MiB cap)..."
+        : "Loading and decoding the complete source file in the background (64 MiB cap)...");
     source_load_timer_.Start(35);
 }
 
@@ -2407,10 +2441,13 @@ void SourceView::poll_full_source_load() {
         source_load_timer_.Stop();
         source_load_running_ = source_load_rendering_ = false;
         std::string{}.swap(source_load_render_buffer_);
+        std::vector<std::byte>{}.swap(source_load_original_bytes_);
+        std::vector<bool>{}.swap(source_load_line_endings_crlf_);
         source_load_render_offset_ = source_load_next_progress_ = 0;
         source_load_document_.reset();
         source_load_path_.clear();
         source_load_selection_.reset();
+        source_load_for_edit_ = false;
         source_->Enable(true);
         update_source_edit_controls();
         return;
@@ -2434,6 +2471,9 @@ void SourceView::poll_full_source_load() {
             source_load_document_.reset();
             source_load_path_.clear();
             source_load_selection_.reset();
+            source_load_for_edit_ = false;
+            std::vector<std::byte>{}.swap(source_load_original_bytes_);
+            std::vector<bool>{}.swap(source_load_line_endings_crlf_);
             source_->Enable(true);
             update_source_edit_controls();
             status_->SetLabel("Could not load full source file: " + text(result.failure));
@@ -2443,6 +2483,12 @@ void SourceView::poll_full_source_load() {
         // Convert and append bounded chunks on successive timer ticks so the
         // UI thread never handles a 64 MiB ChangeValue or re-encodes the file.
         source_load_render_buffer_ = std::move(result.utf8_text);
+        source_load_original_bytes_ = std::move(result.original_bytes);
+        source_load_line_endings_crlf_ = std::move(result.line_endings_crlf);
+        source_load_utf8_bom_ = result.utf8_bom;
+        source_load_utf16_ = result.utf16;
+        source_load_utf16_little_endian_ = result.utf16_little_endian;
+        source_load_default_crlf_ = result.default_crlf;
         source_load_render_offset_ = 0;
         source_load_next_progress_ = 1024u * 1024u;
         source_load_rendering_ = true;
@@ -2466,10 +2512,13 @@ void SourceView::poll_full_source_load() {
             source_load_timer_.Stop();
             source_load_rendering_ = source_load_running_ = false;
             std::string{}.swap(source_load_render_buffer_);
+            std::vector<std::byte>{}.swap(source_load_original_bytes_);
+            std::vector<bool>{}.swap(source_load_line_endings_crlf_);
             source_load_render_offset_ = source_load_next_progress_ = 0;
             source_load_document_.reset();
             source_load_path_.clear();
             source_load_selection_.reset();
+            source_load_for_edit_ = false;
             source_->Enable(true);
             update_source_edit_controls();
             status_->SetLabel("Could not split the validated source text at a UTF-8 boundary");
@@ -2482,10 +2531,13 @@ void SourceView::poll_full_source_load() {
             source_load_timer_.Stop();
             source_load_rendering_ = source_load_running_ = false;
             std::string{}.swap(source_load_render_buffer_);
+            std::vector<std::byte>{}.swap(source_load_original_bytes_);
+            std::vector<bool>{}.swap(source_load_line_endings_crlf_);
             source_load_render_offset_ = source_load_next_progress_ = 0;
             source_load_document_.reset();
             source_load_path_.clear();
             source_load_selection_.reset();
+            source_load_for_edit_ = false;
             source_->Enable(true);
             update_source_edit_controls();
             status_->SetLabel("Source text chunk could not be represented safely by the desktop text control");
@@ -2503,6 +2555,11 @@ void SourceView::poll_full_source_load() {
     }
 
     full_file_display_ = true;
+    const bool begin_edit = source_load_for_edit_;
+    const auto completed_path = source_load_path_;
+    const auto completed_size = size;
+    std::optional<std::filesystem::path> edit_path;
+    if (begin_edit) edit_path = usable_path(completed_path);
     source_load_timer_.Stop();
     source_load_rendering_ = source_load_running_ = false;
     std::string{}.swap(source_load_render_buffer_);
@@ -2510,6 +2567,7 @@ void SourceView::poll_full_source_load() {
     source_load_document_.reset();
     source_load_path_.clear();
     source_load_selection_.reset();
+    source_load_for_edit_ = false;
     source_->Enable(true);
     if (displayed_source_row_ && displayed_source_row_->line > 0 &&
         displayed_source_row_->line <= source_->GetNumberOfLines()) {
@@ -2521,9 +2579,31 @@ void SourceView::poll_full_source_load() {
             source_->ShowPosition(start);
         }
     }
-    update_source_edit_controls();
-    status_->SetLabel(wxString::Format("Loaded complete source file: %s (%zu UTF-8 bytes)",
-        display_path(rendered_path_), size));
+    if (begin_edit && edit_path) {
+        editing_path_ = std::move(*edit_path);
+        original_source_bytes_ = std::move(source_load_original_bytes_);
+        source_line_endings_crlf_ = std::move(source_load_line_endings_crlf_);
+        source_default_crlf_ = source_load_default_crlf_;
+        source_utf8_bom_ = source_load_utf8_bom_;
+        source_utf16_ = source_load_utf16_;
+        source_utf16_little_endian_ = source_load_utf16_little_endian_;
+        source_editing_ = true;
+        source_dirty_ = false;
+        source_->SetEditable(true);
+        update_source_edit_controls();
+        status_->SetLabel(source_utf16_
+            ? (source_utf16_little_endian_ ? "Editing full UTF-16LE source file (64 MiB encoded-file limit)"
+                                           : "Editing full UTF-16BE source file (64 MiB encoded-file limit)")
+            : "Editing full UTF-8 source file (64 MiB encoded-file limit)");
+    } else {
+        std::vector<std::byte>{}.swap(source_load_original_bytes_);
+        std::vector<bool>{}.swap(source_load_line_endings_crlf_);
+        update_source_edit_controls();
+        status_->SetLabel(begin_edit && !edit_path
+            ? text("Source path changed while loading; editing was not started")
+            : wxString::Format("Loaded complete source file: %s (%zu UTF-8 bytes)",
+                               display_path(rendered_path_), completed_size));
+    }
 }
 
 void SourceView::render_unavailable(const wxString &message) {
@@ -2580,7 +2660,8 @@ void SourceView::update_source_edit_controls() {
     previous_match_->Enable(!source_editing_ && !source_busy && source_search_available_);
     next_match_->Enable(!source_editing_ && !source_busy && source_search_available_);
     if (load_full_source_) {
-        load_full_source_->SetLabel(source_load_running_ ? "Cancel load" :
+        load_full_source_->SetLabel(source_load_running_
+                                        ? (source_load_for_edit_ ? "Cancel edit load" : "Cancel load") :
                                     full_file_display_ ? "Show mapped excerpt" : "Load full file");
         load_full_source_->Enable(source_load_running_ ||
             (!source_editing_ && !source_search_running_ && !source_excerpt_running_ &&
@@ -2627,44 +2708,7 @@ bool SourceView::finish_source_edit() {
 
 void SourceView::begin_source_edit() {
     if (rendered_path_.empty() || source_editing_) return;
-    auto path = usable_path(rendered_path_);
-    if (!path) return;
-    std::string failure;
-    auto bytes = read_source(*path, failure);
-    if (!failure.empty()) { status_->SetLabel(text(failure)); return; }
-    const bool bom = bytes.size() >= 3 && std::to_integer<unsigned char>(bytes[0]) == 0xef &&
-        std::to_integer<unsigned char>(bytes[1]) == 0xbb && std::to_integer<unsigned char>(bytes[2]) == 0xbf;
-    source_utf16_ = bytes.size() >= 2 &&
-        ((std::to_integer<unsigned char>(bytes[0]) == 0xff &&
-          std::to_integer<unsigned char>(bytes[1]) == 0xfe) ||
-         (std::to_integer<unsigned char>(bytes[0]) == 0xfe &&
-          std::to_integer<unsigned char>(bytes[1]) == 0xff));
-    source_utf16_little_endian_ = !source_utf16_ || std::to_integer<unsigned char>(bytes[0]) == 0xff;
-    const auto decoded = decode_source_text(bytes, failure);
-    if (!decoded) { status_->SetLabel(text(failure)); return; }
-    const auto candidate = wxString::FromUTF8(decoded->data(), decoded->size());
-    if (utf8(candidate) != *decoded) {
-        status_->SetLabel("Source is not valid UTF-8 and cannot be edited safely");
-        return;
-    }
-    std::error_code canonical_error;
-    editing_path_ = std::filesystem::canonical(*path, canonical_error);
-    if (canonical_error) { status_->SetLabel("Source path changed before editing could begin"); return; }
-    original_source_bytes_ = std::move(bytes);
-    source_utf8_bom_ = bom;
-    auto newline_style = inspect_newlines(*decoded);
-    source_default_crlf_ = newline_style.default_crlf;
-    source_line_endings_crlf_ = std::move(newline_style.line_crlf);
-    source_editing_ = true;
-    source_dirty_ = false;
-    source_->SetEditable(true);
-    source_->ChangeValue(candidate);
-    source_->SetInsertionPointEnd();
-    status_->SetLabel(source_utf16_
-        ? (source_utf16_little_endian_ ? "Editing full UTF-16LE source file (1 MiB limit)"
-                                       : "Editing full UTF-16BE source file (1 MiB limit)")
-        : "Editing full UTF-8 source file (1 MiB limit)");
-    update_source_edit_controls();
+    load_or_cancel_full_source(true);
 }
 
 void SourceView::save_source_edit() {
@@ -2679,8 +2723,8 @@ void SourceView::save_source_edit() {
                                   SourceNewlineStyle{source_line_endings_crlf_, source_default_crlf_});
     std::vector<std::byte> output;
     if (source_utf16_) {
-        const auto estimate = content.size() >= max_source_bytes / 2
-            ? static_cast<std::size_t>(max_source_bytes) : content.size() * 2 + 2;
+        const auto estimate = content.size() >= max_source_edit_bytes / 2
+            ? static_cast<std::size_t>(max_source_edit_bytes) : content.size() * 2 + 2;
         output.reserve(estimate);
         if (source_utf16_little_endian_) {
             output.push_back(std::byte{0xff}); output.push_back(std::byte{0xfe});
@@ -2688,13 +2732,13 @@ void SourceView::save_source_edit() {
             output.push_back(std::byte{0xfe}); output.push_back(std::byte{0xff});
         }
         if (!append_utf16(content, source_utf16_little_endian_, output)) {
-            status_->SetLabel("Edited source is invalid UTF-8 or exceeds the 1 MiB encoded-file limit");
+            status_->SetLabel("Edited source is invalid UTF-8 or exceeds the 64 MiB encoded-file limit");
             return;
         }
     } else {
         const std::size_t prefix = source_utf8_bom_ ? 3 : 0;
-        if (content.size() > max_source_bytes - prefix) {
-            status_->SetLabel("Edited source exceeds the 1 MiB file limit");
+        if (content.size() > max_source_edit_bytes - prefix) {
+            status_->SetLabel("Edited source exceeds the 64 MiB file limit");
             return;
         }
         output.reserve(content.size() + prefix);
