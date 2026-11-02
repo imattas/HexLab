@@ -2825,13 +2825,16 @@ void DebuggerView::step_over_event() {
     const auto &existing_breakpoints = std::get<2>(target);
     if (!process || process->id != last_event_snapshot_->process || !modules ||
         (process->architecture != Architecture::x86 && process->architecture != Architecture::x86_64 &&
+         (process->architecture != Architecture::arm || remote_session_active_) &&
          process->architecture != Architecture::arm64)) {
         step_event();
         return;
     }
     std::string mapping_reason;
+    const auto stopped_runtime_address = process->architecture == Architecture::arm
+        ? last_event_snapshot_->address & ~UINT64_C(1) : last_event_snapshot_->address;
     const auto mapping = debugger_image_mapping(*document, modules.value(), process->architecture, mapping_reason);
-    const auto image_pc = mapping ? mapping->to_image(image, last_event_snapshot_->address) : std::nullopt;
+    const auto image_pc = mapping ? mapping->to_image(image, stopped_runtime_address) : std::nullopt;
     if (!image_pc) {
         step_event();
         return;
@@ -2841,7 +2844,7 @@ void DebuggerView::step_over_event() {
     // are absent, ambiguous, or too large, the instruction-level path below
     // remains available.
     const auto current_source = symbolize_debugger_address(*document->project, image,
-        last_event_snapshot_->address, mapping->runtime_base, mapping->size);
+        stopped_runtime_address, mapping->runtime_base, mapping->size);
     if (current_source && current_source->function_entry && current_source->source_location) {
         const auto line_key = [](std::string_view location) {
             constexpr std::string_view inline_suffix = " (inline)";
@@ -2873,7 +2876,7 @@ void DebuggerView::step_over_event() {
             blocks.reserve(document->project->functions->blocks.size());
             for (const auto &block : document->project->functions->blocks)
                 if (block) blocks.emplace(block->id.value, block);
-            std::optional<std::pair<Address, std::string>> next_source;
+            std::optional<std::tuple<Address, std::string, ExecutionMode>> next_source;
             std::size_t inspected = 0, line_lookups = 0;
             bool exhausted = false;
             for (const auto block_id : (*function)->blocks) {
@@ -2883,7 +2886,7 @@ void DebuggerView::step_over_event() {
                     if (++inspected > 16384) { exhausted = true; break; }
                     if (!candidate || candidate->instruction.address.space != image_pc->space ||
                         candidate->instruction.address.offset <= image_pc->offset) continue;
-                    if (next_source && candidate->instruction.address.offset >= next_source->first.offset) continue;
+                    if (next_source && candidate->instruction.address.offset >= std::get<0>(*next_source).offset) continue;
                     if (++line_lookups > 256) { exhausted = true; break; }
                     const auto runtime = mapping->to_runtime(image, candidate->instruction.address);
                     if (!runtime) continue;
@@ -2891,7 +2894,9 @@ void DebuggerView::step_over_event() {
                         mapping->runtime_base, mapping->size);
                     if (!symbol || symbol->function_entry != current_source->function_entry || !symbol->source_location ||
                         line_key(*symbol->source_location) == current_line) continue;
-                    next_source = std::pair{candidate->instruction.address, *symbol->source_location};
+                    const auto mode = candidate->instruction.context.mode;
+                    if (process->architecture == Architecture::arm && mode != ExecutionMode::thumb) continue;
+                    next_source = std::tuple{candidate->instruction.address, *symbol->source_location, mode};
                 }
                 if (exhausted) break;
             }
@@ -2900,20 +2905,24 @@ void DebuggerView::step_over_event() {
                 return;
             }
             if (next_source) {
-                const auto runtime = mapping->to_runtime(image, next_source->first);
-                if (!runtime || *runtime <= last_event_snapshot_->address) {
+                const auto runtime = mapping->to_runtime(image, std::get<0>(*next_source));
+                if (!runtime || *runtime <= stopped_runtime_address) {
                     report("Source step-over destination does not round-trip through the current module mapping.");
                     return;
                 }
+                auto breakpoint_address = *runtime;
+                if (process->architecture == Architecture::arm && std::get<2>(*next_source) == ExecutionMode::thumb)
+                    breakpoint_address |= 1;
                 if (std::any_of(existing_breakpoints.begin(), existing_breakpoints.end(), [&](const auto &breakpoint) {
-                        return breakpoint.address == *runtime;
+                        return process->architecture == Architecture::arm
+                            ? (breakpoint.address & ~UINT64_C(1)) == *runtime : breakpoint.address == *runtime;
                     })) {
                     report("Source step-over cannot reuse a user breakpoint at the next source line.");
                     return;
                 }
                 auto added = [&] {
                     std::lock_guard lock(inspection_state_->backend_mutex);
-                    return session_->add_breakpoint(*runtime, debugger::BreakpointKind::software);
+                    return session_->add_breakpoint(breakpoint_address, debugger::BreakpointKind::software);
                 }();
                 if (!added) {
                     report("Could not arm source step-over at the next source line: " +
@@ -2943,7 +2952,7 @@ void DebuggerView::step_over_event() {
                     return;
                 }
                 source_step_out_target_ = SourceStepOutTarget{added.value().id, process->id, *pending_event_thread_,
-                    document->id, document->revision, *runtime, next_source->second, false, true};
+                    document->id, document->revision, *runtime, std::get<1>(*next_source), false, true};
                 pending_event_.reset();
                 pending_event_thread_.reset();
                 invalidate_frames();
@@ -2952,7 +2961,7 @@ void DebuggerView::step_over_event() {
                 refresh_breakpoints();
                 refresh_threads(selected_register_thread_);
                 poll_timer_.Start(100);
-                report("Source step-over armed for " + wxString::FromUTF8(next_source->second) +
+                report("Source step-over armed for " + wxString::FromUTF8(std::get<1>(*next_source)) +
                     "; another stop event cancels the operation.");
                 return;
             }
@@ -2968,6 +2977,10 @@ void DebuggerView::step_over_event() {
         return;
     }
     const auto &instruction = (*fact)->instruction;
+    if (process->architecture == Architecture::arm && instruction.context.mode != ExecutionMode::thumb) {
+        step_event();
+        return;
+    }
     if (instruction.address.offset > UINT64_MAX - instruction.byte_length()) {
         report("Step over cannot represent the address after this call instruction.");
         return;
@@ -2980,12 +2993,16 @@ void DebuggerView::step_over_event() {
         return;
     }
     const auto runtime_return = mapping->to_runtime(image, return_address);
-    if (!runtime_return || *runtime_return <= last_event_snapshot_->address) {
+    if (!runtime_return || *runtime_return <= stopped_runtime_address) {
         report("Step over return address does not round-trip through the current module mapping.");
         return;
     }
+    auto breakpoint_return = *runtime_return;
+    if (process->architecture == Architecture::arm && instruction.context.mode == ExecutionMode::thumb)
+        breakpoint_return |= 1;
     if (std::any_of(existing_breakpoints.begin(), existing_breakpoints.end(), [&](const auto &breakpoint) {
-            return breakpoint.address == *runtime_return;
+            return process->architecture == Architecture::arm
+                ? (breakpoint.address & ~UINT64_C(1)) == *runtime_return : breakpoint.address == *runtime_return;
         })) {
         report("Step over cannot reuse a user breakpoint at the instruction after the call.");
         return;
@@ -2993,7 +3010,7 @@ void DebuggerView::step_over_event() {
 
     auto added = [&] {
         std::lock_guard lock(inspection_state_->backend_mutex);
-        return session_->add_breakpoint(*runtime_return, debugger::BreakpointKind::software);
+        return session_->add_breakpoint(breakpoint_return, debugger::BreakpointKind::software);
     }();
     if (!added) {
         report("Could not arm step-over at the instruction after the call: " +

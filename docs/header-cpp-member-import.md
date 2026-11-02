@@ -1,6 +1,20 @@
 # C++ member declaration import
 
-The bounded header importer accepts ordinary named `class` declarations, member typedefs, `using Name = Type` aliases, and static data-member declarations in classes, structs and named unions. It uses the existing immutable type graph and existing static-data serialization; it does not add inheritance, vtables, constructors, or storage definitions.
+The bounded header importer accepts ordinary named `class` declarations, nested named enum definitions, member typedefs, `using Name = Type` aliases, and static data-member declarations in classes, structs and named unions. It uses the existing immutable type graph and existing static-data serialization; it does not add inheritance, vtables, constructors, or storage definitions.
+
+Named enum definitions inside a class, struct, or union are retained as qualified type symbols such as `api::FileOptions::Permission`. Scoped enumerators remain qualified by the enum; unscoped enumerators are class-scope constants and can be used by later declarations in that class. Nested enums do not add instance storage. Enum values remain subject to the existing bounded integer-expression and underlying-type rules:
+
+```cpp
+struct FileOptions {
+    enum class Permission : unsigned char { read = 1, write = read << 1 };
+    enum Flags { compressed = 1, encrypted = 2 };
+    unsigned access : compressed | encrypted;
+};
+
+using Permission = FileOptions::Permission;
+```
+
+The example records `FileOptions::Permission` as a scoped enum and `FileOptions::Flags` as an unscoped enum. `compressed` and `encrypted` are available in the class scope for the bitfield width expression. Nested class/struct/union definitions, nested enum forward declarations, and out-of-class qualified enum definitions remain unsupported.
 
 ```cpp
 namespace api {
@@ -44,4 +58,4 @@ A non-inline static declaration can retain an incomplete aggregate type or incom
 
 New aliases and static declarations are checked for collisions with existing aliases, instance members, static data and methods in the imported aggregate. Typedefs of function types are aliases rather than method declarations, and callback pointers keep their complete nested signature. Existing target scalar widths, packing, field alignment and bitfield rules still determine every instance field. Class names and bodies with C++ member declarations are injected into ordinary type lookup; plain C tags retain their separate historical lookup behavior.
 
-The importer rejects in-class initializers, inline static variable definitions, static bitfields, void static objects, and declaration-specific static alignment/packing attributes that `StaticDataMember` cannot preserve. A previously declared aligned type remains usable. `constexpr`, `constinit`, thread-local data, member alias templates, inherited using-declarations, new nested aggregate/enum declarations, constructors/destructors, inheritance, non-pure virtual methods and unrepresented cv/ref/noexcept function qualifiers remain unsupported. A pure virtual prototype with the required `virtual` keyword and `= 0;` is retained as a `Method` with `MemberDispatch::pure_virtual`; it does not add object layout or an inferred vtable slot. `override` and other virtual specifiers, ordinary virtual methods, and method bodies remain unsupported. Alias access labels are not represented or enforced. Class lookup is declaration-ordered and bounded; this is not a complete C++ name-lookup or access checker. No system compiler is invoked.
+The importer rejects in-class initializers, inline static variable definitions, static bitfields, void static objects, and declaration-specific static alignment/packing attributes that `StaticDataMember` cannot preserve. A previously declared aligned type remains usable. `constexpr`, `constinit`, thread-local data, member alias templates, inherited using-declarations, nested class/struct/union definitions, constructors/destructors, inheritance, non-pure virtual methods and unrepresented cv/ref/noexcept function qualifiers remain unsupported. A pure virtual prototype with the required `virtual` keyword and `= 0;` is retained as a `Method` with `MemberDispatch::pure_virtual`; it does not add object layout or an inferred vtable slot. `override` and other virtual specifiers, ordinary virtual methods, and method bodies remain unsupported. Alias access labels are not represented or enforced. Class lookup is declaration-ordered and bounded; this is not a complete C++ name-lookup or access checker. No system compiler is invoked.

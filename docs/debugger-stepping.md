@@ -17,12 +17,18 @@ with incomplete recovery, ambiguous or missing line
 records, or no later line use the instruction-level behavior: for a decoded
 call at the stopped PC it plants a one-shot breakpoint at the fall-through
 instruction; other or unavailable instruction facts perform one instruction
-step. A source-line or call-return breakpoint requires a free address with no
-existing breakpoint. A scan that reaches either bound reports the limit and
-leaves the target stopped. Any intervening stop, thread change, or process
-change cancels the temporary run. Step-over continues only the thread that
-owns the pending event, leaving peers stopped. The Debugger view also offers a
-conservative source-level **Step out** operation, described below.
+step. Windows ARM32 Thumb targets use the decoded Thumb mode bit when tagging a
+temporary breakpoint. A32 and unknown-mode instructions fall back to
+one-instruction stepping because the backend cannot safely select A32 for a
+temporary breakpoint away from the current PC. The caller return address is
+tracked without the Thumb state bit so the reported event address can be
+compared with the canonical code address. A source-line or call-return
+breakpoint requires a free address with no existing breakpoint. A scan that
+reaches either bound reports the limit and leaves the target stopped. Any
+intervening stop, thread change, or process change cancels the temporary run.
+Step-over continues only the thread that owns the pending event, leaving peers
+stopped. The Debugger view also offers a conservative source-level **Step out**
+operation, described below.
 
 ## Source step-out
 

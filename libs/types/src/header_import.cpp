@@ -2691,12 +2691,49 @@ private:
         std::set<std::string> method_names;
         struct BitfieldUnit { std::uint64_t type_id=0,size=0,alignment=1,offset=0,used=0; };
         std::optional<BitfieldUnit> bitfield_unit;
+        const auto nested_enum_definition_ahead = [&]() {
+            if (!at("enum")) return false;
+            std::size_t cursor = pos_ + 1;
+            if (cursor < t_.size() && (t_[cursor].text == "class" || t_[cursor].text == "struct")) ++cursor;
+            if (cursor >= t_.size() || !identifier(t_[cursor].text)) return false;
+            ++cursor;
+            if (cursor < t_.size() && t_[cursor].text == ":") {
+                ++cursor;
+                while (cursor < t_.size() && t_[cursor].text != "{" && t_[cursor].text != ";") ++cursor;
+            }
+            if (cursor >= t_.size() || t_[cursor].text != "{") return false;
+            std::size_t braces = 1;
+            while (++cursor < t_.size() && braces) {
+                if (t_[cursor].text == "{") ++braces;
+                else if (t_[cursor].text == "}") --braces;
+            }
+            return braces == 0 && cursor < t_.size() && t_[cursor].text == ";";
+        };
         while(!take("}")){
             if(at("<eof>"))syntax("unterminated aggregate");
             consume_standard_attributes();
             if(at("static_assert")||at("_Static_assert")){
                 if(at("static_assert"))cpp_declarations=true;
                 parse_static_assert();
+                ++declaration_ordinal;
+                continue;
+            }
+            // A nested enum definition is a class-scope type declaration, not
+            // an object member. Keep it in the shared symbol/type graph while
+            // leaving instance layout unchanged.
+            if (nested_enum_definition_ahead()) {
+                need("enum");
+                const bool scoped_enum = at("class") || at("struct");
+                std::size_t name_index = pos_ + (scoped_enum ? 1u : 0u);
+                if (name_index >= t_.size() || !identifier(t_[name_index].text))
+                    syntax("nested enum definition requires a simple name");
+                const auto nested_name = t_[name_index].text;
+                if (member_names.contains(nested_name) || method_names.contains(nested_name))
+                    fail(ErrorCode::conflict, "duplicate aggregate type or member '" + nested_name + "'");
+                (void)parse_enum();
+                need(";");
+                member_names.insert(nested_name);
+                cpp_declarations = true;
                 ++declaration_ordinal;
                 continue;
             }
@@ -3213,7 +3250,16 @@ private:
     std::int64_t integer_literal(std::string s){return static_cast<std::int64_t>(integer_magnitude(std::move(s),std::uint64_t(INT64_MAX)));}
     TypePtr parse_enum(){
         const bool scoped=take("class")||take("struct");
-        if(!identifier(peek().text)&&!at("::"))syntax("named enum tags are required");std::string tag=parse_qualified_name();
+        if(!identifier(peek().text)&&!at("::"))syntax("named enum tags are required");
+        const bool explicitly_qualified = at("::") || peek(1).text == "::";
+        std::string tag=parse_qualified_name();
+        if (!aggregate_scopes_.empty() && !explicitly_qualified) {
+            const auto owner = aggregate_scopes_.back();
+            const auto namespace_prefix = current_namespace().empty() ? std::string{} : current_namespace() + "::";
+            if (!namespace_prefix.empty() && tag.starts_with(namespace_prefix))
+                tag.erase(0, namespace_prefix.size());
+            tag = owner + "::" + tag;
+        }
         if(at("<"))fail(ErrorCode::unsupported,"templated enum declarations and specializations are unsupported");
         std::string key="enum "+tag;
         TypePtr fixed_underlying;
@@ -3227,11 +3273,12 @@ private:
                      "fixed enum underlying types must be unqualified integers from 1 through 8 bytes");
             fixed_underlying = std::move(underlying.type);
         }
-        if(!aggregate_scopes_.empty()&&at("{"))fail(ErrorCode::unsupported,"nested enum definitions are unsupported");
         if(!take("{")){auto it=names_.find(key);if(it==names_.end())fail(ErrorCode::unsupported,"forward enum reference is unsupported");return it->second;}
+        if (names_.contains(key) || result_.symbols.contains(tag) || result_.enum_constants.contains(tag))
+            fail(ErrorCode::conflict, "duplicate enum type '" + tag + "'");
         std::vector<Enumerator> values;std::int64_t next_value=0,min_value=0,max_value=0;bool auto_overflow=false;std::set<std::string> unique;
         auto prior_enumerators = enum_value_bindings_;
-        const auto namespace_scope = current_namespace();
+        const auto namespace_scope = aggregate_scopes_.empty() ? current_namespace() : aggregate_scopes_.back();
         std::vector<std::string> lookup_scopes;
         auto lookup_scope = namespace_scope;
         for (;;) {
@@ -3258,7 +3305,8 @@ private:
             if(at("}"))break;
             const auto enumerator_token = next();
             auto name=enumerator_token.text;if(!identifier(name))syntax("expected enum constant name");
-            const auto constant_name=scoped?tag+"::"+name:qualify_name(name);
+            const auto constant_name = scoped ? tag + "::" + name :
+                (namespace_scope.empty() ? name : namespace_scope + "::" + name);
             if(!unique.insert(name).second||result_.enum_constants.contains(constant_name)||result_.symbols.contains(constant_name)||names_.contains(constant_name))
                 fail(ErrorCode::conflict,"duplicate enum constant '"+constant_name+"'");
             if(take("=")){
@@ -3289,7 +3337,10 @@ private:
             prior_enumerators.insert_or_assign("::"+constant_name,next_value);
             prior_enumerators.insert_or_assign("::"+tag+"::"+name,next_value);
             if(relative_tag!=tag)prior_enumerators.insert_or_assign(relative_tag+"::"+name,next_value);
-            if(!scoped)prior_enumerators.insert_or_assign(name,next_value);
+            // Earlier enumerators are visible unqualified inside the same
+            // enumerator-list, including for scoped enums. Only unscoped
+            // enumerators enter the enclosing namespace/class scope below.
+            prior_enumerators.insert_or_assign(name,next_value);
             enum_value_bindings_.insert_or_assign(constant_name,next_value);
             enum_value_bindings_.insert_or_assign(tag+"::"+name,next_value);
             enum_value_bindings_.insert_or_assign("::"+constant_name,next_value);
@@ -3303,7 +3354,7 @@ private:
         if (fixed_underlying) {
             auto p = Type::enumeration_with_values(tag, std::move(fixed_underlying), std::move(values));
             if (!p) fail(p.error().code, p.error().message);
-            register_tag_type("enum",tag,p.value());return p.value();
+            register_tag_type("enum",tag,p.value(),!aggregate_scopes_.empty());return p.value();
         }
         std::uint8_t enum_bytes=0;std::string enum_base;
         for(const auto [name,bytes] : {std::pair<std::string_view,std::uint8_t>{"int",o_.int_bytes},{"long",o_.long_bytes},{"long long",o_.long_long_bytes}}){
@@ -3313,7 +3364,7 @@ private:
         if(!enum_bytes)fail(ErrorCode::unsupported,"enum values exceed supported signed integer types");
         auto base=Type::integer(enum_base,enum_bytes,enum_bytes,true);if(!base)fail(base.error().code,base.error().message);
         auto p=Type::enumeration_with_values(tag,base.value(),std::move(values));if(!p)fail(p.error().code,p.error().message);
-        register_tag_type("enum",tag,p.value());return p.value();
+        register_tag_type("enum",tag,p.value(),!aggregate_scopes_.empty());return p.value();
     }
     struct ParameterPackPattern {
         std::vector<Token> type;

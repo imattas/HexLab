@@ -992,6 +992,18 @@ PseudocodeView::PseudocodeView(wxWindow *parent) : wxPanel(parent) {
     function_navigation->Add(previous_function_, 1, wxRIGHT, FromDIP(3));
     function_navigation->Add(next_function_, 1);
     address_panel->Add(function_navigation, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, FromDIP(4));
+    auto *origin_navigation = new wxBoxSizer(wxHORIZONTAL);
+    previous_origin_ = new wxButton(this, wxID_ANY, "Previous instruction");
+    previous_origin_->SetName("pseudocode-previous-origin");
+    previous_origin_->SetToolTip("Navigate to the previous instruction origin in this function (Alt+Up in pseudocode).");
+    previous_origin_->Enable(false);
+    next_origin_ = new wxButton(this, wxID_ANY, "Next instruction");
+    next_origin_->SetName("pseudocode-next-origin");
+    next_origin_->SetToolTip("Navigate to the next instruction origin in this function (Alt+Down in pseudocode).");
+    next_origin_->Enable(false);
+    origin_navigation->Add(previous_origin_, 1, wxRIGHT, FromDIP(3));
+    origin_navigation->Add(next_origin_, 1);
+    address_panel->Add(origin_navigation, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, FromDIP(3));
     addresses_ = new wxListCtrl(this, wxID_ANY, wxDefaultPosition, wxDefaultSize,
                                 wxLC_REPORT | wxLC_SINGLE_SEL);
     addresses_->SetName("pseudocode-addresses");
@@ -1137,6 +1149,8 @@ PseudocodeView::PseudocodeView(wxWindow *parent) : wxPanel(parent) {
     });
     previous_function_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { move_function(false); });
     next_function_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { move_function(true); });
+    previous_origin_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { move_instruction_origin(false); });
+    next_origin_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { move_instruction_origin(true); });
     stack_slots_->Bind(wxEVT_LIST_ITEM_SELECTED, [this](wxListEvent &event) {
         if (updating_) return;
         const auto row = event.GetIndex();
@@ -1224,6 +1238,11 @@ PseudocodeView::PseudocodeView(wxWindow *parent) : wxPanel(parent) {
     source_->Bind(wxEVT_LEFT_UP, [deferred_selection](wxMouseEvent &event) { event.Skip(); deferred_selection(); });
     source_->Bind(wxEVT_KEY_UP, [deferred_selection](wxKeyEvent &event) { event.Skip(); deferred_selection(); });
     source_->Bind(wxEVT_CHAR_HOOK, [this](wxKeyEvent &event) {
+        if (event.AltDown() && !event.ControlDown() && !event.ShiftDown() &&
+            (event.GetKeyCode() == WXK_UP || event.GetKeyCode() == WXK_DOWN)) {
+            move_instruction_origin(event.GetKeyCode() == WXK_DOWN);
+            return;
+        }
         if (event.GetKeyCode() == WXK_F2 && !event.ControlDown() && !event.AltDown() && !event.ShiftDown()) {
             source_selection_changed();
             if (editable_variable()) rename_variable();
@@ -1784,6 +1803,53 @@ void PseudocodeView::move_function(bool next) {
     navigate_to(Location{*entry});
 }
 
+std::optional<Address> PseudocodeView::adjacent_instruction_origin(bool next) const {
+    if (!model_ready_ || source_origins_.empty()) return {};
+    if (!current_instruction_)
+        return next ? std::optional<Address>{source_origins_.front().address} : std::nullopt;
+    const auto current = std::find_if(source_origins_.begin(), source_origins_.end(), [&](const auto &origin) {
+        return origin.address == *current_instruction_;
+    });
+    if (current == source_origins_.end()) return {};
+    if (next) {
+        auto following = std::next(current);
+        while (following != source_origins_.end() && following->address == current->address) ++following;
+        return following == source_origins_.end() ? std::nullopt : std::optional<Address>{following->address};
+    }
+    auto previous = current;
+    while (previous != source_origins_.begin()) {
+        --previous;
+        if (previous->address != current->address) return previous->address;
+    }
+    return {};
+}
+
+void PseudocodeView::update_instruction_origin_navigation() {
+    const bool navigation_available = document_
+        ? navigate_document && current_navigation_token().has_value()
+        : static_cast<bool>(navigate);
+    if (previous_origin_)
+        previous_origin_->Enable(navigation_available && adjacent_instruction_origin(false).has_value());
+    if (next_origin_)
+        next_origin_->Enable(navigation_available && adjacent_instruction_origin(true).has_value());
+}
+
+void PseudocodeView::move_instruction_origin(bool next) {
+    if (!model_ready_) return;
+    const auto target = adjacent_instruction_origin(next);
+    if (!target) {
+        status_->SetLabel(next ? "No later instruction origin in this function"
+                               : "No earlier instruction origin in this function");
+        return;
+    }
+    if (document_ ? (!navigate_document || !current_navigation_token()) : !navigate) {
+        status_->SetLabel("Instruction-origin navigation is unavailable for the active document");
+        return;
+    }
+    current_instruction_ = *target;
+    navigate_to(Location{*target});
+}
+
 std::optional<PseudocodeNavigationToken> PseudocodeView::current_navigation_token() const {
     if (!document_ || !model_ready_ || !rendered_function_) return {};
     PseudocodeNavigationToken token;
@@ -1828,6 +1894,7 @@ void PseudocodeView::update(const FunctionSnapshot *snapshot, std::optional<Loca
         rendered_project_ == project && rendered_image_ == image && rendered_function_ == match->function->entry) {
         rendered_document_revision_ = document_revision_;
         select_address(match->instruction);
+        update_instruction_origin_navigation();
         apply_pending_cross_function_reveal();
         return;
     }
@@ -1837,6 +1904,8 @@ void PseudocodeView::update(const FunctionSnapshot *snapshot, std::optional<Loca
     rendered_function_.reset();
     previous_function_->Enable(false);
     next_function_->Enable(false);
+    previous_origin_->Enable(false);
+    next_origin_->Enable(false);
     selected_variable_.reset();
     updating_ = true;
     function_ = nullptr;
@@ -2402,6 +2471,7 @@ void PseudocodeView::select_address(Address address) {
     }
     updating_ = was_updating;
     update_variable_actions();
+    update_instruction_origin_navigation();
 }
 void PseudocodeView::apply_pending_cross_function_reveal() {
     if (!pending_cross_function_reveal_) return;
@@ -2561,6 +2631,7 @@ void PseudocodeView::source_selection_changed() {
         navigate_to(Location{origin->address});
         update_variable_actions();
     }
+    update_instruction_origin_navigation();
 }
 void PseudocodeView::select_variable(std::size_t row, bool follow) {
     if (!model_ready_ || row >= variable_links_.size()) return;

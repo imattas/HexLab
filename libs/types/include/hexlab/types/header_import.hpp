@@ -109,14 +109,15 @@ struct HeaderImportResult {
 // namespace aliases, bounded using-namespace lookup, qualified using-declarations, and scoped using type
 // aliases, scoped enums with default int representation or a fixed integral
 // underlying type, and nested function pointers
-// are supported. Class/struct/union declarations may contain method prototypes,
+// are supported. Class/struct/union declarations may contain named nested enum
+// definitions, method prototypes,
 // class-scoped typedef/using type aliases, static data declarations, and access
 // labels. Aliases resolve from their declaration onward and export Owner::Alias;
 // concrete templates and bound aggregate types can qualify those aliases.
 // Static data preserves type/access/source order separately from object layout;
 // incomplete static object/array declarations are retained without inventing
 // storage. Initializers, inline static definitions, static alignment attributes,
-// nested aggregate/enum definitions, method bodies and constructors fail explicitly.
+// nested class/struct/union definitions, method bodies and constructors fail explicitly.
 // Bounded alias
 // and class/struct/union templates support type, integral non-type, and template-
 // template parameters, defaults, and a trailing parameter pack. Integral arguments
