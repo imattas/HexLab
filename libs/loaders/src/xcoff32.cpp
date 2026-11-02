@@ -309,6 +309,56 @@ Result<Xcoff32Object> inspect_xcoff32_object(const ByteStorage &storage,
             section.relocations.push_back(relocation);
         }
     }
+    // IBM linenum.h: six-byte rows group line entries by function. A zero
+    // l_lnno changes the union word from a virtual address to a symbol slot.
+    for (auto &section : result.sections) {
+        if (!section.line_number_count) continue;
+        canceled(stop);
+        charge(std::uint64_t{section.line_number_count} * sizeof(Xcoff32LineNumber), budget, limits);
+        const auto rows = read(storage, section.line_number_file_offset,
+                               std::uint64_t{section.line_number_count} * 6, budget, limits, stop);
+        section.line_numbers.reserve(section.line_number_count);
+        std::uint32_t function_slot = 0;
+        bool have_function = false;
+        const auto in_section = [&](std::uint32_t address) {
+            return address >= section.virtual_address &&
+                std::uint64_t{address} - section.virtual_address < section.size;
+        };
+        for (std::uint32_t i = 0; i < section.line_number_count; ++i) {
+            canceled(stop);
+            const auto at = std::size_t{i} * 6;
+            const auto row = std::span<const std::byte>(rows).subspan(at, 6);
+            Xcoff32LineNumber line;
+            line.raw_value = be(row, 0, 4);
+            line.line_number = static_cast<std::uint16_t>(be(row, 4, 2));
+            line.file_offset = std::uint64_t{section.line_number_file_offset} + at;
+            if (line.line_number == 0) {
+                require(line.raw_value < result.symbol_count,
+                        "XCOFF32 line marker symbol index exceeds symbol table");
+                const auto symbol = std::lower_bound(result.symbols.begin(), result.symbols.end(), line.raw_value,
+                    [](const auto &candidate, auto slot) { return candidate.index < slot; });
+                require(symbol != result.symbols.end() && symbol->index == line.raw_value,
+                        "XCOFF32 line marker refers to an auxiliary symbol slot");
+                require(symbol->storage_class == 2 || symbol->storage_class == 107 ||
+                            symbol->storage_class == 111,
+                        "XCOFF32 line marker does not reference an external function symbol");
+                require(symbol->section_number > 0 &&
+                            static_cast<std::uint32_t>(symbol->section_number) == section.index,
+                        "XCOFF32 line marker function is not defined in its owning section");
+                require(in_section(symbol->value),
+                        "XCOFF32 line marker function address is outside its section");
+                // IBM permits the n_type function bit to be absent. The marker
+                // establishes the function association; do not infer aux types.
+                function_slot = line.raw_value;
+                have_function = true;
+            } else {
+                require(have_function, "XCOFF32 line address precedes a function marker");
+                require(in_section(line.raw_value), "XCOFF32 line address is outside its section");
+            }
+            line.function_symbol_index = function_slot;
+            section.line_numbers.push_back(line);
+        }
+    }
     canceled(stop);
     return result;
 } catch (const Failure &failure) {

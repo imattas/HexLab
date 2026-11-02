@@ -3136,6 +3136,23 @@ int xcoff32_command(std::span<const std::wstring_view> args, std::ostream &out, 
                     << " symbol=" << (symbol != object.symbols.end() ? safe_text(symbol->name) : "<invalid>") << '\n';
             }
         }
+        for (const auto &section : object.sections) {
+            for (const auto &line : section.line_numbers) {
+                const auto symbol = std::lower_bound(object.symbols.begin(), object.symbols.end(), line.function_symbol_index,
+                    [](const auto &candidate, auto slot) { return candidate.index < slot; });
+                out << "Line metadata: section=" << section.index
+                    << " kind=" << (line.line_number == 0 ? "function-marker" : "address-line")
+                    << " record-offset=0x" << std::hex << line.file_offset
+                    << " raw-value=0x" << line.raw_value << std::dec
+                    << " raw-line=" << line.line_number
+                    << " function-slot=" << line.function_symbol_index
+                    << " function=" << (symbol != object.symbols.end() ? safe_text(symbol->name) : "<invalid>");
+                if (line.line_number != 0)
+                    out << " address=0x" << std::hex << line.raw_value
+                        << " section-byte-offset=0x" << (line.raw_value - section.virtual_address) << std::dec;
+                out << '\n';
+            }
+        }
         for (const auto &symbol : object.symbols) {
             out << "Symbol slot=" << symbol.index << " name=" << safe_text(symbol.name)
                 << " value=0x" << std::hex << symbol.value << std::dec
@@ -3145,7 +3162,7 @@ int xcoff32_command(std::span<const std::wstring_view> args, std::ostream &out, 
                 << " auxiliary-slots=" << static_cast<unsigned>(symbol.auxiliary_count) << '\n';
         }
         out << "Note: ordinary relocation fields are decoded as raw metadata and are not applied; "
-               "line-number rows remain uninterpreted and linking is unsupported.\n";
+               "line rows retain raw values without source-file/absolute-line resolution; linking is unsupported.\n";
         return 0;
     } catch (const Failure &failure) {
         err << "XCOFF32: " << failure.error.message << '\n';

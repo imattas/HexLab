@@ -34,7 +34,7 @@ Both overflow target fields must identify the same primary section, with matchin
 table offsets and zero overflow-header size/data pointer. Missing, duplicate,
 orphaned, mismatched, truncated and over-limit records are rejected before table
 decoding. Both expanded counts are exposed as 32-bit values; line-number rows
-remain extent-checked only. Overflow headers retain their original section slots
+are decoded after symbol traversal. Overflow headers retain their original section slots
 and do not become image mappings, so symbol section numbers keep their meaning.
 Ordinary 10-byte relocation rows are decoded into virtual address, zero-based symbol
 slot, raw `r_rsize`/`r_rtype` bytes and record file offset. A one-million-row
@@ -45,15 +45,14 @@ that each address is within the section relative to `s_paddr`, and ascending
 address order. The CLI displays each validated row with its section byte offset,
 symbol name when available, raw type and known name, bit width, signed flag and
 instruction-modified flag. This is metadata display only; no relocation is
-applied. Line-number rows remain extent-checked only. Section
+applied. Line-number rows retain function markers and raw line/address pairs. Section
 type flags determine whether raw data is BSS/TBSS; names are only metadata.
 A zero raw-data pointer denotes absent raw data, including in a nonempty section.
 
 The subset rejects executable (`F_EXEC`) objects, optional headers and deleted
 section headers. Loader-section payloads
-and their embedded loader relocation tables remain uninterpreted. Line-number
-rows are extent-checked only. It does not validate overlap between payload
-tables or decode line records. Csect auxiliary records are decoded by the
+and their embedded loader relocation tables remain uninterpreted. It does not
+validate overlap between payload tables. Csect auxiliary records are decoded by the
 relocatable loader as described below; archive member selection and external
 library binding remain unsupported.
 
@@ -137,5 +136,34 @@ Windows Debug (MSVC 19.44) and Ubuntu 24.04 WSL Debug (Clang 18.1.3)
 `hexlab_loaders` builds passed with `BUILD_TESTING=OFF`; no tests or GitHub CI
 ran. WSL built an ext4 snapshot of the isolated checkout after Windows-mounted
 source reads stalled; SHA-256 hashes of both changed C++ files matched.
-Linked-executable overflow sections, source-line decoding, overlapping-table
+Linked-executable overflow sections, absolute source-line resolution, overlapping-table
 validation, archive/library binding and full AIX linking remain unsupported.
+
+## 2026-11-02 decoded line-row inventory
+
+Section `line_numbers` now retains all six-byte rows after symbol decoding.
+Each row preserves the raw 32-bit union word, raw 16-bit line field, source-storage offset (member-relative for archive member storage) and current function symbol slot. A zero line is a function marker;
+nonzero rows carry virtual instruction addresses. The decoder rejects missing
+markers, out-of-range or auxiliary symbol slots, disallowed marker storage
+classes, symbols defined in another section, and function/instruction addresses
+outside the owning virtual section. It accepts the optional function type bit
+being absent and does not infer function bounds or line/address ordering.
+
+`hexlab_cli xcoff32 inspect object.o` prints marker versus address/line kinds,
+function slot/name, raw fields and record offsets, plus section offsets for
+instruction rows. These are original object virtual addresses, before synthetic
+relocatable mapping. Raw line values can be relative to the function or absolute
+inside include-file contexts; no source filename, include context, absolute
+source-line conversion, or generic image debug-line mapping is inferred.
+
+Reads and retained row vectors are charged to the shared metadata budget;
+ordinary and expanded counts share the existing `max_line_numbers` bound.
+Cancellation is checked during table reads and before every decoded row.
+The rules follow IBM's linked format reference above, specifically Line Number
+Information and Symbol Table Information. Archive symbol indexing remains a
+separate summary and does not expose these rows.
+
+Windows MSVC 19.44 Debug x64 and WSL Clang 18.1.3 Debug loader builds passed
+with BUILD_TESTING=OFF. The changed CLI translation unit also compiled on WSL.
+The plan records exact commands and the ext4 snapshot/hash verification. No
+tests or CI ran; full CLI linking and runtime fixture verification were not run.

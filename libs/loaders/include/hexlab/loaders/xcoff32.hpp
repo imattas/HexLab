@@ -19,6 +19,16 @@ struct Xcoff32Relocation {
     std::uint64_t file_offset = 0;
 };
 
+struct Xcoff32LineNumber {
+    // line_number == 0: raw_value is a primary function symbol slot.
+    // Otherwise raw_value is a virtual instruction address. Line values are
+    // retained verbatim; include-file and absolute source-line resolution is
+    // not performed. Every row retains its current function marker's slot.
+    std::uint32_t raw_value = 0, function_symbol_index = 0;
+    std::uint16_t line_number = 0;
+    std::uint64_t file_offset = 0;
+};
+
 struct Xcoff32Section {
     std::uint32_t index = 0, flags = 0;
     std::string name;
@@ -27,6 +37,7 @@ struct Xcoff32Section {
     // Expanded XCOFF32 table counts, including STYP_OVRFLO counts.
     std::uint32_t relocation_count = 0, line_number_count = 0;
     std::vector<Xcoff32Relocation> relocations;
+    std::vector<Xcoff32LineNumber> line_numbers;
 };
 
 struct Xcoff32Object {
@@ -62,7 +73,8 @@ struct Xcoff32ObjectLimits {
 // Structural inventory of big-endian relocatable XCOFF32 without an optional
 // header. Decodes ordinary relocation rows as metadata; it does not modify the
 // source storage. Resolves paired overflow headers for both table counts;
-// line-number rows remain extent-checked only. Loader relocations are unsupported.
+// decodes function markers and raw address/line rows, without resolving source
+// files or absolute source lines. Loader relocations are unsupported.
 HEXLAB_LOADERS_EXPORT std::string_view xcoff32_relocation_type_name(std::uint8_t);
 HEXLAB_LOADERS_EXPORT Result<Xcoff32Object> inspect_xcoff32_object(
     const ByteStorage &, std::stop_token = {}, Xcoff32ObjectLimits = {});
