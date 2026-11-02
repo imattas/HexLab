@@ -28,6 +28,35 @@ inline std::string module_leaf(std::string value) {
     return value;
 }
 
+inline std::optional<std::string> elf_unique_soname(const ElfMetadata &elf) {
+    std::optional<std::string> soname;
+    for (const auto &table : elf.dynamic_tables) {
+        for (const auto &entry : table.entries) {
+            if (entry.tag != 14 || !entry.string_value) continue; // DT_SONAME
+            const auto &value = *entry.string_value;
+            if (value.empty() || value.size() > 32768 ||
+                value.find_first_of("/\\:") != std::string::npos ||
+                value.find('\0') != std::string::npos) continue;
+            if (soname && *soname != value) return {};
+            soname = value;
+        }
+    }
+    return soname;
+}
+
+inline bool elf_provider_name_matches(std::string_view requested, std::string_view path,
+                                      const std::optional<std::string> &soname) {
+    if (module_leaf(std::string(requested)) == module_leaf(std::string(path))) return true;
+    return soname && module_leaf(std::string(requested)) == module_leaf(*soname);
+}
+
+inline bool elf_provider_matches_needed(const std::set<std::string> &needed,
+                                        std::string_view path,
+                                        const std::optional<std::string> &soname) {
+    if (needed.contains(module_leaf(std::string(path)))) return true;
+    return soname && needed.contains(module_leaf(*soname));
+}
+
 inline bool is_pe_module(const ImageMetadata &metadata) {
     return metadata.format == "PE32" || metadata.format == "PE32+";
 }
@@ -284,10 +313,12 @@ inline void print_elf_copy_dependencies(const std::vector<SuppliedModule> &modul
     };
     std::vector<std::vector<std::size_t>> dynamic_tables_by_module(modules.size());
     std::vector<bool> pie_by_module(modules.size());
+    std::vector<std::optional<std::string>> sonames_by_module(modules.size());
     for (std::size_t i = 0; i < modules.size(); ++i)
         if (modules[i].metadata && modules[i].metadata->elf) {
             dynamic_tables_by_module[i] = elf_dynamic_symbol_table_indices(*modules[i].metadata->elf);
             pie_by_module[i] = pie(*modules[i].metadata->elf);
+            sonames_by_module[i] = elf_unique_soname(*modules[i].metadata->elf);
         }
     const auto mapped_object = [](const ElfMetadata &elf, std::uint64_t value,
                                   std::uint64_t size, std::uint32_t permission) {
@@ -355,19 +386,21 @@ inline void print_elf_copy_dependencies(const std::vector<SuppliedModule> &modul
             }
             const SuppliedModule *match_provider = nullptr;
             const ElfSymbol *match_symbol = nullptr;
+            std::size_t match_provider_index = 0;
             std::size_t matches = 0, incompatible = 0, unsupported = 0;
             for (std::size_t provider_index = 0; provider_index < modules.size(); ++provider_index) {
                 if (lookup_work == lookup_work_cap) { lookup_exhausted = true; break; }
                 ++lookup_work;
                 const auto &provider = modules[provider_index];
                 if (&provider == &importer || !provider.metadata || !provider.metadata->elf) continue;
-                if (!needed.contains(module_leaf(provider.path))) continue;
                 const auto &candidate_elf = *provider.metadata->elf;
+                if (!elf_provider_matches_needed(needed, provider.path, sonames_by_module[provider_index])) continue;
                 if (elf_abi_incompatibility(elf.header, candidate_elf.header)) { ++incompatible; continue; }
                 // Some shared libraries (including libc) also have PT_INTERP.
                 // Only ET_EXEC and explicit DF_1_PIE sources are excluded.
                 if (candidate_elf.header.object_type != 3 || pie_by_module[provider_index]) continue;
-                if (wanted->version_file && module_leaf(*wanted->version_file) != module_leaf(provider.path)) continue;
+                if (wanted->version_file && !elf_provider_name_matches(
+                        *wanted->version_file, provider.path, sonames_by_module[provider_index])) continue;
                 const auto &provider_tables = dynamic_tables_by_module[provider_index];
                 for (const auto &candidate : candidate_elf.symbols) {
                     if (lookup_work == lookup_work_cap) { lookup_exhausted = true; break; }
@@ -385,6 +418,7 @@ inline void print_elf_copy_dependencies(const std::vector<SuppliedModule> &modul
                     ++matches;
                     match_provider = &provider;
                     match_symbol = &candidate;
+                    match_provider_index = provider_index;
                 }
                 if (lookup_exhausted) break;
             }
@@ -394,7 +428,14 @@ inline void print_elf_copy_dependencies(const std::vector<SuppliedModule> &modul
                 << " matching source definitions have unsupported type/state/visibility/size/storage)";
             else if (!matches) out << "unresolved (no eligible supplied DT_NEEDED shared-object source)";
             else {
-                out << "candidate source " << match_provider->path << " symbol-table=0x" << std::hex
+                out << "candidate source " << match_provider->path;
+                const bool selected_by_soname =
+                    !needed.contains(module_leaf(match_provider->path)) ||
+                    (wanted->version_file &&
+                     module_leaf(*wanted->version_file) != module_leaf(match_provider->path));
+                if (selected_by_soname && sonames_by_module[match_provider_index])
+                    out << " via DT_SONAME " << *sonames_by_module[match_provider_index];
+                out << " symbol-table=0x" << std::hex
                     << match_symbol->table_offset << std::dec << " symbol-index=" << match_symbol->index
                     << " address=0x" << std::hex << match_symbol->address->offset << std::dec
                     << " size=" << match_symbol->size;
@@ -412,15 +453,18 @@ inline void print_elf_copy_dependencies(const std::vector<SuppliedModule> &modul
 inline void print_elf_import_resolutions(const std::vector<SuppliedModule> &modules, std::ostream &out) {
     constexpr std::size_t row_cap = 100000;
     std::vector<std::vector<std::size_t>> dynamic_tables_by_module(modules.size());
+    std::vector<std::optional<std::string>> sonames_by_module(modules.size());
     for (std::size_t module_index = 0; module_index < modules.size(); ++module_index)
-        if (modules[module_index].metadata && modules[module_index].metadata->elf)
+        if (modules[module_index].metadata && modules[module_index].metadata->elf) {
             dynamic_tables_by_module[module_index] = elf_dynamic_symbol_table_indices(*modules[module_index].metadata->elf);
+            sonames_by_module[module_index] = elf_unique_soname(*modules[module_index].metadata->elf);
+        }
     auto needed_names = [](const ImageMetadata &m) {
-        std::vector<std::string> names;
+        std::set<std::string> names;
         if (!m.elf) return names;
         for (const auto &table : m.elf->dynamic_tables)
             for (const auto &entry : table.entries)
-                if (entry.tag == 1 && entry.string_value) names.push_back(*entry.string_value);
+                if (entry.tag == 1 && entry.string_value) names.insert(module_leaf(*entry.string_value));
         return names;
     };
     out << "ELF imported-symbol resolution (only supplied files are considered):\n";
@@ -450,9 +494,9 @@ inline void print_elf_import_resolutions(const std::vector<SuppliedModule> &modu
             for (std::size_t candidate_index = 0; candidate_index < modules.size(); ++candidate_index) {
                 const auto &candidate = modules[candidate_index];
                 if (candidate_index == importer_index || !candidate.metadata || !candidate.metadata->elf) continue;
-                if (names.empty() || std::any_of(names.begin(), names.end(), [&](const auto &n) {
-                    return module_leaf(n) == module_leaf(candidate.path);
-                })) providers.push_back(candidate_index);
+                if (names.empty() || (candidate.metadata->elf &&
+                    elf_provider_matches_needed(names, candidate.path, sonames_by_module[candidate_index])))
+                    providers.push_back(candidate_index);
             }
             const bool weak_undefined = wanted.binding == 2; // STB_WEAK
             if (providers.empty()) {
@@ -475,7 +519,8 @@ inline void print_elf_import_resolutions(const std::vector<SuppliedModule> &modu
                     continue;
                 }
                 has_abi_compatible_provider = true;
-                if (wanted.version_file && module_leaf(*wanted.version_file) != module_leaf(provider->path))
+                if (wanted.version_file && !elf_provider_name_matches(
+                        *wanted.version_file, provider->path, sonames_by_module[provider_index]))
                     continue;
                 for (const auto &candidate : pe.symbols) {
                     if (!candidate.table ||
@@ -527,6 +572,13 @@ inline void print_elf_import_resolutions(const std::vector<SuppliedModule> &modu
             if (matches.size() != 1) { out << "ambiguous (" << matches.size() << " matching exports)\n"; continue; }
             const auto &[provider, symbol] = matches.front();
             out << "resolved " << provider->path;
+            const bool selected_by_soname =
+                (!names.empty() && !names.contains(module_leaf(provider->path))) ||
+                (wanted.version_file &&
+                 module_leaf(*wanted.version_file) != module_leaf(provider->path));
+            if (selected_by_soname && sonames_by_module[static_cast<std::size_t>(provider - modules.data())])
+                out << " via DT_SONAME "
+                    << *sonames_by_module[static_cast<std::size_t>(provider - modules.data())];
             if (symbol->address) out << " at 0x" << std::hex << symbol->address->offset << std::dec;
             else out << " (address unavailable)";
             out << "\n";
