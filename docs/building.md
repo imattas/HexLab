@@ -77,11 +77,27 @@ If it detects an earlier installation, it offers to uninstall that version
 before proceeding with the new install.
 The ZIP remains the default when this option is disabled.
 
-The `Windows release package` workflow builds the Release ZIP on Windows Server
-2022 for pushes, pull requests, and manual runs. It uploads the multi-file ZIP
-and a SHA-256 checksum as a 14-day workflow artifact. This makes the same
-relocatable install tree available for review without publishing a release or
-changing the local build's package directory.
+Windows and portability GitHub workflows are manual-dispatch only. They do not
+run on pushes or pull requests. Local release builds and publishing are the
+normal release path:
+
+```powershell
+cmake --preset windows-desktop
+cmake --build --preset windows-desktop --config Release --target package --parallel 6
+```
+
+From WSL Ubuntu with the Linux desktop dependencies installed:
+
+```sh
+cmake --preset linux-desktop
+cmake --build --preset linux-desktop --target package --parallel 6
+```
+
+The Windows ZIP and Linux TGZ/DEB are written under their preset's
+`out/build/<preset>/packages/` directory. After reviewing the local artifacts,
+create and push a version tag, then publish those files manually with `gh
+release create TAG ARTIFACT... --title TITLE --notes-file NOTES_FILE --verify-tag`.
+Do not use a GitHub Actions run to build or publish releases.
 
 Linux desktop builds produce both a relocatable TGZ and an installable Debian
 package. Linux packages include the GUI,
@@ -126,7 +142,7 @@ ctest --test-dir out/build/headless-offline -C Debug --output-on-failure
 
 For an offline desktop build, obtain a complete wxWidgets checkout at the commit listed in [third-party dependencies](third-party.md), including its submodules. Pass `-DFETCHCONTENT_SOURCE_DIR_WXWIDGETS=C:/path/to/wxWidgets` at configure time. Do not use a GitHub auto-generated source archive without required submodule content. After provisioning, application startup uses no network service.
 
-Linux headless presets and CI jobs exercise Clang Debug (`linux-headless`) and GCC Release (`linux-gcc-headless-release`) on Ubuntu 24.04. They configure without wxWidgets, build the CLI and test targets, and run every CTest registered by the preset; tests that require pinned LLVM oracle executables remain disabled on these hosts. The CLI uses native entry points and strict UTF-8 argument decoding; paths are converted to the host filesystem representation. The `linux-desktop` preset builds the Release distribution with wxWidgets and CPack on Ubuntu. Linux CI installs the GTK/X11/Wayland development dependencies required by wxWidgets, then inspects and relocates the package to verify its runtime paths. Desktop launch and interactive behavior still require validation on a Linux host.
+Linux headless presets (`linux-headless` and `linux-gcc-headless-release`) configure without wxWidgets. They build the CLI and test targets; tests that require pinned LLVM oracle executables remain disabled on these hosts. The CLI uses native entry points and strict UTF-8 argument decoding; paths are converted to the host filesystem representation. The `linux-desktop` preset builds the Release distribution with wxWidgets and CPack on Ubuntu and requires the GTK/X11/Wayland development dependencies. Desktop launch and interactive behavior still require validation on a Linux host.
 
 For a native GCC Debug build without the test-only LLVM tools or GUI dependencies:
 
