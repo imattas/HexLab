@@ -543,10 +543,20 @@ that spilled HFA as one stack slot per scalar member, so exact-width member
 loads in the callee and direct register-to-stack member stores at a compatible
 callsite can propagate each member's floating type. It does not reconstruct
 aggregate copies, partial stores, or non-register store sources. Prototype
-slots that cannot be classified stop at the first unsupported parameter. Aggregates
-with padding, unions, mixed member types, or more than four members remain
-unsupported. Multi-register HFA returns and ambiguous mixed-class argument
-evidence without a prototype are left unresolved. Without a prototype,
+slots that cannot be classified stop at the first unsupported parameter. The
+shared AAPCS64 classifier also supplies locations for non-HFA composites and
+wide scalar values. A direct composite of at most 16 bytes is mapped to exact
+X-register chunks when all chunks fit; a 16-byte-aligned value observes the
+classifier's even-register rounding, and a value that cannot fit is placed
+wholly on the stack. Composites larger than 16 bytes are represented as
+pointers to the caller-created copy in the classified X-register or stack
+slot. Register chunks keep an exact member type when one member fills the
+chunk; chunks that combine fields or padding retain an integer type at the
+transported width. Exact whole-width stack loads/stores can propagate a stack
+composite, but multi-store reconstruction of an arbitrary stack copy remains
+unsupported. Unsupported HFA member shapes and ambiguous mixed-class argument
+evidence without a prototype remain unresolved. The separately bounded one-to-four
+member HFA return path is described below. Without a prototype,
 argument inference is emitted only when evidence occupies a contiguous prefix
 of one register class; seeing both integer and SIMD classes leaves source
 parameter ordering ambiguous. Multiple observed scalar FP values in consecutive
@@ -677,9 +687,14 @@ or arrangement of locations remain unresolved. Windows x64 retains its bounded
 single-register cases. AAPCS64 supports one-member HFAs through v0 and
 two-to-four member HFAs through v0-v3 when the classifier's floating-register
 locations match each homogeneous element's exact size and contiguous object
-offset. The lifter's call writes must include every result register before
-those component types are propagated. This path is prototype-driven and never
-guesses aggregate returns from observed register widths. For SysV AMD64 and
+offset. HFA unions are projected by their unique member offsets; same-offset
+alternatives must have matching floating type name, size, and alignment, and
+conflicting alternatives remain unresolved. Non-HFA composite results of at most 16 bytes use exact X0/X1 integer
+locations from the shared classifier; each returned register receives either
+its exact member type or a width-matched integer chunk type. The lifter's call
+writes must include every classified result register before those component
+types are propagated. This path is prototype-driven and never guesses
+aggregate returns from observed register widths. For SysV AMD64 and
 AAPCS64, explicit function prototypes with a complete structure or array result
 classified as indirect also model the hidden result pointer. The classifier's
 single exact register location (RDI for SysV AMD64 or X8 for AAPCS64) is used to

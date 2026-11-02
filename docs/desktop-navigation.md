@@ -203,6 +203,23 @@ Unmapped destinations and addressless records are omitted; pending/stale
 recovered-function data is not presented as current. Incomplete metadata or
 function analysis is labeled partial.
 
+Choose **Navigate > Search Names in Project Folder...** to search saved
+projects that are not open as tabs. Select a folder explicitly; the scan reads
+only up to 256 direct-child `.hxproj` files (4,096 directory entries maximum),
+opens each database read-only, and uses its embedded input. It never follows
+subfolders or opens the project's recorded external binary path. Results show
+the saved project path and exact address/file offset. Selecting a result opens
+that project if needed, then validates its UUID and embedded input identity
+before navigating.
+
+The folder search indexes parsed image names, saved annotations, bookmarks,
+user function names and any already-persisted reference-cache rows. It does not
+run analysis to synthesize missing references. A bounded per-user `.hlnx`
+cache is keyed by normalized project path, UUID, embedded-input hash/size and
+project revisions; a mismatch rebuilds the index. Projects over 128 MiB each,
+folders over 512 MiB of embedded inputs, and indexes over 50,000 records are
+reported as partial. Cache files are checksummed and capped at 16 MiB.
+
 Each refinement scans the captured sources again after the existing 120 ms
 typing delay. Per query, at most 200,000 source records and 16 MiB of source
 name bytes are examined; names exceeding 2,048 UTF-8 bytes are omitted and
@@ -351,3 +368,13 @@ chooser is open, the selection is rejected and the chooser must be reopened.
 HexLab keeps **Functions** and **Symbols** in dockable navigation panes on the left, the active binary views in the central notebook, and **Binary Metadata** and **Decompiler** in separate right-side panes. The decompiler stays visible beside the listing so address-synchronized pseudocode and assembly can be compared together. **Output** remains a bottom pane. Use View > Move Pane to Display or drag pane captions to resize, reorder, float, or dock these work areas.
 
 The center notebook contains Disassembly, Bytes, Graph, and Source. Saved view IDs remain stable across this layout: Disassembly 0, Bytes 1, Graph 2, Decompiler 3, and Source 4. Older desktop sessions and navigation history therefore retain their original view meaning.
+
+## Unopened project documents
+
+Cross-document name navigation currently searches immutable snapshots for open
+tabs. A saved `.hxproj` database stores one binary input and its analysis state;
+its schema has no project-level document catalog or stable identities for
+multiple inputs. Search cannot include documents that are not open until
+HexLab has an authoritative project document catalog and a persisted index
+keyed by those document identities. The desktop must not infer project
+membership by scanning arbitrary filesystem paths.

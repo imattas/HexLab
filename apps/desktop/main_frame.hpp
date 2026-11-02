@@ -46,6 +46,7 @@ enum Command {
     outgoing_references_id,
     flirt_apply_id,
     cross_document_jump_id,
+    project_folder_name_search_id,
     python_console_id,
     browse_image_entries_id,
     export_navigation_history_id,

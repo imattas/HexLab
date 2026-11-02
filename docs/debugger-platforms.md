@@ -102,6 +102,24 @@ will read. The target executes the original LDM, including register/writeback
 updates, under the existing peer-suspension and temporary-trap rollback path.
 Addressing order and PC interworking follow the
 [Armv7-A/R LDM definitions](https://documentation-service.arm.com/static/5f8daeb7f86e16515cdb8c4e).
+Ordinary A32 word LDR-to-PC now also follows immediate and immediate-shifted
+register-offset forms with a general-register base, including pre-index,
+post-index, and pre-index writeback. The
+current condition and shifter carry are used
+to resolve the effective address; a false condition takes the sequential
+successor without reading target memory. The loaded word selects ARM or Thumb
+state through bit zero. LDRT, PC writeback bases, byte loads,
+register-controlled shifts, PC as an offset register, big-endian data state,
+unaligned transfer words, invalid
+address arithmetic, and successor traps overlapping the instruction or loaded
+word remain unsupported. The target executes the original LDR, so architectural
+register and base updates are preserved.
+Thumb-2 `LDR (register)` T2 to PC is followed with its non-PC base and index,
+positive offset, and encoded `LSL #0..3` scale. It has no writeback; an active
+IT block must be in its last slot, and a false IT predicate takes the next
+instruction without reading memory. The transfer word must be aligned, and
+the loaded value selects ARM or Thumb state. Other Thumb-2 memory-to-PC forms
+remain unsupported.
 The A32 LDM addition passed a Windows x64 Debug debugger build and an ARMv7
 Windows clang-cl syntax check against the installed MSVC/Windows SDK headers;
 native ARM32 linking and runtime stepping remain unverified. The context

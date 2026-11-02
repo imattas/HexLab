@@ -5,6 +5,7 @@
 #include "hexlab/image/metadata.hpp"
 #include "hexlab/symbols/demangle.hpp"
 #include "hexlab/workspace/navigation.hpp"
+#include "hexlab/database/project_state.hpp"
 #include <algorithm>
 #include <atomic>
 #include <set>
@@ -13,6 +14,7 @@
 #include <tuple>
 #include <wx/string.h>
 #include <optional>
+#include <filesystem>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -27,6 +29,11 @@ struct NamedLocationCandidate {
     // Only cross-document searches set this owner. Location alone is not a
     // unique destination when multiple documents share an address range.
     std::optional<std::uint64_t> document;
+    // Saved-project search keeps its durable owner identity on each result.
+    // These fields are absent for ordinary current-document candidates.
+    std::optional<std::filesystem::path> project_path;
+    std::optional<database::ProjectUuid> project_uuid;
+    std::optional<InputIdentity> project_input;
 };
 
 struct NamedLocationMatch {

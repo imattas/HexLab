@@ -25,8 +25,8 @@ class SessionController final : public wxEvtHandler {
     explicit SessionController(std::function<void()> changed);
     ~SessionController() override;
     void open(OpenRequest);
-    void open_project(std::filesystem::path, database::ProjectMode = database::ProjectMode::read_write,
-                      AnalysisOptions = {});
+    Result<DocumentId> open_project(std::filesystem::path, database::ProjectMode = database::ProjectMode::read_write,
+                                   AnalysisOptions = {});
     void cancel();
     void cancel_analyses();
     void wait_for_analysis_workers();

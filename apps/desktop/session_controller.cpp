@@ -79,7 +79,7 @@ void SessionController::open(OpenRequest request) {
         manager_->report_error(opened.error());
     changed_();
 }
-void SessionController::open_project(std::filesystem::path path, database::ProjectMode mode, AnalysisOptions options) {
+Result<DocumentId> SessionController::open_project(std::filesystem::path path, database::ProjectMode mode, AnalysisOptions options) {
     auto tracked_path = path;
     auto opened = manager_->open_project(std::move(path), mode, options);
     if (!opened)
@@ -88,6 +88,7 @@ void SessionController::open_project(std::filesystem::path path, database::Proje
         pending_project_opens_.insert_or_assign(opened.value().value,
                                                   PendingProjectOpen{std::move(tracked_path), mode});
     changed_();
+    return opened;
 }
 void SessionController::scan_recovery_candidates(std::filesystem::path failed_path,
                                                  database::ProjectMode mode, Error open_error) {

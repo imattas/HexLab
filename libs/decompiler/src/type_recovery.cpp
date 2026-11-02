@@ -139,20 +139,24 @@ types::TypePtr unqualified_type(types::TypePtr type) {
 
 std::optional<std::vector<types::TypePtr>> hfa_float_elements(types::TypePtr input) {
     const auto root = unqualified_type(std::move(input));
-    if (!root || (root->kind() != types::Kind::structure && root->kind() != types::Kind::array) ||
+    if (!root || (root->kind() != types::Kind::structure && root->kind() != types::Kind::union_type &&
+                  root->kind() != types::Kind::array) ||
         !root->size() || *root->size() == 0 || *root->size() > 64)
         return {};
     struct Element { std::uint64_t offset; types::TypePtr type; };
     std::vector<Element> elements;
     bool valid = true;
+    std::size_t work = 0;
     const auto collect = [&](const types::TypePtr &candidate, std::uint64_t base, unsigned depth,
                              auto &&self) -> void {
-        if (!valid || !candidate || depth > 4 || elements.size() > 4) { valid = false; return; }
+        if (!valid || !candidate || depth > 4 || work >= 4096) { valid = false; return; }
+        ++work;
         const auto type = unqualified_type(candidate);
         if (!type) { valid = false; return; }
         if (type->kind() == types::Kind::floating) {
-            if (!type->size() || (*type->size() != 4 && *type->size() != 8 && *type->size() != 16) ||
-                base > 64 || *type->size() > 64 - base || elements.size() == 4) {
+            if (!type->size() || (*type->size() != 2 && *type->size() != 4 &&
+                                  *type->size() != 8 && *type->size() != 16) ||
+                base > 64 || *type->size() > 64 - base) {
                 valid = false;
                 return;
             }
@@ -175,8 +179,8 @@ std::optional<std::vector<types::TypePtr>> hfa_float_elements(types::TypePtr inp
                 self(type->element(), base + index * *element->size(), depth + 1, self);
             return;
         }
-        if (type->kind() != types::Kind::structure || type->members().empty() ||
-            type->members().size() > 4 || !type->size()) {
+        if ((type->kind() != types::Kind::structure && type->kind() != types::Kind::union_type) ||
+            type->members().empty() || !type->size()) {
             valid = false;
             return;
         }
@@ -194,12 +198,30 @@ std::optional<std::vector<types::TypePtr>> hfa_float_elements(types::TypePtr inp
     std::sort(elements.begin(), elements.end(), [](const Element &left, const Element &right) {
         return left.offset < right.offset;
     });
+    // Union alternatives occupy the same byte range. Match AAPCS64's HFA
+    // treatment by counting a same-offset, same-width floating alternative
+    // once; reject overlapping alternatives whose element types conflict.
+    std::vector<Element> unique_elements;
+    unique_elements.reserve(elements.size());
+    for (const auto &element : elements) {
+        if (!unique_elements.empty() && unique_elements.back().offset == element.offset) {
+            const auto &previous = unique_elements.back().type;
+            if (!previous || !element.type || previous->kind() != element.type->kind() ||
+                previous->name() != element.type->name() ||
+                previous->size() != element.type->size() ||
+                previous->alignment() != element.type->alignment())
+                return {};
+            continue;
+        }
+        unique_elements.push_back(element);
+    }
+    if (unique_elements.empty() || unique_elements.size() > 4) return {};
     const auto element_size = elements.front().type->size();
     if (!element_size || !*element_size) return {};
     std::uint64_t expected = 0;
     std::vector<types::TypePtr> result;
-    result.reserve(elements.size());
-    for (const auto &element : elements) {
+    result.reserve(unique_elements.size());
+    for (const auto &element : unique_elements) {
         if (!element.type || !element.type->size() || *element.type->size() != *element_size ||
             element.offset != expected || expected > 64 - *element_size)
             return {};
@@ -208,37 +230,6 @@ std::optional<std::vector<types::TypePtr>> hfa_float_elements(types::TypePtr inp
     }
     if (expected != *root->size()) return {};
     return result;
-}
-
-struct Aapcs64Value {
-    AbiValueClass value_class = AbiValueClass::integer;
-    std::vector<types::TypePtr> floating_components;
-    bool homogeneous_aggregate = false;
-};
-
-std::optional<Aapcs64Value> classify_aapcs64_value(types::TypePtr input) {
-    const auto type = unqualified_type(std::move(input));
-    if (!type) return {};
-    switch (type->kind()) {
-    case types::Kind::boolean:
-    case types::Kind::integer:
-    case types::Kind::enumeration:
-    case types::Kind::pointer:
-        return Aapcs64Value{AbiValueClass::integer, {}, false};
-    case types::Kind::floating:
-        if (!type->size() || (*type->size() != 4 && *type->size() != 8 && *type->size() != 16)) return {};
-        return Aapcs64Value{AbiValueClass::floating, {type}, false};
-    case types::Kind::vector:
-        return Aapcs64Value{AbiValueClass::vector, {}, false};
-    case types::Kind::array:
-    case types::Kind::structure: {
-        auto components = hfa_float_elements(type);
-        if (!components) return {};
-        return Aapcs64Value{AbiValueClass::floating, std::move(*components), true};
-    }
-    default:
-        return {};
-    }
 }
 
 std::shared_ptr<const AggregateLayout> observed_structure_layout(
@@ -823,7 +814,8 @@ std::optional<HiddenResultPointerInfo> hidden_result_pointer_info(
                          abi.name != "PowerPC64 ELFv2"))
         return {};
     const auto result = unqualified_type(result_type);
-    if (!result || (result->kind() != types::Kind::structure && result->kind() != types::Kind::array) ||
+    if (!result || (result->kind() != types::Kind::structure && result->kind() != types::Kind::union_type &&
+                    result->kind() != types::Kind::array) ||
         !result->size() || *result->size() == 0)
         return {};
     const auto convention = classifier_convention(abi);
@@ -856,79 +848,109 @@ std::vector<AbiArgumentSlot> aapcs64_prototype_slots(const types::TypePtr &proto
     std::vector<AbiArgumentSlot> slots;
     if (!prototype || prototype->kind() != types::Kind::function || prototype->parameters().size() > 256)
         return slots;
-    std::size_t next_integer = 0;
-    std::size_t next_simd = 0;
-    std::int64_t stack_offset = 0;
-    for (std::size_t parameter_index = 0; parameter_index < prototype->parameters().size(); ++parameter_index) {
-        const auto &parameter = prototype->parameters()[parameter_index];
-        const auto classified = classify_aapcs64_value(parameter.type);
-        if (!classified) break;
+    const auto classified = classify_abi_signature(CallingConvention::aapcs64, *prototype);
+    if (classified.arguments.size() != prototype->parameters().size()) return slots;
+    for (std::size_t parameter_index = 0; parameter_index < classified.arguments.size(); ++parameter_index) {
+        const auto &placement = classified.arguments[parameter_index];
+        const auto parameter_type = unqualified_type(prototype->parameters()[parameter_index].type);
         const auto parameter_number = static_cast<std::uint16_t>(parameter_index);
-        if (classified->value_class == AbiValueClass::integer) {
-            if (next_integer < 8) {
-                slots.push_back({AbiValueClass::integer,
-                    RegisterOperand{RegisterBank::arm64_gpr, static_cast<std::uint8_t>(next_integer++), 64, false},
-                    {}, parameter_number, {}});
-                continue;
-            }
-        } else if (classified->value_class == AbiValueClass::floating) {
-            if (classified->floating_components.size() <= 8 - next_simd) {
-                for (std::size_t component = 0; component < classified->floating_components.size(); ++component) {
-                    slots.push_back({AbiValueClass::floating, arm64_simd(static_cast<unsigned>(next_simd++)), {},
-                        parameter_number, classified->homogeneous_aggregate
-                            ? std::optional<std::uint8_t>{static_cast<std::uint8_t>(component)}
-                            : std::nullopt});
-                }
-                continue;
-            }
-            // An HFA is allocated all-or-nothing. If it does not fit, AAPCS64
-            // exhausts the remaining SIMD argument bank and places the whole
-            // aggregate on the stack; it is never split across SIMD and GPRs.
-            if (classified->homogeneous_aggregate) next_simd = 8;
-        } else if (classified->value_class == AbiValueClass::vector) {
-            if (next_simd < 8) {
-                slots.push_back({AbiValueClass::vector, arm64_simd(static_cast<unsigned>(next_simd++)), {},
-                    parameter_number, {}});
-                continue;
-            }
+        if (!placement.supported || placement.locations.empty() || !parameter_type) {
+            const auto value_class = parameter_type && parameter_type->kind() == types::Kind::floating
+                ? AbiValueClass::floating
+                : parameter_type && parameter_type->kind() == types::Kind::vector
+                    ? AbiValueClass::vector : AbiValueClass::integer;
+            slots.push_back({value_class, {}, {}, parameter_number, {}, {}, {}, false});
+            break;
         }
 
-        const auto type = unqualified_type(parameter.type);
-        const auto maximum_stack_value_size = classified->homogeneous_aggregate ? 64u : 16u;
-        if (!type || !type->size() || *type->size() == 0 ||
-            *type->size() > maximum_stack_value_size) break;
-        const auto alignment = std::min<std::uint64_t>(16, std::max<std::uint64_t>(8, type->alignment()));
-        const auto remainder = static_cast<std::uint64_t>(stack_offset) % alignment;
-        if (remainder) stack_offset += static_cast<std::int64_t>(alignment - remainder);
-        const auto allocation = std::max<std::uint64_t>(8, (*type->size() + 7) & ~std::uint64_t{7});
-        constexpr std::uint64_t stack_budget = 1u << 20;
-        if (stack_offset < 0 || static_cast<std::uint64_t>(stack_offset) > stack_budget ||
-            allocation > stack_budget - static_cast<std::uint64_t>(stack_offset)) break;
-        if (classified->homogeneous_aggregate) {
-            auto component_offset = stack_offset;
-            bool representable = true;
-            for (std::size_t component = 0; component < classified->floating_components.size(); ++component) {
-                const auto &component_type = classified->floating_components[component];
-                if (!component_type || !component_type->size() ||
-                    *component_type->size() > static_cast<std::uint64_t>(stack_offset) + allocation -
-                        static_cast<std::uint64_t>(component_offset) || component > UINT8_MAX) {
-                    representable = false;
-                    break;
-                }
-                slots.push_back({AbiValueClass::floating, {}, component_offset, parameter_number,
-                    static_cast<std::uint8_t>(component)});
-                component_offset += static_cast<std::int64_t>(*component_type->size());
-            }
-            if (!representable) {
-                while (!slots.empty() && slots.back().parameter_index == parameter_number)
-                    slots.pop_back();
+        const bool aggregate = parameter_type->kind() == types::Kind::structure ||
+            parameter_type->kind() == types::Kind::union_type || parameter_type->kind() == types::Kind::array;
+        const auto hfa = aggregate ? hfa_float_elements(parameter_type) : std::nullopt;
+        std::uint64_t hfa_offset = 0;
+        bool valid = true;
+        const auto slot_begin = slots.size();
+        for (std::size_t location_index = 0; location_index < placement.locations.size(); ++location_index) {
+            const auto &location = placement.locations[location_index];
+            if (location.role != AbiLocationRole::value || location.duplicate || !location.size ||
+                location.size > UINT8_MAX || location.value_offset > UINT8_MAX) {
+                valid = false;
                 break;
             }
-            stack_offset += static_cast<std::int64_t>(allocation);
-            continue;
+            auto component_index = std::optional<std::uint8_t>{};
+            if (hfa) {
+                hfa_offset = 0;
+                for (std::size_t component = 0; component < hfa->size(); ++component) {
+                    const auto &element = (*hfa)[component];
+                    if (element && element->size() && hfa_offset == location.value_offset &&
+                        *element->size() == location.size && component <= UINT8_MAX) {
+                        component_index = static_cast<std::uint8_t>(component);
+                        hfa_offset += *element->size();
+                        break;
+                    }
+                    if (element && element->size()) hfa_offset += *element->size();
+                }
+                // Stack locations carry the whole HFA, so expand them into
+                // exact scalar locations using the dense member ordering.
+                if (location.kind == AbiLocationKind::stack && location.value_offset == 0 &&
+                    location.size == parameter_type->size().value_or(0)) {
+                    if (!hfa || location.stack_offset > static_cast<std::uint64_t>(INT64_MAX)) {
+                        valid = false;
+                        break;
+                    }
+                    std::uint64_t offset = 0;
+                    for (std::size_t component = 0; component < hfa->size(); ++component) {
+                        const auto &element = (*hfa)[component];
+                        if (!element || !element->size() || component > UINT8_MAX ||
+                            offset > location.size || *element->size() > location.size - offset ||
+                            location.stack_offset > static_cast<std::uint64_t>(INT64_MAX) - offset) {
+                            valid = false;
+                            break;
+                        }
+                        slots.push_back({AbiValueClass::floating, {},
+                            static_cast<std::int64_t>(location.stack_offset + offset), parameter_number,
+                            static_cast<std::uint8_t>(component)});
+                        offset += *element->size();
+                    }
+                    if (offset != location.size) valid = false;
+                    continue;
+                }
+            }
+
+            AbiValueClass value_class = AbiValueClass::integer;
+            std::optional<RegisterOperand> reg;
+            if (location.kind == AbiLocationKind::register_) {
+                reg = classified_register(location.register_name);
+                if (!reg) { valid = false; break; }
+                if (reg->bank == RegisterBank::arm64_simd)
+                    value_class = (hfa || parameter_type->kind() == types::Kind::floating)
+                        ? AbiValueClass::floating : AbiValueClass::vector;
+                else if (reg->bank != RegisterBank::arm64_gpr) { valid = false; break; }
+            } else if (location.kind != AbiLocationKind::stack ||
+                       location.stack_offset > static_cast<std::uint64_t>(INT64_MAX)) {
+                valid = false;
+                break;
+            }
+
+            const bool split_value = !placement.indirect &&
+                (aggregate || placement.locations.size() > 1) &&
+                location.size < parameter_type->size().value_or(0);
+            const auto component_offset = split_value
+                ? std::optional<std::uint8_t>{static_cast<std::uint8_t>(location.value_offset)}
+                : std::nullopt;
+            const auto component_size = split_value
+                ? std::optional<std::uint8_t>{static_cast<std::uint8_t>(location.size)}
+                : std::nullopt;
+            slots.push_back({value_class, reg,
+                location.kind == AbiLocationKind::stack
+                    ? std::optional<std::int64_t>{static_cast<std::int64_t>(location.stack_offset)}
+                    : std::nullopt,
+                parameter_number, component_index, component_offset, component_size, true, placement.indirect});
         }
-        slots.push_back({classified->value_class, {}, stack_offset, parameter_number, {}});
-        stack_offset += static_cast<std::int64_t>(allocation);
+        if (!valid) {
+            slots.resize(slot_begin);
+            slots.push_back({AbiValueClass::integer, {}, {}, parameter_number, {}, {}, {}, false});
+            break;
+        }
     }
     return slots;
 }
@@ -1256,6 +1278,19 @@ std::optional<types::TypePtr> abi_component_type(const types::TypePtr &input,
     return vector ? std::optional<types::TypePtr>{vector.value()} : std::nullopt;
 }
 
+std::optional<types::TypePtr> aapcs64_component_type(const types::TypePtr &input,
+    std::uint8_t component_offset, std::uint8_t component_size, AbiValueClass value_class) {
+    auto projected = abi_component_type(input, component_offset, component_size, value_class,
+                                        types::Abi::aarch64);
+    if (projected || value_class != AbiValueClass::integer) return projected;
+    // AAPCS64 transports a non-HFA composite as raw integer-class register
+    // chunks. Several fields, padding, or a field crossing the 8-byte chunk
+    // boundary do not change that transport class, so preserve the exact
+    // chunk width without inventing a source member type.
+    const auto piece = types::Type::integer("aapcs64_aggregate_piece", component_size, 1, false);
+    return piece ? std::optional<types::TypePtr>{piece.value()} : std::nullopt;
+}
+
 struct Sysv64ReturnPiece {
     RegisterOperand reg;
     std::uint8_t offset = 0;
@@ -1377,10 +1412,52 @@ struct Aapcs64HfaReturnPiece {
     types::TypePtr type;
 };
 
+std::optional<std::vector<Sysv64ReturnPiece>> aapcs64_integer_return_pieces(
+    const types::TypePtr &input) {
+    const auto aggregate = unqualified_type(input);
+    if (!aggregate || (aggregate->kind() != types::Kind::integer &&
+                       aggregate->kind() != types::Kind::structure &&
+                       aggregate->kind() != types::Kind::union_type &&
+                       aggregate->kind() != types::Kind::array) ||
+        !aggregate->size() || *aggregate->size() == 0 || *aggregate->size() > 16 ||
+        (aggregate->kind() != types::Kind::integer && hfa_float_elements(input)))
+        return {};
+    const auto signature = types::Type::function(input, {}, false);
+    if (!signature) return {};
+    const auto classified = classify_abi_signature(CallingConvention::aapcs64, *signature.value());
+    const auto &result = classified.result;
+    if (!result.supported || result.indirect || result.locations.empty() || result.locations.size() > 2)
+        return {};
+
+    std::vector<Sysv64ReturnPiece> pieces;
+    pieces.reserve(result.locations.size());
+    std::uint64_t cursor = 0;
+    for (std::size_t index = 0; index < result.locations.size(); ++index) {
+        const auto &location = result.locations[index];
+        if (location.kind != AbiLocationKind::register_ || location.role != AbiLocationRole::value ||
+            location.duplicate || !location.size || location.size > 8 || location.value_offset != cursor ||
+            location.value_offset > UINT8_MAX || location.size > UINT8_MAX)
+            return {};
+        const auto reg = classified_register(location.register_name);
+        if (!reg || reg->bank != RegisterBank::arm64_gpr || reg->index != index || reg->width != 64)
+            return {};
+        const auto piece_type = aapcs64_component_type(input,
+            static_cast<std::uint8_t>(location.value_offset), static_cast<std::uint8_t>(location.size),
+            AbiValueClass::integer);
+        if (!piece_type) return {};
+        pieces.push_back({*reg, static_cast<std::uint8_t>(location.value_offset),
+                          static_cast<std::uint8_t>(location.size), *piece_type});
+        cursor += location.size;
+    }
+    if (cursor != *aggregate->size()) return {};
+    return pieces;
+}
+
 std::optional<std::vector<Aapcs64HfaReturnPiece>> aapcs64_hfa_return_pieces(
     const types::TypePtr &input) {
     const auto aggregate = unqualified_type(input);
     if (!aggregate || (aggregate->kind() != types::Kind::structure &&
+                       aggregate->kind() != types::Kind::union_type &&
                        aggregate->kind() != types::Kind::array) ||
         !aggregate->size() || *aggregate->size() == 0 || *aggregate->size() > 64)
         return {};
@@ -1980,9 +2057,14 @@ static Result<TypeRecoveryResult> recover_types_impl(
                     merge_exact_type(returned, s.result_type);
                 }
                 const auto returned_aggregate = unqualified_type(s.result_type);
+                const auto aapcs64_pieces = s.result_type
+                    ? aapcs64_integer_return_pieces(s.result_type) : std::nullopt;
                 if (s.result_type && !s.return_register && returned_aggregate &&
-                    (returned_aggregate->kind() == types::Kind::structure ||
-                     returned_aggregate->kind() == types::Kind::array)) {
+                    (returned_aggregate->kind() == types::Kind::integer ||
+                     returned_aggregate->kind() == types::Kind::structure ||
+                     returned_aggregate->kind() == types::Kind::union_type ||
+                     returned_aggregate->kind() == types::Kind::array) &&
+                    (returned_aggregate->kind() != types::Kind::integer || aapcs64_pieces)) {
                     const auto pieces = sysv64_aggregate_return_pieces(s.result_type);
                     const auto hfa_pieces = aapcs64_hfa_return_pieces(s.result_type);
                     const auto ppc_pieces = ppc64_aggregate_return_pieces(s.result_type);
@@ -2007,6 +2089,8 @@ static Result<TypeRecoveryResult> recover_types_impl(
                         }
                     } else if (hfa_pieces) {
                         for (const auto &piece : *hfa_pieces) apply_piece(piece);
+                    } else if (aapcs64_pieces) {
+                        for (const auto &piece : *aapcs64_pieces) apply_piece(piece);
                     } else if (ppc_pieces) {
                         for (const auto &piece : *ppc_pieces) apply_piece(piece);
                     }
@@ -2258,21 +2342,38 @@ static Result<TypeRecoveryResult> recover_types_impl(
                 if (!slot.parameter_index || *slot.parameter_index >= parameters.size()) continue;
                 const auto parameter_index = static_cast<std::size_t>(*slot.parameter_index);
                 const auto &parameter_type = parameters[parameter_index].type;
+                if (!parameter_type) continue;
+                auto constrained_type = parameter_type;
+                if (slot.indirect) {
+                    const auto pointer = types::Type::pointer(parameter_type, 8, 8);
+                    if (!pointer) continue;
+                    constrained_type = pointer.value();
+                }
                 if (slot.reg) {
-                    auto component_type = parameter_type;
+                    auto component_type = constrained_type;
                     if (slot.component_index) {
                         const auto elements = hfa_float_elements(parameter_type);
                         if (!elements || *slot.component_index >= elements->size()) continue;
                         component_type = (*elements)[*slot.component_index];
+                    } else if (!slot.indirect && slot.component_offset && slot.component_size) {
+                        const auto projected = aapcs64_component_type(parameter_type, *slot.component_offset,
+                            *slot.component_size, slot.value_class);
+                        if (!projected) continue;
+                        component_type = *projected;
                     }
                     constrain_register(*slot.reg, component_type);
                     mapped[parameter_index] = true;
                 } else if (slot.stack_offset) {
-                    auto component_type = parameter_type;
+                    auto component_type = constrained_type;
                     if (slot.component_index) {
                         const auto elements = hfa_float_elements(parameter_type);
                         if (!elements || *slot.component_index >= elements->size()) continue;
                         component_type = (*elements)[*slot.component_index];
+                    } else if (!slot.indirect && slot.component_offset && slot.component_size) {
+                        const auto projected = aapcs64_component_type(parameter_type, *slot.component_offset,
+                            *slot.component_size, slot.value_class);
+                        if (!projected) continue;
+                        component_type = *projected;
                     }
                     constrain_stack_slot(*slot.stack_offset, component_type);
                     mapped[parameter_index] = true;
@@ -4542,7 +4643,7 @@ Result<std::vector<TypeRecoveryResult>> recover_interprocedural_types(
                 lhs[i].component_index != rhs[i].component_index ||
                 lhs[i].component_offset != rhs[i].component_offset ||
                 lhs[i].component_size != rhs[i].component_size ||
-                lhs[i].supported != rhs[i].supported) return false;
+                lhs[i].supported != rhs[i].supported || lhs[i].indirect != rhs[i].indirect) return false;
         return true;
     };
     const auto same_register_file = [&](const AbiDescription &left, const AbiDescription &right) {
@@ -4578,6 +4679,9 @@ Result<std::vector<TypeRecoveryResult>> recover_interprocedural_types(
         switch (type->kind()) {
         case types::Kind::boolean:
         case types::Kind::integer:
+            if (abi.name == "AArch64 AAPCS64" && type->size() && *type->size() == 16)
+                return {};
+            return abi.integer_return_register;
         case types::Kind::enumeration:
         case types::Kind::pointer: return abi.integer_return_register;
         case types::Kind::floating:
@@ -4603,7 +4707,8 @@ Result<std::vector<TypeRecoveryResult>> recover_interprocedural_types(
         const auto aggregate = unqualified_type(type);
         const auto result = abi.integer_return_register;
         if (!aggregate || !aggregate->size() || (*aggregate->size() == 0) ||
-            (aggregate->kind() != types::Kind::structure && aggregate->kind() != types::Kind::array))
+            (aggregate->kind() != types::Kind::structure && aggregate->kind() != types::Kind::union_type &&
+             aggregate->kind() != types::Kind::array))
             return {};
         if (abi.name == "x86-64 System V" || abi.name == "PowerPC64 ELFv2") {
             const auto signature = types::Type::function(type, {}, false);
@@ -5375,6 +5480,9 @@ Result<std::vector<TypeRecoveryResult>> recover_interprocedural_types(
                     call->result_type = type;
                 else if (target_abi->name == "AArch64 AAPCS64" && aapcs64_hfa_return_pieces(type))
                     call->result_type = type;
+                else if (target_abi->name == "AArch64 AAPCS64" &&
+                         aapcs64_integer_return_pieces(type))
+                    call->result_type = type;
                 else if (target_abi->name == "ARM32 AAPCS VFP PCS" && type &&
                          hfa_float_elements(type) && hfa_float_elements(type)->size() > 1) {
                     auto signature = types::Type::function(type, {}, false);
@@ -5495,12 +5603,33 @@ Result<std::vector<TypeRecoveryResult>> recover_interprocedural_types(
                         // and the caller's direct store proof below matches it.
                         if (!signature || !argument_slot.stack_offset) continue;
                         auto parameter_type = signature->parameters()[parameter_index].type;
+                        if (argument_slot.indirect) {
+                            const auto pointer = types::Type::pointer(parameter_type, 8, 8);
+                            if (!pointer) continue;
+                            parameter_type = pointer.value();
+                        }
                         if (argument_slot.component_index) {
-                            const auto components = hfa_float_elements(parameter_type);
+                            const auto components = hfa_float_elements(
+                                signature->parameters()[parameter_index].type);
                             if (!components || *argument_slot.component_index >= components->size()) continue;
                             parameter_type = (*components)[*argument_slot.component_index];
+                        } else if (!argument_slot.indirect && argument_slot.component_offset &&
+                                   argument_slot.component_size && target_abi->name == "AArch64 AAPCS64") {
+                            const auto projected = aapcs64_component_type(
+                                signature->parameters()[parameter_index].type, *argument_slot.component_offset,
+                                *argument_slot.component_size, argument_slot.value_class);
+                            if (!projected) continue;
+                            parameter_type = *projected;
                         }
-                        if (!matches_slot_class(argument_slot.value_class, unqualified_type(parameter_type))) continue;
+                        const auto source_type = unqualified_type(
+                            signature->parameters()[parameter_index].type);
+                        const bool direct_composite = target_abi->name == "AArch64 AAPCS64" &&
+                            !argument_slot.indirect && !argument_slot.component_offset && source_type &&
+                            (source_type->kind() == types::Kind::structure ||
+                             source_type->kind() == types::Kind::union_type ||
+                             source_type->kind() == types::Kind::array);
+                        if (!matches_slot_class(argument_slot.value_class, unqualified_type(parameter_type)) &&
+                            !direct_composite) continue;
                         const auto parameter_bits = type_bits(parameter_type);
                         if (!parameter_bits) continue;
                         const auto stacked = stack_call_argument_value(i, converted.value(), stack_aliases,
@@ -5525,7 +5654,18 @@ Result<std::vector<TypeRecoveryResult>> recover_interprocedural_types(
                     if (known_input_keys.insert(actual_key).second) known_inputs.push_back(*actual);
                     if (!signature) continue;
                     auto parameter_type = signature->parameters()[parameter_index].type;
-                    if (argument_slot.component_offset && argument_slot.component_size) {
+                    if (argument_slot.indirect) {
+                        const auto pointer = types::Type::pointer(parameter_type, 8, 8);
+                        if (!pointer) continue;
+                        parameter_type = pointer.value();
+                    } else if (argument_slot.component_offset && argument_slot.component_size &&
+                               target_abi->name == "AArch64 AAPCS64") {
+                        const auto projected_component = aapcs64_component_type(
+                            parameter_type, *argument_slot.component_offset, *argument_slot.component_size,
+                            argument_slot.value_class);
+                        if (!projected_component) continue;
+                        parameter_type = *projected_component;
+                    } else if (argument_slot.component_offset && argument_slot.component_size) {
                         const auto projected_component = abi_component_type(parameter_type,
                             *argument_slot.component_offset, *argument_slot.component_size,
                             argument_slot.value_class,
@@ -5541,7 +5681,14 @@ Result<std::vector<TypeRecoveryResult>> recover_interprocedural_types(
                     const auto slot_class = argument_slot.component_offset && classified_component &&
                         classified_component->kind() == types::Kind::vector
                         ? AbiValueClass::vector : argument_slot.value_class;
-                    if (!matches_slot_class(slot_class, classified_component)) continue;
+                    const auto source_type = unqualified_type(
+                        signature->parameters()[parameter_index].type);
+                    const bool direct_composite = target_abi->name == "AArch64 AAPCS64" &&
+                        !argument_slot.indirect && !argument_slot.component_offset && source_type &&
+                        (source_type->kind() == types::Kind::structure ||
+                         source_type->kind() == types::Kind::union_type ||
+                         source_type->kind() == types::Kind::array);
+                    if (!matches_slot_class(slot_class, classified_component) && !direct_composite) continue;
                     if (!typed_argument_candidates.contains(actual_key) && typed_argument_candidates.size() >= 4096) {
                         typed_argument_budget_exhausted = true;
                         continue;

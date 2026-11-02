@@ -683,6 +683,149 @@ Result<Arm32StepDestination> arm32_thumb2_ldm_pc_destination(HANDLE process,
     return Arm32StepDestination{target, thumb};
 }
 
+Result<Arm32StepDestination> arm32_a32_ldr_pc_destination(HANDLE process,
+    std::uint32_t word, DWORD pc, DWORD cpsr, const std::array<DWORD, 16>& registers) {
+    // A32 LDR (immediate/register), A1, with Rt=PC. Do not include byte or
+    // unprivileged LDRT encodings: those do not have ordinary LoadWritePC
+    // semantics that this successor planner can safely model.
+    if ((word & 0x0c50f000u) != 0x0410f000u || (word >> 28) == 15 ||
+        (cpsr & (1u << 9)))
+        return Error{ErrorCode::unsupported, "A32 PC load requires a conditional little-endian word LDR"};
+    const auto condition = static_cast<unsigned>(word >> 28);
+    if (!arm32_condition_passed(condition, cpsr))
+        return Arm32StepDestination{static_cast<DWORD>(pc + 4u), false};
+
+    const bool pre_index = (word & (1u << 24)) != 0;
+    const bool add = (word & (1u << 23)) != 0;
+    const bool register_offset = (word & (1u << 25)) != 0;
+    const bool writeback_bit = (word & (1u << 21)) != 0;
+    // P=0,W=1 denotes the unprivileged LDRT alias. Refuse it before reading
+    // target memory because its access privilege semantics are not modeled.
+    if (!pre_index && writeback_bit)
+        return Error{ErrorCode::unsupported, "A32 unprivileged LDRT-to-PC is unsupported"};
+    const auto base_register = static_cast<unsigned>((word >> 16) & 15u);
+    const bool writeback = !pre_index || writeback_bit;
+    // A writeback base may not overlap the PC destination. Keep PC based
+    // register-offset forms out of this path; immediate PC-based forms are
+    // handled by the dedicated literal decoder above.
+    if (writeback && base_register == 15)
+        return Error{ErrorCode::unsupported, "A32 PC load writeback cannot use PC as its base"};
+    if (base_register == 15 && register_offset)
+        return Error{ErrorCode::unsupported, "A32 PC load register-offset form cannot use PC as its base"};
+
+    std::uint32_t offset = 0;
+    if (!register_offset) {
+        offset = word & 0xfffu;
+    } else {
+        if (word & (1u << 4))
+            return Error{ErrorCode::unsupported, "A32 PC load register offset requires an immediate shift"};
+        const auto offset_register = static_cast<unsigned>(word & 15u);
+        if (offset_register == 15)
+            return Error{ErrorCode::unsupported, "A32 PC load cannot use PC as its offset register"};
+        const auto value = registers[offset_register];
+        const auto amount = static_cast<unsigned>((word >> 7) & 31u);
+        switch ((word >> 5) & 3u) {
+        case 0: offset = amount ? static_cast<std::uint32_t>(value << amount) : value; break;
+        case 1: offset = amount ? value >> amount : 0; break; // LSR #0 means LSR #32.
+        case 2:
+            offset = amount ? static_cast<std::uint32_t>(
+                std::bit_cast<std::int32_t>(value) >> amount) :
+                ((value & 0x80000000u) ? UINT32_MAX : 0u); // ASR #0 means ASR #32.
+            break;
+        case 3:
+            offset = amount ? std::rotr(value, static_cast<int>(amount)) :
+                (((cpsr >> 29) & 1u) << 31) | (value >> 1); // RRX uses the captured C flag.
+            break;
+        }
+    }
+
+    const std::uint64_t base = base_register == 15
+        ? static_cast<std::uint64_t>(pc) + 8u : registers[base_register];
+    std::uint64_t indexed = base;
+    if (add) {
+        if (offset > UINT32_MAX - std::min<std::uint64_t>(base, UINT32_MAX))
+            return Error{ErrorCode::invalid_argument, "A32 PC-load effective address overflows"};
+        indexed += offset;
+    } else {
+        if (offset > base)
+            return Error{ErrorCode::invalid_argument, "A32 PC-load effective address underflows"};
+        indexed -= offset;
+    }
+    if (base > UINT32_MAX || indexed > UINT32_MAX)
+        return Error{ErrorCode::invalid_argument, "A32 PC-load base or effective address exceeds the address space"};
+    const auto memory_address = pre_index ? indexed : base;
+    if ((memory_address & 3u) != 0 || memory_address > UINT32_MAX - 3u)
+        return Error{ErrorCode::invalid_argument, "A32 PC-load word address is unaligned or exceeds the address space"};
+
+    std::array<std::byte, 4> bytes{};
+    SIZE_T read = 0;
+    if (!ReadProcessMemory(process, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(memory_address)),
+                           bytes.data(), bytes.size(), &read) || read != bytes.size())
+        return win_error("ReadProcessMemory for A32 indexed PC load");
+    const auto loaded = std::to_integer<std::uint32_t>(bytes[0]) |
+        (std::to_integer<std::uint32_t>(bytes[1]) << 8) |
+        (std::to_integer<std::uint32_t>(bytes[2]) << 16) |
+        (std::to_integer<std::uint32_t>(bytes[3]) << 24);
+    const bool thumb = (loaded & 1u) != 0;
+    if (!thumb && (loaded & 3u) != 0)
+        return Error{ErrorCode::invalid_argument, "A32 PC load produced an unaligned ARM-state target"};
+    const auto target = loaded & (thumb ? ~std::uint32_t{1} : ~std::uint32_t{3});
+    const auto trap_end = static_cast<std::uint64_t>(target) + (thumb ? 2u : 4u);
+    const auto transfer_end = memory_address + 4u;
+    if ((target < transfer_end && memory_address < trap_end) ||
+        (target < static_cast<std::uint64_t>(pc) + 4u && pc < trap_end))
+        return Error{ErrorCode::unsupported,
+            "A32 PC-load successor trap overlaps its instruction or transfer word"};
+    return Arm32StepDestination{target, thumb};
+}
+
+Result<Arm32StepDestination> arm32_thumb2_ldr_reg_pc_destination(HANDLE process,
+    std::uint16_t first, std::uint16_t second, DWORD pc, DWORD cpsr,
+    const std::array<DWORD, 16>& registers, std::uint8_t it_state) {
+    // LDR (register) T2: positive Rm shifted left by imm2, without writeback.
+    const auto base_register = static_cast<unsigned>(first & 15u);
+    const auto destination_register = static_cast<unsigned>(second >> 12);
+    const auto offset_register = static_cast<unsigned>(second & 15u);
+    const auto shift = static_cast<unsigned>((second >> 4) & 3u);
+    if ((first & 0xfff0u) != 0xf850u || (second & 0x0fc0u) != 0 ||
+        base_register == 15 || destination_register != 15 || offset_register == 15 ||
+        (cpsr & (1u << 9)))
+        return Error{ErrorCode::unsupported, "Thumb-2 PC load requires LDR register T2 with non-PC base and index"};
+    if (it_state != 0 && (it_state & 7u) != 0)
+        return Error{ErrorCode::unsupported, "Thumb-2 PC load is only valid in the final IT slot"};
+    if (it_state != 0 && !arm32_condition_passed(it_state >> 4, cpsr))
+        return Arm32StepDestination{static_cast<DWORD>(pc + 4u), true};
+
+    const auto base = static_cast<std::uint64_t>(registers[base_register]);
+    const auto offset = static_cast<std::uint64_t>(registers[offset_register]) << shift;
+    if (base > UINT32_MAX || offset > UINT32_MAX - base)
+        return Error{ErrorCode::invalid_argument, "Thumb-2 PC-load effective address exceeds the address space"};
+    const auto memory_address = base + offset;
+    if ((memory_address & 3u) != 0 || memory_address > UINT32_MAX - 3u)
+        return Error{ErrorCode::invalid_argument, "Thumb-2 PC-load word address is unaligned or exceeds the address space"};
+
+    std::array<std::byte, 4> bytes{};
+    SIZE_T read = 0;
+    if (!ReadProcessMemory(process, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(memory_address)),
+                           bytes.data(), bytes.size(), &read) || read != bytes.size())
+        return win_error("ReadProcessMemory for Thumb-2 register PC load");
+    const auto loaded = std::to_integer<std::uint32_t>(bytes[0]) |
+        (std::to_integer<std::uint32_t>(bytes[1]) << 8) |
+        (std::to_integer<std::uint32_t>(bytes[2]) << 16) |
+        (std::to_integer<std::uint32_t>(bytes[3]) << 24);
+    const bool thumb = (loaded & 1u) != 0;
+    if (!thumb && (loaded & 3u) != 0)
+        return Error{ErrorCode::invalid_argument, "Thumb-2 PC load produced an unaligned ARM-state target"};
+    const auto target = loaded & (thumb ? ~std::uint32_t{1} : ~std::uint32_t{3});
+    const auto trap_end = static_cast<std::uint64_t>(target) + (thumb ? 2u : 4u);
+    const auto transfer_end = memory_address + 4u;
+    if ((target < transfer_end && memory_address < trap_end) ||
+        (target < static_cast<std::uint64_t>(pc) + 4u && pc < trap_end))
+        return Error{ErrorCode::unsupported,
+            "Thumb-2 PC-load successor trap overlaps its instruction or transfer word"};
+    return Arm32StepDestination{target, thumb};
+}
+
 std::int64_t arm32_sign_extend(std::uint32_t value, unsigned bits) {
     const auto sign = std::uint32_t{1} << (bits - 1);
     return (value & sign) ? static_cast<std::int64_t>(value) - (std::int64_t{1} << bits)
@@ -2801,7 +2944,13 @@ private:
                 (std::to_integer<unsigned>(instruction[1]) << 8));
             const auto second = static_cast<std::uint16_t>(std::to_integer<unsigned>(instruction[2]) |
                 (std::to_integer<unsigned>(instruction[3]) << 8));
-            if (((first & 0xffd0u) == 0xe890u || (first & 0xffd0u) == 0xe910u) &&
+            if ((first & 0xfff0u) == 0xf850u && (second >> 12) == 15u) {
+                pc_relative_load = true;
+                auto destination = arm32_thumb2_ldr_reg_pc_destination(process_, first, second,
+                    static_cast<DWORD>(pc), context.Cpsr, registers, it_state);
+                if (!destination) { CloseHandle(thread); return destination.error(); }
+                branch = destination.value();
+            } else if (((first & 0xffd0u) == 0xe890u || (first & 0xffd0u) == 0xe910u) &&
                 (second & 0x8000u)) { // LDMIA/LDMDB T2 including PC.
                 pc_relative_load = true;
                 auto destination = arm32_thumb2_ldm_pc_destination(process_, first, second,
@@ -2938,6 +3087,12 @@ private:
                     }
                     branch = Arm32StepDestination{target, target_thumb};
                 }
+            } else if ((word & 0x0c50f000u) == 0x0410f000u) {
+                pc_relative_load = true;
+                auto destination = arm32_a32_ldr_pc_destination(process_, word,
+                    static_cast<DWORD>(pc), context.Cpsr, registers);
+                if (!destination) { CloseHandle(thread); return destination.error(); }
+                branch = destination.value();
             }
         }
         if (!table_branch && !pc_relative_load)

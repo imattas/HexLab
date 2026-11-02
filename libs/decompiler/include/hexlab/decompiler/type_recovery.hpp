@@ -31,6 +31,9 @@ struct AbiArgumentSlot {
     // False placeholders preserve declared parameter positions when the
     // classifier cannot establish a location.
     bool supported = true;
+    // The ABI location carries a pointer to a caller-created aggregate copy.
+    // The source-level parameter type remains the aggregate type.
+    bool indirect = false;
 };
 
 // ABI positions are explicit and ordered. Stack locations are offsets from

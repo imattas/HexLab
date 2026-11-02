@@ -2,6 +2,7 @@
 #include "jump_resolver.hpp"
 #include "jump_suggestions_dialog.hpp"
 #include "cross_document_jump.hpp"
+#include "project_name_search.hpp"
 #include "marker_navigation.hpp"
 #include "session_controller.hpp"
 #include "document_tabs.hpp"
@@ -63,6 +64,7 @@
 #include <wx/log.h>
 #include <wx/dataobj.h>
 #include <wx/filedlg.h>
+#include <wx/dirdlg.h>
 #include <wx/textdlg.h>
 #include <wx/menu.h>
 #include <wx/gauge.h>
@@ -872,6 +874,14 @@ std::vector<compare::FunctionBodyDiff> compare_function_bodies(
 } // namespace
 struct MainFrame::Impl {
     MainFrame &frame;
+    struct PendingProjectNavigation {
+        DocumentId id;
+        std::filesystem::path path;
+        database::ProjectUuid uuid{};
+        InputIdentity input;
+        Location location;
+    };
+    std::optional<PendingProjectNavigation> pending_project_navigation;
     bool session_restore_activation_pending = false;
     std::vector<DocumentId> session_restore_documents;
     std::optional<DocumentId> session_restore_active;
@@ -3287,6 +3297,46 @@ struct MainFrame::Impl {
                                          " navigation history entries as CSV.")));
     }
     void sync() {
+        if (pending_project_navigation) {
+            const auto pending = *pending_project_navigation;
+            const auto project = controller->documents().project(pending.id);
+            const auto documents = controller->documents().documents();
+            const auto opening = std::find_if(documents.begin(), documents.end(), [&](const DocumentInfo &entry) {
+                return entry.id == pending.id && entry.save_state == DocumentSaveState::opening;
+            });
+            const auto failed = std::find_if(documents.begin(), documents.end(), [&](const DocumentInfo &entry) {
+                return entry.id == pending.id && entry.error.has_value();
+            });
+            const auto still_open = std::find_if(documents.begin(), documents.end(), [&](const DocumentInfo &entry) {
+                return entry.id == pending.id;
+            });
+            if (failed != documents.end()) {
+                pending_project_navigation.reset();
+                log(wxString("Could not open the selected project: ") + text(failed->error->message));
+            }
+            else if (still_open == documents.end()) {
+                pending_project_navigation.reset();
+                log("Selected project closed before its name destination could be opened.");
+            }
+            else if (opening == documents.end() && project && project->state && project->loaded && project->loaded->image) {
+                pending_project_navigation.reset();
+                const bool same_project = project->state->uuid == pending.uuid &&
+                    project->state->input == pending.input;
+                if (!same_project) {
+                    log("Selected project identity changed while opening; name navigation canceled.");
+                } else {
+                    auto moved = controller->documents().navigate(pending.id, pending.location);
+                    if (!moved) log(text(moved.error().message));
+                    else {
+                        controller->activate(pending.id);
+                        mark_active_document(pending.id);
+                        pages->SetSelection(std::holds_alternative<Address>(moved.value()) ? 0 : 1);
+                        center->SetSelection(1);
+                        record_navigation(moved.value());
+                    }
+                }
+            }
+        }
         if (debugger) debugger->document_changed();
         if (auto selection = state().selection()) {
             listing->select(*selection);
@@ -4008,6 +4058,70 @@ struct MainFrame::Impl {
         record_navigation(moved.value());
         sync();
     }
+    void search_project_folder_names() {
+        wxDirDialog picker(&frame, "Choose a folder containing HexLab .hxproj files", wxEmptyString,
+                           wxDD_DIR_MUST_EXIST);
+        if (picker.ShowModal() != wxID_OK) return;
+        struct SearchState { std::mutex mutex; std::optional<ProjectFolderNameIndex> index; };
+        auto shared = std::make_shared<SearchState>();
+        const auto folder = std::filesystem::path(picker.GetPath().ToStdWstring());
+        JumpSuggestionsDialog chooser(&frame, {},
+            [shared, folder](const wxString &query, NamedLocationScope scope, NamedLocationSearchMode mode,
+                             const std::atomic_bool &cancelled, std::size_t, std::size_t) {
+                std::lock_guard lock(shared->mutex);
+                if (!shared->index) {
+                    auto indexed = index_project_folder_names(folder, &cancelled);
+                    if (!indexed) {
+                        NamedLocationSearch failed; failed.truncated = true;
+                        failed.limitation = indexed.error().message; return failed;
+                    }
+                    shared->index = std::move(indexed.value());
+                }
+                return hexlab::desktop::search_project_folder_names(*shared->index, query, scope, mode, &cancelled);
+            },
+            [](const NamedLocationCandidate &candidate) {
+                const auto path = candidate.project_path ? wxString(candidate.project_path->wstring()) : wxString("Unknown project");
+                wxString location;
+                if (const auto *address = std::get_if<Address>(&candidate.location))
+                    location = wxString::Format("%08x:%016llx", address->space.value,
+                                                static_cast<unsigned long long>(address->offset));
+                else location = wxString::Format("file+%llx", static_cast<unsigned long long>(std::get<FileOffset>(candidate.location).value));
+                return path + " - " + candidate.name + " - " + location;
+            }, NamedLocationSearchMode::contains, "Search Names in Project Folder",
+            "Search direct-child .hxproj databases in the selected folder. A result project opens only after you choose it.",
+            false, true);
+        if (chooser.ShowModal() != wxID_OK) return;
+        const auto selected = chooser.selected_candidate();
+        if (!selected || !selected->project_path || !selected->project_uuid || !selected->project_input) return;
+        auto &manager = controller->documents();
+        for (const auto &document : manager.documents()) {
+            if (!document.path || document.path->lexically_normal() != selected->project_path->lexically_normal()) continue;
+            const auto project = manager.project(document.id);
+            if (!project && document.save_state == DocumentSaveState::opening) {
+                pending_project_navigation = PendingProjectNavigation{document.id, *selected->project_path,
+                    *selected->project_uuid, *selected->project_input, selected->location};
+                frame.SetStatusText("Waiting for the already-opening project before navigating...");
+                return;
+            }
+            if (!project || !project->state || project->state->uuid != *selected->project_uuid ||
+                project->state->input != *selected->project_input) {
+                log("Project name result is stale; search again."); return;
+            }
+            auto moved = manager.navigate(document.id, selected->location);
+            if (!moved) { log(text(moved.error().message)); return; }
+            controller->activate(document.id);
+            mark_active_document(document.id);
+            pages->SetSelection(std::holds_alternative<Address>(moved.value()) ? 0 : 1);
+            center->SetSelection(1); record_navigation(moved.value()); sync(); return;
+        }
+        auto opened = controller->open_project(*selected->project_path, database::ProjectMode::read_write,
+                                               plugins->analysis_options(options));
+        if (!opened) { log(text(opened.error().message)); return; }
+        pending_project_navigation = PendingProjectNavigation{opened.value(), *selected->project_path,
+            *selected->project_uuid, *selected->project_input, selected->location};
+        controller->activate(opened.value());
+        frame.SetStatusText("Opening selected project before navigating to the chosen name...");
+    }
     void jump() {
         if (!shown)
             return;
@@ -4406,7 +4520,7 @@ struct MainFrame::Impl {
         if (closer->closing_window())
             reason = "The window is closing";
         else if (event.GetId() == wxID_OPEN || event.GetId() == open_raw_id || event.GetId() == open_project_id ||
-                 event.GetId() == analysis_options_id)
+                 event.GetId() == analysis_options_id || event.GetId() == project_folder_name_search_id)
             enabled = true;
         else if (event.GetId() == cancel_id) {
             enabled = state().opening() || (id && (controller->read_pending(*id) || controller->backup_pending(*id)));
@@ -4560,6 +4674,7 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
     auto *nav = new wxMenu;
     nav->Append(jump_id, "&Jump...\tG");
     nav->Append(cross_document_jump_id, "Search Names in Open Documents...\tCtrl+Shift+G");
+    nav->Append(project_folder_name_search_id, "Search Names in Project Folder...");
     nav->Append(follow_id, "&Follow Target\tEnter");
     nav->Append(incoming_references_id, "Incoming References\tCtrl+Shift+X");
     nav->Append(outgoing_references_id, "Outgoing References\tCtrl+Alt+X");
@@ -6182,12 +6297,13 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
         wxID_OPEN, open_raw_id, open_project_id, analysis_options_id, wxID_CLOSE,    cancel_id,    jump_id,
         follow_id, back_id,     forward_id,      browse_navigation_history_id, export_navigation_history_id,
         previous_marker_id, next_marker_id,
-        previous_function_id, next_function_id, browse_image_entries_id, cross_document_jump_id,
+        previous_function_id, next_function_id, browse_image_entries_id, cross_document_jump_id, project_folder_name_search_id,
         copy_address_id, copy_bytes_id, copy_text_id, next_page_id, incoming_references_id, outgoing_references_id};
     for (int id : navigation_ids)
         Bind(wxEVT_UPDATE_UI, [this](wxUpdateUIEvent &event) { impl_->update_navigation(event); }, id);
     Bind(wxEVT_MENU, [this](wxCommandEvent &) { impl_->jump(); }, jump_id);
     Bind(wxEVT_MENU, [this](wxCommandEvent &) { impl_->jump_open_documents(); }, cross_document_jump_id);
+    Bind(wxEVT_MENU, [this](wxCommandEvent &) { impl_->search_project_folder_names(); }, project_folder_name_search_id);
     Bind(wxEVT_MENU, [this](wxCommandEvent &) { impl_->follow(); }, follow_id);
     Bind(wxEVT_MENU, [this](wxCommandEvent &) { impl_->browse_references(true); }, incoming_references_id);
     Bind(wxEVT_MENU, [this](wxCommandEvent &) { impl_->browse_references(false); }, outgoing_references_id);
