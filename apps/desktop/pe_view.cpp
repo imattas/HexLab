@@ -97,7 +97,7 @@ PeView::PeView(wxWindow *parent)
     authenticode_status_ = new wxStaticText(authenticode_page, wxID_ANY,
         "Select a PKCS#7 record on the Certificates page to check its signer chain.");
     authenticode_signers_ = new VirtualTable(authenticode_page, "pe-authenticode-signers",
-        {"Signer", "CMS signature", "Signature error", "Chain", "Chain errors", "Policy error", "Provider error"});
+        {"Signer", "CMS signature", "Image digest", "Authenticode trust", "Chain", "Chain errors", "Policy error", "Provider error"});
     auto *authenticode_layout = new wxBoxSizer(wxVERTICAL);
     authenticode_layout->Add(verify_authenticode_, 0, wxALL, 6);
     authenticode_layout->Add(authenticode_status_, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 6);
@@ -710,15 +710,18 @@ void PeView::poll_authenticode_verification() {
     }
 
     const auto signers = completed->result.value().signers;
-    std::size_t valid_signatures = 0, trusted_chains = 0;
+    std::size_t valid_signatures = 0, matching_digests = 0, trusted_chains = 0, trusted_authenticode = 0;
     for (const auto &signer : signers) {
         valid_signatures += static_cast<std::size_t>(signer.signature_valid);
+        matching_digests += static_cast<std::size_t>(signer.image_digest_checked && signer.image_digest_matches);
         trusted_chains += static_cast<std::size_t>(signer.chain_trusted);
+        trusted_authenticode += static_cast<std::size_t>(signer.authenticode_trusted);
     }
     authenticode_status_->SetLabel(wxString::Format(
-        "%u signer(s); %u CMS signature(s) valid; %u code-signing chain(s) trusted. Revocation and timestamps were not checked.",
+        "%u signer(s); %u CMS signature(s) valid; %u image digest(s) match; %u chain(s) trusted; %u Authenticode result(s) trusted. Offline check; revocation and timestamps were not checked.",
         static_cast<unsigned>(signers.size()), static_cast<unsigned>(valid_signatures),
-        static_cast<unsigned>(trusted_chains)));
+        static_cast<unsigned>(matching_digests), static_cast<unsigned>(trusted_chains),
+        static_cast<unsigned>(trusted_authenticode)));
     authenticode_signers_->populate(signers.size(), [signers](std::size_t row, int column) {
         const auto &signer = signers[row];
         const auto error = [](std::uint32_t value) {
@@ -727,14 +730,16 @@ void PeView::poll_authenticode_verification() {
         switch (column) {
         case 0: return wxString::Format("%u", static_cast<unsigned>(row));
         case 1: return signer.signature_valid ? wxString("verified") : wxString("failed");
-        case 2: return error(signer.signature_error);
-        case 3: return signer.chain_built ? wxString("built") : wxString("unavailable");
-        case 4: return error(signer.chain_error_status);
-        case 5: return error(signer.policy_error);
+        case 2: return !signer.image_digest_checked ? wxString("unavailable")
+            : signer.image_digest_matches ? wxString("matches") : wxString("mismatch");
+        case 3: return signer.authenticode_trusted ? wxString("trusted") : wxString("not trusted");
+        case 4: return signer.chain_built ? wxString("built") : wxString("unavailable");
+        case 5: return error(signer.chain_error_status);
+        case 6: return error(signer.policy_error);
         default: return error(signer.provider_error);
         }
     });
-    authenticode_signers_->fit_columns({0, 1, 2, 3, 4, 5, 6});
+    authenticode_signers_->fit_columns({0, 1, 2, 3, 4, 5, 6, 7});
 }
 
 } // namespace hexlab::desktop

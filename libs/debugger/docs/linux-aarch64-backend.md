@@ -49,6 +49,12 @@ separate debugger daemon. The x86-64 host build continues to select
   hit reporting, displaced-instruction stepping, and instruction restoration.
 - `NT_ARM_HW_BREAK` execute breakpoints and `NT_ARM_HW_WATCH` read/write/access
   watchpoints, with slot ownership, cloned-thread setup, and execute-hit step-over.
+- Execute-breakpoint step-over records exactly which owned comparator slots it
+  disabled. On completion it re-reads the debug regset, verifies those slots
+  still match the expected disabled values, then restores only those slots into
+  the current snapshot. Changes to unrelated comparator slots are preserved;
+  an external change to an owned disabled slot blocks restoration and keeps the
+  pending recovery state instead of overwriting that change.
 - A continue-only thread schedule may pass an owned hardware execute breakpoint
   with selected peers: peers remain stopped while the event owner executes one
   instruction and its debug-register state is restored, then the selected peers

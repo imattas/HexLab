@@ -47,6 +47,29 @@ Result<PeAuthenticodeTrustVerification> verify_pe_authenticode_trust(
     if (!CryptMsgUpdate(message, encoded, static_cast<DWORD>(payload_view.value().bytes.size()), TRUE))
         return Error{ErrorCode::malformed, "Crypt32 could not decode the PKCS#7 signed message"};
 
+    // Authenticode trust is stronger than a trusted CMS signer: the signed
+    // SpcIndirectDataContent digest must also identify these exact PE bytes.
+    // Keep signer/chain evidence available if the content or hash algorithm
+    // is unsupported, but never report the publisher as trusted in that case.
+    bool image_digest_checked = false;
+    bool image_digest_matches = false;
+    auto digest_match = inspect_pe_authenticode_digest(image, metadata, certificate_record, stop);
+    if (digest_match) {
+        image_digest_checked = true;
+        image_digest_matches = digest_match.value().matches;
+    } else if (digest_match.error().code == ErrorCode::canceled) {
+        return digest_match.error();
+    }
+
+    DWORD embedded_certificate_count = 0;
+    DWORD certificate_count_size = sizeof(embedded_certificate_count);
+    if (!CryptMsgGetParam(message, CMSG_CERT_COUNT_PARAM, 0, &embedded_certificate_count,
+                          &certificate_count_size))
+        return Error{ErrorCode::malformed, "Crypt32 could not read the embedded certificate count"};
+    constexpr DWORD max_embedded_certificates = 4096;
+    if (embedded_certificate_count > max_embedded_certificates)
+        return Error{ErrorCode::resource_limit, "PKCS#7 embedded certificate count exceeds 4096"};
+
     HCERTSTORE embedded = CertOpenStore(CERT_STORE_PROV_MSG,
         X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, 0, CERT_STORE_OPEN_EXISTING_FLAG, message);
     if (!embedded)
@@ -66,11 +89,15 @@ Result<PeAuthenticodeTrustVerification> verify_pe_authenticode_trust(
 
     PeAuthenticodeTrustVerification result;
     result.certificate_record = certificate_record;
+    result.online_retrieval_disabled = true;
+    result.timestamp_checked = false;
     result.signers.reserve(signer_count);
     for (DWORD index = 0; index < signer_count; ++index) {
         if (stop.stop_requested())
             return Error{ErrorCode::canceled, "Authenticode trust verification canceled"};
         PeAuthenticodeSignerTrust status;
+        status.image_digest_checked = image_digest_checked;
+        status.image_digest_matches = image_digest_matches;
         DWORD selected_signer = index;
         PCCERT_CONTEXT signer = nullptr;
         if (!CryptMsgGetAndVerifySigner(message, 0, nullptr, CMSG_USE_SIGNER_INDEX_FLAG,
@@ -122,6 +149,8 @@ Result<PeAuthenticodeTrustVerification> verify_pe_authenticode_trust(
             status.policy_error = policy_status.dwError;
             status.chain_trusted = status.chain_error_status == 0 && status.policy_error == 0;
         }
+        status.authenticode_trusted = status.signature_valid && status.image_digest_checked &&
+            status.image_digest_matches && status.chain_trusted;
         // No revocation flags are passed to CertGetCertificateChain, so a
         // successful local chain-policy result must not be described as
         // revocation-checked.

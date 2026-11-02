@@ -80,6 +80,8 @@ struct Aarch64HardwareBreakpoint {
 struct Aarch64HardwareStepState {
     pid_t thread{};
     Aarch64HwdebugState saved{};
+    Aarch64HwdebugState temporarily_disabled{};
+    std::array<bool, aarch64_hwdebug_max_slots> disabled_slots{};
     std::size_t slots{};
 };
 constexpr std::array<const char*, aarch64_reg_count> names = {
@@ -2290,8 +2292,28 @@ private:
         const auto saved = *hardware_step_state_;
         if (!stopped_.contains(saved.thread))
             return Error{ErrorCode::busy, "AArch64 execute-breakpoint step thread must be stopped before restoring debug registers"};
-        auto restored = set_hwdebug_state(saved.thread, nt_arm_hw_break, saved.saved, saved.slots);
-        if (!restored) return restored;
+        auto current = get_hwdebug_state(saved.thread, nt_arm_hw_break);
+        if (!current) return current.error();
+        if (current.value().slots != saved.slots)
+            return Error{ErrorCode::busy, "AArch64 hardware breakpoint slot count changed during step-over"};
+        auto restored = current.value().state;
+        bool owns_disabled_slot = false;
+        for (std::size_t slot = 0; slot < saved.slots; ++slot) {
+            if (!saved.disabled_slots[slot]) continue;
+            owns_disabled_slot = true;
+            const auto& actual = current.value().state.registers[slot];
+            const auto& expected = saved.temporarily_disabled.registers[slot];
+            if (actual.address != expected.address || actual.control != expected.control || actual.pad != expected.pad)
+                return Error{ErrorCode::conflict, "owned AArch64 execute-breakpoint slot changed outside this session during step-over"};
+            restored.registers[slot] = saved.saved.registers[slot];
+        }
+        if (!owns_disabled_slot)
+            return Error{ErrorCode::malformed, "AArch64 execute-breakpoint step has no owned disabled slots"};
+        // Preserve all comparator state that this step did not disable. In
+        // particular, do not write the stale full regset snapshot over a
+        // comparator installed by another debugger while the instruction ran.
+        auto restore_status = set_hwdebug_state(saved.thread, nt_arm_hw_break, restored, saved.slots);
+        if (!restore_status) return restore_status;
         hardware_step_state_.reset();
         return std::monostate{};
     }
@@ -2315,7 +2337,15 @@ private:
         if (!found) return Error{ErrorCode::invalid_argument, "no enabled AArch64 execute breakpoint matches the stopped PC"};
         auto disabled = set_hwdebug_state(tid, nt_arm_hw_break, temporarily_disabled, snapshot.value().slots);
         if (!disabled) return disabled;
-        hardware_step_state_ = Aarch64HardwareStepState{tid, snapshot.value().state, snapshot.value().slots};
+        Aarch64HardwareStepState step_state{};
+        step_state.thread = tid;
+        step_state.saved = snapshot.value().state;
+        step_state.temporarily_disabled = temporarily_disabled;
+        step_state.slots = snapshot.value().slots;
+        for (std::size_t slot = 0; slot < snapshot.value().slots; ++slot)
+            step_state.disabled_slots[slot] = snapshot.value().state.registers[slot].control !=
+                temporarily_disabled.registers[slot].control;
+        hardware_step_state_ = std::move(step_state);
         if (ptrace(PTRACE_SINGLESTEP, tid, nullptr, nullptr) != 0) {
             const auto error = sys_error("PTRACE_SINGLESTEP over AArch64 hardware breakpoint");
             auto restored = restore_hardware_execute_step();

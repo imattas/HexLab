@@ -50,9 +50,13 @@ std::optional<std::int64_t> add_signed(std::int64_t left, std::int64_t right) {
 
 std::optional<std::uint64_t> integer_constant(const ExpressionPtr &expression,
                                               const IntegerConstants &constants);
+std::optional<IntegerRange> integer_range(const ExpressionPtr &expression,
+                                          const IntegerConstants &constants,
+                                          const IntegerRanges &ranges);
 
 std::optional<PointerOrigin> pointer_origin(const ExpressionPtr &expression, const PointerOrigins &origins,
-                                            const IntegerConstants &constants) {
+                                            const IntegerConstants &constants,
+                                            const IntegerRanges &integer_ranges) {
     if (!expression) return {};
     if (const auto *reg = std::get_if<RegisterValue>(&expression->value)) {
         if (!reg->version || !expression->type.bits || expression->type.bits != reg->reg.width) return {};
@@ -64,22 +68,32 @@ std::optional<PointerOrigin> pointer_origin(const ExpressionPtr &expression, con
     if (!expression->type.bits || !binary->left || !binary->right ||
         binary->left->type.bits != expression->type.bits || binary->right->type.bits != expression->type.bits)
         return {};
-    auto left = pointer_origin(binary->left, origins, constants);
-    auto offset_constant = integer_constant(binary->right, constants);
-    if (!left && binary->operation == "add") {
-        left = pointer_origin(binary->right, origins, constants);
-        offset_constant = integer_constant(binary->left, constants);
+    auto origin = pointer_origin(binary->left, origins, constants, integer_ranges);
+    auto offset_range = integer_range(binary->right, constants, integer_ranges);
+    if (!origin || !offset_range) {
+        if (binary->operation != "add") return {};
+        origin = pointer_origin(binary->right, origins, constants, integer_ranges);
+        offset_range = integer_range(binary->left, constants, integer_ranges);
     }
-    if (!left || !offset_constant || std::get<2>(left->root.first) != expression->type.bits ||
-        *offset_constant > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) return {};
-    auto delta = static_cast<std::int64_t>(*offset_constant);
-    if (binary->operation == "sub") delta = -delta;
-    const auto min_offset = add_signed(left->min_offset, delta);
-    const auto max_offset = add_signed(left->max_offset, delta);
+    if (!origin || !offset_range || offset_range->first > offset_range->second ||
+        std::get<2>(origin->root.first) != expression->type.bits ||
+        offset_range->second > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) return {};
+    auto delta_min = static_cast<std::int64_t>(offset_range->first);
+    auto delta_max = static_cast<std::int64_t>(offset_range->second);
+    if (binary->operation == "sub") {
+        delta_min = -static_cast<std::int64_t>(offset_range->second);
+        delta_max = -static_cast<std::int64_t>(offset_range->first);
+    }
+    const auto min_offset = add_signed(origin->min_offset, delta_min);
+    const auto max_offset = add_signed(origin->max_offset, delta_max);
     if (!min_offset || !max_offset) return {};
-    left->min_offset = *min_offset;
-    left->max_offset = *max_offset;
-    return left;
+    origin->min_offset = *min_offset;
+    origin->max_offset = *max_offset;
+    if (expression->type.bits < 2) return {};
+    const auto offset_limit_bits = std::min(static_cast<unsigned>(expression->type.bits - 2), 60u);
+    const auto offset_limit = std::int64_t{1} << offset_limit_bits;
+    if (origin->min_offset < -offset_limit || origin->max_offset > offset_limit) return {};
+    return origin;
 }
 
 std::optional<std::uint64_t> integer_constant(const ExpressionPtr &expression,
@@ -1254,9 +1268,18 @@ Result<LiftedFunction> to_ssa(const LiftedFunction &input,
                     }
             }
         }
+        // A non-converged interval may be a loop-carried induction variable.
+        // Do not use its last finite approximation as if it covered all
+        // iterations; keep only exact constants and fall back for other ranges.
+        if (ranges_changed) {
+            for (auto range = integer_ranges.begin(); range != integer_ranges.end();) {
+                if (!integer_constants.contains(range->first)) range = integer_ranges.erase(range);
+                else ++range;
+            }
+        }
 
-        // Track pointer identity through SSA copies, constant add/sub (including
-        // offsets in constant-proven SSA registers), and unanimous phis. Flat
+        // Track pointer identity through SSA copies, constant or bounded-range
+        // add/sub offsets, and unanimous phis. Flat
         // architecture registers with proven numeric addresses share one root
         // per bank and width. Every other value gets an opaque root; distinct
         // roots remain may-alias, so this never licenses cross-root disjointness.
@@ -1331,12 +1354,20 @@ Result<LiftedFunction> to_ssa(const LiftedFunction &input,
                 for (const auto &instruction : partitioned.blocks[block_index].instructions)
                     if (const auto *assign = std::get_if<Assign>(&instruction.statement); assign && assign->destination_version) {
                         if (!assign->value || assign->destination.width != assign->value->type.bits) continue;
-                        const auto candidate = pointer_origin(assign->value, pointer_origins, integer_constants);
+                        const auto candidate = pointer_origin(assign->value, pointer_origins, integer_constants,
+                                                              integer_ranges);
                         if (!candidate) continue;
                         auto &origin = pointer_origins[{key(assign->destination), *assign->destination_version}];
                         if (origin != *candidate) { origin = *candidate; provenance_changed = true; }
                     }
             }
+        }
+        // Similarly, a same-root offset interval that still expands after the
+        // bounded fixed point is not a complete loop summary. Reset derived
+        // values to opaque roots instead of publishing an under-approximation.
+        if (provenance_changed) {
+            for (auto &[value, origin] : pointer_origins)
+                origin = initial_pointer_origin(value);
         }
         std::set<std::string> partitions;
         constexpr std::size_t max_absolute_ranges = 4'096;

@@ -92,18 +92,25 @@ Data](https://learn.microsoft.com/en-us/windows/win32/seccrypto/decoding-signed-
 and [`CryptMsgGetAndVerifySigner`](https://learn.microsoft.com/en-us/windows/win32/api/wincrypt/nf-wincrypt-cryptmsggetandverifysigner)
 documentation.
 
-`verify_pe_authenticode_trust` adds a separate Windows-only trust result per
-CMS signer. It first verifies the CMS signature, then asks Crypt32 to build a
-certificate chain for the code-signing EKU and apply the Authenticode chain
-policy against the host's current certificate stores. Embedded certificates
-are supplied as the additional store; AIA and URL retrieval are disabled, so
-this operation does not fetch certificates or revocation data. Results expose
-signature validity, whether a chain was built, the chain trust flags, the
-Authenticode policy error, and provider errors. `chain_trusted` is true only when
-chain construction and policy validation both report no errors. The result
-does not imply revocation or timestamp validation, and trust can differ across
-machines as their local trust stores change. The CLI reports this separately
-from the PE image digest match and raw CMS signature result. See Microsoft's
+`verify_pe_authenticode_trust` returns a Windows-only trust result per CMS
+signer. It verifies the CMS signature, checks whether the signed
+`SpcIndirectDataContent` digest matches the loaded PE's original file bytes,
+then asks Crypt32 to build a certificate chain for the code-signing EKU and
+apply Authenticode chain policy against the host's current certificate stores.
+The PKCS#7 payload is capped at 64 MiB, signer count at 1024, and embedded
+certificate count at 4096 before chain construction. Embedded certificates are
+supplied as the additional store. `CERT_CHAIN_DISABLE_AIA` and
+`CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL` make retrieval offline/cache-only;
+`online_retrieval_disabled` reports this policy. No revocation or timestamp
+checks are performed (`revocation_checked` and `timestamp_checked` remain
+false). Results expose signature validity, whether a chain was built, chain
+trust flags, Authenticode policy/provider errors, and image-digest status.
+`chain_trusted` describes chain policy alone. `authenticode_trusted` requires a
+valid CMS signature, a successfully checked matching PE digest, and a trusted
+chain. Unsupported or malformed digest content therefore cannot become a
+trusted publisher result even when the signer chain is trusted. Trust can vary
+across machines with their local trust stores. The CLI continues to display the
+digest, signer-signature, and chain-policy evidence separately. See Microsoft's
 [`CertGetCertificateChain`](https://learn.microsoft.com/en-us/windows/win32/api/wincrypt/nf-wincrypt-certgetcertificatechain)
 and [`CertVerifyCertificateChainPolicy`](https://learn.microsoft.com/en-us/windows/win32/api/wincrypt/nf-wincrypt-certverifycertificatechainpolicy)
 documentation.

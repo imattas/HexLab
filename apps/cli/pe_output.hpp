@@ -115,13 +115,19 @@ inline void pe_description(std::ostream &out, const ImageMetadata &metadata, con
                             << escape_pe_version_text(verification.error().message) << ")\n";
                         return;
                     }
-                    out << "PE Authenticode chain trust (Crypt32; local trust stores; revocation and timestamps unchecked):\n";
+                    out << "PE Authenticode trust (Crypt32; offline="
+                        << (verification.value().online_retrieval_disabled ? "true" : "false")
+                        << "; revocation-checked=false; timestamp-checked="
+                        << (verification.value().timestamp_checked ? "true" : "false") << "):\n";
                     constexpr std::size_t trust_output_limit = 32;
                     const auto rows = (std::min)(verification.value().signers.size(), trust_output_limit);
                     for (std::size_t signer_index = 0; signer_index < rows; ++signer_index) {
                         const auto &status = verification.value().signers[signer_index];
                         out << "  signer=" << signer_index
                             << " signature=" << (status.signature_valid ? "verified" : "failed")
+                            << " image-digest=" << (!status.image_digest_checked ? "unavailable"
+                                : status.image_digest_matches ? "matches" : "mismatch")
+                            << " authenticode-trusted=" << (status.authenticode_trusted ? "true" : "false")
                             << " chain=" << (status.chain_built ? "built" : "unavailable")
                             << " chain-trusted=" << (status.chain_trusted ? "true" : "false")
                             << " chain-errors=0x" << std::hex << status.chain_error_status

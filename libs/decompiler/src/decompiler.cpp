@@ -14793,6 +14793,16 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
             std::vector<std::pair<std::string, std::string>> cleanup_true_return_copies;
             std::vector<std::pair<std::string, std::string>> cleanup_false_return_copies;
             const Branch *cleanup_condition = nullptr;
+            struct CleanupReturnTreeNode {
+                std::vector<const LiftedBlock *> path;
+                const Branch *condition = nullptr;
+                std::optional<std::size_t> true_child, false_child;
+                std::vector<std::pair<std::string, std::string>> return_copies;
+            };
+            std::vector<CleanupReturnTreeNode> cleanup_return_tree;
+            std::set<std::uint64_t> cleanup_return_tree_blocks;
+            std::optional<std::size_t> cleanup_return_tree_true, cleanup_return_tree_false;
+            const Branch *cleanup_return_tree_condition = nullptr;
             // Return phis are edge assignments. Validate the entire incoming
             // set before duplicating a shared return into guarded arms.
             const auto return_phi_copies = [&](const LiftedBlock &terminal,
@@ -14852,6 +14862,99 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                 if (const auto *candidate = terminal_conditional(*exit_cursor);
                     candidate && candidate->true_target && candidate->false_target &&
                     *candidate->true_target != *candidate->false_target) {
+                    // First try a bounded return-only tree. Tree nodes own
+                    // disjoint, single-entry paths; every branch and leaf is
+                    // proved before any part of the source is emitted.
+                    if (exit_cursor->successors.size() == 2 &&
+                        conditional_edges_match_targets(*exit_cursor, *candidate) &&
+                        std::count_if(exit_cursor->successors.begin(), exit_cursor->successors.end(), [&](const auto &edge) {
+                            return edge_targets(edge, *candidate->true_target);
+                        }) == 1 &&
+                        std::count_if(exit_cursor->successors.begin(), exit_cursor->successors.end(), [&](const auto &edge) {
+                            return edge_targets(edge, *candidate->false_target);
+                        }) == 1) {
+                        std::vector<CleanupReturnTreeNode> tree;
+                        std::set<std::uint64_t> tree_blocks;
+                        std::size_t branch_count = 1;
+                        std::function<std::optional<std::size_t>(Address, std::uint64_t, unsigned)> trace_tree;
+                        trace_tree = [&](Address start, std::uint64_t incoming, unsigned depth)
+                            -> std::optional<std::size_t> {
+                            if (depth > 32 || tree.size() >= 63 || tree_blocks.size() >= 63) return {};
+                            CleanupReturnTreeNode node;
+                            std::set<std::uint64_t> path_seen;
+                            auto *cursor = find_block(start);
+                            auto predecessor = incoming;
+                            while (cursor && cursor != entry && cursor != latch &&
+                                   !do_body_ids.contains(cursor->id.value) &&
+                                   !exit_path_ids.contains(cursor->id.value) &&
+                                   node.path.size() + tree_blocks.size() < 63 &&
+                                   path_seen.insert(cursor->id.value).second &&
+                                   !tree_blocks.contains(cursor->id.value) &&
+                                   predecessors[cursor->id.value] == std::set<std::uint64_t>{predecessor} &&
+                                   !cursor->switch_dispatch && has_only_simple_statements(*cursor)) {
+                                if (has_only_terminal_return(*cursor)) {
+                                    std::map<std::uint64_t, std::vector<std::pair<std::string, std::string>>> copies;
+                                    if (!return_phi_copies(*cursor, {predecessor}, copies)) return {};
+                                    node.path.push_back(cursor);
+                                    node.return_copies = std::move(copies[predecessor]);
+                                    tree_blocks.insert(cursor->id.value);
+                                    const auto index = tree.size();
+                                    tree.push_back(std::move(node));
+                                    return index;
+                                }
+                                if (contains_return(*cursor) || !cursor->phis.empty() || cursor->memory_phi ||
+                                    !cursor->memory_partition_phis.empty()) return {};
+                                node.path.push_back(cursor);
+                                tree_blocks.insert(cursor->id.value);
+                                const auto *condition = terminal_conditional(*cursor);
+                                if (condition) {
+                                    if (!condition->true_target || !condition->false_target ||
+                                        *condition->true_target == *condition->false_target ||
+                                        cursor->successors.size() != 2 ||
+                                        !conditional_edges_match_targets(*cursor, *condition) ||
+                                        std::count_if(cursor->successors.begin(), cursor->successors.end(), [&](const auto &edge) {
+                                            return edge_targets(edge, *condition->true_target);
+                                        }) != 1 ||
+                                        std::count_if(cursor->successors.begin(), cursor->successors.end(), [&](const auto &edge) {
+                                            return edge_targets(edge, *condition->false_target);
+                                        }) != 1 || ++branch_count > 32) return {};
+                                    const auto index = tree.size();
+                                    tree.push_back(std::move(node));
+                                    const auto true_child = trace_tree(*condition->true_target,
+                                        cursor->id.value, depth + 1);
+                                    if (!true_child) return {};
+                                    const auto false_child = trace_tree(*condition->false_target,
+                                        cursor->id.value, depth + 1);
+                                    if (!false_child) return {};
+                                    tree[index].condition = condition;
+                                    tree[index].true_child = *true_child;
+                                    tree[index].false_child = *false_child;
+                                    return index;
+                                }
+                                if (cursor->successors.size() != 1 || !cursor->successors.front().target ||
+                                    (cursor->successors.front().kind != BlockEdgeKind::jump &&
+                                     cursor->successors.front().kind != BlockEdgeKind::fallthrough) ||
+                                    !has_unconditional_edge(*cursor, *cursor->successors.front().target)) return {};
+                                predecessor = cursor->id.value;
+                                cursor = find_block(*cursor->successors.front().target);
+                            }
+                            return {};
+                        };
+                        const auto tree_true = trace_tree(*candidate->true_target, exit_cursor->id.value, 1);
+                        const auto tree_false = tree_true
+                            ? trace_tree(*candidate->false_target, exit_cursor->id.value, 1)
+                            : std::optional<std::size_t>{};
+                        if (tree_true && tree_false && tree_blocks.size() <= 63) {
+                            cleanup_return_tree = std::move(tree);
+                            cleanup_return_tree_blocks = std::move(tree_blocks);
+                            cleanup_return_tree_true = *tree_true;
+                            cleanup_return_tree_false = *tree_false;
+                            cleanup_return_tree_condition = candidate;
+                            cleanup_branch = exit_cursor;
+                            cleanup_condition = candidate;
+                            break;
+                        }
+                    }
                     const auto trace_cleanup_return = [&](Address start) {
                         std::vector<const LiftedBlock *> path;
                         std::set<std::uint64_t> seen;
@@ -14971,7 +15074,7 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                            }) ||
                            std::any_of(cleanup_false_path.begin(), cleanup_false_path.end(), [&](const auto *block) {
                                return block == &candidate;
-                           }) ||
+                           }) || cleanup_return_tree_blocks.contains(candidate.id.value) ||
                            do_body_ids.contains(candidate.id.value);
                 })) {
                 std::map<std::uint64_t, const DoLoopDiamond *> by_branch;
@@ -15063,6 +15166,33 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                             emit_parallel_copies(out, cleanup_false_return_copies, 8);
                         emit_block(*block, 8, block != cleanup_false_path.back());
                     }
+                    out << "    }\n";
+                }
+                if (cleanup_return_tree_condition && cleanup_return_tree_true && cleanup_return_tree_false) {
+                    const auto emit_return_tree = [&](const auto &self, std::size_t index,
+                                                      unsigned indent) -> void {
+                        const auto &node = cleanup_return_tree[index];
+                        const auto spaces = std::string(indent, ' ');
+                        const bool branch_node = node.condition && node.true_child && node.false_child;
+                        const auto prefix_count = node.path.size() - 1;
+                        for (std::size_t i = 0; i < prefix_count; ++i)
+                            emit_block(*node.path[i], indent, true);
+                        if (branch_node) {
+                            emit_block(*node.path.back(), indent, true);
+                            out << spaces << "if (" << branch_condition_text(*node.condition) << ") {\n";
+                            self(self, *node.true_child, indent + 4);
+                            out << spaces << "} else {\n";
+                            self(self, *node.false_child, indent + 4);
+                            out << spaces << "}\n";
+                        } else if (!node.path.empty()) {
+                            emit_parallel_copies(out, node.return_copies, indent);
+                            emit_block(*node.path.back(), indent);
+                        }
+                    };
+                    out << "    if (" << branch_condition_text(*cleanup_return_tree_condition) << ") {\n";
+                    emit_return_tree(emit_return_tree, *cleanup_return_tree_true, 8);
+                    out << "    } else {\n";
+                    emit_return_tree(emit_return_tree, *cleanup_return_tree_false, 8);
                     out << "    }\n";
                 }
                 out << "}\n";

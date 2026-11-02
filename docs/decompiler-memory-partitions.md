@@ -14,8 +14,15 @@ The partitioner recognizes three bounded forms:
   the same address space. A load or store uses the resulting connected-range
   partition only when its exact byte range was observed and mapped.
 - **Pointer-relative ranges:** a base register must have a proven SSA pointer
-  origin through supported copies, constant offsets, constant-proven SSA
-  register offsets, and unanimous phi inputs. For flat A32, AArch64, RISC-V,
+  origin through supported copies, constant or bounded-interval offsets, and
+  unanimous phi inputs. A nonconstant same-width add/sub offset can widen the
+  origin when integer value analysis proves one bounded unsigned interval
+  without wrap. Subtraction reverses the interval endpoints before checked
+  signed-offset accumulation. The interval analysis accepts complete SSA phis
+  and checked arithmetic but does not infer bounds from path predicates. If
+  its bounded fixed point does not converge, nonconstant ranges and derived
+  pointer origins are discarded rather than using a finite approximation. For
+  flat A32, AArch64, RISC-V,
   MIPS, and PowerPC register banks, a proven 32- or 64-bit constant register
   value is rooted at that numeric address. Equal constants in different
   registers therefore share one address origin, and differing constants
@@ -78,10 +85,10 @@ whole-memory SSA. If whole-function partition construction exceeds its budget,
 the function keeps only whole-memory SSA.
 
 This does not partition heap or global accesses whose address cannot be proven,
-aliases reached through unrelated roots, variable indices without a supported
-bounded interval, unsupported index extensions, or pointer arithmetic whose
-offset is not a proven nonnegative constant in a supported same-width integer
-expression. Bitwise and shift constant expressions are evaluated at their
+aliases reached through unrelated roots as disjoint, variable indices without
+a supported bounded interval, unsupported index extensions, or pointer
+arithmetic whose offset is neither a proven constant nor a supported bounded
+nonnegative integer interval. Bitwise and shift constant expressions are evaluated at their
 declared width; shifts require a proven count below the width, while add/sub/mul
 still require no intermediate wrap. Bounded unsigned index intervals also
 propagate through constant-count shifts when the result remains ordered without

@@ -58,9 +58,10 @@ same multi-library tree for manual extraction. Optional Python automation uses
 the system CPython shared library when enabled at configure time; it is not a
 bundled interpreter distribution.
 
-HexLab packages are produced for Windows and Linux only. Linux packages keep
-the command-line and desktop tools in `bin` and shared runtime libraries in the
-configured library directory; no macOS application bundle is produced.
+HexLab supports Windows and Linux hosts only. Linux packages keep the
+command-line and desktop tools in `bin` and shared runtime libraries in the
+configured library directory. CMake rejects unsupported host operating systems
+before dependency configuration begins.
 
 Plugins are optional, separately built native modules. The manifest identifies
 the host ABI major/minor version and query symbol so a distribution or plugin

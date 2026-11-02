@@ -152,6 +152,10 @@ struct PeAuthenticodeSignerTrust {
     bool signature_valid = false;
     bool chain_built = false;
     bool chain_trusted = false;
+    bool image_digest_checked = false;
+    bool image_digest_matches = false;
+    // True only when CMS, the signed PE image digest, and chain policy all pass.
+    bool authenticode_trusted = false;
     bool revocation_checked = false;
     std::uint32_t signature_error = 0;
     std::uint32_t chain_error_status = 0;
@@ -161,11 +165,14 @@ struct PeAuthenticodeSignerTrust {
 };
 struct PeAuthenticodeTrustVerification {
     std::size_t certificate_record = 0;
+    bool online_retrieval_disabled = false;
+    bool timestamp_checked = false;
     std::vector<PeAuthenticodeSignerTrust> signers;
 };
-// Verifies signer signatures and builds a local-machine Authenticode code-
-// signing chain using embedded certificates and local cached trust material.
-// It disables AIA/network retrieval and does not check revocation or timestamps.
+// Verifies the signer signature, signed PE image digest, and local-machine
+// Authenticode code-signing chain. Cert retrieval is offline/cache-only and
+// revocation and timestamp checks are not performed. `chain_trusted` reports
+// chain policy alone; `authenticode_trusted` requires all three checks.
 HEXLAB_LOADERS_EXPORT Result<PeAuthenticodeTrustVerification> verify_pe_authenticode_trust(
     const Image &, const ImageMetadata &, std::size_t certificate_record,
     std::stop_token = {});
