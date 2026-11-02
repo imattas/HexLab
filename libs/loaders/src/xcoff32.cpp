@@ -1,11 +1,29 @@
 #include "hexlab/loaders/xcoff32.hpp"
 #include <algorithm>
+#include <cstring>
 #include <limits>
 #include <new>
 #include <stdexcept>
 
 namespace hexlab {
 namespace {
+class OwnedBytes final : public ByteStorage, public std::enable_shared_from_this<OwnedBytes> {
+public:
+    explicit OwnedBytes(std::vector<std::byte> bytes) : bytes_(std::move(bytes)) {}
+    std::uint64_t size() const noexcept override { return bytes_.size(); }
+    Result<ByteView> read_at(FileOffset offset, std::size_t count) const override {
+        if (offset.value > bytes_.size() || count > bytes_.size() - static_cast<std::size_t>(offset.value))
+            return Error{ErrorCode::io, "Synthetic XCOFF32 read exceeds mapped bytes"};
+        auto owner = std::static_pointer_cast<const void>(shared_from_this());
+        return ByteView{std::move(owner), std::span<const std::byte>(bytes_).subspan(
+            static_cast<std::size_t>(offset.value), count)};
+    }
+    static std::shared_ptr<OwnedBytes> create(std::vector<std::byte> bytes) {
+        return std::shared_ptr<OwnedBytes>(new OwnedBytes(std::move(bytes)));
+    }
+private:
+    std::vector<std::byte> bytes_;
+};
 struct Failure { Error error; };
 void require(bool ok, const char *message, ErrorCode code = ErrorCode::malformed) {
     if (!ok) throw Failure{{code, message}};
@@ -224,6 +242,163 @@ Result<Xcoff32Object> inspect_xcoff32_object(const ByteStorage &storage,
     return Error{ErrorCode::resource_limit, "Cannot allocate bounded XCOFF32 object metadata"};
 } catch (const std::length_error &) {
     return Error{ErrorCode::resource_limit, "XCOFF32 object metadata exceeds host container limits"};
+}
+
+Result<LoadedImage> load_xcoff32_relocatable(std::shared_ptr<const ByteStorage> storage,
+    std::stop_token stop, Xcoff32ObjectLimits limits) try {
+    require(bool(storage), "XCOFF32 object loading requires storage", ErrorCode::invalid_argument);
+    auto inspected = inspect_xcoff32_object(*storage, stop, limits);
+    if (!inspected) throw Failure{inspected.error()};
+    const auto &object = inspected.value();
+    struct Mapping { std::uint32_t address = 0; bool mapped = false; };
+    std::vector<Mapping> mappings(object.sections.size());
+    std::uint64_t total = 0x10000;
+    for (const auto &section : object.sections) {
+        canceled(stop);
+        const auto type = section.flags & 0xffffu;
+        const bool mapped = type == 0x20 || type == 0x40 || type == 0x80 ||
+                            type == 0x400 || type == 0x800;
+        if (!mapped || !section.size) continue;
+        total = (total + 0xfff) & ~UINT64_C(0xfff);
+        require(total <= UINT32_MAX && section.size <= (UINT64_C(1) << 32) - total,
+                "XCOFF32 synthetic section layout exceeds 32-bit address space", ErrorCode::resource_limit);
+        mappings[section.index - 1] = {static_cast<std::uint32_t>(total), true};
+        total += section.size;
+    }
+    require(total <= limits.max_metadata_bytes && total <= std::numeric_limits<std::size_t>::max(),
+            "XCOFF32 synthetic image exceeds configured byte limit", ErrorCode::resource_limit);
+    std::vector<std::byte> bytes(static_cast<std::size_t>(total));
+    ImageLayout layout{{{0}, 32, 1, ByteOrder::big}, Architecture::powerpc,
+                        ExecutionMode::ppc32, {}, {}};
+    LoadedImage loaded;
+    loaded.metadata.format = "XCOFF32 relocatable object";
+    loaded.metadata.machine = 1;
+    loaded.metadata.preferred_base = 0x10000;
+    loaded.metadata.image_size = total - 0x10000;
+    loaded.metadata_complete = true;
+    std::uint64_t budget = total;
+    for (const auto &section : object.sections) {
+        canceled(stop);
+        const auto type = section.flags & 0xffffu;
+        const auto mapping = mappings[section.index - 1];
+        if (!mapping.mapped) {
+            if (section.size || section.relocation_count) {
+                loaded.metadata_complete = false;
+                loaded.diagnostics.push_back({DiagnosticSeverity::warning,
+                    "XCOFF32 section type " + std::to_string(type) + " is inventoried but not mapped", {}});
+            }
+            continue;
+        }
+        const bool bss = type == 0x80 || type == 0x800;
+        if (!bss && section.size) {
+            auto raw = read(*storage, section.data_file_offset, section.size, budget, limits, stop);
+            std::copy(raw.begin(), raw.end(), bytes.begin() + mapping.address);
+        }
+        const bool executable = type == 0x20;
+        const bool writable = type != 0x20;
+        layout.segments.push_back({section.name.empty() ? "section" + std::to_string(section.index) : section.name,
+            {{0}, mapping.address}, section.size, {mapping.address}, section.size,
+            true, writable, executable});
+        loaded.metadata.sections.push_back({section.name, {mapping.address}, section.size,
+            {mapping.address}, section.size, section.flags});
+    }
+    auto symbol_for_slot = [&](std::uint32_t slot) -> const Xcoff32Object::Symbol * {
+        auto it = std::lower_bound(object.symbols.begin(), object.symbols.end(), slot,
+            [](const auto &candidate, auto index) { return candidate.index < index; });
+        return it != object.symbols.end() && it->index == slot ? &*it : nullptr;
+    };
+    auto symbol_address = [&](const Xcoff32Object::Symbol &symbol) -> std::optional<std::uint64_t> {
+        if (symbol.section_number == -1) return symbol.value;
+        if (symbol.section_number <= 0 || static_cast<std::size_t>(symbol.section_number) > object.sections.size())
+            return {};
+        const auto &section = object.sections[static_cast<std::size_t>(symbol.section_number - 1)];
+        const auto mapping = mappings[section.index - 1];
+        if (!mapping.mapped || symbol.value < section.physical_address ||
+            std::uint64_t{symbol.value} - section.physical_address > section.size) return {};
+        return std::uint64_t{mapping.address} + symbol.value - section.physical_address;
+    };
+    for (const auto &symbol : object.symbols) {
+        if (symbol.name.empty()) continue;
+        const auto address = symbol_address(symbol);
+        if (!address || symbol.storage_class == 3) continue;
+        loaded.metadata.exports.push_back({symbol.index, symbol.name, Address{{0}, *address}, {}});
+    }
+    for (const auto &section : object.sections) {
+        const auto mapping = mappings[section.index - 1];
+        if (!mapping.mapped) continue;
+        for (const auto &reloc : section.relocations) {
+            canceled(stop);
+            const auto type = reloc.type;
+            if (type == 0x0f) continue; // R_REF records a reference without patching bytes.
+            if (type != 0x00 && type != 0x01 && type != 0x02) {
+                loaded.metadata_complete = false;
+                loaded.diagnostics.push_back({DiagnosticSeverity::warning,
+                    "XCOFF32 " + std::string(xcoff32_relocation_type_name(type)) +
+                    " relocation is retained but not applied", Address{{0},
+                    std::uint64_t{mapping.address} + reloc.virtual_address - section.physical_address}});
+                continue;
+            }
+            const auto width_bits = (reloc.size_info & 0x3fu) + 1u;
+            if ((width_bits != 8 && width_bits != 16 && width_bits != 32) ||
+                (reloc.size_info & 0x40u) != 0) {
+                loaded.metadata_complete = false;
+                loaded.diagnostics.push_back({DiagnosticSeverity::warning,
+                    "XCOFF32 relocation uses an unsupported bit-field or instruction encoding",
+                    Address{{0}, std::uint64_t{mapping.address} + reloc.virtual_address - section.physical_address}});
+                continue;
+            }
+            const auto *symbol = symbol_for_slot(reloc.symbol_index);
+            const auto resolved = symbol ? symbol_address(*symbol) : std::optional<std::uint64_t>{};
+            if (!resolved) {
+                loaded.metadata_complete = false;
+                loaded.diagnostics.push_back({DiagnosticSeverity::warning,
+                    "XCOFF32 relocation target is undefined, common, or outside mapped sections",
+                    Address{{0}, std::uint64_t{mapping.address} + reloc.virtual_address - section.physical_address}});
+                continue;
+            }
+            const std::uint64_t place = std::uint64_t{mapping.address} + reloc.virtual_address - section.physical_address;
+            const auto width = width_bits / 8;
+            const auto within_section = std::uint64_t{reloc.virtual_address} - section.physical_address;
+            if (width > section.size - within_section) {
+                loaded.metadata_complete = false;
+                loaded.diagnostics.push_back({DiagnosticSeverity::warning,
+                    "XCOFF32 relocation field crosses the end of its section", Address{{0}, place}});
+                continue;
+            }
+            const auto old = be(bytes, static_cast<std::size_t>(place), width);
+            const std::int64_t addend = (reloc.size_info & 0x80u) &&
+                (old & (UINT32_C(1) << (width_bits - 1)))
+                ? static_cast<std::int64_t>(old) - (INT64_C(1) << width_bits) : old;
+            const std::int64_t value = type == 0x00 ? addend + static_cast<std::int64_t>(*resolved) :
+                type == 0x01 ? addend - static_cast<std::int64_t>(*resolved) :
+                addend + static_cast<std::int64_t>(*resolved) - static_cast<std::int64_t>(place);
+            const std::int64_t minimum = (reloc.size_info & 0x80u) ? -(INT64_C(1) << (width_bits - 1)) : 0;
+            const std::int64_t maximum = (reloc.size_info & 0x80u)
+                ? (INT64_C(1) << (width_bits - 1)) - 1 : (INT64_C(1) << width_bits) - 1;
+            if (value < minimum || value > maximum) {
+                loaded.metadata_complete = false;
+                loaded.diagnostics.push_back({DiagnosticSeverity::warning,
+                    "XCOFF32 relocation result overflows its encoded field",
+                    Address{{0}, place}});
+                continue;
+            }
+            for (std::size_t i = 0; i < width; ++i)
+                bytes[static_cast<std::size_t>(place) + width - i - 1] =
+                    static_cast<std::byte>((static_cast<std::uint64_t>(value) >> (i * 8)) & 0xff);
+        }
+    }
+    auto backing = OwnedBytes::create(std::move(bytes));
+    auto image = Image::create(backing, std::move(layout));
+    if (!image) throw Failure{image.error()};
+    loaded.image = std::move(image.value());
+    loaded.metadata_reads_complete = false;
+    return loaded;
+} catch (const Failure &failure) {
+    return failure.error;
+} catch (const std::bad_alloc &) {
+    return Error{ErrorCode::resource_limit, "Cannot allocate bounded synthetic XCOFF32 image"};
+} catch (const std::length_error &) {
+    return Error{ErrorCode::resource_limit, "Synthetic XCOFF32 image exceeds host container limits"};
 }
 
 Result<LoadedImage> load_xcoff32_executable(std::shared_ptr<const ByteStorage> storage,
@@ -591,6 +766,21 @@ Result<LoadedImage> load_xcoff32_executable(std::shared_ptr<const ByteStorage> s
     return Error{ErrorCode::resource_limit, "Cannot allocate bounded XCOFF32 executable metadata"};
 } catch (const std::length_error &) {
     return Error{ErrorCode::resource_limit, "XCOFF32 executable metadata exceeds host container limits"};
+}
+
+Result<LoadedImage> load_xcoff32_image(std::shared_ptr<const ByteStorage> storage,
+    std::stop_token stop, Xcoff32ObjectLimits limits) {
+    if (!storage) return Error{ErrorCode::invalid_argument, "XCOFF32 loading requires storage"};
+    std::uint64_t budget = 0;
+    try {
+        const auto header = read(*storage, 0, 20, budget, limits, stop);
+        require(be(header, 0, 2) == 0x01df, "Invalid XCOFF32 magic");
+        return (be(header, 18, 2) & 0x0002u)
+            ? load_xcoff32_executable(std::move(storage), stop, limits)
+            : load_xcoff32_relocatable(std::move(storage), stop, limits);
+    } catch (const Failure &failure) {
+        return failure.error;
+    }
 }
 
 std::string_view xcoff32_relocation_type_name(std::uint8_t type) {

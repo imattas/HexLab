@@ -644,6 +644,75 @@ evaluate_m6502_hardware_interrupt(M6502HardwareInterrupt interrupt,
                                      pushed_status, vector_address};
 }
 
+std::optional<M65C02ControlResult>
+evaluate_m65c02_wait_stop(Opcode opcode, std::uint16_t next_program_counter,
+                          std::uint8_t stack_pointer, std::uint8_t status) noexcept {
+    M65C02RunState state{};
+    if (opcode == Opcode::m65c02_wai) state = M65C02RunState::waiting;
+    else if (opcode == Opcode::m65c02_stp) state = M65C02RunState::stopped;
+    else return {};
+    return M65C02ControlResult{state, next_program_counter, stack_pointer, status};
+}
+
+std::optional<M65C02ControlResult>
+evaluate_m65c02_wait_stop_instruction(const Instruction &instruction,
+                                      std::uint16_t next_program_counter,
+                                      std::uint8_t stack_pointer,
+                                      std::uint8_t status) noexcept {
+    if (instruction.context.architecture != Architecture::mos6502 ||
+        instruction.context.mode != ExecutionMode::m65c02 || instruction.length != 1 ||
+        !instruction.operands.empty() || !instruction.access.empty() ||
+        instruction.memory_read || instruction.memory_write)
+        return {};
+    const auto opcode = instruction.opcode;
+    if ((opcode == Opcode::m65c02_wai && instruction.flow != FlowKind::fallthrough) ||
+        (opcode == Opcode::m65c02_stp && instruction.flow != FlowKind::trap))
+        return {};
+    return evaluate_m65c02_wait_stop(opcode, next_program_counter, stack_pointer, status);
+}
+
+std::optional<M65C02ControlResult>
+evaluate_m65c02_wait_interrupt(M65C02RunState state,
+                               M6502HardwareInterrupt interrupt,
+                               std::uint16_t program_counter,
+                               std::uint8_t stack_pointer, std::uint8_t status,
+                               std::uint8_t vector_low,
+                               std::uint8_t vector_high) noexcept {
+    if (state != M65C02RunState::waiting) return {};
+    if (interrupt != M6502HardwareInterrupt::irq && interrupt != M6502HardwareInterrupt::nmi)
+        return {};
+    // IRQ is level-sensitive. Even with I set it releases WAI, but cannot
+    // start the interrupt frame; execution resumes at the post-WAI PC.
+    if (interrupt == M6502HardwareInterrupt::irq && (status & 0x04u) != 0)
+        return M65C02ControlResult{M65C02RunState::running, program_counter,
+                                   stack_pointer, status};
+
+    const auto entry = evaluate_m6502_hardware_interrupt(interrupt, program_counter,
+        stack_pointer, status, vector_low, vector_high);
+    if (!entry) return {};
+    const auto cmos_status = static_cast<std::uint8_t>(entry->status & ~0x08u);
+    return M65C02ControlResult{M65C02RunState::running, entry->program_counter,
+        entry->stack_pointer, cmos_status, true,
+        entry->pushed_program_counter_high, entry->pushed_program_counter_low,
+        entry->pushed_status, entry->vector_address};
+}
+
+std::optional<M65C02ControlResult>
+evaluate_m65c02_reset(M65C02RunState state, std::uint8_t stack_pointer,
+                      std::uint8_t status, std::uint8_t vector_low,
+                      std::uint8_t vector_high) noexcept {
+    if (state != M65C02RunState::running && state != M65C02RunState::waiting &&
+        state != M65C02RunState::stopped)
+        return {};
+    const auto target = static_cast<std::uint16_t>(vector_low |
+        (static_cast<std::uint16_t>(vector_high) << 8));
+    // D is cleared, I and the modeled always-one bit are asserted. Other
+    // flags are software-initialized/unspecified by reset and left as supplied.
+    const auto reset_status = static_cast<std::uint8_t>((status & ~0x18u) | 0x24u);
+    return M65C02ControlResult{M65C02RunState::running, target, stack_pointer,
+                               reset_status};
+}
+
 std::optional<M6502FlagControlResult>
 evaluate_m6502_flag_control(Opcode opcode, std::uint8_t status) noexcept {
     std::uint8_t bit = 0;

@@ -2,9 +2,9 @@
 
 `Project::save_workflow_state` and `Project::load_workflow_state` preserve an
 application's bounded cursor, review queue, or other opaque state across host
-process restarts. The service is part of the native C++ automation SDK. A state
-file is separate from the project database; project backups and Save As do not
-automatically copy it. Python bindings are not provided for this service yet.
+process restarts. The service is available through both the native C++ SDK and
+the Python `Project` facade. A state file is separate from the project database;
+project backups and Save As do not automatically copy it.
 
 Open the same project in the next process, then load the checkpoint with the
 same application name and application schema version. Loading verifies the
@@ -29,6 +29,31 @@ auto loaded = project.value()->load_workflow_state(
     "inventory-0001.state", "mytool.annotation-inventory", 1);
 ```
 
+Python uses the same envelope and validation rules. The save call requires the
+edit revision observed when the application prepared its checkpoint; both
+methods return a `hexlab.WorkflowState` dataclass with the UUID, revision,
+namespace, schema, and opaque `bytes` payload:
+
+```python
+import hexlab
+
+with hexlab.Project.open("input.hxproj") as project:
+    revision = project.snapshot()["edit_revision"]
+    saved = project.save_workflow_state(
+        "inventory.state", "mytool.annotation-inventory", 1,
+        b"64", expected_revision=revision)
+
+with hexlab.Project.open("input.hxproj") as project:
+    state = project.load_workflow_state(
+        "inventory.state", "mytool.annotation-inventory", 1)
+    cursor = int(state.payload.decode("ascii"))
+```
+
+The Python facade accepts `bytes` payloads up to
+`hexlab.MAX_WORKFLOW_STATE_BYTES` (1 MiB). Optional `cancel=` values are
+`hexlab.CancellationToken` objects and use the normal cooperative cancellation
+behavior. Application payload encoding and migration remain the caller's job.
+
 The methods follow `Project` thread ownership. Saving requires a live owner
 and accepts a read-only project, since it writes a separate file. Captured
 owners may load a checkpoint matching their pinned generation but cannot save
@@ -39,7 +64,9 @@ does not make a combined transaction with project edits or an output sink.
 ## Restartable example
 
 Configure with `-DHEXLAB_BUILD_AUTOMATION_EXAMPLES=ON` and build the
-`hexlab_resume_inventory` target. With the HexLab runtime DLLs available, run:
+`hexlab_resume_inventory` target for the C++ example. The Python example is
+installed with the other Python automation examples. With the HexLab runtime
+available, run either example as follows:
 
 ```text
 hexlab_resume_inventory input.hxproj inventory-0001.state
@@ -47,9 +74,15 @@ hexlab_resume_inventory input.hxproj inventory-0002.state inventory-0001.state
 hexlab_resume_inventory input.hxproj inventory-0003.state inventory-0002.state
 ```
 
+```text
+hexlab_python resume_inventory.py input.hxproj inventory-0001.state
+hexlab_python resume_inventory.py input.hxproj inventory-0002.state inventory-0001.state
+```
+
 Each invocation opens the project read-only, exports up to 64 durable annotation
-rows, and saves the next decimal row offset in a schema-1 payload. Stop once it
-reports `inventory complete`. An exact multiple of 64 needs one extra invocation
+rows, and saves the next decimal row offset in a schema-1 payload. The C++ and
+Python examples use separate application namespaces, so their state files are
+not interchangeable. Stop once it reports `inventory complete`. An exact multiple of 64 needs one extra invocation
 to discover the empty final page. Rows contain the annotation ID and quoted name
 and comment; this example is a diagnostic listing, not a formal interchange
 format. Newlines in annotation text may span physical output lines.

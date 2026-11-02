@@ -16,6 +16,8 @@ from threading import Event, Lock, Thread, current_thread
 import _hexlab
 
 API_VERSION = 1
+MAX_WORKFLOW_STATE_BYTES = 1024 * 1024
+MAX_WORKFLOW_APPLICATION_NAME_BYTES = 128
 Error = _hexlab.Error
 FUNCTION_CONVENTIONS = (
     "platform_default", "c_decl", "stdcall", "fastcall", "thiscall",
@@ -60,6 +62,15 @@ class Address:
 @dataclass(frozen=True)
 class FileOffset:
     offset: int
+
+@dataclass(frozen=True)
+class WorkflowState:
+    """Opaque application checkpoint tied to one project UUID and edit revision."""
+    project_uuid: str
+    edit_revision: int
+    application: str
+    schema_version: int
+    payload: bytes
 
 @dataclass(frozen=True)
 class StackFrameInfo:
@@ -571,6 +582,70 @@ class Project:
     def annotations(self, *, start=0, count=256):
         """Page durable user names and comments in database order."""
         return self._call("annotations", start, count)
+
+    @staticmethod
+    def _workflow_application(application):
+        if not isinstance(application, str):
+            raise TypeError("application must be a string")
+        try:
+            encoded = application.encode("ascii")
+        except UnicodeEncodeError:
+            raise ValueError("application must use ASCII letters, digits, '.', '_' or '-'") from None
+        if not 1 <= len(encoded) <= MAX_WORKFLOW_APPLICATION_NAME_BYTES or any(
+                char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+                for char in application):
+            raise ValueError("application must be 1..128 ASCII letters, digits, '.', '_' or '-'")
+        return application
+
+    def save_workflow_state(self, path, application, schema_version, payload, *,
+                            expected_revision, cancel=None):
+        """Publish an immutable, revision-pinned opaque application checkpoint.
+
+        Use a fresh destination for each checkpoint. ``expected_revision`` must
+        match the project's current edit revision; payloads are limited to 1 MiB.
+        """
+        application = self._workflow_application(application)
+        if not isinstance(payload, bytes):
+            raise TypeError("payload must be bytes")
+        if len(payload) > MAX_WORKFLOW_STATE_BYTES:
+            raise ValueError("payload exceeds the 1 MiB workflow-state limit")
+        schema_version = _unsigned(schema_version, "schema_version", (1 << 32) - 1)
+        if schema_version == 0:
+            raise ValueError("schema_version must be greater than zero")
+        expected_revision = _unsigned(expected_revision, "expected_revision")
+        if cancel is None:
+            cancel = globals().get("_hexlab_console_cancellation_token")
+        if cancel is not None and not isinstance(cancel, CancellationToken):
+            raise TypeError("cancel must be a CancellationToken")
+        try:
+            result = self._call("save_workflow_state", os.fspath(path), application,
+                                schema_version, payload, expected_revision,
+                                None if cancel is None else cancel._handle)
+            return WorkflowState(**result)
+        except Error as error:
+            if cancel is not None and cancel.cancelled and error.code == _hexlab.CANCELED_ERROR_CODE:
+                raise AnalysisCancelled("workflow-state save canceled") from None
+            raise
+
+    def load_workflow_state(self, path, application, schema_version, *, cancel=None):
+        """Load a checkpoint after native checksum, schema, UUID, and revision checks."""
+        application = self._workflow_application(application)
+        schema_version = _unsigned(schema_version, "schema_version", (1 << 32) - 1)
+        if schema_version == 0:
+            raise ValueError("schema_version must be greater than zero")
+        if cancel is None:
+            cancel = globals().get("_hexlab_console_cancellation_token")
+        if cancel is not None and not isinstance(cancel, CancellationToken):
+            raise TypeError("cancel must be a CancellationToken")
+        try:
+            result = self._call("load_workflow_state", os.fspath(path), application,
+                                schema_version,
+                                None if cancel is None else cancel._handle)
+            return WorkflowState(**result)
+        except Error as error:
+            if cancel is not None and cancel.cancelled and error.code == _hexlab.CANCELED_ERROR_CODE:
+                raise AnalysisCancelled("workflow-state load canceled") from None
+            raise
 
     def types(self, *, start=0, count=256):
         """Page durable type definitions, including their TypeSpec values."""

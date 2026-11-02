@@ -215,6 +215,53 @@ evaluate_m6502_hardware_interrupt(M6502HardwareInterrupt interrupt,
                                   std::uint8_t vector_low,
                                   std::uint8_t vector_high) noexcept;
 
+// Coarse W65C02 execution-control state for event evaluators. This is not a
+// cycle-accurate CPU state machine; the caller owns pin sampling and memory.
+enum class M65C02RunState : std::uint8_t { running, waiting, stopped };
+
+struct M65C02ControlResult {
+    M65C02RunState state = M65C02RunState::running;
+    std::uint16_t program_counter = 0;
+    std::uint8_t stack_pointer = 0;
+    std::uint8_t status = 0;
+    bool interrupt_entry = false;
+    std::uint8_t pushed_program_counter_high = 0;
+    std::uint8_t pushed_program_counter_low = 0;
+    std::uint8_t pushed_status = 0;
+    std::uint16_t vector_address = 0;
+    bool operator==(const M65C02ControlResult &) const = default;
+};
+
+// Apply decoded WAI/STP control effects with PC already advanced past the
+// one-byte instruction. Other opcodes and non-running input states reject.
+HEXLAB_PROCESSORS_EXPORT std::optional<M65C02ControlResult>
+evaluate_m65c02_wait_stop(Opcode opcode, std::uint16_t next_program_counter,
+                          std::uint8_t stack_pointer, std::uint8_t status) noexcept;
+HEXLAB_PROCESSORS_EXPORT std::optional<M65C02ControlResult>
+evaluate_m65c02_wait_stop_instruction(const Instruction &instruction,
+                                      std::uint16_t next_program_counter,
+                                      std::uint8_t stack_pointer,
+                                      std::uint8_t status) noexcept;
+
+// Deliver a pending IRQ/NMI while WAI is active. A masked IRQ wakes WAI and
+// resumes at the saved post-WAI PC without vectoring; NMI always vectors. The
+// caller supplies vector bytes and has already sampled/latched the event.
+HEXLAB_PROCESSORS_EXPORT std::optional<M65C02ControlResult>
+evaluate_m65c02_wait_interrupt(M65C02RunState state,
+                               M6502HardwareInterrupt interrupt,
+                               std::uint16_t program_counter,
+                               std::uint8_t stack_pointer, std::uint8_t status,
+                               std::uint8_t vector_low,
+                               std::uint8_t vector_high) noexcept;
+
+// Apply architectural reset register effects from any control state. Caller
+// supplies bytes fetched from $FFFC/$FFFD. S and software flags are preserved
+// because reset-time S bus activity and unspecified flags are not modeled.
+HEXLAB_PROCESSORS_EXPORT std::optional<M65C02ControlResult>
+evaluate_m65c02_reset(M65C02RunState state, std::uint8_t stack_pointer,
+                      std::uint8_t status, std::uint8_t vector_low,
+                      std::uint8_t vector_high) noexcept;
+
 // Evaluate RTS/RTI using caller-fetched stack bytes in pop order.
 HEXLAB_PROCESSORS_EXPORT std::optional<M6502ReturnResult>
 evaluate_m6502_return(Opcode opcode, std::uint8_t stack_pointer,

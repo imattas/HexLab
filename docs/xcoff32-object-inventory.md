@@ -40,14 +40,32 @@ A zero raw-data pointer denotes absent raw data, including in a nonempty section
 The subset rejects executable (`F_EXEC`) objects, optional headers, deleted
 section headers and overflow sections/count sentinels. Loader-section payloads
 and their embedded loader relocation tables remain uninterpreted. Line-number
-rows are extent-checked only. It does not
-validate overlap between payload tables, decode auxiliary csect records,
-interpret csect relocation semantics or relocation arithmetic, decode line
-records, resolve symbols beyond displaying names for validated slots, apply
-relocations, or produce linked output. No runtime tests were
-added or run for this slice. This is
-partial structural inspection, not full XCOFF support or verification of
-archive linking capability.
+rows are extent-checked only. It does not validate overlap between payload
+tables, decode auxiliary csect or line records, implement csect linking,
+archive member selection, or external library binding.
+
+`load_xcoff32_relocatable` maps common `STYP_TEXT`, `STYP_DATA`, `STYP_BSS`,
+`STYP_TDATA`, and `STYP_TBSS` sections into deterministic synthetic 32-bit
+addresses beginning at `0x10000`, page-aligning each nonempty section.
+Initialized bytes are copied into bounded owned storage and BSS/TBSS are
+zero-filled. Section permissions reflect text versus writable data. No entry
+point is inferred. Defined symbols in mapped sections and absolute symbols are
+resolved; external/common or unsupported-section targets remain unresolved
+diagnostics. The loader applies only full-byte `R_POS`, `R_NEG`, and `R_REL`
+fields of 8, 16, or 32 bits with checked field range. `R_REF` is validated but
+has no patch. Instruction-modified fields, bit fields, TOC/TLS, and other
+relocation kinds remain unapplied and mark metadata incomplete. This is an
+analysis view, not an AIX link: csect alignment, TOC setup, archive extraction,
+import libraries and runtime binding are not implemented.
+
+Automatic open now routes both executable and relocatable XCOFF32 inputs to the
+format loader. `hexlab_cli inspect object.o` (or
+`hexlab_cli inspect object.o --format xcoff32`) maps supported sections for
+normal image inspection and disassembly. Structural inventory remains
+available through `hexlab_cli xcoff32 inspect object.o`. The normal project
+workflow can import the same object with
+`hexlab_cli project create object.hxproj --input object.o`; subsequent project
+inspection and disassembly commands operate on the synthetic mapped view.
 
 `load_xcoff32_executable` provides a separate linked-image slice for big-endian
 XCOFF32 executables with `F_EXEC` and the standard 72-byte AIX auxiliary
@@ -72,8 +90,7 @@ register or emulate AIX process startup. Other section types remain unsupported.
 This is a mapped linked image for static inspection, not an AIX execution
 environment.
 Automatic open detects `F_EXEC` XCOFF32 files and routes them through this
-loader; relocatable objects are separately identified and rejected with an
-object-specific message. AIX archive magic is detected first and continues to
+loader. AIX archive magic is detected first and continues to
 use the archive member workflow. CLI image commands also accept
 `--format xcoff32` for an explicit selection.
 

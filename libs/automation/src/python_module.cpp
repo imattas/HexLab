@@ -1534,6 +1534,29 @@ PyObject* call_project(PyObject*,PyObject* args){return guarded([&]()->PyObject*
         const auto stop=argument(values,1)==Py_None?std::stop_token{}:stop_source(argument(values,1)).get_token();
         take(without_gil([&]{return p.save_as(destination,stop);}));return none();
     }
+    if(method=="save_workflow_state"){
+        count(values,6);const auto destination=path(argument(values,0));const auto application=text(argument(values,1));
+        const auto schema=number32(argument(values,2));auto payload=bytes_value(argument(values,3));
+        const auto expected=number(argument(values,4));
+        const auto stop=argument(values,5)==Py_None?std::stop_token{}:stop_source(argument(values,5)).get_token();
+        const auto state=take(without_gil([&]{return p.save_workflow_state(destination,application,schema,payload,expected,stop);}));
+        Object result(PyDict_New());set(result,"project_uuid",encode_uuid(state.project_uuid));
+        set(result,"edit_revision",integer(state.edit_revision));set(result,"application",string(state.application));
+        set(result,"schema_version",integer(state.schema_version));
+        set(result,"payload",PyBytes_FromStringAndSize(reinterpret_cast<const char*>(state.payload.data()),static_cast<Py_ssize_t>(state.payload.size())));
+        return result.release();
+    }
+    if(method=="load_workflow_state"){
+        count(values,4);const auto source=path(argument(values,0));const auto application=text(argument(values,1));
+        const auto schema=number32(argument(values,2));
+        const auto stop=argument(values,3)==Py_None?std::stop_token{}:stop_source(argument(values,3)).get_token();
+        const auto state=take(without_gil([&]{return p.load_workflow_state(source,application,schema,stop);}));
+        Object result(PyDict_New());set(result,"project_uuid",encode_uuid(state.project_uuid));
+        set(result,"edit_revision",integer(state.edit_revision));set(result,"application",string(state.application));
+        set(result,"schema_version",integer(state.schema_version));
+        set(result,"payload",PyBytes_FromStringAndSize(reinterpret_cast<const char*>(state.payload.data()),static_cast<Py_ssize_t>(state.payload.size())));
+        return result.release();
+    }
     if(method=="backup_to"){
         count(values,3);const auto destination=path(argument(values,0));const auto replace=boolean(argument(values,1));
         auto stop=argument(values,2)==Py_None?std::stop_token{}:stop_source(argument(values,2)).get_token();

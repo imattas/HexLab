@@ -811,8 +811,7 @@ Result<LoadRecipe> resolve_load_recipe(const ByteStorage &storage, const LoadRec
         if (detected.value() == DetectedFormat::xcoff32_executable_candidate)
             return LoadRecipe{Format::xcoff32, {}};
         if (detected.value() == DetectedFormat::xcoff32_object_candidate)
-            return Error{ErrorCode::unsupported,
-                "XCOFF32 relocatable object is not a linked image; inspect it or open its containing archive"};
+            return LoadRecipe{Format::xcoff32, {}};
         return Error{ErrorCode::unsupported, "Unknown format; choose raw with explicit architecture and base"};
     }
     if (!valid(recipe))
@@ -1072,7 +1071,7 @@ Result<LoadedImage> load_durable_image(std::shared_ptr<const ByteStorage> storag
         return loaded;
     }
     if (recipe.format == Format::xcoff32)
-        return load_xcoff32_executable(std::move(storage), stop);
+        return load_xcoff32_image(std::move(storage), stop);
     if (recipe.format == Format::ar)
         return Error{ErrorCode::unsupported, "ar archives have no single image; use load_archive and select a member"};
     auto image = load_raw(storage, *recipe.raw, stop);

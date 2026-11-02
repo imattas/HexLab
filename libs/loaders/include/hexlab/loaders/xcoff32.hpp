@@ -54,18 +54,31 @@ struct Xcoff32ObjectLimits {
 };
 
 // Structural inventory of big-endian relocatable XCOFF32 without an optional
-// header. Decodes ordinary relocation rows as metadata but does not apply
-// them. Overflow sections and loader relocation rows are
-// explicitly unsupported. No csect interpretation or linking is performed.
+// header. Decodes ordinary relocation rows as metadata; it does not modify the
+// source storage. Overflow sections and loader relocation rows are unsupported.
 HEXLAB_LOADERS_EXPORT std::string_view xcoff32_relocation_type_name(std::uint8_t);
 HEXLAB_LOADERS_EXPORT Result<Xcoff32Object> inspect_xcoff32_object(
     const ByteStorage &, std::stop_token = {}, Xcoff32ObjectLimits = {});
+
+// Maps common initialized and zero-fill sections of a relocatable object into
+// deterministic synthetic section bases. Applies bounded data-field R_POS,
+// R_NEG, and R_REL relocations to locally defined symbols. Unsupported section
+// kinds, relocation encodings, common symbols, and unresolved external symbols
+// remain explicitly diagnosed; no AIX library binding or csect linker layout
+// is inferred.
+HEXLAB_LOADERS_EXPORT Result<LoadedImage> load_xcoff32_relocatable(
+    std::shared_ptr<const ByteStorage>, std::stop_token = {}, Xcoff32ObjectLimits = {});
 
 // Maps an already linked, big-endian XCOFF32 executable into its declared
 // virtual addresses and inventories the bounded AIX loader tables. Imports
 // and loader relocations are reported as unresolved: no runtime binding or
 // relocation is performed.
 HEXLAB_LOADERS_EXPORT Result<LoadedImage> load_xcoff32_executable(
+    std::shared_ptr<const ByteStorage>, std::stop_token = {}, Xcoff32ObjectLimits = {});
+
+// Detects the XCOFF32 F_EXEC bit and routes the input to the linked executable
+// mapper or relocatable-object mapper above.
+HEXLAB_LOADERS_EXPORT Result<LoadedImage> load_xcoff32_image(
     std::shared_ptr<const ByteStorage>, std::stop_token = {}, Xcoff32ObjectLimits = {});
 
 } // namespace hexlab
