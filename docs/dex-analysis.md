@@ -376,7 +376,7 @@ merge at joins under per-method and aggregate state-cell budgets. Invoke
 exception edges do not receive the normal-path move-result write.
 
 The current transfer subset recognizes scalar/wide constants,
-string/class/new-instance/new-array results, scalar/wide/object moves,
+string/class/new-instance/new-array/filled-new-array results, scalar/wide/object moves,
 move-exception, move-result-object/wide, check-cast, instance-of,
 array-length, monitor operations, throw, fill-array-data, zero comparisons,
 typed returns, long/float/double compare opcodes and two-register conditional
@@ -399,7 +399,10 @@ Arithmetic and conversion checks cover the standard register forms and
 integer literal arithmetic; they validate register categories and wide pairs,
 not numeric overflow or runtime value constraints. Array opcodes validate
 reference/index and broad element categories, while `aget-wide`/`aput-wide`
-remain long/double agnostic. Field descriptor checks apply to standard field
+remain long/double agnostic. `filled-new-array` and `/range` check each encoded
+element against the array component descriptor, including known reference
+assignability, reject wide element descriptors, and carry the exact array type
+to the adjacent `move-result-object`. Field descriptor checks apply to standard field
 identifier opcodes; optimized quick/volatile forms are not linked to field
 descriptors. Invoke checks validate argument categories when a method
 prototype is available, including standard polymorphic/custom call-site

@@ -1775,6 +1775,7 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
                     previous_result_descriptor = {};
                     if (opcode == 0x24 || opcode == 0x25) {
                         previous_result = PendingDexResult::object;
+                        previous_result_descriptor = types[index16];
                     } else if (invoke_proto || opcode == 0xee || opcode == 0xef ||
                                opcode == 0xf8 || opcode == 0xf9) {
                         if (!invoke_proto) {
@@ -2272,6 +2273,28 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
                             if (!expect_type(reg4b, RegType::int32))
                                 return Error{ErrorCode::malformed, "DEX new-array size is not an integer"};
                             set_descriptor(reg4a, types[word(1)]);
+                        } else if (opcode == 0x24 || opcode == 0x25) {
+                            const auto array_type_index = word(1);
+                            const auto &array_descriptor = types[array_type_index];
+                            if (array_descriptor.size() < 2 || array_descriptor.front() != '[')
+                                return Error{ErrorCode::malformed,
+                                    "DEX filled-new-array type is not an array descriptor"};
+                            const auto component = std::string_view(array_descriptor).substr(1);
+                            if (component == "J" || component == "D")
+                                return Error{ErrorCode::malformed,
+                                    "DEX filled-new-array cannot initialize a wide-element array"};
+                            const bool reference_component = component.front() == 'L' || component.front() == '[';
+                            for (const auto read : decoded_for_flow.instruction->register_reads) {
+                                if (reference_component) {
+                                    if (!expect_type(read.index, RegType::reference) ||
+                                        !expect_assignable_reference(read.index, component))
+                                        return Error{ErrorCode::malformed,
+                                            "DEX filled-new-array element is not assignable to its reference component"};
+                                } else if (!expect_descriptor(read.index, component)) {
+                                    return Error{ErrorCode::malformed,
+                                        "DEX filled-new-array element disagrees with its primitive component"};
+                                }
+                            }
                         } else if (opcode == 0x26) {
                             if (!expect_type(reg8, RegType::reference))
                                 return Error{ErrorCode::malformed, "DEX fill-array-data operand is not a reference"};
