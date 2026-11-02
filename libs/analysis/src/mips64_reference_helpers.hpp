@@ -4,10 +4,59 @@
 #include "hexlab/processors/instruction.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <optional>
 #include <utility>
 
 namespace hexlab::reference_detail {
+
+// Classic MIPS32 calls and REGIMM link branches write the instruction after
+// the delay slot. Keep this as a register fact only when the decoded write is
+// unambiguous and the return PC names initialized executable image bytes.
+inline std::optional<std::pair<std::uint8_t, Address>> mips32_link_value(
+    const Image &image, const Instruction &instruction,
+    std::optional<std::uint32_t> regimm_source_value = {}) {
+    if (instruction.context.architecture != Architecture::mips32 ||
+        instruction.context.mode != ExecutionMode::mips32 || instruction.length != 4 ||
+        instruction.delay_slots != 1 ||
+        instruction.address.offset > UINT32_MAX - 8)
+        return {};
+
+    const bool regimm_link = instruction.opcode == Opcode::mips_bltzal ||
+        instruction.opcode == Opcode::mips_bgezal || instruction.opcode == Opcode::mips_bltzall ||
+        instruction.opcode == Opcode::mips_bgezall;
+    const bool jump_link = instruction.opcode == Opcode::mips_jal || instruction.opcode == Opcode::mips_jalr;
+    if (!regimm_link && !jump_link)
+        return {};
+    if (regimm_link) {
+        if (!regimm_source_value) return {};
+        const auto signed_source = std::bit_cast<std::int32_t>(*regimm_source_value);
+        const bool nonnegative = instruction.opcode == Opcode::mips_bgezal ||
+            instruction.opcode == Opcode::mips_bgezall;
+        if (nonnegative != (signed_source >= 0)) return {};
+    }
+
+    std::optional<std::uint8_t> destination;
+    for (const auto &written : instruction.register_writes)
+        if (written.bank == RegisterBank::mips_gpr && written.index != 0 && written.width == 32) {
+            if (written.index >= 32 || destination) return {};
+            destination = static_cast<std::uint8_t>(written.index);
+        }
+    if (!destination || ((regimm_link || instruction.opcode == Opcode::mips_jal) && *destination != 31))
+        return {};
+
+    const auto *space = image.space(instruction.address.space);
+    if (!space || space->width_bits != 32)
+        return {};
+    const Address target{instruction.address.space, instruction.address.offset + 8};
+    const auto *segment = image.segment_at(target);
+    if (!segment || !segment->executable || target.offset < segment->begin.offset)
+        return {};
+    const auto relative = target.offset - segment->begin.offset;
+    if (relative > segment->file_size || 4 > segment->file_size - relative)
+        return {};
+    return std::pair{*destination, target};
+}
 
 // Call and REGIMM link branches write the address after their classic delay
 // slot. Retain that PC value only when representable in the image's address

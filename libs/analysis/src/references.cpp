@@ -4755,6 +4755,21 @@ RegisterReferenceFacts mips_reference_facts(const Image *image, const Relocation
                         registers.erase(mips32_hi_key + reg.index);
                 }
             };
+            const auto mips32_regimm_source_value = [&]() -> std::optional<std::uint32_t> {
+                if (instruction.opcode != Opcode::mips_bltzal && instruction.opcode != Opcode::mips_bgezal &&
+                    instruction.opcode != Opcode::mips_bltzall && instruction.opcode != Opcode::mips_bgezall)
+                    return {};
+                const auto *source = architecture_register(instruction, 0, RegisterBank::mips_gpr, 32);
+                if (!source || source->index >= 32) return {};
+                if (source->index == 0) return 0;
+                const auto found = registers.find(source->index);
+                if (found == registers.end() || found->second.space != instruction.address.space) return {};
+                if (found->second.offset > UINT32_MAX) return {};
+                return static_cast<std::uint32_t>(found->second.offset);
+            };
+            // Snapshot the predicate before this instruction overwrites its
+            // link destination (which may also be the source register).
+            const auto mips32_link_condition = mips32_regimm_source_value();
             // MIPS HI16/LO16 and other instruction relocations are not
             // currently solved as semantic pairs. Never treat their encoded
             // immediate bits as a complete address; unsupported, incomplete,
@@ -4762,6 +4777,10 @@ RegisterReferenceFacts mips_reference_facts(const Image *image, const Relocation
             if (relocations.overlaps(instruction.address, instruction.length)) {
                 if (mips32) registers.clear(); else erase_written();
                 if (instruction.flow == FlowKind::call) registers.clear();
+                if (mips32)
+                    if (const auto link = reference_detail::mips32_link_value(
+                            *image, instruction, mips32_link_condition))
+                        registers[link->first] = link->second;
                 if (mips64)
                     if (const auto link = reference_detail::mips64_link_value(*image, instruction))
                         registers[link->first] = link->second;
@@ -5774,6 +5793,10 @@ RegisterReferenceFacts mips_reference_facts(const Image *image, const Relocation
             // everything after the callee has run.
             if (instruction.flow == FlowKind::call && !analysis_detail::has_delay_slot(instruction))
                 registers.clear();
+            if (mips32)
+                if (const auto link = reference_detail::mips32_link_value(
+                        *image, instruction, mips32_link_condition))
+                    registers[link->first] = link->second;
             if (mips64)
                 if (const auto link = reference_detail::mips64_link_value(*image, instruction))
                     registers[link->first] = link->second;
