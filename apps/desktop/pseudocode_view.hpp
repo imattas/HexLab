@@ -47,6 +47,7 @@ class PseudocodeView final : public wxPanel {
     std::function<void(const PseudocodeNavigationToken &, Location)> navigate_document;
     std::function<bool(const PseudocodeNavigationToken &, Address)> source_mapping_available;
     std::function<void(const PseudocodeNavigationToken &, Address)> open_source_origin;
+    std::function<void(const PseudocodeNavigationToken &, Address origin, Address function_entry)> inspect_calls;
     std::function<std::optional<wxString>(const wxString &, const wxString &, bool)> prompt;
 
   private:
@@ -63,6 +64,7 @@ class PseudocodeView final : public wxPanel {
     wxButton *previous_stack_access_ = nullptr, *next_stack_access_ = nullptr;
     wxButton *copy_pseudocode_ = nullptr, *copy_excerpt_ = nullptr, *save_pseudocode_ = nullptr;
     wxButton *open_source_origin_ = nullptr;
+    wxButton *inspect_calls_ = nullptr;
     wxButton *source_font_smaller_ = nullptr, *source_font_larger_ = nullptr, *source_font_reset_ = nullptr;
     int source_font_default_size_ = 10;
     wxTextCtrl *find_query_ = nullptr;

@@ -1041,6 +1041,17 @@ PseudocodeView::PseudocodeView(wxWindow *parent) : wxPanel(parent) {
     open_source_origin_->SetName("pseudocode-open-source-origin");
     open_source_origin_->SetToolTip("Open the Source page at the selected pseudocode line's validated instruction origin when a source mapping is available.");
     open_source_origin_->Enable(false);
+    inspect_calls_ = new wxButton(this, wxID_ANY, "Inspect calls...");
+    inspect_calls_->SetName("pseudocode-inspect-calls");
+    inspect_calls_->SetToolTip("Inspect recovered calls and callers of this function, selecting the call at the current instruction origin.");
+    inspect_calls_->Enable(false);
+    inspect_calls_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) {
+        const auto token = current_navigation_token();
+        const auto origin = selected_source_origin();
+        if (token && rendered_function_ && inspect_calls)
+            inspect_calls(*token, origin.value_or(*rendered_function_), *rendered_function_);
+    });
+    font_layout->Add(inspect_calls_, 0, wxLEFT, FromDIP(8));
     variable_status_ = new wxStaticText(this, wxID_ANY, "Select a variable in source or the table",
                                        wxDefaultPosition, wxDefaultSize, wxST_ELLIPSIZE_END);
     variable_status_->SetName("pseudocode-variable-status");
@@ -2575,6 +2586,8 @@ void PseudocodeView::update_variable_actions() {
     const bool source_available = origin && token && source_mapping_available && open_source_origin &&
                                   source_mapping_available(*token, *origin);
     open_source_origin_->Enable(source_available);
+    inspect_calls_->Enable(model_ready_ && rendered_function_.has_value() && current_navigation_token().has_value() &&
+                           static_cast<bool>(inspect_calls));
     copy_pseudocode_->Enable(pseudocode_available);
     save_pseudocode_->Enable(pseudocode_available);
     const bool search_available = pseudocode_available && !find_query_->GetValue().empty();

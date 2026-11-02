@@ -50,6 +50,7 @@ class TypeSymbolsView final : public wxPanel {
                 std::function<void(ProjectCommand)> submit);
     std::function<void(DocumentId, std::shared_ptr<const ProjectSnapshot>, Location)> navigate;
     std::function<void(std::vector<AnalysisIssueDiagnostic>)> diagnostics_changed;
+    void inspect_assignment(Address);
 
   private:
     wxNotebook *pages_ = nullptr;

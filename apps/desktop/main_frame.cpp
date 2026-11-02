@@ -10,6 +10,7 @@
 #include "search_view.hpp"
 #include "graph_view.hpp"
 #include "reference_view.hpp"
+#include "call_site_browser.hpp"
 #include "close_coordinator.hpp"
 #include "project_view.hpp"
 #include "data_views.hpp"
@@ -4439,6 +4440,62 @@ struct MainFrame::Impl {
         if (location == state().selection()) location = reference_origin(*location);
         browse_references(*id, *location, incoming);
     }
+    void inspect_calls(std::optional<Address> origin = {}, std::optional<Address> function_entry = {}) {
+        const auto document = shown;
+        if (!document || !document->project || !document->image || closer->closing_window()) return;
+        auto location = origin ? std::optional<Location>{Location{*origin}} : action_location();
+        if (!location) return;
+        if (!origin) {
+            if (const auto *address = std::get_if<Address>(&*location)) origin = *address;
+            else if (const auto mapped = document->image->to_address(std::get<FileOffset>(*location)); mapped)
+                origin = mapped.value();
+        }
+        if (!origin) { log("Call inspection requires a mapped instruction address."); return; }
+        const auto source_current = [&] {
+            const auto current = state().current();
+            return !closer->closing_window() && current && current->id == document->id &&
+                current->revision == document->revision && current->image == document->image &&
+                controller->documents().active_document() == document->id &&
+                controller->documents().project(document->id) == document->project;
+        };
+        if (!source_current()) return;
+        const auto destination = browse_call_sites(&frame, document->project, *origin, function_entry);
+        if (!destination) return;
+        if (!source_current()) {
+            log("Call navigation canceled because its source document or analysis snapshot changed. Reopen Inspect calls.");
+            return;
+        }
+        if (!navigate_from_document(document, Location{destination->address})) return;
+        switch (destination->destination) {
+        case CallSiteDestination::listing:
+            pages->SetSelection(pages->FindPage(listing)); listing->SetFocus();
+            break;
+        case CallSiteDestination::graph: {
+            auto queued = controller->request_graph(document->id, Location{destination->address}, GraphKind::function_cfg);
+            if (!queued) log(text(queued.error().message));
+            sync(); pages->SetSelection(pages->FindPage(graph)); graph->SetFocus();
+            break;
+        }
+        case CallSiteDestination::pseudocode:
+            frame.docking_.GetPane("pseudocode").Show();
+            document_page_views.insert_or_assign(document->id.value, 3);
+            pseudocode->SetFocus();
+            break;
+        case CallSiteDestination::references:
+            browse_references(document->id, Location{destination->address}, true);
+            break;
+        case CallSiteDestination::call_evidence:
+            browse_references(document->id, Location{destination->address}, false);
+            break;
+        case CallSiteDestination::prototype:
+            frame.docking_.GetPane("metadata").Show();
+            if (auto *notebook = dynamic_cast<wxNotebook *>(type_symbols->GetParent()))
+                notebook->SetSelection(notebook->FindPage(type_symbols));
+            type_symbols->inspect_assignment(destination->address);
+            break;
+        }
+        frame.docking_.Update();
+    }
     void browse_selected_metadata_references(bool imports_table) {
         const auto document = shown;
         if (!document || controller->documents().active_document() != document->id ||
@@ -4765,6 +4822,7 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
     nav->Append(follow_id, "&Follow Target\tEnter");
     nav->Append(incoming_references_id, "Incoming References\tCtrl+Shift+X");
     nav->Append(outgoing_references_id, "Outgoing References\tCtrl+Alt+X");
+    nav->Append(browse_call_sites_id, "Inspect Calls in Function...\tCtrl+Alt+C");
     nav->Append(back_id, "&Back\tAlt+Left");
     nav->Append(forward_id, "&Forward\tAlt+Right");
     nav->Append(browse_navigation_history_id, "Browse History...");
@@ -4895,6 +4953,14 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
         }
         Navigate(location);
         if (impl_->graph && impl_->graph->canvas) impl_->graph->canvas->reveal_selection();
+    };
+    ui.pseudocode->inspect_calls = [this, pseudocode_token_current](
+        const PseudocodeNavigationToken &token, Address origin, Address function_entry) {
+        if (!pseudocode_token_current(token)) {
+            impl_->log("Call inspection canceled because its pseudocode origin is stale.");
+            return;
+        }
+        impl_->inspect_calls(origin, function_entry);
     };
     ui.pseudocode->source_mapping_available = [this, pseudocode_token_current](
         const PseudocodeNavigationToken &token, Address address) {
@@ -6160,6 +6226,7 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
         menu.AppendSeparator();
         menu.Append(function_id, "Define function here");
         menu.Append(chunks_id, "Function chunks...");
+        menu.Append(browse_call_sites_id, "Inspect calls in function...");
         menu.Append(suppress_id, "Toggle function suppression");
         if (position.x == -1 && position.y == -1)
             table->PopupMenu(&menu);
@@ -6412,6 +6479,14 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
     for (int id : navigation_ids)
         Bind(wxEVT_UPDATE_UI, [this](wxUpdateUIEvent &event) { impl_->update_navigation(event); }, id);
     Bind(wxEVT_MENU, [this](wxCommandEvent &) { impl_->jump(); }, jump_id);
+    Bind(wxEVT_MENU, [this](wxCommandEvent &) { impl_->inspect_calls(); }, browse_call_sites_id);
+    Bind(wxEVT_UPDATE_UI, [this](wxUpdateUIEvent &event) {
+        const auto document = impl_->shown;
+        const auto project = document ? document->project : nullptr;
+        event.Enable(project && project->functions && project->derived_key &&
+            project->functions->key == project->derived_key && impl_->action_location().has_value() &&
+            (project->status == DerivedStatus::fresh || project->status == DerivedStatus::incomplete));
+    }, browse_call_sites_id);
     Bind(wxEVT_MENU, [this](wxCommandEvent &) { impl_->jump_open_documents(); }, cross_document_jump_id);
     Bind(wxEVT_MENU, [this](wxCommandEvent &) { impl_->search_project_folder_names(); }, project_folder_name_search_id);
     Bind(wxEVT_MENU, [this](wxCommandEvent &) { impl_->follow(); }, follow_id);

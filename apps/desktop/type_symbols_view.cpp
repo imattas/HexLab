@@ -1721,6 +1721,34 @@ void TypeSymbolsView::copy_selected_pdb_data_symbol() {
                                                        : "Clipboard copy failed");
 }
 
+void TypeSymbolsView::inspect_assignment(Address address) {
+    if (!project_ || !selected_address_ || *selected_address_ != address) return;
+    // An explicit navigation must reveal its assignment even if a saved filter
+    // previously hid it. Ordinary selection synchronization preserves filters.
+    assignment_filter_->SetValue({});
+    pages_->SetSelection(1);
+    if (const auto *assignment = type_assignment(*project_, address)) {
+        const auto type_id = assignment->type_id;
+        for (std::size_t row = 0; row < visible_assignment_indices_.size(); ++row) {
+            const auto &item = project_->state->user->type_assignments[visible_assignment_indices_[row]];
+            if (item.location == Location{address} && item.type_id == assignment->type_id) {
+                assignments_->select_row(row);
+                break;
+            }
+        }
+        if (type_definition(*project_, type_id)) {
+            selected_type_id_ = type_id;
+            type_filter_->ChangeValue({});
+            save_filter_preferences();
+            refresh_types();
+            pages_->SetSelection(0);
+            types_->SetFocus();
+            return;
+        }
+    }
+    assignments_->SetFocus();
+}
+
 void TypeSymbolsView::import_pdb_types() {
     if (!project_ || !submit_ || project_->mode != database::ProjectMode::read_write) return;
     pdb_function_ids_.clear();
