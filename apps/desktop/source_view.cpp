@@ -66,6 +66,7 @@ std::atomic_uint64_t source_temp_serial{0};
 SourceRevisionStamp source_revision_stamp(const std::shared_ptr<const DocumentSnapshot> &document) {
     SourceRevisionStamp stamp;
     if (!document) return stamp;
+    stamp.document_id = document->id.value;
     stamp.document = document->revision;
     if (document->project && document->project->state) {
         const auto &revision = document->project->state->revisions;
@@ -1146,7 +1147,10 @@ SourceView::~SourceView() {
 }
 
 void SourceView::set_document(std::shared_ptr<const DocumentSnapshot> document) {
+    if (source_editing_ && source_edit_stamp_ != source_revision_stamp(document))
+        source_edit_revision_conflict_ = true;
     if (!finish_source_edit()) return;
+    source_edit_revision_conflict_ = false;
     if (source_search_running_) source_search_stop_.request_stop();
     if (source_load_running_) source_load_stop_.request_stop();
     if (source_excerpt_running_) source_excerpt_stop_.request_stop();
@@ -2581,6 +2585,8 @@ void SourceView::poll_full_source_load() {
     }
     if (begin_edit && edit_path) {
         editing_path_ = std::move(*edit_path);
+        source_edit_stamp_ = source_load_stamp_;
+        source_edit_revision_conflict_ = false;
         original_source_bytes_ = std::move(source_load_original_bytes_);
         source_line_endings_crlf_ = std::move(source_load_line_endings_crlf_);
         source_default_crlf_ = source_load_default_crlf_;
@@ -2713,6 +2719,10 @@ void SourceView::begin_source_edit() {
 
 void SourceView::save_source_edit() {
     if (!source_editing_) return;
+    if (source_edit_revision_conflict_ || source_edit_stamp_ != source_revision_stamp(document_)) {
+        status_->SetLabel("Document or project revision changed while editing; edits remain unsaved. Discard them before switching.");
+        return;
+    }
     std::string failure;
     const auto current = read_source(editing_path_, failure);
     if (!failure.empty() || current != original_source_bytes_) {
@@ -2754,6 +2764,8 @@ void SourceView::save_source_edit() {
     original_source_bytes_ = std::move(output);
     source_editing_ = false;
     source_dirty_ = false;
+    source_edit_revision_conflict_ = false;
+    source_edit_stamp_ = {};
     source_->SetEditable(false);
     update_source_edit_controls();
     if (displayed_source_row_) render_source_row(*displayed_source_row_, displayed_context_);
@@ -2767,6 +2779,8 @@ void SourceView::discard_source_edit() {
     const auto decoded = failure.empty() ? decode_source_text(bytes, failure) : std::nullopt;
     source_editing_ = false;
     source_dirty_ = false;
+    source_edit_revision_conflict_ = false;
+    source_edit_stamp_ = {};
     source_->SetEditable(false);
     update_source_edit_controls();
     if (decoded && displayed_source_row_)

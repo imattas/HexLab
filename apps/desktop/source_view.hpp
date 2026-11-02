@@ -26,7 +26,7 @@ namespace hexlab::desktop {
 class VirtualTable;
 struct SourceScanCheckpoint;
 struct SourceRevisionStamp {
-    std::uint64_t document = 0;
+    std::uint64_t document_id = 0, document = 0;
     std::uint64_t project_edit = 0, project_bytes = 0, project_decisions = 0;
     bool has_project = false;
     bool operator==(const SourceRevisionStamp &) const = default;
@@ -203,6 +203,8 @@ class SourceView final : public wxPanel {
     bool updating_ = false;
     bool source_editing_ = false;
     bool source_dirty_ = false;
+    bool source_edit_revision_conflict_ = false;
+    SourceRevisionStamp source_edit_stamp_;
     bool source_full_file_available_ = false;
     bool source_search_available_ = false;
     bool source_utf8_bom_ = false;

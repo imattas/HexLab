@@ -84,6 +84,10 @@ dominant original style, with LF on a tie. Inserting or deleting lines shifts
 text relative to this positional rule; line-ending identity is not matched by
 text content. Malformed UTF-8 or UTF-16
 remains view-only. The 64 MiB limit applies to the encoded file after editing.
+The edit session is pinned to the document ID and document/project revisions
+captured by its full-file load. If the active document or a project revision
+changes before save, HexLab refuses the write and keeps the unsaved buffer open;
+discard the edits before switching to the newer snapshot.
 **Save** writes through a temporary sibling file and atomically replaces the selected local
 file. The replacement retains Windows file
 ACLs through `ReplaceFile`; on POSIX it preserves owner, group, and mode, and
