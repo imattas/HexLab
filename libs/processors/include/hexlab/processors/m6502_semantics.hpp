@@ -2,6 +2,7 @@
 
 #include "hexlab/processors/instruction.hpp"
 #include "hexlab/processors/processors_export.hpp"
+#include <array>
 #include <cstdint>
 #include <optional>
 
@@ -291,6 +292,29 @@ HEXLAB_PROCESSORS_EXPORT std::optional<bool>
 evaluate_m6502_branch(Opcode opcode, std::uint8_t status) noexcept;
 HEXLAB_PROCESSORS_EXPORT std::optional<bool>
 evaluate_m6502_branch_instruction(const Instruction &instruction, std::uint8_t status) noexcept;
+
+enum class M6502BusAccessKind : std::uint8_t { opcode_fetch, operand_fetch, dummy_read };
+struct M6502BusAccess {
+    std::uint16_t address = 0;
+    M6502BusAccessKind kind = M6502BusAccessKind::opcode_fetch;
+    std::uint8_t cycle = 0;
+    bool operator==(const M6502BusAccess &) const = default;
+};
+struct M6502BranchBusTrace {
+    std::array<M6502BusAccess, 4> accesses{};
+    std::uint8_t access_count = 0;
+    std::uint16_t next_program_counter = 0;
+    bool branch_taken = false;
+    bool page_crossed = false;
+    bool operator==(const M6502BranchBusTrace &) const = default;
+};
+// Describe the NMOS branch's opcode/offset fetches and conditional dummy reads.
+// A taken branch reads PC+2; a page-crossing branch also reads the intermediate
+// address with the old high byte and target low byte. This is an address trace,
+// not a memory model or pin-level trace. Only a validated NMOS BPL/BMI/BVC/BVS/
+// BCC/BCS/BNE/BEQ instruction and known incoming status are accepted.
+HEXLAB_PROCESSORS_EXPORT std::optional<M6502BranchBusTrace>
+trace_m6502_branch_bus(const Instruction &instruction, std::uint8_t status) noexcept;
 
 // Evaluate a W65C02 BBR/BBS branch from its zero-page byte. `bit` is the
 // decoded bit number (0-7); the result is only the branch decision.

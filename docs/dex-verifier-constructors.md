@@ -11,10 +11,12 @@ An ordinary method call naming `<init>` must use `invoke-direct` or
 decoder's two one-receiver optimized `0xf0` initializer encodings. Its known
 receiver must be an uninitialized object. Null, scalar, conflicting, and already initialized
 receivers are rejected. The existing bounded reference-assignability walk checks
-the receiver against the method owner and rejects proven contradictions. Missing
-external hierarchy facts stay unresolved. The verifier permits compatible
-ancestor constructor owners rather than requiring an exact allocation class or
-immediate superclass match.
+the receiver against the method owner and rejects proven contradictions. A
+tracked `new-instance` value must invoke the constructor declared by its exact
+allocated class; an ancestor constructor cannot initialize a different
+allocation type. Incoming uninitialized `this` retains the bounded
+ancestor-owner check for constructor chaining. Missing external hierarchy facts
+stay unresolved.
 
 After argument checks succeed, the normal outgoing state initializes every
 register alias of that allocation, retaining its concrete type descriptor. Two

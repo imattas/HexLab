@@ -826,6 +826,53 @@ Result<Arm32StepDestination> arm32_thumb2_ldr_reg_pc_destination(HANDLE process,
     return Arm32StepDestination{target, thumb};
 }
 
+Result<Arm32StepDestination> arm32_thumb2_ldr_imm_pc_destination(HANDLE process,
+    std::uint16_t first, std::uint16_t second, DWORD pc, DWORD cpsr,
+    const std::array<DWORD, 16>& registers, std::uint8_t it_state) {
+    // LDR (immediate) T3: nonnegative imm12, offset addressing, no writeback.
+    // Rn=PC is the literal encoding and is deliberately left to a separate
+    // PC-relative decoder rather than treating the stored PC as a register.
+    const auto base_register = static_cast<unsigned>(first & 15u);
+    const auto destination_register = static_cast<unsigned>(second >> 12);
+    const auto offset = static_cast<std::uint64_t>(second & 0x0fffu);
+    if ((first & 0xfff0u) != 0xf8d0u || base_register == 15 || destination_register != 15 ||
+        (cpsr & (1u << 9)))
+        return Error{ErrorCode::unsupported,
+            "Thumb-2 PC load requires non-PC-base LDR immediate T3 with little-endian data"};
+    if (it_state != 0 && (it_state & 7u) != 0)
+        return Error{ErrorCode::unsupported, "Thumb-2 PC load is only stepped in the final IT slot"};
+    if (it_state != 0 && !arm32_condition_passed(it_state >> 4, cpsr))
+        return Arm32StepDestination{static_cast<DWORD>(pc + 4u), true};
+
+    const auto base = static_cast<std::uint64_t>(registers[base_register]);
+    if (base > UINT32_MAX || offset > UINT32_MAX - base)
+        return Error{ErrorCode::invalid_argument, "Thumb-2 PC-load effective address exceeds the address space"};
+    const auto memory_address = base + offset;
+    if ((memory_address & 3u) != 0 || memory_address > UINT32_MAX - 3u)
+        return Error{ErrorCode::invalid_argument, "Thumb-2 PC-load word address is unaligned or exceeds the address space"};
+
+    std::array<std::byte, 4> bytes{};
+    SIZE_T read = 0;
+    if (!ReadProcessMemory(process, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(memory_address)),
+                           bytes.data(), bytes.size(), &read) || read != bytes.size())
+        return win_error("ReadProcessMemory for Thumb-2 immediate PC load");
+    const auto loaded = std::to_integer<std::uint32_t>(bytes[0]) |
+        (std::to_integer<std::uint32_t>(bytes[1]) << 8) |
+        (std::to_integer<std::uint32_t>(bytes[2]) << 16) |
+        (std::to_integer<std::uint32_t>(bytes[3]) << 24);
+    const bool thumb = (loaded & 1u) != 0;
+    if (!thumb && (loaded & 3u) != 0)
+        return Error{ErrorCode::invalid_argument, "Thumb-2 PC load produced an unaligned ARM-state target"};
+    const auto target = loaded & (thumb ? ~std::uint32_t{1} : ~std::uint32_t{3});
+    const auto trap_end = static_cast<std::uint64_t>(target) + (thumb ? 2u : 4u);
+    const auto transfer_end = memory_address + 4u;
+    if ((target < transfer_end && memory_address < trap_end) ||
+        (target < static_cast<std::uint64_t>(pc) + 4u && pc < trap_end))
+        return Error{ErrorCode::unsupported,
+            "Thumb-2 PC-load successor trap overlaps its instruction or transfer word"};
+    return Arm32StepDestination{target, thumb};
+}
+
 std::int64_t arm32_sign_extend(std::uint32_t value, unsigned bits) {
     const auto sign = std::uint32_t{1} << (bits - 1);
     return (value & sign) ? static_cast<std::int64_t>(value) - (std::int64_t{1} << bits)
@@ -2944,7 +2991,13 @@ private:
                 (std::to_integer<unsigned>(instruction[1]) << 8));
             const auto second = static_cast<std::uint16_t>(std::to_integer<unsigned>(instruction[2]) |
                 (std::to_integer<unsigned>(instruction[3]) << 8));
-            if ((first & 0xfff0u) == 0xf850u && (second >> 12) == 15u) {
+            if ((first & 0xfff0u) == 0xf8d0u && (second >> 12) == 15u) {
+                pc_relative_load = true;
+                auto destination = arm32_thumb2_ldr_imm_pc_destination(process_, first, second,
+                    static_cast<DWORD>(pc), context.Cpsr, registers, it_state);
+                if (!destination) { CloseHandle(thread); return destination.error(); }
+                branch = destination.value();
+            } else if ((first & 0xfff0u) == 0xf850u && (second >> 12) == 15u) {
                 pc_relative_load = true;
                 auto destination = arm32_thumb2_ldr_reg_pc_destination(process_, first, second,
                     static_cast<DWORD>(pc), context.Cpsr, registers, it_state);

@@ -2335,6 +2335,11 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
                                     const bool uninitialized = before[receiver_reg] == RegType::uninitialized_reference;
                                     if (calls_constructor && before[receiver_reg] != RegType::unknown && !uninitialized)
                                         return initialization_error("DEX constructor receiver is already initialized or is not an object");
+                                    if (calls_constructor && uninitialized && receiver_owner &&
+                                        before.allocations[receiver_reg] != uninitialized_this &&
+                                        before.references[receiver_reg] != *receiver_owner)
+                                        return initialization_error(
+                                            "DEX allocated object must be initialized by its exact class constructor");
                                     if (!(calls_constructor && uninitialized) &&
                                         !expect_type(receiver_reg, RegType::reference))
                                         return Error{ErrorCode::malformed, "DEX invoke receiver is not a reference"};

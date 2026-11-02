@@ -118,8 +118,14 @@ Thumb-2 `LDR (register)` T2 to PC is followed with its non-PC base and index,
 positive offset, and encoded `LSL #0..3` scale. It has no writeback; an active
 IT block must be in its last slot, and a false IT predicate takes the next
 instruction without reading memory. The transfer word must be aligned, and
-the loaded value selects ARM or Thumb state. Other Thumb-2 memory-to-PC forms
-remain unsupported.
+the loaded value selects ARM or Thumb state. The no-writeback `LDR (immediate)`
+T3 form is also followed for a non-PC base and nonnegative `imm12`; it applies the
+same final-IT-slot and false-predicate rules, checks the computed word address,
+and rejects a successor trap that would overlap the instruction or loaded
+word. The target executes the original load after the temporary trap is
+installed. Literal-PC and T4 pre/post-indexed or negative-offset loads remain
+unsupported. Encoding, IT constraints and PC interworking follow the
+[Armv7-A/R LDR immediate definitions](https://documentation-service.arm.com/static/5f8daeb7f86e16515cdb8c4e).
 The A32 LDM addition passed a Windows x64 Debug debugger build and an ARMv7
 Windows clang-cl syntax check against the installed MSVC/Windows SDK headers;
 native ARM32 linking and runtime stepping remain unverified. The context

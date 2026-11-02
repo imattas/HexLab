@@ -65,7 +65,11 @@ The partitioner recognizes three bounded forms:
   the full target domain because they do not form one precise unsigned interval.
   AArch64 `uxtw`, `sxtw`, and `sxtx` indices use their architectural zero- or
   sign-extension before checked scale/shift and displacement arithmetic. The
-  final byte range must fit the checked signed offset bounds.
+  final byte range must fit the checked signed offset bounds. Pointer arithmetic
+  also interprets bounded two's-complement offset ranges as signed displacements,
+  including negative ranges produced by sign extension. A range crossing its
+  sign bit widens to the full signed domain before the existing checked offset
+  bound is applied.
   The access also needs a bounded byte width. Ranges sharing the same root
   register version and overlapping offsets
   are grouped together. Call results and call-clobbered register
@@ -112,7 +116,7 @@ This does not partition heap or global accesses whose address cannot be proven,
 aliases reached through unrelated roots as disjoint, variable indices without
 a supported bounded interval, unsupported index extensions, or pointer
 arithmetic whose offset is neither a proven constant nor a supported bounded
-nonnegative integer interval. Bitwise and shift constant expressions are evaluated at their
+integer interval. Bitwise and shift constant expressions are evaluated at their
 declared width; shifts require a proven count below the width, while add/sub/mul
 still require no intermediate wrap. Bounded unsigned index intervals also
 propagate through constant-count shifts when the result remains ordered without

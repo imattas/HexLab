@@ -783,6 +783,72 @@ evaluate_m6502_branch_instruction(const Instruction &instruction, std::uint8_t s
     return evaluate_m6502_branch(instruction.opcode, status);
 }
 
+std::optional<M6502BranchBusTrace>
+trace_m6502_branch_bus(const Instruction &instruction, std::uint8_t status) noexcept {
+    if (instruction.context.architecture != Architecture::mos6502 ||
+        instruction.context.mode != ExecutionMode::m6502 ||
+        instruction.address.offset > UINT16_MAX || instruction.length != 2 || instruction.bytes.size() < 2 ||
+        instruction.flow != FlowKind::conditional_branch || instruction.operands.size() != 1 ||
+        instruction.access.size() != 1 || instruction.access[0] != OperandAccess::address ||
+        instruction.memory_read || instruction.memory_write || !instruction.direct_target ||
+        instruction.direct_target->space != instruction.address.space ||
+        instruction.direct_target->offset > UINT16_MAX || !instruction.m6502_timing)
+        return {};
+
+    std::uint8_t expected_opcode = 0;
+    switch (instruction.opcode) {
+    case Opcode::m6502_bpl: expected_opcode = 0x10; break;
+    case Opcode::m6502_bmi: expected_opcode = 0x30; break;
+    case Opcode::m6502_bvc: expected_opcode = 0x50; break;
+    case Opcode::m6502_bvs: expected_opcode = 0x70; break;
+    case Opcode::m6502_bcc: expected_opcode = 0x90; break;
+    case Opcode::m6502_bcs: expected_opcode = 0xb0; break;
+    case Opcode::m6502_bne: expected_opcode = 0xd0; break;
+    case Opcode::m6502_beq: expected_opcode = 0xf0; break;
+    default: return {};
+    }
+    const auto *relative = std::get_if<RelativeOperand>(&instruction.operands[0]);
+    const auto &timing = *instruction.m6502_timing;
+    const auto pc = static_cast<std::uint16_t>(instruction.address.offset);
+    const auto sequential = static_cast<std::uint16_t>(pc + 2u);
+    const auto displacement = static_cast<std::int8_t>(std::to_integer<std::uint8_t>(instruction.bytes[1]));
+    const auto expected_target = static_cast<std::uint16_t>(sequential + displacement);
+    if (std::to_integer<std::uint8_t>(instruction.bytes[0]) != expected_opcode || !relative ||
+        relative->encoded_width != 8 || relative->effective_width != 16 ||
+        relative->displacement != displacement || relative->encoding != EncodedField{1, 1} ||
+        *instruction.direct_target != Address{instruction.address.space, expected_target} ||
+        timing.base_cycles != 2 || timing.page_cross_penalty || !timing.branch_taken_penalty ||
+        !timing.branch_page_cross_penalty || timing.decimal_mode_penalty)
+        return {};
+
+    const RegisterOperand processor_status{RegisterBank::mos6502, 3, 8, false};
+    if (instruction.register_reads.size() != 1 || instruction.register_reads[0] != processor_status ||
+        !instruction.register_writes.empty())
+        return {};
+    const auto taken = evaluate_m6502_branch(instruction.opcode, status);
+    if (!taken) return {};
+
+    M6502BranchBusTrace trace;
+    const auto append = [&](std::uint16_t address, M6502BusAccessKind kind) {
+        const auto cycle = static_cast<std::uint8_t>(trace.access_count + 1u);
+        trace.accesses[trace.access_count++] = M6502BusAccess{address, kind, cycle};
+    };
+    append(pc, M6502BusAccessKind::opcode_fetch);
+    append(static_cast<std::uint16_t>(pc + 1u), M6502BusAccessKind::operand_fetch);
+    trace.branch_taken = *taken;
+    trace.next_program_counter = *taken ? expected_target : sequential;
+    if (*taken) {
+        append(sequential, M6502BusAccessKind::dummy_read);
+        trace.page_crossed = (sequential & 0xff00u) != (expected_target & 0xff00u);
+        if (trace.page_crossed) {
+            const auto intermediate = static_cast<std::uint16_t>(
+                (sequential & 0xff00u) | (expected_target & 0x00ffu));
+            append(intermediate, M6502BusAccessKind::dummy_read);
+        }
+    }
+    return trace;
+}
+
 std::optional<bool>
 evaluate_m65c02_bit_branch(Opcode opcode, std::uint8_t bit, std::uint8_t value) noexcept {
     if (bit > 7 || (opcode != Opcode::m65c02_bbr && opcode != Opcode::m65c02_bbs))

@@ -36,6 +36,7 @@ using PointerValueKey = std::pair<Key, std::uint32_t>;
 using PointerOrigins = std::map<PointerValueKey, PointerOrigin>;
 using IntegerConstants = std::map<PointerValueKey, std::uint64_t>;
 using IntegerRange = std::pair<std::uint64_t, std::uint64_t>;
+using SignedIntegerRange = std::pair<std::int64_t, std::int64_t>;
 using IntegerRanges = std::map<PointerValueKey, IntegerRange>;
 using FlatAddressRootKey = std::pair<unsigned, unsigned>;
 using FlatAddressRoots = std::map<FlatAddressRootKey, PointerRoot>;
@@ -53,6 +54,9 @@ std::optional<std::uint64_t> integer_constant(const ExpressionPtr &expression,
 std::optional<IntegerRange> integer_range(const ExpressionPtr &expression,
                                           const IntegerConstants &constants,
                                           const IntegerRanges &ranges);
+std::optional<SignedIntegerRange> signed_integer_range(const ExpressionPtr &expression,
+                                                       const IntegerConstants &constants,
+                                                       const IntegerRanges &ranges);
 
 std::optional<PointerOrigin> pointer_origin(const ExpressionPtr &expression, const PointerOrigins &origins,
                                             const IntegerConstants &constants,
@@ -69,20 +73,20 @@ std::optional<PointerOrigin> pointer_origin(const ExpressionPtr &expression, con
         binary->left->type.bits != expression->type.bits || binary->right->type.bits != expression->type.bits)
         return {};
     auto origin = pointer_origin(binary->left, origins, constants, integer_ranges);
-    auto offset_range = integer_range(binary->right, constants, integer_ranges);
+    auto offset_range = signed_integer_range(binary->right, constants, integer_ranges);
     if (!origin || !offset_range) {
         if (binary->operation != "add") return {};
         origin = pointer_origin(binary->right, origins, constants, integer_ranges);
-        offset_range = integer_range(binary->left, constants, integer_ranges);
+        offset_range = signed_integer_range(binary->left, constants, integer_ranges);
     }
     if (!origin || !offset_range || offset_range->first > offset_range->second ||
-        std::get<2>(origin->root.first) != expression->type.bits ||
-        offset_range->second > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) return {};
-    auto delta_min = static_cast<std::int64_t>(offset_range->first);
-    auto delta_max = static_cast<std::int64_t>(offset_range->second);
+        std::get<2>(origin->root.first) != expression->type.bits) return {};
+    auto delta_min = offset_range->first;
+    auto delta_max = offset_range->second;
     if (binary->operation == "sub") {
-        delta_min = -static_cast<std::int64_t>(offset_range->second);
-        delta_max = -static_cast<std::int64_t>(offset_range->first);
+        if (offset_range->first == std::numeric_limits<std::int64_t>::min()) return {};
+        delta_min = -offset_range->second;
+        delta_max = -offset_range->first;
     }
     const auto min_offset = add_signed(origin->min_offset, delta_min);
     const auto max_offset = add_signed(origin->max_offset, delta_max);
@@ -312,6 +316,32 @@ std::optional<IntegerRange> integer_range(const ExpressionPtr &expression,
                                           const IntegerRanges &ranges) {
     std::size_t remaining_nodes = 1024;
     return integer_range_impl(expression, constants, ranges, 0, remaining_nodes);
+}
+
+std::optional<SignedIntegerRange> signed_integer_range(const ExpressionPtr &expression,
+                                                       const IntegerConstants &constants,
+                                                       const IntegerRanges &ranges) {
+    if (!expression || !expression->type.bits || expression->type.bits > 64) return {};
+    const auto range = integer_range(expression, constants, ranges);
+    if (!range || range->first > range->second) return {};
+    const auto width = expression->type.bits;
+    const auto sign = std::uint64_t{1} << (width - 1);
+    if (range->second < sign)
+        return SignedIntegerRange{static_cast<std::int64_t>(range->first),
+                                  static_cast<std::int64_t>(range->second)};
+    if (range->first >= sign) {
+        if (width == 64)
+            return SignedIntegerRange{std::bit_cast<std::int64_t>(range->first),
+                                      std::bit_cast<std::int64_t>(range->second)};
+        const auto modulus = std::uint64_t{1} << width;
+        return SignedIntegerRange{-static_cast<std::int64_t>(modulus - range->first),
+                                  -static_cast<std::int64_t>(modulus - range->second)};
+    }
+    if (width == 64)
+        return SignedIntegerRange{std::numeric_limits<std::int64_t>::min(),
+                                  std::numeric_limits<std::int64_t>::max()};
+    return SignedIntegerRange{-static_cast<std::int64_t>(sign),
+                              static_cast<std::int64_t>(sign - 1)};
 }
 
 std::optional<std::int64_t> flat_address_constant(PointerValueKey value,
