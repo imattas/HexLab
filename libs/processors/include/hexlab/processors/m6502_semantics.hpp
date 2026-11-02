@@ -303,14 +303,38 @@ HEXLAB_PROCESSORS_EXPORT std::optional<bool>
 evaluate_m6502_branch_instruction(const Instruction &instruction, std::uint8_t status) noexcept;
 
 enum class M6502BusAccessKind : std::uint8_t {
-    opcode_fetch, operand_fetch, dummy_read, stack_read, stack_write, vector_read
+    opcode_fetch, operand_fetch, dummy_read, stack_read, stack_write, vector_read,
+    data_read, data_write, dummy_write
 };
 struct M6502BusAccess {
     std::uint16_t address = 0;
     M6502BusAccessKind kind = M6502BusAccessKind::opcode_fetch;
     std::uint8_t cycle = 0;
+    std::optional<std::uint8_t> value;
     bool operator==(const M6502BusAccess &) const = default;
 };
+
+// Caller-supplied state for ordinary byte-memory instruction traces. Pointer
+// bytes are used by indexed-indirect/indirect-indexed and CMOS (zp) forms.
+struct M6502MemoryBusInputs {
+    std::uint8_t accumulator = 0, x = 0, y = 0, status = 0;
+    std::uint8_t memory_value = 0;
+    std::optional<std::uint8_t> pointer_low, pointer_high;
+};
+struct M6502MemoryBusTrace {
+    std::array<M6502BusAccess, 8> accesses{};
+    std::uint8_t access_count = 0;
+    std::uint16_t effective_address = 0, next_program_counter = 0;
+    std::optional<std::uint8_t> result_value;
+    bool page_crossed = false;
+    bool operator==(const M6502MemoryBusTrace &) const = default;
+};
+// Trace validated documented NMOS/65C02 byte loads, stores, ALU/compare, and
+// memory INC/DEC. The caller supplies the value read from the final effective
+// address (and pointer bytes where needed); no memory or pin model is implied.
+HEXLAB_PROCESSORS_EXPORT std::optional<M6502MemoryBusTrace>
+trace_m6502_memory_bus(const Instruction &instruction,
+                       const M6502MemoryBusInputs &inputs) noexcept;
 struct M6502InterruptBusTrace {
     std::array<M6502BusAccess, 7> accesses{};
     std::uint8_t access_count = 0;

@@ -5,6 +5,174 @@
 
 namespace hexlab {
 
+std::optional<M6502MemoryBusTrace>
+trace_m6502_memory_bus(const Instruction &instruction,
+                       const M6502MemoryBusInputs &inputs) noexcept {
+    if (instruction.context.architecture != Architecture::mos6502 ||
+        (instruction.context.mode != ExecutionMode::m6502 && instruction.context.mode != ExecutionMode::m65c02) ||
+        instruction.address.offset > UINT16_MAX || instruction.length < 1 || instruction.length > 3 ||
+        instruction.bytes.size() < instruction.length || instruction.flow != FlowKind::fallthrough ||
+        instruction.operands.size() != 1 || instruction.access.size() != 1 || !instruction.m6502_timing ||
+        instruction.direct_target) return {};
+    const auto *memory = std::get_if<MemoryOperand>(&instruction.operands[0]);
+    const auto *immediate = std::get_if<ImmediateOperand>(&instruction.operands[0]);
+    const auto byte = [&](std::size_t n) { return std::to_integer<std::uint8_t>(instruction.bytes[n]); };
+    const auto opcode_byte = byte(0);
+    const bool cmos = instruction.context.mode == ExecutionMode::m65c02;
+    const bool store = instruction.opcode == Opcode::m6502_sta || instruction.opcode == Opcode::m6502_stx ||
+                       instruction.opcode == Opcode::m6502_sty || (cmos && instruction.opcode == Opcode::m65c02_stz);
+    const bool rmw = instruction.opcode == Opcode::m6502_inc || instruction.opcode == Opcode::m6502_dec;
+    const bool read = instruction.opcode == Opcode::m6502_lda || instruction.opcode == Opcode::m6502_ldx ||
+        instruction.opcode == Opcode::m6502_ldy || instruction.opcode == Opcode::m6502_adc ||
+        instruction.opcode == Opcode::m6502_sbc || instruction.opcode == Opcode::m6502_and ||
+        instruction.opcode == Opcode::m6502_ora || instruction.opcode == Opcode::m6502_eor ||
+        instruction.opcode == Opcode::m6502_cmp || instruction.opcode == Opcode::m6502_cpx ||
+        instruction.opcode == Opcode::m6502_cpy || instruction.opcode == Opcode::m6502_bit;
+    if (cmos && instruction.m6502_timing && instruction.m6502_timing->decimal_mode_penalty &&
+        (inputs.status & 0x08u) != 0) return {}; // The extra decimal-mode bus address is not asserted here.
+    if (!(store || rmw || read) || instruction.access[0] != (store ? OperandAccess::write :
+        rmw ? OperandAccess::read_write : OperandAccess::read) ||
+        (store && !instruction.memory_write) ||
+        (read && (instruction.memory_write || (immediate ? instruction.memory_read : !instruction.memory_read))) ||
+        (rmw && (!instruction.memory_write || !instruction.memory_read))) return {};
+    const auto opcode_matches = [&] {
+        switch (instruction.opcode) {
+        case Opcode::m6502_lda: return opcode_byte==0xa9||opcode_byte==0xa5||opcode_byte==0xb5||opcode_byte==0xad||opcode_byte==0xbd||opcode_byte==0xb9||opcode_byte==0xa1||opcode_byte==0xb1||(cmos&&opcode_byte==0xb2);
+        case Opcode::m6502_ldx: return opcode_byte==0xa2||opcode_byte==0xa6||opcode_byte==0xb6||opcode_byte==0xae||opcode_byte==0xbe;
+        case Opcode::m6502_ldy: return opcode_byte==0xa0||opcode_byte==0xa4||opcode_byte==0xb4||opcode_byte==0xac||opcode_byte==0xbc;
+        case Opcode::m6502_sta: return opcode_byte==0x85||opcode_byte==0x95||opcode_byte==0x8d||opcode_byte==0x9d||opcode_byte==0x99||opcode_byte==0x81||opcode_byte==0x91||(cmos&&opcode_byte==0x92);
+        case Opcode::m6502_stx: return opcode_byte==0x86||opcode_byte==0x96||opcode_byte==0x8e;
+        case Opcode::m6502_sty: return opcode_byte==0x84||opcode_byte==0x94||opcode_byte==0x8c;
+        case Opcode::m65c02_stz: return cmos&&(opcode_byte==0x64||opcode_byte==0x74||opcode_byte==0x9c||opcode_byte==0x9e);
+        case Opcode::m6502_adc: return opcode_byte==0x69||opcode_byte==0x65||opcode_byte==0x75||opcode_byte==0x6d||opcode_byte==0x7d||opcode_byte==0x79||opcode_byte==0x61||opcode_byte==0x71||(cmos&&opcode_byte==0x72);
+        case Opcode::m6502_sbc: return opcode_byte==0xe9||opcode_byte==0xe5||opcode_byte==0xf5||opcode_byte==0xed||opcode_byte==0xfd||opcode_byte==0xf9||opcode_byte==0xe1||opcode_byte==0xf1||(cmos&&opcode_byte==0xf2);
+        case Opcode::m6502_and: return opcode_byte==0x29||opcode_byte==0x25||opcode_byte==0x35||opcode_byte==0x2d||opcode_byte==0x3d||opcode_byte==0x39||opcode_byte==0x21||opcode_byte==0x31||(cmos&&opcode_byte==0x32);
+        case Opcode::m6502_ora: return opcode_byte==0x09||opcode_byte==0x05||opcode_byte==0x15||opcode_byte==0x0d||opcode_byte==0x1d||opcode_byte==0x19||opcode_byte==0x01||opcode_byte==0x11||(cmos&&opcode_byte==0x12);
+        case Opcode::m6502_eor: return opcode_byte==0x49||opcode_byte==0x45||opcode_byte==0x55||opcode_byte==0x4d||opcode_byte==0x5d||opcode_byte==0x59||opcode_byte==0x41||opcode_byte==0x51||(cmos&&opcode_byte==0x52);
+        case Opcode::m6502_cmp: return opcode_byte==0xc9||opcode_byte==0xc5||opcode_byte==0xd5||opcode_byte==0xcd||opcode_byte==0xdd||opcode_byte==0xd9||opcode_byte==0xc1||opcode_byte==0xd1||(cmos&&opcode_byte==0xd2);
+        case Opcode::m6502_cpx: return opcode_byte==0xe0||opcode_byte==0xe4||opcode_byte==0xec;
+        case Opcode::m6502_cpy: return opcode_byte==0xc0||opcode_byte==0xc4||opcode_byte==0xcc;
+        case Opcode::m6502_bit: return (cmos&&opcode_byte==0x89)||opcode_byte==0x24||opcode_byte==0x2c||(cmos&&(opcode_byte==0x34||opcode_byte==0x3c));
+        case Opcode::m6502_inc: return opcode_byte==0xe6||opcode_byte==0xf6||opcode_byte==0xee||opcode_byte==0xfe;
+        case Opcode::m6502_dec: return opcode_byte==0xc6||opcode_byte==0xd6||opcode_byte==0xce||opcode_byte==0xde;
+        default: return false;
+        }
+    };
+    if (!opcode_matches()) return {};
+
+    enum class Mode { imm, zp, zpx, zpy, abs, absx, absy, indx, indy, zpind };
+    Mode mode{};
+    std::uint16_t base = 0;
+    if (immediate) {
+        if (!read || instruction.length != 2 || immediate->effective_width != 8 ||
+            immediate->value != byte(1) || instruction.m6502_timing->base_cycles != 2) return {};
+        mode = Mode::imm;
+    } else if (memory && memory->data_width == 8 && memory->address_width == 16 && instruction.length >= 2 &&
+               !memory->ip_relative && !memory->base && !memory->segment && !memory->writeback && !memory->post_index) {
+        base = static_cast<std::uint16_t>(memory->displacement);
+        if (instruction.length == 2) {
+            if (opcode_byte == 0x01 || opcode_byte == 0x21 || opcode_byte == 0x41 || opcode_byte == 0x61 ||
+                opcode_byte == 0x81 || opcode_byte == 0xa1 || opcode_byte == 0xc1 || opcode_byte == 0xe1) mode = Mode::indx;
+            else if ((opcode_byte & 0x1fu) == 0x11u) mode = Mode::indy;
+            else if ((opcode_byte & 0x1fu) == 0x12u && cmos) mode = Mode::zpind;
+            else if (memory->index) {
+                if (memory->index->index == 1) mode = Mode::zpx;
+                else if (memory->index->index == 2) mode = Mode::zpy;
+                else return {};
+            } else mode = Mode::zp;
+            if (base > 0xff) return {};
+        } else {
+            if (memory->index) {
+                if (memory->index->index == 1) mode = Mode::absx;
+                else if (memory->index->index == 2) mode = Mode::absy;
+                else return {};
+            } else mode = Mode::abs;
+        }
+        const auto encoded_base = instruction.length == 2 ? std::uint16_t(byte(1)) :
+            static_cast<std::uint16_t>(byte(1) | (std::uint16_t(byte(2)) << 8));
+        if (base != encoded_base) return {};
+    } else return {};
+
+    const bool pointer_mode = mode == Mode::indx || mode == Mode::indy || mode == Mode::zpind;
+    if (store && instruction.memory_read != pointer_mode) return {};
+
+    M6502MemoryBusTrace trace;
+    const auto pc = static_cast<std::uint16_t>(instruction.address.offset);
+    trace.next_program_counter = static_cast<std::uint16_t>(pc + instruction.length);
+    const auto append = [&](std::uint16_t address, M6502BusAccessKind kind, std::optional<std::uint8_t> value = {}) {
+        if (trace.access_count >= trace.accesses.size()) return false;
+        trace.accesses[trace.access_count] = {address, kind, static_cast<std::uint8_t>(trace.access_count + 1), value};
+        ++trace.access_count;
+        return true;
+    };
+    append(pc, M6502BusAccessKind::opcode_fetch, opcode_byte);
+    if (instruction.length > 1) append(static_cast<std::uint16_t>(pc + 1), M6502BusAccessKind::operand_fetch, byte(1));
+    if (instruction.length > 2) append(static_cast<std::uint16_t>(pc + 2), M6502BusAccessKind::operand_fetch, byte(2));
+    if (mode == Mode::imm) {
+        trace.effective_address = static_cast<std::uint16_t>(pc + 1);
+        trace.result_value = static_cast<std::uint8_t>(immediate->value);
+        return trace;
+    }
+    std::uint16_t effective = base;
+    const bool indexed_indirect = mode == Mode::indx;
+    const bool indirect_y = mode == Mode::indy;
+    const bool indirect_zp = mode == Mode::zpind;
+    if (indexed_indirect || indirect_y || indirect_zp) {
+        const auto slot = static_cast<std::uint8_t>(indexed_indirect ? base + inputs.x : base);
+        if (indexed_indirect) append(static_cast<std::uint16_t>(0x0000u | static_cast<std::uint8_t>(base)), M6502BusAccessKind::dummy_read);
+        if (!inputs.pointer_low || !inputs.pointer_high) return {};
+        append(slot, M6502BusAccessKind::data_read, inputs.pointer_low);
+        append(static_cast<std::uint8_t>(slot + 1u), M6502BusAccessKind::data_read, inputs.pointer_high);
+        effective = static_cast<std::uint16_t>(*inputs.pointer_low | (std::uint16_t(*inputs.pointer_high) << 8));
+        if (indirect_y) effective = static_cast<std::uint16_t>(effective + inputs.y);
+    } else if (mode == Mode::zpx) effective = static_cast<std::uint8_t>(base + inputs.x);
+    else if (mode == Mode::zpy) effective = static_cast<std::uint8_t>(base + inputs.y);
+    else if (mode == Mode::absx) effective = static_cast<std::uint16_t>(base + inputs.x);
+    else if (mode == Mode::absy) effective = static_cast<std::uint16_t>(base + inputs.y);
+    const auto original_base = (indexed_indirect || indirect_y || indirect_zp) ?
+        static_cast<std::uint16_t>(effective - (indirect_y ? inputs.y : 0)) : base;
+    trace.effective_address = effective;
+    trace.page_crossed = (original_base & 0xff00u) != (effective & 0xff00u);
+    const bool indexed = mode == Mode::zpx || mode == Mode::zpy || mode == Mode::absx || mode == Mode::absy || indirect_y;
+    const bool absolute_index = mode == Mode::absx || mode == Mode::absy;
+    const auto wrong_page = static_cast<std::uint16_t>((original_base & 0xff00u) | (effective & 0xffu));
+    const auto indexed_dummy_address = cmos ? static_cast<std::uint16_t>(pc + instruction.length - 1u) : wrong_page;
+    if (rmw) {
+        if (mode == Mode::zpx || mode == Mode::zpy) append(base, M6502BusAccessKind::dummy_read);
+        else if (absolute_index && (!cmos || trace.page_crossed))
+            append(indexed_dummy_address, M6502BusAccessKind::dummy_read);
+    } else {
+        if (mode == Mode::zpx || mode == Mode::zpy) append(base, M6502BusAccessKind::dummy_read);
+        if ((store && indexed && !indexed_indirect && !indirect_zp) ||
+            (read && trace.page_crossed && (absolute_index || indirect_y)))
+            append(indexed_dummy_address, M6502BusAccessKind::dummy_read);
+    }
+
+    std::uint8_t write_value = 0;
+    if (instruction.opcode == Opcode::m6502_sta) write_value = inputs.accumulator;
+    else if (instruction.opcode == Opcode::m6502_stx) write_value = inputs.x;
+    else if (instruction.opcode == Opcode::m6502_sty) write_value = inputs.y;
+    else if (cmos && instruction.opcode == Opcode::m65c02_stz) write_value = 0;
+    else if (rmw) write_value = instruction.opcode == Opcode::m6502_inc ?
+        static_cast<std::uint8_t>(inputs.memory_value + 1u) : static_cast<std::uint8_t>(inputs.memory_value - 1u);
+    if (rmw) {
+        append(effective, M6502BusAccessKind::data_read, inputs.memory_value);
+        if (!cmos) append(effective, M6502BusAccessKind::dummy_write, inputs.memory_value);
+        else append(effective, M6502BusAccessKind::data_read, inputs.memory_value);
+        append(effective, M6502BusAccessKind::data_write, write_value);
+        trace.result_value = write_value;
+    } else if (store) {
+        append(effective, M6502BusAccessKind::data_write, write_value);
+        trace.result_value = write_value;
+    } else {
+        append(effective, M6502BusAccessKind::data_read, inputs.memory_value);
+        trace.result_value = inputs.memory_value;
+    }
+    if (trace.access_count != instruction.m6502_timing->base_cycles +
+        (((read || rmw) && instruction.m6502_timing->page_cross_penalty && trace.page_crossed) ? 1u : 0u)) return {};
+    return trace;
+}
+
 std::optional<M6502LoadResult>
 evaluate_m6502_load(Opcode opcode, std::uint8_t operand, std::uint8_t status) noexcept {
     if (opcode != Opcode::m6502_lda && opcode != Opcode::m6502_ldx && opcode != Opcode::m6502_ldy)
@@ -637,7 +805,7 @@ trace_m6502_control_stack_bus(const Instruction &instruction, std::uint8_t stack
     const auto pc = static_cast<std::uint16_t>(instruction.address.offset);
     const auto append = [&](std::uint16_t address, M6502BusAccessKind kind) {
         const auto cycle = static_cast<std::uint8_t>(trace.access_count + 1u);
-        trace.accesses[trace.access_count++] = M6502BusAccess{address, kind, cycle};
+        trace.accesses[trace.access_count++] = M6502BusAccess{address, kind, cycle, {}};
     };
     if (instruction.opcode == Opcode::m6502_jsr) {
         if (instruction.length != 3 || instruction.bytes.size() < 3 ||
@@ -781,7 +949,7 @@ trace_m6502_hardware_interrupt_bus(M6502HardwareInterrupt interrupt,
     M6502InterruptBusTrace trace;
     const auto append = [&](std::uint16_t address, M6502BusAccessKind kind) {
         const auto cycle = static_cast<std::uint8_t>(trace.access_count + 1u);
-        trace.accesses[trace.access_count++] = M6502BusAccess{address, kind, cycle};
+        trace.accesses[trace.access_count++] = M6502BusAccess{address, kind, cycle, {}};
     };
     append(program_counter, M6502BusAccessKind::opcode_fetch);
     append(program_counter, M6502BusAccessKind::opcode_fetch);
@@ -809,7 +977,7 @@ trace_m6502_brk_bus(const Instruction &instruction, std::uint16_t program_counte
     M6502InterruptBusTrace trace;
     const auto append = [&](std::uint16_t address, M6502BusAccessKind kind) {
         const auto cycle = static_cast<std::uint8_t>(trace.access_count + 1u);
-        trace.accesses[trace.access_count++] = M6502BusAccess{address, kind, cycle};
+        trace.accesses[trace.access_count++] = M6502BusAccess{address, kind, cycle, {}};
     };
     append(program_counter, M6502BusAccessKind::opcode_fetch);
     append(static_cast<std::uint16_t>(program_counter + 1u), M6502BusAccessKind::operand_fetch);
@@ -1014,7 +1182,7 @@ trace_m6502_branch_bus(const Instruction &instruction, std::uint8_t status) noex
     M6502BranchBusTrace trace;
     const auto append = [&](std::uint16_t address, M6502BusAccessKind kind) {
         const auto cycle = static_cast<std::uint8_t>(trace.access_count + 1u);
-        trace.accesses[trace.access_count++] = M6502BusAccess{address, kind, cycle};
+        trace.accesses[trace.access_count++] = M6502BusAccess{address, kind, cycle, {}};
     };
     append(pc, M6502BusAccessKind::opcode_fetch);
     append(static_cast<std::uint16_t>(pc + 1u), M6502BusAccessKind::operand_fetch);
@@ -1080,7 +1248,7 @@ trace_m6502_stack_bus(const Instruction &instruction, std::uint8_t stack_pointer
     const auto pc = static_cast<std::uint16_t>(instruction.address.offset);
     const auto append = [&](std::uint16_t address, M6502BusAccessKind kind) {
         const auto cycle = static_cast<std::uint8_t>(trace.access_count + 1u);
-        trace.accesses[trace.access_count++] = M6502BusAccess{address, kind, cycle};
+        trace.accesses[trace.access_count++] = M6502BusAccess{address, kind, cycle, {}};
     };
     append(pc, M6502BusAccessKind::opcode_fetch);
     append(static_cast<std::uint16_t>(pc + 1u), M6502BusAccessKind::dummy_read);
