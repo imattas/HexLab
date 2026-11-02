@@ -228,6 +228,24 @@ bool set_reg(const RegisterValue& source, const char* name, unsigned long long& 
 
 class LinuxPtraceBackend final : public Backend {
     bool supports_scheduled_signal_disposition() const noexcept override { return true; }
+    Status prepare_memory_patch() override {
+        if (pid_ <= 0 || !pending_ || startup_cleanup_ || terminating_ || detach_preparing_ || detaching_ ||
+            resume_blocked_ || !interrupting_.empty() || !initial_children_.empty() ||
+            breakpoint_rollback_ || breakpoint_rearm_ || hardware_step_restore_)
+            return Error{ErrorCode::busy, "memory patches require a stopped Linux target without pending cleanup"};
+        auto observed = threads();
+        if (!observed) return observed.error();
+        std::set<pid_t> ids;
+        for (const auto& thread : observed.value()) {
+            const auto tid = static_cast<pid_t>(thread.id);
+            if (!tracked_.contains(tid) || !stopped_.contains(tid))
+                return Error{ErrorCode::busy, "memory patches require every process thread to be traced and stopped"};
+            ids.insert(tid);
+        }
+        if (ids.empty() || ids != tracked_ || stopped_ != tracked_)
+            return Error{ErrorCode::busy, "memory patches require every process thread to be traced and stopped"};
+        return std::monostate{};
+    }
     using Clock = std::chrono::steady_clock;
     // A nested rollback/suspension shares its caller's deadline. EINTR and
     // additional TIDs never restart the timeout.

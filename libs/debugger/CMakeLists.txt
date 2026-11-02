@@ -19,3 +19,5 @@ hexlab_add_library(debugger SOURCES src/debugger.cpp src/memory_search.cpp src/r
 if(WIN32)
   target_link_libraries(hexlab_debugger PRIVATE kernel32 psapi ws2_32)
 endif()
+install(FILES docs/memory-patch-batches.md
+  DESTINATION "${CMAKE_INSTALL_DATADIR}/hexlab/docs")

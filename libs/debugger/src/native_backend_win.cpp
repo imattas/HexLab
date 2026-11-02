@@ -1053,6 +1053,13 @@ std::optional<Arm32StepDestination> arm32_branch_destination(
 
 class Win32Backend final : public Backend {
 public:
+    Status prepare_memory_patch() override {
+        if (!process_ || exited_ || !pending_)
+            return Error{ErrorCode::busy, "memory patches require a pending Windows debug event"};
+        if (arm32_step_)
+            return Error{ErrorCode::busy, "ARM32 step patch restoration is pending"};
+        return std::monostate{};
+    }
     ~Win32Backend() override {
         // DebugSession normally detaches before it releases this backend, but
         // Backend is also a public interface and can be destroyed directly.

@@ -290,6 +290,9 @@ struct DebugSession::Impl {
     std::unique_ptr<Backend> backend;
     SessionState state = SessionState::idle;
     std::optional<ProcessInfo> process;
+    // Replaced on every successful launch/attach/inferior switch. Reports must
+    // not undo memory in a later attachment that happens to reuse the PID.
+    std::shared_ptr<const void> memory_patch_owner = std::make_shared<const int>(0);
     std::optional<std::string> last_diagnostic;
     std::optional<std::uint64_t> pending_event;
     std::optional<EventKind> pending_event_kind;
@@ -364,7 +367,7 @@ Result<ProcessInfo> DebugSession::launch(const Target& target) {
         return Error{ErrorCode::conflict, "remove session breakpoints before launching a new remote target"};
     auto result = connected_remote_launch ? impl_->backend->launch_remote(target) : impl_->backend->launch(target);
     if (result) { impl_->resume_filter.reset(); impl_->step_resume = false; }
-    if (result) { impl_->process = result.value(); impl_->state = SessionState::running; impl_->pending_event.reset(); impl_->pending_event_kind.reset(); impl_->notification_ack_pending = false; impl_->interrupt_requested = false; impl_->breakpoints.clear(); }
+    if (result) { impl_->memory_patch_owner = std::make_shared<const int>(0); impl_->process = result.value(); impl_->state = SessionState::running; impl_->pending_event.reset(); impl_->pending_event_kind.reset(); impl_->notification_ack_pending = false; impl_->interrupt_requested = false; impl_->breakpoints.clear(); }
     return result;
 }
 Result<ProcessInfo> DebugSession::attach(ProcessId id) {
@@ -372,7 +375,7 @@ Result<ProcessInfo> DebugSession::attach(ProcessId id) {
         return invalid_state("attach");
     auto result = impl_->backend->attach(id);
     if (result) { impl_->resume_filter.reset(); impl_->step_resume = false; }
-    if (result) { impl_->process = result.value(); impl_->state = SessionState::running; impl_->pending_event.reset(); impl_->pending_event_kind.reset(); impl_->notification_ack_pending = false; impl_->interrupt_requested = false; impl_->breakpoints.clear(); }
+    if (result) { impl_->memory_patch_owner = std::make_shared<const int>(0); impl_->process = result.value(); impl_->state = SessionState::running; impl_->pending_event.reset(); impl_->pending_event_kind.reset(); impl_->notification_ack_pending = false; impl_->interrupt_requested = false; impl_->breakpoints.clear(); }
     return result;
 }
 Result<ProcessInfo> DebugSession::connect_remote(std::string_view host, std::uint16_t port) {
@@ -384,7 +387,7 @@ Result<ProcessInfo> DebugSession::connect_remote(std::string_view host, std::uin
         return invalid_state("connect_remote");
     auto result = impl_->backend->connect_remote(host, port, options);
     if (result) { impl_->resume_filter.reset(); impl_->step_resume = false; }
-    if (result) { impl_->process = result.value(); impl_->state = SessionState::running; impl_->pending_event.reset(); impl_->pending_event_kind.reset(); impl_->notification_ack_pending = false; impl_->interrupt_requested = false; impl_->breakpoints.clear(); }
+    if (result) { impl_->memory_patch_owner = std::make_shared<const int>(0); impl_->process = result.value(); impl_->state = SessionState::running; impl_->pending_event.reset(); impl_->pending_event_kind.reset(); impl_->notification_ack_pending = false; impl_->interrupt_requested = false; impl_->breakpoints.clear(); }
     return result;
 }
 std::optional<RemoteTargetMetadata> DebugSession::remote_target_metadata() const {
@@ -400,6 +403,7 @@ Result<ProcessInfo> DebugSession::attach_remote_process(ProcessId process) {
     if (result) {
         impl_->resume_filter.reset();
         impl_->step_resume = false;
+        impl_->memory_patch_owner = std::make_shared<const int>(0);
         impl_->process = result.value();
         // vAttach supplies a fresh initial stop for the newly selected inferior.
         impl_->pending_event.reset();
@@ -830,6 +834,144 @@ Status DebugSession::write_memory(std::uint64_t address, std::span<const std::by
     if (bytes.size() > max_inspection_write || address > UINT64_MAX - bytes.size())
         return Error{ErrorCode::invalid_argument, "memory write exceeds the 1 MiB limit or wraps the address space"};
     return impl_->backend->write_memory(address, bytes);
+}
+Result<MemoryPatchReport> DebugSession::apply_memory_patches(std::span<const MemoryPatch> patches,
+    std::stop_token cancellation) {
+    if (!impl_->backend || !impl_->process || impl_->state != SessionState::stopped || !impl_->pending_event)
+        return invalid_state("apply_memory_patches");
+    if (patches.empty() || patches.size() > max_memory_patch_ranges)
+        return Error{ErrorCode::invalid_argument, "memory patch batch requires 1-256 ranges"};
+    std::size_t total = 0;
+    std::vector<std::size_t> order;
+    order.reserve(patches.size());
+    for (std::size_t i = 0; i < patches.size(); ++i) {
+        const auto& patch = patches[i];
+        if (patch.bytes.empty() || patch.bytes.size() > max_memory_patch_bytes - total ||
+            patch.address > UINT64_MAX - patch.bytes.size() ||
+            (patch.expected && patch.expected->size() != patch.bytes.size()))
+            return Error{ErrorCode::invalid_argument, "memory patches require nonempty, nonwrapping ranges within 1 MiB total and matching expected sizes"};
+        total += patch.bytes.size();
+        order.push_back(i);
+    }
+    std::sort(order.begin(), order.end(), [&](auto left, auto right) {
+        return patches[left].address < patches[right].address;
+    });
+    for (std::size_t i = 1; i < order.size(); ++i)
+        if (patches[order[i - 1]].address + patches[order[i - 1]].bytes.size() > patches[order[i]].address)
+            return Error{ErrorCode::conflict, "memory patch ranges overlap"};
+    // Reads expose physical trap bytes on native targets. Saving those as an
+    // original instruction would corrupt the backend's breakpoint ownership.
+    for (const auto& breakpoint : impl_->breakpoints) {
+        if (breakpoint.kind != BreakpointKind::software) continue;
+        const auto architecture = impl_->process->architecture;
+        const std::uint64_t extent = std::max<std::uint64_t>(breakpoint.size,
+            architecture == Architecture::arm || architecture == Architecture::arm64 ? 4 :
+            architecture == Architecture::x86 || architecture == Architecture::x86_64 ? 1 : 16);
+        const auto start = architecture == Architecture::arm && breakpoint.address >= 2
+            ? breakpoint.address - 2 : breakpoint.address;
+        const auto end = breakpoint.address > UINT64_MAX - extent ? UINT64_MAX : breakpoint.address + extent;
+        for (const auto& patch : patches)
+            if (patch.address < end && start < patch.address + patch.bytes.size())
+                return Error{ErrorCode::conflict, "remove overlapping owned software breakpoints before applying memory patches"};
+    }
+    if (cancellation.stop_requested()) return Error{ErrorCode::canceled, "memory patch canceled before preflight"};
+    auto prepared = impl_->backend->prepare_memory_patch();
+    if (!prepared) return prepared.error();
+    MemoryPatchReport report;
+    report.owner_ = impl_->memory_patch_owner;
+    report.records.reserve(patches.size());
+    report.rollback_failures.reserve(patches.size());
+    // Finish every snapshot and caller precondition before the first write.
+    for (const auto& patch : patches) {
+        if (cancellation.stop_requested()) return Error{ErrorCode::canceled, "memory patch canceled during preflight"};
+        auto original = impl_->backend->read_memory(patch.address, patch.bytes.size());
+        if (!original) return original.error();
+        if (original.value().size() != patch.bytes.size())
+            return Error{ErrorCode::io, "memory patch preflight read returned an unexpected byte count"};
+        if (patch.expected && original.value() != *patch.expected)
+            return Error{ErrorCode::conflict, "memory patch precondition does not match target bytes"};
+        report.records.push_back({patch.address, std::move(original.value()), patch.bytes});
+    }
+    std::size_t attempted = 0;
+    for (std::size_t i = 0; i < report.records.size(); ++i) {
+        auto& record = report.records[i];
+        const auto fail = [&](Error error) { report.failure = MemoryPatchFailure{i, std::move(error)}; };
+        if (cancellation.stop_requested()) {
+            fail({ErrorCode::canceled, "memory patch canceled; restoring attempted ranges"});
+            break;
+        }
+        auto current = impl_->backend->read_memory(record.address, record.before.size());
+        if (!current) { fail(current.error()); break; }
+        if (current.value().size() != record.before.size()) {
+            fail({ErrorCode::io, "memory patch recheck returned an unexpected byte count"});
+            break;
+        }
+        if (current.value() != record.before) {
+            fail({ErrorCode::conflict, "memory patch target changed after preflight"});
+            break;
+        }
+        if (cancellation.stop_requested()) {
+            fail({ErrorCode::canceled, "memory patch canceled; restoring attempted ranges"});
+            break;
+        }
+        // Include the failing range: backend errors can follow a partial write.
+        attempted = i + 1;
+        record.state = MemoryPatchState::uncertain;
+        auto written = impl_->backend->write_memory(record.address, record.after);
+        if (!written) { fail(written.error()); break; }
+        auto verified = impl_->backend->read_memory(record.address, record.after.size());
+        if (!verified) { fail(verified.error()); break; }
+        if (verified.value() != record.after) {
+            fail({ErrorCode::integrity, "memory patch verification differs from requested bytes"});
+            break;
+        }
+        record.state = MemoryPatchState::applied;
+        if (cancellation.stop_requested()) {
+            fail({ErrorCode::canceled, "memory patch canceled; restoring attempted ranges"});
+            break;
+        }
+    }
+    if (!report.failure) return report;
+    report.completion = MemoryPatchCompletion::rolled_back;
+    // Never use the canceled token for recovery. Attempt every affected range
+    // even when a previous restore fails, and verify the resulting bytes.
+    while (attempted) {
+        const auto i = --attempted;
+        auto& record = report.records[i];
+        auto restored = impl_->backend->write_memory(record.address, record.before);
+        auto verified = impl_->backend->read_memory(record.address, record.before.size());
+        if (verified && verified.value() == record.before) {
+            record.state = MemoryPatchState::restored;
+            continue;
+        }
+        record.state = MemoryPatchState::uncertain;
+        report.completion = MemoryPatchCompletion::rollback_incomplete;
+        Error error = !restored ? restored.error() : !verified ? verified.error() :
+            Error{ErrorCode::integrity, "restored memory differs from the preflight snapshot"};
+        report.rollback_failures.push_back({i, std::move(error)});
+    }
+    return report;
+}
+Result<MemoryPatchReport> DebugSession::restore_memory_patches(const MemoryPatchReport& report,
+    std::stop_token cancellation) {
+    const auto owner = report.owner_.lock();
+    if (!owner || owner != impl_->memory_patch_owner)
+        return Error{ErrorCode::conflict, "memory patch report belongs to another process attachment"};
+    if (report.completion != MemoryPatchCompletion::applied || report.failure || !report.rollback_failures.empty() ||
+        report.records.empty() || report.records.size() > max_memory_patch_ranges)
+        return Error{ErrorCode::invalid_argument, "only a completely applied memory patch report can be undone"};
+    std::size_t total = 0;
+    for (const auto& record : report.records) {
+        if (record.state != MemoryPatchState::applied || record.before.empty() ||
+            record.before.size() != record.after.size() || record.before.size() > max_memory_patch_bytes - total)
+            return Error{ErrorCode::invalid_argument, "invalid applied memory patch record"};
+        total += record.before.size();
+    }
+    std::vector<MemoryPatch> undo;
+    undo.reserve(report.records.size());
+    for (const auto& record : report.records)
+        undo.push_back({record.address, record.before, record.after});
+    return apply_memory_patches(undo, cancellation);
 }
 Result<MemorySearchReport> DebugSession::search_memory(const MemorySearchPattern& pattern,
     const MemorySearchOptions& options, std::stop_token cancellation) {

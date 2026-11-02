@@ -1092,6 +1092,13 @@ class RemoteBackend final : public Backend {
 public:
     explicit RemoteBackend(std::unique_ptr<rsp::ByteTransport> transport = {}) : transport_(std::move(transport)) {}
     bool supports_scheduled_signal_disposition() const noexcept override { return true; }
+    Status prepare_memory_patch() override {
+        if (!client_ || !pending_event_)
+            return Error{ErrorCode::busy, "memory patches require a pending remote stop"};
+        if (non_stop_mode_)
+            return unsupported("guarded memory patches require all-stop RSP mode");
+        return select_breakpoint_process();
+    }
     bool remote_launch_available() const noexcept override { return client_ != nullptr; }
     Result<ProcessInfo> launch(const Target&) override { return unsupported("RSP targets must be connected by host and port"); }
     Result<ProcessInfo> launch_remote(const Target& target) override {
@@ -2579,6 +2586,7 @@ public:
         return active().read_memory_tags(address, size, type, max_tag_bytes);
     }
     Status write_memory(std::uint64_t address, std::span<const std::byte> bytes) override { return active().write_memory(address, bytes); }
+    Status prepare_memory_patch() override { return active().prepare_memory_patch(); }
     Result<std::vector<ThreadInfo>> threads() override { return active().threads(); }
     Result<std::vector<ThreadRunState>> thread_run_states() override { return active().thread_run_states(); }
     Result<std::vector<ModuleInfo>> modules() override { return active().modules(); }

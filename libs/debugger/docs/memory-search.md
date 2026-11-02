@@ -123,6 +123,13 @@ not an atomic snapshot: mappings or bytes may change between chunks. Stop the
 target first when stable inspection is required. Software breakpoint bytes are
 searched exactly as exposed by the backend's existing memory-read API.
 
+For a stopped-target search-and-edit workflow, turn selected matches into
+`MemoryPatch` ranges with complete expected bytes and use
+[`apply_memory_patches()`](memory-patch-batches.md). The batch API guards the
+expected bytes again before each write, retains undo snapshots, and attempts
+reverse rollback on failure or cancellation. Wildcard patterns are search
+criteria, not complete write preconditions; obtain the actual bytes first.
+
 ## Verification scope
 
 The feature is intended to be checked by compiling the debugger library. No

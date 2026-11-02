@@ -4,6 +4,7 @@
 #include "hexlab/core/result.hpp"
 #include "hexlab/debugger/debugger_export.hpp"
 #include "hexlab/debugger/memory_search.hpp"
+#include "hexlab/debugger/memory_patch.hpp"
 #include "hexlab/debugger/remote_environment.hpp"
 
 #include <chrono>
@@ -287,6 +288,12 @@ public:
         return Error{ErrorCode::unsupported, "memory-tag inspection is not supported by this backend"};
     }
     virtual Status write_memory(std::uint64_t address, std::span<const std::byte> bytes) = 0;
+    // Establishes whole-process quiescence for a memory patch batch. Must not
+    // resume threads or consume pending events. Multiprocess transports also
+    // restore the selected inferior's memory context here.
+    virtual Status prepare_memory_patch() {
+        return Error{ErrorCode::unsupported, "guarded memory patches are not supported by this backend"};
+    }
     virtual Result<std::vector<ThreadInfo>> threads() = 0;
     // Returns the backend's current per-thread execution-state snapshot.
     // Backends without reliable state tracking keep this unsupported.
@@ -408,6 +415,18 @@ public:
     Result<MemorySearchReport> search_memory(const MemorySearchPattern& pattern,
         const MemorySearchOptions& options = {}, std::stop_token cancellation = {});
     Status write_memory(std::uint64_t address, std::span<const std::byte> bytes);
+    // Requires a pending stop and a backend that proves process quiescence.
+    // Snapshots all non-overlapping ranges before writing; verifies each write
+    // and rolls back every attempted range on failure or cancellation. Access
+    // must be serialized. Cancellation is checked between backend calls and
+    // never suppresses rollback. Software-breakpoint overlaps are rejected.
+    Result<MemoryPatchReport> apply_memory_patches(std::span<const MemoryPatch> patches,
+        std::stop_token cancellation = {});
+    // Guarded undo of a fully applied batch from the same process attachment.
+    // Requires current bytes to match the original report's after snapshots.
+    // Returns a new report; undoing that report implements redo.
+    Result<MemoryPatchReport> restore_memory_patches(const MemoryPatchReport& report,
+        std::stop_token cancellation = {});
     Result<std::vector<ThreadInfo>> threads();
     // Thread-state snapshot keyed by session thread IDs. A backend may return
     // unknown when the OS cannot provide a race-free state observation.

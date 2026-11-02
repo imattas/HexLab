@@ -494,6 +494,12 @@ Result<std::pair<Aarch64TlsState, bool>> get_tls_state(pid_t tid) {
 
 class LinuxAarch64Backend final : public Backend {
     bool supports_scheduled_signal_disposition() const noexcept override { return true; }
+    Status prepare_memory_patch() override {
+        if (!pending_ || startup_cleanup_ || detaching_ || !interrupting_.empty() ||
+            !initial_children_.empty() || step_pending_ || hardware_step_state_)
+            return Error{ErrorCode::busy, "memory patches require a pending Linux AArch64 stop without cleanup"};
+        return require_all_threads_stopped();
+    }
     using Clock = std::chrono::steady_clock;
     // A nested rollback/suspension shares its caller's deadline. EINTR and
     // additional TIDs never restart the timeout.
