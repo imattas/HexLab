@@ -492,7 +492,7 @@ predecessor blocks when a bounded path-complete proof finds unanimous values at
 the switch block entry. The proof is limited to complete functions with at
 most 128 function blocks, 1024 snapshot blocks, 4096 graph instructions,
 8192 incoming edges, and 32768 work steps per register. Every predecessor
-path must reach supported `LUI`, `ORI`, `ADDIU`, or `ADDU` constant
+path must reach supported `LUI`, `ORI`, `ADDIU`, `ADDU`, or fixed `SLL` constant
 definitions; cycles, alternate entries, unresolved transfers, calls,
 delay-slot control flow, unknown writes, relocation-backed definitions, and
 differing path values reject the seed. Existing same-block table/load/dispatch
@@ -508,7 +508,7 @@ within 32 bits. Each halfword must be file-backed and uncovered by relocation
 metadata, and the resulting address must decode as executable MIPS32 code. CLI
 JSON labels this encoding `signed_halfword_offset_from_target_base`. The exact
 explicit sign-extension form below is also supported; other halfword load
-sequences and shifted-base forms remain unsupported.
+sequences and shifted symbolic table-address forms remain unsupported.
 
 O32 also accepts the exact explicit sign-extension sequence
 `LHU target, tableBase, scaledIndex; SLL target,target,16; SRA target,target,16;
@@ -517,8 +517,8 @@ same-context fallthrough instructions with immediate shift count 16, and the
 table load, shifts, base addition, and dispatch must be contiguous. Entries are
 two-byte signed offsets after the explicit extension; raw slots must be
 file-backed and relocation-free, and targets must decode as executable
-MIPS32 code. Other sign-extension sequences and shifted-base forms remain
-unsupported.
+MIPS32 code. Other sign-extension sequences and shifted symbolic table-address
+forms remain unsupported.
 
 O32 also recognizes one-byte signed-relative entries loaded with `LB` or the
 exact `LBU; SLL target,target,24; SRA target,target,24` sign-extension
@@ -532,6 +532,68 @@ produced by unsupported arithmetic are not accepted. Entries are signed
 file-backed and relocation-free, and each resulting target must decode as
 executable MIPS32 code. Guarded counts and the 4096-entry verified-prefix cap
 remain in force; other narrow-width transforms remain unsupported.
+
+O32 table/code-base constants now also accept exact fixed `SLL` construction,
+for example `ORI base,$zero,high16; SLL base,base,16; ORI base,base,low16`,
+before the existing indexed load and `JR` dispatch. This closes the fixed
+constant subset of the previously unsupported shifted-base forms. The shift
+uses an unsigned five-bit immediate in `[0,31]` and 32-bit GPR operands;
+results truncate to 32 bits, including in-place shifts. A `LUI` source uses
+the native decoder's encoded-16/effective-32 immediate facts. The native
+fixed-shift decoder now locates shamt's bits 10:6 in both byte orders.
+
+An absolute-pointer example is:
+
+```text
+ORI   tableBase, $zero, high16
+SLL   tableBase, tableBase, 16
+ORI   tableBase, tableBase, low16
+SLL   scaledIndex, selector, 2
+ADDU  address, tableBase, scaledIndex
+LW    target, 0(address)
+JR    target
+```
+
+The same constant construction is accepted by the bounded unanimous
+predecessor proof above, with unchanged graph/work limits. All predecessor
+paths must establish the same constant. Constant `SLL` is separate from
+dynamic selector scaling: known symbolic indexed addresses cannot be shifted
+into a new base, and the selector factor must still match the entry width.
+Opaque instructions reject same-block setup rather than preserving constants
+across unknown writes, matching the predecessor proof's conservative rule.
+Immediate, arithmetic-base and selector-scale construction instructions must
+be free of relocation coverage across their complete words; placeholder
+immediate or shift bits never establish a base. Absolute table slots keep
+their existing per-case relocation provenance;
+signed-relative slots remain raw, file-backed and relocation-free. The
+load/sign-extension/add/dispatch tail must also be relocation-free, so a
+relocated load displacement cannot silently redirect a shifted literal base.
+The exact guard proof, 4096-entry prefix cap, executable-target decoding and per-switch
+overlap validation are unchanged. Variable shifts, shifted symbolic addresses,
+PIC/GOT and runtime bases remain unsupported.
+
+Validation passed on local Windows/MSVC 19.44 Debug and Ubuntu 24.04
+WSL/Clang 18 Debug builds of `hexlab_processors`, `hexlab_analysis`, and
+`hexlab_cli` with `BUILD_TESTING=OFF`. Fresh builds and final incremental
+rebuilds after the provenance guards each exited 0 on both platforms. No tests
+were added or run; runtime recognition remains unverified. The function-engine
+fingerprint changes so older cached switch-derived function results are not
+reused.
+
+Windows commands, from the isolated worktree:
+
+```powershell
+cmake -S . -B .build/mips32-shifted-base-windows -G "Visual Studio 17 2022" -A x64 -DHEXLAB_BUILD_DESKTOP=OFF -DBUILD_TESTING=OFF -DHEXLAB_ENABLE_PINNED_LLVM_ORACLES=OFF
+cmake --build .build/mips32-shifted-base-windows --config Debug --target hexlab_processors hexlab_analysis hexlab_cli --parallel 4
+```
+
+Ubuntu 24.04 WSL commands, using Clang 18 and Unix Makefiles because Ninja is
+not installed in this distribution:
+
+```sh
+cmake -S /mnt/g/HexLab/.worktrees/mips32-shifted-switch-base-20261102 -B /home/imattas/hexlab-builds/mips32-shifted-base-20261102 -G "Unix Makefiles" -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=Debug -DHEXLAB_BUILD_DESKTOP=OFF -DBUILD_TESTING=OFF -DHEXLAB_ENABLE_PINNED_LLVM_ORACLES=OFF
+cmake --build /home/imattas/hexlab-builds/mips32-shifted-base-20261102 --target hexlab_processors hexlab_analysis hexlab_cli --parallel 4
+```
 
 PPC32 recognizes a straight-line indexed absolute-pointer form ending in
 `LWZX target, tableBase, scaledIndex; MTCTR target; BCTR`. The index must come

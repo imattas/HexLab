@@ -81,7 +81,9 @@ DecodeResult decode_mips32(ByteOrder order, std::span<const std::byte> bytes, Ad
             if (rs != 0 && !(funct == 2 && rs == 1)) return invalid("Reserved fixed-shift encoding");
             i.opcode = funct == 0 ? Opcode::mips_sll : funct == 2
                 ? (rs == 1 ? Opcode::mips32_rotr : Opcode::mips_srl) : Opcode::mips_sra;
-            i.operands = {reg(rd), reg(rt), ImmediateOperand{shamt, 5, 32, false, EncodedField{3, 1}}};
+            // shamt occupies bits 10:6 and therefore spans two instruction bytes.
+            i.operands = {reg(rd), reg(rt), ImmediateOperand{shamt, 5, 32, false,
+                EncodedField{static_cast<std::uint8_t>(order == ByteOrder::little ? 0 : 2), 2}}};
             i.access = {OperandAccess::write, OperandAccess::read, OperandAccess::read};
             i.register_reads = {reg(rt)}; if (rd) i.register_writes = {reg(rd)}; break;
         case 0x0a: case 0x0b: // MOVZ / MOVN
