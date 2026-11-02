@@ -957,6 +957,8 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
         return names[static_cast<std::size_t>(op) - static_cast<std::size_t>(Opcode::rv_vfadd_vv)];
     }
     if (op == Opcode::rv_vfrdiv_vf) return "vfrdiv.vf";
+    if (op == Opcode::rv_vfcvt_xu_f_v) return "vfcvt.xu.f.v";
+    if (op == Opcode::rv_vfcvt_x_f_v) return "vfcvt.x.f.v";
     if (op == Opcode::rv_vfsqrt_v) return "vfsqrt.v";
     if (op == Opcode::rv_vfclass_v) return "vfclass.v";
     if (op == Opcode::rv_vfrsqrt7_v) return "vfrsqrt7.v";

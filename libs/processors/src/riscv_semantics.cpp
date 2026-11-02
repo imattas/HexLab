@@ -2310,7 +2310,8 @@ evaluate_riscv_vector_floating_operation(RiscvOpcode opcode, const RiscvVectorIn
                            sign_copy, sign_invert, sign_xor, min, max,
                            reduce_min, reduce_max, reduce_unordered_sum, reduce_ordered_sum,
                            reduce_widen_unordered_sum, reduce_widen_ordered_sum,
-                           equal, not_equal, less, less_equal, greater, greater_equal };
+                           equal, not_equal, less, less_equal, greater, greater_equal,
+                           to_unsigned_integer, to_signed_integer };
     Operation operation;
     bool vector_rhs = false, mask_result = false;
     switch (opcode) {
@@ -2337,6 +2338,8 @@ evaluate_riscv_vector_floating_operation(RiscvOpcode opcode, const RiscvVectorIn
     case RiscvOpcode::vmfgt_vf: operation = Operation::greater; break;
     case RiscvOpcode::vmfge_vf: operation = Operation::greater_equal; break;
     case RiscvOpcode::vfrdiv_vf: operation = Operation::reverse_divide; break;
+    case RiscvOpcode::vfcvt_xu_f_v: operation = Operation::to_unsigned_integer; break;
+    case RiscvOpcode::vfcvt_x_f_v: operation = Operation::to_signed_integer; break;
     case RiscvOpcode::vfmacc_vv: case RiscvOpcode::vfmacc_vf: operation = Operation::fma_accumulate; break;
     case RiscvOpcode::vfnmacc_vv: case RiscvOpcode::vfnmacc_vf: operation = Operation::fma_negate_accumulate; break;
     case RiscvOpcode::vfmsac_vv: case RiscvOpcode::vfmsac_vf: operation = Operation::fma_subtract_accumulate; break;
@@ -2367,6 +2370,8 @@ evaluate_riscv_vector_floating_operation(RiscvOpcode opcode, const RiscvVectorIn
         (config.masked && std::any_of(operands.predicate_mask.begin(), operands.predicate_mask.end(),
                                       [](std::uint8_t bit) { return bit > 1; })))) return {};
     if (sum_reduction && (!operands.frm || *operands.frm > 4)) return {};
+    const bool integer_conversion = operation == Operation::to_unsigned_integer ||
+                                   operation == Operation::to_signed_integer;
     const bool fused_operation = operation == Operation::fma_accumulate ||
         operation == Operation::fma_negate_accumulate || operation == Operation::fma_subtract_accumulate ||
         operation == Operation::fma_negate_subtract_accumulate || operation == Operation::fma_add ||
@@ -2375,7 +2380,7 @@ evaluate_riscv_vector_floating_operation(RiscvOpcode opcode, const RiscvVectorIn
     const bool rounded_arithmetic = operation == Operation::add || operation == Operation::subtract ||
         operation == Operation::multiply || operation == Operation::divide ||
         operation == Operation::reverse_divide || fused_operation;
-    if (rounded_arithmetic && (!operands.frm || *operands.frm > 4)) return {};
+    if ((rounded_arithmetic || integer_conversion) && (!operands.frm || *operands.frm > 4)) return {};
     if (vector_rhs && operands.vs1.size() != vlmax) return {};
     mask_result = operation == Operation::equal || operation == Operation::not_equal ||
                   operation == Operation::less || operation == Operation::less_equal ||
@@ -2484,6 +2489,78 @@ evaluate_riscv_vector_floating_operation(RiscvOpcode opcode, const RiscvVectorIn
         return maximum ? (take_lhs ? rhs : lhs) : (take_lhs ? lhs : rhs);
     };
 
+    const auto convert_to_integer = [&](std::uint64_t input, bool is_signed,
+                                        std::uint8_t &fflags) -> std::uint64_t {
+        input &= element_mask;
+        const bool sign = (input & sign_mask) != 0;
+        const auto exp_field = static_cast<unsigned>((input & exponent_mask) >> frac_bits);
+        const auto fraction = input & fraction_mask;
+        const auto max_exp_field = (1u << exp_bits) - 1;
+        const auto max_unsigned = width_mask(sew);
+        const auto max_signed = (UINT64_C(1) << (sew - 1)) - 1;
+        const auto min_signed_mag = UINT64_C(1) << (sew - 1);
+        if (exp_field == max_exp_field) {
+            fflags |= 0x10;
+            if (fraction != 0) return is_signed ? max_signed : max_unsigned;
+            if (is_signed) return sign ? min_signed_mag : max_signed;
+            return sign ? 0 : max_unsigned;
+        }
+        const bool normal = exp_field != 0;
+        const int exponent = normal ? static_cast<int>(exp_field) - bias
+            : (fraction == 0 ? -100000 : 1 - bias);
+        const std::uint64_t significand = normal ? ((UINT64_C(1) << frac_bits) | fraction) : fraction;
+        std::uint64_t magnitude = 0;
+        bool discarded = false, above_half = false, exactly_half = false, odd = false;
+        if (significand != 0) {
+            if (exponent >= static_cast<int>(sew)) {
+                fflags |= 0x10;
+                if (is_signed) return sign ? min_signed_mag : max_signed;
+                return sign ? 0 : max_unsigned;
+            }
+            const int shift = static_cast<int>(frac_bits) - exponent;
+            if (shift >= 64) {
+                magnitude = 0;
+                discarded = true;
+                const int half_shift = shift - 1;
+                above_half = half_shift < 64 && significand > (UINT64_C(1) << half_shift);
+                exactly_half = half_shift < 64 && significand == (UINT64_C(1) << half_shift);
+            } else if (shift > 0) {
+                const auto mask = (UINT64_C(1) << shift) - 1;
+                const auto remainder = significand & mask;
+                magnitude = significand >> shift;
+                discarded = remainder != 0;
+                const auto half = UINT64_C(1) << (shift - 1);
+                above_half = remainder > half;
+                exactly_half = remainder == half;
+            } else {
+                // exponent < SEW was checked above; the significand's top
+                // bit therefore lands no higher than bit SEW-1.
+                magnitude = significand << static_cast<unsigned>(-shift);
+            }
+            odd = (magnitude & 1) != 0;
+        }
+        bool increment = false;
+        switch (*operands.frm) {
+        case 0: increment = above_half || (exactly_half && odd); break;
+        case 1: break;
+        case 2: increment = sign && discarded; break;
+        case 3: increment = !sign && discarded; break;
+        case 4: increment = above_half || exactly_half; break;
+        default: return 0;
+        }
+        if (increment) ++magnitude;
+        const bool out_of_range = is_signed
+            ? (sign ? magnitude > min_signed_mag : magnitude > max_signed)
+            : (sign ? magnitude != 0 : magnitude > max_unsigned);
+        if (out_of_range) {
+            fflags |= 0x10;
+            if (is_signed) return sign ? min_signed_mag : max_signed;
+            return sign ? 0 : max_unsigned;
+        }
+        if (discarded) fflags |= 0x01;
+        return sign ? ((~magnitude + 1) & max_unsigned) : magnitude;
+    };
+
     RiscvVectorFloatingResult result;
     result.vlmax = vlmax;
     result.mask_result = mask_result;
@@ -2546,6 +2623,12 @@ evaluate_riscv_vector_floating_operation(RiscvOpcode opcode, const RiscvVectorIn
         case Operation::reciprocal_estimate:
         case Operation::reciprocal_sqrt_estimate:
             value = estimate_value(lhs, result.fflags_set);
+            break;
+        case Operation::to_unsigned_integer:
+            value = convert_to_integer(lhs, false, result.fflags_set);
+            break;
+        case Operation::to_signed_integer:
+            value = convert_to_integer(lhs, true, result.fflags_set);
             break;
         case Operation::add:
         case Operation::subtract: {

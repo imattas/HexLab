@@ -127,7 +127,9 @@ enum class RiscvOpcode {
     // Zfa/Zfh half-precision round-to-integral forms; preserve prior IDs.
     fround_h, froundnx_h,
     // RVV scalar-over-vector floating divide; appended for serialized ID stability.
-    vfrdiv_vf
+    vfrdiv_vf,
+    // RVV FP-to-integer conversions, appended for stable opcode IDs.
+    vfcvt_xu_f_v, vfcvt_x_f_v
 };
 
 struct RiscvRegister {

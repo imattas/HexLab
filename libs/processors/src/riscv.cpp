@@ -319,6 +319,20 @@ bool decode_vector_floating(std::uint32_t w, RiscvInstruction &i) {
         return true;
     }
     // VFUNARY1 uses OPFVV and encodes its sub-op in vs1.
+    // VFUNARY0 integer conversions (round-to-current-mode variants).
+    if (funct3 == 1 && funct6 == 0x12 && (vs1 == 0 || vs1 == 1)) {
+        i.opcode = vs1 == 0 ? RiscvOpcode::vfcvt_xu_f_v : RiscvOpcode::vfcvt_x_f_v;
+        i.reads_frm = true;
+        i.reads_fflags = true;
+        i.writes_fflags = true;
+        operand(i, RiscvRegister{static_cast<std::uint8_t>(vd), false, true}, RiscvOperandAccess::write);
+        read_vector_destination(i, vd);
+        operand(i, RiscvRegister{static_cast<std::uint8_t>(vs2), false, true}, RiscvOperandAccess::read);
+        if (!vm) i.register_reads.push_back(RiscvRegister{0, false, true});
+        i.vector_masked = !vm;
+        return true;
+    }
+    // VFUNARY1 uses OPFVV and encodes its sub-op in vs1.
     if (funct3 == 1 && funct6 == 0x13 &&
         (vs1 == 0 || vs1 == 4 || vs1 == 5 || vs1 == 16)) {
         switch (vs1) {

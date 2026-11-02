@@ -135,6 +135,30 @@ The decoder supports the encoded RVV 1.0 forms listed here without claiming a
 complete RVV implementation; implementation-specific VLEN/ELEN and execution
 semantics remain outside this bounded static representation.
 
+## Floating-to-integer conversion subset
+
+The decoder recognizes the OPFVV unary `vfcvt.xu.f.v` and `vfcvt.x.f.v`
+forms (funct6 `010010`, unary selectors `00000` and `00001`). The destination
+is an SEW-wide integer vector and the source is an SEW-wide floating vector;
+the conversions do not widen and therefore retain the configured LMUL lane
+count. The lifted named intrinsics retain `frm`, accrued `fflags`, `vl`,
+`vtype`, `vstart`, masked `v0`, and old destination dependencies. At execution,
+conversion rounds according to `frm`; unsigned conversion saturates to zero
+for negative out-of-range values and to all ones for NaN, positive infinity,
+or positive overflow. Signed conversion saturates to the minimum/maximum signed
+SEW value. Out-of-range values and NaNs accrue NV; valid rounded results that
+lose fractional information accrue NX. Invalid conversions use NV without NX.
+These are accrued flags, so masked-off lanes do not contribute. Invalid `frm`
+encodings are reserved. The lane evaluator accepts SEW 32/64 and every
+representable LMUL, performs conversion from raw IEEE bits without host FP,
+and preserves prestart, masked-off, and tail destination lanes. The static
+decoder cannot inspect runtime SEW, LMUL, or `frm`. Other vector conversion
+selectors (including RTZ, integer to
+float, widening, narrowing, and FP-format conversions) remain unsupported and
+fail closed.
+The conversion opcodes and scalar conversion exceptions follow the official
+[RISC-V Vector specification conversion section](https://github.com/riscv/riscv-isa-manual/blob/main/src/unpriv/vector-common.adoc).
+
 ## Base vector floating-point elementwise slice
 
 The RVV decoder recognizes base `vfadd`, `vfsub`, `vfmul`, and `vfdiv` in
