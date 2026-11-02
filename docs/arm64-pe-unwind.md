@@ -10,6 +10,8 @@ Every accepted start must point to initialized executable bytes, and known packe
 
 Each validated non-link ARM64 `.pdata` start becomes a `FunctionSeedKind::unwind` root only when its source spans provide exactly eight nonempty bytes without extent overflow. Its seed evidence retains the pdata row index, first source file offset, and eight-byte record extent. A normalized row missing that provenance is skipped and marks function recovery incomplete; its function range is not applied as an ownership bound. Root addresses are computed using the image's loaded base, so rebasing is reflected in recovered functions. The validated function length bounds control-flow recovery unless an explicit user chunk definition overrides the metadata. Functions omitted from `.pdata` (such as leaf functions) are not inferred by this feature.
 
+When decoded `.xdata` carries an exception-handler RVA, function recovery also adds that handler as a distinct unwind-backed root. Its evidence points to the exact four-byte handler-RVA field in `.xdata`, and its target is translated with the image's loaded base before the ordinary initialized-executable root check. Handler-specific language data and exception dispatch remain uninterpreted.
+
 Flag-3 link rows describe jump islands, not independent functions. Function
 recovery follows each validated parent-link chain and adds the island's mapped
 executable interval to the parent function's chunks. The interval ends at the
