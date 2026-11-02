@@ -105,3 +105,5 @@ same-width integer operands, exact structurally equal SSA values in both
 subexpressions, a literal one-bit shift, pure versioned inputs, and at most 256
 expression nodes. The rewrite preserves fixed-width modular addition and does
 not generalize through other shift counts or rearranged expression trees.
+
+The identity pass now factors a common exact SSA operand from fixed-width integer products under addition or subtraction: `x*y + x*z` becomes `x*(y+z)`, and `x*y - x*z` becomes `x*(y-z)`. The matching operand may appear on either side of either multiplication. The entire input must be a pure, total bitvector expression with exact same integer types and at most 256 nodes. These operations are modular at the result width, so the rule preserves wraparound and does not depend on signed no-overflow assumptions. Division/remainder, memory, unknown values, unversioned registers, floating-point values, and partial/effectful operands are not rewritten; common factors are matched only by exact SSA structural identity.

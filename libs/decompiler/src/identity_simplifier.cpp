@@ -1021,6 +1021,51 @@ ExpressionPtr simplify_additive_cancellation(const ExpressionPtr &expression) {
     return {};
 }
 
+// Factor an exact repeated operand from a sum or difference of products:
+// x*y + x*z == x*(y+z), and x*y - x*z == x*(y-z), modulo 2^width.
+// Keep all leaves total and pure: this avoids moving, suppressing, or
+// duplicating any effect or potentially partial operation.
+ExpressionPtr simplify_product_factoring(const ExpressionPtr &expression) {
+    const auto *root = expression ? std::get_if<BinaryValue>(&expression->value) : nullptr;
+    if (!root || (root->operation != "add" && root->operation != "sub") ||
+        expression->type.kind != TypeKind::integer || !valid_bitvector(*expression) ||
+        !root->left || !root->right || root->left->type != expression->type ||
+        root->right->type != expression->type || expression_nodes(expression) > 256 ||
+        !pure_bitvector(expression) || !total_select_value(expression))
+        return {};
+
+    const auto *left_product = std::get_if<BinaryValue>(&root->left->value);
+    const auto *right_product = std::get_if<BinaryValue>(&root->right->value);
+    if (!left_product || left_product->operation != "mul" ||
+        !right_product || right_product->operation != "mul" ||
+        !left_product->left || !left_product->right ||
+        !right_product->left || !right_product->right ||
+        left_product->left->type != expression->type ||
+        left_product->right->type != expression->type ||
+        right_product->left->type != expression->type ||
+        right_product->right->type != expression->type)
+        return {};
+
+    const std::array<ExpressionPtr, 2> left_factors{left_product->left, left_product->right};
+    const std::array<ExpressionPtr, 2> right_factors{right_product->left, right_product->right};
+    for (std::size_t li = 0; li < left_factors.size(); ++li) {
+        for (std::size_t ri = 0; ri < right_factors.size(); ++ri) {
+            const auto &factor = left_factors[li];
+            const auto &left_term = left_factors[1 - li];
+            const auto &right_term = right_factors[1 - ri];
+            if (!structurally_equal(factor, right_factors[ri])) continue;
+            if (!total_select_value(factor) || !total_select_value(left_term) ||
+                !total_select_value(right_term))
+                return {};
+            auto sum = std::make_shared<Expression>(Expression{expression->type,
+                BinaryValue{root->operation, left_term, right_term}});
+            return std::make_shared<Expression>(Expression{expression->type,
+                BinaryValue{"mul", factor, std::move(sum)}});
+        }
+    }
+    return {};
+}
+
 ExpressionPtr simplify_rotate_cancellation(const ExpressionPtr &expression) {
     // Compose adjacent rotations modulo the exact bit width. This handles
     // cancellation and reduces any pair to at most one pure SSA rotation.
@@ -1228,6 +1273,7 @@ ExpressionPtr simplify(const ExpressionPtr &input) {
     if (auto carry = simplify_carry_recombination(result)) return carry;
     if (auto low_bit = simplify_lowest_set_bit(result)) return low_bit;
     if (auto additive = simplify_additive_cancellation(result)) return additive;
+    if (auto factored = simplify_product_factoring(result)) return factored;
     if (auto rotation = simplify_rotate_cancellation(result)) return rotation;
     const auto *lc = std::get_if<ConstantValue>(&left->value);
     const auto *rc = std::get_if<ConstantValue>(&right->value);
