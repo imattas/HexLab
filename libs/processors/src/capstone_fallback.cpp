@@ -486,9 +486,19 @@ void apply_capstone_detail(csh handle, const cs_insn& insn, Instruction& out, Ar
         const auto has_register=[&](const auto &set,uint8_t count,unsigned reg){
             return std::find(set.begin(),set.begin()+count,reg)!=set.begin()+count;
         };
+        // MOS65XX has no cs_regs_access callback in the bundled backend.
+        // These exact NMOS encodings still prove the accumulator's role.
+        const bool accumulator_shift = m.am == MOS65XX_AM_ACC && insn.size == 1 &&
+            ((insn.id == MOS65XX_INS_ASL && insn.bytes[0] == 0x0a) ||
+             (insn.id == MOS65XX_INS_ROL && insn.bytes[0] == 0x2a) ||
+             (insn.id == MOS65XX_INS_LSR && insn.bytes[0] == 0x4a) ||
+             (insn.id == MOS65XX_INS_ROR && insn.bytes[0] == 0x6a));
         for(unsigned i=0;i<m.op_count;i++){
             const auto &op=m.operands[i];
-            if(op.type==MOS65XX_OP_REG&&known){
+            if(op.type==MOS65XX_OP_REG && accumulator_shift && op.reg==MOS65XX_REG_ACC){
+                out.operands.emplace_back(RegisterOperand{RegisterBank::mos6502,0,8,false});
+                out.access.push_back(OperandAccess::read_write);
+            }else if(op.type==MOS65XX_OP_REG&&known){
                 auto r=named_register(handle,op.reg,8,architecture);if(!r)continue;
                 const bool rd=has_register(reads,nr,op.reg),wr=has_register(writes,nw,op.reg);
                 if(rd||wr){out.operands.emplace_back(*r);out.access.push_back(rd&&wr?OperandAccess::read_write:wr?OperandAccess::write:OperandAccess::read);}
@@ -496,7 +506,7 @@ void apply_capstone_detail(csh handle, const cs_insn& insn, Instruction& out, Ar
                 out.operands.emplace_back(ImmediateOperand{op.imm,8,8,false,{}});
                 out.access.push_back(OperandAccess::read);
             }else if(op.type==MOS65XX_OP_MEM){
-                MemoryOperand mem;mem.address_width=16;mem.data_width=8;
+                MemoryOperand mem;mem.address_width=16;
                 mem.displacement=static_cast<std::int64_t>(op.mem);
                 switch(m.am){
                 case MOS65XX_AM_ZP_X:case MOS65XX_AM_ABS_X:case MOS65XX_AM_ZP_X_IND:case MOS65XX_AM_ABS_X_IND:
@@ -513,6 +523,12 @@ void apply_capstone_detail(csh handle, const cs_insn& insn, Instruction& out, Ar
                 const bool relative_target = (m.am==MOS65XX_AM_REL && i==0) ||
                     (m.am==MOS65XX_AM_ZP_REL && i==1);
                 const auto access = relative_target ? OperandAccess::address : memory_access;
+                if (access != OperandAccess::address) mem.data_width = 8;
+                // JMP ($hhhh) fetches a two-byte pointer, not a data byte.
+                // The NMOS page-wrap behavior is not expressible here.
+                if (insn.id==MOS65XX_INS_JMP && m.am==MOS65XX_AM_ABS_IND &&
+                    insn.size==3 && insn.bytes[0]==0x6c)
+                    mem.data_width=16;
                 out.operands.emplace_back(mem);out.access.push_back(access);
                 out.memory_read |= access==OperandAccess::read || access==OperandAccess::read_write;
                 out.memory_write |= access==OperandAccess::write || access==OperandAccess::read_write;
@@ -650,6 +666,12 @@ void apply_capstone_detail(csh handle, const cs_insn& insn, Instruction& out, Ar
         if(complete) { out.register_reads=std::move(rr); out.register_writes=std::move(rw); }
     }
     if (architecture == Architecture::mos6502) {
+        // Do this after cs_regs_access, which may replace the register sets.
+        // An address index is read even when the data operand is write-only.
+        for (const auto &operand : out.operands) {
+            if (const auto *memory = std::get_if<MemoryOperand>(&operand); memory && memory->index)
+                add_unique(out.register_reads, *memory->index);
+        }
         const auto reg = [](std::uint8_t index) {
             return RegisterOperand{RegisterBank::mos6502, index, 8, false};
         };
