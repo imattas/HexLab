@@ -357,7 +357,7 @@ void usage(std::ostream &out) {
            "  project --help                            Persistent projects and editing\n"
            "  plugins scan|dependencies <dir> [options] Inspect native plugins\n"
            "  processors [--json]                      List decoder variants\n"
-           "  archive, jar, dex, jvm, macho, firmware, xcoff32 Format-specific commands\n\n"
+           "  archive, jar, dex, jvm, elf, macho, firmware, xcoff32 Format-specific commands\n\n"
            "Hex dump options:\n"
            "  --offset <bytes>   Start at this file offset (default 0)\n"
            "  --length <bytes>   Number of bytes to print (default: to end of file)\n"
@@ -3732,6 +3732,8 @@ int run_cli(std::span<const std::wstring_view> arguments, std::ostream &out, std
         return dex_command(arguments.subspan(1), out, err);
     if (arguments[0] == L"macho")
         return macho_chained_targets_command(arguments.subspan(1), out, err);
+    if (arguments[0] == L"elf")
+        return run_elf_debug_companion_cli(arguments.subspan(1), out, err);
     if (arguments[0] == L"firmware")
         return firmware_command(arguments.subspan(1), out, err);
     if (arguments[0] == L"xcoff32")

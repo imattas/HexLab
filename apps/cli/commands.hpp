@@ -6,6 +6,7 @@ namespace hexlab::cli {
 // arguments excludes the executable name; paths stay native Unicode.
 int run_cli(std::span<const std::wstring_view> arguments,std::ostream& out,std::ostream& err);
 int run_compare_cli(std::span<const std::wstring_view> arguments,std::ostream& out,std::ostream& err);
+int run_elf_debug_companion_cli(std::span<const std::wstring_view> arguments,std::ostream& out,std::ostream& err);
 int run_uefi_firmware_cli(std::span<const std::wstring_view> arguments,std::ostream& out,std::ostream& err);
 int run_uefi_capsule_cli(std::span<const std::wstring_view> arguments,std::ostream& out,std::ostream& err);
 int run_intel_fit_cli(std::span<const std::wstring_view> arguments,std::ostream& out,std::ostream& err);

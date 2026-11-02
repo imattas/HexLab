@@ -43,6 +43,12 @@ also needs a separately checksum-verified supplementary object. It uses the
 existing bounded DWP importer; unsupported debug data still produces its normal
 diagnostics. It does not search directories or download symbols.
 
+Local GNU separate-debug files can be discovered and identity-checked with
+`hexlab_cli elf debug-companions <primary>`. Use `--debug-dir`, `--sysroot`, or
+explicit `--candidate` files to control the bounded search; `--json` emits the
+candidate report. This catalogs local identities without importing external
+DWARF. See [ELF debug companions](elf-debug-companion-verification.md).
+
 Segmented raw inputs use `--format raw --profile mapping.profile`; see [x86 profiles](x86-profiles.md). Project commands accept `seg:<selector>:<offset>` with hexadecimal coordinates resolved against the embedded profile. Domain identity remains separate from canonical file offsets.
 
 Portable types, source origins, and symbolic assignments can be exchanged with `project types export/import`; `project types verify` checks a bundle without opening a project. `project types export-header` writes supported definitions as an atomic C11 header and rejects existing outputs unless `--replace` is supplied. HXTL v6 file-offset assignments require an exact binary size and SHA-256 match; on mismatch or older bundles without that identity, definitions still import while assignments are skipped. Virtual-address assignments also require matching source and recipe identity. See [type libraries](type-library.md) for identity and conflict options.

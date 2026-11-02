@@ -125,6 +125,8 @@ install(FILES README.md CHANGELOG.md docs/building.md docs/project-cli.md docs/p
   DESTINATION "${CMAKE_INSTALL_DATADIR}/hexlab/docs")
 install(FILES docs/jvm-module-path.md docs/riscv-fcsr.md docs/ppc-carry-arithmetic.md
   DESTINATION "${CMAKE_INSTALL_DATADIR}/hexlab/docs")
+install(FILES docs/elf-debug-companion-verification.md
+  DESTINATION "${CMAKE_INSTALL_DATADIR}/hexlab/docs")
 
 # Produce a relocatable, multi-file archive of the complete install tree.
 # Runtime libraries remain separate files beside the tools by design.
