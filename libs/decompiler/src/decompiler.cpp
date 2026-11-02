@@ -11419,7 +11419,7 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
         for (const auto &block : function.blocks) {
             if (!ids.insert(block.id.value).second ||
                 !addresses.emplace(block.begin.space.value, block.begin.offset).second ||
-                block.switch_dispatch || block.memory_phi || !block.memory_partition_phis.empty() ||
+                block.switch_dispatch ||
                 !has_only_simple_statements(block)) return {};
             // This loop proof requires a returning cleanup. Explicit nonreturn
             // transfers keep their state-machine or label/goto representation.
@@ -11443,7 +11443,8 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
         std::vector<const LiftedBlock *> preheader_path;
         auto *header = entry;
         while (header && !terminal_conditional(*header) && preheader_path.size() < 64) {
-            if (!header->phis.empty() || contains_return(*header) ||
+            if (!header->phis.empty() || header->memory_phi || !header->memory_partition_phis.empty() ||
+                contains_return(*header) ||
                 header->successors.size() != 1 || !header->successors.front().target ||
                 (header->successors.front().kind != BlockEdgeKind::jump &&
                  header->successors.front().kind != BlockEdgeKind::fallthrough) ||
@@ -11454,7 +11455,8 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
             if (predecessors[header->id.value] != predecessor) return {};
             header = find_block(*header->successors.front().target);
         }
-        if (!header || preheader_path.empty() || contains_return(*header) || !terminal_conditional(*header) ||
+        if (!header || preheader_path.empty() || header->memory_phi || !header->memory_partition_phis.empty() ||
+            contains_return(*header) || !terminal_conditional(*header) ||
             header->successors.size() != 2 || !conditional_edges_match_targets(*header, *terminal_conditional(*header)))
             return {};
         const auto *dispatch = terminal_conditional(*header);
@@ -11483,36 +11485,41 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
 
         // Distinguish a conditional latch's cleanup edge from an in-loop
         // continuation without claiming either path speculatively. Only an
-        // exact, bounded unconditional chain to a terminal return proves an
-        // exit; another conditional or backedge must be traced as loop work.
+        // exact, bounded returning DAG proves an exit; a conditional or
+        // backedge outside that DAG must be traced as loop work.
         // Ownership and predecessor/phi coverage are proved separately below.
         enum class RepeatSibling { cleanup, continuation, unsupported };
         const auto is_bounded_returning_cleanup = [&](Address start) {
-            std::set<std::uint64_t> seen;
-            std::size_t visited = 0;
+            std::set<std::uint64_t> active, complete;
             std::function<bool(Address, unsigned)> visit;
             visit = [&](Address at, unsigned depth) -> bool {
-                if (depth >= 64 || ++visited > 64) return false;
+                if (depth >= 64) return false;
                 const auto *block = find_block(at);
-                const bool cleanup_head = at == start;
                 if (!block || block == header || claimed.contains(block->id.value) ||
-                    !seen.insert(block->id.value).second || block->switch_dispatch ||
-                    (!cleanup_head && !block->phis.empty()) || block->memory_phi || !block->memory_partition_phis.empty() ||
+                    active.contains(block->id.value) || block->switch_dispatch ||
                     !has_only_simple_statements(*block)) return false;
-                if (has_only_terminal_return(*block)) return true;
+                if (complete.contains(block->id.value)) return true;
+                if (active.size() + complete.size() >= 64) return false;
+                active.insert(block->id.value);
+                const auto finish = [&]() {
+                    active.erase(block->id.value);
+                    complete.insert(block->id.value);
+                    return true;
+                };
+                if (has_only_terminal_return(*block)) return finish();
                 if (contains_return(*block)) return false;
                 if (const auto *branch = terminal_conditional(*block)) {
                     if (!conditional_edges_match_targets(*block, *branch) || block->successors.size() != 2 ||
                         !branch->true_target || !branch->false_target ||
                         *branch->true_target == *branch->false_target) return false;
                     return visit(*branch->true_target, depth + 1) &&
-                           visit(*branch->false_target, depth + 1);
+                           visit(*branch->false_target, depth + 1) && finish();
                 }
                 if (block->successors.size() != 1 || !block->successors.front().target ||
                     (block->successors.front().kind != BlockEdgeKind::jump &&
                      block->successors.front().kind != BlockEdgeKind::fallthrough) ||
                     !has_unconditional_edge(*block, *block->successors.front().target)) return false;
-                return visit(*block->successors.front().target, depth + 1);
+                return visit(*block->successors.front().target, depth + 1) && finish();
             };
             return visit(start, 0);
         };
@@ -11629,67 +11636,73 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                 return expected;
             }() || predecessors[exit->id.value] != exit_latch_ids) return {};
 
-        // Only conditional latch exits merge at the cleanup head. That head may
-        // carry register phis; after it, a bounded disjoint decision tree may
-        // select a returning cleanup arm. Every edge has one exact predecessor
-        // and every arm terminates in its own explicit return.
-        struct CleanupTreeNode {
-            std::vector<const LiftedBlock *> path;
-            const LiftedBlock *branch_block = nullptr;
+        // Prove unique cleanup nodes first. Shared tails are copied only during
+        // emission, with the original incoming edge's simultaneous phi copies.
+        struct CleanupNode {
+            const LiftedBlock *block = nullptr;
             const Branch *condition = nullptr;
-            std::size_t true_child = 0;
-            std::size_t false_child = 0;
+            std::vector<std::size_t> children;
         };
-        std::vector<CleanupTreeNode> cleanup_tree;
-        std::size_t cleanup_block_count = 0;
-        std::function<std::optional<std::size_t>(Address, std::set<std::uint64_t>, unsigned)> trace_cleanup;
-        trace_cleanup = [&](Address start, std::set<std::uint64_t> expected,
-                            unsigned depth) -> std::optional<std::size_t> {
-            if (depth >= 64 || cleanup_tree.size() >= 64) return {};
-            const auto index = cleanup_tree.size();
-            cleanup_tree.emplace_back();
-            auto *current = find_block(start);
-            auto predecessor = std::move(expected);
-            while (current && cleanup_block_count < 64 &&
-                   predecessors[current->id.value] == predecessor) {
-                const bool cleanup_head = current == exit;
-                if ((!cleanup_head && !current->phis.empty()) || current->switch_dispatch ||
-                    current->memory_phi || !current->memory_partition_phis.empty() ||
-                    !has_only_simple_statements(*current) || !claimed.insert(current->id.value).second)
-                    return {};
-                ++cleanup_block_count;
-                const auto *condition = terminal_conditional(*current);
-                if (condition) {
-                    if (!conditional_edges_match_targets(*current, *condition) || current->successors.size() != 2 ||
-                        !condition->true_target || !condition->false_target ||
-                        *condition->true_target == *condition->false_target) return {};
-                    cleanup_tree[index].branch_block = current;
-                    cleanup_tree[index].condition = condition;
-                    const auto yes = trace_cleanup(*condition->true_target, {current->id.value}, depth + 1);
-                    if (!yes) return {};
-                    const auto no = trace_cleanup(*condition->false_target, {current->id.value}, depth + 1);
-                    if (!no) return {};
-                    cleanup_tree[index].true_child = *yes;
-                    cleanup_tree[index].false_child = *no;
-                    return index;
-                }
-                if (has_only_terminal_return(*current)) {
-                    cleanup_tree[index].path.push_back(current);
-                    return index;
-                }
+        std::vector<CleanupNode> cleanup;
+        std::map<std::uint64_t, std::size_t> cleanup_indices;
+        std::set<std::uint64_t> cleanup_active;
+        std::function<std::optional<std::size_t>(Address, unsigned)> trace_cleanup;
+        trace_cleanup = [&](Address start, unsigned depth) -> std::optional<std::size_t> {
+            const auto *current = find_block(start);
+            if (!current || depth >= 64 || cleanup_active.contains(current->id.value)) return {};
+            if (const auto found = cleanup_indices.find(current->id.value); found != cleanup_indices.end())
+                return found->second;
+            if (cleanup.size() >= 64 || current->switch_dispatch || !has_only_simple_statements(*current) ||
+                !claimed.insert(current->id.value).second) return {};
+            const auto index = cleanup.size();
+            cleanup_indices.emplace(current->id.value, index);
+            cleanup_active.insert(current->id.value);
+            cleanup.push_back(CleanupNode{current, terminal_conditional(*current), {}});
+            const auto *condition = cleanup[index].condition;
+            std::vector<Address> targets;
+            if (condition) {
+                if (contains_return(*current) || !conditional_edges_match_targets(*current, *condition) ||
+                    current->successors.size() != 2 || !condition->true_target || !condition->false_target ||
+                    *condition->true_target == *condition->false_target) return {};
+                targets = {*condition->true_target, *condition->false_target};
+            } else if (!has_only_terminal_return(*current)) {
                 if (contains_return(*current) || current->successors.size() != 1 ||
                     !current->successors.front().target ||
                     (current->successors.front().kind != BlockEdgeKind::jump &&
                      current->successors.front().kind != BlockEdgeKind::fallthrough) ||
                     !has_unconditional_edge(*current, *current->successors.front().target)) return {};
-                cleanup_tree[index].path.push_back(current);
-                predecessor = {current->id.value};
-                current = find_block(*current->successors.front().target);
+                targets = {*current->successors.front().target};
             }
-            return {};
+            for (const auto target : targets) {
+                const auto child = trace_cleanup(target, depth + 1);
+                if (!child) return {};
+                cleanup[index].children.push_back(*child);
+            }
+            cleanup_active.erase(current->id.value);
+            return index;
         };
-        const auto cleanup_root = trace_cleanup(exit->begin, exit_latch_ids, 0);
-        if (!cleanup_root || cleanup_block_count == 0 || claimed.size() != function.blocks.size()) return {};
+        const auto cleanup_root = trace_cleanup(exit->begin, 0);
+        if (!cleanup_root || claimed.size() != function.blocks.size()) return {};
+        std::map<std::uint64_t, std::set<std::uint64_t>> cleanup_predecessors;
+        cleanup_predecessors[exit->id.value] = exit_latch_ids;
+        for (const auto &node : cleanup)
+            for (const auto child : node.children)
+                cleanup_predecessors[cleanup[child].block->id.value].insert(node.block->id.value);
+        for (const auto &node : cleanup)
+            if (predecessors[node.block->id.value] != cleanup_predecessors[node.block->id.value]) return {};
+
+        // Preflight every duplicated occurrence before writing to the output.
+        // A shared node's statements stay under each original guarded path.
+        std::size_t cleanup_occurrences = 0;
+        std::vector<unsigned> cleanup_copies(cleanup.size());
+        std::function<bool(std::size_t, unsigned)> prove_expansion;
+        prove_expansion = [&](std::size_t index, unsigned depth) {
+            if (depth >= 64 || ++cleanup_occurrences > 4096 || ++cleanup_copies[index] > 64) return false;
+            for (const auto child : cleanup[index].children)
+                if (!prove_expansion(child, depth + 1)) return false;
+            return true;
+        };
+        if (!prove_expansion(*cleanup_root, 0)) return {};
 
         std::size_t phi_input_count = 0;
         const auto build_copies = [&](const LiftedBlock &target, const std::set<std::uint64_t> &expected,
@@ -11714,11 +11727,32 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
             }
             return true;
         };
-        std::map<std::uint64_t, std::vector<std::pair<std::string, std::string>>> header_copies, exit_copies;
+        using EdgeCopies = std::map<std::uint64_t, std::vector<std::pair<std::string, std::string>>>;
+        EdgeCopies header_copies;
+        std::map<std::uint64_t, EdgeCopies> cleanup_edge_copies;
         auto header_predecessors = latch_ids;
         header_predecessors.insert(preheader->id.value);
-        if (!build_copies(*header, header_predecessors, header_copies) ||
-            !build_copies(*exit, exit_latch_ids, exit_copies)) return {};
+        if (!build_copies(*header, header_predecessors, header_copies)) return {};
+        for (const auto &node : cleanup) {
+            const auto &block = *node.block;
+            const auto &expected = cleanup_predecessors[block.id.value];
+            if (!build_copies(block, expected, cleanup_edge_copies[block.id.value])) return {};
+            const auto valid_memory_inputs = [&](const auto &inputs) {
+                if (inputs.size() != expected.size() || inputs.size() > 65536 - phi_input_count) return false;
+                phi_input_count += inputs.size();
+                std::set<std::uint64_t> seen;
+                for (const auto &input : inputs)
+                    if (!expected.contains(input.predecessor.value) ||
+                        !seen.insert(input.predecessor.value).second) return false;
+                return seen == expected;
+            };
+            if (block.memory_phi && !valid_memory_inputs(block.memory_phi->inputs)) return {};
+            if (block.memory_partition_phis.size() > 4096) return {};
+            std::set<std::string> partitions;
+            for (const auto &phi : block.memory_partition_phis)
+                if (phi.partition.empty() || !partitions.insert(phi.partition).second ||
+                    !valid_memory_inputs(phi.inputs)) return {};
+        }
 
         std::function<void(std::size_t, unsigned)> emit_tree;
         emit_tree = [&](std::size_t index, unsigned indent) {
@@ -11747,7 +11781,8 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                     if (node.continuation_child) {
                         emit_tree(*node.continuation_child, indent + 4);
                     } else {
-                        emit_parallel_copies(out, exit_copies[node.branch_block->id.value], indent + 4);
+                        emit_parallel_copies(out,
+                            cleanup_edge_copies[exit->id.value][node.branch_block->id.value], indent + 4);
                         emit_transfer("break", indent + 4);
                     }
                 };
@@ -11765,17 +11800,22 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
             out << spaces << "}\n";
         };
 
-        std::function<void(std::size_t, unsigned)> emit_cleanup_tree;
-        emit_cleanup_tree = [&](std::size_t index, unsigned indent) {
-            const auto &node = cleanup_tree[index];
-            for (const auto *block : node.path) emit_block(*block, indent, true);
-            if (!node.branch_block || !node.condition) return;
-            emit_block(*node.branch_block, indent, true);
+        std::function<void(std::size_t, std::optional<std::uint64_t>, unsigned)> emit_cleanup;
+        emit_cleanup = [&](std::size_t index, std::optional<std::uint64_t> predecessor, unsigned indent) {
+            const auto &node = cleanup[index];
+            if (predecessor)
+                emit_parallel_copies(out, cleanup_edge_copies[node.block->id.value][*predecessor], indent);
+            emit_block(*node.block, indent, true);
+            if (node.children.empty()) return;
+            if (!node.condition) {
+                emit_cleanup(node.children.front(), node.block->id.value, indent);
+                return;
+            }
             const std::string spaces(indent, ' ');
             out << spaces << "if (" << branch_condition_text(*node.condition) << ") {\n";
-            emit_cleanup_tree(node.true_child, indent + 4);
+            emit_cleanup(node.children[0], node.block->id.value, indent + 4);
             out << spaces << "} else {\n";
-            emit_cleanup_tree(node.false_child, indent + 4);
+            emit_cleanup(node.children[1], node.block->id.value, indent + 4);
             out << spaces << "}\n";
         };
 
@@ -11789,7 +11829,7 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
         out << "        } else {\n";
         emit_tree(roots[1], 12);
         out << "        }\n    }\n";
-        emit_cleanup_tree(*cleanup_root, 4);
+        emit_cleanup(*cleanup_root, std::nullopt, 4);
         out << "}\n";
         return StructuredPseudocode{out.str(), false, {}};
     };

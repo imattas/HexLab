@@ -22,10 +22,10 @@ equal the preheader plus **all** proven latches. The cleanup head predecessor
 set must equal only the **conditional exit** latches. Unconditional latches
 and interior repeat guards cannot supply cleanup phi inputs because those
 edges never reach cleanup. Each repeat guard's sibling is classified by a
-bounded lookahead: a resolved unconditional chain ending in an explicit return
-is an exit candidate; a chain ending in another conditional or backedge must
-pass the full in-loop subtree proof. Cycles, unresolved transfers, and an
-exhausted lookahead reject the entire candidate.
+bounded lookahead: a resolved unconditional chain or acyclic conditional graph
+whose leaves all return is an exit candidate; other conditional or backedge
+paths must pass the full in-loop subtree proof. Cycles, unresolved transfers,
+and an exhausted lookahead reject the entire candidate.
 
 Header register phis must exactly cover the preheader and every proven latch;
 cleanup-head register phis must exactly cover the conditional exit latches.
@@ -51,25 +51,52 @@ header phi inputs alongside the preheader. If only `finish` can leave the
 loop, it alone supplies the cleanup phi input. The `retry_now` predicate is
 evaluated once, and only its repeat edge receives its header copies.
 
-The cleanup contains at most 64 blocks and every path ends in an explicit
-return. It may be a disjoint conditional decision tree: each conditional has
-two distinct arms, each arm has one exact predecessor, and no blocks are shared
-between arms. Only the cleanup head may carry register phis, and those inputs
-must exactly cover the conditional exit latches. Other cleanup blocks are
-phi-free; linear links are unconditional jumps or fallthroughs. All function
-blocks must be uniquely claimed by the preheader, header, loop tree, or cleanup.
-The formatter emits the cleanup once after the loop and emits conditional arms
+The cleanup contains at most 64 unique blocks and every path ends in an explicit
+return. It may be an acyclic graph with nested conditionals, shared terminal
+returns, shared nonterminal cleanup tails, and overlapping joins. Each
+conditional has two distinct, exact true/false targets; linear links are
+unconditional jumps or fallthroughs. Only conditional exit latches may enter
+the cleanup head. Every other cleanup block's predecessor set must equal the
+incoming edges discovered inside the cleanup graph. All function blocks must
+be uniquely owned by the preheader, header, loop tree, or cleanup.
+
+Every cleanup block may carry register phis when the inputs exactly cover its
+original CFG predecessors and destinations are unique. Copies at the cleanup
+head execute on the selected loop-exit edge. Copies at an interior cleanup
+block execute before its statements, using the actual incoming predecessor ID.
+Whole-memory and partition-memory phis are accepted throughout cleanup with
+the same exact predecessor proof, nonempty unique partition names, at most
+4,096 partition phis per block, and a combined 65,536 input budget including
+register phis. Memory tokens are analysis-only; original memory statements
+remain in their guarded blocks.
+
+For example, cleanup block `E` may branch directly to shared block `J` or to
+`K`, which in turn selects `J` or a separate return. A register phi at `J` must
+have exactly the original predecessors `{E, K}`. The direct arm copies the
+`E` input before its copy of `J`; the arm through `K` copies the `K` input.
+If `J` contains another conditional or cleanup tail, it remains inside those
+same guards. Its outgoing edges still use `J` as their original predecessor,
+even though the formatter emits two copies of its source text.
+
+The formatter emits cleanup after the loop, duplicating shared tails beneath
+their incoming predicates. A selected invocation executes exactly one original
+path, so copied side effects are neither hoisted nor repeated on that path.
+Before output begins, expansion is checked against 4,096 block occurrences,
+64 occurrences of any one block, and 64 blocks on a path. Conditional arms emit
 in deterministic true/false order. New `continue` and `break` transfers retain
 their source instruction address (block begin for an empty block) and block ID.
 
-Whole-memory or partition phis, side entries, extra exits, switch dispatch,
-shared or overlapping loop arms, irreducible flow, malformed edge metadata,
+Whole-memory or partition phis outside cleanup, external side entries, extra
+exits, switch dispatch, shared or overlapping loop arms, irreducible flow, malformed edge metadata,
 and exhausted bounds are not accepted by this recognizer. All-unconditional
 trees without a proven exit and nonreturn exits (including `throw`,
 `rethrow_current_exception`, and `exception_unhandled`) remain unsupported.
-Cleanup joins, shared terminal returns, side entries, and register phis after
-the cleanup head also remain unsupported. Shared in-loop subtrees, including
-merges between repeat-guard siblings, remain unsupported even when their header
+Cleanup cycles, malformed phis, and expansion beyond the stated budgets remain
+unsupported. Shared in-loop subtrees, including merges between repeat-guard
+siblings, remain unsupported even when their header
 inputs are complete. Those shapes continue through the existing
 region/state-machine/explicit-goto formatters; no partial rendering from this
 recognizer is retained.
+
+The November 2 cleanup-DAG extension is verified by Windows and WSL library
+builds and static review only; no tests were added or run in that session.

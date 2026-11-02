@@ -718,3 +718,23 @@ source growth and bound the recursive emitter's native stack use. Exceeding a
 bound discards the entire partial rendering and uses the existing state-machine
 or label/goto fallback. Cycles, unresolved edges, incomplete switch metadata,
 and malformed phi inputs retain that fallback as well.
+
+The explicit-preheader multi-latch loop recognizer also accepts a returning
+cleanup DAG after its single shared exit head. Cleanup can contain nested
+conditionals with shared terminal or nonterminal tails and overlapping joins.
+Every node's original predecessor set and register/whole-memory/partition-memory
+phi inputs must match exactly; only the proven conditional exit latches may
+enter the cleanup head, and only cleanup nodes may enter other cleanup nodes.
+The original loop ownership proof remains unchanged. Copies into the head stay
+on selected loop-exit edges; copies into interior nodes use their original
+incoming edge before statements or predicates execute. Shared cleanup tails
+are duplicated under their incoming predicates, preserving guarded side effects.
+
+This form permits at most 64 unique cleanup blocks, 64 blocks per path, 4,096
+expanded block occurrences, and 64 copies of a node. Expansion is proved before
+rendering. Cleanup leaves must explicitly return. Cycles, switches, external
+side entries, nonreturn leaves, shared in-loop subtrees, malformed phis, and
+exceeded budgets retain fallback. The November 2 extension was checked by
+static review and Windows/WSL library builds with `BUILD_TESTING=OFF`; no tests
+were added or run. See `libs/decompiler/docs/multi-latch-loops.md` for the full
+shape and SSA limits.
