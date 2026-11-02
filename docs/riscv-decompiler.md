@@ -68,13 +68,16 @@ NaNs, and mismatched value types stay symbolic. See
 The H forms require Zfh; the decoder does not currently enforce extension
 availability, and the lifter does not model physical FPR NaN-boxing.
 
-Zfa `FLI.S` and `FLI.D` decode the complete five-bit immediate selector table
+Zfa `FLI.H`, `FLI.S`, and `FLI.D` decode the complete five-bit immediate selector table
 from the FMV encoding with `rs2=1`. The selector is retained as an immediate,
 not a fictitious GPR dependency. Lifting maps each selector to its exact IEEE
-binary32 or binary64 bit pattern, including the format-specific minimum normal,
-positive infinity, and canonical quiet NaN. FLI writes only its FPR destination
-and does not read or update `frm` or `fflags`. FLI.H/Q and the remaining Zfa
-rounding/minimum families remain unsupported.
+binary16, binary32, or binary64 bit pattern through the shared processor semantic
+helper, including the format-specific minimum normal, positive infinity, and
+canonical quiet NaN. FLI writes only its FPR destination
+and does not read or update `frm` or `fflags`. FLI.H includes subnormal selectors
+2/3 and positive infinity for both selectors 29/30. The H form requires Zfh or
+Zvfh; extension availability and physical FPR NaN-boxing are not modeled. FLI.Q
+remains unsupported. See [Zfa immediate loads](riscv-fli.md).
 
 Encodings and effects follow the official
 [F extension](https://docs.riscv.org/reference/isa/v20260120/unpriv/f-st-ext.html),

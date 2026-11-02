@@ -110,6 +110,11 @@ NaNs. This bit-level operation does not use host floating-point or update
 `fflags`; the caller supplies a raw binary32 value with no upper bits set or a
 raw binary64 value. NaN-box validation for scalar S operands remains outside
 this evaluator.
+Zfa FLI.H/S/D decode all 32 immediate selectors at either XLEN, with a single
+FPR destination and no GPR or floating-status dependencies. The shared semantic
+helper returns exact logical binary16/32/64 bits and their width, and typed
+lifting reuses that result. FLI.H retains its subnormal and infinity table
+entries; see [Zfa immediate loads](riscv-fli.md).
 The Zfa FROUND.H/S/D and FROUNDNX.H/S/D round-to-integral forms are decoded with
 their selected rounding mode and lifted as typed floating-point intrinsics.
 The processor semantics API also evaluates their raw binary16/binary32/binary64

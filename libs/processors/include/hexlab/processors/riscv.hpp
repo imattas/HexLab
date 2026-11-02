@@ -129,7 +129,9 @@ enum class RiscvOpcode {
     // RVV scalar-over-vector floating divide; appended for serialized ID stability.
     vfrdiv_vf,
     // RVV FP-to-integer conversions, appended for stable opcode IDs.
-    vfcvt_xu_f_v, vfcvt_x_f_v
+    vfcvt_xu_f_v, vfcvt_x_f_v,
+    // Zfa half-precision immediate load; append to preserve serialized IDs.
+    fli_h
 };
 
 struct RiscvRegister {

@@ -245,6 +245,16 @@ HEXLAB_PROCESSORS_EXPORT std::optional<std::uint64_t>
 evaluate_riscv_zicond_operation(RiscvOpcode opcode, unsigned xlen, std::uint64_t value,
                                 std::uint64_t condition) noexcept;
 
+struct RiscvFloatingImmediateResult {
+    std::uint64_t value = 0; // logical IEEE-754 bits, without physical FPR NaN-boxing.
+    std::uint8_t width = 0; // binary16, binary32, or binary64.
+};
+
+// Evaluate a Zfa FLI.H/S/D five-bit selector. All 32 selectors are valid;
+// unsupported opcodes and selectors above 31 fail closed. No flags are raised.
+HEXLAB_PROCESSORS_EXPORT std::optional<RiscvFloatingImmediateResult>
+evaluate_riscv_fli_operation(RiscvOpcode opcode, unsigned selector) noexcept;
+
 struct RiscvIntegerConversionResult {
     std::uint64_t value = 0; // destination-register bits; word results are sign-extended.
     std::uint8_t fflags_set = 0; // accrued exception bits: NX=1, UF=2, OF=4, DZ=8, NV=16.

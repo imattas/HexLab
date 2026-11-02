@@ -1645,6 +1645,44 @@ evaluate_riscv_zicond_operation(RiscvOpcode opcode, unsigned xlen, std::uint64_t
     }
 }
 
+std::optional<RiscvFloatingImmediateResult>
+evaluate_riscv_fli_operation(RiscvOpcode opcode, unsigned selector) noexcept {
+    if (selector > 31) return {};
+    static constexpr std::uint16_t half_bits[32]{
+        0xbc00, 0x0400, 0x0100, 0x0200,
+        0x1c00, 0x2000, 0x2c00, 0x3000,
+        0x3400, 0x3500, 0x3600, 0x3700,
+        0x3800, 0x3900, 0x3a00, 0x3b00,
+        0x3c00, 0x3d00, 0x3e00, 0x3f00,
+        0x4000, 0x4100, 0x4200, 0x4400,
+        0x4800, 0x4c00, 0x5800, 0x5c00,
+        0x7800, 0x7c00, 0x7c00, 0x7e00};
+    static constexpr std::uint32_t single_bits[32]{
+        0xbf800000, 0x00800000, 0x37800000, 0x38000000,
+        0x3b800000, 0x3c000000, 0x3d800000, 0x3e000000,
+        0x3e800000, 0x3ea00000, 0x3ec00000, 0x3ee00000,
+        0x3f000000, 0x3f200000, 0x3f400000, 0x3f600000,
+        0x3f800000, 0x3fa00000, 0x3fc00000, 0x3fe00000,
+        0x40000000, 0x40200000, 0x40400000, 0x40800000,
+        0x41000000, 0x41800000, 0x43000000, 0x43800000,
+        0x47000000, 0x47800000, 0x7f800000, 0x7fc00000};
+    static constexpr std::uint64_t double_bits[32]{
+        0xbff0000000000000, 0x0010000000000000, 0x3ef0000000000000, 0x3f00000000000000,
+        0x3f70000000000000, 0x3f80000000000000, 0x3fb0000000000000, 0x3fc0000000000000,
+        0x3fd0000000000000, 0x3fd4000000000000, 0x3fd8000000000000, 0x3fdc000000000000,
+        0x3fe0000000000000, 0x3fe4000000000000, 0x3fe8000000000000, 0x3fec000000000000,
+        0x3ff0000000000000, 0x3ff4000000000000, 0x3ff8000000000000, 0x3ffc000000000000,
+        0x4000000000000000, 0x4004000000000000, 0x4008000000000000, 0x4010000000000000,
+        0x4020000000000000, 0x4030000000000000, 0x4060000000000000, 0x4070000000000000,
+        0x40e0000000000000, 0x40f0000000000000, 0x7ff0000000000000, 0x7ff8000000000000};
+    switch (opcode) {
+    case RiscvOpcode::fli_h: return RiscvFloatingImmediateResult{half_bits[selector], 16};
+    case RiscvOpcode::fli_s: return RiscvFloatingImmediateResult{single_bits[selector], 32};
+    case RiscvOpcode::fli_d: return RiscvFloatingImmediateResult{double_bits[selector], 64};
+    default: return {};
+    }
+}
+
 std::optional<RiscvIntegerConversionResult>
 evaluate_riscv_fcvtmod_w_d(std::uint64_t source_bits, unsigned xlen) noexcept {
     if (xlen != 32 && xlen != 64) return {};

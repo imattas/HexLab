@@ -851,6 +851,7 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
     if (op == Opcode::rv_fence_tso) return "fence.tso";
     if (op == Opcode::rv_fli_s) return "fli.s";
     if (op == Opcode::rv_fli_d) return "fli.d";
+    if (op == Opcode::rv_fli_h) return "fli.h";
     if (op == Opcode::rv_fround_s) return "fround.s";
     if (op == Opcode::rv_froundnx_s) return "froundnx.s";
     if (op == Opcode::rv_fround_d) return "fround.d";

@@ -4915,36 +4915,22 @@ a64_unhandled:
         const auto dst = as_register(instruction.operands[0]);
         const auto op = instruction.opcode;
         if (auto status_csr = lift_riscv_fstatus_csr(instruction, operands)) return *status_csr;
-        if (op == Opcode::rv_fli_s || op == Opcode::rv_fli_d) {
+        if (op == Opcode::rv_fli_h || op == Opcode::rv_fli_s || op == Opcode::rv_fli_d) {
             const auto *selector = instruction.operands.size() == 2
                 ? std::get_if<ImmediateOperand>(&instruction.operands[1]) : nullptr;
-            const bool single = op == Opcode::rv_fli_s;
-            static constexpr std::uint32_t single_bits[32]{
-                0xbf800000, 0x00800000, 0x37800000, 0x38000000,
-                0x3b800000, 0x3c000000, 0x3d800000, 0x3e000000,
-                0x3e800000, 0x3ea00000, 0x3ec00000, 0x3ee00000,
-                0x3f000000, 0x3f200000, 0x3f400000, 0x3f600000,
-                0x3f800000, 0x3fa00000, 0x3fc00000, 0x3fe00000,
-                0x40000000, 0x40200000, 0x40400000, 0x40800000,
-                0x41000000, 0x41800000, 0x43000000, 0x43800000,
-                0x47000000, 0x47800000, 0x7f800000, 0x7fc00000};
-            static constexpr std::uint64_t double_bits[32]{
-                0xbff0000000000000, 0x0010000000000000, 0x3ef0000000000000, 0x3f00000000000000,
-                0x3f70000000000000, 0x3f80000000000000, 0x3fb0000000000000, 0x3fc0000000000000,
-                0x3fd0000000000000, 0x3fd4000000000000, 0x3fd8000000000000, 0x3fdc000000000000,
-                0x3fe0000000000000, 0x3fe4000000000000, 0x3fe8000000000000, 0x3fec000000000000,
-                0x3ff0000000000000, 0x3ff4000000000000, 0x3ff8000000000000, 0x3ffc000000000000,
-                0x4000000000000000, 0x4004000000000000, 0x4008000000000000, 0x4010000000000000,
-                0x4020000000000000, 0x4030000000000000, 0x4060000000000000, 0x4070000000000000,
-                0x40e0000000000000, 0x40f0000000000000, 0x7ff0000000000000, 0x7ff8000000000000};
             if (!dst || dst->bank != RegisterBank::riscv_fpr || !selector || selector->is_signed ||
-                selector->value > 31 || instruction.register_reads.size() != 0 ||
+                selector->encoded_width != 5 || selector->value > 31 || !instruction.register_reads.empty() ||
+                instruction.access != std::vector<OperandAccess>{OperandAccess::write, OperandAccess::read} ||
+                instruction.rounding_mode || instruction.memory_read || instruction.memory_write ||
                 instruction.register_writes != std::vector<RegisterOperand>{*dst} ||
                 instruction.writes_fflags || instruction.reads_fflags || instruction.reads_frm)
                 return Intrinsic{"riscv_malformed_fli", {}, IntrinsicMemoryEffect::none};
-            const auto type = floating_type(single ? 32 : 64);
-            const std::uint64_t bits = single ? single_bits[selector->value] : double_bits[selector->value];
-            return Assign{*dst, std::make_shared<Expression>(Expression{type, ConstantValue{bits, type}})};
+            const auto operation = op == Opcode::rv_fli_h ? RiscvOpcode::fli_h
+                : op == Opcode::rv_fli_s ? RiscvOpcode::fli_s : RiscvOpcode::fli_d;
+            const auto result = evaluate_riscv_fli_operation(operation, static_cast<unsigned>(selector->value));
+            if (!result) return Intrinsic{"riscv_malformed_fli", {}, IntrinsicMemoryEffect::none};
+            const auto type = floating_type(result->width);
+            return Assign{*dst, std::make_shared<Expression>(Expression{type, ConstantValue{result->value, type}})};
         }
         const auto append_vector_mask = [&](std::vector<ExpressionPtr> &inputs) {
             for (const auto &reg : instruction.register_reads) {
@@ -5074,7 +5060,7 @@ a64_unhandled:
         }
         if ((op >= Opcode::rv_flw && op <= Opcode::rv_fmv_d_x) || op == Opcode::rv_fcvtmod_w_d ||
             (op >= Opcode::rv_fleq_s && op <= Opcode::rv_fltq_d) ||
-            op == Opcode::rv_fli_s || op == Opcode::rv_fli_d ||
+            op == Opcode::rv_fli_h || op == Opcode::rv_fli_s || op == Opcode::rv_fli_d ||
             (op >= Opcode::rv_fround_s && op <= Opcode::rv_froundnx_d) ||
             op == Opcode::rv_fround_h || op == Opcode::rv_froundnx_h) {
             if (auto converted = lift_riscv_fp_conversion(instruction, operands)) return *converted;
