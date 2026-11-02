@@ -48,6 +48,7 @@ class AnalysisIssuesView final : public wxPanel {
         DiagnosticSeverity severity = DiagnosticSeverity::warning;
         std::uint64_t duplicate_ordinal = 0;
         std::string source_identity;
+        std::string document_identity;
         wxString source_label;
         bool stale_import = false;
         bool operator==(const Row &) const = default;
@@ -103,6 +104,7 @@ class AnalysisIssuesView final : public wxPanel {
     std::vector<std::size_t> visible_rows_;
     bool capped_ = false;
     std::optional<DocumentId> document_;
+    std::string file_review_source_identity_;
     std::optional<Location> cursor_;
     std::map<std::uint64_t, Preference> preferences_;
     std::optional<Row> selection_key_;
@@ -128,6 +130,9 @@ class AnalysisIssuesView final : public wxPanel {
     void set_visible_reviewed(bool reviewed);
     void activate_row(std::size_t);
     static std::string review_key(const Row &);
+    std::string stored_review_key(const Row &) const;
+    std::unordered_set<std::string> load_file_reviewed_keys() const;
+    void persist_reviewed_keys();
     bool is_reviewed(const Row &) const;
     wxString finding_text(const Row &) const;
     const Row *selected_issue() const;

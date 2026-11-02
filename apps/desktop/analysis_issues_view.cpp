@@ -5,8 +5,10 @@
 #include "hexlab/image/file_publication.hpp"
 #include "hexlab/image/file_storage.hpp"
 #include "hexlab/workspace/project_analysis.hpp"
+#include "hexlab/core/sha256.hpp"
 
 #include <wx/clipbrd.h>
+#include <wx/config.h>
 #include <wx/dataobj.h>
 #include <wx/filedlg.h>
 #include <wx/msgdlg.h>
@@ -359,11 +361,18 @@ void AnalysisIssuesView::update(std::optional<DocumentId> document, std::shared_
         project.reset();
     }
     const bool changed_document = document_ != document;
-    if (!changed_document && project_ == project && document_snapshot_ == document_snapshot && cursor_ == cursor)
+    const auto incoming_file_identity = document_snapshot && document_snapshot->issue_review_source_identity
+        ? *document_snapshot->issue_review_source_identity : std::string{};
+    const bool changed_review_scope = (bool(project_) != bool(project)) ||
+        file_review_source_identity_ != incoming_file_identity;
+    if (!changed_document && !changed_review_scope && project_ == project &&
+        document_snapshot_ == document_snapshot && cursor_ == cursor)
         return;
-    if (changed_document) {
-        remember_preference();
-        document_ = document;
+    if (changed_document || changed_review_scope) {
+        if (changed_document) {
+            remember_preference();
+            document_ = document;
+        }
         Preference preference;
         if (document_) {
             const auto found = preferences_.find(document_->value);
@@ -376,15 +385,21 @@ void AnalysisIssuesView::update(std::optional<DocumentId> document, std::shared_
         search_->ChangeValue(preference.query);
         scope_entry_ = preference.function;
         selection_key_ = std::move(preference.selected);
-        if (preference.reviewed) reviewed_ = std::move(preference.reviewed);
+        if (preference.reviewed && !changed_review_scope) reviewed_ = std::move(preference.reviewed);
         else {
             reviewed_ = std::make_shared<std::unordered_set<std::string>>();
             if (project && project->state)
                 reviewed_->insert(project->state->reviewed_analysis_issue_keys.begin(),
                                   project->state->reviewed_analysis_issue_keys.end());
+            else if (!incoming_file_identity.empty()) {
+                file_review_source_identity_ = incoming_file_identity;
+                auto stored = load_file_reviewed_keys();
+                reviewed_->insert(stored.begin(), stored.end());
+            }
         }
         scope_error_.clear();
     }
+    file_review_source_identity_ = incoming_file_identity;
     const auto *incoming = project && project->functions ? project->functions.get() : nullptr;
     const auto *incoming_loader = project && project->loaded ? project->loaded.get() : nullptr;
     const bool same_source = !changed_document && source_ == incoming && loader_source_ == incoming_loader &&
@@ -868,6 +883,9 @@ void AnalysisIssuesView::rebuild() {
     add_producer(active_decompiler, Kind::decompiler_diagnostic);
     capped_ = function_capped || diagnostic_rows < diagnostic_total || diagnostic_source_truncated || producer_source_truncated;
 
+    if (!project_ && !file_review_source_identity_.empty())
+        for (auto &row : rows_) row.document_identity = file_review_source_identity_;
+
     std::stable_sort(rows_.begin(), rows_.end(), [](const Row &left, const Row &right) {
         if (left.address && right.address) {
             if (address_less(*left.address, *right.address)) return true;
@@ -886,16 +904,14 @@ void AnalysisIssuesView::rebuild() {
             row.duplicate_ordinal = ++review_key_occurrences[key];
     }
     row_review_keys_.reserve(rows_.size());
-    for (const auto &row : rows_) row_review_keys_.push_back(review_key(row));
-    if (reviewed_) {
+    for (const auto &row : rows_) row_review_keys_.push_back(stored_review_key(row));
+    const bool preserve_file_reviews = !project_ && !file_review_source_identity_.empty() &&
+        (capped_ || !document_snapshot_ || !document_snapshot_->analysis);
+    if (reviewed_ && !preserve_file_reviews) {
         const auto previous_count = reviewed_->size();
         std::unordered_set<std::string> current_keys(row_review_keys_.begin(), row_review_keys_.end());
         std::erase_if(*reviewed_, [&](const std::string &key) { return !current_keys.contains(key); });
-        if (reviewed_->size() != previous_count && reviewed_changed) {
-            std::vector<std::string> keys(reviewed_->begin(), reviewed_->end());
-            std::sort(keys.begin(), keys.end());
-            reviewed_changed(std::move(keys));
-        }
+        if (reviewed_->size() != previous_count) persist_reviewed_keys();
     }
     render();
 }
@@ -948,11 +964,12 @@ wxString AnalysisIssuesView::export_text() const {
         result += "# Scope coverage\tFunction is unavailable or chunk coverage is partial\n";
     if (capped_)
         result += "# Coverage\tCapped at 20,000 findings and 100,000 functions\n";
-    result += "finding\tseverity\treview\taddress\trelated\tfunction\tdetails\n";
+    result += "finding\tseverity\treview\taddress\trelated\tfunction\tdetails\tdocument_identity\n";
     for (const auto index : visible_rows_) {
         const auto &item = rows_[index];
-        const std::array<wxString, 7> fields{kind_text(item.kind), severity_text(item.severity), cell(index, 2),
-                                             cell(index, 3), cell(index, 4), cell(index, 5), cell(index, 6)};
+        const std::array<wxString, 8> fields{kind_text(item.kind), severity_text(item.severity), cell(index, 2),
+                                             cell(index, 3), cell(index, 4), cell(index, 5), cell(index, 6),
+                                             text(item.document_identity)};
         for (std::size_t column = 0; column < fields.size(); ++column) {
             if (column) result += '\t';
             result += tsv_field(fields[column]);
@@ -1021,6 +1038,12 @@ std::optional<std::string> AnalysisIssuesView::export_json_text(std::size_t row_
         if (row.source_label.empty()) {
             if (!append("null")) return {};
         } else if (!append(json_quote(utf8_text(row.source_label)))) return {};
+        if (!append(",\"document_identity_current\":") ||
+            !append(row.document_identity.empty() ? "null" : "true") ||
+            !append(",\"document_identity\":")) return {};
+        if (row.document_identity.empty()) {
+            if (!append("null")) return {};
+        } else if (!append(json_quote(row.document_identity))) return {};
         const auto details = preview_text(utf8_text(row.detail), 4096);
         if (!append(",\"details\":") || !append(json_quote(utf8_text(details))) || !append("}")) return {};
     }
@@ -1294,6 +1317,14 @@ void AnalysisIssuesView::render() {
             status += wxString::Format(" of %llu", static_cast<unsigned long long>(rows_.size()));
         if (location_filter_ && location_filter_->GetSelection() != 0)
             status += "; " + location_filter_->GetStringSelection();
+        if (!project_ && document_snapshot_) {
+            if (file_review_source_identity_.empty())
+                status += "; file-only review state is session-only (input identity unavailable)";
+            else if (wxConfigBase::Get(false))
+                status += "; file-only reviews are saved locally by content and load recipe";
+            else
+                status += "; file-only review state is session-only (local config is unavailable)";
+        }
         std::size_t errors = 0, warnings = 0, info = 0, reviewed = 0;
         for (const auto index : visible_rows_) {
             if (reviewed_ && index < row_review_keys_.size() && reviewed_->contains(row_review_keys_[index]))
@@ -1396,6 +1427,11 @@ std::string AnalysisIssuesView::review_key(const Row &row) {
         // them separately so old review marks never inherit a fabricated match.
         key.append("\xfdsource-key-unavailable");
     }
+    if (!row.document_identity.empty()) {
+        key.push_back('\xfc');
+        number(row.document_identity.size());
+        key += row.document_identity;
+    }
     if (row.duplicate_ordinal != 0) {
         key.push_back('\xff');
         number(row.duplicate_ordinal);
@@ -1403,8 +1439,63 @@ std::string AnalysisIssuesView::review_key(const Row &row) {
     return key;
 }
 
+std::string AnalysisIssuesView::stored_review_key(const Row &row) const {
+    auto key = review_key(row);
+    if (project_ || file_review_source_identity_.empty()) return key;
+    Sha256 hash;
+    const auto bytes = std::as_bytes(std::span{key.data(), key.size()});
+    if (!hash.update(bytes)) return {};
+    return digest_hex(hash.digest());
+}
+
+std::unordered_set<std::string> AnalysisIssuesView::load_file_reviewed_keys() const {
+    std::unordered_set<std::string> keys;
+    auto *config = wxConfigBase::Get(false);
+    if (!config || file_review_source_identity_.empty()) return keys;
+    const auto previous_path = config->GetPath();
+    config->SetPath("/HexLab/AnalysisIssueReviews/FileOnly/" + text(file_review_source_identity_));
+    wxString entry;
+    long cookie = 0;
+    bool has_entry = config->GetFirstEntry(entry, cookie);
+    while (has_entry && keys.size() < max_rows) {
+        const auto name = utf8_text(entry);
+        const bool valid_hex = name.size() == 64 && std::all_of(name.begin(), name.end(), [](unsigned char c) {
+            return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+        });
+        bool reviewed = false;
+        if (valid_hex && config->Read(entry, &reviewed, false) && reviewed) keys.insert(name);
+        has_entry = config->GetNextEntry(entry, cookie);
+    }
+    config->SetPath(previous_path);
+    return keys;
+}
+
+void AnalysisIssuesView::persist_reviewed_keys() {
+    if (!reviewed_) return;
+    if (project_) {
+        if (reviewed_changed && project_->mode != database::ProjectMode::read_only) {
+            std::vector<std::string> keys(reviewed_->begin(), reviewed_->end());
+            std::sort(keys.begin(), keys.end());
+            reviewed_changed(std::move(keys));
+        }
+        return;
+    }
+    auto *config = wxConfigBase::Get(false);
+    if (!config || file_review_source_identity_.empty()) return;
+    const auto desired = *reviewed_;
+    auto existing = load_file_reviewed_keys();
+    const auto previous_path = config->GetPath();
+    config->SetPath("/HexLab/AnalysisIssueReviews/FileOnly/" + text(file_review_source_identity_));
+    for (const auto &key : existing)
+        if (!desired.contains(key)) config->DeleteEntry(text(key), false);
+    for (const auto &key : desired)
+        if (!existing.contains(key)) config->Write(text(key), true);
+    config->SetPath(previous_path);
+    config->Flush();
+}
+
 bool AnalysisIssuesView::is_reviewed(const Row &row) const {
-    return reviewed_ && reviewed_->contains(review_key(row));
+    return reviewed_ && reviewed_->contains(stored_review_key(row));
 }
 
 void AnalysisIssuesView::toggle_reviewed() {
@@ -1412,7 +1503,7 @@ void AnalysisIssuesView::toggle_reviewed() {
     if (!row) return;
     if (!reviewed_)
         reviewed_ = std::make_shared<std::unordered_set<std::string>>();
-    const auto key = review_key(*row);
+    const auto key = stored_review_key(*row);
     if (reviewed_->contains(key)) {
         reviewed_->erase(key);
     } else {
@@ -1426,11 +1517,7 @@ void AnalysisIssuesView::toggle_reviewed() {
     selection_key_ = *row;
     render();
     remember_preference();
-    if (reviewed_changed && project_ && project_->mode != database::ProjectMode::read_only) {
-        std::vector<std::string> keys(reviewed_->begin(), reviewed_->end());
-        std::sort(keys.begin(), keys.end());
-        reviewed_changed(std::move(keys));
-    }
+    persist_reviewed_keys();
 }
 
 void AnalysisIssuesView::set_visible_reviewed(bool reviewed) {
@@ -1466,11 +1553,7 @@ void AnalysisIssuesView::set_visible_reviewed(bool reviewed) {
 
     render();
     remember_preference();
-    if (reviewed_changed && project_ && project_->mode != database::ProjectMode::read_only) {
-        std::vector<std::string> keys(reviewed_->begin(), reviewed_->end());
-        std::sort(keys.begin(), keys.end());
-        reviewed_changed(std::move(keys));
-    }
+    persist_reviewed_keys();
 }
 
 wxString AnalysisIssuesView::finding_text(const Row &row) const {
@@ -1478,6 +1561,9 @@ wxString AnalysisIssuesView::finding_text(const Row &row) const {
     wxString report = kind_text(row.kind) + "\nSeverity: " + severity_text(row.severity) + "\nAddress: " +
                       (row.address ? location_text(*row.address, image) : wxString("not location-specific"));
     report += "\nReview: " + wxString(is_reviewed(row) ? "Reviewed" : "Open");
+    if (!row.document_identity.empty())
+        report += "\nFile-only source identity: current (content and load recipe)\nInput identity: " +
+                  text(row.document_identity);
     if (row.kind == Kind::type_import_diagnostic || row.kind == Kind::decompiler_diagnostic || row.kind == Kind::minidump_context_diagnostic) {
         report += row.source_identity.empty() && row.stale_import
             ? "\nDiagnostic source identity: unavailable; this finding is ungrouped"

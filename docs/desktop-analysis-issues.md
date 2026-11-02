@@ -186,3 +186,17 @@ Duplicate rows remain separate and use occurrence discriminators; a changed
 duplicate set drops ambiguous marks.
 
 Use **Stale diagnostic reports** in the category selector to isolate diagnostics whose source identity is missing or differs from the active analysis. This includes loader, project string-scan, type-import, decompiler, and minidump reports; the category combines with severity, review state, search, and function scope like the other filters.
+
+File-only documents now retain review marks in the user's wxWidgets configuration
+when a stable identity is available. The identity hashes the complete input bytes,
+the encoded load recipe, the analysis-engine fingerprint, and any certified
+auxiliary-input fingerprint; path names are not used as identity. Inputs up to
+4 GiB are fingerprinted while the document loads. Larger inputs, uncertified plugin inputs, or hashing failures keep review
+state only for the open session. Each finding's persisted review key is hashed
+before it is written, and at most 20,000 marks are retained per input identity.
+Changing the bytes or load recipe opens a separate review set. The finding detail
+shows the current file-only identity; TSV adds `document_identity`, and JSON adds
+`document_identity` plus `document_identity_current`. These fields are distinct
+from a diagnostic producer's `source_identity`, which still describes that
+producer's AnalysisKey when one exists. Project review marks continue to live in
+the project database.

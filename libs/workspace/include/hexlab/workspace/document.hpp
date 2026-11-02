@@ -43,6 +43,9 @@ struct OpenRequest {
 struct DocumentSnapshot {
     DocumentId id{0};
     std::uint64_t revision=0;
+    // Stable content/recipe identity for per-user file-only triage state.
+    // Empty when the source or its auxiliary inputs could not be certified.
+    std::optional<std::string> issue_review_source_identity;
     std::shared_ptr<const Image> image;
     // Original/effective source bytes may differ from decoded image backing
     // (Intel HEX and S-record store text, but map decoded record data).
