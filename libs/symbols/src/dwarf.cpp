@@ -697,7 +697,12 @@ hexlab::Result<ImportResult> import_dwarf(const DwarfSections&sections){
         std::vector<types::Parameter> parameters;
         bool variadic = false;
     };
+    struct PriorVariableSummary {
+        std::string name;
+        types::TypePtr type;
+    };
     std::unordered_map<std::uint64_t,PriorFunctionSignature> prior_function_signatures;
+    std::unordered_map<std::uint64_t,PriorVariableSummary> prior_variable_summaries;
     std::map<std::uint64_t,DwarfCrossContributionDie> cross_contribution_dies;
     std::uint64_t cross_contribution_bytes_used=0;
     std::uint32_t cross_contribution_requests=0;
@@ -744,6 +749,7 @@ hexlab::Result<ImportResult> import_dwarf(const DwarfSections&sections){
     };
     std::vector<UnitContext> contexts;
     std::unordered_map<std::uint64_t,std::size_t> die_unit_index;
+    std::unordered_map<std::uint64_t,std::pair<std::size_t,std::size_t>> die_location_index;
     for(const auto&indexed_unit:unit_positions){
         if(canceled())return hexlab::Error{hexlab::ErrorCode::canceled,"DWARF import canceled"};
         info=Reader(sections.info,indexed_unit.offset,sections.info.size());
@@ -847,8 +853,11 @@ hexlab::Result<ImportResult> import_dwarf(const DwarfSections&sections){
         context.unit_type=unit_type;context.type_unit=type_unit;context.type_die_offset=type_die_offset;
         context.type_signature=type_signature;context.dies=std::move(dies);context.abbrevs=std::move(abbrevs.value());
         const auto context_index=contexts.size();
-        for(const auto&die:context.dies){
-            if(!die_unit_index.emplace(die.offset,context_index).second)return malformed("duplicate absolute DWARF DIE offset");
+        for(std::size_t die_index=0;die_index<context.dies.size();++die_index){
+            const auto &die=context.dies[die_index];
+            if(!die_unit_index.emplace(die.offset,context_index).second||
+               !die_location_index.emplace(die.offset,std::pair{context_index,die_index}).second)
+                return malformed("duplicate absolute DWARF DIE offset");
         }
         contexts.push_back(std::move(context));
     }
@@ -942,6 +951,63 @@ hexlab::Result<ImportResult> import_dwarf(const DwarfSections&sections){
         std::function<hexlab::Result<types::TypePtr>(const Reference&)> resolve_type_reference;
         std::function<hexlab::Result<std::vector<types::Parameter>>(const Die&)> parameters;
         resolve_type_reference=[&](const Reference&r)->hexlab::Result<types::TypePtr>{if(r.supplementary){if(canceled())return hexlab::Error{hexlab::ErrorCode::canceled,"DWARF import canceled"};if(!sections.supplementary_identity.present)return unsupported("DW_FORM_ref_sup requires a .debug_sup descriptor");if(sections.supplementary_identity.version!=5||sections.supplementary_identity.supplementary)return unsupported("DW_FORM_ref_sup requires an application .debug_sup identity (is_supplementary=0)");if(!sections.supplementary_type_resolver)return unsupported("DW_FORM_ref_sup requires an explicit supplementary type resolver");if(supplementary_requests>=sections.supplementary_resolution_max_requests)return hexlab::Error{hexlab::ErrorCode::resource_limit,"DWARF supplementary reference request limit exceeded"};++supplementary_requests;auto resolved=sections.supplementary_type_resolver(sections.supplementary_identity,r.offset);if(canceled())return hexlab::Error{hexlab::ErrorCode::canceled,"DWARF import canceled"};if(!resolved)return resolved.error();if(!resolved.value().identity_verified||resolved.value().identity!=sections.supplementary_identity)return malformed("supplementary type resolver did not verify the requested object identity/checksum");if(resolved.value().die_offset!=r.offset)return malformed("supplementary type resolver returned a different DIE offset");if(!resolved.value().type)return malformed("supplementary type resolver returned an empty type");auto encoded=types::encode(*resolved.value().type);if(!encoded)return encoded.error();const auto cost=resolved.value().bytes_examined;if(cost>sections.supplementary_resolution_max_bytes-supplementary_bytes_used||encoded.value().size()>sections.supplementary_resolution_max_bytes-supplementary_bytes_used-cost)return hexlab::Error{hexlab::ErrorCode::resource_limit,"DWARF supplementary resolution byte budget exceeded"};supplementary_bytes_used+=cost+encoded.value().size();return resolved.value().type;}if(r.signature){auto found=signature_types.find(r.offset);if(found!=signature_types.end())return found->second;if(!sections.type_signature_resolver)return unsupported("DW_FORM_ref_sig8 has no supported type unit with that signature in the supplied contribution");if(canceled())return hexlab::Error{hexlab::ErrorCode::canceled,"DWARF import canceled"};auto resolved=sections.type_signature_resolver(r.offset);if(canceled())return hexlab::Error{hexlab::ErrorCode::canceled,"DWARF import canceled"};if(!resolved)return resolved.error();if(!resolved.value())return malformed("DW_FORM_ref_sig8 resolver returned an empty type");return resolved.value();}auto target=resolve_index(r);if(!target){if(r.section_absolute){auto external=absolute_type_references.find(r.offset);if(external!=absolute_type_references.end())return external->second;const bool local_info=r.offset>=sections.info_section_offset&&r.offset-sections.info_section_offset<sections.info.size();if(!local_info){auto external_die=resolve_cross_contribution_die(r.offset);if(!external_die)return external_die.error();if(external_die.value()->kind!=DwarfReferencedDieKind::type)return unsupported("DW_FORM_ref_addr type reference targets a non-type DIE in another contribution");return external_die.value()->type;}}return target.error();}return resolve_type(target.value());};
+        std::function<hexlab::Result<PriorVariableSummary>(std::size_t,std::set<std::uint64_t>&)> resolve_variable_summary;
+        resolve_variable_summary=[&](std::size_t index,std::set<std::uint64_t>&active)->hexlab::Result<PriorVariableSummary>{
+            if(index>=dies.size())return malformed("DWARF variable reference index is outside its compilation unit");
+            const auto &die=dies[index];
+            if(die.tag!=tag_variable&&die.tag!=tag_formal_parameter)
+                return malformed("DW_AT_specification or DW_AT_abstract_origin does not target a variable DIE");
+            if(sections.info_section_offset>UINT64_MAX-die.offset)return hexlab::Error{hexlab::ErrorCode::overflow,"DWARF variable DIE identity overflows"};
+            const auto absolute_offset=sections.info_section_offset+die.offset;
+            if(const auto found=prior_variable_summaries.find(absolute_offset);found!=prior_variable_summaries.end())return found->second;
+            if(active.size()>=256)return hexlab::Error{hexlab::ErrorCode::resource_limit,"DWARF variable declaration-reference chain exceeds 256 DIEs"};
+            if(!active.insert(absolute_offset).second)return malformed("cycle in DWARF variable declaration references");
+            struct ActiveGuard{std::set<std::uint64_t>&active;std::uint64_t offset;~ActiveGuard(){active.erase(offset);}} guard{active,absolute_offset};
+            PriorVariableSummary summary;
+            if(const auto *name_value=attr(die,attr_name)){
+                const auto *name=std::get_if<std::string>(name_value);
+                if(!name)return malformed("DWARF variable DW_AT_name is not a string");
+                summary.name=*name;
+            }
+            if(const auto *type_reference=ref(die,attr_type)){
+                auto resolved=resolve_type_reference(*type_reference);
+                if(!resolved)return resolved.error();
+                summary.type=resolved.value();
+            }
+            if(summary.name.empty()||!summary.type){
+                for(const auto reference_attribute:{attr_specification,attr_abstract_origin}){
+                    const auto *reference=ref(die,reference_attribute);
+                    if(!reference)continue;
+                    std::optional<PriorVariableSummary> inherited;
+                    if(reference->section_absolute){
+                        if(reference->offset<sections.info_section_offset||
+                           reference->offset-sections.info_section_offset>=sections.info.size())continue;
+                        const auto local_offset=reference->offset-sections.info_section_offset;
+                        const auto target_location=die_location_index.find(local_offset);
+                        if(target_location==die_location_index.end())return malformed("DW_FORM_ref_addr variable reference does not identify a DIE");
+                        if(target_location->second.first==context_index){
+                            auto resolved=resolve_variable_summary(target_location->second.second,active);
+                            if(!resolved)return resolved.error();
+                            inherited=std::move(resolved.value());
+                        }else if(const auto found=prior_variable_summaries.find(reference->offset);found!=prior_variable_summaries.end()){
+                            inherited=found->second;
+                        }
+                    }else{
+                        auto target=resolve_index(*reference);
+                        if(!target)return target.error();
+                        auto resolved=resolve_variable_summary(target.value(),active);
+                        if(!resolved)return resolved.error();
+                        inherited=std::move(resolved.value());
+                    }
+                    if(!inherited)continue;
+                    if(summary.name.empty())summary.name=std::move(inherited->name);
+                    if(!summary.type)summary.type=std::move(inherited->type);
+                    if(!summary.name.empty()&&summary.type)break;
+                }
+            }
+            if(!summary.name.empty()&&summary.type)prior_variable_summaries.emplace(absolute_offset,summary);
+            return summary;
+        };
         parameters=[&](const Die&parent)->hexlab::Result<std::vector<types::Parameter>>{std::vector<types::Parameter> out;auto found=by_offset.find(parent.offset);if(found==by_offset.end())return malformed("function DIE is not indexed in its compilation unit");std::set<std::size_t> visited;auto source=parameter_source(found->second,visited);if(!source)return source.error();unsigned index=0;for(auto ci:dies[source.value()].children){const auto&child=dies[ci];if(child.tag==tag_unspecified_parameters)continue;if(child.tag!=tag_formal_parameter)continue;const auto*r=ref(child,attr_type);if(!r)return malformed("formal parameter DIE lacks DW_AT_type");auto ty=resolve_type_reference(*r);if(!ty)return ty.error();const auto*n=str(child,attr_name);out.push_back({n?*n:"arg"+std::to_string(index),ty.value()});++index;}return out;};
         resolve_type=[&](std::size_t ix)->hexlab::Result<types::TypePtr>{if(canceled())return hexlab::Error{hexlab::ErrorCode::canceled,"DWARF import canceled"};const auto&d=dies[ix];if(auto it=cache.find(d.offset);it!=cache.end())return it->second;if(state[d.offset]==1)return unsupported("recursive DWARF type graph cannot be represented by the current immutable type model");if(state[d.offset]==2)return malformed("failed DWARF type resolution");if(resolve_depth>=256)return hexlab::Error{hexlab::ErrorCode::resource_limit,"DWARF type-reference nesting exceeds 256"};++resolve_depth;struct DepthGuard{unsigned&depth;~DepthGuard(){--depth;}} depth_guard{resolve_depth};state[d.offset]=1;
             auto resolve_attr_type=[&](bool required)->hexlab::Result<types::TypePtr>{const auto*r=ref(d,attr_type);if(!r){if(required)return malformed("type DIE lacks DW_AT_type");return types::TypePtr{};}return resolve_type_reference(*r);};
@@ -1067,6 +1133,13 @@ hexlab::Result<ImportResult> import_dwarf(const DwarfSections&sections){
             }
             state[d.offset]=2;cache.emplace(d.offset,result);return result;
         };
+        for(std::size_t i=0;i<dies.size();++i){
+            if(canceled())return hexlab::Error{hexlab::ErrorCode::canceled,"DWARF variable summary indexing canceled"};
+            if(dies[i].tag!=tag_variable&&dies[i].tag!=tag_formal_parameter)continue;
+            std::set<std::uint64_t> active;
+            auto summary=resolve_variable_summary(i,active);
+            if(!summary)return summary.error();
+        }
         // Resolve every recognized, complete type DIE. A declaration DIE may
         // remain intentionally opaque unless another DIE requires its layout.
         for(std::size_t i=0;i<dies.size();++i){if(canceled())return hexlab::Error{hexlab::ErrorCode::canceled,"DWARF import canceled"};if(is_type_tag(dies[i].tag)){
@@ -1167,7 +1240,14 @@ hexlab::Result<ImportResult> import_dwarf(const DwarfSections&sections){
                 std::string inherited_name;
                 types::TypePtr inherited_type;
                 if(!n||!r){
-                    if(d.tag==tag_formal_parameter)continue;
+                    if(sections.info_section_offset<=UINT64_MAX-d.offset){
+                        const auto local_summary=prior_variable_summaries.find(sections.info_section_offset+d.offset);
+                        if(local_summary!=prior_variable_summaries.end()){
+                            inherited_name=local_summary->second.name;
+                            inherited_type=local_summary->second.type;
+                        }
+                    }
+                    if((!n||!r)&& (inherited_name.empty()||!inherited_type) && d.tag==tag_variable){
                     for(const auto reference_attribute:{attr_specification,attr_abstract_origin}){
                         const auto*reference=ref(d,reference_attribute);
                         if(!reference||!reference->section_absolute)continue;
@@ -1176,6 +1256,7 @@ hexlab::Result<ImportResult> import_dwarf(const DwarfSections&sections){
                         auto external_die=resolve_cross_contribution_die(reference->offset);if(!external_die)return external_die.error();
                         if(external_die.value()->kind!=DwarfReferencedDieKind::variable)return malformed("cross-contribution variable specification or abstract origin does not target a variable DIE");
                         inherited_name=external_die.value()->name;inherited_type=external_die.value()->type;break;
+                    }
                     }
                 }
                 const std::string *resolved_name=n;

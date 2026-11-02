@@ -226,6 +226,121 @@ Result<Xcoff32Object> inspect_xcoff32_object(const ByteStorage &storage,
     return Error{ErrorCode::resource_limit, "XCOFF32 object metadata exceeds host container limits"};
 }
 
+Result<LoadedImage> load_xcoff32_executable(std::shared_ptr<const ByteStorage> storage,
+    std::stop_token stop, Xcoff32ObjectLimits limits) try {
+    require(bool(storage), "XCOFF32 executable loading requires storage", ErrorCode::invalid_argument);
+    require(limits.max_sections && limits.max_metadata_bytes && limits.max_name_bytes,
+            "XCOFF32 executable limits must be positive", ErrorCode::invalid_argument);
+    std::uint64_t budget = 0;
+    const auto header = read(*storage, 0, 20, budget, limits, stop);
+    require(be(header, 0, 2) == 0x01df, "Invalid XCOFF32 magic");
+    const auto section_count = be(header, 2, 2);
+    const auto optional_size = be(header, 16, 2);
+    const auto flags = static_cast<std::uint16_t>(be(header, 18, 2));
+    require((flags & 0x0002u) != 0,
+            "XCOFF32 linked-image loader requires F_EXEC", ErrorCode::unsupported);
+    // AIX defines the executable auxiliary header as 72 bytes. Read the
+    // declared size, but reject nonstandard layouts before interpreting entry.
+    require(optional_size == 72,
+            "Unsupported XCOFF32 executable auxiliary-header size", ErrorCode::unsupported);
+    const auto auxiliary = read(*storage, 20, optional_size, budget, limits, stop);
+    const auto entry_value = be(auxiliary, 20, 4);
+    require(section_count && section_count <= limits.max_sections,
+            "XCOFF32 executable section count exceeds configured limit", ErrorCode::resource_limit);
+    const std::uint64_t section_headers_offset = 20 + optional_size;
+    const std::uint64_t section_bytes = std::uint64_t{section_count} * 40;
+    require(contains(storage->size(), section_headers_offset, section_bytes),
+            "XCOFF32 executable section headers exceed file extent");
+    auto section_rows = read(*storage, section_headers_offset, section_bytes, budget, limits, stop);
+    const auto section_end = section_headers_offset + section_bytes;
+    ImageLayout layout{{{0}, 32, 1, ByteOrder::big}, Architecture::powerpc,
+                       ExecutionMode::ppc32, {}, {}};
+    LoadedImage loaded;
+    loaded.metadata_complete = true;
+    loaded.metadata.format = "XCOFF32 executable";
+    loaded.metadata.machine = 1; // IBM POWER/PowerPC
+    loaded.metadata.header_size = static_cast<std::uint32_t>(section_end);
+    bool loader_section_seen = false;
+    bool other_section_seen = false;
+    bool has_text = false;
+    std::uint64_t low = UINT64_MAX, high = 0;
+    for (std::uint32_t i = 0; i < section_count; ++i) {
+        canceled(stop);
+        const auto row = std::span<const std::byte>(section_rows).subspan(std::size_t{i} * 40, 40);
+        std::size_t name_size = 0;
+        while (name_size < 8 && row[name_size] != std::byte{0}) ++name_size;
+        require(name_size <= limits.max_name_bytes,
+                "XCOFF32 executable section name exceeds limit", ErrorCode::resource_limit);
+        const std::string name(reinterpret_cast<const char *>(row.data()), name_size);
+        const auto address = be(row, 12, 4);
+        const auto size = be(row, 16, 4);
+        const auto raw_offset = be(row, 20, 4);
+        const auto section_flags = be(row, 36, 4);
+        const auto type = section_flags & 0xffffu;
+        require(section_flags != 0xffffffffu && type != 0x8000,
+                "Deleted or overflow XCOFF32 executable section is unsupported", ErrorCode::unsupported);
+        const bool bss = type == 0x80 || type == 0x800;
+        const bool mapped = type == 0x20 || type == 0x40 || bss || type == 0x400;
+        if (size) {
+            require(std::uint64_t{address} + size <= (UINT64_C(1) << 32),
+                    "XCOFF32 section virtual extent wraps the 32-bit address space");
+            if (!bss) {
+                require(raw_offset != 0 && raw_offset >= section_end &&
+                            contains(storage->size(), raw_offset, size),
+                        "XCOFF32 initialized section data exceeds file extent or overlaps headers");
+            }
+        }
+        if (type == 0x1000) loader_section_seen = true;
+        else if (!mapped && size && type != 0x10 && type != 0x200)
+            other_section_seen = true;
+        if (!mapped || !size) continue;
+        const bool executable = type == 0x20;
+        const bool writable = type == 0x40 || bss || type == 0x400;
+        layout.segments.push_back({name.empty() ? "section" + std::to_string(i + 1) : name,
+            {{0}, address}, size, {bss ? 0 : raw_offset}, bss ? 0 : size,
+            true, writable, executable});
+        loaded.metadata.sections.push_back({name, {address}, size,
+            {bss ? 0 : raw_offset}, bss ? 0 : size, section_flags});
+        low = std::min<std::uint64_t>(low, address);
+        high = std::max<std::uint64_t>(high, std::uint64_t{address} + size);
+        has_text |= executable;
+    }
+    require(has_text, "XCOFF32 executable has no initialized text section", ErrorCode::unsupported);
+    auto image = Image::create(storage, layout);
+    if (!image) throw Failure{image.error()};
+    const Address entry{{0}, entry_value};
+    const auto *entry_segment = image.value()->segment_at(entry);
+    require(entry_segment && entry_segment->executable && image.value()->to_file_offset(entry),
+            "XCOFF32 executable entry is not in initialized text");
+    layout.entries.push_back(entry);
+    image = Image::create(storage, std::move(layout));
+    if (!image) throw Failure{image.error()};
+    loaded.image = std::move(image.value());
+    loaded.metadata.preferred_base = low;
+    loaded.metadata.image_size = high - low;
+    if (loader_section_seen) {
+        loaded.metadata_complete = false;
+        loaded.diagnostics.push_back({DiagnosticSeverity::warning,
+            "XCOFF32 loader section is not interpreted; imports and loader relocations remain unresolved", {}});
+    }
+    if (other_section_seen) {
+        loaded.metadata_complete = false;
+        loaded.diagnostics.push_back({DiagnosticSeverity::warning,
+            "One or more XCOFF32 section types are not mapped by this loader", {}});
+    }
+    // The image contains file-backed data and zero-fill mappings only. Runtime
+    // AIX loader relocation, import binding, and TOC setup remain out of scope.
+    loaded.metadata_reads_complete = false;
+    canceled(stop);
+    return loaded;
+} catch (const Failure &failure) {
+    return failure.error;
+} catch (const std::bad_alloc &) {
+    return Error{ErrorCode::resource_limit, "Cannot allocate bounded XCOFF32 executable metadata"};
+} catch (const std::length_error &) {
+    return Error{ErrorCode::resource_limit, "XCOFF32 executable metadata exceeds host container limits"};
+}
+
 std::string_view xcoff32_relocation_type_name(std::uint8_t type) {
     switch (type) {
     case 0x00: return "R_POS"; case 0x01: return "R_NEG"; case 0x02: return "R_REL";

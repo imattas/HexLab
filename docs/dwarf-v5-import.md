@@ -65,11 +65,18 @@ the importer does not adjust it, resolve it to a path, or match it to a line
 row. Values must be nonnegative integer forms; unsupported or negative values
 are rejected.
 
-Global variable DIEs with missing names or types can inherit those fields from
-an exact `DW_FORM_ref_addr` `DW_AT_specification` or `DW_AT_abstract_origin`
-target in a selected DWP compile-unit contribution. The package index row,
-contribution bounds, and DIE offset are verified before the summary is used.
-Parameter inheritance remains unsupported. Top-level file-backed ELF loading can discover adjacent DWP and DWO companions under the limits described below.
+Variable and formal-parameter DIEs with missing names or types can inherit
+those fields through `DW_AT_specification` or `DW_AT_abstract_origin` within
+the supplied `.debug_info`, including `DW_FORM_ref_addr` references between
+compile units. Cross-unit summaries are keyed by the exact section DIE offset
+and units are processed in reference-dependency order. References must identify
+a variable or formal-parameter DIE; cycles and chains beyond 256 DIEs are
+rejected, and cancellation is checked while summaries are indexed. Global
+variables can also inherit from an exact target in a selected DWP compile-unit
+contribution; the package index row, contribution bounds, and DIE offset are
+verified before its summary is used. Cross-contribution parameter inheritance
+is not supported. Top-level file-backed ELF loading can discover adjacent DWP
+and DWO companions under the limits described below.
 
 The symbols API `evaluate_imported_variable_location(variable, pc, context)` selects a matching half-open location range and evaluates its already-decoded operations. For an un-ranged variable it evaluates the direct expression, then falls back to a direct absolute address when present. For a ranged variable, an explicit matching range is selected first, then its default entry if present; otherwise it never falls back to its address or another range when the requested PC is uncovered. The result is a register location, memory address, or scalar value as classified by the expression. Register values, frame/CFA values, and memory reads come only from the caller callbacks; this API performs no process access. Missing locations, unmatched PCs, and unavailable runtime inputs return explicit errors.
 

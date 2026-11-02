@@ -49,6 +49,19 @@ added or run for this slice. This is
 partial structural inspection, not full XCOFF support or verification of
 archive linking capability.
 
+`load_xcoff32_executable` provides a separate linked-image slice for big-endian
+XCOFF32 executables with `F_EXEC` and the standard 72-byte AIX auxiliary
+header. It maps `STYP_TEXT`, `STYP_DATA`, `STYP_BSS`, `STYP_TDATA`, and
+`STYP_TBSS` by each section's declared virtual address. Initialized sections
+map their exact file-backed extent; BSS/TBSS map as zero-fill. The auxiliary
+header entry must point into initialized executable text. A loader section is
+extent checked but uninterpreted, and makes metadata explicitly incomplete
+with a diagnostic. Loader relocations, import binding, AIX TOC initialization,
+other section types, and process runtime behavior remain unsupported. This is
+a mapped linked image for static inspection, not an AIX execution environment.
+The API is a direct loader entry point and is not wired into general format
+auto-detection/open workflow.
+
 Record layouts and section/name rules follow IBM's [AIX XCOFF object file
 format](https://www.ibm.com/docs/en/aix/7.3.0?topic=formats-xcoff-object-file-format)
 and LLVM's [XCOFF object structures](https://llvm.org/doxygen/XCOFFObjectFile_8h_source.html).

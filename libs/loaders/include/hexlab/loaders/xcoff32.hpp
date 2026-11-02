@@ -2,6 +2,7 @@
 
 #include "hexlab/core/result.hpp"
 #include "hexlab/image/byte_storage.hpp"
+#include "hexlab/loaders/loaded_image.hpp"
 #include "hexlab/loaders/loaders_export.hpp"
 #include <cstddef>
 #include <cstdint>
@@ -59,5 +60,11 @@ struct Xcoff32ObjectLimits {
 HEXLAB_LOADERS_EXPORT std::string_view xcoff32_relocation_type_name(std::uint8_t);
 HEXLAB_LOADERS_EXPORT Result<Xcoff32Object> inspect_xcoff32_object(
     const ByteStorage &, std::stop_token = {}, Xcoff32ObjectLimits = {});
+
+// Maps an already linked, big-endian XCOFF32 executable into its declared
+// virtual addresses. This does not perform AIX loader relocations or resolve
+// imports; such files are returned with incomplete metadata diagnostics.
+HEXLAB_LOADERS_EXPORT Result<LoadedImage> load_xcoff32_executable(
+    std::shared_ptr<const ByteStorage>, std::stop_token = {}, Xcoff32ObjectLimits = {});
 
 } // namespace hexlab

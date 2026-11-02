@@ -51,23 +51,25 @@ header phi inputs alongside the preheader. If only `finish` can leave the
 loop, it alone supplies the cleanup phi input. The `retry_now` predicate is
 evaluated once, and only its repeat edge receives its header copies.
 
-The cleanup consists of at most 64 blocks ending in an explicit return.
-Only the cleanup head may carry register phis. Every later block
-has exactly its preceding block as predecessor; nonterminal cleanup links
-are unconditional jumps or fallthroughs. All function blocks must be uniquely
-claimed by the preheader, header, tree, or cleanup. The formatter emits the
-cleanup once after the loop, follows explicit branch polarity in deterministic
-tree order, and retains address-bearing statements in their owning arm. New
-`continue` and `break` transfers also retain their source instruction address
-(block begin for an empty block) and block ID.
+The cleanup contains at most 64 blocks and every path ends in an explicit
+return. It may be a disjoint conditional decision tree: each conditional has
+two distinct arms, each arm has one exact predecessor, and no blocks are shared
+between arms. Only the cleanup head may carry register phis, and those inputs
+must exactly cover the conditional exit latches. Other cleanup blocks are
+phi-free; linear links are unconditional jumps or fallthroughs. All function
+blocks must be uniquely claimed by the preheader, header, loop tree, or cleanup.
+The formatter emits the cleanup once after the loop and emits conditional arms
+in deterministic true/false order. New `continue` and `break` transfers retain
+their source instruction address (block begin for an empty block) and block ID.
 
 Whole-memory or partition phis, side entries, extra exits, switch dispatch,
-shared or overlapping arms, irreducible flow, malformed edge metadata, and
-exhausted bounds are not accepted by this recognizer. All-unconditional trees
-without a proven exit, nonreturn exits (including `throw`,
-`rethrow_current_exception`, and `exception_unhandled`), branched cleanup,
-and register phis after the cleanup head also remain unsupported. Shared
-in-loop subtrees, including merges between repeat-guard siblings, remain
-unsupported even when their header inputs are complete. Those shapes continue
-through the existing region/state-machine/explicit-goto formatters; no partial
-rendering from this recognizer is retained.
+shared or overlapping loop arms, irreducible flow, malformed edge metadata,
+and exhausted bounds are not accepted by this recognizer. All-unconditional
+trees without a proven exit and nonreturn exits (including `throw`,
+`rethrow_current_exception`, and `exception_unhandled`) remain unsupported.
+Cleanup joins, shared terminal returns, side entries, and register phis after
+the cleanup head also remain unsupported. Shared in-loop subtrees, including
+merges between repeat-guard siblings, remain unsupported even when their header
+inputs are complete. Those shapes continue through the existing
+region/state-machine/explicit-goto formatters; no partial rendering from this
+recognizer is retained.

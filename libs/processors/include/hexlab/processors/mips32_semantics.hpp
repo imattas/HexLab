@@ -107,7 +107,7 @@ evaluate_mips32_arithmetic_s_instruction(const Instruction &instruction,
                                          std::uint32_t lhs_bits, std::uint32_t rhs_bits,
                                          std::uint32_t fcsr) noexcept;
 
-enum class Mips32DArithmeticOperation { add, subtract, multiply };
+enum class Mips32DArithmeticOperation { add, subtract, multiply, divide };
 
 struct Mips32ArithmeticDResult {
     std::uint64_t value_bits = 0;
@@ -118,9 +118,10 @@ struct Mips32ArithmeticDResult {
     bool operator==(const Mips32ArithmeticDResult &) const = default;
 };
 
-// Exact binary64 ADD.D/SUB.D/MUL.D for finite inputs. All four FCSR rounding
+// Exact binary64 ADD.D/SUB.D/MUL.D/DIV.D for finite inputs. All four FCSR rounding
 // modes, gradual underflow, FS input/output flushing, and the Cause/Flag/Enable
-// fields are modeled. NaNs, infinities, and DIV.D remain outside this slice.
+// fields are modeled. DIV.D also handles zero operands and divide-by-zero.
+// NaN/infinity propagation and SQRT.D remain outside this slice.
 HEXLAB_PROCESSORS_EXPORT std::optional<Mips32ArithmeticDResult>
 evaluate_mips32_arithmetic_d(Mips32DArithmeticOperation operation,
                              std::uint64_t lhs_bits, std::uint64_t rhs_bits,

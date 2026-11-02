@@ -701,7 +701,8 @@ std::optional<Mips32ArithmeticDResult> evaluate_mips32_arithmetic_d(
     std::uint64_t rhs_bits, std::uint32_t fcsr) noexcept {
     if (operation != Mips32DArithmeticOperation::add &&
         operation != Mips32DArithmeticOperation::subtract &&
-        operation != Mips32DArithmeticOperation::multiply) return {};
+        operation != Mips32DArithmeticOperation::multiply &&
+        operation != Mips32DArithmeticOperation::divide) return {};
     constexpr std::uint64_t sign_mask = UINT64_C(0x8000000000000000);
     constexpr std::uint64_t exponent_mask = UINT64_C(0x7ff0000000000000);
     constexpr std::uint64_t fraction_mask = UINT64_C(0x000fffffffffffff);
@@ -731,6 +732,137 @@ std::optional<Mips32ArithmeticDResult> evaluate_mips32_arithmetic_d(
     const auto lhs = decode(lhs_bits);
     auto rhs = decode(rhs_bits);
     if (operation == Mips32DArithmeticOperation::subtract) rhs.negative = !rhs.negative;
+    if (operation == Mips32DArithmeticOperation::divide) {
+        const bool negative = lhs.negative != rhs.negative;
+        const auto sign = negative ? sign_mask : UINT64_C(0);
+        constexpr std::uint64_t canonical_qnan = UINT64_C(0x7ff8000000000000);
+        if (!rhs.significand) {
+            if (!lhs.significand) {
+                result.value_bits = canonical_qnan;
+                result.exception_bits |= fp_invalid;
+            } else {
+                result.value_bits = sign | exponent_mask;
+                result.exception_bits |= fp_divide_by_zero;
+            }
+            mips32_finalize_d(result, fcsr);
+            return result;
+        }
+        if (!lhs.significand) {
+            result.value_bits = sign;
+            mips32_finalize_d(result, fcsr);
+            return result;
+        }
+
+        std::uint64_t numerator = lhs.significand;
+        std::uint64_t denominator = rhs.significand;
+        int exponent = lhs.scale - rhs.scale;
+        const int significand_shift = static_cast<int>(std::bit_width(numerator)) -
+                                      static_cast<int>(std::bit_width(denominator));
+        if (significand_shift > 0) {
+            denominator <<= significand_shift;
+            exponent += significand_shift;
+        } else if (significand_shift < 0) {
+            numerator <<= -significand_shift;
+            exponent += significand_shift;
+        }
+        if (numerator < denominator) {
+            numerator <<= 1;
+            --exponent;
+        }
+        // Generate the 53-bit normalized quotient and retain its exact
+        // remainder. Both significands are at most 53 bits, so the doubled
+        // remainder stays within uint64_t without host FP or compiler-specific
+        // wide integer extensions.
+        std::uint64_t remainder = numerator - denominator;
+        std::uint64_t significand = UINT64_C(1) << 52;
+        for (int bit = 51; bit >= 0; --bit) {
+            remainder <<= 1;
+            if (remainder >= denominator) {
+                remainder -= denominator;
+                significand |= UINT64_C(1) << bit;
+            }
+        }
+        const bool inexact = remainder != 0;
+        const auto increment_for = [&](std::uint64_t truncated, bool guard,
+                                       bool lower, bool any_inexact) {
+            if (!any_inexact) return false;
+            switch (rounding) {
+            case 0: return guard && (lower || (truncated & 1u));
+            case 1: return false;
+            case 2: return !negative;
+            default: return negative;
+            }
+        };
+
+        if ((fcsr & fcsr_flush_subnormal) != 0 && exponent < -1022) {
+            result.value_bits = sign;
+            result.exception_bits |= fp_underflow | fp_inexact;
+            mips32_finalize_d(result, fcsr);
+            return result;
+        }
+        if (exponent > 1023) {
+            result.value_bits = mips32_d_overflow(negative, rounding);
+            result.exception_bits |= fp_overflow | fp_inexact;
+            mips32_finalize_d(result, fcsr);
+            return result;
+        }
+        if (exponent >= -1022) {
+            if (exponent == 1023 && significand == ((UINT64_C(1) << 53) - 1) && inexact) {
+                result.value_bits = mips32_d_overflow(negative, rounding);
+                result.exception_bits |= fp_overflow | fp_inexact;
+                mips32_finalize_d(result, fcsr);
+                return result;
+            }
+            const auto twice_remainder = remainder * 2;
+            const bool guard = twice_remainder >= denominator;
+            const bool lower = twice_remainder > denominator;
+            const bool increment = increment_for(significand, guard, lower, inexact);
+            if (increment) ++significand;
+            if (inexact) result.exception_bits |= fp_inexact;
+            if (significand == (UINT64_C(1) << 53)) {
+                significand >>= 1;
+                ++exponent;
+            }
+            if (exponent > 1023) {
+                result.value_bits = mips32_d_overflow(negative, rounding);
+                result.exception_bits |= fp_overflow | fp_inexact;
+            } else {
+                result.value_bits = sign | (static_cast<std::uint64_t>(exponent + 1023) << 52) |
+                    (significand & fraction_mask);
+            }
+            mips32_finalize_d(result, fcsr);
+            return result;
+        }
+
+        if (exponent < -1074) {
+            bool increment = false;
+            if (rounding == 2) increment = !negative;
+            else if (rounding == 3) increment = negative;
+            else if (rounding == 0 && exponent == -1075)
+                increment = numerator != denominator;
+            result.value_bits = sign | static_cast<std::uint64_t>(increment);
+            result.exception_bits |= fp_underflow | fp_inexact;
+            mips32_finalize_d(result, fcsr);
+            return result;
+        }
+
+        const unsigned shift = static_cast<unsigned>(exponent + 1074);
+        const unsigned dropped = 52u - shift;
+        const auto truncated = significand >> dropped;
+        const auto guard = (significand >> (dropped - 1)) & 1u;
+        const auto low_mask = (UINT64_C(1) << (dropped - 1)) - 1;
+        const bool lower = (significand & low_mask) != 0 || inexact;
+        const bool increment = increment_for(truncated, guard != 0, lower, guard != 0 || lower);
+        const auto rounded = truncated + static_cast<std::uint64_t>(increment);
+        result.value_bits = sign | (rounded >= (UINT64_C(1) << 52)
+            ? (UINT64_C(1) << 52) : rounded);
+        if (guard || lower) {
+            result.exception_bits |= fp_inexact;
+            if (rounded < (UINT64_C(1) << 52)) result.exception_bits |= fp_underflow;
+        }
+        mips32_finalize_d(result, fcsr);
+        return result;
+    }
     Mips32Magnitude exact;
     int scale = 0;
     bool negative = false;
@@ -856,10 +988,11 @@ std::optional<Mips32ArithmeticDResult> evaluate_mips32_arithmetic_d_instruction(
     if (instruction.register_reads != std::vector<RegisterOperand>{*left, *right, fcsr_reg} ||
         instruction.register_writes != std::vector<RegisterOperand>{*destination, fcsr_reg} ||
         (instruction.opcode != Opcode::mips_add_d && instruction.opcode != Opcode::mips_sub_d &&
-         instruction.opcode != Opcode::mips_mul_d)) return {};
+         instruction.opcode != Opcode::mips_mul_d && instruction.opcode != Opcode::mips_div_d)) return {};
     const auto operation = instruction.opcode == Opcode::mips_add_d ? Mips32DArithmeticOperation::add :
         instruction.opcode == Opcode::mips_sub_d ? Mips32DArithmeticOperation::subtract :
-        Mips32DArithmeticOperation::multiply;
+        instruction.opcode == Opcode::mips_mul_d ? Mips32DArithmeticOperation::multiply :
+        Mips32DArithmeticOperation::divide;
     return evaluate_mips32_arithmetic_d(operation, lhs_bits, rhs_bits, fcsr);
 }
 
