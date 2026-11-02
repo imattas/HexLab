@@ -177,6 +177,8 @@ Result<std::vector<ManagedMethodAnalysis>> inspect_managed_methods(const LoadedI
   const auto base=loaded.load_base.value_or(loaded.metadata.preferred_base);
   auto methods=parse_managed_methods(metadata_bytes.value());if(!methods)return methods.error();
   auto call_signatures=parse_managed_call_signatures(metadata_bytes.value());
+  auto local_signatures=parse_managed_local_signatures(metadata_bytes.value());
+  if(!local_signatures)return local_signatures.error();
   auto fields=parse_managed_fields(metadata_bytes.value());
   if(!fields)return fields.error();
   auto field_references=parse_managed_field_references(metadata_bytes.value());
@@ -340,6 +342,21 @@ Result<std::vector<ManagedMethodAnalysis>> inspect_managed_methods(const LoadedI
     }
     auto raw=get(body_size);if(!raw){fail(raw.error());result.push_back(std::move(analysis));continue;}
     auto body=parse_cil_method_body(raw.value());if(!body){fail(body.error());result.push_back(std::move(analysis));continue;}
+    if(body.value().local_signature_token){
+      const auto token=body.value().local_signature_token;
+      if((token>>24)!=0x11){
+        analysis.status=ManagedMethodStatus::malformed;
+        analysis.diagnostic="CIL local-signature token is not a StandAloneSig token";
+        result.push_back(std::move(analysis));continue;
+      }
+      const auto signature=local_signatures.value().find(token);
+      if(signature==local_signatures.value().end()){
+        analysis.status=ManagedMethodStatus::malformed;
+        analysis.diagnostic="CIL local-signature token does not resolve to a LocalVarSig row";
+        result.push_back(std::move(analysis));continue;
+      }
+      analysis.local_variables=signature->second;
+    }
     if(exception_type_catalog) {
       const auto unresolved=std::find_if(body.value().exception_clauses.begin(),body.value().exception_clauses.end(),[&](const auto &clause) {
         return clause.kind==CilExceptionKind::catch_clause &&
@@ -386,6 +403,26 @@ Result<std::vector<ManagedMethodAnalysis>> inspect_managed_methods(const LoadedI
       if(invalid_exception_types){result.push_back(std::move(analysis));continue;}
     }
     auto instructions=decode_cil_instructions(body.value().il);if(!instructions){fail(instructions.error());result.push_back(std::move(analysis));continue;}
+    bool invalid_local_operand=false;
+    for(const auto &instruction:instructions.value()){
+      const auto mnemonic=std::string_view(instruction.mnemonic);
+      std::optional<std::uint32_t> local_index;
+      if(mnemonic.size()==7 && (mnemonic.starts_with("ldloc.")||mnemonic.starts_with("stloc.")) &&
+         mnemonic.back()>='0' && mnemonic.back()<='3')
+        local_index=static_cast<std::uint32_t>(mnemonic.back()-'0');
+      else if(mnemonic=="ldloc.s"||mnemonic=="ldloca.s"||mnemonic=="stloc.s"){
+        if(const auto *index=std::get_if<std::uint8_t>(&instruction.operand))local_index=*index;
+      }else if(mnemonic=="ldloc"||mnemonic=="ldloca"||mnemonic=="stloc"){
+        if(const auto *index=std::get_if<std::uint16_t>(&instruction.operand))local_index=*index;
+      }
+      if(local_index && *local_index>=analysis.local_variables.size()){
+        analysis.status=ManagedMethodStatus::malformed;
+        analysis.diagnostic="CIL local-variable operand exceeds the resolved LocalVarSig";
+        invalid_local_operand=true;
+        break;
+      }
+    }
+    if(invalid_local_operand){result.push_back(std::move(analysis));continue;}
     analysis.body=std::move(body.value());analysis.instructions=std::move(instructions.value());
     const auto uses_user_strings=std::any_of(analysis.instructions.begin(),analysis.instructions.end(),[](const auto &instruction){return std::string_view(instruction.mnemonic)=="ldstr";});
     if(uses_user_strings){

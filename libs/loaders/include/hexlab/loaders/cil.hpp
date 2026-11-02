@@ -41,6 +41,9 @@ struct ManagedMethodAnalysis {
     ManagedMethodStatus status=ManagedMethodStatus::unsupported;
     std::string diagnostic;
     std::optional<CilMethodBody> body;
+    // Resolved ECMA-335 LocalVarSig entries for the body's StandAloneSig
+    // token. Empty when the method has no locals or no local signature.
+    ManagedLocalSignature local_variables;
     std::vector<CilInstruction> instructions;
     std::map<std::uint32_t,ManagedMethodSignature> resolved_call_signatures;
     std::map<std::uint32_t,ManagedField> resolved_fields;
