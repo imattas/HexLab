@@ -906,7 +906,8 @@ void AnalysisIssuesView::rebuild() {
     row_review_keys_.reserve(rows_.size());
     for (const auto &row : rows_) row_review_keys_.push_back(stored_review_key(row));
     const bool preserve_file_reviews = !project_ && !file_review_source_identity_.empty() &&
-        (capped_ || !document_snapshot_ || !document_snapshot_->analysis);
+        (capped_ || !document_snapshot_ || !document_snapshot_->analysis ||
+         !document_snapshot_->analysis->complete);
     if (reviewed_ && !preserve_file_reviews) {
         const auto previous_count = reviewed_->size();
         std::unordered_set<std::string> current_keys(row_review_keys_.begin(), row_review_keys_.end());

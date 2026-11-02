@@ -192,7 +192,9 @@ when a stable identity is available. The identity hashes the complete input byte
 the encoded load recipe, the analysis-engine fingerprint, and any certified
 auxiliary-input fingerprint; path names are not used as identity. Inputs up to
 4 GiB are fingerprinted while the document loads. Larger inputs, uncertified plugin inputs, or hashing failures keep review
-state only for the open session. Each finding's persisted review key is hashed
+state only for the open session. If analysis is incomplete or visible findings
+are capped, existing file-only marks are retained instead of being pruned
+against a partial row set. Each finding's persisted review key is hashed
 before it is written, and at most 20,000 marks are retained per input identity.
 Changing the bytes or load recipe opens a separate review set. The finding detail
 shows the current file-only identity; TSV adds `document_identity`, and JSON adds
