@@ -14911,7 +14911,7 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                             while (cursor && cursor != entry && cursor != latch &&
                                    !do_body_ids.contains(cursor->id.value) &&
                                    !exit_path_ids.contains(cursor->id.value) &&
-                                   node.path.size() + tree_blocks.size() < 63 &&
+                                   tree_blocks.size() < 63 &&
                                    path_seen.insert(cursor->id.value).second &&
                                    !tree_blocks.contains(cursor->id.value) &&
                                    predecessors[cursor->id.value] == std::set<std::uint64_t>{predecessor} &&
@@ -14964,9 +14964,11 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                             }
                             return {};
                         };
-                        const auto tree_true = trace_tree(*candidate->true_target, exit_cursor->id.value, 1);
+                        // The exit cursor is the root branch at depth one, so
+                        // each child subtree begins at depth two.
+                        const auto tree_true = trace_tree(*candidate->true_target, exit_cursor->id.value, 2);
                         const auto tree_false = tree_true
-                            ? trace_tree(*candidate->false_target, exit_cursor->id.value, 1)
+                            ? trace_tree(*candidate->false_target, exit_cursor->id.value, 2)
                             : std::optional<std::size_t>{};
                         if (tree_true && tree_false && tree_blocks.size() <= 63) {
                             cleanup_return_tree = std::move(tree);

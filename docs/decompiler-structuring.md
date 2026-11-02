@@ -80,8 +80,9 @@ the conservative fallback.
 
 A post-tested loop's exit cleanup may contain a bounded nested conditional tree
 whose leaves are explicit returns. Linear cleanup paths remain supported. The
-tree is capped at 64 blocks including its root branch, 32 branches, and depth
-32. Every branch has exactly two validated CFG edges. Every path block is
+tree is capped at 64 blocks including the exit cleanup's root branch, with at
+most 32 conditional nodes and depth 32 (counting that root as depth one). Every
+branch has exactly two validated CFG edges. Every path block is
 single-entry, and no block is shared or repeated; joins, cycles, side entries,
 switches, and mixed non-return leaves retain the existing fallback. Intermediate
 blocks are phi-free (including memory-partition phis). Return blocks may have
