@@ -10,6 +10,7 @@
 #include <wx/timer.h>
 
 #include <memory>
+#include <array>
 #include <functional>
 #include <cstdint>
 #include <map>
@@ -101,6 +102,12 @@ class DebuggerView final : public wxPanel {
     wxButton *memory_history_forward_button_ = nullptr;
     wxChoice *memory_history_choice_ = nullptr;
     bool updating_memory_history_choice_ = false;
+    bool memory_patch_running_ = false;
+    std::stop_source memory_patch_stop_;
+    std::optional<debugger::MemoryPatchReport> memory_patch_undo_;
+    std::vector<std::array<wxString, 3>> memory_patch_rows_;
+    wxString memory_patch_report_;
+    std::function<void()> memory_patch_finished_;
     wxTextCtrl *memory_write_bytes_ = nullptr;
     wxCheckBox *memory_write_utf8_ = nullptr;
     wxTextCtrl *memory_view_ = nullptr;
@@ -352,6 +359,8 @@ class DebuggerView final : public wxPanel {
     void copy_memory_search_report();
     void render_memory_search_matches();
     void write_memory();
+    void edit_memory_patches();
+    void run_memory_patches(std::vector<debugger::MemoryPatch> patches, bool undo);
     void move_memory_page(int direction);
     void refresh_modules();
     void render_modules(std::optional<std::size_t> preferred = {});

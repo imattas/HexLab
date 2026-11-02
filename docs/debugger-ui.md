@@ -26,3 +26,36 @@ enumeration is unsupported or fails, the remote session remains active and the
 process selector shows the listing error. Closing the debugger view before a
 pending connection completes disconnects a successful late connection instead
 of leaving an unowned remote session behind.
+
+## Guarded memory patch batches
+
+Open **Patch batch...** beside the Memory pane's existing **Write** button.
+The modal editor provides address, optional expected bytes, and replacement
+bytes in separate editable columns. Use **Add range** and **Remove row** for
+1–256 non-overlapping ranges totaling at most 1 MiB. Addresses accept decimal
+or `0x` hexadecimal; byte columns accept hex pairs. Leave expected bytes blank
+to snapshot the current contents without a caller precondition.
+
+Stop the target before **Apply batch**. The batch runs on the serialized
+inspection worker; the dialog stays responsive, and the main window remains
+unavailable until the editor closes. **Cancel operation** requests cooperative
+cancellation, which waits for an in-flight backend call and does not interrupt
+recovery. Closing during an operation requests cancellation and keeps the
+editor open until completion. Event polling pauses during the batch.
+
+The report distinguishes applied, verified rollback, and **ROLLBACK INCOMPLETE**.
+It includes the original failure, recovery failures, each row's state, and full
+before/replacement snapshots. Inspect uncertain ranges before explicitly
+continuing the target. The editor never resumes the target automatically.
+
+**Undo / redo last batch** restores a retained successful report through the
+same guarded API. A successful undo becomes the next redo; a conflict fails
+before writes. Incomplete recovery clears the undo candidate. Reports, editor
+rows, and undo are attachment-scoped and cleared when the UI changes sessions.
+Queued operations reject changed session/stop generations before execution;
+late results cannot authorize undo against a different attachment. These
+in-memory reports are not persisted across application restarts.
+
+The ordinary single-range Write workflow is unchanged. Backend stop,
+breakpoint, expected-byte, and recovery rules are described in
+[Guarded memory patch batches](../libs/debugger/docs/memory-patch-batches.md).

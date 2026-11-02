@@ -4,6 +4,8 @@
 #include "hexlab/workspace/project.hpp"
 
 #include <wx/button.h>
+#include <wx/dialog.h>
+#include <wx/grid.h>
 #include <wx/accel.h>
 #include <wx/clipbrd.h>
 #include <wx/choice.h>
@@ -64,6 +66,8 @@ enum : int { browse_executable_id = wxID_HIGHEST + 220, browse_working_directory
             inspect_local_address_id, inspect_frame_cfa_id, breakpoint_at_frame_id,
             refresh_auxv_id, copy_auxv_id, copy_visible_auxv_id, refresh_osdata_id, copy_osdata_id, refresh_signal_info_id,
             refresh_remote_file_id, run_remote_monitor_id };
+
+constexpr int memory_patch_task_kind = -1;
 
 std::string narrow(const wxString &value) { return value.ToStdString(); }
 std::string os_data_cell(std::string_view value) {
@@ -347,6 +351,44 @@ const char *debugger_error_code_name(ErrorCode code) {
     case ErrorCode::integrity: return "integrity";
     }
     return "unknown";
+}
+std::string memory_patch_report_text(const debugger::MemoryPatchReport &outcome) {
+    using debugger::MemoryPatchCompletion;
+    std::string text = outcome.completion == MemoryPatchCompletion::applied
+        ? "Applied and verified. Guarded undo / redo is available.\n"
+        : outcome.completion == MemoryPatchCompletion::rollback_incomplete
+            ? "ROLLBACK INCOMPLETE: inspect uncertain ranges before continuing.\n"
+            : "Rolled back: every attempted range was verified restored.\n";
+    auto failure = [&](const char *label, const debugger::MemoryPatchFailure &item) {
+        text += std::string(label) + " row " + std::to_string(item.index + 1) + " [" +
+            debugger_error_code_name(item.error.code) + "]: " + item.error.message + "\n";
+    };
+    if (outcome.failure) failure("Failure at", *outcome.failure);
+    for (const auto &item : outcome.rollback_failures) failure("Recovery failed at", item);
+    auto bytes = [&](const auto &values) {
+        constexpr char hex[] = "0123456789ABCDEF";
+        for (std::size_t index = 0; index < values.size(); ++index) {
+            const auto value = std::to_integer<unsigned>(values[index]);
+            text += hex[value >> 4]; text += hex[value & 15];
+            text += (index + 1) % 32 == 0 ? '\n' : ' ';
+        }
+        text += '\n';
+    };
+    for (std::size_t row = 0; row < outcome.records.size(); ++row) {
+        const auto &record = outcome.records[row];
+        const char *status = "untouched";
+        switch (record.state) {
+        case debugger::MemoryPatchState::applied: status = "applied"; break;
+        case debugger::MemoryPatchState::restored: status = "restored"; break;
+        case debugger::MemoryPatchState::uncertain: status = "UNCERTAIN"; break;
+        default: break;
+        }
+        char address[32];
+        std::snprintf(address, sizeof(address), "0x%llX", static_cast<unsigned long long>(record.address));
+        text += "\nRow " + std::to_string(row + 1) + " at " + address + ": " + status + "\nBefore:\n";
+        bytes(record.before); text += "Replacement:\n"; bytes(record.after);
+    }
+    return text;
 }
 std::string json_quote_utf8(std::string_view text) {
     std::string result{"\""};
@@ -995,6 +1037,9 @@ DebuggerView::DebuggerView(wxWindow *parent, std::unique_ptr<debugger::Backend> 
     memory_write_utf8_->SetName("debug-memory-write-utf8");
     memory_write_controls->Add(memory_write_utf8_, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(3));
     memory_write_controls->Add(make_button(memory_page, "debug-write-memory", "Write", write_memory_id), 0);
+    auto *patch_batches = make_button(memory_page, "debug-memory-patch-batches", "Patch batch...", wxID_ANY);
+    memory_write_controls->Add(patch_batches, 0, wxLEFT, FromDIP(3));
+    patch_batches->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { edit_memory_patches(); });
     memory_write_utf8_->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent &) {
         memory_write_bytes_->SetHint(memory_write_utf8_->GetValue()
             ? "UTF-8 text to write (no terminator)" : "Bytes to write (hex pairs, e.g. 90 C3)");
@@ -1815,6 +1860,7 @@ plugins::ActiveDebuggerServices DebuggerView::active_debugger_services(
 }
 
 DebuggerView::~DebuggerView() {
+    memory_patch_stop_.request_stop();
     memory_search_stop_.request_stop();
     {
         std::lock_guard lock(termination_state_->mutex);
@@ -2244,6 +2290,7 @@ void DebuggerView::finish_terminate(debugger::Status result) {
 }
 
 void DebuggerView::poll_event() {
+    if (memory_patch_running_) return;
     document_changed();
     if (session_->state() != debugger::SessionState::running) return;
     auto result = [&] { std::lock_guard lock(inspection_state_->backend_mutex); return session_->wait_event(std::chrono::milliseconds(0)); }();
@@ -5558,6 +5605,202 @@ void DebuggerView::write_memory() {
                             static_cast<unsigned long long>(address)));
 }
 
+void DebuggerView::edit_memory_patches() {
+    if (memory_patch_running_) return;
+    const auto editor_generation = session_generation_;
+    wxDialog dialog(this, wxID_ANY, "Guarded memory patch batch", wxDefaultPosition,
+                    FromDIP(wxSize(900, 640)), wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER);
+    auto *box = new wxBoxSizer(wxVERTICAL);
+    box->Add(new wxStaticText(&dialog, wxID_ANY,
+        "Stopped target required. Enter 1-256 non-overlapping ranges, at most 1 MiB total.\n"
+        "Expected and replacement use hex byte pairs. Blank expected snapshots current bytes.\n"
+        "Remove overlapping software breakpoints first. Cancel waits for any in-flight call and rollback."),
+        0, wxEXPAND | wxALL, FromDIP(8));
+    auto *grid = new wxGrid(&dialog, wxID_ANY);
+    grid->SetName("debug-memory-patch-rows");
+    grid->CreateGrid(static_cast<int>(std::max<std::size_t>(1, memory_patch_rows_.size())), 3);
+    grid->SetColLabelValue(0, "Address (decimal or 0x)");
+    grid->SetColLabelValue(1, "Expected hex (optional)");
+    grid->SetColLabelValue(2, "Replacement hex");
+    for (int col = 0; col < 3; ++col) grid->SetColSize(col, FromDIP(col == 0 ? 180 : 290));
+    for (std::size_t row = 0; row < memory_patch_rows_.size(); ++row)
+        for (int col = 0; col < 3; ++col) grid->SetCellValue(static_cast<int>(row), col, memory_patch_rows_[row][col]);
+    if (memory_patch_rows_.empty()) grid->SetCellValue(0, 0, memory_address_->GetValue());
+    box->Add(grid, 1, wxEXPAND | wxLEFT | wxRIGHT, FromDIP(8));
+    auto *actions = new wxBoxSizer(wxHORIZONTAL);
+    auto button = [&](const char *label) {
+        auto *control = new wxButton(&dialog, wxID_ANY, label);
+        actions->Add(control, 0, wxRIGHT, FromDIP(5));
+        return control;
+    };
+    auto *add = button("Add range");
+    auto *remove = button("Remove row");
+    auto *apply = button("Apply batch");
+    auto *undo = button("Undo / redo last batch");
+    auto *cancel = button("Cancel operation");
+    auto *close = button("Close");
+    dialog.SetEscapeId(close->GetId());
+    box->Add(actions, 0, wxALL, FromDIP(8));
+    auto *output = new wxTextCtrl(&dialog, wxID_ANY, memory_patch_report_, wxDefaultPosition,
+                                 wxDefaultSize, wxTE_MULTILINE | wxTE_READONLY | wxTE_DONTWRAP);
+    output->SetName("debug-memory-patch-report");
+    box->Add(output, 1, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, FromDIP(8));
+    dialog.SetSizer(box);
+    auto update = [&] {
+        const bool ready = !memory_patch_running_;
+        const bool current = session_generation_ == editor_generation;
+        grid->Enable(ready); add->Enable(ready && grid->GetNumberRows() < static_cast<int>(debugger::max_memory_patch_ranges));
+        remove->Enable(ready && grid->GetNumberRows() > 1);
+        apply->Enable(ready && current); undo->Enable(ready && current && memory_patch_undo_.has_value());
+        cancel->Enable(!ready); close->Enable(ready);
+        output->ChangeValue(memory_patch_report_);
+    };
+    memory_patch_finished_ = update;
+    add->Bind(wxEVT_BUTTON, [&](wxCommandEvent &) { grid->AppendRows(); update(); });
+    remove->Bind(wxEVT_BUTTON, [&](wxCommandEvent &) {
+        const auto row = grid->GetGridCursorRow();
+        if (row >= 0 && grid->GetNumberRows() > 1) grid->DeleteRows(row);
+        update();
+    });
+    auto invalid = [&](int row, const char *message) {
+        memory_patch_report_ = wxString::Format("Row %d: %s\nNo writes attempted.", row + 1, wxString::FromUTF8(message));
+        update();
+    };
+    apply->Bind(wxEVT_BUTTON, [&](wxCommandEvent &) {
+        if (session_generation_ != editor_generation) { update(); return; }
+        grid->SaveEditControlValue();
+        grid->HideCellEditControl();
+        std::vector<debugger::MemoryPatch> patches;
+        std::size_t total = 0;
+        for (int row = 0; row < grid->GetNumberRows(); ++row) {
+            debugger::MemoryPatch patch;
+            bool too_many = false;
+            if (!parse_unsigned(narrow(grid->GetCellValue(row, 0)), patch.address)) {
+                invalid(row, "Enter a valid address."); return;
+            }
+            if (!parse_hex_bytes(narrow(grid->GetCellValue(row, 2)), patch.bytes,
+                                 debugger::max_memory_patch_bytes - total, too_many)) {
+                invalid(row, too_many ? "Batch exceeds 1 MiB." : "Enter non-empty replacement hex byte pairs."); return;
+            }
+            total += patch.bytes.size();
+            if (patch.address > UINT64_MAX - patch.bytes.size()) {
+                invalid(row, "Range wraps the address space."); return;
+            }
+            auto expected = grid->GetCellValue(row, 1);
+            expected.Trim().Trim(false);
+            if (!expected.empty()) {
+                patch.expected.emplace();
+                if (!parse_hex_bytes(narrow(expected), *patch.expected, patch.bytes.size(), too_many) ||
+                    patch.expected->size() != patch.bytes.size()) {
+                    invalid(row, "Expected hex must have exactly the replacement length."); return;
+                }
+            }
+            for (const auto &prior : patches) {
+                if (patch.address < prior.address + prior.bytes.size() && prior.address < patch.address + patch.bytes.size()) {
+                    invalid(row, "Range overlaps an earlier row."); return;
+                }
+            }
+            patches.push_back(std::move(patch));
+        }
+        run_memory_patches(std::move(patches), false);
+        update();
+    });
+    undo->Bind(wxEVT_BUTTON, [&](wxCommandEvent &) {
+        if (session_generation_ == editor_generation) run_memory_patches({}, true);
+        update();
+    });
+    cancel->Bind(wxEVT_BUTTON, [&](wxCommandEvent &) {
+        memory_patch_stop_.request_stop(); cancel->Disable();
+        output->AppendText("\nCancellation requested; waiting for completion and recovery.\n");
+    });
+    close->Bind(wxEVT_BUTTON, [&](wxCommandEvent &) { if (!memory_patch_running_) dialog.EndModal(wxID_CLOSE); });
+    dialog.Bind(wxEVT_CLOSE_WINDOW, [&](wxCloseEvent &event) {
+        if (memory_patch_running_) { memory_patch_stop_.request_stop(); event.Veto(); return; }
+        dialog.EndModal(wxID_CLOSE);
+    });
+    update();
+    dialog.ShowModal();
+    grid->SaveEditControlValue();
+    memory_patch_rows_.clear();
+    for (int row = 0; session_generation_ == editor_generation && row < grid->GetNumberRows(); ++row)
+        memory_patch_rows_.push_back({grid->GetCellValue(row, 0), grid->GetCellValue(row, 1), grid->GetCellValue(row, 2)});
+    memory_patch_finished_ = {};
+}
+
+void DebuggerView::run_memory_patches(std::vector<debugger::MemoryPatch> patches, bool undo) {
+    if (memory_patch_running_) return;
+    if (!pending_event_ || session_->state() != debugger::SessionState::stopped || termination_pending_ || remote_connecting_) {
+        memory_patch_report_ = "Stop the attached target before applying or undoing patches."; return;
+    }
+    if (undo && !memory_patch_undo_) return;
+    memory_patch_running_ = true;
+    memory_patch_stop_ = std::stop_source{};
+    const auto cancellation = memory_patch_stop_.get_token();
+    const auto generation = session_generation_;
+    const auto state = inspection_state_;
+    const auto session = session_;
+    const auto worker_generation = state->session_generation.load(std::memory_order_acquire);
+    const auto stop_generation = state->stop_generation.load(std::memory_order_acquire);
+    auto previous = undo ? memory_patch_undo_ : std::nullopt;
+    memory_patch_report_ = undo ? "Undo / redo running..." : "Applying batch...";
+    // Unique task kind: inspection coalescing must never replace a queued mutation.
+    enqueue_inspection(memory_patch_task_kind, [session, state, generation, worker_generation, stop_generation, cancellation,
+                           patches = std::move(patches), previous = std::move(previous)]() mutable {
+        std::optional<debugger::MemoryPatchReport> outcome;
+        std::string error, text;
+        bool uncertain = false;
+        {
+            std::lock_guard lock(state->backend_mutex);
+            if (state->stopping || state->session_generation.load(std::memory_order_acquire) != worker_generation ||
+                state->stop_generation.load(std::memory_order_acquire) != stop_generation) {
+                error = "Session or pending stop changed before execution; no writes attempted.";
+            } else {
+                try {
+                    auto result = previous ? session->restore_memory_patches(*previous, cancellation)
+                                           : session->apply_memory_patches(patches, cancellation);
+                    if (result) outcome = std::move(result.value());
+                    else error = std::string(debugger_error_code_name(result.error().code)) + ": " + result.error().message;
+                } catch (const std::exception &exception) {
+                    uncertain = true;
+                    error = exception.what();
+                } catch (...) {
+                    uncertain = true;
+                    error = "Unknown backend exception.";
+                }
+            }
+        }
+        // Format potentially 1 MiB of snapshots away from the UI thread.
+        if (outcome) text = memory_patch_report_text(*outcome);
+        if (auto *app = wxTheApp) app->CallAfter([state, generation, uncertain, text = std::move(text),
+                                                  error = std::move(error), outcome = std::move(outcome)]() mutable {
+            DebuggerView *view;
+            { std::lock_guard lock(state->mutex); view = state->target; }
+            if (!view) return;
+            view->memory_patch_running_ = false;
+            if (view->session_generation_ != generation) {
+                view->memory_patch_report_ = "Discarded a batch result from an earlier attachment.";
+            } else if (uncertain) {
+                view->memory_patch_undo_.reset();
+                view->memory_patch_report_ = "Backend exception; memory state is uncertain. Inspect the target before continuing: " + wxString::FromUTF8(error);
+            } else if (!error.empty()) {
+                view->memory_patch_report_ = "Preflight failed; no writes attempted: " + wxString::FromUTF8(error);
+            } else if (outcome) {
+                using debugger::MemoryPatchCompletion;
+                const bool applied = outcome->completion == MemoryPatchCompletion::applied;
+                const bool incomplete = outcome->completion == MemoryPatchCompletion::rollback_incomplete;
+                view->memory_patch_report_ = wxString::FromUTF8(text);
+                if (applied) view->memory_patch_undo_ = std::move(outcome);
+                else if (incomplete) view->memory_patch_undo_.reset();
+                view->refresh_memory();
+                view->report(applied ? "Memory patch batch applied and verified."
+                    : incomplete ? "Memory patch rollback incomplete; inspect the batch report before continuing."
+                                 : "Memory patch batch rolled back; inspect the batch report.");
+            }
+            if (view->memory_patch_finished_) view->memory_patch_finished_();
+        });
+    });
+}
+
 void DebuggerView::move_memory_page(int direction) {
     std::uint64_t address = 0;
     if (!parse_unsigned(narrow(memory_address_->GetValue()), address)) {
@@ -6715,6 +6958,10 @@ void DebuggerView::move_watch_expression(int direction) {
 }
 
 void DebuggerView::clear_inspection() {
+    memory_patch_stop_.request_stop();
+    memory_patch_undo_.reset();
+    memory_patch_report_.Clear();
+    memory_patch_rows_.clear();
     invalidate_frames();
     cancel_source_step_out();
     thread_schedule_snapshot_event_.reset();
@@ -6732,11 +6979,10 @@ void DebuggerView::clear_inspection() {
     update_memory_history_controls();
     memory_search_stop_.request_stop();
     {
-        // Requests captured for the previous process cannot contribute to
-        // the new inspection state. Drop them before accepting new work so
-        // stale queued snapshots cannot delay the first result for a target.
+        // Drop stale snapshots, but let a queued mutation observe cancellation
+        // and deliver its completion so its modal editor can become idle.
         std::lock_guard lock(inspection_state_->mutex);
-        inspection_state_->tasks.clear();
+        std::erase_if(inspection_state_->tasks, [](const auto &task) { return task.kind != memory_patch_task_kind; });
     }
     registers_.clear(); previous_registers_.clear(); previous_register_thread_.reset();
     pinned_registers_.clear(); pinned_register_thread_.reset();
