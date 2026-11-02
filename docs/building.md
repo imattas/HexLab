@@ -114,14 +114,10 @@ runtime instead of bundling a Python distribution. On Linux the DEB dependency
 scanner records the needed host Python shared-library dependency. Python
 automation remains disabled by default.
 
-The Linux desktop workflow extracts the Release TGZ under a fresh runner
-directory and runs the packaged CLI version command from that relocated tree
-with `LD_LIBRARY_PATH` unset. This checks that the CLI resolves its bundled
-engine libraries using the installed runtime paths. The workflow also verifies
-the desktop executable and bundled wxWidgets libraries are present; it does not
-launch the GUI. It uploads the TGZ with a SHA-256 sidecar, plus the Linux DEB
-and its checksum, as 14-day artifacts. These artifacts are for review and
-download; the workflow does not publish a GitHub release.
+Build and package Windows and Linux releases locally. Review the resulting
+artifacts on each host, then publish them manually with `gh release create` as
+described above. HexLab does not use GitHub Actions to build, test, or publish
+releases.
 
 Validate the installed files and both tools with:
 
