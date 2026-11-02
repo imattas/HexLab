@@ -6,8 +6,36 @@ bool data(Instruction &i, std::uint32_t word) {
         // Integer literal loads use the address of this instruction as PC,
         // with a signed imm19 scaled by four (no page alignment).
         const auto opc = word >> 30;
-        if ((word & 0x04000000u) || opc == 3)
-            return false; // SIMD/FP literals and PRFM are outside this slice.
+        if (word & 0x04000000u) {
+            // AdvSIMD/FP literal loads use the same signed imm19 * 4
+            // instruction-relative address as integer LDR literals. opc
+            // selects S, D, or Q; the fourth encoding is reserved.
+            if (opc == 3) return false;
+            const unsigned data_width = opc == 0 ? 32u : opc == 1 ? 64u : 128u;
+            const auto displacement = signed_value((word >> 5) & 0x7ffffu, 19) * 4;
+            i.opcode = Opcode::a64_ldr;
+            i.vector_bits = static_cast<std::uint16_t>(data_width);
+            i.vector_element_bits = static_cast<std::uint16_t>(data_width);
+            const RegisterOperand destination{RegisterBank::arm64_simd,
+                static_cast<std::uint8_t>(word & 31), static_cast<std::uint16_t>(data_width), false};
+            operand(i, destination, OperandAccess::write);
+            // Narrow S/D literal loads clear the remaining bits of the
+            // architectural V register. Publish that full write so generic
+            // register consumers cannot preserve stale upper-lane facts.
+            if (data_width < 128)
+                i.register_writes.push_back({RegisterBank::arm64_simd,
+                    static_cast<std::uint8_t>(word & 31), 128, false});
+            MemoryOperand memory;
+            memory.data_width = static_cast<std::uint16_t>(data_width);
+            memory.address_width = 64;
+            memory.ip_relative = true;
+            memory.displacement = displacement;
+            memory.resolved_address = target(i.address, displacement);
+            operand(i, memory, OperandAccess::read);
+            i.memory_read = true;
+            return true;
+        }
+        if (opc == 3) return false; // PRFM literal is not an architectural data read.
         const bool signed_word = opc == 2;
         const unsigned data_width = signed_word ? 32 : opc == 1 ? 64 : 32;
         const auto displacement = signed_value((word >> 5) & 0x7ffffu, 19) * 4;

@@ -73,6 +73,24 @@ std::string mnemonic(Opcode opcode, std::uint8_t condition) {
     return result;
 }
 std::string format(const Instruction &i) {
+    if (i.opcode == Opcode::a64_ldr && i.vector_bits &&
+        i.operands.size() == 2) {
+        const auto *destination = std::get_if<RegisterOperand>(&i.operands[0]);
+        const auto *memory = std::get_if<MemoryOperand>(&i.operands[1]);
+        if (!destination || destination->bank != RegisterBank::arm64_simd || !memory ||
+            !memory->ip_relative || destination->index >= 32 ||
+            (i.vector_bits != 32 && i.vector_bits != 64 && i.vector_bits != 128) ||
+            destination->width != i.vector_bits)
+            return "?a64-simd-literal";
+        const char *prefix = i.vector_bits == 32 ? "s" : i.vector_bits == 64 ? "d" : "q";
+        std::string address = memory->resolved_address
+            ? "[" + hex(memory->resolved_address->offset) + "]"
+            : "[pc" + std::string(memory->displacement < 0 ? " - #" : " + #") +
+                hex(memory->displacement < 0
+                    ? static_cast<std::uint64_t>(-(memory->displacement + 1)) + 1
+                    : static_cast<std::uint64_t>(memory->displacement)) + "]";
+        return "ldr " + std::string(prefix) + std::to_string(destination->index) + ", " + address;
+    }
     if (i.opcode == Opcode::a64_extr && i.operands.size() == 4) {
         const auto *dst = std::get_if<RegisterOperand>(&i.operands[0]);
         const auto *low = std::get_if<RegisterOperand>(&i.operands[1]);
