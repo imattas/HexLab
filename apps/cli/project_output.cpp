@@ -21,6 +21,7 @@
 #include "hexlab/loaders/pe.hpp"
 #include "hexlab/image/file_storage.hpp"
 #include <algorithm>
+#include <functional>
 #include <iomanip>
 #include <fstream>
 #include <map>
@@ -665,6 +666,67 @@ int print_derived(std::ostream &out, const Arguments &args, const ProjectSnapsho
         }
         if (events.size() > limit) out << "Events omitted: " << events.size() - limit << '\n';
         out << "Events: " << events.size() << "\nAnalysis: complete\n";
+        return 0;
+    }
+    if (args.action == L"custom-attributes") {
+        if (!snapshot.loaded)
+            throw Failure{{ErrorCode::unsupported, "Managed custom-attribute query requires a loaded PE image"}};
+        const auto attributes = take(inspect_managed_custom_attributes(*snapshot.loaded));
+        const auto status_name = [](ManagedCustomAttributeDecodeStatus status) {
+            switch (status) {
+            case ManagedCustomAttributeDecodeStatus::opaque_constructor: return "opaque-constructor";
+            case ManagedCustomAttributeDecodeStatus::fixed_values: return "fixed-values";
+            case ManagedCustomAttributeDecodeStatus::fixed_values_named_opaque: return "fixed-values-named-opaque";
+            }
+            return "unknown";
+        };
+        std::function<void(const ManagedCustomAttributeValue &, unsigned)> print_value;
+        print_value = [&](const ManagedCustomAttributeValue &value, unsigned depth) {
+            out << (depth == 0 ? "Value:" : "") << " kind=";
+            switch (value.kind) {
+            case ManagedCustomAttributeValueKind::boolean: out << "bool"; break;
+            case ManagedCustomAttributeValueKind::character: out << "char"; break;
+            case ManagedCustomAttributeValueKind::signed_integer: out << "signed"; break;
+            case ManagedCustomAttributeValueKind::unsigned_integer: out << "unsigned"; break;
+            case ManagedCustomAttributeValueKind::single: out << "single"; break;
+            case ManagedCustomAttributeValueKind::double_value: out << "double"; break;
+            case ManagedCustomAttributeValueKind::string: out << "string"; break;
+            case ManagedCustomAttributeValueKind::array: out << "array"; break;
+            }
+            out << " element-type=0x" << std::hex << unsigned(value.element_type) << std::dec;
+            if (value.kind == ManagedCustomAttributeValueKind::string) {
+                out << " value=" << (value.string_value ? escape(*value.string_value) : "<null>");
+            } else if (value.kind == ManagedCustomAttributeValueKind::array) {
+                if (value.null_array) out << " value=<null-array>";
+                else out << " count=" << value.elements.size();
+            } else {
+                out << " bits=0x" << std::hex << value.scalar_bits << std::dec;
+            }
+            out << " payload-offset=0x" << std::hex << value.data_offset << std::dec
+                << " payload-bytes=" << value.data_size << '\n';
+            if (value.kind == ManagedCustomAttributeValueKind::array && depth < 16) {
+                for (std::size_t i = 0; i < std::min<std::size_t>(value.elements.size(), 16); ++i) {
+                    out << "    [" << i << "] "; print_value(value.elements[i], depth + 1);
+                }
+                if (value.elements.size() > 16) out << "    values-omitted=" << value.elements.size() - 16 << '\n';
+            }
+        };
+        constexpr std::size_t limit = 128;
+        for (std::size_t index = 0; index < std::min(attributes.size(), limit); ++index) {
+            const auto &attribute = attributes[index];
+            out << "CustomAttribute: token=0x" << std::hex << attribute.token
+                << " parent-token=0x" << attribute.parent_token << " constructor-token=0x"
+                << attribute.constructor_token << " metadata-offset=0x" << attribute.metadata_offset
+                << std::dec << " status=" << status_name(attribute.decode_status)
+                << " fixed-arguments=" << attribute.fixed_arguments.size()
+                << " named-arguments=" << attribute.named_argument_count
+                << " raw-bytes=" << attribute.serialized_value.size() << '\n';
+            for (const auto &value : attribute.fixed_arguments) print_value(value, 0);
+            if (!attribute.decode_diagnostic.empty())
+                out << "  Decode: " << escape(attribute.decode_diagnostic) << '\n';
+        }
+        if (attributes.size() > limit) out << "Custom attributes omitted: " << attributes.size() - limit << '\n';
+        out << "Custom attributes: " << attributes.size() << "\nExecution: none\n";
         return 0;
     }
     if (args.action == L"managed-types") {

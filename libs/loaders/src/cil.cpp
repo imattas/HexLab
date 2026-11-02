@@ -147,6 +147,12 @@ Result<std::vector<ManagedEvent>> inspect_managed_events(const LoadedImage &load
 } catch(const std::bad_alloc&) {return Error{ErrorCode::resource_limit,"Cannot allocate CLR event catalog"};}
   catch(const std::length_error&) {return Error{ErrorCode::resource_limit,"CLR event catalog exceeds container limits"};}
 
+Result<std::vector<ManagedCustomAttribute>> inspect_managed_custom_attributes(const LoadedImage &loaded) try {
+  auto metadata=read_managed_metadata_root(loaded);if(!metadata)return metadata.error();
+  return parse_managed_custom_attributes(metadata.value());
+} catch(const std::bad_alloc&) {return Error{ErrorCode::resource_limit,"Cannot allocate CLR custom-attribute catalog"};}
+  catch(const std::length_error&) {return Error{ErrorCode::resource_limit,"CLR custom-attribute catalog exceeds container limits"};}
+
 Result<std::vector<ManagedMarshalDescriptor>> inspect_managed_marshal_descriptors(const LoadedImage &loaded) try {
   auto metadata=read_managed_metadata_root(loaded);if(!metadata)return metadata.error();
   return parse_managed_marshal_descriptors(metadata.value());

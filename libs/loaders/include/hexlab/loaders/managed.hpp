@@ -76,12 +76,36 @@ struct ManagedConstant {
   std::u16string string_value;
 };
 HEXLAB_LOADERS_EXPORT Result<std::vector<ManagedConstant>> parse_managed_constants(std::span<const std::byte> metadata_root);
-// Custom-attribute values are retained as bounded opaque serialized payloads;
-// this catalog validates parent/constructor tokens and the required prolog.
+enum class ManagedCustomAttributeValueKind : std::uint8_t {
+  boolean, character, signed_integer, unsigned_integer, single, double_value,
+  string, array
+};
+enum class ManagedCustomAttributeDecodeStatus : std::uint8_t {
+  opaque_constructor, fixed_values, fixed_values_named_opaque
+};
+struct ManagedCustomAttributeValue {
+  ManagedCustomAttributeValueKind kind=ManagedCustomAttributeValueKind::signed_integer;
+  // ECMA-335 ELEMENT_TYPE or SZARRAY element type from the constructor signature.
+  std::uint8_t element_type=0;
+  // Exact scalar/IEEE bits; string null is represented by a disengaged value.
+  std::uint64_t scalar_bits=0;
+  std::optional<std::string> string_value;
+  bool null_array=false;
+  // Arrays are decoded only for one-dimensional primitive/string element types.
+  std::vector<ManagedCustomAttributeValue> elements;
+  // Offsets refer to ManagedCustomAttribute::serialized_value.
+  std::uint32_t data_offset=0, data_size=0;
+};
+// Raw serialized bytes remain authoritative. The fixed constructor arguments
+// below are a bounded, inert decoded view; no attribute code is invoked.
 struct ManagedCustomAttribute {
   std::uint32_t token=0, parent_token=0, constructor_token=0, value_blob_index=0;
   std::uint64_t metadata_offset=0;
   std::vector<std::byte> serialized_value;
+  ManagedCustomAttributeDecodeStatus decode_status=ManagedCustomAttributeDecodeStatus::opaque_constructor;
+  std::uint16_t named_argument_count=0;
+  std::vector<ManagedCustomAttributeValue> fixed_arguments;
+  std::string decode_diagnostic;
 };
 HEXLAB_LOADERS_EXPORT Result<std::vector<ManagedCustomAttribute>> parse_managed_custom_attributes(std::span<const std::byte> metadata_root);
 // Declarative-security rows retain their HasDeclSecurity parent and the raw

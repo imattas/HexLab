@@ -1244,7 +1244,7 @@ void project_usage(std::ostream &out) {
            "       hexlab_cli project backup restore-in-place <backup.hxproj> --target <existing-project.hxproj>\n"
            "       hexlab_cli project exchange import <project> --input <file> [--conflict fail|skip|replace] [--dry-run] [--json]\n"
            "Actions: create inspect decompile rename comment bookmark define undefine reference patch undo redo\n"
-           "         save save-as export functions references switches stack graph search signatures signature-apply signature-create signature-catalog-create flirt flirt-apply fingerprints fingerprint-create recognition-evidence methods managed-types managed-resources fields properties events marshaling user-strings\n"
+           "         save save-as export functions references switches stack graph search signatures signature-apply signature-create signature-catalog-create flirt flirt-apply fingerprints fingerprint-create recognition-evidence methods managed-types managed-resources custom-attributes fields properties events marshaling user-strings\n"
            "         managed-resources <project> [--inputs-list <utf8-path-list>] [--json]\n"
            "         exchange export|import <project> --output/--input <file> [--conflict fail|skip|replace]\n"
            "         types export|export-header|import <project> --output/--input <file> [--replace] [--replace-assignments]\n"
@@ -1431,7 +1431,7 @@ int run_project_cli(std::span<const std::wstring_view> arguments, std::ostream &
         bool query = args.action == L"exchange-export" || args.action == L"types-export" || args.action == L"types-export-header" ||
                      args.action == L"decompile" ||
                      (args.action == L"exchange-import" && args.exchange_dry_run) ||
-                     args.action == L"inspect" || args.action == L"functions" || args.action == L"methods" || args.action == L"managed-types" || args.action == L"managed-resources" || args.action == L"fields" || args.action == L"properties" || args.action == L"events" || args.action == L"marshaling" || args.action == L"user-strings" || args.action == L"references" || args.action == L"stack" ||
+                     args.action == L"inspect" || args.action == L"functions" || args.action == L"methods" || args.action == L"managed-types" || args.action == L"managed-resources" || args.action == L"custom-attributes" || args.action == L"fields" || args.action == L"properties" || args.action == L"events" || args.action == L"marshaling" || args.action == L"user-strings" || args.action == L"references" || args.action == L"stack" ||
                      args.action == L"switches" ||
                      args.action == L"graph" || args.action == L"search" || args.action == L"recognition-evidence" || (args.action == L"signatures" && !args.signature_function_entries) ||
                      args.action == L"signature-create" || args.action == L"signature-catalog-create" || args.action == L"flirt" ||

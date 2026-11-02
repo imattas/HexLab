@@ -100,7 +100,8 @@ AssemblyRef implementation binds only when its root row has the `Forwarder`
 flag (`0x00200000`). Assembled full names are capped at 4,096 bytes.
 
 The parser preserves field signature indexes but does not yet decode field
-signature blobs into editable C++ project types or resolve custom attributes.
+signature blobs into editable C++ project types or resolve named custom-
+attribute arguments.
 `parse_managed_fields` now decodes the supported ECMA-335 `FIELD` signature
 subset into bounded `ManagedTypeSignature` trees and resolves local TypeDef,
 TypeRef, and TypeSpec tokens against the same metadata catalog used for method
@@ -213,3 +214,14 @@ record, and the `project fields` and `project methods` queries show a compact
 summary. The `project marshaling` query prints the full bounded catalog. Parser
 validation and the deliberate opaque descriptor boundary are documented in
 [CLR marshal metadata](managed-field-marshal.md).
+
+`parse_managed_custom_attributes` validates each `CustomAttribute` parent,
+constructor token, blob extent and prolog, and retains the serialized value
+bytes. When the constructor signature is available, common fixed arguments
+with primitive, string and one-dimensional primitive/string array types are
+decoded into inert typed records. Scalar payload bits and per-value offsets
+remain exact; SerString values are strict UTF-8 and arrays are bounded to
+65,536 elements. `project custom-attributes` displays these values without
+invoking attribute constructors. Named argument values, enum/custom types,
+boxed values and unsupported constructor signatures stay opaque in the raw
+blob; a status and diagnostic identify the boundary. No user code is run.

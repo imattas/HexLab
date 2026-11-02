@@ -18,6 +18,7 @@ std::uint16_t u16(std::span<const std::byte> b,std::size_t p){return std::uint16
 std::uint32_t u32(std::span<const std::byte> b,std::size_t p){return std::uint32_t(u16(b,p))|(std::uint32_t(u16(b,p+2))<<16);}
 std::uint64_t u64(std::span<const std::byte> b,std::size_t p){return std::uint64_t(u32(b,p))|(std::uint64_t(u32(b,p+4))<<32);}
 Error malformed(const char* s){return {ErrorCode::malformed,s};}
+bool resource_utf8_valid(std::string_view s);
 Result<bool> managed_assembly_identity_matches(const ManagedAssemblyIdentity&,const ManagedAssemblyIdentity&,
                                                std::size_t& key_work_bytes);
 bool fits(std::size_t p,std::uint64_t n,std::size_t total){return p<=total && n<=total-p;}
@@ -1413,6 +1414,111 @@ Result<std::vector<ManagedConstant>> parse_managed_constants(std::span<const std
   return result;
 }
 
+namespace {
+bool custom_attribute_type_supported(const ManagedTypeSignature &type, unsigned depth=0) {
+  if (depth > 16) return false;
+  switch (type.element_type) {
+  case 0x02: case 0x03: case 0x04: case 0x05: case 0x06: case 0x07:
+  case 0x08: case 0x09: case 0x0a: case 0x0b: case 0x0c: case 0x0d: case 0x0e:
+    return type.children.empty();
+  case 0x1d:
+    return type.children.size() == 1 && custom_attribute_type_supported(type.children.front(), depth + 1);
+  default:
+    return false;
+  }
+}
+
+Result<bool> decode_custom_attribute_value(const ManagedTypeSignature &type,
+    std::span<const std::byte> bytes, std::size_t &cursor, ManagedCustomAttributeValue &value,
+    std::uint64_t &total_values, std::uint64_t &decoded_string_bytes, unsigned depth=0) {
+  if (!custom_attribute_type_supported(type, depth)) return false;
+  if (++total_values > 1'000'000)
+    return Error{ErrorCode::resource_limit, "CLR custom-attribute decoded value count exceeds one million"};
+  const auto start = cursor;
+  value.element_type = type.element_type;
+  const auto scalar = [&](unsigned width) -> Result<bool> {
+    if (cursor > bytes.size() || width > bytes.size() - cursor)
+      return malformed("Truncated CLR custom-attribute scalar argument");
+    value.scalar_bits = 0;
+    for (unsigned i = 0; i < width; ++i)
+      value.scalar_bits |= std::uint64_t{std::to_integer<std::uint8_t>(bytes[cursor + i])} << (i * 8);
+    cursor += width;
+    return true;
+  };
+  switch (type.element_type) {
+  case 0x02: {
+    value.kind = ManagedCustomAttributeValueKind::boolean;
+    auto decoded = scalar(1); if (!decoded) return decoded.error();
+    if (value.scalar_bits > 1) return malformed("CLR custom-attribute Boolean is neither zero nor one");
+    break;
+  }
+  case 0x03: value.kind = ManagedCustomAttributeValueKind::character; { auto decoded=scalar(2); if(!decoded)return decoded.error(); } break;
+  case 0x04: case 0x06: case 0x08: case 0x0a:
+    value.kind = ManagedCustomAttributeValueKind::signed_integer;
+    { auto decoded=scalar(type.element_type==0x04?1u:type.element_type==0x06?2u:type.element_type==0x08?4u:8u); if(!decoded)return decoded.error(); }
+    break;
+  case 0x05: case 0x07: case 0x09: case 0x0b:
+    value.kind = ManagedCustomAttributeValueKind::unsigned_integer;
+    { auto decoded=scalar(type.element_type==0x05?1u:type.element_type==0x07?2u:type.element_type==0x09?4u:8u); if(!decoded)return decoded.error(); }
+    break;
+  case 0x0c: value.kind=ManagedCustomAttributeValueKind::single; { auto decoded=scalar(4); if(!decoded)return decoded.error(); } break;
+  case 0x0d: value.kind=ManagedCustomAttributeValueKind::double_value; { auto decoded=scalar(8); if(!decoded)return decoded.error(); } break;
+  case 0x0e: {
+    value.kind = ManagedCustomAttributeValueKind::string;
+    if (cursor >= bytes.size()) return malformed("Truncated CLR custom-attribute SerString");
+    if (bytes[cursor] == std::byte{0xff}) {
+      ++cursor;
+      value.string_value.reset();
+      break;
+    }
+    auto length = compressed_uint(bytes, cursor); if (!length) return length.error();
+    if (length.value() > 1024u * 1024u)
+      return Error{ErrorCode::resource_limit, "CLR custom-attribute SerString exceeds 1 MiB"};
+    if (cursor > bytes.size() || length.value() > bytes.size() - cursor)
+      return malformed("CLR custom-attribute SerString exceeds its value blob");
+    if (decoded_string_bytes > 64u * 1024u * 1024u - length.value())
+      return Error{ErrorCode::resource_limit, "CLR custom-attribute decoded strings exceed 64 MiB"};
+    decoded_string_bytes += length.value();
+    std::string text;
+    text.reserve(length.value());
+    for (std::uint32_t i = 0; i < length.value(); ++i)
+      text.push_back(static_cast<char>(std::to_integer<std::uint8_t>(bytes[cursor + i])));
+    if (!resource_utf8_valid(text)) return malformed("CLR custom-attribute SerString is invalid UTF-8");
+    cursor += length.value();
+    value.string_value = std::move(text);
+    break;
+  }
+  case 0x1d: {
+    value.kind = ManagedCustomAttributeValueKind::array;
+    value.element_type = type.children.front().element_type;
+    if (cursor > bytes.size() || 4 > bytes.size() - cursor)
+      return malformed("Truncated CLR custom-attribute array count");
+    const auto raw_count = u32(bytes, cursor); cursor += 4;
+    if (raw_count == UINT32_MAX) {
+      value.null_array = true;
+      break;
+    }
+    if (raw_count > 65536)
+      return Error{ErrorCode::resource_limit, "CLR custom-attribute array exceeds 65,536 elements"};
+    value.elements.reserve(raw_count);
+    for (std::uint32_t i = 0; i < raw_count; ++i) {
+      ManagedCustomAttributeValue element;
+      auto decoded = decode_custom_attribute_value(type.children.front(), bytes, cursor, element,
+          total_values, decoded_string_bytes, depth + 1);
+      if (!decoded) return decoded.error();
+      if (!decoded.value()) return false;
+      value.elements.push_back(std::move(element));
+    }
+    break;
+  }
+  default: return false;
+  }
+  value.data_offset = static_cast<std::uint32_t>(start);
+  value.data_size = static_cast<std::uint32_t>(cursor - start);
+  return true;
+}
+}
+
 Result<std::vector<ManagedCustomAttribute>> parse_managed_custom_attributes(std::span<const std::byte> root) try {
   if(root.size()>64u*1024u*1024u)return Error{ErrorCode::resource_limit,"CLR custom-attribute inspection root exceeds 64 MiB"};
   auto parsed=parse_cli_metadata(root);if(!parsed)return parsed.error();const auto& md=parsed.value();
@@ -1439,6 +1545,50 @@ Result<std::vector<ManagedCustomAttribute>> parse_managed_custom_attributes(std:
     std::size_t cursor=value.value_blob_index;auto length=compressed_uint(blobs,cursor);if(!length)return length.error();if(length.value()>blobs.size()-cursor)return malformed("CustomAttribute value exceeds #Blob heap");
     if(length.value()>4u*1024u*1024u)return Error{ErrorCode::resource_limit,"CustomAttribute value exceeds 4 MiB"};if(length.value()>64u*1024u*1024u-payload_total)return Error{ErrorCode::resource_limit,"CustomAttribute payloads exceed 64 MiB"};payload_total+=length.value();
     const auto payload=blobs.subspan(cursor,length.value());if(payload.size()<2||u16(payload,0)!=1)return malformed("CustomAttribute value has a missing or invalid prolog");value.serialized_value.assign(payload.begin()+2,payload.end());result.push_back(std::move(value));
+  }
+  if (result.empty()) return result;
+  const auto signatures = parse_managed_call_signatures(root);
+  if (!signatures) {
+    for (auto &attribute : result) attribute.decode_diagnostic =
+        "Constructor signatures are unavailable: " + signatures.error().message;
+    return result;
+  }
+  std::uint64_t total_values = 0, decoded_string_bytes = 0;
+  for (auto &attribute : result) {
+    const auto signature = signatures.value().find(attribute.constructor_token);
+    if (signature == signatures.value().end() || !signature->second.has_this ||
+        signature->second.returns_value || signature->second.generic_arity != 0 ||
+        signature->second.parameter_count != signature->second.parameter_types.size() ||
+        !std::all_of(signature->second.parameter_types.begin(), signature->second.parameter_types.end(),
+                     [](const ManagedTypeSignature &type) { return custom_attribute_type_supported(type); })) {
+      attribute.decode_diagnostic = "Constructor signature is unavailable or contains unsupported argument types";
+      continue;
+    }
+    std::size_t cursor = 0;
+    for (const auto &type : signature->second.parameter_types) {
+      ManagedCustomAttributeValue argument;
+      auto decoded = decode_custom_attribute_value(type, attribute.serialized_value, cursor,
+          argument, total_values, decoded_string_bytes);
+      if (!decoded) return decoded.error();
+      if (!decoded.value()) {
+        attribute.fixed_arguments.clear();
+        attribute.decode_diagnostic = "Constructor contains an unsupported fixed argument type";
+        break;
+      }
+      attribute.fixed_arguments.push_back(std::move(argument));
+    }
+    if (!attribute.decode_diagnostic.empty()) continue;
+    if (cursor > attribute.serialized_value.size() || 2 > attribute.serialized_value.size() - cursor)
+      return malformed("CLR custom-attribute named-argument count is truncated");
+    attribute.named_argument_count = u16(attribute.serialized_value, cursor);
+    cursor += 2;
+    if (!attribute.named_argument_count && cursor != attribute.serialized_value.size())
+      return malformed("CLR custom-attribute has trailing bytes after named-argument count");
+    attribute.decode_status = attribute.named_argument_count
+        ? ManagedCustomAttributeDecodeStatus::fixed_values_named_opaque
+        : ManagedCustomAttributeDecodeStatus::fixed_values;
+    if (attribute.named_argument_count)
+      attribute.decode_diagnostic = "Named argument values remain in the raw serialized blob";
   }
   return result;
 } catch(const std::bad_alloc&) {return Error{ErrorCode::resource_limit,"Cannot allocate CLR custom-attribute catalog"};}

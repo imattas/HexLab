@@ -73,6 +73,7 @@ HEXLAB_LOADERS_EXPORT Result<std::vector<ManagedTypeDefinition>> inspect_managed
 HEXLAB_LOADERS_EXPORT Result<std::vector<ManagedField>> inspect_managed_fields(const LoadedImage&);
 HEXLAB_LOADERS_EXPORT Result<std::vector<ManagedProperty>> inspect_managed_properties(const LoadedImage&);
 HEXLAB_LOADERS_EXPORT Result<std::vector<ManagedEvent>> inspect_managed_events(const LoadedImage&);
+HEXLAB_LOADERS_EXPORT Result<std::vector<ManagedCustomAttribute>> inspect_managed_custom_attributes(const LoadedImage&);
 HEXLAB_LOADERS_EXPORT Result<std::vector<ManagedMarshalDescriptor>> inspect_managed_marshal_descriptors(const LoadedImage&);
 HEXLAB_LOADERS_EXPORT Result<ManagedUserStringCatalog> inspect_managed_user_strings(const LoadedImage&);
 }
