@@ -27,9 +27,9 @@
 
 ## Task 1: Remove dormant Darwin debugger implementation
 
-**Files:** delete `libs/debugger/src/native_backend_macos.cpp`; update `docs/capabilities.csv` to mark the implementation as removed. Keep the Darwin debugger notes only as historical, unsupported documentation.
+**Files:** delete `libs/debugger/src/native_backend_macos.cpp` and the unreferenced `libs/debugger/src/darwin_modules.hpp`; update `docs/capabilities.csv` to mark the implementation as removed. Keep the Darwin debugger notes only as historical, unsupported documentation.
 
-- [ ] Confirm CMake selects only Windows, Linux, or portable stub backends.
-- [ ] Delete the unused Darwin implementation; retain docs that clearly say the backend is unsupported history.
-- [ ] Update the capability ledger's current debugger platform description and remove file references to deleted paths.
-- [ ] Verify there are no dangling source/document links and inspect `git diff --check`.
+- [x] Confirm CMake selects only Windows, Linux, or portable stub backends.
+- [x] Delete the unused Darwin implementation and helper; retain docs that clearly say the backend is unsupported history.
+- [x] Update the capability ledger's current debugger platform description and preserve the implementation details as historical evidence.
+- [x] Verify there are no dangling source/document links and inspect `git diff --check`; Windows desktop/CLI and WSL Linux CLI builds pass with tests disabled.
