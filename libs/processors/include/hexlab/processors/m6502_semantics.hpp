@@ -335,6 +335,19 @@ struct M6502MemoryBusTrace {
 HEXLAB_PROCESSORS_EXPORT std::optional<M6502MemoryBusTrace>
 trace_m6502_memory_bus(const Instruction &instruction,
                        const M6502MemoryBusInputs &inputs) noexcept;
+struct M6502IndirectJumpBusTrace {
+    std::array<M6502BusAccess, 5> accesses{};
+    std::uint8_t access_count = 0;
+    std::uint16_t pointer_address = 0, high_byte_address = 0, next_program_counter = 0;
+    bool operator==(const M6502IndirectJumpBusTrace &) const = default;
+};
+// Trace the five documented NMOS JMP (absolute) bus cycles. The caller
+// supplies the two pointer bytes; the high-byte address applies the NMOS
+// same-page wrap at xxFF. CMOS indexed-indirect variants are not accepted.
+HEXLAB_PROCESSORS_EXPORT std::optional<M6502IndirectJumpBusTrace>
+trace_m6502_indirect_jump_bus(const Instruction &instruction,
+                              std::uint8_t pointer_low,
+                              std::uint8_t pointer_high) noexcept;
 struct M6502InterruptBusTrace {
     std::array<M6502BusAccess, 7> accesses{};
     std::uint8_t access_count = 0;

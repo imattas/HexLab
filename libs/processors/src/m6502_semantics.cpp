@@ -787,6 +787,53 @@ evaluate_m6502_return_instruction(const Instruction &instruction,
     return evaluate_m6502_return(instruction.opcode, stack_pointer, first, second, third);
 }
 
+std::optional<M6502IndirectJumpBusTrace>
+trace_m6502_indirect_jump_bus(const Instruction &instruction,
+                              std::uint8_t pointer_low,
+                              std::uint8_t pointer_high) noexcept {
+    if (instruction.context.architecture != Architecture::mos6502 ||
+        instruction.context.mode != ExecutionMode::m6502 || instruction.address.offset > UINT16_MAX ||
+        instruction.opcode != Opcode::m6502_jmp || instruction.length != 3 || instruction.bytes.size() < 3 ||
+        instruction.bytes[0] != std::byte{0x6c} || instruction.flow != FlowKind::jump ||
+        instruction.direct_target || instruction.operands.size() != 1 || instruction.access.size() != 1 ||
+        instruction.access[0] != OperandAccess::address || !instruction.memory_read || instruction.memory_write ||
+        !instruction.register_reads.empty() || !instruction.register_writes.empty() || !instruction.m6502_timing)
+        return {};
+    const auto *pointer = std::get_if<MemoryOperand>(&instruction.operands[0]);
+    const auto &timing = *instruction.m6502_timing;
+    if (!pointer || pointer->data_width != 16 || pointer->address_width != 16 || pointer->segment ||
+        pointer->base || pointer->index || pointer->scale != 1 || pointer->ip_relative ||
+        pointer->displacement < 0 || pointer->displacement > UINT16_MAX ||
+        pointer->displacement_encoding != EncodedField{1, 2} ||
+        pointer->displacement != (std::uint16_t(std::to_integer<std::uint8_t>(instruction.bytes[1])) |
+            (std::uint16_t(std::to_integer<std::uint8_t>(instruction.bytes[2])) << 8)) ||
+        timing.base_cycles != 5 || timing.page_cross_penalty || timing.branch_taken_penalty ||
+        timing.branch_page_cross_penalty || timing.decimal_mode_penalty)
+        return {};
+
+    M6502IndirectJumpBusTrace trace;
+    trace.pointer_address = static_cast<std::uint16_t>(pointer->displacement);
+    trace.high_byte_address = static_cast<std::uint16_t>((trace.pointer_address & 0xff00u) |
+        ((trace.pointer_address + 1u) & 0x00ffu));
+    trace.next_program_counter = static_cast<std::uint16_t>(pointer_low |
+        (std::uint16_t(pointer_high) << 8));
+    const auto append = [&](std::uint16_t address, M6502BusAccessKind kind,
+                            std::optional<std::uint8_t> value = {}) {
+        const auto cycle = static_cast<std::uint8_t>(trace.access_count + 1u);
+        trace.accesses[trace.access_count++] = M6502BusAccess{address, kind, cycle, value};
+    };
+    const auto pc = static_cast<std::uint16_t>(instruction.address.offset);
+    append(pc, M6502BusAccessKind::opcode_fetch,
+        std::to_integer<std::uint8_t>(instruction.bytes[0]));
+    append(static_cast<std::uint16_t>(pc + 1u), M6502BusAccessKind::operand_fetch,
+        std::to_integer<std::uint8_t>(instruction.bytes[1]));
+    append(static_cast<std::uint16_t>(pc + 2u), M6502BusAccessKind::operand_fetch,
+        std::to_integer<std::uint8_t>(instruction.bytes[2]));
+    append(trace.pointer_address, M6502BusAccessKind::data_read, pointer_low);
+    append(trace.high_byte_address, M6502BusAccessKind::data_read, pointer_high);
+    return trace;
+}
+
 std::optional<M6502ControlStackBusTrace>
 trace_m6502_control_stack_bus(const Instruction &instruction, std::uint8_t stack_pointer,
                               std::array<std::uint8_t, 3> pulled_bytes) noexcept {
