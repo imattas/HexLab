@@ -215,6 +215,15 @@ evaluate_m6502_hardware_interrupt(M6502HardwareInterrupt interrupt,
                                   std::uint8_t status,
                                   std::uint8_t vector_low,
                                   std::uint8_t vector_high) noexcept;
+HEXLAB_PROCESSORS_EXPORT std::optional<M6502InterruptEntryResult>
+evaluate_m6502_brk(std::uint16_t program_counter, std::uint8_t stack_pointer,
+                   std::uint8_t status, std::uint8_t vector_low,
+                   std::uint8_t vector_high) noexcept;
+HEXLAB_PROCESSORS_EXPORT std::optional<M6502InterruptEntryResult>
+evaluate_m6502_brk_instruction(const Instruction &instruction,
+                               std::uint16_t program_counter, std::uint8_t stack_pointer,
+                               std::uint8_t status, std::uint8_t vector_low,
+                               std::uint8_t vector_high) noexcept;
 
 // Coarse W65C02 execution-control state for event evaluators. This is not a
 // cycle-accurate CPU state machine; the caller owns pin sampling and memory.
@@ -307,6 +316,7 @@ struct M6502InterruptBusTrace {
     std::uint8_t access_count = 0;
     std::uint16_t next_program_counter = 0;
     std::uint8_t next_stack_pointer = 0;
+    std::uint8_t next_status = 0;
     bool operator==(const M6502InterruptBusTrace &) const = default;
 };
 // Trace an already accepted NMOS IRQ/NMI entry. The caller supplies PC/P/S and
@@ -316,6 +326,10 @@ trace_m6502_hardware_interrupt_bus(M6502HardwareInterrupt interrupt,
                                    std::uint16_t program_counter,
                                    std::uint8_t stack_pointer, std::uint8_t status,
                                    std::uint8_t vector_low, std::uint8_t vector_high) noexcept;
+HEXLAB_PROCESSORS_EXPORT std::optional<M6502InterruptBusTrace>
+trace_m6502_brk_bus(const Instruction &instruction, std::uint16_t program_counter,
+                    std::uint8_t stack_pointer, std::uint8_t status,
+                    std::uint8_t vector_low, std::uint8_t vector_high) noexcept;
 struct M6502BranchBusTrace {
     std::array<M6502BusAccess, 4> accesses{};
     std::uint8_t access_count = 0;

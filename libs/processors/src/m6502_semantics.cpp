@@ -732,6 +732,43 @@ evaluate_m6502_hardware_interrupt(M6502HardwareInterrupt interrupt,
                                      pushed_status, vector_address};
 }
 
+std::optional<M6502InterruptEntryResult>
+evaluate_m6502_brk(std::uint16_t program_counter, std::uint8_t stack_pointer,
+                   std::uint8_t status, std::uint8_t vector_low,
+                   std::uint8_t vector_high) noexcept {
+    const auto return_address = static_cast<std::uint16_t>(program_counter + 2u);
+    const auto pushed_status = static_cast<std::uint8_t>((status & 0xcfu) | 0x30u);
+    const auto next_status = static_cast<std::uint8_t>((status & 0xcfu) | 0x24u);
+    const auto target = static_cast<std::uint16_t>(vector_low |
+        (static_cast<std::uint16_t>(vector_high) << 8));
+    return M6502InterruptEntryResult{target, static_cast<std::uint8_t>(stack_pointer - 3u),
+        next_status, static_cast<std::uint8_t>(return_address >> 8),
+        static_cast<std::uint8_t>(return_address), pushed_status, 0xfffe};
+}
+
+std::optional<M6502InterruptEntryResult>
+evaluate_m6502_brk_instruction(const Instruction &instruction,
+                               std::uint16_t program_counter, std::uint8_t stack_pointer,
+                               std::uint8_t status, std::uint8_t vector_low,
+                               std::uint8_t vector_high) noexcept {
+    if (instruction.context.architecture != Architecture::mos6502 ||
+        instruction.context.mode != ExecutionMode::m6502 || instruction.opcode != Opcode::m6502_brk ||
+        instruction.length != 1 || instruction.bytes.empty() || instruction.bytes[0] != std::byte{0x00} ||
+        instruction.flow != FlowKind::trap || !instruction.operands.empty() || !instruction.access.empty() ||
+        instruction.memory_read != true || instruction.memory_write != true ||
+        !instruction.m6502_timing || instruction.m6502_timing->base_cycles != 7 ||
+        instruction.m6502_timing->page_cross_penalty || instruction.m6502_timing->branch_taken_penalty ||
+        instruction.m6502_timing->branch_page_cross_penalty || instruction.m6502_timing->decimal_mode_penalty)
+        return {};
+    const RegisterOperand stack{RegisterBank::mos6502, 4, 8, false};
+    const RegisterOperand processor_status{RegisterBank::mos6502, 3, 8, false};
+    if (instruction.register_reads.size() != 2 || instruction.register_reads[0] != stack ||
+        instruction.register_reads[1] != processor_status || instruction.register_writes.size() != 2 ||
+        instruction.register_writes[0] != stack || instruction.register_writes[1] != processor_status)
+        return {};
+    return evaluate_m6502_brk(program_counter, stack_pointer, status, vector_low, vector_high);
+}
+
 std::optional<M6502InterruptBusTrace>
 trace_m6502_hardware_interrupt_bus(M6502HardwareInterrupt interrupt,
                                    std::uint16_t program_counter,
@@ -758,6 +795,35 @@ trace_m6502_hardware_interrupt_bus(M6502HardwareInterrupt interrupt,
     append(static_cast<std::uint16_t>(entry->vector_address + 1u), M6502BusAccessKind::vector_read);
     trace.next_program_counter = entry->program_counter;
     trace.next_stack_pointer = entry->stack_pointer;
+    trace.next_status = entry->status;
+    return trace;
+}
+
+std::optional<M6502InterruptBusTrace>
+trace_m6502_brk_bus(const Instruction &instruction, std::uint16_t program_counter,
+                    std::uint8_t stack_pointer, std::uint8_t status,
+                    std::uint8_t vector_low, std::uint8_t vector_high) noexcept {
+    const auto entry = evaluate_m6502_brk_instruction(instruction, program_counter, stack_pointer,
+                                                       status, vector_low, vector_high);
+    if (!entry) return {};
+    M6502InterruptBusTrace trace;
+    const auto append = [&](std::uint16_t address, M6502BusAccessKind kind) {
+        const auto cycle = static_cast<std::uint8_t>(trace.access_count + 1u);
+        trace.accesses[trace.access_count++] = M6502BusAccess{address, kind, cycle};
+    };
+    append(program_counter, M6502BusAccessKind::opcode_fetch);
+    append(static_cast<std::uint16_t>(program_counter + 1u), M6502BusAccessKind::operand_fetch);
+    auto stack = stack_pointer;
+    append(static_cast<std::uint16_t>(0x0100u | stack), M6502BusAccessKind::stack_write);
+    stack = static_cast<std::uint8_t>(stack - 1u);
+    append(static_cast<std::uint16_t>(0x0100u | stack), M6502BusAccessKind::stack_write);
+    stack = static_cast<std::uint8_t>(stack - 1u);
+    append(static_cast<std::uint16_t>(0x0100u | stack), M6502BusAccessKind::stack_write);
+    append(0xfffe, M6502BusAccessKind::vector_read);
+    append(0xffff, M6502BusAccessKind::vector_read);
+    trace.next_program_counter = entry->program_counter;
+    trace.next_stack_pointer = entry->stack_pointer;
+    trace.next_status = entry->status;
     return trace;
 }
 

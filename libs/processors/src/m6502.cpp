@@ -650,7 +650,7 @@ static DecodeResult decode_m6502_impl(std::span<const std::byte> bytes, Address 
         if (!implied(Opcode::m6502_brk, length)) return bad(DecodeStatus::truncated, "65C02 BRK signature byte is truncated");
         i.flow = FlowKind::trap;
         i.register_reads = {s, p}; i.register_writes = {s, p};
-        i.memory_read = i.memory_write = cmos; // Stack writes and vector reads.
+        i.memory_read = i.memory_write = true; // Stack writes and vector reads.
         return finish(length);
     }
     case 0xea: implied(Opcode::nop); return finish(1);
