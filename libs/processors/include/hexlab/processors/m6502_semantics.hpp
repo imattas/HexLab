@@ -293,7 +293,7 @@ evaluate_m6502_branch(Opcode opcode, std::uint8_t status) noexcept;
 HEXLAB_PROCESSORS_EXPORT std::optional<bool>
 evaluate_m6502_branch_instruction(const Instruction &instruction, std::uint8_t status) noexcept;
 
-enum class M6502BusAccessKind : std::uint8_t { opcode_fetch, operand_fetch, dummy_read };
+enum class M6502BusAccessKind : std::uint8_t { opcode_fetch, operand_fetch, dummy_read, stack_read, stack_write };
 struct M6502BusAccess {
     std::uint16_t address = 0;
     M6502BusAccessKind kind = M6502BusAccessKind::opcode_fetch;
@@ -315,6 +315,19 @@ struct M6502BranchBusTrace {
 // BCC/BCS/BNE/BEQ instruction and known incoming status are accepted.
 HEXLAB_PROCESSORS_EXPORT std::optional<M6502BranchBusTrace>
 trace_m6502_branch_bus(const Instruction &instruction, std::uint8_t status) noexcept;
+
+struct M6502StackBusTrace {
+    std::array<M6502BusAccess, 4> accesses{};
+    std::uint8_t access_count = 0;
+    std::uint16_t next_program_counter = 0;
+    std::uint8_t next_stack_pointer = 0;
+    bool operator==(const M6502StackBusTrace &) const = default;
+};
+// Trace the documented NMOS PHA/PHP/PLA/PLP cycles. Stack addresses are in
+// page one; instruction and internal dummy reads are retained as address facts.
+// Bus values and pins are outside this bounded trace.
+HEXLAB_PROCESSORS_EXPORT std::optional<M6502StackBusTrace>
+trace_m6502_stack_bus(const Instruction &instruction, std::uint8_t stack_pointer) noexcept;
 
 // Evaluate a W65C02 BBR/BBS branch from its zero-page byte. `bit` is the
 // decoded bit number (0-7); the result is only the branch decision.

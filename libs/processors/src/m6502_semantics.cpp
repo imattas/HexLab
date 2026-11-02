@@ -849,6 +849,71 @@ trace_m6502_branch_bus(const Instruction &instruction, std::uint8_t status) noex
     return trace;
 }
 
+std::optional<M6502StackBusTrace>
+trace_m6502_stack_bus(const Instruction &instruction, std::uint8_t stack_pointer) noexcept {
+    if (instruction.context.architecture != Architecture::mos6502 ||
+        instruction.context.mode != ExecutionMode::m6502 ||
+        instruction.address.offset > UINT16_MAX || instruction.length != 1 ||
+        instruction.bytes.size() < 1 || instruction.operands.size() != 0 ||
+        !instruction.access.empty() || instruction.flow != FlowKind::fallthrough ||
+        !instruction.m6502_timing || instruction.memory_read == instruction.memory_write)
+        return {};
+
+    const auto opcode_byte = std::to_integer<std::uint8_t>(instruction.bytes[0]);
+    const bool push = opcode_byte == 0x48 || opcode_byte == 0x08;
+    const bool pull = opcode_byte == 0x68 || opcode_byte == 0x28;
+    if (!push && !pull) return {};
+    const auto expected_opcode = opcode_byte == 0x48 ? Opcode::m6502_pha :
+        opcode_byte == 0x08 ? Opcode::m6502_php :
+        opcode_byte == 0x68 ? Opcode::m6502_pla : Opcode::m6502_plp;
+    const auto &timing = *instruction.m6502_timing;
+    if (instruction.opcode != expected_opcode || timing.base_cycles != (push ? 3 : 4) ||
+        timing.page_cross_penalty || timing.branch_taken_penalty ||
+        timing.branch_page_cross_penalty || timing.decimal_mode_penalty)
+        return {};
+
+    const RegisterOperand accumulator{RegisterBank::mos6502, 0, 8, false};
+    const RegisterOperand processor_status{RegisterBank::mos6502, 3, 8, false};
+    const RegisterOperand stack{RegisterBank::mos6502, 4, 8, false};
+    const bool pha = opcode_byte == 0x48;
+    const bool php = opcode_byte == 0x08;
+    const bool pla = opcode_byte == 0x68;
+    const bool reads_match = pha
+        ? instruction.register_reads.size() == 2 && instruction.register_reads[0] == accumulator && instruction.register_reads[1] == stack
+        : php
+            ? instruction.register_reads.size() == 2 && instruction.register_reads[0] == processor_status && instruction.register_reads[1] == stack
+            : instruction.register_reads.size() == 1 && instruction.register_reads[0] == stack;
+    const bool writes_match = push
+        ? instruction.register_writes.size() == 1 && instruction.register_writes[0] == stack
+        : pla
+            ? instruction.register_writes.size() == 3 && instruction.register_writes[0] == accumulator &&
+                instruction.register_writes[1] == stack && instruction.register_writes[2] == processor_status
+            : instruction.register_writes.size() == 2 && instruction.register_writes[0] == stack &&
+                instruction.register_writes[1] == processor_status;
+    if (!reads_match || !writes_match || instruction.memory_read != pull || instruction.memory_write != push)
+        return {};
+
+    M6502StackBusTrace trace;
+    const auto pc = static_cast<std::uint16_t>(instruction.address.offset);
+    const auto append = [&](std::uint16_t address, M6502BusAccessKind kind) {
+        const auto cycle = static_cast<std::uint8_t>(trace.access_count + 1u);
+        trace.accesses[trace.access_count++] = M6502BusAccess{address, kind, cycle};
+    };
+    append(pc, M6502BusAccessKind::opcode_fetch);
+    append(static_cast<std::uint16_t>(pc + 1u), M6502BusAccessKind::dummy_read);
+    if (push) {
+        append(static_cast<std::uint16_t>(0x0100u | stack_pointer), M6502BusAccessKind::stack_write);
+        trace.next_stack_pointer = static_cast<std::uint8_t>(stack_pointer - 1u);
+    } else {
+        append(static_cast<std::uint16_t>(0x0100u | stack_pointer), M6502BusAccessKind::dummy_read);
+        stack_pointer = static_cast<std::uint8_t>(stack_pointer + 1u);
+        append(static_cast<std::uint16_t>(0x0100u | stack_pointer), M6502BusAccessKind::stack_read);
+        trace.next_stack_pointer = stack_pointer;
+    }
+    trace.next_program_counter = static_cast<std::uint16_t>(pc + 1u);
+    return trace;
+}
+
 std::optional<bool>
 evaluate_m65c02_bit_branch(Opcode opcode, std::uint8_t bit, std::uint8_t value) noexcept {
     if (bit > 7 || (opcode != Opcode::m65c02_bbr && opcode != Opcode::m65c02_bbs))
