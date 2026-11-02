@@ -70,10 +70,11 @@ shadowing is resolved by the method scope taking precedence over the class
 scope.
 
 These trees do not establish class-loader identities, validate declared bounds,
-infer subtype/assignability, compare erased signatures with descriptors or
-validate code. In particular, method signature parameter counts are not
-required to equal descriptor counts because compiler generated constructor
-parameters may be omitted from generic signatures.
+infer subtype/assignability or validate code. The loader compares successfully
+resolved erasures with descriptors. For constructors, the generic signature's
+source-level parameter sequence may be an ordered subsequence of the descriptor
+parameters because compiler-generated parameters can be omitted; other methods
+must match their descriptor parameter sequence exactly.
 Actual module linking, split/encrypted archives and compression beyond
 stored/DEFLATE remain unsupported.
 

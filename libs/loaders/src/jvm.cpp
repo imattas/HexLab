@@ -1853,13 +1853,41 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage,std::stop_t
             else if(node.kind==JvmGenericNodeKind::result)result=&node;
         }
         if(!params||!result||result->children.size()!=1)continue;
-        std::string erased_descriptor="(";bool complete=true;
-        for(const auto parameter:params->children){auto erased=erased_signature_type(tree,parameter,method_erasure_variables);if(!erased){complete=false;break;}erased_descriptor+=*erased;}
+        std::vector<std::string> erased_parameters;erased_parameters.reserve(params->children.size());bool complete=true;
+        for(const auto parameter:params->children){auto erased=erased_signature_type(tree,parameter,method_erasure_variables);if(!erased){complete=false;break;}erased_parameters.push_back(std::move(*erased));}
         auto erased_result=erased_signature_type(tree,result->children.front(),method_erasure_variables);
         if(!erased_result)complete=false;
         if(complete){
-            erased_descriptor+=")"+*erased_result;
-            if(erased_descriptor!=method.descriptor)return malformed("generic method signature erasure disagrees with its descriptor");
+            std::vector<std::string_view> descriptor_parameters;
+            for(std::size_t position=1;position<method.descriptor.size()&&method.descriptor[position]!=')';){
+                const auto begin=position;
+                while(position<method.descriptor.size()&&method.descriptor[position]=='[')++position;
+                if(position<method.descriptor.size()&&method.descriptor[position]=='L'){
+                    const auto end=method.descriptor.find(';',position);
+                    if(end==std::string::npos){complete=false;break;}
+                    position=end+1;
+                }else if(position<method.descriptor.size())++position;
+                descriptor_parameters.emplace_back(method.descriptor.data()+begin,position-begin);
+            }
+            if(complete){
+                const auto close=method.descriptor.find(')');
+                const auto descriptor_result=close==std::string::npos?std::string_view{}:std::string_view(method.descriptor).substr(close+1);
+                bool parameters_match=erased_parameters.size()==descriptor_parameters.size();
+                if(parameters_match){
+                    for(std::size_t i=0;i<erased_parameters.size();++i)if(erased_parameters[i]!=descriptor_parameters[i]){parameters_match=false;break;}
+                }else if(method.name=="<init>"&&erased_parameters.size()<descriptor_parameters.size()){
+                    // JVMS 4.7.9 permits constructor signatures to omit compiler-generated
+                    // parameters. Match the source-level sequence in order while allowing
+                    // descriptor-only parameters between or around it.
+                    std::size_t signature_index=0;
+                    for(const auto descriptor_parameter:descriptor_parameters){
+                        if(signature_index<erased_parameters.size()&&erased_parameters[signature_index]==descriptor_parameter)++signature_index;
+                    }
+                    parameters_match=signature_index==erased_parameters.size();
+                }
+                if(!parameters_match||*erased_result!=descriptor_result)
+                    return malformed("generic method signature erasure disagrees with its descriptor");
+            }
         }
     }
     for(auto &method:md.methods)if(method.code&&method.code->local_variable_types){

@@ -303,6 +303,23 @@ Result<database::StateDelta> validate_command(const ProjectSnapshot &snapshot, c
                     require(!value.type_id || std::any_of(user.types.begin(), user.types.end(), [&](const auto &type) {
                                 return type.id == *value.type_id;
                             }), "Unknown pseudocode type definition");
+                    require(value.clear_legacy_type_assignments.size() <= 4096,
+                            "Pseudocode type cleanup exceeds 4096 legacy assignments", ErrorCode::resource_limit);
+                    std::set<std::pair<std::uint64_t, std::uint64_t>> legacy_locations;
+                    for (const auto &removal : value.clear_legacy_type_assignments) {
+                        require(removal.expected_type_id != 0,
+                                "Pseudocode legacy type cleanup requires an expected type");
+                        check_location(snapshot, Location{removal.location});
+                        require(legacy_locations.emplace(removal.location.space.value,
+                                                         removal.location.offset).second,
+                                "Pseudocode type cleanup contains duplicate legacy locations");
+                        const auto assigned = std::find_if(user.type_assignments.begin(), user.type_assignments.end(),
+                            [&](const auto &row) { return row.location == Location{removal.location}; });
+                        require(assigned != user.type_assignments.end() &&
+                                    assigned->type_id == removal.expected_type_id,
+                                "Legacy pseudocode type assignment changed before it could be cleared",
+                                ErrorCode::conflict);
+                    }
                     auto &rows = user.pseudocode_edits;
                     auto found = std::find_if(rows.begin(), rows.end(), [&](const auto &row) {
                         return row.function_id == value.function_id && row.identity == value.identity &&
@@ -320,7 +337,15 @@ Result<database::StateDelta> validate_command(const ProjectSnapshot &snapshot, c
                         after = database::PseudocodeEdit{found == rows.end() ? allocate() : found->id,
                                                          value.function_id, value.definition, value.identity,
                                                          value.source_key, value.name, value.comment, value.type_id};
-                    change(rows, found, std::move(after));
+                    const bool edit_changed = found == rows.end() ? bool(after)
+                                                                   : !after || *found != *after;
+                    if (edit_changed) change(rows, found, std::move(after));
+                    for (const auto &removal : value.clear_legacy_type_assignments) {
+                        auto &assignments = user.type_assignments;
+                        const auto assigned = std::find_if(assignments.begin(), assignments.end(),
+                            [&](const auto &row) { return row.location == Location{removal.location}; });
+                        change(assignments, assigned, std::optional<database::TypeAssignment>{});
+                    }
                 } else if constexpr (std::is_same_v<T, Rename> || std::is_same_v<T, Comment>) {
                     check_location(snapshot, value.location, true);
                     auto &rows = user.annotations;

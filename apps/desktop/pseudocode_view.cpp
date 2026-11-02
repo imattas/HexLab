@@ -2858,17 +2858,21 @@ void PseudocodeView::assign_variable_type() {
     if (!value) return;
     const auto name = utf8(*value);
     if (name.empty()) {
-        if (edit && edit->type_id)
+        if (assigned_id) {
+            auto addresses = match->access_sites;
+            addresses.push_back(at);
+            std::sort(addresses.begin(), addresses.end(), [](Address left, Address right) {
+                return address_identity(left) < address_identity(right);
+            });
+            addresses.erase(std::unique(addresses.begin(), addresses.end()), addresses.end());
+            std::vector<LegacyTypeAssignmentRemoval> legacy_removals;
+            for (const auto address : addresses)
+                if (const auto *legacy = type_assignment(*project_, address))
+                    legacy_removals.push_back({address, legacy->type_id});
             submit(SetPseudocodeEdit{function_->id.value, at, match->token,
                                      project_->derived_key ? pseudocode_source_key(*project_->derived_key) : std::string{},
-                                     edit->name, edit->comment, false, std::nullopt});
-        else if (assigned_id) {
-            // Retire legacy address-based assignments when the user clears a
-            // type that predates scoped pseudocode edits.
-            if (!match->access_sites.empty())
-                submit(AssignStackLocalType{match->access_sites, assigned_id, *assigned_id, true});
-            else
-                submit(AssignType{at, *assigned_id, true});
+                                     edit ? edit->name : std::string{}, edit ? edit->comment : std::string{}, false,
+                                     std::nullopt, std::move(legacy_removals)});
         }
         return;
     }
