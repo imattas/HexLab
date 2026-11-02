@@ -297,6 +297,23 @@ struct MachODynamicSymbolTable {
     std::vector<std::uint32_t> indirect_symbols;
     bool operator==(const MachODynamicSymbolTable &) const = default;
 };
+// Advisory LC_TWOLEVEL_HINTS entries; sub-image/TOC indexes refer to external
+// libraries and are preserved without treating them as resolved bindings.
+struct MachOTwoLevelHint {
+    std::uint32_t command_index = 0, index = 0, raw = 0, table_of_contents_index = 0;
+    std::uint8_t sub_image_index = 0;
+    std::uint64_t record_file_offset = 0;
+    std::optional<std::uint32_t> symbol_table_command, symbol_index;
+    bool operator==(const MachOTwoLevelHint &) const = default;
+};
+struct MachOTwoLevelHintsTable {
+    std::uint32_t command_index = 0, raw_offset = 0, count = 0;
+    std::uint64_t record_file_offset = 0, first_hint = 0;
+    FileOffset offset{};
+    std::optional<std::uint32_t> dynamic_symbol_table_command;
+    bool symbols_associated = false;
+    bool operator==(const MachOTwoLevelHintsTable &) const = default;
+};
 enum class MachOIndirectBindingKind : std::uint8_t { symbol, local, absolute, reserved_flags };
 struct MachOIndirectSymbolBinding {
     std::uint32_t dynamic_symbol_table_command = 0, section_ordinal = 0;
@@ -541,6 +558,8 @@ struct MachOMetadata {
     std::vector<MachOCompactUnwindFunction> compact_unwind_functions;
     std::vector<MachOEhFrameFunction> eh_frame_functions;
     std::vector<MachODynamicSymbolTable> dynamic_symbol_tables;
+    std::vector<MachOTwoLevelHintsTable> two_level_hint_tables;
+    std::vector<MachOTwoLevelHint> two_level_hints;
     std::vector<MachOIndirectSymbolBinding> indirect_symbol_bindings;
     bool indirect_symbol_bindings_complete = true;
     bool commands_complete = true, entries_conflict = false;

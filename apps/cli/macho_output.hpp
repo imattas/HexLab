@@ -318,6 +318,28 @@ inline void macho_description(std::ostream &out, const ImageMetadata &metadata, 
         for (std::size_t n = 0; n < row.indirect_symbols.size(); ++n)
             out << "    indirect-symbol #" << n << " value=" << macho_hex(row.indirect_symbols[n]) << '\n';
     }
+    for (const auto &table : m.two_level_hint_tables) {
+        out << "  two-level-hints command=" << table.command_index
+            << " record=file:" << macho_hex(table.record_file_offset)
+            << " file=" << macho_hex(table.offset.value) << " raw-offset=" << macho_hex(table.raw_offset)
+            << " count=" << table.count << " first-hint=" << table.first_hint
+            << " symbols-associated=" << table.symbols_associated;
+        if (table.dynamic_symbol_table_command) out << " dysymtab=" << *table.dynamic_symbol_table_command;
+        out << '\n';
+    }
+    constexpr std::size_t max_two_level_hint_rows = 4096;
+    const auto shown_two_level_hints = std::min(m.two_level_hints.size(), max_two_level_hint_rows);
+    for (std::size_t index = 0; index < shown_two_level_hints; ++index) {
+        const auto &row = m.two_level_hints[index];
+        out << "  two-level-hint command=" << row.command_index << " index=" << row.index
+            << " record=file:" << macho_hex(row.record_file_offset) << " raw=" << macho_hex(row.raw)
+            << " sub-image=" << unsigned(row.sub_image_index) << " toc-index=" << row.table_of_contents_index;
+        if (row.symbol_table_command) out << " symbol-table=" << *row.symbol_table_command;
+        if (row.symbol_index) out << " symbol-index=" << *row.symbol_index;
+        out << '\n';
+    }
+    if (shown_two_level_hints < m.two_level_hints.size())
+        out << "  two-level-hints omitted=" << m.two_level_hints.size() - shown_two_level_hints << '\n';
     out << "Mach-O indirect symbol bindings: " << m.indirect_symbol_bindings.size()
         << " complete=" << m.indirect_symbol_bindings_complete << '\n';
     for (const auto &row : m.indirect_symbol_bindings) {

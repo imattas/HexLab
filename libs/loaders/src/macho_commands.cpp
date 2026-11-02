@@ -132,6 +132,114 @@ void dynamic_symbols(const Reader &reader, const MachOLoadCommand &command, cons
     }
     metadata.dynamic_symbol_tables.push_back(std::move(table));
 }
+void two_level_hints(const Reader &reader, const MachOSlice &slice, MachOMetadata &metadata,
+                     Budget &budget, std::stop_token stop) {
+    const auto declarations = std::count_if(slice.header.commands.begin(), slice.header.commands.end(),
+        [](const auto &command) { return command.command == 0x16; });
+    if (!declarations) return;
+    using FileRange = std::pair<std::uint64_t, std::uint64_t>;
+    budget.include(std::uint64_t(metadata.encryption.size()) * sizeof(FileRange));
+    std::vector<FileRange> encrypted;
+    encrypted.reserve(metadata.encryption.size());
+    for (const auto &encryption : metadata.encryption) {
+        canceled(stop);
+        if (encryption.cryptid && encryption.size)
+            encrypted.emplace_back(encryption.raw_offset, std::uint64_t(encryption.raw_offset) + encryption.size);
+    }
+    std::sort(encrypted.begin(), encrypted.end());
+    std::size_t merged = 0;
+    for (const auto &range : encrypted) {
+        canceled(stop);
+        if (merged && range.first <= encrypted[merged - 1].second)
+            encrypted[merged - 1].second = std::max(encrypted[merged - 1].second, range.second);
+        else encrypted[merged++] = range;
+    }
+    encrypted.resize(merged);
+    const MachODynamicSymbolTable *dynamic = metadata.dynamic_symbol_tables.size() == 1
+        ? &metadata.dynamic_symbol_tables.front() : nullptr;
+    const MachOSymbolTable *symbols = metadata.symbol_tables.size() == 1
+        ? &metadata.symbol_tables.front() : nullptr;
+    for (const auto &command : slice.header.commands) {
+        canceled(stop);
+        if (command.command != 0x16) continue;
+        require(command.size == 16, "Mach-O LC_TWOLEVEL_HINTS command must contain exactly 16 bytes");
+        const auto fixed = reader.bytes(command.file_offset - slice.offset, 16);
+        MachOTwoLevelHintsTable table;
+        table.command_index = command.index;
+        table.record_file_offset = command.file_offset;
+        table.raw_offset = static_cast<std::uint32_t>(reader.value(fixed.bytes, 8, 4));
+        table.count = static_cast<std::uint32_t>(reader.value(fixed.bytes, 12, 4));
+        require(metadata.two_level_hints.size() <= 1'000'000 &&
+                    table.count <= 1'000'000 - metadata.two_level_hints.size(),
+                "Mach-O two-level hint count exceeds budget", ErrorCode::resource_limit);
+        const auto extent = std::uint64_t(table.count) * 4;
+        table.offset = reader.file(table.raw_offset, extent);
+        require(!table.count || table.raw_offset >= (slice.header.is_64 ? 32u : 28u) +
+                    std::uint64_t(slice.header.command_bytes),
+                "Mach-O two-level hints overlap the header or load commands");
+        require(!table.count || table.raw_offset % 4 == 0, "Mach-O two-level hint table is unaligned");
+        const auto encrypted_after = std::lower_bound(encrypted.begin(), encrypted.end(), table.raw_offset,
+            [](const FileRange &range, std::uint64_t value) { return range.second <= value; });
+        require(!extent || encrypted_after == encrypted.end() ||
+                    encrypted_after->first >= std::uint64_t(table.raw_offset) + extent,
+                "Encrypted Mach-O two-level hints are unsupported", ErrorCode::unsupported);
+        budget.include(sizeof(MachOTwoLevelHintsTable) +
+                       std::uint64_t(table.count) * sizeof(MachOTwoLevelHint));
+        table.first_hint = metadata.two_level_hints.size();
+        // Hints follow the undefined-symbol group in order. Never invent this
+        // association when either namespace is absent, duplicated or disagrees.
+        table.symbols_associated = (slice.header.flags & 0x80) && declarations == 1 && dynamic && symbols &&
+            dynamic->symbol_table &&
+            *dynamic->symbol_table == symbols->command_index && dynamic->ranges[2].count == table.count;
+        if (table.symbols_associated) {
+            const auto &range = dynamic->ranges[2];
+            table.symbols_associated = range.begin <= symbols->count && range.count <= symbols->count - range.begin &&
+                symbols->first_symbol <= metadata.symbols.size() &&
+                symbols->count <= metadata.symbols.size() - symbols->first_symbol;
+            for (std::uint32_t index = 0; table.symbols_associated && index < range.count; ++index) {
+                canceled(stop);
+                const auto &symbol = metadata.symbols[symbols->first_symbol + range.begin + index];
+                table.symbols_associated = symbol.table_command == symbols->command_index &&
+                    symbol.index == range.begin + index && (symbol.type & 0xe0) == 0 && (symbol.type & 1) &&
+                    (symbol.state == MachOSymbolState::undefined ||
+                     symbol.state == MachOSymbolState::prebound_undefined);
+            }
+        }
+        if (table.symbols_associated) table.dynamic_symbol_table_command = dynamic->command_index;
+        else metadata.commands_complete = false;
+        // Bound transient reads independently of the declared table size.
+        constexpr std::uint32_t window_rows = 4096;
+        if (table.count) budget.include(std::uint64_t(std::min(table.count, window_rows)) * 4);
+        for (std::uint32_t first = 0; first < table.count;) {
+            canceled(stop);
+            const auto count = std::min(window_rows, table.count - first);
+            const auto relative = std::uint64_t(table.raw_offset) + std::uint64_t(first) * 4;
+            const auto bytes = reader.bytes(relative, std::size_t(count) * 4);
+            for (std::uint32_t index = 0; index < count; ++index) {
+                canceled(stop);
+                MachOTwoLevelHint row;
+                row.command_index = command.index;
+                row.index = first + index;
+                row.record_file_offset = reader.file(relative + std::uint64_t(index) * 4, 4).value;
+                row.raw = static_cast<std::uint32_t>(reader.value(bytes.bytes, std::size_t(index) * 4, 4));
+                if (slice.header.order == ByteOrder::little) {
+                    row.sub_image_index = static_cast<std::uint8_t>(row.raw & 0xff);
+                    row.table_of_contents_index = row.raw >> 8;
+                } else {
+                    row.sub_image_index = static_cast<std::uint8_t>(row.raw >> 24);
+                    row.table_of_contents_index = row.raw & 0xffffff;
+                }
+                if (table.symbols_associated) {
+                    row.symbol_table_command = symbols->command_index;
+                    row.symbol_index = dynamic->ranges[2].begin + row.index;
+                }
+                metadata.two_level_hints.push_back(std::move(row));
+            }
+            first += count;
+        }
+        metadata.two_level_hint_tables.push_back(std::move(table));
+    }
+}
 std::uint64_t uleb(std::span<const std::byte> bytes, std::size_t &cursor) {
     std::uint64_t result = 0;
     for (unsigned index = 0; index < 10; ++index) {
@@ -1234,7 +1342,7 @@ bool supported_command(std::uint32_t command) {
            command == 0x11 || command == 0x1a || command == 0x26 || command == 0x22 || command == 0x80000022 || command == 0x80000033 ||
            command == 0x80000034 || command == 0x29 || command == 0x1d || command == 0x21 || command == 0x2c ||
            command == 0x32 || command == 0x24 || command == 0x25 || command == 0x2f || command == 0x30 ||
-           command == 0x2a || command == 0x31 || command == 0x35;
+           command == 0x2a || command == 0x31 || command == 0x35 || command == 0x16;
 }
 void read_commands(const ByteStorage &storage, const Image &image, MachOMetadata &metadata, Budget &budget,
                    std::stop_token stop) {
@@ -1360,6 +1468,7 @@ void read_commands(const ByteStorage &storage, const Image &image, MachOMetadata
             linker_options(reader, command, slice, metadata, budget, stop);
         }
     }
+    two_level_hints(reader, slice, metadata, budget, stop);
     compact_unwind(reader, slice, image, metadata, text_base, budget, stop);
     eh_frame(reader, slice, image, metadata, budget, stop);
     std::set<std::pair<std::uint32_t, std::uint64_t>> entries;

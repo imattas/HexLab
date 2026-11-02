@@ -1,5 +1,11 @@
 # Mach-O implementation validation
 
+`LC_TWOLEVEL_HINTS` now has bounded endian-aware loader metadata and capped CLI
+output, with exact table/row provenance and conservative undefined-symbol
+associations. See [two-level namespace hints](../libs/loaders/docs/macho-two-level-hints.md)
+for bounds and unsupported external lookup semantics. This increment has local
+Windows and Ubuntu 24.04 WSL build validation only; no tests were run.
+
 Mach-O work is in progress. The full IDA-class objective remains active. Existing
 accepted installations are preserved; no Mach-O installed distribution is claimed.
 
