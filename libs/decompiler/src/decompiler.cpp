@@ -2536,6 +2536,39 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
                 unknown_expr("x87-status-after-" + name, 16)};
             return effect;
         }
+        // FIST/FISTP/FISTTP have a concrete integer memory destination even
+        // though their floating-point exception/status effects remain opaque.
+        // Preserve the converted value as a memory-output formula so SSA and
+        // pseudocode consumers can see what is stored. The operation remains
+        // symbolic to retain x87 indefinite/exception behavior; the processor
+        // semantics API provides caller-driven numeric evaluation.
+        if ((name == "fist" || name == "fistp" || name == "fisttp") &&
+            instruction.memory_write && instruction.operands.size() == 1 &&
+            std::holds_alternative<MemoryOperand>(instruction.operands.front()) &&
+            !numeric_operands.empty()) {
+            const auto width = std::get<MemoryOperand>(instruction.operands.front()).data_width;
+            if (width == 16 || width == 32 || width == 64) {
+                const auto st0 = numeric_operands.front();
+                const auto control = std::find_if(instruction.register_reads.begin(), instruction.register_reads.end(),
+                    [](RegisterOperand reg) { return reg.bank == RegisterBank::x87_control; });
+                auto converted = std::make_shared<Expression>(Expression{integer_type(width), UnknownValue{
+                    "x87-integer-conversion"}});
+                if (name == "fisttp") {
+                    converted->value = UnaryValue{"x87_fisttp_i" + std::to_string(width), st0};
+                } else {
+                    converted->value = BinaryValue{"x87_fist_rc_i" + std::to_string(width), st0,
+                        control == instruction.register_reads.end()
+                            ? unknown_expr("x87-control-word", 16) : reg_expr(*control)};
+                }
+                const auto output_index = static_cast<std::uint32_t>(typed_operands.size());
+                typed_operands.push_back(std::move(converted));
+                Intrinsic effect{"x87_" + name, std::move(typed_operands), IntrinsicMemoryEffect::write};
+                effect.register_writes = instruction.register_writes;
+                effect.x87_stack_delta = instruction.x87_stack_delta;
+                effect.memory_output = IntrinsicMemoryOutput{0, output_index};
+                return effect;
+            }
+        }
         Intrinsic effect{"x87_" + name, std::move(typed_operands),
             instruction.memory_read && instruction.memory_write ? IntrinsicMemoryEffect::unknown :
             instruction.memory_read ? IntrinsicMemoryEffect::read :
