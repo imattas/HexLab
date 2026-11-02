@@ -1753,6 +1753,7 @@ evaluate_riscv_vector_floating_operation(RiscvOpcode opcode, const RiscvVectorIn
         return {};
 
     enum class Operation { classification, reciprocal_estimate, reciprocal_sqrt_estimate,
+                           add, subtract,
                            sign_copy, sign_invert, sign_xor, min, max,
                            reduce_min, reduce_max, reduce_unordered_sum, reduce_ordered_sum,
                            reduce_widen_unordered_sum, reduce_widen_ordered_sum,
@@ -1766,6 +1767,8 @@ evaluate_riscv_vector_floating_operation(RiscvOpcode opcode, const RiscvVectorIn
 #define RV_FLOAT_PAIR(vv, vf, name) \
     case RiscvOpcode::vv: operation = Operation::name; vector_rhs = true; break; \
     case RiscvOpcode::vf: operation = Operation::name; break
+    RV_FLOAT_PAIR(vfadd_vv, vfadd_vf, add);
+    RV_FLOAT_PAIR(vfsub_vv, vfsub_vf, subtract);
     RV_FLOAT_PAIR(vfsgnj_vv, vfsgnj_vf, sign_copy);
     RV_FLOAT_PAIR(vfsgnjn_vv, vfsgnjn_vf, sign_invert);
     RV_FLOAT_PAIR(vfsgnjx_vv, vfsgnjx_vf, sign_xor);
@@ -1800,6 +1803,8 @@ evaluate_riscv_vector_floating_operation(RiscvOpcode opcode, const RiscvVectorIn
         (config.masked && std::any_of(operands.predicate_mask.begin(), operands.predicate_mask.end(),
                                       [](std::uint8_t bit) { return bit > 1; })))) return {};
     if (sum_reduction && (!operands.frm || *operands.frm > 4)) return {};
+    const bool rounded_arithmetic = operation == Operation::add || operation == Operation::subtract;
+    if (rounded_arithmetic && (!operands.frm || *operands.frm > 4)) return {};
     if (vector_rhs && operands.vs1.size() != vlmax) return {};
     mask_result = operation == Operation::equal || operation == Operation::not_equal ||
                   operation == Operation::less || operation == Operation::less_equal ||
@@ -1971,6 +1976,14 @@ evaluate_riscv_vector_floating_operation(RiscvOpcode opcode, const RiscvVectorIn
         case Operation::reciprocal_sqrt_estimate:
             value = estimate_value(lhs, result.fflags_set);
             break;
+        case Operation::add:
+        case Operation::subtract: {
+            const auto arithmetic_rhs = operation == Operation::subtract ? (rhs ^ sign_mask) : rhs;
+            const auto arithmetic = add_riscv_float_bits(lhs, arithmetic_rhs, sew, *operands.frm);
+            value = arithmetic.bits;
+            result.fflags_set |= arithmetic.fflags;
+            break;
+        }
         case Operation::sign_copy:
             value = (lhs & ~sign_mask) | (rhs & sign_mask);
             break;

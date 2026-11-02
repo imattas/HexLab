@@ -558,6 +558,30 @@ std::optional<Statement> lift_ppc_instruction(const Instruction &i, std::vector<
         return result;
     }
 
+    if (i.opcode == Opcode::ppc_vperm) {
+        const auto *left = ops.size() == 4 ? std::get_if<R>(&ops[1]) : nullptr;
+        const auto *right = ops.size() == 4 ? std::get_if<R>(&ops[2]) : nullptr;
+        const auto *control = ops.size() == 4 ? std::get_if<R>(&ops[3]) : nullptr;
+        const auto valid_vr = [](const R *value) {
+            return value && value->bank == RegisterBank::ppc_vr && value->width == 128 && value->index < 32;
+        };
+        if (!valid_vr(dst) || !valid_vr(left) || !valid_vr(right) || !valid_vr(control) ||
+            i.vector_bits != 128 || i.vector_element_bits != 0 ||
+            i.access != std::vector<OperandAccess>{OperandAccess::write, OperandAccess::read,
+                                                   OperandAccess::read, OperandAccess::read} ||
+            i.register_reads != std::vector<R>{*left, *right, *control} ||
+            i.register_writes != std::vector<R>{*dst} || i.memory_read || i.memory_write)
+            return effect(i, "ppc_malformed_vperm");
+        const auto type = vmx_vector_type(0);
+        Intrinsic result{"ppc_vperm_bytes",
+                         {typed_vmx_reg(*left, type), typed_vmx_reg(*right, type),
+                          typed_vmx_reg(*control, type)},
+                         IntrinsicMemoryEffect::none};
+        result.register_writes = {*dst};
+        result.result_type = type;
+        return result;
+    }
+
     if (i.opcode == Opcode::ppc_lfsu || i.opcode == Opcode::ppc_lfdu ||
         i.opcode == Opcode::ppc_stfsu || i.opcode == Opcode::ppc_stfdu) {
         const bool load = i.opcode == Opcode::ppc_lfsu || i.opcode == Opcode::ppc_lfdu;

@@ -260,6 +260,19 @@ MinidumpContext decode_context(std::uint16_t architecture, std::span<const std::
                 if (!(in_use & (std::uint64_t{1} << feature.index))) continue;
                 const std::uint64_t offset = feature.offset;
                 const std::uint64_t size = feature.size;
+                const bool overlaps_another_feature = std::any_of(xstate_features.begin(), xstate_features.end(),
+                    [&](const auto &other) {
+                        if (other.index < 2 || other.index == feature.index) return false;
+                        const std::uint64_t other_begin = other.offset;
+                        const std::uint64_t other_end = other_begin + other.size;
+                        return offset < other_end && other_begin < offset + size;
+                    });
+                if (overlaps_another_feature) {
+                    omitted = true;
+                    truncated = true;
+                    result.diagnostics.emplace_back("AMD64 XSTATE feature overlaps another feature-map entry; overlapping payloads remain source-backed but are not decoded");
+                    continue;
+                }
                 if (!size || offset > xstate_context_size || size > xstate_context_size - offset ||
                     offset > UINT64_MAX - xsave_area_in_context ||
                     size > UINT64_MAX - xsave_area_in_context - offset) {
@@ -334,17 +347,6 @@ MinidumpContext decode_context(std::uint16_t architecture, std::span<const std::
                     if (size != pkru_component_size) {
                         omitted = true;
                         result.diagnostics.emplace_back("AMD64 PKRU XSTATE component is not the supported eight-byte layout; bytes remain opaque");
-                        continue;
-                    }
-                    const bool overlaps_another_feature = std::any_of(xstate_features.begin(), xstate_features.end(),
-                        [&](const auto &other) {
-                            return other.index >= 2 && other.index != feature.index &&
-                                offset < std::uint64_t{other.offset} + other.size &&
-                                other.offset < offset + size;
-                        });
-                    if (overlaps_another_feature) {
-                        omitted = true;
-                        result.diagnostics.emplace_back("AMD64 PKRU XSTATE component overlaps another feature-map entry; bytes remain opaque");
                         continue;
                     }
                     add("pkru", static_cast<std::size_t>(begin), 4);

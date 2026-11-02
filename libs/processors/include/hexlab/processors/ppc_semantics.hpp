@@ -104,6 +104,13 @@ HEXLAB_PROCESSORS_EXPORT std::optional<PpcVectorBits>
 evaluate_ppc_vmx_integer_operation(Opcode opcode, const PpcVectorBits &va,
                                    const PpcVectorBits &vb) noexcept;
 
+// Evaluate decoded VMX VPERM. Control bytes select from VA||VB using their
+// low five bits, in architectural (most-significant-byte-first) register order.
+HEXLAB_PROCESSORS_EXPORT std::optional<PpcVectorBits>
+evaluate_ppc_vperm_instruction(const Instruction &instruction,
+                               const PpcVectorBits &va, const PpcVectorBits &vb,
+                               const PpcVectorBits &control) noexcept;
+
 // Evaluate PPC32/PPC64 POPCNTB over a 32- or 64-bit GPR value. Each output
 // byte is the population count (0..8) of the corresponding input byte.
 HEXLAB_PROCESSORS_EXPORT std::optional<std::uint64_t>

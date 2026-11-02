@@ -335,12 +335,50 @@ bool classify_sysv_part(const types::Type &type, std::uint64_t base,
         for (std::size_t i = 0; i < value.members().size(); ++i) {
             const auto &member = value.members()[i];
             if (!member.type) { reason = "aggregate member has no type"; return false; }
-            if (member.bit_width) { reason = "aggregate bitfields are not yet classified"; return false; }
             const auto &placed = object_layout.value().members[i];
             if (placed.offset > std::numeric_limits<std::uint64_t>::max() - base) {
                 reason = "aggregate member offset overflows"; return false;
             }
             const auto member_offset = base + placed.offset;
+            if (member.bit_width) {
+                // SysV AMD64 classifies an integral bitfield through the
+                // integer class of its allocation unit. The immutable type
+                // record carries that unit's byte offset and bit coordinates;
+                // do not infer compiler-specific placement here.
+                if (*member.bit_width == 0) continue;
+                const auto &field = unqualified(*member.type);
+                if (field.kind() != types::Kind::integer &&
+                    field.kind() != types::Kind::boolean &&
+                    field.kind() != types::Kind::enumeration) {
+                    reason = "aggregate bitfield has a non-integral allocation type";
+                    return false;
+                }
+                if (!placed.bit_width || *placed.bit_width != *member.bit_width ||
+                    !placed.bit_offset || placed.size == 0 || placed.size > 16 ||
+                    placed.size > std::numeric_limits<std::uint64_t>::max() / 8) {
+                    reason = "aggregate bitfield has incomplete or unsupported allocation metadata";
+                    return false;
+                }
+                const auto storage_bits = placed.size * 8;
+                const auto width = static_cast<std::uint64_t>(*member.bit_width);
+                const auto bit_offset = static_cast<std::uint64_t>(*placed.bit_offset);
+                if (bit_offset > storage_bits || width > storage_bits - bit_offset) {
+                    reason = "aggregate bitfield exceeds its allocation unit";
+                    return false;
+                }
+                const auto aggregate_extent = static_cast<std::uint64_t>(classes.size()) * 8;
+                if (placed.size > aggregate_extent ||
+                    member_offset > aggregate_extent - placed.size) {
+                    reason = "aggregate bitfield allocation unit exceeds its containing object";
+                    return false;
+                }
+                if (placed.alignment > 1 && member_offset % placed.alignment != 0) {
+                    std::fill(classes.begin(), classes.end(), SysvClass::memory);
+                    return true;
+                }
+                merge_class(classes, member_offset, placed.size, SysvClass::integer);
+                continue;
+            }
             if (placed.alignment > 1 && member_offset % placed.alignment != 0) {
                 std::fill(classes.begin(), classes.end(), SysvClass::memory);
                 return true;

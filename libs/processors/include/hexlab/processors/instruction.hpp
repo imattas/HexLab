@@ -733,7 +733,9 @@ enum class Opcode {
     // Legacy unpacked decimal adjustment; append for persisted ID stability.
     aaa, aas,
     // AArch64 variable shifts; append so persisted opcode values remain stable.
-    a64_lslv, a64_lsrv, a64_asrv, a64_rorv
+    a64_lslv, a64_lsrv, a64_asrv, a64_rorv,
+    // PowerPC VMX byte permutation; appended to preserve serialized IDs.
+    ppc_vperm
 };
 enum class OperandAccess { read, write, read_write, address };
 // The encoded x86 group-one repeat prefix is retained separately from the

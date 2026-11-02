@@ -896,6 +896,7 @@ DecodeResult decode_powerpc(DecodeContext context, std::span<const std::byte> by
         const unsigned vx_xo = w & 0x7ff;
         unsigned element_bits = 0;
         switch (vx_xo) {
+        case 43:   i.opcode = Opcode::ppc_vperm; break;
         case 0:    i.opcode = Opcode::ppc_vaddubm; element_bits = 8; break;
         case 64:   i.opcode = Opcode::ppc_vadduhm; element_bits = 16; break;
         case 128:  i.opcode = Opcode::ppc_vadduwm; element_bits = 32; break;
@@ -925,6 +926,12 @@ DecodeResult decode_powerpc(DecodeContext context, std::span<const std::byte> by
         i.operands = {destination, left, right};
         i.access = {OperandAccess::write, OperandAccess::read, OperandAccess::read};
         i.register_reads = {left, right};
+        if (i.opcode == Opcode::ppc_vperm) {
+            const auto control = vr((w >> 6) & 31);
+            i.operands.push_back(control);
+            i.access.push_back(OperandAccess::read);
+            i.register_reads.push_back(control);
+        }
         i.register_writes = {destination};
         i.vector_bits = 128;
         i.vector_element_bits = static_cast<std::uint16_t>(element_bits);

@@ -618,6 +618,7 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
     case Opcode::ppc_vminsb: return "vminsb";
     case Opcode::ppc_vminsh: return "vminsh";
     case Opcode::ppc_vminsw: return "vminsw";
+    case Opcode::ppc_vperm: return "vperm";
     case Opcode::vpaddb: return "vpaddb";
     case Opcode::vpsllvw: return "vpsllvw";
     case Opcode::vpsllvd: return "vpsllvd";

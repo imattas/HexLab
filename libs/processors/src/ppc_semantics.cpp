@@ -452,6 +452,37 @@ std::optional<PpcVectorBits> evaluate_ppc_vmx_integer_operation(Opcode opcode,
     return result;
 }
 
+std::optional<PpcVectorBits> evaluate_ppc_vperm_instruction(
+    const Instruction &instruction, const PpcVectorBits &va, const PpcVectorBits &vb,
+    const PpcVectorBits &control) noexcept {
+    if (instruction.context.architecture != Architecture::powerpc ||
+        (instruction.context.mode != ExecutionMode::ppc32 &&
+         instruction.context.mode != ExecutionMode::ppc64) ||
+        instruction.opcode != Opcode::ppc_vperm || instruction.operands.size() != 4 ||
+        instruction.access != std::vector<OperandAccess>{OperandAccess::write, OperandAccess::read,
+                                                         OperandAccess::read, OperandAccess::read} ||
+        instruction.memory_read || instruction.memory_write || instruction.vector_bits != 128 ||
+        instruction.vector_element_bits != 0)
+        return {};
+    const auto *dst = std::get_if<RegisterOperand>(&instruction.operands[0]);
+    const auto *a = std::get_if<RegisterOperand>(&instruction.operands[1]);
+    const auto *b = std::get_if<RegisterOperand>(&instruction.operands[2]);
+    const auto *c = std::get_if<RegisterOperand>(&instruction.operands[3]);
+    const auto valid = [](const RegisterOperand *r) {
+        return r && r->bank == RegisterBank::ppc_vr && r->width == 128 && r->index < 32 && !r->high_byte;
+    };
+    if (!valid(dst) || !valid(a) || !valid(b) || !valid(c) ||
+        instruction.register_reads != std::vector<RegisterOperand>{*a, *b, *c} ||
+        instruction.register_writes != std::vector<RegisterOperand>{*dst})
+        return {};
+    PpcVectorBits result{};
+    for (std::size_t i = 0; i < result.size(); ++i) {
+        const auto index = static_cast<std::size_t>(control[i] & 0x1fu);
+        result[i] = index < 16 ? va[index] : vb[index - 16];
+    }
+    return result;
+}
+
 std::optional<std::uint64_t>
 evaluate_ppc_popcntb(Opcode opcode, std::uint64_t value, unsigned register_width) noexcept {
     if (opcode != Opcode::ppc_popcntb || (register_width != 32 && register_width != 64))

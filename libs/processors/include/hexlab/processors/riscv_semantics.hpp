@@ -373,12 +373,13 @@ HEXLAB_PROCESSORS_EXPORT std::optional<RiscvVectorIntegerResult>
 evaluate_riscv_vector_integer_operation(RiscvOpcode opcode, const RiscvVectorIntegerConfig &config,
                                        const RiscvVectorIntegerOperands &operands);
 
-// Evaluates bit-exact RVV reciprocal estimates, floating classification, sign
-// injection, min/max, comparisons, reductions, and ordered/unordered sums for
-// SEW=32 or 64. Widening floating sums additionally evaluate FP32-to-FP64
-// accumulation with SEW=32. vfrec7 and all sum reductions require operands.frm
-// to supply a valid rounding mode (0..4). fflags_set contains exception bits
-// raised by active lanes only; callers merge these into fflags.
+// Evaluates bit-exact RVV add/subtract, reciprocal estimates, floating
+// classification, sign injection, min/max, comparisons, reductions, and
+// ordered/unordered sums for SEW=32 or 64. Widening floating sums additionally
+// evaluate FP32-to-FP64 accumulation with SEW=32. Rounded add/subtract, vfrec7,
+// and all sum reductions require operands.frm to supply a valid rounding mode
+// (0..4). fflags_set contains exception bits raised by active lanes only;
+// callers merge these into fflags.
 HEXLAB_PROCESSORS_EXPORT std::optional<RiscvVectorFloatingResult>
 evaluate_riscv_vector_floating_operation(RiscvOpcode opcode, const RiscvVectorIntegerConfig &config,
                                          const RiscvVectorFloatingOperands &operands);

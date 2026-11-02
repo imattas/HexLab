@@ -265,6 +265,11 @@ IDs 0â€“1 remain in the fixed AMD64 context fields. Context XSTATE componen
 are included only when the MiscInfo5 feature table validates and the checked
 XSAVE-relative range (`256 + feature offset`) is present in the original
 context extent and the corresponding XSTATE_BV bit marks the component in use.
+For standard (non-compacted) layout, an active extended-state component is
+decoded only when its MiscInfo5 range is disjoint from every other advertised
+extended component range; overlapping entries remain visible in the retained
+source context and are reported as partial instead of producing duplicate or
+misattributed register rows. This check applies to unknown feature IDs too.
 Classic AMX features 17/18 additionally decode structurally validated palette
 0/1 TILECFG and palette 1 tile storage into source-backed rows. Exact component
 sizes and disjoint extended-component ranges are required; unknown palettes or

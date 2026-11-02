@@ -107,6 +107,12 @@ ST0 result and stack argument rules. A memory-class result reports its hidden bu
 pointer separately in `hidden_result_pointer` at RDI and reports the returned
 buffer address in RAX. The hidden pointer consumes the first integer argument
 register, while declared arguments retain their original indices.
+Recorded integral bitfields are classified through their allocation unit as
+INTEGER when the width, bit offset, storage extent, and alignment agree with
+the immutable type layout. Zero-width bitfields add no data class. Missing
+coordinates, non-integral base types, out-of-unit bit ranges, and allocation
+units outside the containing object remain unsupported or memory-class; the
+classifier does not infer compiler-specific bitfield allocation rules.
 The [System V AMD64 psABI](https://gitlab.com/x86-psABIs/x86-64-ABI/-/blob/master/x86-64-ABI/low-level-sys-info.tex)
 defines the X87/X87UP memory cleanup rule. Ghidra's [x86-64 GCC compiler
 specification](https://github.com/NationalSecurityAgency/ghidra/blob/master/Ghidra/Processors/x86/data/languages/x86-64-gcc.cspec)
