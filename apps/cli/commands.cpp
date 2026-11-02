@@ -1936,7 +1936,7 @@ int archive_command(std::span<const std::wstring_view> args, std::ostream &out, 
         if(thin_root){
             resolver=take(make_ar_thin_member_resolver(*thin_root));
         }
-        if(archive.thin&&action!=L"list"&&action!=L"lookup"&&!resolver)
+        if(archive.thin&&action!=L"list"&&action!=L"lookup"&&action!=L"index-audit"&&!resolver)
             argument_error("Thin archive reads/link actions require --thin-root <directory>");
         const auto open_member=[&](const ArMember& member){return open_ar_member(storage,member,resolver);};
         if (action == L"lookup") {
@@ -1961,78 +1961,144 @@ int archive_command(std::span<const std::wstring_view> args, std::ostream &out, 
         if (action == L"index-audit") {
             if (args.size() != 2) argument_error("archive index-audit takes one archive path");
             constexpr std::size_t max_members = 4096;
-            constexpr std::size_t max_index_rows = 1'000'000;
-            constexpr std::uint64_t max_name_bytes = 64ULL * 1024 * 1024;
+            constexpr std::size_t max_symbols = 1'000'000;
+            constexpr std::size_t max_name_bytes = 64ULL * 1024 * 1024;
             constexpr std::uint64_t max_member_bytes = 256ULL * 1024 * 1024;
             if (archive.members.size() > max_members)
                 argument_error("Archive index audit exceeds 4096 members");
-            if (archive.symbols.size() > max_index_rows)
-                argument_error("Archive index audit exceeds one million index rows");
-            std::map<std::string, std::set<std::size_t>> expected;
-            std::set<std::size_t> audited_members;
-            std::uint64_t total_bytes = 0, total_symbols = 0, total_name_bytes = 0;
+            std::vector<ArMemberSymbols> summaries;
+            summaries.reserve(archive.members.size());
+            std::uint64_t total_bytes = 0;
+            std::size_t total_symbols = 0, total_name_bytes = 0;
             std::size_t skipped_members = 0;
+            auto skip_member = [&](std::size_t index, std::string_view reason) {
+                ++skipped_members;
+                const auto &member = archive.members[index];
+                out << "Skipped member: member=" << index << " member-name=" << safe_text(member.name)
+                    << " header-offset=" << hex(member.header_offset.value)
+                    << " reason=" << safe_text(reason) << '\n';
+            };
             for (std::size_t i = 0; i < archive.members.size(); ++i) {
                 const auto &member = archive.members[i];
                 if (member.kind != ArMemberKind::regular && member.kind != ArMemberKind::thin_external) continue;
-                auto member_storage = take(open_member(member));
-                const auto format = take(detect_format(*member_storage));
-                if (format != DetectedFormat::elf_candidate) { ++skipped_members; continue; }
-                if (member_storage->size() > max_member_bytes - total_bytes)
-                    argument_error("Archive index audit exceeds 256 MiB of ELF member data");
-                total_bytes += member_storage->size();
-                auto summary = take(summarize_elf_ar_member(*member_storage, i));
-                audited_members.insert(i);
-                total_symbols += summary.definitions.size();
-                if (total_symbols > 1'000'000)
-                    argument_error("Archive index audit exceeds one million defined symbols");
-                for (const auto &name : summary.definitions) {
-                    if (name.size() > max_name_bytes - total_name_bytes)
-                        argument_error("Archive index audit exceeds 64 MiB of decoded ELF symbol names");
-                    total_name_bytes += name.size();
-                    expected[name].insert(i);
-                }
-            }
-            std::set<std::pair<std::string, std::size_t>> actual;
-            std::size_t stale = 0, unverifiable = 0;
-            for (const auto &symbol : archive.symbols) {
-                if (symbol.name.size() > max_name_bytes - total_name_bytes)
-                    argument_error("Archive index audit exceeds 64 MiB of decoded symbol names");
-                total_name_bytes += symbol.name.size();
-                if (!audited_members.contains(symbol.member_index)) {
-                    ++unverifiable;
-                    out << "Unverifiable index row: symbol=" << safe_text(symbol.name)
-                        << " member=" << symbol.member_index << " reason=non-ELF-or-unsupported-member\n";
+                if (member.size > max_member_bytes - total_bytes) {
+                    skip_member(i, "aggregate-member-byte-limit");
                     continue;
                 }
-                actual.emplace(symbol.name, symbol.member_index);
-                const auto found = expected.find(symbol.name);
-                if (found == expected.end() || !found->second.contains(symbol.member_index)) {
-                    ++stale;
-                    out << "Stale index row: symbol=" << safe_text(symbol.name)
-                        << " member=" << symbol.member_index << " member-name="
-                        << safe_text(archive.members[symbol.member_index].name) << '\n';
+                auto member_storage_result = open_member(member);
+                if (!member_storage_result) {
+                    skip_member(i, member_storage_result.error().message);
+                    continue;
                 }
-            }
-            std::size_t missing = 0;
-            for (const auto &[name, providers] : expected) {
-                for (const auto member_index : providers) {
-                    if (actual.contains({name, member_index})) continue;
-                    ++missing;
-                    out << "Missing index row: symbol=" << safe_text(name)
-                        << " member=" << member_index << " member-name="
-                        << safe_text(archive.members[member_index].name) << '\n';
+                auto member_storage = std::move(member_storage_result.value());
+                if (!member_storage || member_storage->size() > max_member_bytes - total_bytes) {
+                    skip_member(i, "resolved-member-exceeds-aggregate-byte-limit");
+                    continue;
                 }
+                total_bytes += member_storage->size();
+                auto detected = detect_format(*member_storage);
+                if (!detected) {
+                    skip_member(i, detected.error().message);
+                    continue;
+                }
+                const auto is_xcoff64 = [&] {
+                    if (member_storage->size() < 2) return false;
+                    const auto prefix = member_storage->read_at({0}, 2);
+                    return prefix && prefix.value().bytes.size() == 2 &&
+                        prefix.value().bytes[0] == std::byte{0x01} &&
+                        prefix.value().bytes[1] == std::byte{0xf7};
+                };
+                if (total_symbols >= max_symbols || total_name_bytes >= max_name_bytes) {
+                    skip_member(i, "aggregate-symbol-or-name-limit");
+                    continue;
+                }
+                ArObjectLimits object_limits;
+                object_limits.max_symbols = max_symbols - total_symbols;
+                object_limits.max_name_bytes = 4096;
+                object_limits.max_metadata_bytes = static_cast<std::size_t>(std::min<std::uint64_t>(
+                    object_limits.max_metadata_bytes, max_member_bytes - total_bytes));
+                Result<ArMemberSymbols> summary = Error{ErrorCode::unsupported,
+                    "Archive member format is not supported by the symbol inventory"};
+                switch (detected.value()) {
+                case DetectedFormat::elf_candidate:
+                    summary = summarize_elf_ar_member(*member_storage, i, {}, object_limits);
+                    break;
+                case DetectedFormat::macho_candidate:
+                    summary = summarize_macho_ar_member(*member_storage, i, {}, object_limits);
+                    break;
+                case DetectedFormat::xcoff32_object_candidate:
+                    summary = summarize_xcoff32_ar_member(*member_storage, i, {}, object_limits);
+                    break;
+                case DetectedFormat::unknown:
+                    if (is_xcoff64())
+                        summary = summarize_xcoff64_ar_member(*member_storage, i, {}, object_limits);
+                    else
+                        summary = summarize_coff_ar_member(*member_storage, i, {}, object_limits);
+                    break;
+                default:
+                    summary = Error{ErrorCode::unsupported,
+                        "Detected member format has no supported archive symbol summary"};
+                    break;
+                }
+                if (!summary) {
+                    skip_member(i, summary.error().message);
+                    continue;
+                }
+                const auto symbol_count = summary.value().definitions.size() + summary.value().undefined.size();
+                if (symbol_count > max_symbols - total_symbols) {
+                    skip_member(i, "aggregate-object-symbol-limit");
+                    continue;
+                }
+                bool names_fit = true;
+                std::size_t member_name_bytes = 0;
+                for (const auto &name : summary.value().definitions) {
+                    if (name.size() > max_name_bytes - total_name_bytes - member_name_bytes) {
+                        names_fit = false;
+                        break;
+                    }
+                    member_name_bytes += name.size();
+                }
+                if (names_fit) for (const auto &name : summary.value().undefined) {
+                    if (name.size() > max_name_bytes - total_name_bytes - member_name_bytes) {
+                        names_fit = false;
+                        break;
+                    }
+                    member_name_bytes += name.size();
+                }
+                if (!names_fit) {
+                    skip_member(i, "aggregate-symbol-name-byte-limit");
+                    continue;
+                }
+                total_symbols += symbol_count;
+                total_name_bytes += member_name_bytes;
+                summaries.push_back(std::move(summary.value()));
             }
-            out << "Archive index audit: format=ELF members=" << audited_members.size()
-                << " skipped-members=" << skipped_members << " defined-symbols=" << total_symbols
-                << " index-rows=" << archive.symbols.size() << " missing=" << missing
-                << " stale=" << stale << " unverifiable=" << unverifiable
+
+            ArIndexAuditLimits audit_limits;
+            audit_limits.max_members = max_members;
+            audit_limits.max_object_symbols = max_symbols;
+            audit_limits.max_name_bytes = max_name_bytes;
+            const auto audit = take(audit_ar_symbol_index(archive, summaries, {}, audit_limits));
+            for (const auto &finding : audit.findings) {
+                const auto &member = archive.members[finding.member_index];
+                const auto kind = finding.kind == ArIndexFindingKind::missing ? "Missing" :
+                    finding.kind == ArIndexFindingKind::stale ? "Stale" : "Unverifiable";
+                out << kind << " index row: symbol=" << safe_text(finding.symbol)
+                    << " member=" << finding.member_index << " member-name=" << safe_text(member.name)
+                    << " header-offset=" << hex(member.header_offset.value) << '\n';
+            }
+            out << "Archive index audit: formats=mixed audited-members=" << audit.audited_members
+                << " skipped-members=" << skipped_members << " defined-symbols=" << audit.object_definitions
+                << " index-rows=" << audit.index_rows << " missing=" << audit.missing
+                << " stale=" << audit.stale << " unverifiable=" << audit.unverifiable
+                << " omitted-findings=" << audit.omitted_findings
                 << " index-present=" << (archive.has_symbol_index ? "true" : "false")
-                << " index-complete=" << (archive.symbol_index_complete ? "true" : "false") << '\n';
+                << " index-complete=" << (archive.symbol_index_complete ? "true" : "false")
+                << " audit-complete=" << (audit.complete ? "true" : "false") << '\n';
             for (const auto &diagnostic : archive.diagnostics)
                 out << "Archive diagnostic: " << safe_text(diagnostic) << '\n';
-            return missing == 0 && stale == 0 && archive.has_symbol_index && archive.symbol_index_complete ? 0 : 1;
+            return audit.missing == 0 && audit.stale == 0 && audit.unverifiable == 0 && skipped_members == 0 &&
+                audit.omitted_findings == 0 && archive.has_symbol_index && archive.symbol_index_complete ? 0 : 1;
         }
         if (action == L"link-pe") {
             if (args.size() != 8 || args[2] != L"--root-object" || args[4] != L"--entry" || args[6] != L"--output")

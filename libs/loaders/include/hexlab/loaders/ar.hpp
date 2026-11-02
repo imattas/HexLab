@@ -68,6 +68,28 @@ struct ArMemberSymbols {
     std::vector<std::string> undefined;
 };
 
+enum class ArIndexFindingKind : std::uint8_t { missing, stale, unverifiable };
+struct ArIndexFinding {
+    ArIndexFindingKind kind = ArIndexFindingKind::missing;
+    std::size_t member_index = 0;
+    std::string symbol;
+};
+struct ArIndexAuditLimits {
+    std::size_t max_members = 4096;
+    std::size_t max_index_rows = 1'000'000;
+    std::size_t max_object_symbols = 1'000'000;
+    std::size_t max_name_bytes = 64 * 1024 * 1024;
+    std::size_t max_findings = 65'536;
+};
+struct ArIndexAudit {
+    std::size_t audited_members = 0, skipped_members = 0;
+    std::size_t object_definitions = 0, index_rows = 0;
+    std::size_t missing = 0, stale = 0, unverifiable = 0;
+    std::size_t omitted_findings = 0;
+    bool has_symbol_index = false, index_complete = true, complete = true;
+    std::vector<ArIndexFinding> findings;
+};
+
 struct ArObjectLimits {
     std::uint64_t max_metadata_bytes = 64ULL * 1024 * 1024;
     std::size_t max_sections = 1'000'000;
@@ -137,6 +159,12 @@ HEXLAB_LOADERS_EXPORT Result<ArSymbolSelection> select_ar_members(
 // complete miss.
 HEXLAB_LOADERS_EXPORT Result<ArSymbolLookup> lookup_ar_member_by_symbol(
     const ArArchive &, std::string_view symbol);
+// Cross-checks archive index pairs against caller-provided object definition
+// summaries. Summaries may come from ELF, COFF, Mach-O, XCOFF, or other readers;
+// unsummarized members are reported as unverifiable rather than assumed empty.
+HEXLAB_LOADERS_EXPORT Result<ArIndexAudit> audit_ar_symbol_index(
+    const ArArchive &, std::span<const ArMemberSymbols>, std::stop_token = {},
+    ArIndexAuditLimits = {});
 // Repeatedly selects the earliest unselected member defining a currently
 // unresolved symbol, adds that member's undefined symbols, and rescans until
 // no further member can be selected. Results preserve archive order and record

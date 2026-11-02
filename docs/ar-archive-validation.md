@@ -74,6 +74,34 @@ complete miss from an absent or partially malformed BSD ranlib index. The
 multi-symbol selector applies the same earliest-member rule for duplicate
 provider rows. Empty requests and malformed in-memory symbol rows are rejected.
 
+`audit_ar_symbol_index` cross-checks the parsed archive index against
+caller-supplied `ArMemberSymbols` summaries. It is format-neutral: callers can
+summarize ELF, COFF, Mach-O, XCOFF, or other supported object members, including
+resolved thin members, and pass the summaries together. Findings distinguish
+missing rows (a summarized definition absent from the index), stale rows (an
+indexed provider that does not define the symbol), and unverifiable rows
+(indexed members without a supplied summary). Duplicate `(symbol, member)`
+rows are compared once. Member, row, symbol-name-byte, object-symbol, and
+retained-finding limits are bounded; cancellation is checked through all
+passes. `complete` reports whether every finding was retained, while
+`index_complete` reports the archive parser's structural assessment. The API
+does not open members or infer that an unsummarized member has no definitions.
+
+`hexlab_cli archive index-audit <archive> [--thin-root <directory>]` now uses
+that API with the bounded symbol summaries available for ELF, Mach-O, COFF
+(including supported BigObj/import objects), XCOFF32, and XCOFF64 archive
+members. Thin members are inspected only through the explicit `--thin-root`
+resolver. Unsupported, malformed, or unreadable members are printed as skipped
+with their archive member index, decoded name, header offset, and reason; any
+index rows that point into them remain unverifiable. The command checks at most
+4096 members, 256 MiB of aggregate member bytes, one million summary symbols,
+64 MiB of combined symbol-name data, and one million index rows. At most 65,536
+findings are printed; an omitted-finding count keeps truncated reports
+incomplete. The audit reads data only and never changes an archive or project.
+It exits successfully only when the index is present and structurally complete,
+all audited definitions agree with its rows, and no member was skipped or
+finding omitted.
+
 The desktop **Browse ar Archive** dialog lists archive members and a second indexed-symbol table. Each symbol row shows the member name and stable archive member index; selecting a symbol also selects its member, which can then be opened. The status line distinguishes archives without a supported index from incomplete indexes, so an empty symbol table does not imply the archive has no object members.
 
 GNU 32-/64-bit indexes and BSD 32-/64-bit `__.SYMDEF` ranlib tables are decoded with bounded metadata reads. BSD word order is selected by validating the table shape (little-endian first, then big-endian), and all symbol rows resolve through archive member header offsets. Unsupported or malformed BSD index layouts leave member browsing available and produce a diagnostic. `hexlab_cli archive list` prints indexed symbols with their member index and member name, and `archive open` imports a selected regular member into a project. `hexlab_cli archive link-select <archive> --root-object <ET_REL>` summarizes the root object and ELF archive members, selects members to a fixed point, and prints trigger symbols and unresolved names. `archive link-audit` reports each selected relocation's type, symbol, and provider without producing output. `archive link <archive> --root-object <ET_REL> --output <ET_REL>` applies a bounded linker subset and writes a combined ELF64 little-endian x86-64 relocatable object. The linker concatenates executable `.text`, optional read-only `.rodata`, optional writable initialized `.data`, and optional writable zero-filled SHT_NOBITS `.bss` sections per object with section alignment, preserves each output section's maximum input alignment in the section and file layout, resolves strong/weak global symbols, rejects unresolved strong references, and applies supported `.text`, `.rodata`, and `.data` RELA types R_X86_64_NONE, 64, PC32, PLT32, 32, 32S, PC64, 16, PC16, 8, and PC8 with checked overflow and narrow-field range checks. Relocation places and local/global definitions are rebased within their merged output section, so a `.data` relocation can reach a symbol in another object's `.data` as well as `.text`. Local and global symbols from all merged output sections receive rebased values and section indices. It rejects other architectures, allocated sections outside `.text`/`.rodata`/`.data`/`.bss`, non-RELA records, unsupported relocation kinds, duplicate strong definitions, and out-of-range relocation fields. TLS, COMDAT, and non-alloc debug sections remain unsupported. ELF `SHN_COMMON` definitions are coalesced into merged `.bss` using maximum size and alignment; strong definitions take precedence over common and weak definitions, while common definitions take precedence over weak definitions. Archive member summaries treat common symbols as definitions for fixed-point selection. Allocated SHT_NOBITS `.bss` sections are merged into a zero-filled output section; symbols and relocations from `.text`/`.rodata`/`.data` may target `.bss`, while relocations stored inside `.bss` remain unsupported. `hexlab_cli archive link-pe <archive> --root-object <COFF .obj> --entry <symbol> --output <PE .exe>` selects COFF archive members to a fixed point and links ordinary AMD64 objects into a static PE32+ console image. Initialized `.text`/`.rdata`/`.data` and zero-filled `.bss` are merged; references to BSS symbols are relocated, but relocations stored inside BSS remain unsupported. COFF common symbols coalesce by name into zero-filled `.bss`, using natural alignment capped at 32 bytes; selected strong section definitions take precedence. The archive summary treats common symbols as definitions so a needed member can be selected. COFF linking still omits imports, TLS, unwind metadata, base relocations, weak external aliases and CRT support. Mach-O link output is unsupported. ELF archive selection skips non-ELF members. Archive mutation and symbol-index rebuilding are not supported.

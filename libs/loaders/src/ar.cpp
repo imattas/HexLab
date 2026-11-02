@@ -6,6 +6,7 @@
 #include <mutex>
 #include <new>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <filesystem>
 #include <memory>
@@ -873,6 +874,100 @@ Result<ArSymbolLookup> lookup_ar_member_by_symbol(const ArArchive &archive, std:
     if (!result.candidate_member_indices.empty())
         result.member_index = result.candidate_member_indices.front();
     return result;
+}
+
+Result<ArIndexAudit> audit_ar_symbol_index(const ArArchive &archive,
+    std::span<const ArMemberSymbols> summaries, std::stop_token stop,
+    ArIndexAuditLimits limits) {
+    try {
+        canceled(stop);
+        require(limits.max_members && limits.max_index_rows && limits.max_object_symbols &&
+                    limits.max_name_bytes,
+                "ar index-audit limits must be positive", ErrorCode::invalid_argument);
+        require(archive.members.size() <= limits.max_members,
+                "ar index audit exceeds member limit", ErrorCode::resource_limit);
+        require(archive.symbols.size() <= limits.max_index_rows,
+                "ar index audit exceeds indexed-row limit", ErrorCode::resource_limit);
+        ArIndexAudit result;
+        result.has_symbol_index = archive.has_symbol_index;
+        result.index_complete = archive.symbol_index_complete;
+        result.index_rows = archive.symbols.size();
+        std::vector<bool> audited(archive.members.size(), false);
+        std::set<std::pair<std::string, std::size_t>> expected, actual;
+        std::size_t total_symbols = 0, total_name_bytes = 0;
+        auto charge_name = [&](const std::string &name) {
+            require(!name.empty(), "ar index audit encountered an empty symbol name");
+            require(name.size() <= limits.max_name_bytes - total_name_bytes,
+                    "ar index audit exceeds symbol-name byte limit", ErrorCode::resource_limit);
+            total_name_bytes += name.size();
+        };
+        auto finding = [&](ArIndexFindingKind kind, std::size_t member, const std::string &name,
+                           std::size_t &counter) {
+            ++counter;
+            if (result.findings.size() < limits.max_findings)
+                result.findings.push_back({kind, member, name});
+            else
+                ++result.omitted_findings;
+        };
+
+        for (const auto &summary : summaries) {
+            canceled(stop);
+            require(summary.member_index < archive.members.size(),
+                    "ar index audit summary references an invalid member");
+            const auto kind = archive.members[summary.member_index].kind;
+            require(kind == ArMemberKind::regular || kind == ArMemberKind::thin_external,
+                    "ar index audit summary references a special member");
+            require(!audited[summary.member_index], "duplicate ar index audit summary");
+            audited[summary.member_index] = true;
+            ++result.audited_members;
+            require(summary.definitions.size() <= limits.max_object_symbols - total_symbols,
+                    "ar index audit exceeds object-symbol limit", ErrorCode::resource_limit);
+            total_symbols += summary.definitions.size();
+            for (const auto &name : summary.definitions) {
+                canceled(stop);
+                charge_name(name);
+                expected.emplace(name, summary.member_index);
+            }
+        }
+        for (std::size_t i = 0; i < archive.members.size(); ++i) {
+            canceled(stop);
+            const auto kind = archive.members[i].kind;
+            if ((kind == ArMemberKind::regular || kind == ArMemberKind::thin_external) && !audited[i])
+                ++result.skipped_members;
+        }
+        result.object_definitions = expected.size();
+
+        for (const auto &symbol : archive.symbols) {
+            canceled(stop);
+            charge_name(symbol.name);
+            require(symbol.member_index < archive.members.size(),
+                    "ar index audit index row references an invalid member");
+            const auto kind = archive.members[symbol.member_index].kind;
+            require(kind == ArMemberKind::regular || kind == ArMemberKind::thin_external,
+                    "ar index audit index row references a special member");
+            if (!actual.emplace(symbol.name, symbol.member_index).second) continue;
+            if (!audited[symbol.member_index]) {
+                finding(ArIndexFindingKind::unverifiable, symbol.member_index,
+                        symbol.name, result.unverifiable);
+            } else if (!expected.contains({symbol.name, symbol.member_index})) {
+                finding(ArIndexFindingKind::stale, symbol.member_index, symbol.name, result.stale);
+            }
+        }
+        for (const auto &[name, member] : expected) {
+            canceled(stop);
+            if (!actual.contains({name, member}))
+                finding(ArIndexFindingKind::missing, member, name, result.missing);
+        }
+        result.complete = result.omitted_findings == 0;
+        canceled(stop);
+        return result;
+    } catch (const Failure &failure) {
+        return failure.error;
+    } catch (const std::bad_alloc &) {
+        return Error{ErrorCode::resource_limit, "Cannot allocate bounded ar index audit"};
+    } catch (const std::length_error &) {
+        return Error{ErrorCode::resource_limit, "ar index audit exceeds host container limits"};
+    }
 }
 
 Result<ArLinkSelection> select_ar_members_fixed_point(
