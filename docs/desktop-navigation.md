@@ -212,9 +212,10 @@ function analysis is labeled partial.
 
 Choose **Navigate > Search Names in Project Folder...** to search saved
 projects that are not open as tabs. Select a folder explicitly; the scan reads
-only up to 256 direct-child `.hxproj` files (4,096 directory entries maximum),
-opens each database read-only, and uses its embedded input. It never follows
-subfolders or opens the project's recorded external binary path. Results show
+up to 256 `.hxproj` files within four directory levels (4,096 entries maximum),
+opens each database read-only, and uses its embedded input. It does not follow
+symbolic links or open the project's recorded external binary path. Deeper
+folders and results beyond either cap are reported as partial. Results show
 the saved project path and exact address/file offset. Selecting a result opens
 that project if needed, then validates its UUID and embedded input identity
 before navigating.

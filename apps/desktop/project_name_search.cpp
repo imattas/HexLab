@@ -32,6 +32,7 @@ constexpr std::size_t per_project_input_limit = 128u * 1024u * 1024u;
 constexpr std::uint64_t aggregate_input_limit = 512u * 1024u * 1024u;
 constexpr std::size_t project_limit = 256;
 constexpr std::size_t directory_entry_limit = 4096;
+constexpr std::size_t directory_depth_limit = 4;
 constexpr std::size_t name_byte_limit = 2048;
 
 void put_u8(std::vector<std::byte> &out, std::uint8_t value) { out.push_back(std::byte{value}); }
@@ -323,23 +324,34 @@ Result<ProjectFolderNameIndex> index_project_folder_names(
         return Error{ErrorCode::invalid_argument, "Select an accessible folder of saved HexLab projects"};
     std::vector<std::filesystem::path> projects;
     std::size_t examined = 0;
-    for (std::filesystem::directory_iterator it(result.folder,
+    for (std::filesystem::recursive_directory_iterator it(result.folder,
              std::filesystem::directory_options::skip_permission_denied, error), end;
          !error && it != end; it.increment(error)) {
         if (cancelled && cancelled->load(std::memory_order_relaxed))
             return Error{ErrorCode::canceled, "Project name indexing canceled"};
         if (++examined > directory_entry_limit) {
             result.truncated = true;
-            result.limitation = "folder scan stopped after 4,096 direct children";
+            result.limitation = "folder scan stopped after 4,096 entries";
             break;
         }
         const auto path = it->path();
+        const auto status = it->symlink_status(error);
+        if (error) { error.clear(); continue; }
+        if (std::filesystem::is_symlink(status)) {
+            it.disable_recursion_pending();
+            continue;
+        }
+        if (std::filesystem::is_directory(status) &&
+            it.depth() >= static_cast<int>(directory_depth_limit)) {
+            it.disable_recursion_pending();
+            result.truncated = true;
+            if (result.limitation.empty()) result.limitation = "folder scan stopped at the 4-directory-level depth limit";
+            continue;
+        }
+        if (!std::filesystem::is_regular_file(status)) continue;
         auto extension = path.extension().wstring();
         std::transform(extension.begin(), extension.end(), extension.begin(), towlower);
         if (extension != L".hxproj") continue;
-        const auto status = it->symlink_status(error);
-        if (error) { error.clear(); continue; }
-        if (!std::filesystem::is_regular_file(status) || std::filesystem::is_symlink(status)) continue;
         projects.push_back(std::filesystem::absolute(path, error).lexically_normal());
         if (error) { error.clear(); projects.pop_back(); }
         if (projects.size() >= project_limit) {
