@@ -11,6 +11,11 @@ namespace hexlab {
 // Vector bytes are in architectural register order: byte 0 is the most
 // significant byte of the 128-bit VMX register, independent of file byte order.
 using PpcVectorBits = std::array<std::uint8_t, 16>;
+struct PpcVmxCompareResult {
+    PpcVectorBits value{};
+    // CR6 nibble in LT/GT/EQ/SO bit order, present only for Rc forms.
+    std::optional<std::uint8_t> cr6;
+};
 
 struct PpcBranchPredicateResult {
     bool taken = false;
@@ -103,6 +108,14 @@ evaluate_ppc_fp_arithmetic_instruction(const Instruction &instruction,
 HEXLAB_PROCESSORS_EXPORT std::optional<PpcVectorBits>
 evaluate_ppc_vmx_integer_operation(Opcode opcode, const PpcVectorBits &va,
                                    const PpcVectorBits &vb) noexcept;
+
+// Evaluates a decoded VMX byte/halfword/word integer compare. True lanes are
+// all ones, false lanes are zero. Rc forms also return the architectural CR6
+// all-true / all-false / mixed summary nibble.
+HEXLAB_PROCESSORS_EXPORT std::optional<PpcVmxCompareResult>
+evaluate_ppc_vmx_compare_instruction(const Instruction &instruction,
+                                    const PpcVectorBits &va,
+                                    const PpcVectorBits &vb) noexcept;
 
 // Evaluate decoded VMX VPERM. Control bytes select from VA||VB using their
 // low five bits, in architectural (most-significant-byte-first) register order.

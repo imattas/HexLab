@@ -891,10 +891,11 @@ DecodeResult decode_powerpc(DecodeContext context, std::span<const std::byte> by
             i.register_writes.push_back(cr1());
     } else if (op == 4) {
         // VMX VX form: six-bit primary opcode, three five-bit vector registers,
-        // and an exact eleven-bit extended opcode. None of the selected forms
-        // uses a record bit or an additional modifier field.
+        // and an exact eleven-bit extended opcode. Integer compare forms use
+        // the low bit of that field as Rc.
         const unsigned vx_xo = w & 0x7ff;
         unsigned element_bits = 0;
+        bool record_compare = false;
         switch (vx_xo) {
         case 43:   i.opcode = Opcode::ppc_vperm; break;
         case 0:    i.opcode = Opcode::ppc_vaddubm; element_bits = 8; break;
@@ -920,6 +921,15 @@ DecodeResult decode_powerpc(DecodeContext context, std::span<const std::byte> by
         case 770:  i.opcode = Opcode::ppc_vminsb; element_bits = 8; break;
         case 834:  i.opcode = Opcode::ppc_vminsh; element_bits = 16; break;
         case 898:  i.opcode = Opcode::ppc_vminsw; element_bits = 32; break;
+        case 6: case 7: i.opcode = vx_xo & 1 ? Opcode::ppc_vcmpequb_dot : Opcode::ppc_vcmpequb; element_bits = 8; record_compare = vx_xo & 1; break;
+        case 70: case 71: i.opcode = vx_xo & 1 ? Opcode::ppc_vcmpequh_dot : Opcode::ppc_vcmpequh; element_bits = 16; record_compare = vx_xo & 1; break;
+        case 134: case 135: i.opcode = vx_xo & 1 ? Opcode::ppc_vcmpequw_dot : Opcode::ppc_vcmpequw; element_bits = 32; record_compare = vx_xo & 1; break;
+        case 518: case 519: i.opcode = vx_xo & 1 ? Opcode::ppc_vcmpgtub_dot : Opcode::ppc_vcmpgtub; element_bits = 8; record_compare = vx_xo & 1; break;
+        case 582: case 583: i.opcode = vx_xo & 1 ? Opcode::ppc_vcmpgtuh_dot : Opcode::ppc_vcmpgtuh; element_bits = 16; record_compare = vx_xo & 1; break;
+        case 646: case 647: i.opcode = vx_xo & 1 ? Opcode::ppc_vcmpgtuw_dot : Opcode::ppc_vcmpgtuw; element_bits = 32; record_compare = vx_xo & 1; break;
+        case 774: case 775: i.opcode = vx_xo & 1 ? Opcode::ppc_vcmpgtsb_dot : Opcode::ppc_vcmpgtsb; element_bits = 8; record_compare = vx_xo & 1; break;
+        case 838: case 839: i.opcode = vx_xo & 1 ? Opcode::ppc_vcmpgtsh_dot : Opcode::ppc_vcmpgtsh; element_bits = 16; record_compare = vx_xo & 1; break;
+        case 902: case 903: i.opcode = vx_xo & 1 ? Opcode::ppc_vcmpgtsw_dot : Opcode::ppc_vcmpgtsw; element_bits = 32; record_compare = vx_xo & 1; break;
         default: return fail(DecodeStatus::unsupported, "PowerPC opcode-4 form is outside the enabled VMX integer subset");
         }
         const auto destination = vr(rt), left = vr(ra), right = vr(rb);
@@ -933,6 +943,7 @@ DecodeResult decode_powerpc(DecodeContext context, std::span<const std::byte> by
             i.register_reads.push_back(control);
         }
         i.register_writes = {destination};
+        if (record_compare) i.register_writes.push_back(cr(6));
         i.vector_bits = 128;
         i.vector_element_bits = static_cast<std::uint16_t>(element_bits);
     } else {

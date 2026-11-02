@@ -747,7 +747,14 @@ enum class Opcode {
     // RVV scalar-insert single-element slides; append for stable stored IDs.
     rv_vslide1up_vx, rv_vslide1down_vx, rv_vfslide1up_vf, rv_vfslide1down_vf,
     // AVX lane permutation family; append to preserve persisted opcode values.
-    vpermilps, vpermilpd, vperm2f128, vperm2i128
+    vpermilps, vpermilpd, vperm2f128, vperm2i128,
+    // PowerPC VMX integer comparisons; appended for persisted opcode stability.
+    ppc_vcmpequb, ppc_vcmpequh, ppc_vcmpequw,
+    ppc_vcmpgtub, ppc_vcmpgtuh, ppc_vcmpgtuw,
+    ppc_vcmpgtsb, ppc_vcmpgtsh, ppc_vcmpgtsw,
+    ppc_vcmpequb_dot, ppc_vcmpequh_dot, ppc_vcmpequw_dot,
+    ppc_vcmpgtub_dot, ppc_vcmpgtuh_dot, ppc_vcmpgtuw_dot,
+    ppc_vcmpgtsb_dot, ppc_vcmpgtsh_dot, ppc_vcmpgtsw_dot
 };
 enum class OperandAccess { read, write, read_write, address };
 // The encoded x86 group-one repeat prefix is retained separately from the

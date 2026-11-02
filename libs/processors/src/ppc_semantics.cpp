@@ -452,6 +452,88 @@ std::optional<PpcVectorBits> evaluate_ppc_vmx_integer_operation(Opcode opcode,
     return result;
 }
 
+std::optional<PpcVmxCompareResult> evaluate_ppc_vmx_compare_instruction(
+    const Instruction &instruction, const PpcVectorBits &va, const PpcVectorBits &vb) noexcept {
+    unsigned lane_bits = 0;
+    bool equal = false, signed_lanes = false, record = false;
+    switch (instruction.opcode) {
+    case Opcode::ppc_vcmpequb: lane_bits = 8; equal = true; break;
+    case Opcode::ppc_vcmpequh: lane_bits = 16; equal = true; break;
+    case Opcode::ppc_vcmpequw: lane_bits = 32; equal = true; break;
+    case Opcode::ppc_vcmpgtub: lane_bits = 8; break;
+    case Opcode::ppc_vcmpgtuh: lane_bits = 16; break;
+    case Opcode::ppc_vcmpgtuw: lane_bits = 32; break;
+    case Opcode::ppc_vcmpgtsb: lane_bits = 8; signed_lanes = true; break;
+    case Opcode::ppc_vcmpgtsh: lane_bits = 16; signed_lanes = true; break;
+    case Opcode::ppc_vcmpgtsw: lane_bits = 32; signed_lanes = true; break;
+    case Opcode::ppc_vcmpequb_dot: lane_bits = 8; equal = record = true; break;
+    case Opcode::ppc_vcmpequh_dot: lane_bits = 16; equal = record = true; break;
+    case Opcode::ppc_vcmpequw_dot: lane_bits = 32; equal = record = true; break;
+    case Opcode::ppc_vcmpgtub_dot: lane_bits = 8; record = true; break;
+    case Opcode::ppc_vcmpgtuh_dot: lane_bits = 16; record = true; break;
+    case Opcode::ppc_vcmpgtuw_dot: lane_bits = 32; record = true; break;
+    case Opcode::ppc_vcmpgtsb_dot: lane_bits = 8; signed_lanes = record = true; break;
+    case Opcode::ppc_vcmpgtsh_dot: lane_bits = 16; signed_lanes = record = true; break;
+    case Opcode::ppc_vcmpgtsw_dot: lane_bits = 32; signed_lanes = record = true; break;
+    default: return {};
+    }
+
+    const auto *dst = instruction.operands.size() == 3
+        ? std::get_if<RegisterOperand>(&instruction.operands[0]) : nullptr;
+    const auto *left = instruction.operands.size() == 3
+        ? std::get_if<RegisterOperand>(&instruction.operands[1]) : nullptr;
+    const auto *right = instruction.operands.size() == 3
+        ? std::get_if<RegisterOperand>(&instruction.operands[2]) : nullptr;
+    const auto valid_vr = [](const RegisterOperand *r) {
+        return r && r->bank == RegisterBank::ppc_vr && r->width == 128 && r->index < 32 && !r->high_byte;
+    };
+    const RegisterOperand cr6{RegisterBank::ppc_cr, 6, 4, false};
+    if (!valid_vr(dst) || !valid_vr(left) || !valid_vr(right) || instruction.flow != FlowKind::fallthrough ||
+        instruction.access != std::vector<OperandAccess>{OperandAccess::write, OperandAccess::read, OperandAccess::read} ||
+        instruction.register_reads != std::vector<RegisterOperand>{*left, *right} ||
+        instruction.register_writes != (record ? std::vector<RegisterOperand>{*dst, cr6}
+                                                : std::vector<RegisterOperand>{*dst}) ||
+        instruction.memory_read || instruction.memory_write || instruction.vector_bits != 128 ||
+        instruction.vector_element_bits != lane_bits)
+        return {};
+
+    PpcVmxCompareResult result;
+    const unsigned lane_bytes = lane_bits / 8;
+    const std::uint64_t mask = (UINT64_C(1) << lane_bits) - 1;
+    bool all_true = true;
+    bool any_true = false;
+    for (unsigned offset = 0; offset < result.value.size(); offset += lane_bytes) {
+        std::uint64_t a = 0, b = 0;
+        for (unsigned byte = 0; byte < lane_bytes; ++byte) {
+            a = (a << 8) | va[offset + byte];
+            b = (b << 8) | vb[offset + byte];
+        }
+        bool matches = false;
+        if (equal) {
+            matches = a == b;
+        } else if (signed_lanes) {
+            const auto sign_extend = [lane_bits](std::uint64_t value) -> std::int64_t {
+                if (lane_bits == 8) return std::bit_cast<std::int8_t>(static_cast<std::uint8_t>(value));
+                if (lane_bits == 16) return std::bit_cast<std::int16_t>(static_cast<std::uint16_t>(value));
+                return std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(value));
+            };
+            matches = sign_extend(a) > sign_extend(b);
+        } else {
+            matches = a > b;
+        }
+        all_true = all_true && matches;
+        any_true = any_true || matches;
+        const auto lane = matches ? mask : UINT64_C(0);
+        for (unsigned byte = 0; byte < lane_bytes; ++byte)
+            result.value[offset + lane_bytes - 1 - byte] = static_cast<std::uint8_t>(lane >> (byte * 8));
+    }
+    if (record) {
+        const auto summary = static_cast<std::uint8_t>(all_true ? 8 : any_true ? 0 : 2);
+        result.cr6 = summary;
+    }
+    return result;
+}
+
 std::optional<PpcVectorBits> evaluate_ppc_vperm_instruction(
     const Instruction &instruction, const PpcVectorBits &va, const PpcVectorBits &vb,
     const PpcVectorBits &control) noexcept {

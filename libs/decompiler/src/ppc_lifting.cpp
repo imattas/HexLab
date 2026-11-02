@@ -24,7 +24,7 @@ ExpressionPtr reg(R value) {
 ExpressionPtr typed_vmx_reg(R value, ValueType type) {
     return std::make_shared<Expression>(Expression{type, RegisterValue{value, {}}});
 }
-struct VmxOperation { const char *mnemonic; std::uint16_t lane_bits; };
+struct VmxOperation { const char *mnemonic; std::uint16_t lane_bits; bool updates_cr6 = false; };
 std::optional<VmxOperation> vmx_operation(Opcode opcode) {
     switch (opcode) {
     case Opcode::ppc_vaddubm: return VmxOperation{"vaddubm", 8};
@@ -50,6 +50,24 @@ std::optional<VmxOperation> vmx_operation(Opcode opcode) {
     case Opcode::ppc_vminsb: return VmxOperation{"vminsb", 8};
     case Opcode::ppc_vminsh: return VmxOperation{"vminsh", 16};
     case Opcode::ppc_vminsw: return VmxOperation{"vminsw", 32};
+    case Opcode::ppc_vcmpequb: return VmxOperation{"vcmpequb", 8};
+    case Opcode::ppc_vcmpequh: return VmxOperation{"vcmpequh", 16};
+    case Opcode::ppc_vcmpequw: return VmxOperation{"vcmpequw", 32};
+    case Opcode::ppc_vcmpgtub: return VmxOperation{"vcmpgtub", 8};
+    case Opcode::ppc_vcmpgtuh: return VmxOperation{"vcmpgtuh", 16};
+    case Opcode::ppc_vcmpgtuw: return VmxOperation{"vcmpgtuw", 32};
+    case Opcode::ppc_vcmpgtsb: return VmxOperation{"vcmpgtsb", 8};
+    case Opcode::ppc_vcmpgtsh: return VmxOperation{"vcmpgtsh", 16};
+    case Opcode::ppc_vcmpgtsw: return VmxOperation{"vcmpgtsw", 32};
+    case Opcode::ppc_vcmpequb_dot: return VmxOperation{"vcmpequb_dot", 8, true};
+    case Opcode::ppc_vcmpequh_dot: return VmxOperation{"vcmpequh_dot", 16, true};
+    case Opcode::ppc_vcmpequw_dot: return VmxOperation{"vcmpequw_dot", 32, true};
+    case Opcode::ppc_vcmpgtub_dot: return VmxOperation{"vcmpgtub_dot", 8, true};
+    case Opcode::ppc_vcmpgtuh_dot: return VmxOperation{"vcmpgtuh_dot", 16, true};
+    case Opcode::ppc_vcmpgtuw_dot: return VmxOperation{"vcmpgtuw_dot", 32, true};
+    case Opcode::ppc_vcmpgtsb_dot: return VmxOperation{"vcmpgtsb_dot", 8, true};
+    case Opcode::ppc_vcmpgtsh_dot: return VmxOperation{"vcmpgtsh_dot", 16, true};
+    case Opcode::ppc_vcmpgtsw_dot: return VmxOperation{"vcmpgtsw_dot", 32, true};
     default: return std::nullopt;
     }
 }
@@ -541,10 +559,12 @@ std::optional<Statement> lift_ppc_instruction(const Instruction &i, std::vector<
         const auto valid_vr = [](const R *value) {
             return value && value->bank == RegisterBank::ppc_vr && value->width == 128 && value->index < 32;
         };
+        const R cr6{RegisterBank::ppc_cr, 6, 4, false};
+        const auto expected_writes = vmx->updates_cr6 ? std::vector<R>{*dst, cr6} : std::vector<R>{*dst};
         if (!valid_vr(dst) || !valid_vr(left) || !valid_vr(right) ||
             i.vector_bits != 128 || i.vector_element_bits != vmx->lane_bits ||
             i.access != std::vector<OperandAccess>{OperandAccess::write, OperandAccess::read, OperandAccess::read} ||
-            i.register_reads != std::vector<R>{*left, *right} || i.register_writes != std::vector<R>{*dst} ||
+            i.register_reads != std::vector<R>{*left, *right} || i.register_writes != expected_writes ||
             i.memory_read || i.memory_write)
             return effect(i, "ppc_malformed_vmx");
         const auto type = vmx_vector_type(vmx->lane_bits);
@@ -553,7 +573,7 @@ std::optional<Statement> lift_ppc_instruction(const Instruction &i, std::vector<
         Intrinsic result{"ppc_" + std::string(vmx->mnemonic) + suffix,
                          {typed_vmx_reg(*left, type), typed_vmx_reg(*right, type)},
                          IntrinsicMemoryEffect::none};
-        result.register_writes = {*dst};
+        result.register_writes = expected_writes;
         result.result_type = type;
         return result;
     }
