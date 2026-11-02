@@ -79,6 +79,19 @@ The partitioner recognizes three bounded forms:
   root invalidates their partitions along with the other pointer-relative
   partitions.
 
+Pointer-typed values loaded from an identical explicit absolute byte range at
+the same whole-memory SSA version share a root, even when the destination
+registers differ. The whole-memory version is captured before each
+instruction and advances across every modeled store, call, and write-capable
+intrinsic, so an intervening modeled write prevents this equality fact. This
+models stable sequential memory represented by the IR; it does not cover
+asynchronous external mutation or volatile/device memory, which the current
+`MemoryValue` does not distinguish. Loads from dynamic source addresses,
+non-pointer values, or different versions retain opaque roots. Equal loaded
+roots permit same-root byte-range reasoning only; distinct opaque roots remain
+may-alias and stores through them continue to invalidate each other's
+partitions.
+
 The alias rule is byte-range based. A store advances its exact stack or
 absolute-range partition. An absolute-address store also invalidates stack and
 pointer-relative partitions, plus any absolute partition not proven disjoint

@@ -1404,6 +1404,32 @@ Result<LiftedFunction> to_ssa(const LiftedFunction &input,
                         initial_pointer_origin({key(reg), version}));
                 }
             }
+        // Repeated pointer loads from the same exact global byte range and
+        // whole-memory version observe the same modeled value. Canonicalize
+        // those destination roots before copy/offset propagation so derived
+        // SSA values inherit that identity. The coarse version changes for
+        // every modeled write; loads with a different version stay opaque.
+        using PointerLoadSource = std::tuple<AbsoluteMemoryRange, std::uint32_t, unsigned>;
+        std::map<PointerLoadSource, PointerRoot> pointer_load_roots;
+        std::map<PointerValueKey, PointerRoot> pointer_load_value_roots;
+        for (auto block_index : reachable) for (const auto &instruction : partitioned.blocks[block_index].instructions)
+            if (const auto *assign = std::get_if<Assign>(&instruction.statement);
+                assign && assign->destination_version && assign->value &&
+                assign->destination.width == assign->value->type.bits &&
+                assign->value->type.kind == TypeKind::pointer &&
+                assign->value->type.bits == assign->destination.width) {
+                const auto *load = std::get_if<MemoryValue>(&assign->value->value);
+                if (!load || !load->memory_version || load->effective_address) continue;
+                const auto source_range = absolute_memory_range(*load);
+                if (!source_range) continue;
+                const PointerLoadSource source{*source_range, *load->memory_version, assign->destination.width};
+                const PointerRoot value_root{key(assign->destination), *assign->destination_version};
+                const auto [root, inserted] = pointer_load_roots.emplace(source, value_root);
+                (void)inserted;
+                const PointerValueKey destination{key(assign->destination), *assign->destination_version};
+                pointer_load_value_roots[destination] = root->second;
+                pointer_origins[destination] = PointerOrigin{root->second, 0, 0};
+            }
         bool provenance_changed = true;
         for (std::size_t iteration = 0; provenance_changed && iteration < 64; ++iteration) {
             provenance_changed = false;
@@ -1444,6 +1470,8 @@ Result<LiftedFunction> to_ssa(const LiftedFunction &input,
         if (provenance_changed) {
             for (auto &[value, origin] : pointer_origins)
                 origin = initial_pointer_origin(value);
+            for (const auto &[value, root] : pointer_load_value_roots)
+                pointer_origins[value] = PointerOrigin{root, 0, 0};
         }
         std::set<std::string> partitions;
         constexpr std::size_t max_absolute_ranges = 4'096;

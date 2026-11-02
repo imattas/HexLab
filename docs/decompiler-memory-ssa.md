@@ -40,6 +40,13 @@ always treated as potentially aliasing: a store through one root clobbers
 every other root's partition, along with absolute and stack partitions. Calls
 and unknown writes clobber all dynamic partitions. Conflicting phis receive an
 opaque root, which remains may-alias with every other root.
+Pointer-typed loads from the same exact absolute byte range at the same
+whole-memory SSA version share a root across destination registers. This fact
+uses the modeled sequential memory state; `MemoryValue` does not distinguish
+volatile/device accesses or asynchronous external mutation. Dynamic-address
+source loads and loads at different whole-memory versions do not share this
+root. Distinct opaque roots remain may-alias and retain cross-partition
+invalidation.
 This is a local must-alias refinement; it does not discover heap
 allocation sites, prove distinct pointer roots disjoint, or model interprocedural
 points-to facts.
