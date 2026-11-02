@@ -24,7 +24,9 @@ struct Xcoff32Section {
     std::string name;
     std::uint32_t physical_address = 0, virtual_address = 0, size = 0;
     std::uint32_t data_file_offset = 0, relocation_file_offset = 0, line_number_file_offset = 0;
-    std::uint16_t relocation_count = 0, line_number_count = 0;
+    // Expanded XCOFF32 relocation count, including STYP_OVRFLO counts.
+    std::uint32_t relocation_count = 0;
+    std::uint16_t line_number_count = 0;
     std::vector<Xcoff32Relocation> relocations;
 };
 

@@ -23,8 +23,16 @@ The reader checks cancellation before and after storage reads and during section
 and symbol traversal, checks complete reads and table extents, and maps allocation
 failures to resource-limit errors. The string table may be absent when names are
 inline; when present, empty tables (size at most four bytes) are accepted. It
-checks ordinary 10-byte relocation and 6-byte line-number table extents. Ordinary
-10-byte relocation rows are decoded into virtual address, zero-based symbol
+checks ordinary 10-byte relocation and 6-byte line-number table extents.
+XCOFF32 `STYP_OVRFLO` headers are resolved by their one-based target section
+number independent of header order. For paired `0xffff` primary counts, the
+true relocation count in the overflow header's `s_paddr` is accepted, bounded,
+and used to validate and decode the primary section's relocation rows. The
+overflow record must match the primary relocation and line-table offsets and
+must report zero line-number rows; line-number overflow remains unsupported.
+Orphaned, duplicate, mismatched, or over-budget overflow headers are rejected.
+The expanded relocation count is exposed as a 32-bit value in the result.
+Ordinary 10-byte relocation rows are decoded into virtual address, zero-based symbol
 slot, raw `r_rsize`/`r_rtype` bytes and record file offset. A one-million-row
 aggregate limit bounds retained relocations, in addition to the shared 256 MiB
 metadata budget. The decoder checks cancellation, complete table extents,
@@ -38,7 +46,7 @@ type flags determine whether raw data is BSS/TBSS; names are only metadata.
 A zero raw-data pointer denotes absent raw data, including in a nonempty section.
 
 The subset rejects executable (`F_EXEC`) objects, optional headers, deleted
-section headers and overflow sections/count sentinels. Loader-section payloads
+section headers and line-number overflow. Loader-section payloads
 and their embedded loader relocation tables remain uninterpreted. Line-number
 rows are extent-checked only. It does not validate overlap between payload
 tables, decode auxiliary csect or line records, implement csect linking,
