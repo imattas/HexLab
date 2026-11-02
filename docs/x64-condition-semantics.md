@@ -28,6 +28,8 @@ The native x86 decoder also recognizes the implicit-address `MOVS`, `CMPS`, `STO
 
 `evaluate_x86_shift_rotate_instruction` accepts decoded x86/x86-64 scalar forms, reads an immediate count from the instruction record, and requires a caller-supplied byte count for the CL register form. The caller supplies a memory destination's value; neither helper reads memory or mutates a machine state. This is an instruction-family evaluator, not a complete x64 execution engine.
 
+The decompiler lowers register-destination variable-count SHL/SHR/SAR data results into typed SSA expressions. It applies the architectural 5-bit or 6-bit count mask and preserves the destination for an effective count of zero. Counts below the operand width use the corresponding shift; a count exactly equal to the width yields zero for SHL/SHR and sign-fill for SAR. Counts greater than the width remain undefined, matching the scalar evaluator's conservative contract. For nonzero counts, the written status-flags value remains opaque because this expression pass does not yet model each variable-count flag's definedness. A zero count selects the incoming flags unchanged. Memory destinations, rotates, and carry-through rotates remain explicit intrinsics.
+
 `evaluate_x86_setcc_instruction` evaluates a decoded `SETcc` to the byte value
 zero or one from its typed condition code and caller-supplied CF/PF/ZF/SF/OF.
 It validates the byte-register or byte-memory destination and decoded write

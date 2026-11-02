@@ -7749,6 +7749,71 @@ a64_unhandled:
                     destination_memory ? IntrinsicMemoryEffect::unknown : IntrinsicMemoryEffect::none};
                 effect.register_writes = instruction.register_writes;
                 if (destination) effect.result_type = destination_type;
+                // A register-count SHL/SHR/SAR has a precise data result even
+                // though its variable-count status-flag details stay opaque.
+                // Materialize the masked count and the architectural zero- and
+                // exact-width cases so downstream SSA can use the destination.
+                if (destination && source_register &&
+                    (instruction.opcode == Opcode::shl || instruction.opcode == Opcode::shr ||
+                     instruction.opcode == Opcode::sar) &&
+                    (destination->width == 8 || destination->width == 16 ||
+                     destination->width == 32 || destination->width == 64) &&
+                    source_register->width == 8 && source_register->bank == RegisterBank::gpr) {
+                    const auto bits = destination->width;
+                    const auto value = retag_expr(operands[0], destination_type);
+                    const auto count_type = integer_type(8);
+                    const auto count_mask = constant_expr(bits == 64 ? 0x3f : 0x1f, 8);
+                    const auto count = std::make_shared<Expression>(Expression{count_type,
+                        BinaryValue{"and", retag_expr(operands[1], count_type), count_mask}});
+                    const auto boolean_type = ValueType{TypeKind::boolean, 1, false};
+                    const auto zero_count = std::make_shared<Expression>(Expression{boolean_type,
+                        BinaryValue{"eq", count, constant_expr(0, 8)}});
+                    const auto at_width = std::make_shared<Expression>(Expression{boolean_type,
+                        BinaryValue{"eq", count, constant_expr(bits, 8)}});
+                    const auto over_width = std::make_shared<Expression>(Expression{boolean_type,
+                        BinaryValue{"ugt", count, constant_expr(bits, 8)}});
+                    const auto shifted = std::make_shared<Expression>(Expression{destination_type,
+                        BinaryValue{operation_name(instruction.opcode), value, count}});
+                    ExpressionPtr saturated;
+                    if (instruction.opcode == Opcode::sar) {
+                        saturated = std::make_shared<Expression>(Expression{destination_type,
+                            BinaryValue{"sar", value, constant_expr(bits - 1, bits)}});
+                    } else {
+                        saturated = constant_expr(0, bits);
+                    }
+                    const auto exact_nonzero_value = std::make_shared<Expression>(Expression{destination_type,
+                        BinaryValue{"select_if", at_width,
+                            std::make_shared<Expression>(Expression{destination_type,
+                                BinaryValue{"pair", saturated, shifted}})}});
+                    const auto undefined_above_width = unknown_expr(
+                        "x86_variable_shift_result_above_operand_width", bits);
+                    const auto nonzero_value = std::make_shared<Expression>(Expression{destination_type,
+                        BinaryValue{"select_if", over_width,
+                            std::make_shared<Expression>(Expression{destination_type,
+                                BinaryValue{"pair", undefined_above_width, exact_nonzero_value}})}});
+                    const auto result = std::make_shared<Expression>(Expression{destination_type,
+                        BinaryValue{"select_if", zero_count,
+                            std::make_shared<Expression>(Expression{destination_type,
+                                BinaryValue{"pair", value, nonzero_value}})}});
+                    effect.register_output_values.reserve(effect.register_writes.size());
+                    for (const auto written : effect.register_writes) {
+                        if (written == *destination) {
+                            effect.register_output_values.push_back(result);
+                        } else if (written.bank == RegisterBank::flags) {
+                            const auto unchanged = reg_expr(written);
+                            const auto unknown = unknown_expr("x86_flags_after_nonzero_variable_shift", written.width);
+                            effect.register_output_values.push_back(std::make_shared<Expression>(Expression{
+                                integer_type(written.width), BinaryValue{"select_if", zero_count,
+                                    std::make_shared<Expression>(Expression{integer_type(written.width),
+                                        BinaryValue{"pair", unchanged, unknown}})}}));
+                        } else {
+                            effect.register_output_values.push_back(
+                                unknown_expr("x86_shift_unmodeled_register_output", written.width));
+                        }
+                    }
+                    if (effect.register_output_values.size() != effect.register_writes.size())
+                        effect.register_output_values.clear();
+                }
                 return effect;
             }
         }
