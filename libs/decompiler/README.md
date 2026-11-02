@@ -167,6 +167,17 @@ definition chain. Stores, calls, and intrinsics remain because their effects
 are observable or unknown. The pass leaves unversioned assignments alone and
 rejects duplicate SSA definitions.
 
+`simplify_redundant_phis` removes redundant SSA merge webs across joins and
+loops. Register, whole-memory, and named-partition states are solved separately;
+an entire cyclic web is replaced only when its outside inputs prove one exact
+value. Same-register identity assignments may participate. Conflicting merges,
+rootless cycles, and effectful instructions remain explicit. The standalone
+pass validates incoming and outgoing SSA and returns an immutable copy.
+`eliminate_dead_code` applies it opportunistically to valid SSA, retaining its
+existing behavior for partial synthetic IR. Switch selectors, trap predicates,
+and stack-frame provenance count as live uses during dead-code cleanup. See
+[`redundant SSA merges`](docs/redundant-ssa-merges.md) for proof limits and budgets.
+
 Memory SSA keeps a coarse whole-memory chain as the fallback for all accesses.
 It also attaches partitions to proven stack slots, explicit absolute byte
 ranges, and bounded byte ranges reached through one proven pointer root.

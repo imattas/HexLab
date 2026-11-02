@@ -374,6 +374,13 @@ struct SsaRegisterValidation {
 // implicit incoming value; the JVM evaluation-stack bank is owned by its
 // stack-shape lifter and is excluded.
 HEXLAB_DECOMPILER_EXPORT Result<SsaRegisterValidation> validate_register_ssa(const LiftedFunction &);
+// Collapses redundant register, whole-memory and named-partition phi webs,
+// including loop SCCs with exactly one external value. Exact same-register
+// identity assignments may participate. Input/output SSA is validated; no CFG
+// or effectful instruction is changed. Conflicting and rootless webs remain.
+// Functions with unreachable blocks or exceptional/delay-slot timing are
+// returned unchanged. Resource limits return an error before transformation.
+HEXLAB_DECOMPILER_EXPORT Result<LiftedFunction> simplify_redundant_phis(const LiftedFunction &);
 // Propagates proven SSA constants and folds supported fixed-width integer
 // expressions. Unsupported operations remain unchanged.
 HEXLAB_DECOMPILER_EXPORT Result<LiftedFunction> simplify_constants(const LiftedFunction &);

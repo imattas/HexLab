@@ -58,6 +58,8 @@ void collect_uses(const ExpressionPtr &expression, std::set<Key> &uses) {
         } else if constexpr (std::is_same_v<T, MemoryValue>) {
             if (value.base && value.base_version) uses.insert(key(*value.base, *value.base_version));
             if (value.index && value.index_version) uses.insert(key(*value.index, *value.index_version));
+            if (value.stack_frame_register && value.stack_frame_version)
+                uses.insert(key(*value.stack_frame_register, *value.stack_frame_version));
             collect_uses(value.effective_address, uses);
         } else if constexpr (std::is_same_v<T, UnaryValue>) collect_uses(value.operand, uses);
         else if constexpr (std::is_same_v<T, BinaryValue>) {
@@ -94,6 +96,10 @@ void collect_statement_uses(const Statement &statement, std::set<Key> &uses) {
 
 Result<LiftedFunction> eliminate_dead_code(const LiftedFunction &input) {
     LiftedFunction result = input;
+    // Full SSA inputs can contain redundant loop/diamond merge webs. Cleanup
+    // is optional here: this older API also accepts partial synthetic IR that
+    // does not satisfy the standalone merge pass's stricter SSA contract.
+    if (auto cleaned = simplify_redundant_phis(input)) result = std::move(cleaned.value());
     std::set<Key> definitions;
     for (const auto &block : result.blocks) {
         for (const auto &phi : block.phis)
@@ -116,6 +122,8 @@ Result<LiftedFunction> eliminate_dead_code(const LiftedFunction &input) {
                 for (const auto &incoming : phi.inputs) uses.insert(key(phi.destination, incoming.version));
             for (const auto &instruction : block.instructions)
                 collect_statement_uses(instruction.statement, uses);
+            if (block.switch_dispatch) collect_uses(block.switch_dispatch->selector, uses);
+            for (const auto &edge : block.trap_edges) collect_uses(edge.condition, uses);
         }
         for (auto &block : result.blocks) {
             const auto old_phi_count = block.phis.size();
