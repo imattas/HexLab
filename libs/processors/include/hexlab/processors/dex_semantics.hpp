@@ -4,10 +4,13 @@
 
 #include <algorithm>
 #include <bit>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <string_view>
+#include <vector>
 
 namespace hexlab {
 
@@ -320,7 +323,7 @@ inline std::optional<DexIntegerLiteralResult> evaluate_dex_integer_literal(
     const std::string_view mnemonic(instruction.mnemonic_override.data(),
         separator == std::string::npos ? instruction.mnemonic_override.size() : separator);
     const auto immediate_value = std::bit_cast<std::int64_t>(literal->value);
-    if ((!lit16 && !lit8) || mnemonic != expected_mnemonic || literal->encoded_width != expected_width ||
+    if ((!lit16 && !lit8) || mnemonic != expected_mnemonic() || literal->encoded_width != expected_width ||
         immediate_value < (lit16 ? INT16_MIN : INT8_MIN) || immediate_value > (lit16 ? INT16_MAX : INT8_MAX))
         return std::nullopt;
     const RegisterOperand dst{RegisterBank::dex_vreg, destination->index, 32, false};
@@ -683,6 +686,12 @@ struct DexFloatingConversionResult {
     bool operator==(const DexFloatingConversionResult &) const = default;
 };
 
+struct DexFloatingBinaryResult {
+    std::uint64_t value = 0; // IEEE-754 result bits, low 32 bits for float.
+    std::uint8_t result_width = 32;
+    bool operator==(const DexFloatingBinaryResult &) const = default;
+};
+
 namespace dex_float_detail {
 struct Format {
     unsigned width;
@@ -885,6 +894,112 @@ inline std::optional<DexFloatingConversionResult> evaluate_dex_floating_conversi
     case Operation::f64_to_f32: value = convert_binary(source, f64, f32); break;
     }
     return DexFloatingConversionResult{value, static_cast<std::uint8_t>(result_width)};
+}
+
+// Evaluate standard Dalvik float/double add, sub, mul, div and rem register
+// forms from raw IEEE-754 input bits. The caller owns vreg reads/writes. Float
+// remainder follows Java/Dalvik truncating-remainder semantics (std::fmod),
+// not IEEE remainder. NaN payload selection follows the host IEEE operation.
+inline std::optional<DexFloatingBinaryResult> evaluate_dex_floating_binary(
+    const Instruction &instruction, std::uint64_t lhs_bits, std::uint64_t rhs_bits) noexcept {
+    if (instruction.context.architecture != Architecture::dex || instruction.context.mode != ExecutionMode::dex ||
+        instruction.opcode != Opcode::dex || instruction.memory_read || instruction.memory_write ||
+        instruction.flow != FlowKind::fallthrough || !std::numeric_limits<float>::is_iec559 ||
+        !std::numeric_limits<double>::is_iec559)
+        return std::nullopt;
+
+    const auto encoded = std::to_integer<std::uint8_t>(instruction.bytes[0]);
+    const bool two_address = encoded >= 0xc6 && encoded <= 0xcf;
+    const auto operation = two_address ? static_cast<std::uint8_t>(encoded - 0x20) : encoded;
+    const bool is_float = operation >= 0xa6 && operation <= 0xaa;
+    const bool is_double = operation >= 0xab && operation <= 0xaf;
+    if (!is_float && !is_double) return std::nullopt;
+    const auto width = static_cast<std::uint16_t>(is_double ? 64 : 32);
+    const auto operation_index = static_cast<unsigned>(operation - (is_float ? 0xa6 : 0xab));
+    static constexpr std::array<std::string_view, 5> float_names{
+        "add-float", "sub-float", "mul-float", "div-float", "rem-float"};
+    static constexpr std::array<std::string_view, 5> double_names{
+        "add-double", "sub-double", "mul-double", "div-double", "rem-double"};
+    const auto mnemonic_end = instruction.mnemonic_override.find(' ');
+    auto mnemonic = std::string_view(instruction.mnemonic_override.data(),
+        mnemonic_end == std::string::npos ? instruction.mnemonic_override.size() : mnemonic_end);
+    if (two_address) {
+        if (!mnemonic.ends_with("/2addr")) return std::nullopt;
+        mnemonic.remove_suffix(6);
+    }
+    if (mnemonic != (is_float ? float_names[operation_index] : double_names[operation_index]))
+        return std::nullopt;
+    const auto expected_count = two_address ? 2u : 3u;
+    const auto expected_length = two_address ? 2u : 4u;
+    if (instruction.length != expected_length || instruction.operands.size() != expected_count ||
+        instruction.access.size() != expected_count ||
+        instruction.access[0] != (two_address ? OperandAccess::read_write : OperandAccess::write) ||
+        instruction.access[1] != OperandAccess::read || (!two_address && instruction.access[2] != OperandAccess::read))
+        return std::nullopt;
+
+    const auto *destination = std::get_if<RegisterOperand>(&instruction.operands[0]);
+    const auto *left = two_address ? destination : std::get_if<RegisterOperand>(&instruction.operands[1]);
+    const auto *right = std::get_if<RegisterOperand>(&instruction.operands[two_address ? 1 : 2]);
+    const auto valid = [width](const RegisterOperand *reg) {
+        return reg && reg->bank == RegisterBank::dex_vreg && reg->width == width && !reg->high_byte &&
+               static_cast<unsigned>(reg->index) + width / 32 - 1 <= UINT16_MAX;
+    };
+    if (!valid(destination) || !valid(left) || !valid(right)) return std::nullopt;
+
+    const auto first = static_cast<std::uint16_t>(
+        std::to_integer<std::uint8_t>(instruction.bytes[0]) |
+        (std::uint16_t(std::to_integer<std::uint8_t>(instruction.bytes[1])) << 8));
+    if (two_address) {
+        if (((first >> 8) & 15) != destination->index || (first >> 12) != right->index)
+            return std::nullopt;
+    } else {
+        const auto second = static_cast<std::uint16_t>(
+            std::to_integer<std::uint8_t>(instruction.bytes[2]) |
+            (std::uint16_t(std::to_integer<std::uint8_t>(instruction.bytes[3])) << 8));
+        if ((first >> 8) != destination->index || (second & 255) != left->index ||
+            (second >> 8) != right->index)
+            return std::nullopt;
+    }
+
+    std::vector<RegisterOperand> expected_reads, expected_writes;
+    const auto add_slots = [](auto &effects, const RegisterOperand &reg) {
+        for (unsigned slot = 0; slot < static_cast<unsigned>(reg.width) / 32; ++slot) {
+            const RegisterOperand item{RegisterBank::dex_vreg, static_cast<std::uint16_t>(reg.index + slot), 32, false};
+            if (std::find(effects.begin(), effects.end(), item) == effects.end()) effects.push_back(item);
+        }
+    };
+    add_slots(expected_reads, *left);
+    add_slots(expected_reads, *right);
+    add_slots(expected_writes, *destination);
+    if (instruction.register_reads != expected_reads || instruction.register_writes != expected_writes)
+        return std::nullopt;
+
+    if (is_float) {
+        const auto lhs = std::bit_cast<float>(static_cast<std::uint32_t>(lhs_bits));
+        const auto rhs = std::bit_cast<float>(static_cast<std::uint32_t>(rhs_bits));
+        float result = 0;
+        switch (operation_index) {
+        case 0: result = lhs + rhs; break;
+        case 1: result = lhs - rhs; break;
+        case 2: result = lhs * rhs; break;
+        case 3: result = lhs / rhs; break;
+        case 4: result = std::fmod(lhs, rhs); break;
+        default: return std::nullopt;
+        }
+        return DexFloatingBinaryResult{std::bit_cast<std::uint32_t>(result), 32};
+    }
+    const auto lhs = std::bit_cast<double>(lhs_bits);
+    const auto rhs = std::bit_cast<double>(rhs_bits);
+    double result = 0;
+    switch (operation_index) {
+    case 0: result = lhs + rhs; break;
+    case 1: result = lhs - rhs; break;
+    case 2: result = lhs * rhs; break;
+    case 3: result = lhs / rhs; break;
+    case 4: result = std::fmod(lhs, rhs); break;
+    default: return std::nullopt;
+    }
+    return DexFloatingBinaryResult{std::bit_cast<std::uint64_t>(result), 64};
 }
 
 } // namespace hexlab

@@ -1,4 +1,5 @@
 #include "hexlab/processors/decoder.hpp"
+#include "hexlab/processors/dex_semantics.hpp"
 #include <algorithm>
 #include <array>
 #include <bit>

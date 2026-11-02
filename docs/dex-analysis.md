@@ -271,13 +271,15 @@ register while that local's half-open live range contains the instruction.
 It also lists decoded local types/ranges and named parameters as read-only DEX
 metadata; parameter-to-register bindings are not inferred.
 
-The decoder supports the common scalar move, result, return, constant, string
-reference, monitor, throw, goto, conditional branch, packed/sparse switch,
-invoke, `filled-new-array`/`filled-new-array/range`, and integer/floating arithmetic encodings listed in the supported-subset
-source. It retains method call flow and direct intra-method branch targets.
-Reference operands are shown
-as table indices because string/type/field/method names are not yet attached to
-the decoded instruction. Many core opcodes remain unsupported. Bounded packed/sparse switch tables are lifted to method CFG
+The decoder covers the defined standard DEX opcode encodings through the
+DEX 039 `const-method-handle`/`const-method-type` additions, as well as the
+legacy optimized opcodes documented below. Reserved opcode values and
+unrecognized payload identifiers fail closed. The format version is not
+currently used to reject instructions introduced by later DEX versions.
+Decoded instructions retain method call flow and direct intra-method branch
+targets. Reference operands are shown as table indices because string/type/
+field/method names are not attached to the decoded instruction. Bounded
+packed/sparse switch tables are lifted to method CFG
 dispatches with at most 64 cases; malformed payloads or targets outside the
 recovered method remain incomplete. No Dalvik verifier-wide type model is
 claimed. `inspect` and `disassemble` accept automatic detection or `--format
@@ -394,6 +396,17 @@ ambiguous scalar category may pair with an integer category, but not with a
 known reference; unknown values remain conservative. Ordered comparisons
 require integer operands. `cmp-long`, `cmpl/cmpg-float`, and `cmpl/cmpg-double`
 validate their source categories and establish an integer result register.
+
+The processor semantics API also evaluates the standard `add`, `sub`, `mul`,
+`div`, and `rem` float and double register opcodes, including `/2addr`, from
+caller-provided IEEE-754 bit patterns. It validates the opcode encoding,
+mnemonic, typed register widths, access modes, and complete read/write slot
+effects before returning result bits. Floating remainder follows Dalvik/Java
+truncating remainder (`fmod`), rather than IEEE remainder; division and
+remainder by zero retain IEEE floating behavior and do not report an integer
+arithmetic trap. Result NaN payload choice follows the host IEEE operation.
+Register values and vreg storage remain the caller's responsibility, and the
+evaluator does not emulate Dalvik exceptions or runtime state.
 
 Arithmetic and conversion checks cover the standard register forms and
 integer literal arithmetic; they validate register categories and wide pairs,
