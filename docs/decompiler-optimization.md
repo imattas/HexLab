@@ -269,3 +269,15 @@ with bitwise not; complementing the mask swaps the true and false arms. Both
 value arms must be exact-width pure, total bitvectors within the same 256-node
 bound. Arbitrary masks, unversioned values, effects, and mismatched types remain
 explicit.
+
+The identity pass also reduces a typed `select_if` with a constant one-bit
+condition to the selected arm; the unselected arm is not evaluated by the
+conditional expression and may remain partial or effectful. If both arms are
+structurally identical, it removes the select only when the condition is a
+total, pure SSA bitvector, so condition faults and effects are not discarded.
+The known-bit engine handles the same `select_if` shape: a proven condition
+uses only the chosen arm, while an unresolved condition keeps only bits known
+identically in both arms. Unsupported, partial, or memory-valued arms contribute
+no known bits. Exact type/width checks and the existing work/depth budget still
+apply, and this does not infer properties of an unselected arm or relax signed
+overflow, division, or shift semantics.

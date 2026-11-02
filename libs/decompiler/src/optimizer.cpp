@@ -651,6 +651,39 @@ std::optional<KnownBits> evaluate_known_bits(const ExpressionPtr &expression,
         return {};
     }
     if (const auto *binary = std::get_if<BinaryValue>(&expression->value)) {
+        if (binary->operation == "select_if" && binary->left && binary->right &&
+            (expression->type.kind == TypeKind::integer || expression->type.kind == TypeKind::boolean) &&
+            expression->type.bits > 0 && expression->type.bits <= 64 &&
+            binary->right->type == expression->type) {
+            const auto condition_type = binary->left->type;
+            const bool boolean_condition = condition_type.bits == 1 &&
+                (condition_type.kind == TypeKind::boolean || condition_type.kind == TypeKind::integer);
+            const auto *alternatives = std::get_if<BinaryValue>(&binary->right->value);
+            if (!boolean_condition || !alternatives || alternatives->operation != "pair" ||
+                !alternatives->left || !alternatives->right ||
+                alternatives->left->type != expression->type ||
+                alternatives->right->type != expression->type)
+                return {};
+            const auto condition = evaluate_known_bits(binary->left, work, depth + 1);
+            if (condition && condition->width == 1) {
+                if (condition->one & 1)
+                    return evaluate_known_bits(alternatives->left, work, depth + 1);
+                if (condition->zero & 1)
+                    return evaluate_known_bits(alternatives->right, work, depth + 1);
+            }
+            // A select result keeps only facts guaranteed by both possible
+            // arms. Unsupported, partial, or memory-valued arms contribute no
+            // bit facts rather than being assumed to be harmless constants.
+            const auto facts_for = [&](const ExpressionPtr &arm) {
+                auto facts = evaluate_known_bits(arm, work, depth + 1);
+                return facts && facts->width == expression->type.bits
+                    ? *facts : KnownBits{expression->type.bits, 0, 0};
+            };
+            const auto when_true = facts_for(alternatives->left);
+            const auto when_false = facts_for(alternatives->right);
+            return KnownBits{expression->type.bits,
+                when_true.zero & when_false.zero, when_true.one & when_false.one};
+        }
         const auto left = evaluate_known_bits(binary->left, work, depth + 1);
         const auto right = evaluate_known_bits(binary->right, work, depth + 1);
         if (!left || !right) return {};

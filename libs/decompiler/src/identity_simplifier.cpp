@@ -1136,6 +1136,20 @@ ExpressionPtr simplify(const ExpressionPtr &input) {
     if (!valid_bitvector(*result) || !left || !right || !valid_bitvector(*left) ||
         !valid_bitvector(*right))
         return result;
+    if (binary->operation == "select_if" && right->type == result->type &&
+        left->type.bits == 1 &&
+        (left->type.kind == TypeKind::boolean || left->type.kind == TypeKind::integer)) {
+        const auto *alternatives = std::get_if<BinaryValue>(&right->value);
+        if (alternatives && alternatives->operation == "pair" && alternatives->left && alternatives->right &&
+            alternatives->left->type == result->type && alternatives->right->type == result->type) {
+            if (const auto *condition = std::get_if<ConstantValue>(&left->value);
+                condition && condition->type == left->type)
+                return (condition->value & 1) ? alternatives->left : alternatives->right;
+            if (structurally_equal(alternatives->left, alternatives->right) && total_select_value(left))
+                return alternatives->left;
+        }
+        return result;
+    }
     if (auto shifted = simplify_shift_composition(result)) return shifted;
     if (auto select = simplify_nested_select(result)) return select;
     const bool comparison = binary->operation == "eq" || binary->operation == "ne" ||
