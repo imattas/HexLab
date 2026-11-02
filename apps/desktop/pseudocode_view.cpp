@@ -842,7 +842,8 @@ std::string render_user_variables(const decompiler::LiftedFunction &function, st
         // edit without colliding with another value.
         const auto *edit = project ? pseudocode_edit_at(*project, function_id, address, identity) : nullptr;
         const auto *assignment = project ? type_assignment(*project, address) : nullptr;
-        const auto *definition = assignment ? type_definition(*project, assignment->type_id) : nullptr;
+        const auto *definition = edit && edit->type_id ? type_definition(*project, *edit->type_id)
+                                                        : assignment ? type_definition(*project, assignment->type_id) : nullptr;
         std::string display = edit && !edit->name.empty() ? edit->name : identity;
         if (definition) display += " /* " + (definition->type->name().empty()
                                                    ? types::format(*definition->type) : definition->type->name()) + " */";
@@ -2102,8 +2103,11 @@ void PseudocodeView::update(const FunctionSnapshot *snapshot, std::optional<Loca
                                                     recovered_local_comments)));
     for (const auto &variable : variables_) {
         const auto row = variables_list_->InsertItem(variables_list_->GetItemCount(), text(variable.display));
+        const auto *scoped = project_ ? pseudocode_edit_at(*project_, match->function->id.value,
+                                                           variable.definition, variable.token) : nullptr;
         const auto *assignment = project_ ? type_assignment(*project_, variable.definition) : nullptr;
-        const auto *definition = assignment ? type_definition(*project_, assignment->type_id) : nullptr;
+        const auto *definition = scoped && scoped->type_id ? type_definition(*project_, *scoped->type_id)
+                                   : assignment ? type_definition(*project_, assignment->type_id) : nullptr;
         auto type_name = definition
                              ? (definition->type->name().empty() ? types::format(*definition->type)
                                                                  : definition->type->name())
@@ -2114,8 +2118,6 @@ void PseudocodeView::update(const FunctionSnapshot *snapshot, std::optional<Loca
         }
         variables_list_->SetItem(row, 1, text(type_name));
         variables_list_->SetItem(row, 2, location_text(variable.definition, image));
-        const auto *scoped = project_ ? pseudocode_edit_at(*project_, match->function->id.value,
-                                                           variable.definition, variable.token) : nullptr;
         if (scoped && !scoped->comment.empty()) variables_list_->SetItem(row,4,text(scoped->comment));
         const auto read_only_label = variable.function_entry_collision
             ? std::string(" (function entry; read-only)")
@@ -2780,7 +2782,8 @@ void PseudocodeView::rename_local() {
     if (value) {
         submit(SetPseudocodeEdit{function_->id.value, at, identity,
                                  project_->derived_key ? pseudocode_source_key(*project_->derived_key) : std::string{},
-                                 utf8(*value), existing ? existing->comment : std::string{}, false});
+                                 utf8(*value), existing ? existing->comment : std::string{}, false,
+                                 existing ? existing->type_id : std::nullopt});
     }
 }
 void PseudocodeView::comment_local() {
@@ -2798,7 +2801,8 @@ void PseudocodeView::comment_local() {
     if (value)
         submit(SetPseudocodeEdit{function_->id.value, at, stack_access_identities_[index],
                                  project_->derived_key ? pseudocode_source_key(*project_->derived_key) : std::string{},
-                                 existing ? existing->name : std::string{}, utf8(*value), false});
+                                 existing ? existing->name : std::string{}, utf8(*value), false,
+                                 existing ? existing->type_id : std::nullopt});
 }
 void PseudocodeView::edit_comment() {
     const auto row = addresses_->GetNextItem(-1, wxLIST_NEXT_ALL, wxLIST_STATE_SELECTED);
@@ -2825,7 +2829,8 @@ void PseudocodeView::rename_variable() {
         const auto *current = pseudocode_edit_at(*project_, function_->id.value, at, match->token);
         submit(SetPseudocodeEdit{function_->id.value, at, match->token,
                                  project_->derived_key ? pseudocode_source_key(*project_->derived_key) : std::string{},
-                                 utf8(*value), current ? current->comment : std::string{}, false});
+                                 utf8(*value), current ? current->comment : std::string{}, false,
+                                 current ? current->type_id : std::nullopt});
     }
 }
 
@@ -2839,19 +2844,27 @@ void PseudocodeView::assign_variable_type() {
     const auto at = match->definition;
     const auto submit = submit_;
     const auto state = project_->state;
+    const auto *edit = pseudocode_edit_at(*project_, function_->id.value, at, match->token);
     const auto *assigned = type_assignment(*project_, match->definition);
-    if (!assigned && !match->access_sites.empty())
+    if ((!edit || !edit->type_id) && !assigned && !match->access_sites.empty())
         for (const auto address : match->access_sites)
             if ((assigned = type_assignment(*project_, address))) break;
-    const auto assigned_id = assigned ? std::optional<std::uint64_t>(assigned->type_id) : std::nullopt;
-    const auto *current = assigned ? type_definition(*project_, assigned->type_id) : nullptr;
+    const auto assigned_id = edit && edit->type_id ? edit->type_id
+        : assigned ? std::optional<std::uint64_t>(assigned->type_id) : std::nullopt;
+    const auto *current = assigned_id ? type_definition(*project_, *assigned_id) : nullptr;
     const auto initial = current ? current->name : std::string{};
     const auto value = ask(*this, "Assign pseudocode variable type",
                            "Type name from the project (blank removes an assignment):", text(initial), false);
     if (!value) return;
     const auto name = utf8(*value);
     if (name.empty()) {
-        if (assigned_id) {
+        if (edit && edit->type_id)
+            submit(SetPseudocodeEdit{function_->id.value, at, match->token,
+                                     project_->derived_key ? pseudocode_source_key(*project_->derived_key) : std::string{},
+                                     edit->name, edit->comment, false, std::nullopt});
+        else if (assigned_id) {
+            // Retire legacy address-based assignments when the user clears a
+            // type that predates scoped pseudocode edits.
             if (!match->access_sites.empty())
                 submit(AssignStackLocalType{match->access_sites, assigned_id, *assigned_id, true});
             else
@@ -2862,10 +2875,10 @@ void PseudocodeView::assign_variable_type() {
     const auto found = std::find_if(state->user->types.begin(), state->user->types.end(),
                                     [&](const auto &type) { return type.name == name; });
     if (found != state->user->types.end()) {
-        if (!match->access_sites.empty())
-            submit(AssignStackLocalType{match->access_sites, assigned_id, found->id, false});
-        else
-            submit(AssignType{at, found->id, false});
+        submit(SetPseudocodeEdit{function_->id.value, at, match->token,
+                                 project_->derived_key ? pseudocode_source_key(*project_->derived_key) : std::string{},
+                                 edit ? edit->name : std::string{}, edit ? edit->comment : std::string{}, false,
+                                 found->id});
     }
 }
 
@@ -2882,7 +2895,8 @@ void PseudocodeView::comment_variable() {
     if (value)
         submit(SetPseudocodeEdit{function_->id.value, at, match->token,
                                  project_->derived_key ? pseudocode_source_key(*project_->derived_key) : std::string{},
-                                 current ? current->name : std::string{}, utf8(*value), false});
+                                 current ? current->name : std::string{}, utf8(*value), false,
+                                 current ? current->type_id : std::nullopt});
 }
 
 } // namespace hexlab::desktop

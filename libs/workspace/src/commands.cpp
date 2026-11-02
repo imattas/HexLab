@@ -300,6 +300,9 @@ Result<database::StateDelta> validate_command(const ProjectSnapshot &snapshot, c
                     require(value.name.size() <= 1024 && valid_utf8_name(value.name) &&
                                 value.comment.size() <= 65536 && valid_utf8_name(value.comment),
                             "Pseudocode edit text exceeds its limit");
+                    require(!value.type_id || std::any_of(user.types.begin(), user.types.end(), [&](const auto &type) {
+                                return type.id == *value.type_id;
+                            }), "Unknown pseudocode type definition");
                     auto &rows = user.pseudocode_edits;
                     auto found = std::find_if(rows.begin(), rows.end(), [&](const auto &row) {
                         return row.function_id == value.function_id && row.identity == value.identity &&
@@ -313,10 +316,10 @@ Result<database::StateDelta> validate_command(const ProjectSnapshot &snapshot, c
                                     "Pseudocode variable name already exists in this function", ErrorCode::conflict);
                     }
                     std::optional<database::PseudocodeEdit> after;
-                    if (!value.remove && (!value.name.empty() || !value.comment.empty()))
+                    if (!value.remove && (!value.name.empty() || !value.comment.empty() || value.type_id))
                         after = database::PseudocodeEdit{found == rows.end() ? allocate() : found->id,
                                                          value.function_id, value.definition, value.identity,
-                                                         value.source_key, value.name, value.comment};
+                                                         value.source_key, value.name, value.comment, value.type_id};
                     change(rows, found, std::move(after));
                 } else if constexpr (std::is_same_v<T, Rename> || std::is_same_v<T, Comment>) {
                     check_location(snapshot, value.location, true);

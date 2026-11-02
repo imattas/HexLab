@@ -5,7 +5,7 @@
 namespace hexlab {
 struct Rename {Location location;std::string name;};
 struct Comment {Location location;std::string text;};
-struct SetPseudocodeEdit {std::uint64_t function_id=0;Address definition{};std::string identity,source_key,name,comment;bool remove=false;};
+struct SetPseudocodeEdit {std::uint64_t function_id=0;Address definition{};std::string identity,source_key,name,comment;bool remove=false;std::optional<std::uint64_t> type_id;};
 struct BookmarkCommand {Location location;std::string label;bool remove=false;};
 struct SetProjectBreakpoint {
     Address address;

@@ -94,3 +94,7 @@ between recovered function entries in address-space/address order. They stay
 disabled at the ends of the current analysis snapshot and use the normal
 document/project revision guard. Returning to a function restores its saved
 pseudocode and variable selection when the same analysis key is still active.
+
+## Scoped pseudocode edits
+
+Pseudocode variable names, comments, and manual type assignments are persisted by stable function ID, definition address, SSA or phi identity, and exact analysis source key. When the analysis source changes, the edits remain stored but dormant; they become active again only when the exact source key returns. A scoped type assignment takes display precedence over legacy address-based assignments, which remain a fallback for older project data. Clearing a scoped type preserves that variable's name and comment.

@@ -26,7 +26,7 @@ struct ProjectIntegrityReport {
     bool complete=true;
     std::vector<std::string> issues;
 };
-inline constexpr int current_project_schema_version = 20;
+inline constexpr int current_project_schema_version = 21;
 enum class ProjectSchemaState : std::uint8_t { supported, newer_than_supported, invalid_or_unreadable };
 struct ProjectSchemaCompatibilityReport {
     ProjectSchemaState state = ProjectSchemaState::invalid_or_unreadable;
@@ -43,7 +43,7 @@ struct InputProvenance {NativeEncoding encoding;std::filesystem::path native_pat
 struct Annotation {std::uint64_t id;Location location;std::string name,comment;bool operator==(const Annotation&)const=default;};
 // A decompiler edit is bound to one analyzed function and one lifter identity.
 // source_key is the encoded AnalysisKey at the time the edit was made.
-struct PseudocodeEdit {std::uint64_t id=0,function_id=0;Address definition{};std::string identity,source_key,name,comment;bool operator==(const PseudocodeEdit&)const=default;};
+struct PseudocodeEdit {std::uint64_t id=0,function_id=0;Address definition{};std::string identity,source_key,name,comment;std::optional<std::uint64_t> type_id;bool operator==(const PseudocodeEdit&)const=default;};
 struct Bookmark {std::uint64_t id;Location location;std::string label;bool operator==(const Bookmark&)const=default;};
 enum class ProjectBreakpointKind : std::uint8_t { software, hardware, execute, read, write, access };
 struct ProjectBreakpoint {

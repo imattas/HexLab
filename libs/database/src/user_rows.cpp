@@ -93,7 +93,8 @@ void sync_project_breakpoints(Connection& connection,const std::vector<ProjectBr
 }
 void write_user_state(Connection& connection,const UserState& before,const UserState& after){
     sync_rows(connection,"annotations","INSERT INTO annotations VALUES(?1,?2,?3,?4)",before.annotations,after.annotations,[](Statement& sql,const Annotation& row){take(sql.bind_blob(2,take(encode_location(row.location))));take(sql.bind_text(3,row.name));take(sql.bind_text(4,row.comment));});
-    sync_rows(connection, "pseudocode_edits", "INSERT INTO pseudocode_edits VALUES(?1,?2,?3,?4,?5,?6,?7)",
+    sync_type_definitions(connection,before.types,after.types);
+    sync_rows(connection, "pseudocode_edits", "INSERT INTO pseudocode_edits VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
               before.pseudocode_edits, after.pseudocode_edits, [](Statement &sql, const PseudocodeEdit &row) {
                   take(sql.bind_blob(2, encode_u64(row.function_id)));
                   take(sql.bind_blob(3, take(encode_location(Location{row.definition}))));
@@ -101,10 +102,10 @@ void write_user_state(Connection& connection,const UserState& before,const UserS
                   take(sql.bind_blob(5, std::as_bytes(std::span(row.source_key))));
                   take(sql.bind_text(6, row.name));
                   take(sql.bind_text(7, row.comment));
+                  if(row.type_id)take(sql.bind_blob(8,encode_u64(*row.type_id)));else take(sql.bind_null(8));
               });
     sync_rows(connection,"bookmarks","INSERT INTO bookmarks VALUES(?1,?2,?3)",before.bookmarks,after.bookmarks,[](Statement& sql,const Bookmark& row){take(sql.bind_blob(2,take(encode_location(row.location))));take(sql.bind_text(3,row.label));});
     sync_project_breakpoints(connection,before.breakpoints,after.breakpoints);
-    sync_type_definitions(connection,before.types,after.types);
     sync_rows(connection,"type_assignments","INSERT INTO type_assignments VALUES(?1,?2,?3)",before.type_assignments,after.type_assignments,[](Statement& sql,const TypeAssignment& row){take(sql.bind_blob(2,take(encode_location(row.location))));take(sql.bind_blob(3,encode_u64(row.type_id)));});
     sync_debug_variables(connection,before.debug_variables,after.debug_variables);
     sync_rows(connection,"regions","INSERT INTO regions VALUES(?1,?2,?3,?4)",before.decisions.regions,after.decisions.regions,[](Statement& sql,const RegionDecision& row){take(sql.bind_blob(2,take(encode_location(row.begin))));take(sql.bind_blob(3,encode_u64(row.size)));take(sql.bind_integer(4,static_cast<int>(row.kind)));});

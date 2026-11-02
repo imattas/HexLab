@@ -57,7 +57,8 @@ std::shared_ptr<const ProjectState> read_state(Connection& connection,int versio
     require(state->next_entity>0 && state->next_entity!=UINT64_MAX && state->revisions.bytes<=state->revisions.edit && state->revisions.decisions<=state->revisions.edit && state->history_cursor<=state->revisions.edit,"Inconsistent project revision header");
     size_t remaining=project_payload_limit;
     budget(connection,"annotations","8+length(location)+length(CAST(name AS BLOB))+length(CAST(comment AS BLOB))+8",remaining);
-    if(version>=20)budget(connection,"pseudocode_edits","24+length(definition)+length(CAST(identity AS BLOB))+length(source_key)+length(CAST(name AS BLOB))+length(CAST(comment AS BLOB))",remaining);
+    if(version>=21)budget(connection,"pseudocode_edits","24+length(definition)+length(CAST(identity AS BLOB))+length(source_key)+length(CAST(name AS BLOB))+length(CAST(comment AS BLOB))+CASE WHEN type_id IS NULL THEN 0 ELSE 8 END",remaining);
+    else if(version>=20)budget(connection,"pseudocode_edits","24+length(definition)+length(CAST(identity AS BLOB))+length(source_key)+length(CAST(name AS BLOB))+length(CAST(comment AS BLOB))",remaining);
     budget(connection,"bookmarks","8+length(location)+length(CAST(label AS BLOB))+4",remaining);
     budget(connection,"regions","8+length(begin)+length(size)+1",remaining);
     budget(connection,"functions","8+length(entry)+5",remaining);
@@ -103,7 +104,7 @@ std::shared_ptr<const ProjectState> read_state(Connection& connection,int versio
     while(take(annotations->step()))user->annotations.push_back({unsigned_column(*annotations,0),location_column(*annotations,1),take(annotations->text(2)),take(annotations->text(3))});
     if (version >= 20) {
         auto edits = take(connection.prepare(
-            "SELECT id,function_id,definition,identity,source_key,name,comment FROM pseudocode_edits ORDER BY id"));
+            version >= 21 ? "SELECT id,function_id,definition,identity,source_key,name,comment,type_id FROM pseudocode_edits ORDER BY id" : "SELECT id,function_id,definition,identity,source_key,name,comment FROM pseudocode_edits ORDER BY id"));
         while (take(edits->step())) {
             PseudocodeEdit row;
             row.id = unsigned_column(*edits, 0);
@@ -114,6 +115,7 @@ std::shared_ptr<const ProjectState> read_state(Connection& connection,int versio
             row.source_key.assign(reinterpret_cast<const char *>(key.data()), key.size());
             row.name = take(edits->text(5));
             row.comment = take(edits->text(6));
+            if(version>=21 && !take(edits->is_null(7)))row.type_id=unsigned_column(*edits,7);
             user->pseudocode_edits.push_back(std::move(row));
         }
     }
