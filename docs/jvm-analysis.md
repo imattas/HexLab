@@ -189,6 +189,31 @@ The `bipush` and `sipush` lifter reads signed 8-bit and 16-bit immediate metadat
 
 The lifter transports nonempty operand stacks through versioned definitions and phis. Primitive joins/backedges require exact stack heights and value categories. Reference-bearing joins/backedges additionally require an explicit matching StackMapTable frame and exact incoming reference/local identities, including distinct uninitialized allocation offsets; missing or incomplete evidence fails closed. See [JVM stack transport](../libs/decompiler/docs/jvm-stack-transport.md) for the supported proof and remaining verifier limitations. Category-checked `pop2`, `dup*`, `dup2*`, and `swap` preserve logical category-2 values. The lifter lowers `tableswitch` and `lookupswitch` into switch dispatches after checking decoded CFG targets; exception edges retain ordered handler-dispatch metadata. Analysis and lifting conservatively classify `ldc`, `ldc_w`, and `ldc2_w` as throw-capable because reference and dynamic constants can trigger resolution or bootstrap behavior, and unknown constant kinds must retain exceptional coverage. A method whose exception-table scan exceeds the bounded CFG handler budget carries an explicit unsupported stop and is rejected by the JVM lifter; its partial handler edges are never presented as complete decompilation. Unsupported `ldc` kinds, legacy `jsr`/`ret` and unknown effects remain unsupported. Method-type and method-handle constants preserve their classfile identity and are not resolved or executed. `invokedynamic` call sites and dynamic constants retain their names, descriptors, bootstrap indices and constant-pool identity, but bootstrap behavior is not resolved or executed.
 
+Field access (`getstatic`, `putstatic`, `getfield`, and `putfield`) retains the
+owner, name, and descriptor in its symbolic operation identity. Reference
+stores reject known uninitialized values and known types proved incompatible
+with the declared field descriptor. Instance accesses similarly check known
+receiver types against the field owner using the optional loader-qualified
+hierarchy. A missing identity or incomplete hierarchy remains unproven; these
+operations do not claim full bytecode verification.
+
+A constructor may use `putfield` through `uninitializedThis` only for a
+matching non-static field declared directly by the current class. The
+operation preserves that uninitialized identity and all its aliases; it does
+not substitute for a constructor call. `getfield` through `uninitializedThis`,
+other uninitialized allocation receivers, and reference stores of either
+uninitialized kind fail closed. Ordinary `getfield`/`putfield` receivers add
+an explicit `receiver == null` may-trap predicate for `NullPointerException`;
+a verifier-proven uninitializedThis constructor receiver is non-null and
+needs no such predicate. Operand order remains receiver then stored value.
+Field results remain typed opaque values, and field operations preserve
+unknown memory effects and exception-handler dispatch because resolution,
+access checks, static initialization, and linkage failures are runtime work.
+Protected-field package/receiver restrictions and complete field resolution
+remain unsupported. These rules follow
+[JVMS field instruction verification](https://docs.oracle.com/javase/specs/jvms/se25/html/jvms-4.html#jvms-4.10.1.9.putfield)
+and the [field instruction descriptions](https://docs.oracle.com/javase/specs/jvms/se25/html/jvms-6.html#jvms-6.5.getfield).
+
 Instance method invocations (`invokevirtual`, `invokespecial`, and `invokeinterface`) retain a may-trap edge for the receiver-null `NullPointerException` condition; static invocations have no receiver check. Constructor calls are excluded because valid constructor receivers are verifier-uninitialized and non-null. Callee exceptions and linkage or access failures remain opaque call effects and continue to use applicable exception-table edges.
 
 `lcmp`, `fcmpl`, `fcmpg`, `dcmpl`, and `dcmpg` lift as explicit typed three-way operations. Floating variants preserve their opcode-specific NaN result; see [JVM scalar compare instructions](jvm-scalar-comparisons.md).

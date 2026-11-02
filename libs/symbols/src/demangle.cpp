@@ -330,6 +330,23 @@ class Itanium {
                 result.type.base = combine({prefix.base, "::", result.type.base});
                 result.type.key = combine({prefix.key, "::", result.type.key});
             }
+        } else if (take("DC")) {
+            std::string binding = "<structured binding [";
+            std::size_t names = 0;
+            while (peek() != 'E') {
+                if (!peek()) malformed();
+                component();
+                const auto name = identifier();
+                if (names++) append(binding, ", ");
+                append(binding, name);
+            }
+            if (!names || !take("E")) malformed();
+            append(binding, "]>");
+            result.type = named(std::move(binding));
+            if (!prefix.base.empty()) {
+                result.type.base = combine({prefix.base, "::", result.type.base});
+                result.type.key = combine({prefix.key, "::", result.type.key});
+            }
         } else {
             if (std::isdigit(static_cast<unsigned char>(peek()))) id = identifier();
             else if ((peek() == 'C' || peek() == 'D') && at_ + 1 < input_.size() &&

@@ -278,6 +278,18 @@ the incoming depth is unknown retain the conservative partial result. This
 assumes a normally called x86-64 function entry; custom entry points with a
 different stack alignment are not inferred.
 
+For x86-64, full-width `MOV` copies and `LEA` with a constant displacement
+carry entry-SP relations through non-SP/BP GPRs. Direct accesses through those
+aliases resolve to typed slots, and each proven copy/LEA retains address-taking
+provenance that coalesces with a typed access at the same byte offset. An alias
+may be copied from RSP, an established RBP frame relation, or another tracked
+alias. `MOV` or `LEA` from a tracked alias can restore RSP or establish RBP.
+Calls clear aliases, other writes invalidate
+the destination, and CFG joins retain only identical known offsets on every
+incoming path. Recognition requires full-width registers and exact decoded
+read/write/address effects. Indexed, segmented, partial-width, unknown-base,
+or conflicting relations remain unresolved and preserve partial status.
+
 For PowerPC32/64, constant `ADDI r1,r1,imm` adjustments and the stack update
 forms (`STWU`/`STDU` and immediate load-update instructions) track the entry-SP
 depth. `OR r31,r1,r1` and constant `ADDI` relations establish or restore the

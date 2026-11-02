@@ -213,6 +213,14 @@ short `_<number>` form is accepted only below 10, and `__<number>_` only from
 10 onward. Noncanonical or incomplete discriminator encodings are malformed
 and preserve the original symbol.
 
+Itanium structured-binding declarations (`DC <source-name>+ E`) are rendered
+as explicit placeholders such as `<structured binding [first, second]>`.
+The parser validates every length-prefixed identifier, requires at least one
+binding name, and charges each name against the normal component limit. The
+placeholder keeps the declaration distinguishable while making no claim about
+the types or runtime storage of its hidden backing object. The encoding follows
+the [Itanium C++ ABI name grammar](https://itanium-cxx-abi.github.io/cxx-abi/abi.html#name).
+
 This is not a complete implementation of either ABI. The Itanium substitutions
 described below, array/function/member-pointer types, and selected template
 parameters are recognized; vector support covers the bounded GNU/Clang

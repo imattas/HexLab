@@ -26,6 +26,8 @@ struct FlowState {
     bool ambiguous = false;
     int frame_register = -1;
     bool arm64_frame_pointer = false;
+    // Exact entry-SP-relative aliases held in non-SP/BP x86-64 GPRs.
+    std::array<FlowValue, 16> x64_stack_alias_depths{};
     // A bounded set of exact RISC-V temporary pointers derived from SP, s0,
     // or another tracked temporary. Each value is entry-SP depth (not an
     // absolute address), so direct memory operands can reuse the slot model.
@@ -279,6 +281,18 @@ bool merge(FlowState &current, const FlowState &incoming) {
             current.ambiguous = true;
         }
     }
+    bool x64_alias_changed = false;
+    for (std::size_t index = 0; index < current.x64_stack_alias_depths.size(); ++index) {
+        auto &alias = current.x64_stack_alias_depths[index];
+        const auto incoming_alias = incoming.x64_stack_alias_depths[index];
+        if (!alias.known && incoming_alias.known) {
+            current.ambiguous = true;
+        } else if (alias.known && (!incoming_alias.known || alias.value != incoming_alias.value)) {
+            alias = {};
+            x64_alias_changed = true;
+            current.ambiguous = true;
+        }
+    }
     bool mips32_alias_changed = false;
     for (std::size_t index = 1; index < current.mips32_stack_alias_depths.size(); ++index) {
         auto &alias = current.mips32_stack_alias_depths[index];
@@ -337,7 +351,7 @@ bool merge(FlowState &current, const FlowState &incoming) {
     return stack_changed || frame_changed || previously_supported != current.supported ||
            previously_ambiguous != current.ambiguous || previous_frame_register != current.frame_register ||
            previous_arm64_frame_pointer != current.arm64_frame_pointer || frame_register_delta_changed ||
-           riscv_alias_changed || mips32_alias_changed || arm64_alias_changed || m6502_alias_changed ||
+           riscv_alias_changed || x64_alias_changed || mips32_alias_changed || arm64_alias_changed || m6502_alias_changed ||
            m6502_saved_stack_changed || m6502_carry_changed ||
            m6502_decimal_changed;
 }
@@ -410,6 +424,56 @@ std::optional<RegisterOperand> riscv_bitwise_copy_source(const Instruction &inst
 
 bool ppc_register(const std::optional<RegisterOperand> &value, std::uint8_t index) {
     return value && value->bank == RegisterBank::ppc_gpr && value->index == index;
+}
+
+std::optional<RegisterOperand> x64_stack_copy_source(const Instruction &instruction) {
+    if (instruction.context.architecture != Architecture::x86_64 ||
+        instruction.context.mode != ExecutionMode::x86_64 || instruction.opcode != Opcode::mov ||
+        instruction.operands.size() != 2 ||
+        instruction.access != std::vector<OperandAccess>{OperandAccess::write, OperandAccess::read} ||
+        instruction.flow != FlowKind::fallthrough || instruction.memory_read || instruction.memory_write)
+        return {};
+    const auto destination = register_at(instruction, 0);
+    const auto source = register_at(instruction, 1);
+    const auto full_gpr = [](const std::optional<RegisterOperand> &reg) {
+        return reg && reg->bank == RegisterBank::gpr && reg->index < 16 && reg->width == 64 && !reg->high_byte;
+    };
+    if (!full_gpr(destination) || !full_gpr(source) ||
+        instruction.register_writes != std::vector<RegisterOperand>{*destination} ||
+        instruction.register_reads != std::vector<RegisterOperand>{*source})
+        return {};
+    return source;
+}
+
+struct X64StackLea {
+    RegisterOperand destination;
+    MemoryOperand address;
+};
+
+std::optional<X64StackLea> x64_stack_lea(const Instruction &instruction) {
+    if (instruction.context.architecture != Architecture::x86_64 ||
+        instruction.context.mode != ExecutionMode::x86_64 || instruction.opcode != Opcode::lea ||
+        instruction.operands.size() != 2 ||
+        instruction.access != std::vector<OperandAccess>{OperandAccess::write, OperandAccess::address} ||
+        instruction.flow != FlowKind::fallthrough || instruction.memory_read || instruction.memory_write)
+        return {};
+    const auto destination = register_at(instruction, 0);
+    const auto *address = std::get_if<MemoryOperand>(&instruction.operands[1]);
+    if (!destination || destination->bank != RegisterBank::gpr || destination->index >= 16 ||
+        destination->width != 64 || destination->high_byte || !address || !address->base ||
+        address->base->bank != RegisterBank::gpr || address->base->index >= 16 ||
+        address->base->width != 64 || address->address_width != 64 || address->index ||
+        address->ip_relative || address->segment ||
+        instruction.register_writes != std::vector<RegisterOperand>{*destination} ||
+        instruction.register_reads != std::vector<RegisterOperand>{*address->base})
+        return {};
+    return X64StackLea{*destination, *address};
+}
+
+FlowValue x64_stack_register_depth(const FlowState &state, std::uint8_t index) {
+    if (index == 4) return state.stack_depth;
+    if (index == 5) return state.frame_register == 5 ? state.frame_depth : FlowValue{};
+    return state.x64_stack_alias_depths[index];
 }
 
 // MOV Xd,Xn is encoded as ORR Xd,XZR,Xn. Only the unshifted, full-width
@@ -700,6 +764,32 @@ void mark_incoming_x86_64_argument(StackFrameAnalysis &result, std::int64_t offs
 bool transfer(const Instruction &instruction, FlowState &state) {
     const auto first = register_at(instruction, 0);
     const auto second = register_at(instruction, 1);
+    const bool x64_mode = instruction.context.architecture == Architecture::x86_64 &&
+                          instruction.context.mode == ExecutionMode::x86_64;
+    if (x64_mode) {
+        const auto copy_source = x64_stack_copy_source(instruction);
+        const auto lea = x64_stack_lea(instruction);
+        const auto copy_destination = copy_source ? register_at(instruction, 0) : std::optional<RegisterOperand>{};
+        if (instruction.flow == FlowKind::call) {
+            for (auto &alias : state.x64_stack_alias_depths) alias = {};
+        } else {
+            const auto preserve_destination = [&](const RegisterOperand &reg) {
+                return reg.bank == RegisterBank::gpr && reg.index != 4 && reg.index != 5 &&
+                    ((copy_destination && *copy_destination == reg) ||
+                     (lea && lea->destination == reg));
+            };
+            const auto invalidate_alias = [&](const RegisterOperand &reg) {
+                if (reg.bank == RegisterBank::gpr && reg.index < state.x64_stack_alias_depths.size() &&
+                    !preserve_destination(reg))
+                    state.x64_stack_alias_depths[reg.index] = {};
+            };
+            for (const auto &reg : instruction.register_writes) invalidate_alias(reg);
+            for (std::size_t index = 0; index < instruction.operands.size() && index < instruction.access.size(); ++index)
+                if (instruction.access[index] == OperandAccess::write ||
+                    instruction.access[index] == OperandAccess::read_write)
+                    if (const auto reg = register_at(instruction, index)) invalidate_alias(*reg);
+        }
+    }
     if (instruction.context.architecture == Architecture::mos6502) {
         const auto has_register = [](const std::vector<RegisterOperand> &registers, std::uint8_t index) {
             return std::find(registers.begin(), registers.end(),
@@ -1176,6 +1266,37 @@ bool transfer(const Instruction &instruction, FlowState &state) {
         state.stack_depth = state.frame_depth;
         return true;
     }
+    if (const auto source = x64_stack_copy_source(instruction)) {
+        const auto destination = register_at(instruction, 0);
+        if (destination) {
+            const auto relation = x64_stack_register_depth(state, source->index);
+            if (destination->index == 4) {
+                state.stack_depth = relation;
+                if (!relation.known) state.supported = false;
+                return true;
+            }
+            if (destination->index == 5) {
+                state.frame_depth = relation;
+                state.frame_register = relation.known ? 5 : -1;
+                if (!relation.known) state.supported = false;
+                return true;
+            }
+            state.x64_stack_alias_depths[destination->index] = relation;
+            return true;
+        }
+    }
+    if (const auto lea = x64_stack_lea(instruction)) {
+        if (lea->destination.index != 4 && lea->destination.index != 5) {
+            auto relation = x64_stack_register_depth(state, lea->address.base->index);
+            if (relation.known) {
+                std::int64_t adjusted = 0;
+                if (!subtract_checked(relation.value, lea->address.displacement, adjusted)) return false;
+                relation.value = adjusted;
+            }
+            state.x64_stack_alias_depths[lea->destination.index] = relation;
+            return true;
+        }
+    }
     if (mips_stack_adjust(instruction) && instruction.operands.size() >= 3) {
         const auto immediate = immediate_value(instruction, 2);
         const bool dst_stack = mips_register(first, 29);
@@ -1466,10 +1587,12 @@ bool transfer(const Instruction &instruction, FlowState &state) {
         instruction.operands.size() > 1) {
         const auto *memory = std::get_if<MemoryOperand>(&instruction.operands[1]);
         if (memory && memory->base && memory->base->bank == RegisterBank::gpr &&
-            (memory->base->index == 4 || memory->base->index == 5) &&
+            (memory->base->index == 4 || memory->base->index == 5 ||
+             (x64_mode && memory->base->index >= 6 && memory->base->index < 16)) &&
             memory->base->width == first->width && memory->address_width == first->width &&
             !memory->index && !memory->ip_relative && !memory->segment) {
-            auto relation = memory->base->index == 4 ? state.stack_depth : state.frame_depth;
+            auto relation = x64_mode ? x64_stack_register_depth(state, memory->base->index)
+                : memory->base->index == 4 ? state.stack_depth : state.frame_depth;
             if (!relation.known) {
                 if (first->index == 4)
                     state.stack_depth = {};
@@ -1484,8 +1607,10 @@ bool transfer(const Instruction &instruction, FlowState &state) {
             relation.value = adjusted;
             if (first->index == 4)
                 state.stack_depth = relation;
-            else
+            else {
                 state.frame_depth = relation;
+                state.frame_register = 5;
+            }
             return true;
         }
     }
@@ -2929,6 +3054,22 @@ Result<StackFrameAnalysis> analyze_stack_frame(const FunctionRecord &function, c
                         return Error{ErrorCode::resource_limit, "Stack analysis slot budget exceeded"};
                 }
             }
+            if (const auto source = x64_stack_copy_source(instruction)) {
+                const auto destination = register_at(instruction, 0);
+                if (destination && destination->index != 4 && destination->index != 5) {
+                    const auto relation = x64_stack_register_depth(state, source->index);
+                    if (relation.known) {
+                        std::int64_t offset = 0;
+                        if (!subtract_checked(0, relation.value, offset) ||
+                            !record_stack_slot(result, offset, 0, false, false, true,
+                                               instruction.address, access_detail_count))
+                            return Error{ErrorCode::resource_limit, "Stack analysis slot budget exceeded"};
+                    } else if (source->index == 4 ||
+                               (source->index == 5 && state.frame_register == 5)) {
+                        result.complete = false;
+                    }
+                }
+            }
             for (std::size_t i = 0; i < instruction.operands.size(); ++i) {
                 if (arm64_pair && i == 2)
                     continue; // Both cells were recorded above.
@@ -2953,6 +3094,11 @@ Result<StackFrameAnalysis> analyze_stack_frame(const FunctionRecord &function, c
                                         instruction.context.architecture == Architecture::x86_64) &&
                                        memory->base->bank == RegisterBank::gpr &&
                                        (memory->base->index == 4 || memory->base->index == 5);
+                const bool x64_alias = instruction.context.architecture == Architecture::x86_64 &&
+                                       instruction.context.mode == ExecutionMode::x86_64 &&
+                                       memory->base->bank == RegisterBank::gpr && memory->base->index >= 6 &&
+                                       memory->base->index < 16 &&
+                                       state.x64_stack_alias_depths[memory->base->index].known;
                 const bool mips_stack = (instruction.context.architecture == Architecture::mips32 ||
                                          instruction.context.architecture == Architecture::mips64) &&
                                         memory->base->bank == RegisterBank::mips_gpr && memory->base->index == 29;
@@ -2981,7 +3127,7 @@ Result<StackFrameAnalysis> analyze_stack_frame(const FunctionRecord &function, c
                                        memory->base->bank == RegisterBank::ppc_gpr && memory->base->index == 1;
                 const bool ppc_frame = instruction.context.architecture == Architecture::powerpc &&
                                        memory->base->bank == RegisterBank::ppc_gpr && memory->base->index == 31;
-                if (!arm64_stack && !arm64_frame && !arm64_alias && !x86_stack && !mips_stack && !mips_frame &&
+                if (!arm64_stack && !arm64_frame && !arm64_alias && !x86_stack && !x64_alias && !mips_stack && !mips_frame &&
                     !mips32_alias &&
                     !riscv_stack && !riscv_frame && !riscv_alias && !ppc_stack && !ppc_frame)
                     continue;
@@ -2997,6 +3143,7 @@ Result<StackFrameAnalysis> analyze_stack_frame(const FunctionRecord &function, c
                     continue;
                 }
                 const auto base = arm64_alias ? state.arm64_stack_alias_depths[memory->base->index]
+                    : x64_alias ? state.x64_stack_alias_depths[memory->base->index]
                     : mips32_alias ? state.mips32_stack_alias_depths[memory->base->index]
                     : riscv_alias ? state.riscv_stack_alias_depths[memory->base->index]
                     : from_frame ? state.frame_depth : state.stack_depth;

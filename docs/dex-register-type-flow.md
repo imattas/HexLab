@@ -39,6 +39,9 @@ handlers, before normal register writes or constructor initialization complete.
 Known reference identities are
 checked for assignability at ordinary invoke receivers and instance field
 receivers using the class definitions and array rules present in this DEX.
+Thrown values with known non-null types must also be assignable to
+`Ljava/lang/Throwable;`; literal null and unknown or unresolved reference types
+remain conservative.
 When two known reference types meet at a control-flow join, the verifier keeps
 a common in-image supertype when a hierarchy walk of at most 4,096 queued and
 visited types can establish one.

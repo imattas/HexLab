@@ -775,6 +775,10 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
         }
     }
     const std::size_t local_count = code ? code->max_locals : 256;
+    std::set<std::pair<std::string, std::string>> declared_instance_fields;
+    if (metadata) for (const auto &field : metadata->fields)
+        if ((field.access_flags & 0x0008u) == 0)
+            declared_instance_fields.emplace(field.name, field.descriptor);
     if (code) for (const auto *block : sources) {
         if (block->begin.space != code->begin.space || block->begin.offset < code->begin.offset ||
             block->begin.offset - code->begin.offset >= code->code_size)
@@ -1327,14 +1331,80 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
                 auto member=cp_member(*metadata,*index,false);if(!member)return member.error();
                 std::size_t position=0;auto type=descriptor_type(member.value().descriptor,position);
                 if(!type||position!=member.value().descriptor.size())return no("field descriptor is malformed");
+                const bool write = op == 0xb3 || op == 0xb5;
+                const bool instance = op == 0xb4 || op == 0xb5;
+                ExpressionPtr value, object;
+                if (write) {
+                    auto popped = pop(type.value());
+                    if (!popped) return popped.error();
+                    value = popped.value();
+                    if (type.value() == ref32() && references && !shapes_only) {
+                        if (const auto actual = identity(value)) {
+                            if (actual->kind == JvmVerificationKind::uninitialized ||
+                                actual->kind == JvmVerificationKind::uninitialized_this)
+                                return no("field store value is an uninitialized verifier reference");
+                            auto expected = reference_descriptor(member.value().descriptor);
+                            if (!expected) return no("reference field descriptor is malformed");
+                            expected->defining_loader = metadata->defining_loader;
+                            const auto compatible = verifier_assignability(hierarchy ? &*hierarchy : nullptr,
+                                hierarchy_work, *actual, *expected);
+                            if (compatible && !*compatible)
+                                return no("known field store reference is not assignable to the field descriptor");
+                        }
+                    }
+                }
+                bool uninitialized_this_store = false;
+                if (instance) {
+                    auto popped = pop(ref32());
+                    if (!popped) return popped.error();
+                    object = popped.value();
+                    if (references && !shapes_only) {
+                        if (const auto actual = identity(object)) {
+                            if (actual->kind == JvmVerificationKind::uninitialized)
+                                return no("field access receiver is an uninitialized allocation");
+                            if (actual->kind == JvmVerificationKind::uninitialized_this) {
+                                // The verifier allows only putfield to a field
+                                // declared by this class before its constructor
+                                // chain initializes this. Do not resolve an
+                                // inherited field or initialize any aliases.
+                                uninitialized_this_store = op == 0xb5 && method && method->name == "<init>" &&
+                                    (method->access_flags & 0x0008u) == 0 &&
+                                    member.value().owner == metadata->class_name &&
+                                    actual->descriptor == "L" + metadata->class_name + ";" &&
+                                    actual->defining_loader == metadata->defining_loader &&
+                                    declared_instance_fields.contains({member.value().name, member.value().descriptor});
+                                if (!uninitialized_this_store)
+                                    return no("uninitializedThis field access is not a declared current-class constructor store");
+                            } else {
+                                auto expected = reference_class(member.value().owner);
+                                if (!expected) return no("field owner is not a valid reference type");
+                                expected->defining_loader = metadata->defining_loader;
+                                const auto compatible = verifier_assignability(hierarchy ? &*hierarchy : nullptr,
+                                    hierarchy_work, *actual, *expected);
+                                if (compatible && !*compatible)
+                                    return no("known field receiver is not assignable to the field owner");
+                            }
+                        }
+                    }
+                    if (!uninitialized_this_store)
+                        dst.trap_edges.push_back({i.address, TrapEdgeKind::may_trap,
+                            "java.lang.NullPointerException from " + i.mnemonic_override,
+                            bin("eq", object, con(0, ref32()), int32())});
+                }
                 // Resolution and static initialization can execute opaque code
                 // before a field instruction throws. Preserve that uncertainty.
                 Intrinsic effect;effect.memory_effect=IntrinsicMemoryEffect::unknown;
-                const auto symbol=member.value().owner+"."+member.value().name;
-                if(op==0xb2){effect.name="jvm_getstatic "+symbol;effect.result_type=type.value();const auto result_name=effect.name;emit(*fact,std::move(effect));stack.push_back(evidence(unknown(result_name,type.value()),reference_descriptor(member.value().descriptor)));continue;}
-                if(op==0xb3){auto value=pop(type.value());if(!value)return value.error();effect.name="jvm_putstatic "+symbol;effect.operands.push_back(value.value());emit(*fact,std::move(effect));continue;}
-                if(op==0xb4){auto object=pop(ref32());if(!object)return object.error();effect.name="jvm_getfield "+symbol;effect.operands.push_back(object.value());effect.result_type=type.value();auto result=evidence(unknown(effect.name,type.value()),reference_descriptor(member.value().descriptor));emit(*fact,std::move(effect));stack.push_back(std::move(result));continue;}
-                auto value=pop(type.value());if(!value)return value.error();auto object=pop(ref32());if(!object)return object.error();effect.name="jvm_putfield "+symbol;effect.operands={object.value(),value.value()};emit(*fact,std::move(effect));continue;
+                const auto symbol=member.value().owner+"."+member.value().name+":"+member.value().descriptor;
+                effect.name=std::string(op==0xb2?"jvm_getstatic ":op==0xb3?"jvm_putstatic ":
+                    op==0xb4?"jvm_getfield ":"jvm_putfield ")+symbol;
+                if(instance)effect.operands.push_back(object);
+                if(write)effect.operands.push_back(value);
+                else effect.result_type=type.value();
+                const auto result_name=effect.name;
+                emit(*fact,std::move(effect));
+                if(!write)stack.push_back(evidence(unknown(result_name,type.value()),
+                    reference_descriptor(member.value().descriptor)));
+                continue;
             }
             if(op>=0xb6&&op<=0xb9){
                 if(!metadata)return no("method invocation requires JVM constant-pool metadata");

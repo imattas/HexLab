@@ -5211,11 +5211,41 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
         auto plan = macho_objc_type_import_plan(*impl_->macho_objc_scan, doc->project->state->user->types);
         if (plan.definitions.empty()) {
             wxString message = "No new Objective-C types are eligible for import.";
-            if (!plan.conflicts.empty()) message += "\nConflicts: " + wxString::FromUTF8(plan.conflicts.front().c_str());
-            if (!plan.skipped.empty()) message += "\nSkipped: " + wxString::FromUTF8(plan.skipped.front().c_str());
+            const auto append_examples = [&](const char *heading, const std::vector<std::string> &items) {
+                if (items.empty()) return;
+                message += "\n\n" + wxString::FromUTF8(heading) + wxString::Format(" (%zu):", items.size());
+                constexpr std::size_t example_limit = 20;
+                for (std::size_t i = 0; i < std::min(items.size(), example_limit); ++i)
+                    message += "\n  • " + wxString::FromUTF8(items[i].c_str());
+                if (items.size() > example_limit)
+                    message += wxString::Format("\n  … and %zu more", items.size() - example_limit);
+            };
+            append_examples("Name conflicts", plan.conflicts);
+            append_examples("Unsupported or incomplete records", plan.skipped);
             wxMessageBox(message, "Import Objective-C types", wxOK | wxICON_INFORMATION, this);
             return;
         }
+        wxString preview = "Review the declarations before importing.\n\nEligible new declarations:";
+        preview += wxString::Format(" %zu", plan.definitions.size());
+        constexpr std::size_t preview_limit = 32;
+        for (std::size_t i = 0; i < std::min(plan.definitions.size(), preview_limit); ++i)
+            preview += "\n  • " + wxString::FromUTF8(plan.definitions[i].name.c_str());
+        if (plan.definitions.size() > preview_limit)
+            preview += wxString::Format("\n  … and %zu more", plan.definitions.size() - preview_limit);
+        const auto append_preview_group = [&](const char *heading, const std::vector<std::string> &items) {
+            if (items.empty()) return;
+            preview += "\n\n" + wxString::FromUTF8(heading) + wxString::Format(" (%zu):", items.size());
+            for (std::size_t i = 0; i < std::min(items.size(), preview_limit); ++i)
+                preview += "\n  • " + wxString::FromUTF8(items[i].c_str());
+            if (items.size() > preview_limit)
+                preview += wxString::Format("\n  … and %zu more", items.size() - preview_limit);
+        };
+        append_preview_group("Existing name conflicts (left untouched)", plan.conflicts);
+        append_preview_group("Unsupported or incomplete records (skipped)", plan.skipped);
+        preview += "\n\nExisting project declarations will not be overwritten.";
+        if (wxMessageBox(preview, "Review Objective-C type import",
+                         wxYES_NO | wxNO_DEFAULT | wxICON_QUESTION, this) != wxYES)
+            return;
         const auto count = plan.definitions.size();
         const auto skipped = plan.skipped.size(), conflicts = plan.conflicts.size();
         auto submitted = impl_->frame.ApplyProjectCommand(ImportPortableTypes{std::move(plan.definitions), {}});

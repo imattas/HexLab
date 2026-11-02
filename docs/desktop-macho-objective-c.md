@@ -72,6 +72,15 @@ incomplete aggregates. An ineligible
 record does not prevent eligible declarations from the same scan from being
 imported. The planner also respects the project's type-record limit.
 
+Before writing, the desktop shows a bounded import preview listing eligible
+declaration names, existing-name conflicts, and unsupported or incomplete
+records. Large groups show their total count and the first 32 examples. The
+user can cancel at this point. Conflicting project declarations are excluded
+from the import and are never overwritten; if no declarations are eligible,
+the conflict and skip examples are still shown in an informational summary.
+The preview uses the same cached scan and current project state as the import
+plan, with the existing document-snapshot guard checked before it is displayed.
+
 Types retain project provenance naming the Mach-O ObjC2 class-list or
 metaclass record, its class-list index, metadata address, and instance size
 when known. Reimporting identical definitions is a no-op. A same-name type

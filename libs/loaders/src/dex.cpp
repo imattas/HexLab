@@ -2077,9 +2077,14 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
                                 "Ljava/lang/invoke/MethodType;");
                         } else if (opcode == 0x0d) {
                             set_descriptor(reg8, "Ljava/lang/Throwable;");
-                        } else if (opcode == 0x1d || opcode == 0x1e || opcode == 0x27) {
+                        } else if (opcode == 0x1d || opcode == 0x1e) {
                             if (!expect_type(reg8, RegType::reference))
-                                return Error{ErrorCode::malformed, "DEX monitor or throw operand is not a reference"};
+                                return Error{ErrorCode::malformed, "DEX monitor operand is not a reference"};
+                        } else if (opcode == 0x27) {
+                            if (!expect_type(reg8, RegType::reference) ||
+                                !expect_assignable_reference(reg8, "Ljava/lang/Throwable;"))
+                                return Error{ErrorCode::malformed,
+                                    "DEX throw operand is not assignable to Throwable"};
                         } else if (opcode == 0x1f) {
                             if (!expect_type(reg8, RegType::reference))
                                 return Error{ErrorCode::malformed, "DEX check-cast operand is not a reference"};
