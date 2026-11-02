@@ -132,6 +132,7 @@ Result<std::size_t> read_relocations(const Image&,const Directory&,ImageMetadata
 Result<std::size_t> read_tls(const Image&,const Directory&,bool,ImageMetadata&,std::stop_token);
 Result<std::size_t> read_load_configuration(const Image&,const Directory&,bool,ImageMetadata&,std::stop_token);
 PeEnclaveConfiguration read_enclave_configuration(const Image&,const ImageMetadata&,std::uint64_t,bool,std::stop_token);
+PeVolatileMetadata read_volatile_metadata(const Image&,const ImageMetadata&,std::uint64_t,std::stop_token);
 Result<std::size_t> read_chpe_metadata(const Image&,const Directory&,bool,ImageMetadata&,std::stop_token);
 Result<std::size_t> read_resources(const Image&,const Directory&,ImageMetadata&,std::stop_token);
 Result<std::size_t> read_exception_directory(const Image&,const Directory&,ImageMetadata&,std::stop_token);

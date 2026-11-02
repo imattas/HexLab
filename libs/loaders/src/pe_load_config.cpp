@@ -375,8 +375,21 @@ Result<std::size_t> read_load_configuration(const Image& image, const Directory&
                 result.enclave_configuration = std::move(enclave);
             }
         }
-        result.volatile_metadata_rva = read_optional_pointer_with_source(
-            volatile_metadata_at, "volatile metadata", result.volatile_metadata_source);
+        if (declared >= volatile_metadata_at + width && pointer(volatile_metadata_at)) {
+            result.volatile_metadata_source = PeRecordSource{
+                0, reader.sources(directory.location + volatile_metadata_at, width)};
+            try {
+                result.volatile_metadata_rva = normalize(pointer(volatile_metadata_at), "volatile metadata");
+                result.volatile_metadata = read_volatile_metadata(
+                    image, metadata, *result.volatile_metadata_rva, stop);
+            } catch (const Failure &failure) {
+                if (failure.error.code == ErrorCode::canceled) throw;
+                PeVolatileMetadata volatile_metadata;
+                volatile_metadata.diagnostic = failure.error.message + " (preferred-base VA " +
+                    std::to_string(pointer(volatile_metadata_at)) + ")";
+                result.volatile_metadata = std::move(volatile_metadata);
+            }
+        }
         if (declared >= dynamic_reloc_table_at + width) {
             const auto table_va = pointer(dynamic_reloc_table_at);
             if (table_va) {

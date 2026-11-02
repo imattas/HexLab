@@ -40,8 +40,11 @@ normalized RVAs when their complete pointer fields are present and nonzero.
 `EnclaveConfigurationPointer` and `VolatileMetadataPointer` are retained the
 same way. These values must resolve to initialized image bytes. The
 `HotPatchTableOffset` scalar is retained with its source span when present;
-HexLab does not interpret it as a file or RVA offset. Volatile-metadata and
-Guard RF structures remain opaque. Enclave configuration and import records
+HexLab does not interpret it as a file or RVA offset. Legacy version-1 volatile
+instruction and range tables are decoded with bounded, source-backed rows;
+see [PE volatile metadata](../libs/loaders/docs/pe-volatile-metadata.md).
+Other volatile metadata versions and Guard RF structures remain opaque.
+Enclave configuration and import records
 are decoded as described in [PE enclave metadata](pe-enclave-configuration.md).
 The CLI `inspect` metadata report prints normalized RVAs for the supported
 cookie, Guard CF, XFG, CastGuard, Guard memcpy, Guard RF, enclave, and

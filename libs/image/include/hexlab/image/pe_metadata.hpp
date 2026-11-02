@@ -254,6 +254,31 @@ struct PeEnclaveConfiguration {
     std::vector<PeEnclaveImport> imports;
     bool operator==(const PeEnclaveConfiguration &) const = default;
 };
+enum class PeVolatileMetadataStatus : std::uint8_t { decoded, unsupported, malformed, resource_limit };
+struct PeVolatileAccess {
+    std::uint32_t rva = 0;
+    PeRecordSource source;
+    bool operator==(const PeVolatileAccess &) const = default;
+};
+struct PeVolatileRange {
+    std::uint32_t rva = 0, size = 0;
+    PeRecordSource source;
+    bool operator==(const PeVolatileRange &) const = default;
+};
+// Compiler volatile-access inventory only; this does not enforce runtime
+// memory ordering. Unknown raw version encodings remain unsupported.
+struct PeVolatileMetadata {
+    std::uint32_t rva = 0, declared_size = 0, version = 0;
+    std::uint32_t access_table_rva = 0, access_table_size = 0;
+    std::uint32_t range_table_rva = 0, range_table_size = 0;
+    PeVolatileMetadataStatus status = PeVolatileMetadataStatus::malformed;
+    std::string diagnostic;
+    std::optional<PeRecordSource> source, access_table_source, range_table_source;
+    // Both vectors publish only after every row and target validates.
+    std::vector<PeVolatileAccess> accesses;
+    std::vector<PeVolatileRange> ranges;
+    bool operator==(const PeVolatileMetadata &) const = default;
+};
 // Supported load-config pointer fields are normalized to RVAs; fields with
 // per-record or table payloads retain their source spans and decoded rows.
 // Unknown versioned tail fields remain opaque.
@@ -307,6 +332,7 @@ struct PeLoadConfiguration {
     std::optional<PeRecordSource> hot_patch_table_offset_source;
     std::optional<PeRecordSource> enclave_configuration_source;
     std::optional<PeRecordSource> volatile_metadata_source;
+    std::optional<PeVolatileMetadata> volatile_metadata;
     bool operator==(const PeLoadConfiguration &) const = default;
 };
 enum class PeUnwindOperationKind : std::uint8_t {

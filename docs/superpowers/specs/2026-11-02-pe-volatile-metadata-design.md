@@ -44,6 +44,7 @@ and initialized. Tables contain DWORD instruction RVAs or pairs of DWORD code
 RVA/size. Sizes must be exact multiples of 4 or 8. Enforce 16 MiB aggregate
 table bytes and 1,000,000 aggregate rows before allocation. Empty tables do not
 dereference their retained RVA; nonempty tables require a nonzero RVA.
+Target validation is additionally capped at 1,000,000 aggregate mapping steps.
 
 Access RVAs must address initialized executable bytes. Nonempty code ranges
 must fit the image and span only initialized executable mappings. Widen all
