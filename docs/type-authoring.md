@@ -124,14 +124,19 @@ Non-virtual PDB base subobjects are persisted as `$base$TypeName` aggregate memb
 at their CodeView byte offsets and participate in layout. Virtual bases remain
 unsupported because their locations depend on runtime vbtable data.
 
-Bitfield members keep the underlying integral storage type and CodeView's
+Bitfield members keep the underlying integral storage type and the recorded
 storage-unit byte offset, declared bit width, and LSB-relative bit position.
-The project model rejects zero-width fields, fields extending beyond their
-storage unit, non-integral storage, overlapping bit ranges, and storage extents
-outside the containing aggregate. Multiple disjoint fields can share a storage
-unit. Persisted type encoding version 3 stores the optional width/position pair;
-versions 1 and 2 remain readable and represent ordinary members without bit
-metadata. Layout returns the storage-unit size and the bit range for each member.
+The project model rejects fields extending beyond their storage unit,
+non-integral storage, overlapping bit ranges, and storage extents outside the
+containing aggregate. Multiple disjoint fields can share a storage unit.
+Unnamed positive-width fields and unnamed zero-width barriers are retained;
+barriers require bit offset zero and occupy no member extent. In the desktop
+type editor, use `-` as the member-name token for either form. The type text
+formatter and layout inspector display unnamed members explicitly. Persisted
+type encoding version 3 stores the optional width/position pair; versions 1 and
+2 remain readable and represent ordinary members without bit metadata. Layout
+returns the storage-unit size and bit range for positive-width fields, and a
+zero extent for barriers.
 
 ## Assignment navigation
 

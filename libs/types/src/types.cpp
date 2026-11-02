@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <functional>
 #include <limits>
+#include <map>
 #include <sstream>
 #include <string_view>
 #include <unordered_set>
@@ -319,6 +320,22 @@ hexlab::Result<TypePtr> Type::aggregate(Kind kind, std::string name, std::vector
         }
     }
     if (kind == Kind::structure) {
+        std::map<std::pair<std::uint64_t, std::uint64_t>,
+                 std::vector<std::pair<std::uint64_t, std::uint64_t>>> bit_ranges_by_storage;
+        for (const auto &member : members) {
+            if (!member.bit_width || !*member.bit_width) continue;
+            const auto storage_size = member.type->size().value_or(0);
+            const auto begin = static_cast<std::uint64_t>(*member.bit_offset);
+            bit_ranges_by_storage[{member.offset, storage_size}].push_back(
+                {begin, begin + static_cast<std::uint64_t>(*member.bit_width)});
+        }
+        for (auto &[storage, ranges] : bit_ranges_by_storage) {
+            (void)storage;
+            std::sort(ranges.begin(), ranges.end());
+            for (std::size_t i = 1; i < ranges.size(); ++i)
+                if (ranges[i - 1].second > ranges[i].first)
+                    return invalid("structure bitfields overlap within a storage unit");
+        }
         auto ordered = members;
         std::sort(ordered.begin(), ordered.end(), [](const auto &a, const auto &b) { return a.offset < b.offset; });
         for (std::size_t i = 1; i < ordered.size(); ++i) {
@@ -332,10 +349,6 @@ hexlab::Result<TypePtr> Type::aggregate(Kind kind, std::string name, std::vector
             const bool same_storage = a.bit_width && b.bit_width && a.offset == b.offset &&
                                       a_size == b_size;
             if (!same_storage) return invalid("structure members overlap");
-            const auto a_end = *a.bit_offset + *a.bit_width;
-            const auto b_end = *b.bit_offset + *b.bit_width;
-            if (*a.bit_offset < b_end && *b.bit_offset < a_end)
-                return invalid("structure bitfields overlap within a storage unit");
         }
     }
     if (kind == Kind::union_type)
@@ -656,7 +669,7 @@ std::string format(const Type &type) {
         out << (type.kind() == Kind::structure ? "struct " : "union ") << type.name() << " { ";
         if (type.packing_alignment()) out << "#pragma pack(" << *type.packing_alignment() << ") ";
         for (const auto &member : type.members()) {
-            out << member.name;
+            out << (member.name.empty() ? "<unnamed>" : member.name);
             if (member.virtual_base) {
                 out << " virtual-base(vbptr@" << member.virtual_base->vbptr_offset
                     << ", vbtable-index=" << member.virtual_base->vbtable_index

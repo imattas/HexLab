@@ -1060,7 +1060,7 @@ void TypeSymbolsView::refresh_layout() {
                << (computed.value().size == *definition.type->size() ? " (matches)\n" : " (differs)\n");
     for (std::size_t i = 0; i < computed.value().members.size(); ++i) {
         const auto &member = computed.value().members[i];
-        report << member.name << " @ " << member.offset << " size=" << member.size
+        report << (member.name.empty() ? "<unnamed>" : member.name) << " @ " << member.offset << " size=" << member.size
                << " align=" << member.alignment;
         if (member.bit_width && member.bit_offset)
             report << " bits=" << *member.bit_width << " bit-offset=" << *member.bit_offset;

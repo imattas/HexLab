@@ -335,9 +335,9 @@ std::optional<TypeEditorResult> show_type_editor(
         else if (is_function)
             details_label->SetLabel("Parameters (one per line: name type_name)");
         else if (selected_kind == EditorKind::union_type)
-            details_label->SetLabel("Members: name type_name [bit_width bit_offset]; use TypeName* for pointers");
+            details_label->SetLabel("Members: name type_name [bit_width bit_offset]; use - for unnamed bitfields, TypeName* for pointers");
         else if (selected_kind == EditorKind::structure)
-            details_label->SetLabel("Members: name type_name byte_offset [bit_width bit_offset]; use TypeName* for pointers");
+            details_label->SetLabel("Members: name type_name byte_offset [bit_width bit_offset]; use - for unnamed bitfields, TypeName* for pointers");
         dialog.Layout();
         dialog.Fit();
     };
@@ -382,7 +382,7 @@ std::optional<TypeEditorResult> show_type_editor(
         } else if (type.kind() == types::Kind::structure || type.kind() == types::Kind::union_type) {
             std::ostringstream out;
             for (const auto &member : type.members()) {
-                out << member.name << ' ' << member_type_name(member.type, definitions);
+                out << (member.name.empty() ? "-" : member.name) << ' ' << member_type_name(member.type, definitions);
                 if (type.kind() == types::Kind::structure) out << ' ' << member.offset;
                 if (member.bit_width) out << ' ' << *member.bit_width << ' ' << *member.bit_offset;
                 out << '\n';
@@ -746,6 +746,7 @@ std::optional<TypeEditorResult> show_type_editor(
                     return parse_number(text, value);
                 };
                 std::string member_name = columns.front(), offset_text, width_text, bit_offset_text;
+                if (member_name == "-") member_name.clear();
                 bool has_width = false;
                 std::size_t type_end = columns.size();
                 if (is_union) {
@@ -781,8 +782,9 @@ std::optional<TypeEditorResult> show_type_editor(
                 if (has_width) {
                     std::uint64_t parsed_width = 0, parsed_offset = 0;
                     if (!parse_number(width_text, parsed_width) || !parse_number(bit_offset_text, parsed_offset) ||
-                        !parsed_width || parsed_width > UINT32_MAX || parsed_offset > UINT32_MAX) {
-                        problem = "Bitfield width and offset must be valid nonzero-width 32-bit values.";
+                        parsed_width > UINT32_MAX || parsed_offset > UINT32_MAX ||
+                        (!parsed_width && (!member_name.empty() || parsed_offset != 0))) {
+                        problem = "Bitfield width and offset must be valid 32-bit values; zero-width barriers must be unnamed at bit offset zero.";
                         break;
                     }
                     bit_width = static_cast<std::uint32_t>(parsed_width);
@@ -820,8 +822,10 @@ std::optional<TypeEditorResult> show_type_editor(
                     }
                 }
                 alignment = std::max(alignment, member_alignment);
-                total_size = std::max(total_size, offset + member_size);
-                if (!member_size) total_size = std::max(total_size, deferred_minimum_extent);
+                if (!bit_width || *bit_width != 0)
+                    total_size = std::max(total_size, offset + member_size);
+                if (!member_size && (!bit_width || *bit_width != 0))
+                    total_size = std::max(total_size, deferred_minimum_extent);
                 members.push_back(std::move(member));
             }
             if (problem.empty() && members.empty()) problem = "An aggregate must contain at least one member.";

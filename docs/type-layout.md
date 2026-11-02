@@ -41,9 +41,11 @@ to the union alignment.
 Integral bitfields retain their storage type, storage-unit byte offset, width,
 and LSB-relative bit offset. Multiple fields that reference the same source
 storage-unit offset and have the same storage size share one allocated unit in
-the calculated layout. Bit ranges must be nonzero, fit the storage type, and
-not overlap. Packing caps affect the alignment used to place each storage unit;
-each member layout still reports its bit width and position. This simple unit
+the calculated layout. Bit ranges must fit the storage type and not overlap.
+Unnamed zero-width barriers are the exception to the positive-width rule: they
+require bit offset zero and report zero extent. Packing caps affect the
+alignment used to place each storage unit; each member layout still reports its
+bit width and position. This simple unit
 grouping follows the imported CodeView allocation boundaries and does not claim
 to emulate every compiler's bitfield allocation ABI.
 

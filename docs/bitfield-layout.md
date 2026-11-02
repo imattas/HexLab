@@ -88,3 +88,14 @@ allocation to the platform C ABI, so this policy is deliberately a bounded
 common subset and must be selected only when the caller has compiler/target
 provenance. Recorded importer coordinates remain the default and preserve the
 producer's exact bit positions.
+
+## Authoring and inspection
+
+The desktop type editor accepts the member-name token `-` for an unnamed
+bitfield. Use the same bit-width and bit-offset columns as a named field; width
+zero is accepted only for an unnamed barrier whose bit offset is zero. For a
+structure the byte offset remains explicit, while union fields remain at byte
+zero. Existing named-member syntax and ordinary member placement are unchanged.
+The editor prints `-` when reopening unnamed fields, and formatted type/layout
+inspection uses `<unnamed>` so these physical members are visible. These UI
+labels do not infer packing, allocation-unit size, endianness, or ABI policy.
