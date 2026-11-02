@@ -763,6 +763,7 @@ void collect_register_uses(const decompiler::ExpressionPtr &expression,
 
 std::string render_user_variables(const decompiler::LiftedFunction &function, std::string rendered,
                                   const ProjectSnapshot *project,
+                                  std::uint64_t function_id,
                                   std::vector<PseudocodeVariableEdit> &variables,
                                   const std::map<std::string, std::string> &local_types,
                                   const std::map<std::string, std::string> &local_names,
@@ -839,14 +840,23 @@ std::string render_user_variables(const decompiler::LiftedFunction &function, st
         // the block entry. The later shared-origin and function-entry checks
         // decide whether address-keyed persistence can safely represent the
         // edit without colliding with another value.
-        const auto *annotation = project ? annotation_at(*project, address) : nullptr;
+        const auto *edit = project ? pseudocode_edit_at(*project, function_id, address, identity) : nullptr;
         const auto *assignment = project ? type_assignment(*project, address) : nullptr;
         const auto *definition = assignment ? type_definition(*project, assignment->type_id) : nullptr;
-        std::string display = annotation && !annotation->name.empty() ? annotation->name : identity;
+        std::string display = edit && !edit->name.empty() ? edit->name : identity;
         if (definition) display += " /* " + (definition->type->name().empty()
                                                    ? types::format(*definition->type) : definition->type->name()) + " */";
+        if (edit && !edit->comment.empty()) {
+            auto safe = edit->comment;
+            std::replace(safe.begin(), safe.end(), '\r', ' ');
+            std::replace(safe.begin(), safe.end(), '\n', ' ');
+            for (std::size_t position = 0;
+                 (position = safe.find("*/", position)) != std::string::npos; position += 3)
+                safe.replace(position, 2, "* /");
+            display += " /* " + safe + " */";
+        }
         replacements.emplace(token, display);
-        variables.push_back({identity, address, annotation && !annotation->name.empty() ? annotation->name : identity,
+        variables.push_back({identity, address, edit && !edit->name.empty() ? edit->name : identity,
                              safely_editable, false,
                              safely_editable ? std::move(access_sites) : std::vector<Address>{}});
     }
@@ -1548,7 +1558,7 @@ void PseudocodeView::list_cross_function_matches() {
             if (annotation && !annotation->comment.empty()) local_comments.emplace(name, annotation->comment);
         }
         std::vector<PseudocodeVariableEdit> ignored_variables;
-        source_text = render_user_variables(rendered, std::move(source_text), project, ignored_variables,
+        source_text = render_user_variables(rendered, std::move(source_text), project, function->id.value, ignored_variables,
                                             local_types, local_names, local_comments);
         auto source = text(source_text);
         const auto remaining = rendered_character_limit - rendered_characters;
@@ -1823,6 +1833,7 @@ void PseudocodeView::update(const FunctionSnapshot *snapshot, std::optional<Loca
     variables_.clear();
     stack_access_rows_.clear();
     stack_access_sites_.clear();
+    stack_access_identities_.clear();
     stack_access_editable_.clear();
     previous_stack_access_->Enable(false);
     next_stack_access_->Enable(false);
@@ -1991,9 +2002,10 @@ void PseudocodeView::update(const FunctionSnapshot *snapshot, std::optional<Loca
     if (named_stack) {
         const auto access_sites = stack_access_sites(named_stack.value());
         for (const auto &[name, access] : access_sites) {
-            const auto *annotation = project_ && !access.empty() ? annotation_at(*project_, access.front()) : nullptr;
-            if (annotation && !annotation->name.empty()) recovered_local_names.emplace(name, annotation->name);
-            if (annotation && !annotation->comment.empty()) recovered_local_comments.emplace(name, annotation->comment);
+            const auto *scoped = project_ && !access.empty()
+                ? pseudocode_edit_at(*project_, match->function->id.value, access.front(), name) : nullptr;
+            if (scoped && !scoped->name.empty()) recovered_local_names.emplace(name, scoped->name);
+            if (scoped && !scoped->comment.empty()) recovered_local_comments.emplace(name, scoped->comment);
         }
         // Stack locals already have a stable identity in the lifter (their
         // recovered frame slot name). Keep every access site so edits can be
@@ -2009,8 +2021,10 @@ void PseudocodeView::update(const FunctionSnapshot *snapshot, std::optional<Loca
                 variable_accesses.erase(std::unique(variable_accesses.begin(), variable_accesses.end()),
                                         variable_accesses.end());
                 if (variable_accesses.empty()) continue;
-                const auto *annotation = project_ ? annotation_at(*project_, variable_accesses.front()) : nullptr;
-                const auto display = annotation && !annotation->name.empty() ? annotation->name : variable.name;
+                const auto *scoped = project_
+                    ? pseudocode_edit_at(*project_, match->function->id.value, variable_accesses.front(), variable.name)
+                    : nullptr;
+                const auto display = scoped && !scoped->name.empty() ? scoped->name : variable.name;
                 variables_.push_back({variable.name, variable_accesses.front(), display, true, false,
                                       std::move(variable_accesses)});
             }
@@ -2083,7 +2097,7 @@ void PseudocodeView::update(const FunctionSnapshot *snapshot, std::optional<Loca
     render_parameter_names(source_text, imported_parameter_names(
         *match->function, project_, image ? image->layout().architecture : Architecture::unknown,
         abi, prototype));
-    source_->ChangeValue(text(render_user_variables(pseudocode_function, std::move(source_text), project_,
+    source_->ChangeValue(text(render_user_variables(pseudocode_function, std::move(source_text), project_, match->function->id.value,
                                                     variables_, recovered_local_types, recovered_local_names,
                                                     recovered_local_comments)));
     for (const auto &variable : variables_) {
@@ -2100,9 +2114,9 @@ void PseudocodeView::update(const FunctionSnapshot *snapshot, std::optional<Loca
         }
         variables_list_->SetItem(row, 1, text(type_name));
         variables_list_->SetItem(row, 2, location_text(variable.definition, image));
-        const auto *annotation = project_ ? annotation_at(*project_, variable.definition) : nullptr;
-        if (annotation && !annotation->comment.empty())
-            variables_list_->SetItem(row, 4, text(annotation->comment));
+        const auto *scoped = project_ ? pseudocode_edit_at(*project_, match->function->id.value,
+                                                           variable.definition, variable.token) : nullptr;
+        if (scoped && !scoped->comment.empty()) variables_list_->SetItem(row,4,text(scoped->comment));
         const auto read_only_label = variable.function_entry_collision
             ? std::string(" (function entry; read-only)")
             : (variable.editable ? std::string{} : std::string(" (shared instruction origin; read-only)"));
@@ -2196,6 +2210,7 @@ void PseudocodeView::update(const FunctionSnapshot *snapshot, std::optional<Loca
             const auto access = accesses.empty() ? match->function->entry : accesses.front();
             stack_access_rows_.push_back(access);
             stack_access_sites_.push_back(accesses);
+            stack_access_identities_.push_back("stack:"+std::to_string(slot.offset_from_entry_sp));
             const bool unique_origin = !accesses.empty() &&
                 access != match->function->entry &&
                 std::all_of(accesses.begin(), accesses.end(), [&](Address site) {
@@ -2204,7 +2219,11 @@ void PseudocodeView::update(const FunctionSnapshot *snapshot, std::optional<Loca
                            variable_origin_counts[address_identity(site)] == 1;
                 });
             stack_access_editable_.push_back(unique_origin ? 1 : 0);
-            auto local_name = project_ ? text(presentation_name(*project_, access)) : wxString{};
+            const auto *stack_edit = project_
+                ? pseudocode_edit_at(*project_, match->function->id.value, access, stack_access_identities_.back())
+                : nullptr;
+            auto local_name = stack_edit && !stack_edit->name.empty()
+                ? text(stack_edit->name) : stack_offset(slot.offset_from_entry_sp);
             if (!unique_origin) local_name += " (read-only: ambiguous origin)";
             stack_slots_->SetItem(row, 4, local_name);
             wxString abi_role;
@@ -2753,14 +2772,15 @@ void PseudocodeView::rename_local() {
         !project_ || !submit_) return;
     const auto at = stack_access_rows_[static_cast<std::size_t>(row)];
     const auto submit = submit_;
-    const auto current = text(presentation_name(*project_, at));
-    const auto value = ask(*this, "Rename local", "Local name (stored at its first stack access):", current, false);
+    const auto index=static_cast<std::size_t>(row);
+    const auto identity=index<stack_access_identities_.size()?stack_access_identities_[index]:std::string{};
+    const auto *existing = pseudocode_edit_at(*project_, function_ ? function_->id.value : 0, at, identity);
+    const auto current = existing&&!existing->name.empty()?text(existing->name):text(presentation_name(*project_, at));
+    const auto value = ask(*this, "Rename local", "Local name for this function's stack slot:", current, false);
     if (value) {
-        const auto index = static_cast<std::size_t>(row);
-        if (index < stack_access_sites_.size() && !stack_access_sites_[index].empty())
-            submit(RenameStackLocal{stack_access_sites_[index], utf8(current), utf8(*value)});
-        else
-            submit(Rename{at, utf8(*value)});
+        submit(SetPseudocodeEdit{function_->id.value, at, identity,
+                                 project_->derived_key ? pseudocode_source_key(*project_->derived_key) : std::string{},
+                                 utf8(*value), existing ? existing->comment : std::string{}, false});
     }
 }
 void PseudocodeView::comment_local() {
@@ -2770,10 +2790,15 @@ void PseudocodeView::comment_local() {
         !project_ || !submit_) return;
     const auto at = stack_access_rows_[static_cast<std::size_t>(row)];
     const auto submit = submit_;
-    const auto annotation = annotation_at(*project_, at);
+    const auto index=static_cast<std::size_t>(row);
+    if(index>=stack_access_identities_.size()||!function_)return;
+    const auto *existing = pseudocode_edit_at(*project_, function_->id.value, at, stack_access_identities_[index]);
     const auto value = ask(*this, "Comment local", "Comment for this stack local:",
-                           annotation ? text(annotation->comment) : wxString{}, true);
-    if (value) submit(Comment{at, utf8(*value)});
+                           existing ? text(existing->comment) : wxString{}, true);
+    if (value)
+        submit(SetPseudocodeEdit{function_->id.value, at, stack_access_identities_[index],
+                                 project_->derived_key ? pseudocode_source_key(*project_->derived_key) : std::string{},
+                                 existing ? existing->name : std::string{}, utf8(*value), false});
 }
 void PseudocodeView::edit_comment() {
     const auto row = addresses_->GetNextItem(-1, wxLIST_NEXT_ALL, wxLIST_STATE_SELECTED);
@@ -2797,10 +2822,10 @@ void PseudocodeView::rename_variable() {
     const auto submit = submit_;
     const auto value = ask(*this, "Rename pseudocode variable", "Variable name:", text(match->display), false);
     if (value) {
-        if (!match->access_sites.empty())
-            submit(RenameStackLocal{match->access_sites, match->display, utf8(*value)});
-        else
-            submit(Rename{at, utf8(*value)});
+        const auto *current = pseudocode_edit_at(*project_, function_->id.value, at, match->token);
+        submit(SetPseudocodeEdit{function_->id.value, at, match->token,
+                                 project_->derived_key ? pseudocode_source_key(*project_->derived_key) : std::string{},
+                                 utf8(*value), current ? current->comment : std::string{}, false});
     }
 }
 
@@ -2850,11 +2875,14 @@ void PseudocodeView::comment_variable() {
     if (!match) return;
     const auto at = match->definition;
     const auto submit = submit_;
-    const auto *annotation = annotation_at(*project_, at);
+    const auto *current = pseudocode_edit_at(*project_, function_->id.value, at, match->token);
     const auto value = ask(*this, "Comment pseudocode variable",
-                           "Comment stored at this variable's unique definition address:",
-                           annotation ? text(annotation->comment) : wxString{}, true);
-    if (value) submit(Comment{at, utf8(*value)});
+                           "Comment for this function-scoped variable:",
+                           current ? text(current->comment) : wxString{}, true);
+    if (value)
+        submit(SetPseudocodeEdit{function_->id.value, at, match->token,
+                                 project_->derived_key ? pseudocode_source_key(*project_->derived_key) : std::string{},
+                                 current ? current->name : std::string{}, utf8(*value), false});
 }
 
 } // namespace hexlab::desktop

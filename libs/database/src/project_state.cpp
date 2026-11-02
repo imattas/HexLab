@@ -57,6 +57,7 @@ std::shared_ptr<const ProjectState> read_state(Connection& connection,int versio
     require(state->next_entity>0 && state->next_entity!=UINT64_MAX && state->revisions.bytes<=state->revisions.edit && state->revisions.decisions<=state->revisions.edit && state->history_cursor<=state->revisions.edit,"Inconsistent project revision header");
     size_t remaining=project_payload_limit;
     budget(connection,"annotations","8+length(location)+length(CAST(name AS BLOB))+length(CAST(comment AS BLOB))+8",remaining);
+    if(version>=20)budget(connection,"pseudocode_edits","24+length(definition)+length(CAST(identity AS BLOB))+length(source_key)+length(CAST(name AS BLOB))+length(CAST(comment AS BLOB))",remaining);
     budget(connection,"bookmarks","8+length(location)+length(CAST(label AS BLOB))+4",remaining);
     budget(connection,"regions","8+length(begin)+length(size)+1",remaining);
     budget(connection,"functions","8+length(entry)+5",remaining);
@@ -100,6 +101,22 @@ std::shared_ptr<const ProjectState> read_state(Connection& connection,int versio
     auto user=std::make_shared<UserState>();
     auto annotations=take(connection.prepare("SELECT id,location,name,comment FROM annotations ORDER BY id"));
     while(take(annotations->step()))user->annotations.push_back({unsigned_column(*annotations,0),location_column(*annotations,1),take(annotations->text(2)),take(annotations->text(3))});
+    if (version >= 20) {
+        auto edits = take(connection.prepare(
+            "SELECT id,function_id,definition,identity,source_key,name,comment FROM pseudocode_edits ORDER BY id"));
+        while (take(edits->step())) {
+            PseudocodeEdit row;
+            row.id = unsigned_column(*edits, 0);
+            row.function_id = unsigned_column(*edits, 1);
+            row.definition = address_column(*edits, 2);
+            row.identity = take(edits->text(3));
+            const auto key = take(edits->blob(4));
+            row.source_key.assign(reinterpret_cast<const char *>(key.data()), key.size());
+            row.name = take(edits->text(5));
+            row.comment = take(edits->text(6));
+            user->pseudocode_edits.push_back(std::move(row));
+        }
+    }
     auto bookmarks=take(connection.prepare("SELECT id,location,label FROM bookmarks ORDER BY id"));
     while(take(bookmarks->step()))user->bookmarks.push_back({unsigned_column(*bookmarks,0),location_column(*bookmarks,1),take(bookmarks->text(2))});
     auto regions=take(connection.prepare("SELECT id,begin,size,kind FROM regions ORDER BY id"));
@@ -173,7 +190,7 @@ std::shared_ptr<const ProjectState> read_state(Connection& connection,int versio
     }
     take(validate_user_state(*user));
     const auto check_id=[&](uint64_t id){require(id<state->next_entity,"Entity ID exceeds allocation cursor");};
-    for(const auto& row:user->annotations)check_id(row.id);for(const auto& row:user->bookmarks)check_id(row.id);for(const auto& row:user->breakpoints)check_id(row.id);for(const auto& row:user->types)check_id(row.id);for(const auto& row:user->type_assignments)check_id(row.id);for(const auto& row:user->debug_variables)check_id(row.id);for(const auto& row:user->decisions.regions)check_id(row.id);for(const auto& row:user->decisions.functions)check_id(row.id);for(const auto& row:user->decisions.references)check_id(row.id);
+    for(const auto& row:user->annotations)check_id(row.id);for(const auto& row:user->pseudocode_edits)check_id(row.id);for(const auto& row:user->bookmarks)check_id(row.id);for(const auto& row:user->breakpoints)check_id(row.id);for(const auto& row:user->types)check_id(row.id);for(const auto& row:user->type_assignments)check_id(row.id);for(const auto& row:user->debug_variables)check_id(row.id);for(const auto& row:user->decisions.regions)check_id(row.id);for(const auto& row:user->decisions.functions)check_id(row.id);for(const auto& row:user->decisions.references)check_id(row.id);
     for(const auto& patch:user->patches)require(patch.begin.value<=state->input.size && patch.original.size()<=state->input.size-patch.begin.value,"Patch lies outside original input");
     auto history=take(connection.prepare("SELECT count(*) FROM history"));require(take(history->step()),"Cannot read history extent");auto count=take(history->integer(0));require(count>=0 && count<=project_record_limit && state->history_cursor<=static_cast<uint64_t>(count),"Invalid history extent");state->history_count=static_cast<uint64_t>(count);
     state->user=std::move(user);return state;

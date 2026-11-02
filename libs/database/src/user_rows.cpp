@@ -93,6 +93,15 @@ void sync_project_breakpoints(Connection& connection,const std::vector<ProjectBr
 }
 void write_user_state(Connection& connection,const UserState& before,const UserState& after){
     sync_rows(connection,"annotations","INSERT INTO annotations VALUES(?1,?2,?3,?4)",before.annotations,after.annotations,[](Statement& sql,const Annotation& row){take(sql.bind_blob(2,take(encode_location(row.location))));take(sql.bind_text(3,row.name));take(sql.bind_text(4,row.comment));});
+    sync_rows(connection, "pseudocode_edits", "INSERT INTO pseudocode_edits VALUES(?1,?2,?3,?4,?5,?6,?7)",
+              before.pseudocode_edits, after.pseudocode_edits, [](Statement &sql, const PseudocodeEdit &row) {
+                  take(sql.bind_blob(2, encode_u64(row.function_id)));
+                  take(sql.bind_blob(3, take(encode_location(Location{row.definition}))));
+                  take(sql.bind_text(4, row.identity));
+                  take(sql.bind_blob(5, std::as_bytes(std::span(row.source_key))));
+                  take(sql.bind_text(6, row.name));
+                  take(sql.bind_text(7, row.comment));
+              });
     sync_rows(connection,"bookmarks","INSERT INTO bookmarks VALUES(?1,?2,?3)",before.bookmarks,after.bookmarks,[](Statement& sql,const Bookmark& row){take(sql.bind_blob(2,take(encode_location(row.location))));take(sql.bind_text(3,row.label));});
     sync_project_breakpoints(connection,before.breakpoints,after.breakpoints);
     sync_type_definitions(connection,before.types,after.types);

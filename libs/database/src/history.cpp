@@ -11,6 +11,7 @@ namespace detail {
 namespace {
 template<class T>auto& records(UserState& user){
     if constexpr(std::is_same_v<T,Annotation>)return user.annotations;
+    else if constexpr(std::is_same_v<T,PseudocodeEdit>)return user.pseudocode_edits;
     else if constexpr(std::is_same_v<T,Bookmark>)return user.bookmarks;
     else if constexpr(std::is_same_v<T,RegionDecision>)return user.decisions.regions;
     else if constexpr(std::is_same_v<T,FunctionDecision>)return user.decisions.functions;
@@ -23,9 +24,9 @@ template<class T>auto& records(UserState& user){
 template<class T>std::vector<std::byte> entity_payload(const std::optional<T>& value){if(!value)return {};UserState user;if constexpr(std::is_same_v<T,TypeAssignment>){user.types.push_back({value->type_id,"history_type",types::Type::void_type()});user.type_assignments.push_back(*value);}else if constexpr(std::is_same_v<T,DebugVariable>){std::uint64_t function_id=1;while(function_id==value->id || (value->type_id && function_id==*value->type_id))++function_id;user.decisions.functions.push_back({function_id,value->function_entry,false,{}});if(value->type_id){std::uint64_t type_id=*value->type_id;user.types.push_back({type_id,"history_type",types::Type::void_type()});}records<T>(user).push_back(*value);}else records<T>(user).push_back(*value);return take(encode_user_state(user));}
 template<class T>std::optional<T> entity_value(std::span<const std::byte> bytes){
     if(bytes.empty())return {};auto user=take(decode_user_state(bytes));auto& selected=records<T>(user);
-    if constexpr(std::is_same_v<T,TypeAssignment>){require(selected.size()==1 && user.types.size()==1 && user.types[0].id==selected.front().type_id,"History type assignment reference mismatch");require(user.annotations.empty() && user.bookmarks.empty() && user.breakpoints.empty() && user.debug_variables.empty() && user.decisions.regions.empty() && user.decisions.functions.empty() && user.decisions.references.empty() && user.patches.empty(),"History type assignment payload has unrelated entities");return std::move(selected[0]);}
-    const auto total=user.annotations.size()+user.bookmarks.size()+user.breakpoints.size()+user.types.size()+user.type_assignments.size()+user.debug_variables.size()+user.decisions.regions.size()+user.decisions.functions.size()+user.decisions.references.size();
-    if constexpr(std::is_same_v<T,DebugVariable>){require(selected.size()==1 && user.decisions.functions.size()==1 && user.decisions.functions[0].entry==selected[0].function_entry && user.annotations.empty() && user.bookmarks.empty() && user.breakpoints.empty() && user.type_assignments.empty() && user.decisions.regions.empty() && user.decisions.references.empty() && user.patches.empty() && (selected[0].type_id ? user.types.size()==1 && user.types[0].id==*selected[0].type_id : user.types.empty()),"History debug-variable payload has an incompatible shape");return std::move(selected[0]);}
+    if constexpr(std::is_same_v<T,TypeAssignment>){require(selected.size()==1 && user.types.size()==1 && user.types[0].id==selected.front().type_id,"History type assignment reference mismatch");require(user.annotations.empty() && user.pseudocode_edits.empty() && user.bookmarks.empty() && user.breakpoints.empty() && user.debug_variables.empty() && user.decisions.regions.empty() && user.decisions.functions.empty() && user.decisions.references.empty() && user.patches.empty(),"History type assignment payload has unrelated entities");return std::move(selected[0]);}
+    const auto total=user.annotations.size()+user.pseudocode_edits.size()+user.bookmarks.size()+user.breakpoints.size()+user.types.size()+user.type_assignments.size()+user.debug_variables.size()+user.decisions.regions.size()+user.decisions.functions.size()+user.decisions.references.size();
+    if constexpr(std::is_same_v<T,DebugVariable>){require(selected.size()==1 && user.decisions.functions.size()==1 && user.decisions.functions[0].entry==selected[0].function_entry && user.annotations.empty() && user.pseudocode_edits.empty() && user.bookmarks.empty() && user.breakpoints.empty() && user.type_assignments.empty() && user.decisions.regions.empty() && user.decisions.references.empty() && user.patches.empty() && (selected[0].type_id ? user.types.size()==1 && user.types[0].id==*selected[0].type_id : user.types.empty()),"History debug-variable payload has an incompatible shape");return std::move(selected[0]);}
     require(total==1 && selected.size()==1 && user.patches.empty(),"History entity payload has an incompatible shape");return std::move(selected[0]);
 }
 struct Reader {
@@ -63,13 +64,14 @@ StateDelta decode_delta(std::span<const std::byte> bytes){
         case 4:delta.changes.push_back(ReferenceChange{entity_value<UserReference>(before),entity_value<UserReference>(after)});break;
         case 5:{
             auto old_user=take(decode_user_state(before)),new_user=take(decode_user_state(after));
-            const auto only_patches=[](const UserState& user){return user.annotations.empty() && user.bookmarks.empty() && user.breakpoints.empty() && user.types.empty() && user.type_assignments.empty() && user.debug_variables.empty() && user.decisions.regions.empty() && user.decisions.functions.empty() && user.decisions.references.empty();};
+            const auto only_patches=[](const UserState& user){return user.annotations.empty() && user.pseudocode_edits.empty() && user.bookmarks.empty() && user.breakpoints.empty() && user.types.empty() && user.type_assignments.empty() && user.debug_variables.empty() && user.decisions.regions.empty() && user.decisions.functions.empty() && user.decisions.references.empty();};
             require(only_patches(old_user) && only_patches(new_user),"History patch payload contains unrelated entities");delta.changes.push_back(PatchChange{std::move(old_user.patches),std::move(new_user.patches)});break;
         }
         case 6:delta.changes.push_back(TypeDefinitionChange{entity_value<TypeDefinition>(before),entity_value<TypeDefinition>(after)});break;
         case 7:delta.changes.push_back(TypeAssignmentChange{entity_value<TypeAssignment>(before),entity_value<TypeAssignment>(after)});break;
         case 8:delta.changes.push_back(DebugVariableChange{entity_value<DebugVariable>(before),entity_value<DebugVariable>(after)});break;
         case 9:delta.changes.push_back(ProjectBreakpointChange{entity_value<ProjectBreakpoint>(before),entity_value<ProjectBreakpoint>(after)});break;
+        case 10:delta.changes.push_back(PseudocodeEditChange{entity_value<PseudocodeEdit>(before),entity_value<PseudocodeEdit>(after)});break;
         default:throw Failure{{ErrorCode::integrity,"Unknown history change kind"}};
         }
     }

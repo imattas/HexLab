@@ -49,7 +49,7 @@ void validate(const UserState& user){
     const auto id=[&](uint64_t value){require(value!=0 && value!=UINT64_MAX && ids.insert(value).second,"Invalid or duplicate entity ID");};
     const auto location_key=[](Location value){if(auto address=std::get_if<Address>(&value))return std::tuple<unsigned,uint32_t,uint64_t>{0,address->space.value,address->offset};return std::tuple<unsigned,uint32_t,uint64_t>{1,0,std::get<FileOffset>(value).value};};
     const auto range=[](Address begin,uint64_t size){require(size!=0 && bool(AddressRange::create(begin,size)),"Invalid decision range");};
-    require(user.annotations.size()<=project_record_limit && user.bookmarks.size()<=project_record_limit && user.breakpoints.size()<=project_record_limit && user.decisions.regions.size()<=project_record_limit && user.decisions.functions.size()<=project_record_limit && user.decisions.references.size()<=project_record_limit && user.patches.size()<=project_record_limit && user.debug_variables.size()<=project_record_limit,"Project record count exceeds budget");
+    require(user.annotations.size()<=project_record_limit && user.pseudocode_edits.size()<=project_record_limit && user.bookmarks.size()<=project_record_limit && user.breakpoints.size()<=project_record_limit && user.decisions.regions.size()<=project_record_limit && user.decisions.functions.size()<=project_record_limit && user.decisions.references.size()<=project_record_limit && user.patches.size()<=project_record_limit && user.debug_variables.size()<=project_record_limit,"Project record count exceeds budget");
     for(const auto& annotation:user.annotations){
         charge(16+location_size(annotation.location));charge(annotation.name.size());charge(annotation.comment.size());
         id(annotation.id);require(annotated.insert(location_key(annotation.location)).second,"Duplicate annotation location");
@@ -58,6 +58,8 @@ void validate(const UserState& user){
         require(!annotation.name.empty() || !annotation.comment.empty(),"Empty annotation must be removed");
         if(!annotation.name.empty()){auto address=std::get_if<Address>(&annotation.location);require(address!=nullptr,"Names require an address domain");require(names.emplace(address->space.value,annotation.name).second,"Duplicate name in address space");}
     }
+    std::set<std::tuple<std::uint64_t,std::string,std::string>> pseudocode_keys;
+    for(const auto& edit:user.pseudocode_edits){charge(64+edit.identity.size()+edit.source_key.size()+edit.name.size()+edit.comment.size());id(edit.id);require(edit.function_id!=0&&edit.identity.size()<=256&&utf8(edit.identity,true),"Invalid pseudocode edit identity");require(edit.source_key.size()==120||edit.source_key.size()==153,"Invalid pseudocode edit source key");require(edit.name.size()<=1024&&utf8(edit.name,true)&&edit.comment.size()<=65536&&utf8(edit.comment,false),"Invalid pseudocode edit text");require(!edit.name.empty()||!edit.comment.empty(),"Empty pseudocode edit must be removed");require(pseudocode_keys.emplace(edit.function_id,edit.identity,edit.source_key).second,"Duplicate pseudocode edit identity");}
     for(const auto& bookmark:user.bookmarks){charge(12+location_size(bookmark.location));charge(bookmark.label.size());id(bookmark.id);require(bookmarked.insert(location_key(bookmark.location)).second,"Duplicate bookmark location");require(bookmark.label.size()<=512 && utf8(bookmark.label,true),"Invalid bookmark label");}
     std::set<std::pair<uint32_t,uint64_t>> breakpoint_addresses;
     for(const auto& row:user.breakpoints){charge(27+row.condition.size()+row.log_message.size()+16);id(row.id);require(static_cast<unsigned>(row.kind)<=5,"Invalid project breakpoint kind");require(row.size==1||row.size==2||row.size==4||row.size==8,"Invalid project breakpoint size");if(row.kind==ProjectBreakpointKind::software||row.kind==ProjectBreakpointKind::hardware||row.kind==ProjectBreakpointKind::execute)require(row.size==1,"Execution breakpoints have a fixed size of one byte");require(bool(AddressRange::create(row.address,1)),"Invalid project breakpoint address");require(breakpoint_addresses.emplace(row.address.space.value,row.address.offset).second,"Duplicate project breakpoint address");require(row.condition.size()<=256&&utf8(row.condition,false),"Invalid project breakpoint condition");require(row.log_message.size()<=1024&&utf8(row.log_message,false),"Invalid project breakpoint log message");}
@@ -105,7 +107,7 @@ Result<std::vector<std::byte>> encode_location(Location location){return guarded
 Result<Location> decode_location(std::span<const std::byte> input){return guarded([&]()->Result<Location>{Reader reader{input};auto location=reader.location();reader.finish();return location;});}
 Result<std::vector<std::byte>> encode_user_state(const UserState& user){
     return guarded([&]()->Result<std::vector<std::byte>>{
-        validate(user);Writer out;out.number(10,1);out.number(0,1);
+        validate(user);Writer out;out.number(11,1);out.number(0,1);
         out.count(user.annotations.size());for(const auto& row:user.annotations){out.number(row.id,8);out.location(row.location);out.text(row.name);out.text(row.comment);}
         out.count(user.bookmarks.size());for(const auto& row:user.bookmarks){out.number(row.id,8);out.location(row.location);out.text(row.label);}
         out.count(user.breakpoints.size());for(const auto& row:user.breakpoints){out.number(row.id,8);out.address(row.address);out.number(static_cast<unsigned>(row.kind),1);out.number(row.enabled,1);out.number(row.size,1);out.text(row.condition);out.number(row.logpoint,1);out.text(row.log_message);out.number(row.ignore_count,8);out.number(row.one_shot,1);}
@@ -124,12 +126,23 @@ Result<std::vector<std::byte>> encode_user_state(const UserState& user){
             out.text(row.origin.source_id);out.text(row.origin.section);out.number(row.origin.unit_offset,8);out.number(row.origin.record_offset,8);out.number(row.origin.record_size,8);
             out.count(row.location_ranges.size());for(const auto& range:row.location_ranges){out.number(range.begin,8);out.number(range.end,8);out.number(range.expression.size(),4);out.append(std::as_bytes(std::span(range.expression)));out.count(range.operations.size());for(const auto& operation:range.operations){out.number(operation.kind,1);out.number(operation.unsigned_operand,8);out.number(static_cast<std::uint64_t>(operation.signed_operand),8);out.number(operation.expression_offset,4);out.number(operation.second_unsigned_operand,8);}}
         }
+        out.count(user.pseudocode_edits.size());
+        for (const auto &row : user.pseudocode_edits) {
+            out.number(row.id, 8);
+            out.number(row.function_id, 8);
+            out.address(row.definition);
+            out.text(row.identity);
+            out.number(row.source_key.size(), 2);
+            out.append(std::as_bytes(std::span(row.source_key)));
+            out.text(row.name);
+            out.text(row.comment);
+        }
         return std::move(out.bytes);
     });
 }
 Result<UserState> decode_user_state(std::span<const std::byte> input){
     return guarded([&]()->Result<UserState>{
-        require(input.size()<=project_payload_limit,"Project payload exceeds budget");Reader in{input};const auto version=in.number(1);require((version>=1&&version<=10) && in.number(1)==0,"Unknown project record version");UserState user;
+        require(input.size()<=project_payload_limit,"Project payload exceeds budget");Reader in{input};const auto version=in.number(1);require((version>=1&&version<=11) && in.number(1)==0,"Unknown project record version");UserState user;
         for(size_t count=in.count(25);count;--count){auto id=in.number(8);auto location=in.location();auto name=in.text(512);auto comment=in.text(1024*1024);user.annotations.push_back({id,location,std::move(name),std::move(comment)});}
         for(size_t count=in.count(21);count;--count){auto id=in.number(8);auto location=in.location();auto label=in.text(512);user.bookmarks.push_back({id,location,std::move(label)});}
         if(version>=8)for(size_t count=in.count(version>=10?41:version>=9?40:24);count;--count){ProjectBreakpoint row;row.id=in.number(8);row.address=in.address();const auto kind=in.number(1),enabled=in.number(1),size=in.number(1);require(kind<=5&&enabled<=1,"Invalid project breakpoint fields");row.kind=static_cast<ProjectBreakpointKind>(kind);row.enabled=enabled!=0;row.size=static_cast<std::uint8_t>(size);if(version>=9){row.condition=in.text(256);const auto logpoint=in.number(1);require(logpoint<=1,"Invalid project breakpoint logpoint flag");row.logpoint=logpoint!=0;row.log_message=in.text(1024);row.ignore_count=in.number(8);if(version>=10){const auto one_shot=in.number(1);require(one_shot<=1,"Invalid project breakpoint one-shot flag");row.one_shot=one_shot!=0;}}user.breakpoints.push_back(std::move(row));}
@@ -147,6 +160,22 @@ Result<UserState> decode_user_state(std::span<const std::byte> input){
             row.origin.source_id=in.text(1024);row.origin.section=in.text(256);row.origin.unit_offset=in.number(8);row.origin.record_offset=in.number(8);row.origin.record_size=in.number(8);
             if(version>=5)for(size_t ranges=in.count(20);ranges;--ranges){DebugLocationRange range;range.begin=in.number(8);range.end=in.number(8);const auto size=in.number(4);require(size<=65536,"DWARF range expression exceeds its limit");auto expression=in.read(static_cast<size_t>(size));for(auto byte:expression)range.expression.push_back(std::to_integer<std::uint8_t>(byte));for(size_t ops=in.count(29);ops;--ops){DebugLocationOperation op;op.kind=static_cast<std::uint8_t>(in.number(1));op.unsigned_operand=in.number(8);op.signed_operand=static_cast<std::int64_t>(in.number(8));op.expression_offset=static_cast<std::uint32_t>(in.number(4));op.second_unsigned_operand=in.number(8);range.operations.push_back(op);}row.location_ranges.push_back(std::move(range));}
             user.debug_variables.push_back(std::move(row));
+        }
+        if (version >= 11) {
+            for (size_t count = in.count(56); count; --count) {
+                PseudocodeEdit row;
+                row.id = in.number(8);
+                row.function_id = in.number(8);
+                row.definition = in.address();
+                row.identity = in.text(256);
+                const auto key_size = in.number(2);
+                require(key_size == 120 || key_size == 153, "Invalid pseudocode edit source key length");
+                const auto key = in.read(static_cast<size_t>(key_size));
+                row.source_key.assign(reinterpret_cast<const char *>(key.data()), key.size());
+                row.name = in.text(1024);
+                row.comment = in.text(65536);
+                user.pseudocode_edits.push_back(std::move(row));
+            }
         }
         in.finish();validate(user);return user;
     });

@@ -45,6 +45,8 @@ HEXLAB_WORKSPACE_EXPORT LocationPresentation presentation_at(const ProjectSnapsh
 HEXLAB_WORKSPACE_EXPORT std::string presentation_name(const ProjectSnapshot &, Location);
 // Borrowed from the immutable snapshot. Retain that snapshot while using the result.
 HEXLAB_WORKSPACE_EXPORT const database::Annotation *annotation_at(const ProjectSnapshot &, Location) noexcept;
+HEXLAB_WORKSPACE_EXPORT std::string pseudocode_source_key(const AnalysisKey &);
+HEXLAB_WORKSPACE_EXPORT const database::PseudocodeEdit *pseudocode_edit_at(const ProjectSnapshot &, std::uint64_t function_id, Address definition, std::string_view identity) noexcept;
 // Worker-built indexes; returned pointers borrow the retained immutable snapshot.
 struct ElfDynamicRow {
     const ElfDynamicTable *table;

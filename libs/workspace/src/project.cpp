@@ -28,7 +28,7 @@ std::shared_ptr<ProjectSnapshot> project_bytes(const ProjectSnapshot& before,std
         output->derived_cache_status=database::CacheStatus::stale;output->derived_cache_reason="The preceding cache belongs to an earlier derived source";
     }
     bool same_metadata=before.loaded==output->loaded || (before.loaded && output->loaded && before.loaded->metadata==output->loaded->metadata);
-    if(!before.presentation || !before.state || before.state->user->annotations!=output->state->user->annotations || !same_metadata)output->presentation=make_presentation_index(output->state->user,output->loaded,stop);
+    if(!before.presentation || !before.state || before.state->user->annotations!=output->state->user->annotations || before.state->user->pseudocode_edits!=output->state->user->pseudocode_edits || !same_metadata)output->presentation=make_presentation_index(output->state->user,output->loaded,stop);
     canceled(stop);return output;
 }
 namespace {
@@ -65,9 +65,10 @@ std::vector<database::TypeImportDiagnostic> minidump_context_findings(const Mini
 std::shared_ptr<const database::ProjectState> project_delta(const database::ProjectState& before,const database::StateDelta& delta){
     auto state=std::make_shared<database::ProjectState>(before);auto user=std::make_shared<database::UserState>(*before.user);state->user=user;
     for(auto& item:delta.changes)std::visit([&](auto& change){using T=std::decay_t<decltype(change)>;if constexpr(std::is_same_v<T,database::PatchChange>)user->patches=change.after;else{
-        auto& rows=[&]()->auto&{if constexpr(std::is_same_v<T,database::AnnotationChange>)return user->annotations;else if constexpr(std::is_same_v<T,database::BookmarkChange>)return user->bookmarks;else if constexpr(std::is_same_v<T,database::RegionChange>)return user->decisions.regions;else if constexpr(std::is_same_v<T,database::FunctionChange>)return user->decisions.functions;else if constexpr(std::is_same_v<T,database::ReferenceChange>)return user->decisions.references;else if constexpr(std::is_same_v<T,database::TypeDefinitionChange>)return user->types;else if constexpr(std::is_same_v<T,database::TypeAssignmentChange>)return user->type_assignments;else if constexpr(std::is_same_v<T,database::DebugVariableChange>)return user->debug_variables;else return user->breakpoints;}();
+        auto& rows=[&]()->auto&{if constexpr(std::is_same_v<T,database::AnnotationChange>)return user->annotations;else if constexpr(std::is_same_v<T,database::PseudocodeEditChange>)return user->pseudocode_edits;else if constexpr(std::is_same_v<T,database::BookmarkChange>)return user->bookmarks;else if constexpr(std::is_same_v<T,database::RegionChange>)return user->decisions.regions;else if constexpr(std::is_same_v<T,database::FunctionChange>)return user->decisions.functions;else if constexpr(std::is_same_v<T,database::ReferenceChange>)return user->decisions.references;else if constexpr(std::is_same_v<T,database::TypeDefinitionChange>)return user->types;else if constexpr(std::is_same_v<T,database::TypeAssignmentChange>)return user->type_assignments;else if constexpr(std::is_same_v<T,database::DebugVariableChange>)return user->debug_variables;else return user->breakpoints;}();
         const auto id=change.before?change.before->id:change.after->id;auto found=std::find_if(rows.begin(),rows.end(),[&](auto& row){return row.id==id;});if(found!=rows.end()){if(change.after)*found=*change.after;else rows.erase(found);}else if(change.after)rows.push_back(*change.after);if(!change.before)state->next_entity=take(checked_add(state->next_entity,1));
     }},item);
+    std::sort(user->pseudocode_edits.begin(),user->pseudocode_edits.end(),[](const auto& left,const auto& right){return left.id<right.id;});
     state->revisions.edit=take(checked_add(before.revisions.edit,1));state->history_cursor=take(checked_add(before.history_cursor,1));if(user->patches!=before.user->patches)state->revisions.bytes=take(checked_add(before.revisions.bytes,1));if(user->decisions!=before.user->decisions)state->revisions.decisions=take(checked_add(before.revisions.decisions,1));return state;
 }
 }

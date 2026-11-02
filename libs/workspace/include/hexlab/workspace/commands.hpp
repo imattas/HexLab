@@ -5,6 +5,7 @@
 namespace hexlab {
 struct Rename {Location location;std::string name;};
 struct Comment {Location location;std::string text;};
+struct SetPseudocodeEdit {std::uint64_t function_id=0;Address definition{};std::string identity,source_key,name,comment;bool remove=false;};
 struct BookmarkCommand {Location location;std::string label;bool remove=false;};
 struct SetProjectBreakpoint {
     Address address;
@@ -63,7 +64,7 @@ struct PortableDebugVariable {
 struct ImportPortableDebugVariables {std::vector<PortableDebugVariable> variables;};
 struct ImportSymbols {};
 struct ImportDwarfInfo {};
-using ProjectCommand=std::variant<Rename,Comment,BookmarkCommand,SetProjectBreakpoint,DefineRegion,DefineFunction,SetFunctionChunks,SuppressFunction,ResetFunctionOverride,SetReference,PatchBytes,DefineType,UpdateType,AssignType,RenameStackLocal,AssignStackLocalType,ImportPortableTypes,ImportPortableDebugVariables,ImportSymbols,ImportDwarfInfo>;
+using ProjectCommand=std::variant<Rename,Comment,SetPseudocodeEdit,BookmarkCommand,SetProjectBreakpoint,DefineRegion,DefineFunction,SetFunctionChunks,SuppressFunction,ResetFunctionOverride,SetReference,PatchBytes,DefineType,UpdateType,AssignType,RenameStackLocal,AssignStackLocalType,ImportPortableTypes,ImportPortableDebugVariables,ImportSymbols,ImportDwarfInfo>;
 struct CommandAvailability {bool enabled=false;std::string reason;};
 struct ProjectSnapshot;
 enum class ProjectActionKind {rename,comment,bookmark,define_code,define_data,define_function,function_chunks,suppress_function,reference,patch,undo,redo,save,save_as,export_binary,search,reanalyze,define_type,assign_type,import_symbols,import_dwarf,reset_function};

@@ -6,6 +6,7 @@ namespace {
 using detail::take;using detail::require;using detail::Failure;
 template<class T>auto& records(UserState& user){
     if constexpr(std::is_same_v<T,Annotation>)return user.annotations;
+    else if constexpr(std::is_same_v<T,PseudocodeEdit>)return user.pseudocode_edits;
     else if constexpr(std::is_same_v<T,Bookmark>)return user.bookmarks;
     else if constexpr(std::is_same_v<T,RegionDecision>)return user.decisions.regions;
     else if constexpr(std::is_same_v<T,FunctionDecision>)return user.decisions.functions;

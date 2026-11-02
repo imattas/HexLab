@@ -271,7 +271,54 @@ Result<database::StateDelta> validate_command(const ProjectSnapshot &snapshot, c
         std::visit(
             [&](const auto &value) {
                 using T = std::decay_t<decltype(value)>;
-                if constexpr (std::is_same_v<T, Rename> || std::is_same_v<T, Comment>) {
+                if constexpr (std::is_same_v<T, SetPseudocodeEdit>) {
+                    require(snapshot.functions && snapshot.derived_key,
+                            "Pseudocode edits require a completed analysis");
+                    require(value.function_id != 0 && !value.identity.empty() && value.identity.size() <= 256 &&
+                                valid_utf8_name(value.identity),
+                            "Invalid pseudocode identity");
+                    require(value.source_key == pseudocode_source_key(*snapshot.derived_key),
+                            "Pseudocode edit source analysis is stale", ErrorCode::conflict);
+                    const auto owner = std::find_if(snapshot.functions->functions.begin(),
+                                                    snapshot.functions->functions.end(), [&](const auto &function) {
+                        return function && function->id.value == value.function_id;
+                    });
+                    require(owner != snapshot.functions->functions.end(),
+                            "Pseudocode edit function identity is stale", ErrorCode::conflict);
+                    std::set<std::uint64_t> actual_owners;
+                    for (const auto &block : snapshot.functions->blocks) {
+                        if (!block || !std::any_of(block->instructions.begin(), block->instructions.end(),
+                                                  [&](const auto &fact) {
+                                                      return fact && fact->instruction.address == value.definition;
+                                                  }))
+                            continue;
+                        for (const auto owner_id : block->owners)
+                            actual_owners.insert(owner_id.value);
+                    }
+                    require(actual_owners.size() == 1 && actual_owners.contains(value.function_id),
+                            "Pseudocode definition has ambiguous function ownership", ErrorCode::conflict);
+                    require(value.name.size() <= 1024 && valid_utf8_name(value.name) &&
+                                value.comment.size() <= 65536 && valid_utf8_name(value.comment),
+                            "Pseudocode edit text exceeds its limit");
+                    auto &rows = user.pseudocode_edits;
+                    auto found = std::find_if(rows.begin(), rows.end(), [&](const auto &row) {
+                        return row.function_id == value.function_id && row.identity == value.identity &&
+                               row.source_key == value.source_key;
+                    });
+                    require(!value.remove || found != rows.end(), "No pseudocode edit exists for this identity");
+                    if (!value.name.empty()) {
+                        for (const auto &row : rows)
+                            require(row.function_id != value.function_id || row.source_key != value.source_key ||
+                                        row.identity == value.identity || row.name != value.name,
+                                    "Pseudocode variable name already exists in this function", ErrorCode::conflict);
+                    }
+                    std::optional<database::PseudocodeEdit> after;
+                    if (!value.remove && (!value.name.empty() || !value.comment.empty()))
+                        after = database::PseudocodeEdit{found == rows.end() ? allocate() : found->id,
+                                                         value.function_id, value.definition, value.identity,
+                                                         value.source_key, value.name, value.comment};
+                    change(rows, found, std::move(after));
+                } else if constexpr (std::is_same_v<T, Rename> || std::is_same_v<T, Comment>) {
                     check_location(snapshot, value.location, true);
                     auto &rows = user.annotations;
                     auto found = std::find_if(rows.begin(), rows.end(),

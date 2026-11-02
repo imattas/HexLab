@@ -33,6 +33,8 @@ class ProjectPresentationIndex {
     std::shared_ptr<const database::UserState> user_;
     std::shared_ptr<const LoadedImage> loaded_;
     std::vector<AnnotationRef> annotations_;
+    using PseudocodeKey=std::tuple<std::uint64_t,std::uint32_t,std::uint64_t,std::string_view,std::string_view>;
+    std::map<PseudocodeKey,std::size_t> pseudocode_edits_;
     std::vector<ExportRef> exports_;
     std::vector<NameUse> names_;
     std::vector<std::optional<FileOffset>> elf_symbol_records_;
@@ -55,6 +57,7 @@ class ProjectPresentationIndex {
                     (!loaded_ || loaded_->metadata.exports.size() <= 1000000 - elf_count - macho_count - export_count),
                 "Presentation record budget exceeded", ErrorCode::resource_limit);
         annotations_.reserve(user_->annotations.size());
+        for(std::size_t i=0;i<user_->pseudocode_edits.size();++i){const auto& row=user_->pseudocode_edits[i];pseudocode_edits_.emplace(PseudocodeKey{row.function_id,row.definition.space.value,row.definition.offset,row.identity,row.source_key},i);}
         if (loaded_ && loaded_->metadata.macho) {
             const auto &m = *loaded_->metadata.macho;
             const auto &header = m.container.slices.at(m.selected_slice).header;
@@ -415,6 +418,10 @@ class ProjectPresentationIndex {
                                       [](auto &row, auto at) { return location_key(row.location) < at; });
         return found != annotations_.end() && found->location == location ? &user_->annotations[found->row] : nullptr;
     }
+    const database::PseudocodeEdit *pseudocode_edit(std::uint64_t function_id,Address definition,std::string_view identity,std::string_view source_key) const noexcept {
+        const auto found=pseudocode_edits_.find(PseudocodeKey{function_id,definition.space.value,definition.offset,identity,source_key});
+        return found==pseudocode_edits_.end()?nullptr:&user_->pseudocode_edits[found->second];
+    }
     std::string_view symbol(Address address) const {
         auto found = std::lower_bound(exports_.begin(), exports_.end(), address,
                                       [](auto &row, auto at) { return less(row.address, at); });
@@ -485,6 +492,43 @@ const database::Annotation *annotation_at(const ProjectSnapshot &snapshot, Locat
             if (row.location == location)
                 return &row;
     return nullptr;
+}
+std::string pseudocode_source_key(const AnalysisKey &key) {
+    std::string bytes;
+    bytes.reserve(key.external_input_fingerprint ? 153 : 120);
+    const auto append_number = [&](std::uint64_t value) {
+        for (int shift = 56; shift >= 0; shift -= 8)
+            bytes.push_back(static_cast<char>(value >> shift));
+    };
+    const auto append_digest = [&](const Sha256Digest &digest) {
+        for (const auto value : digest)
+            bytes.push_back(static_cast<char>(std::to_integer<unsigned char>(value)));
+    };
+    append_number(key.input.size);
+    append_digest(key.input.sha256);
+    append_number(key.byte_revision);
+    append_number(key.decision_revision);
+    append_digest(key.recipe_fingerprint);
+    append_digest(key.engine_fingerprint);
+    if (key.external_input_fingerprint) {
+        bytes.push_back(1);
+        append_digest(*key.external_input_fingerprint);
+    }
+    return bytes;
+}
+const database::PseudocodeEdit *pseudocode_edit_at(const ProjectSnapshot &snapshot, std::uint64_t function_id,
+                                                   Address definition, std::string_view identity) noexcept {
+    if (!snapshot.state || !snapshot.state->user || !snapshot.derived_key)
+        return nullptr;
+    const auto key = pseudocode_source_key(*snapshot.derived_key);
+    if (snapshot.presentation)
+        return snapshot.presentation->pseudocode_edit(function_id, definition, identity, key);
+    const auto &edits = snapshot.state->user->pseudocode_edits;
+    const auto found = std::find_if(edits.begin(), edits.end(), [&](const auto &row) {
+        return row.function_id == function_id && row.definition == definition &&
+               row.identity == identity && row.source_key == key;
+    });
+    return found == edits.end() ? nullptr : &*found;
 }
 std::string presentation_name(const ProjectSnapshot &snapshot, Location location) {
     if (auto annotation = annotation_at(snapshot, location); annotation && !annotation->name.empty())

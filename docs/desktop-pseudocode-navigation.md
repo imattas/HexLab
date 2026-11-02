@@ -6,14 +6,21 @@ Origin navigation carries the document ID and workspace document revision used t
 
 Navigation is address-backed only: pseudocode rows without a validated instruction-origin annotation do not move the listing or graph. The CFG can reveal only addresses represented by its current graph; missing nodes remain selected as workspace locations and are revealed if a later graph contains them.
 
-Stack-local renames and type assignments apply to every recovered access site for that slot in one project command. Unique register SSA variables collect their defining instruction and all instructions that read that exact version, including register inputs, memory base/index operands, and nested expressions. Their UI identities include the owning function entry, defining instruction address, and destination register, so unrelated earlier definitions do not renumber them and overlapping function views do not share an identity. Merge (phi) values include the owning function entry, join block address, and destination register, and collect their block-entry definition plus all reads of the merged version. They can be renamed or assigned a type when every collected address is unique to that SSA value and the value does not collide with the function entry. Renames and type assignments apply to those sites atomically. The underlying name annotations and type assignments remain address-keyed, so existing project files and history can replay the edits without a schema change. Each command accepts at most 4,096 distinct access sites; larger variables remain visible but read-only. Shared-origin and function-entry collisions remain read-only. Undo and redo restore the complete edit as one history step.
+Unique register SSA variables collect their defining instruction and all instructions that read that exact version, including register inputs, memory base/index operands, and nested expressions. Their UI identities include the owning function entry, defining instruction address, and destination register, so unrelated earlier definitions do not renumber them and overlapping function views do not share an identity. Merge (phi) values include the owning function entry, join block address, and destination register, and collect their block-entry definition plus all reads of the merged version. A value can be renamed or commented when its function ownership and identity are unique and it does not collide with the function entry. Shared-origin and function-entry collisions remain read-only. Type assignments continue to use the existing address-keyed project model.
 
-A selected unique SSA variable can also have a comment stored at its definition
-address. The Variables table shows that definition comment, and editing or
-clearing it uses the existing address annotation command so it persists with
-the project and participates in undo/redo. The comment is attached to the
-instruction address and is not duplicated at every read site; shared-origin
-and phi-only values remain read-only.
+A selected unique SSA variable can also have a comment. Variable renames and
+comments are stored as project edits scoped by the stable owning function ID,
+the value's definition address, its SSA/phi identity, and the exact analysis
+source key. The source key records input identity, byte and decision revisions,
+recipe and engine fingerprints, and an optional external-input fingerprint.
+The project database persists these rows and the project history records each
+change as one undo/redo step. Clearing both fields removes only that scoped
+edit. Existing edits remain stored through replacement or reanalysis; when the
+analysis source key changes they become dormant and are not shown or applied.
+An edit can be re-created under the new key after the new analysis is current.
+Address-only annotations are not used as a fallback for variable names or
+comments, so overlapping functions and stale local annotations cannot alias a
+scoped variable edit.
 
 Use **Ctrl+F** while the pseudocode pane is focused to search the currently rendered function. Search is a literal, case-sensitive match by default, wraps at either end, and selects/reveals each result; Enter and the Previous/Next buttons move between matches, while Shift+Enter moves backward. Enable **Whole word** to require identifier boundaries around the match; letters, digits, underscore, and non-ASCII characters count as identifier characters. **Escape** returns focus to the pseudocode. The query is limited to 256 characters and the scan to the first 1 MiB of rendered text. Selecting a result with a mapped instruction origin follows the normal document/project revision guard, so a stale render cannot navigate the active workspace. Search only reads the rendered pseudocode and does not change project state.
 
@@ -80,7 +87,7 @@ The pseudocode pane has dedicated **A-**, **A+**, and **Reset** controls for its
 text size. The range is bounded to 6–32 points, and changing it affects only
 the rendered view; it does not alter the generated pseudocode or project data.
 
-SSA and phi identities are deterministic, function-scoped presentation keys based on defining provenance rather than SSA version numbers. This preserves selection across reanalysis when the function/value provenance is unchanged. Name and type edits persist through existing address annotations at the definition and every uniquely attributable access site; the project schema remains unchanged and each edit is one undo/redo history step. Selection recovery is still scoped to the snapshot's AnalysisKey (input identity, byte and decision revisions, and analysis fingerprints); the presentation key is not a promise that a value survives CFG changes or different inputs. Phi values with shared/ambiguous origins or function-entry collisions remain read-only.
+SSA and phi identities are deterministic, function-scoped presentation keys based on defining provenance rather than SSA version numbers. This preserves selection across reanalysis when the function/value provenance is unchanged. Persisted name and comment edits also require an exact matching analysis source key; the presentation identity does not promise that a value survives CFG changes, different inputs, or changed analysis fingerprints. Phi values with shared/ambiguous origins or function-entry collisions remain read-only.
 
 The instruction pane's **Previous function** and **Next function** controls navigate
 between recovered function entries in address-space/address order. They stay

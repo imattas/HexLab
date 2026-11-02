@@ -3,6 +3,7 @@
 namespace hexlab::database {
 template<class T>struct EntityChange {std::optional<T> before,after;};
 using AnnotationChange=EntityChange<Annotation>;
+using PseudocodeEditChange=EntityChange<PseudocodeEdit>;
 using BookmarkChange=EntityChange<Bookmark>;
 using RegionChange=EntityChange<RegionDecision>;
 using FunctionChange=EntityChange<FunctionDecision>;
@@ -12,7 +13,7 @@ using TypeAssignmentChange=EntityChange<TypeAssignment>;
 using DebugVariableChange=EntityChange<DebugVariable>;
 using ProjectBreakpointChange=EntityChange<ProjectBreakpoint>;
 struct PatchChange {std::vector<PatchSpan> before,after;};
-using UserChange=std::variant<AnnotationChange,BookmarkChange,RegionChange,FunctionChange,ReferenceChange,PatchChange,TypeDefinitionChange,TypeAssignmentChange,DebugVariableChange,ProjectBreakpointChange>;
+using UserChange=std::variant<AnnotationChange,BookmarkChange,RegionChange,FunctionChange,ReferenceChange,PatchChange,TypeDefinitionChange,TypeAssignmentChange,DebugVariableChange,ProjectBreakpointChange,PseudocodeEditChange>;
 struct StateDelta {std::vector<UserChange> changes;};
 HEXLAB_DATABASE_EXPORT Result<StateDelta> invert_delta(const StateDelta&);
 }
