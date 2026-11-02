@@ -1629,6 +1629,189 @@ class Project:
                 "segment_count": row_counts["segments"],
                 "bytes": encoded_bytes}
 
+    def export_debug_information_json(self, path, *, page_size=256,
+                                      max_output_bytes=256 * 1024 * 1024,
+                                      cancel=None, progress=None):
+        """Atomically export persisted debug variables and exact expressions.
+
+        One immutable captured project backs every page. The report includes
+        each variable's default expression and operations, plus each location
+        range's expression and operations. Expression bytes are hex encoded in
+        bounded chunks; output is capped before publication.
+        """
+        self._check_page_size(page_size)
+        _unsigned(max_output_bytes, "max_output_bytes", 1024 * 1024 * 1024)
+        if max_output_bytes == 0:
+            raise ValueError("max_output_bytes must be greater than zero")
+        if cancel is None:
+            cancel = globals().get("_hexlab_console_cancellation_token")
+        if cancel is not None and not callable(cancel):
+            raise TypeError("cancel must be a zero-argument callable or CancellationToken")
+        if progress is not None and not callable(progress):
+            raise TypeError("progress must be a callable")
+
+        def check_cancel():
+            if cancel is not None and cancel():
+                raise AnalysisCancelled("debug-information export canceled")
+
+        destination = os.path.abspath(os.fspath(path))
+        directory = os.path.dirname(destination) or os.curdir
+        descriptor, temporary = tempfile.mkstemp(
+            prefix="." + os.path.basename(destination) + ".", suffix=".tmp", dir=directory)
+        descriptor_open = True
+        reader = None
+        encoded_bytes = 0
+        variable_count = 0
+        range_count = 0
+        operation_count = 0
+        expression_bytes = 0
+        encoder = json.JSONEncoder(ensure_ascii=False, separators=(",", ":"))
+        try:
+            check_cancel()
+            reader = self.capture(cancel=cancel if isinstance(cancel, CancellationToken) else None)
+            snapshot = reader.snapshot()
+            revision = snapshot["edit_revision"]
+            stream = os.fdopen(descriptor, "w", encoding="utf-8", newline="\n")
+            descriptor_open = False
+            with stream as output:
+                def write(value):
+                    nonlocal encoded_bytes
+                    amount = len(value.encode("utf-8"))
+                    if amount > max_output_bytes - encoded_bytes:
+                        raise ValueError("debug-information report exceeds max_output_bytes")
+                    output.write(value)
+                    encoded_bytes += amount
+
+                def write_json(value):
+                    for part in encoder.iterencode(_json_value(value)):
+                        write(part)
+
+                def write_operations(variable_id, range_index):
+                    nonlocal operation_count
+                    write("[")
+                    first = True
+                    start = 0
+                    while True:
+                        check_cancel()
+                        page = reader.debug_location_operations(
+                            variable_id, range_index=range_index, start=start,
+                            count=page_size, expected_revision=revision,
+                            cancel=cancel if isinstance(cancel, CancellationToken) else None)
+                        if not page:
+                            break
+                        for operation in page:
+                            check_cancel()
+                            write("," if not first else "")
+                            write_json(operation)
+                            first = False
+                            operation_count += 1
+                        start += len(page)
+                        if len(page) < page_size:
+                            break
+                    write("]")
+
+                def write_expression(variable_id, size, range_index):
+                    nonlocal expression_bytes
+                    write('"')
+                    offset = 0
+                    while offset < size:
+                        check_cancel()
+                        amount = min(1024 * 1024, size - offset)
+                        data = reader.read_debug_expression(
+                            variable_id, offset, amount, range_index=range_index,
+                            expected_revision=revision,
+                            cancel=cancel if isinstance(cancel, CancellationToken) else None)
+                        if len(data) != amount:
+                            raise OSError("debug expression returned a short read")
+                        write(data.hex())
+                        offset += amount
+                        expression_bytes += amount
+                    write('"')
+
+                write('{"schema":"hexlab.debug-information.v1","project":')
+                write_json({"edit_revision": revision,
+                            "byte_revision": snapshot["byte_revision"],
+                            "decision_revision": snapshot["decision_revision"],
+                            "input_size": snapshot["input_size"],
+                            "format": snapshot["format"]})
+                write(',"variables":[')
+                first_variable = True
+                for variable in reader.iter_debug_variables(
+                        page_size=page_size, expected_revision=revision,
+                        cancel=cancel if isinstance(cancel, CancellationToken) else None):
+                    check_cancel()
+                    if variable_count >= 65536:
+                        raise ValueError("debug-information report exceeds 65,536 variables")
+                    write("," if not first_variable else "")
+                    first_variable = False
+                    write_json(asdict(variable))
+                    # asdict already emitted the summary; add nested evidence in
+                    # a parallel keyed table so the summary remains compatible.
+                    variable_count += 1
+                    if progress is not None:
+                        progress("variables", variable_count, None)
+                write('],"evidence":[')
+                first_evidence = True
+                for variable in reader.iter_debug_variables(
+                        page_size=page_size, expected_revision=revision,
+                        cancel=cancel if isinstance(cancel, CancellationToken) else None):
+                    check_cancel()
+                    write("," if not first_evidence else "")
+                    first_evidence = False
+                    write('{"variable_id":')
+                    write_json(variable.id)
+                    write(',"default_expression_hex":')
+                    write_expression(variable.id, variable.expression_size, None)
+                    write(',"default_operations":')
+                    write_operations(variable.id, None)
+                    write(',"ranges":[')
+                    first_range = True
+                    range_index = 0
+                    for location_range in reader.iter_debug_location_ranges(
+                            variable.id, page_size=page_size, expected_revision=revision,
+                            cancel=cancel if isinstance(cancel, CancellationToken) else None):
+                        check_cancel()
+                        if range_count >= 262144:
+                            raise ValueError("debug-information report exceeds 262,144 location ranges")
+                        write("," if not first_range else "")
+                        first_range = False
+                        write('{"begin":')
+                        write_json(location_range.begin)
+                        write(',"end":')
+                        write_json(location_range.end)
+                        write(',"range_index":')
+                        write_json(range_index)
+                        write(',"expression_hex":')
+                        write_expression(variable.id, location_range.expression_size, range_index)
+                        write(',"operations":')
+                        write_operations(variable.id, range_index)
+                        write('}')
+                        range_index += 1
+                        range_count += 1
+                    write("]}")
+                write("]}\n")
+                output.flush()
+                os.fsync(output.fileno())
+            if progress is not None:
+                progress("publish", 0, 1)
+            check_cancel()
+            os.link(temporary, destination)
+        finally:
+            if descriptor_open:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+            if reader is not None:
+                reader.close()
+        return {"path": destination, "variable_count": variable_count,
+                "range_count": range_count, "operation_count": operation_count,
+                "expression_bytes": expression_bytes, "bytes": encoded_bytes}
+
     def references(self, location, *, start=0, count=256):
         return self._call("references", _location(location), start, count)
 

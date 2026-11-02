@@ -120,6 +120,29 @@ Unknown variable IDs or range indexes raise native invalid-argument errors
 (code 2); expression reads outside the selected expression raise out-of-bounds
 (code 1). Zero-length reads at the end of an expression are allowed.
 
+`Project.export_debug_information_json(path, page_size=256,
+max_output_bytes=268435456, cancel=None, progress=None)` writes a complete
+machine-readable `hexlab.debug-information.v1` report from one captured project
+generation. Each variable summary is paired with its exact default expression
+bytes and operation records; location-list ranges include their own expression
+bytes and operation records. Expressions are hex encoded and read in at most
+1 MiB chunks. The exporter pages variables, ranges, and operations, caps the
+report at 65,536 variables, 262,144 ranges, and the caller's output byte budget
+(default 256 MiB), then flushes a same-directory temporary file and publishes it
+atomically without replacing an existing destination. Cancellation or a
+limit/write failure removes the staged file. Progress callbacks receive
+`("variables", completed, None)` per summary and a final
+`("publish", 0, 1)` before atomic publication. The report preserves raw debug
+evidence; it does not evaluate variable values or repair unavailable locations.
+
+```python
+with hexlab.Project.open("sample.hxproj") as project:
+    receipt = project.export_debug_information_json(
+        "debug-information.json", progress=lambda stage, done, total:
+            print(stage, done, total))
+    print(receipt["variable_count"], "variables exported")
+```
+
 The default expression and a range's expression are distinct evidence. Pass
 `range_index=0` to select the first range rather than the default. Operation
 dictionaries retain the native numeric `kind`, `unsigned_operand`,
