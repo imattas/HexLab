@@ -294,8 +294,23 @@ struct MachODynamicSymbolTable {
     std::array<MachOSymbolRange, 3> ranges;
     // contents / modules / references / indirect / external-relocations / local-relocations.
     std::array<MachODataTable, 6> tables;
+    struct TocEntry { std::uint32_t symbol_index = 0, module_index = 0; bool operator==(const TocEntry &) const = default; };
+    struct Module { std::uint32_t name_index = 0, external_definition_start = 0, external_definition_count = 0,
+        reference_start = 0, reference_count = 0, local_symbol_start = 0, local_symbol_count = 0,
+        external_relocation_start = 0, external_relocation_count = 0, init_term_start = 0, init_term_count = 0,
+        module_info_size = 0; std::uint64_t module_info_address = 0; bool operator==(const Module &) const = default; };
+    std::vector<TocEntry> toc_entries;
+    std::vector<Module> modules;
     std::vector<std::uint32_t> indirect_symbols;
     bool operator==(const MachODynamicSymbolTable &) const = default;
+};
+struct MachOSubImage {
+    enum class Kind : std::uint8_t { umbrella, library };
+    Kind kind = Kind::umbrella;
+    std::uint32_t command_index = 0, name_offset = 0;
+    std::uint64_t record_file_offset = 0;
+    std::string name;
+    bool operator==(const MachOSubImage &) const = default;
 };
 // Advisory LC_TWOLEVEL_HINTS entries; sub-image/TOC indexes refer to external
 // libraries and are preserved without treating them as resolved bindings.
@@ -544,6 +559,7 @@ struct MachOMetadata {
     std::vector<MachOSymbol> symbols;
     bool symbols_complete = true;
     std::vector<MachOLibrary> libraries;
+    std::vector<MachOSubImage> sub_images;
     std::vector<MachOCommandString> paths;
     std::vector<MachOLinkerOption> linker_options;
     std::vector<MachODyldEnvironment> dyld_environments;

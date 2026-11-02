@@ -10,6 +10,7 @@
 #include <span>
 #include <vector>
 #include <stop_token>
+#include <string>
 namespace hexlab {
 // Container/header/load-command envelope inspection only. Command payloads,
 // image mappings, architecture support and linking are separate contracts.
@@ -92,4 +93,32 @@ struct MachOChainedBindResolutionLimits {
 HEXLAB_LOADERS_EXPORT Result<std::vector<MachOChainedBindTarget>> resolve_macho_chained_binds(
     const MachOMetadata &, std::span<const std::optional<std::uint64_t>> import_addresses,
     std::stop_token = {}, MachOChainedBindResolutionLimits = {});
+
+// Provider images are supplied by the caller. `source` records provenance
+// (normally the selected file path); this resolver never searches host paths.
+struct MachOTwoLevelProvider {
+    std::uint32_t library_ordinal = 0;
+    std::uint8_t sub_image_index = 0;
+    std::string source;
+    const MachOMetadata *metadata = nullptr;
+};
+enum class MachOTwoLevelStatus : std::uint8_t {
+    resolved, missing_hint, unassociated_hint, non_two_level_image,
+    special_library_ordinal, missing_library_ordinal, missing_provider, ambiguous_provider,
+    missing_provider_tables, toc_index_out_of_range, module_index_out_of_range,
+    invalid_provider_symbol, symbol_name_mismatch
+};
+struct MachOTwoLevelResolution {
+    std::uint32_t hint_index = 0, library_ordinal = 0;
+    std::uint8_t sub_image_index = 0;
+    MachOTwoLevelStatus status = MachOTwoLevelStatus::missing_hint;
+    std::optional<std::uint32_t> provider_symbol_index, provider_module_index;
+    std::string provider_source;
+};
+struct MachOTwoLevelResolutionLimits { std::size_t max_rows = 1'000'000; };
+// Resolves advisory two-level hints against caller-selected provider images
+// using the provider TOC index. Runtime loading and rebinding are not performed.
+HEXLAB_LOADERS_EXPORT Result<std::vector<MachOTwoLevelResolution>> resolve_macho_two_level_hints(
+    const MachOMetadata &, std::span<const MachOTwoLevelProvider>, std::stop_token = {},
+    MachOTwoLevelResolutionLimits = {});
 } // namespace hexlab

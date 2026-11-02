@@ -27,12 +27,30 @@ retain the decoded hints without symbol associations and mark command metadata
 incomplete. No partial prefix of associations is published.
 
 The sub-image index is advisory: zero identifies the primary library, while
-nonzero values refer to its ordered sub-images. The TOC index refers to that
-external library's table of contents. Neither index is interpreted as an index
-into the current image's tables or as proof of a resolved symbol. External
-library/sub-image lookup, TOC validation, prebinding, and runtime binding are
-outside this capability. Source bytes are never patched. Metadata is reparsed
-on image reopen and participates in the existing tracked metadata-read set.
+nonzero values refer to an ordered library sub-image. `LC_SUB_UMBRELLA` (0x13)
+and `LC_SUB_LIBRARY` (0x15) are decoded into `MachOMetadata::sub_images` in
+load-command order with command and file-offset provenance.
+
+`LC_DYSYMTAB` contents (TOC) and module rows are decoded into the dynamic
+symbol-table metadata. TOC rows retain symbol and module indices. Module rows
+retain the nlist/reference/relocation/init-term ranges and ObjC module-info
+size/address. Reads are bounded by the existing count, storage, file-extent,
+cancellation and cumulative loader budgets. TOC symbol indices and module
+indices and module ranges are validated against their declared tables.
+
+`resolve_macho_two_level_hints` resolves an associated hint only against an
+explicit caller-supplied provider keyed by the import library ordinal and
+sub-image index. The provider must include a nonempty source string and parsed
+metadata; results carry that provenance, TOC symbol and module indices, or a
+conservative status such as missing/ambiguous provider, malformed provider
+tables, invalid index, or name mismatch. Special ordinals, absent hint-symbol
+associations and non-two-level images remain unresolved. This function does
+not discover files, interpret runtime search paths, perform dyld rebinding,
+prebind, or patch bytes. The caller is responsible for selecting the provider
+file/sub-image matching the import library declaration.
+
+Source bytes are never patched. Metadata is reparsed on image reopen and
+participates in the existing tracked metadata-read set.
 
 The aggregate hint count is capped at 1,000,000 across all declarations. Table
 and row storage and a transient read window charge the loader's existing

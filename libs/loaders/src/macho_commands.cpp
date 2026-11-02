@@ -115,8 +115,49 @@ void dynamic_symbols(const Reader &reader, const MachOLoadCommand &command, cons
         value.offset = reader.file(value.raw_offset, extent);
         budget.include(extent);
         if (i != 3) {
-            if (value.count)
+            if (value.count && i != 0 && i != 1)
                 metadata.commands_complete = false; // Raw bounded declarations; payload semantics handled separately.
+            if (i == 0 || i == 1) {
+                const auto row_size = i == 0 ? 8u : (slice.header.is_64 ? 56u : 52u);
+                budget.include(std::uint64_t(value.count) * (i == 0 ? sizeof(MachODynamicSymbolTable::TocEntry) : sizeof(MachODynamicSymbolTable::Module)));
+                for (std::uint32_t row = 0; row < value.count; ++row) {
+                    canceled(stop);
+                    const auto record = reader.bytes(std::uint64_t(value.raw_offset) + std::uint64_t(row) * row_size, row_size);
+                    if (i == 0) {
+                        MachODynamicSymbolTable::TocEntry entry;
+                        entry.symbol_index = static_cast<std::uint32_t>(reader.value(record.bytes, 0, 4));
+                        entry.module_index = static_cast<std::uint32_t>(reader.value(record.bytes, 4, 4));
+                        if (symbols) require(entry.symbol_index < symbols->count, "Mach-O TOC symbol index exceeds nlist table");
+                        table.toc_entries.push_back(entry);
+                    } else {
+                        MachODynamicSymbolTable::Module module;
+                        module.name_index = static_cast<std::uint32_t>(reader.value(record.bytes, 0, 4));
+                        module.external_definition_start = static_cast<std::uint32_t>(reader.value(record.bytes, 4, 4));
+                        module.external_definition_count = static_cast<std::uint32_t>(reader.value(record.bytes, 8, 4));
+                        module.reference_start = static_cast<std::uint32_t>(reader.value(record.bytes, 12, 4));
+                        module.reference_count = static_cast<std::uint32_t>(reader.value(record.bytes, 16, 4));
+                        module.local_symbol_start = static_cast<std::uint32_t>(reader.value(record.bytes, 20, 4));
+                        module.local_symbol_count = static_cast<std::uint32_t>(reader.value(record.bytes, 24, 4));
+                        module.external_relocation_start = static_cast<std::uint32_t>(reader.value(record.bytes, 28, 4));
+                        module.external_relocation_count = static_cast<std::uint32_t>(reader.value(record.bytes, 32, 4));
+                        module.init_term_start = static_cast<std::uint32_t>(reader.value(record.bytes, 36, 4));
+                        module.init_term_count = static_cast<std::uint32_t>(reader.value(record.bytes, 40, 4));
+                        module.module_info_size = static_cast<std::uint32_t>(reader.value(record.bytes, 44, 4));
+                        module.module_info_address = reader.value(record.bytes, 48, slice.header.is_64 ? 8 : 4);
+                        const auto check_range = [&](std::uint32_t begin, std::uint32_t count, std::uint32_t limit, const char *message) {
+                            require(begin <= limit && count <= limit - begin, message);
+                        };
+                        if (symbols) {
+                            require(module.name_index < symbols->string_size, "Mach-O module name index exceeds string table");
+                            check_range(module.external_definition_start, module.external_definition_count, symbols->count, "Mach-O module external-definition range is invalid");
+                            check_range(module.local_symbol_start, module.local_symbol_count, symbols->count, "Mach-O module local-symbol range is invalid");
+                        } else metadata.commands_complete = false;
+                        table.modules.push_back(module);
+                    }
+                }
+                if (i == 1) for (const auto &entry : table.toc_entries)
+                    require(entry.module_index < table.modules.size(), "Mach-O TOC module index exceeds module table");
+            }
             continue;
         }
         budget.include(std::uint64_t(value.count) * sizeof(std::uint32_t));
@@ -129,6 +170,15 @@ void dynamic_symbols(const Reader &reader, const MachOLoadCommand &command, cons
                 metadata.commands_complete = false;
             table.indirect_symbols.push_back(index);
         }
+    }
+    for (const auto &module : table.modules) {
+        const auto check_range = [](std::uint32_t begin, std::uint32_t count, std::uint32_t limit) {
+            return begin <= limit && count <= limit - begin;
+        };
+        if (!check_range(module.reference_start, module.reference_count, table.tables[2].count) ||
+            !check_range(module.external_relocation_start, module.external_relocation_count, table.tables[4].count) ||
+            !check_range(module.init_term_start, module.init_term_count, table.tables[3].count))
+            throw Failure{{ErrorCode::malformed, "Mach-O module table range exceeds its dynamic-symbol table"}};
     }
     metadata.dynamic_symbol_tables.push_back(std::move(table));
 }
@@ -1342,7 +1392,7 @@ bool supported_command(std::uint32_t command) {
            command == 0x11 || command == 0x1a || command == 0x26 || command == 0x22 || command == 0x80000022 || command == 0x80000033 ||
            command == 0x80000034 || command == 0x29 || command == 0x1d || command == 0x21 || command == 0x2c ||
            command == 0x32 || command == 0x24 || command == 0x25 || command == 0x2f || command == 0x30 ||
-           command == 0x2a || command == 0x31 || command == 0x35 || command == 0x16;
+           command == 0x2a || command == 0x31 || command == 0x35 || command == 0x16 || command == 0x13 || command == 0x15;
 }
 void read_commands(const ByteStorage &storage, const Image &image, MachOMetadata &metadata, Budget &budget,
                    std::stop_token stop) {
@@ -1407,6 +1457,17 @@ void read_commands(const ByteStorage &storage, const Image &image, MachOMetadata
             row.name = command_string(reader, command, slice.offset, row.name_offset, 12, budget);
             budget.include(sizeof(MachOCommandString));
             metadata.paths.push_back(std::move(row));
+        } else if (command.command == 0x13 || command.command == 0x15) {
+            require(command.size >= 12, "Truncated Mach-O sub-image command");
+            const auto fixed = reader.bytes(command.file_offset - slice.offset, 12);
+            MachOSubImage row;
+            row.kind = command.command == 0x13 ? MachOSubImage::Kind::umbrella : MachOSubImage::Kind::library;
+            row.command_index = command.index;
+            row.record_file_offset = command.file_offset;
+            row.name_offset = static_cast<std::uint32_t>(reader.value(fixed.bytes, 8, 4));
+            row.name = command_string(reader, command, slice.offset, row.name_offset, 12, budget);
+            budget.include(sizeof(MachOSubImage) + row.name.size());
+            metadata.sub_images.push_back(std::move(row));
         } else if (command.command == 0xb) {
             dynamic_symbols(reader, command, slice, metadata, budget, stop);
         } else if (command.command == 0x80000028) {
