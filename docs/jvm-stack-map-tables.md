@@ -23,15 +23,16 @@ The loader also runs a bounded [stack and local analysis](jvm-operand-stack-veri
 after parsing Code metadata. Reachable frames check inferred stack height and
 primitive/reference categories plus local categories where the declared frame
 is representable. Local `top` slots remain unusable during propagation;
-reference class and uninitialized identities remain coarse. A `top` entry on
-the operand stack or a reachable `new` instruction marks that analysis partial;
-allocation identities and constructor alias initialization are not simulated.
+reference class assignability remains coarse. Stack-map uninitialized offsets
+and `uninitializedThis` identities participate in the verifier's bounded
+constructor-alias tracking. A `top` entry on the operand stack still marks
+that analysis partial; reachable `new` instructions alone do not.
 This pass does not seed otherwise unreachable blocks from frames.
 
 The loader preserves verification states that a consumer may not support. It
-does not resolve class hierarchy assignability, simulate constructor
-initialization, prove local reference assignability or complete type consistency,
-or check that every required control-flow boundary has a frame. Consumers must
+does not resolve class hierarchy assignability, prove local reference
+assignability or complete type consistency, or check that every required
+control-flow boundary has a frame. Consumers must
 distinguish these structural metadata and bounded stack/local checks from full
 verification and reject states they cannot represent. Older class files and
 methods without an explicit table do not acquire fabricated frames; the JVM

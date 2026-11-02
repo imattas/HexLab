@@ -359,13 +359,17 @@ The function-entry post-tested recognizer also accepts a complete switch
 dispatch with 2 to 8 distinct target groups and up to 64 case values when each
 target follows a disjoint, phi-free path of at most 64 blocks to its own
 conditional latch. Every latch must branch directly to the entry header or to
-the same phi-free terminal return. Exact CFG predecessors at every path block,
-the header, and the return are required, and every function block must belong
-to the dispatch, one latch path, or the return. The whole graph is limited to
-256 blocks and the existing 4,096-edge graph bound. The formatter emits a
-switch inside `do { ... } while (true)`; it uses an exit flag after the switch
-so a latch's conditional break exits the loop rather than only the switch.
-Phis, cleanup blocks after the latch exit, additional exits, side entries,
+one shared exit chain of at most 64 phi-free straight-line blocks ending in a
+terminal return. The exit-chain head must have exactly the distinct latch
+blocks as predecessors; each later block must have exactly the previous block
+as its predecessor. Exact CFG predecessors at every latch path block, the
+header, and the cleanup chain are required, and every function block must
+belong to the dispatch, one latch path, or the exit chain. The whole graph is
+limited to 256 blocks and the existing 4,096-edge graph bound. The formatter
+emits a switch inside `do { ... } while (true)`; it uses an exit flag after the
+switch so a latch's conditional break exits the loop rather than only the
+switch, then emits the shared cleanup once after the loop. Register or memory
+phis in the cleanup, branches or side entries in the chain, additional exits,
 incomplete switch metadata, and larger or overlapping graphs retain fallback.
 
 An explicit-preheader post-tested loop may also use a bounded nested body-

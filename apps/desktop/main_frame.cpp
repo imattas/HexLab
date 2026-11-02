@@ -43,6 +43,7 @@
 #include "hexlab/analysis/functions.hpp"
 #include "hexlab/analysis/flirt.hpp"
 #include "hexlab/core/sha256.hpp"
+#include "hexlab/core/encoding.hpp"
 #include "hexlab/database/codec.hpp"
 #include "hexlab/loaders/ar.hpp"
 #include "hexlab/image/file_storage.hpp"
@@ -1269,7 +1270,21 @@ struct MainFrame::Impl {
                         catalogs.reserve(catalog_paths.size());
                         std::vector<std::string> catalog_labels;
                         catalog_labels.reserve(catalog_paths.size());
-                        std::string identity;
+                        Sha256 identity_hash;
+                        constexpr std::string_view identity_domain = "HexLab FLAIR ordered catalog set v1";
+                        auto identity_update = identity_hash.update(std::as_bytes(
+                            std::span(identity_domain.data(), identity_domain.size())));
+                        if (!identity_update) throw std::runtime_error(identity_update.error().message);
+                        const auto catalog_count = encode_u64(static_cast<std::uint64_t>(catalog_paths.size()));
+                        identity_update = identity_hash.update(catalog_count);
+                        if (!identity_update) throw std::runtime_error(identity_update.error().message);
+                        const auto append_identity_field = [&](std::string_view field) {
+                            const auto length = encode_u64(static_cast<std::uint64_t>(field.size()));
+                            auto updated = identity_hash.update(length);
+                            if (!updated) throw std::runtime_error(updated.error().message);
+                            updated = identity_hash.update(std::as_bytes(std::span(field.data(), field.size())));
+                            if (!updated) throw std::runtime_error(updated.error().message);
+                        };
                         std::uint64_t input_bytes = 0, inflated_bytes = 0, pattern_count = 0;
                         FlirtRecognitionLimits recognition_limits;
                         for (const auto &catalog_path : catalog_paths) {
@@ -1312,22 +1327,15 @@ struct MainFrame::Impl {
                                 throw std::runtime_error("FLAIR catalog set exceeds aggregate pattern budget.");
                             inflated_bytes += parsed.value().inflated_body_bytes;
                             pattern_count += parsed.value().patterns.size();
-                            if (catalog_paths.size() == 1)
-                                identity = std::to_string(provenance.size()) + ":" + provenance + text;
-                            else
-                                identity += std::to_string(provenance.size()) + ":" + provenance +
-                                    std::to_string(text.size()) + ":" + text;
+                            append_identity_field(provenance);
+                            append_identity_field(text);
                             catalog_labels.push_back(provenance + " (" + std::to_string(parsed.value().patterns.size()) + " patterns)");
                             catalogs.push_back(std::move(parsed.value()));
                         }
                         auto recognition = recognize_flirt_catalogs(image, *snapshot->effective, *snapshot->functions,
                                                                      catalogs, recognition_limits, stop);
                         if (!recognition) throw std::runtime_error(recognition.error().message);
-                        Sha256 hash;
-                        const auto identity_bytes = std::as_bytes(std::span(identity.data(), identity.size()));
-                        auto updated = hash.update(identity_bytes);
-                        if (!updated) throw std::runtime_error(updated.error().message);
-                        auto evidence = make_function_recognition_evidence(*snapshot->functions, hash.digest(),
+                        auto evidence = make_function_recognition_evidence(*snapshot->functions, identity_hash.digest(),
                                                                            recognition.value(), stop);
                         if (!evidence) throw std::runtime_error(evidence.error().message);
                         if (stop.stop_requested()) throw std::runtime_error("FLAIR recognition canceled.");

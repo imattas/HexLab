@@ -199,8 +199,11 @@ capped at 65,536 patterns. Format dispatch uses IDASGN and gzip magic bytes;
 otherwise input is parsed as FLAIR text. Candidates retain their zero-based
 catalog index and per-file provenance, including across duplicate catalogs.
 Set order and raw catalog contents contribute to the persisted evidence
-identity. Its results dialog reports catalog provenance, parsed pattern count, target, scan
-completeness, and work counters, then lists up to 2,000 matching function
+identity. The desktop streams a domain-tagged SHA-256 over the catalog count
+and length-prefixed provenance/content pairs, preserving duplicate entries and
+avoiding a second in-memory copy of the entire catalog set. Its results dialog
+reports catalog provenance, parsed pattern count, target, scan completeness,
+and work counters, then lists up to 2,000 matching function
 entries with candidate names, provenance, and ambiguity status. Select a row
 and choose **Go to Selected Function**, or activate the row, to navigate to that
 entry. Additional matches remain in the stored evidence and are reported in

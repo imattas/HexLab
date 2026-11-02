@@ -13699,7 +13699,7 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
         // post-tested latch arms. Keep this shape bounded and phi-free: all
         // destinations must be represented by the switch metadata, each arm
         // must have one exact predecessor chain, and every latch must share
-        // the same validated loop header and terminal return.
+        // the same validated loop header and shared exit chain.
         if (body_valid && function.blocks.size() >= 4 && function.blocks.size() <= 256 &&
             entry->switch_dispatch && entry->phis.empty() && !entry->memory_phi &&
             entry->memory_partition_phis.empty() && has_only_simple_statements(*entry)) {
@@ -13788,10 +13788,45 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                 if (!candidate_exit || (shared_exit && shared_exit != candidate_exit)) valid = false;
                 shared_exit = candidate_exit;
             }
+            // Latch exits may share a small unconditional cleanup chain before
+            // returning. Require an exact multi-latch predecessor set at its
+            // head and single-predecessor links thereafter so cleanup effects
+            // can be emitted once after leaving the loop.
+            std::vector<const LiftedBlock *> exit_cleanup;
+            if (valid && shared_exit) {
+                auto *cursor = shared_exit;
+                std::set<std::uint64_t> seen;
+                while (cursor && exit_cleanup.size() < 64 && seen.insert(cursor->id.value).second) {
+                    const auto expected_predecessors = exit_cleanup.empty()
+                        ? latch_ids : std::set<std::uint64_t>{exit_cleanup.back()->id.value};
+                    if (predecessors[cursor->id.value] != expected_predecessors ||
+                        cursor->phis.size() != 0 || cursor->memory_phi ||
+                        !cursor->memory_partition_phis.empty() || cursor->switch_dispatch) {
+                        valid = false;
+                        break;
+                    }
+                    if (has_only_terminal_return(*cursor)) {
+                        exit_cleanup.push_back(cursor);
+                        break;
+                    }
+                    if (contains_return(*cursor) || !has_only_simple_statements(*cursor) ||
+                        cursor->successors.size() != 1 || !cursor->successors.front().target ||
+                        (cursor->successors.front().kind != BlockEdgeKind::jump &&
+                         cursor->successors.front().kind != BlockEdgeKind::fallthrough) ||
+                        !has_unconditional_edge(*cursor, *cursor->successors.front().target)) {
+                        valid = false;
+                        break;
+                    }
+                    exit_cleanup.push_back(cursor);
+                    cursor = find_block(*cursor->successors.front().target);
+                }
+                if (exit_cleanup.empty() || !has_only_terminal_return(*exit_cleanup.back())) valid = false;
+            }
+            for (const auto *block : exit_cleanup)
+                if (!covered.insert(block->id.value).second) valid = false;
             if (arms.size() != grouped.size() || !shared_exit ||
-                predecessors[entry->id.value] != latch_ids || predecessors[shared_exit->id.value] != latch_ids ||
-                !has_only_terminal_return(*shared_exit) || !shared_exit->phis.empty() || shared_exit->memory_phi ||
-                !shared_exit->memory_partition_phis.empty() || !covered.insert(shared_exit->id.value).second)
+                predecessors[entry->id.value] != latch_ids || exit_cleanup.empty() ||
+                !has_only_terminal_return(*exit_cleanup.back()))
                 valid = false;
             valid = valid && covered.size() == function.blocks.size() &&
                 std::all_of(function.blocks.begin(), function.blocks.end(), [&](const auto &block) {
@@ -13816,7 +13851,8 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                         << "            break;\n";
                 }
                 out << "        }\n        if (__hexlab_latch_exit) break;\n    } while (true);\n";
-                emit_block(*shared_exit, 4);
+                for (std::size_t i = 0; i < exit_cleanup.size(); ++i)
+                    emit_block(*exit_cleanup[i], 4, i + 1 != exit_cleanup.size());
                 out << "}\n";
                 return {out.str(), false, {}};
             }

@@ -2172,15 +2172,13 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
                                        !expect_type(value, object ? RegType::reference : RegType::int32))) {
                                 return Error{ErrorCode::malformed, "DEX array store value has an incompatible type"};
                             } else if (known_array && object &&
-                                       (!expect_type(value, RegType::reference) ||
-                                        !expect_assignable_reference(value, component))) {
+                                       !expect_type(value, RegType::reference)) {
                                 std::ostringstream provenance;
-                                provenance << "DEX aput-object value is not assignable to the known component"
+                                provenance << "DEX aput-object value is not a reference"
                                     << " (method_idx=" << method_idx
                                     << ", code_item_file_offset=0x" << std::hex << code_off
                                     << ", instruction_code_unit_offset=0x" << (offset / 2)
                                     << ", opcode=0x" << static_cast<unsigned>(opcode)
-                                    << ", component_descriptor=" << component
                                     << ", array_descriptor=" << array_descriptor << ')';
                                 return Error{ErrorCode::malformed, provenance.str()};
                             }
