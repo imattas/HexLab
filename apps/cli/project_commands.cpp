@@ -1274,7 +1274,7 @@ void project_usage(std::ostream &out) {
            "backup rotate/prune: only same-UUID, validated generated siblings are pruned; incomplete bounded scans preserve files and return exit 3\n"
            "backup restore-in-place: requires a same-UUID backup and closed target connections; target retains its UUID and must be reopened\n"
            "exchange import --dry-run: read-only plan with bounded row-level conflict output; --json emits a machine-readable report\n"
-           "create: --input <binary> [--format auto|pe|elf|raw|macho|wasm|ihex|srec] [--replace]\n"
+           "create: --input <binary> [--format auto|pe|elf|raw|macho|wasm|ihex|srec|xcoff32] [--replace]\n"
            "        ihex/srec preserve firmware text and sparse data; CPU analysis and VA patches are unavailable\n"
            "        --slice <index> selects a Mach-O universal slice (auto or macho only)\n"
            "        PE: --pdb <file> selects a local PDB; --pdb-search <directory> adds a local search directory\n"

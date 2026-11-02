@@ -10,13 +10,13 @@ std::uint64_t width_mask(unsigned bits) noexcept {
     return bits == 64 ? UINT64_MAX : (UINT64_C(1) << bits) - 1;
 }
 
-struct RiscvVectorFloatAddResult {
+struct RiscvVectorFloatResult {
     std::uint64_t bits = 0;
     std::uint8_t fflags = 0;
 };
 
-RiscvVectorFloatAddResult add_riscv_float_bits(std::uint64_t lhs, std::uint64_t rhs,
-                                               unsigned width, unsigned rounding_mode) noexcept {
+RiscvVectorFloatResult add_riscv_float_bits(std::uint64_t lhs, std::uint64_t rhs,
+                                             unsigned width, unsigned rounding_mode) noexcept {
     const unsigned fraction_bits = width == 32 ? 23 : 52;
     const unsigned exponent_bits = width == 32 ? 8 : 11;
     const auto element_mask = width_mask(width);
@@ -135,6 +135,153 @@ RiscvVectorFloatAddResult add_riscv_float_bits(std::uint64_t lhs, std::uint64_t 
     if (subnormal && inexact) flags |= 0x02; // tininess after rounding
     return {(result_negative ? sign_mask : 0) |
             (static_cast<std::uint64_t>(encoded_exponent) << fraction_bits) | encoded_fraction, flags};
+}
+
+RiscvVectorFloatResult multiply_riscv_float_bits(std::uint64_t lhs, std::uint64_t rhs,
+                                                 unsigned width, unsigned rounding_mode) noexcept {
+    const unsigned fraction_bits = width == 32 ? 23 : 52;
+    const unsigned exponent_bits = width == 32 ? 8 : 11;
+    const auto element_mask = width_mask(width);
+    const auto sign_mask = UINT64_C(1) << (width - 1);
+    const auto fraction_mask = (UINT64_C(1) << fraction_bits) - 1;
+    const auto exponent_field_mask = (UINT64_C(1) << exponent_bits) - 1;
+    const auto exponent_mask = exponent_field_mask << fraction_bits;
+    const auto quiet_mask = UINT64_C(1) << (fraction_bits - 1);
+    const auto canonical_nan = width == 32 ? UINT64_C(0x7fc00000) : UINT64_C(0x7ff8000000000000);
+    lhs &= element_mask;
+    rhs &= element_mask;
+    const auto exponent = [&](std::uint64_t value) {
+        return static_cast<unsigned>((value & exponent_mask) >> fraction_bits);
+    };
+    const auto fraction = [&](std::uint64_t value) { return value & fraction_mask; };
+    const auto is_nan = [&](std::uint64_t value) {
+        return exponent(value) == exponent_field_mask && fraction(value) != 0;
+    };
+    const auto is_signaling_nan = [&](std::uint64_t value) {
+        return is_nan(value) && (fraction(value) & quiet_mask) == 0;
+    };
+    if (is_nan(lhs) || is_nan(rhs))
+        return {canonical_nan, static_cast<std::uint8_t>(is_signaling_nan(lhs) || is_signaling_nan(rhs) ? 0x10 : 0)};
+
+    const bool negative = ((lhs ^ rhs) & sign_mask) != 0;
+    const auto sign = negative ? sign_mask : UINT64_C(0);
+    const auto lhs_exponent = exponent(lhs), rhs_exponent = exponent(rhs);
+    const bool lhs_infinite = lhs_exponent == exponent_field_mask;
+    const bool rhs_infinite = rhs_exponent == exponent_field_mask;
+    auto lhs_significand = (lhs_exponent ? (UINT64_C(1) << fraction_bits) : 0) | fraction(lhs);
+    auto rhs_significand = (rhs_exponent ? (UINT64_C(1) << fraction_bits) : 0) | fraction(rhs);
+    if ((lhs_infinite && !rhs_significand) || (rhs_infinite && !lhs_significand))
+        return {canonical_nan, 0x10}; // infinity times zero is invalid
+    if (lhs_infinite || rhs_infinite) return {sign | exponent_mask, 0};
+    if (!lhs_significand || !rhs_significand) return {sign, 0};
+
+    const int bias = static_cast<int>((1u << (exponent_bits - 1)) - 1u);
+    const int minimum_exponent = 1 - bias;
+    const int maximum_exponent = bias;
+    auto normalize = [&](std::uint64_t &significand, unsigned field) {
+        int unbiased = field ? static_cast<int>(field) - bias : minimum_exponent;
+        const auto hidden = UINT64_C(1) << fraction_bits;
+        while (significand < hidden) {
+            significand <<= 1;
+            --unbiased;
+        }
+        return unbiased;
+    };
+    const int lhs_scale = normalize(lhs_significand, lhs_exponent);
+    const int rhs_scale = normalize(rhs_significand, rhs_exponent);
+
+    // A normalized binary64 significand is at most 53 bits. Build its exact
+    // product as a portable two-limb integer rather than relying on host FP or
+    // compiler-specific 128-bit integer extensions.
+    const auto a0 = static_cast<std::uint32_t>(lhs_significand);
+    const auto a1 = static_cast<std::uint32_t>(lhs_significand >> 32);
+    const auto b0 = static_cast<std::uint32_t>(rhs_significand);
+    const auto b1 = static_cast<std::uint32_t>(rhs_significand >> 32);
+    const std::uint64_t p00 = std::uint64_t{a0} * b0;
+    const std::uint64_t p01 = std::uint64_t{a0} * b1;
+    const std::uint64_t p10 = std::uint64_t{a1} * b0;
+    const std::uint64_t p11 = std::uint64_t{a1} * b1;
+    std::uint64_t product_low = p00;
+    const auto addend_a = p01 << 32;
+    const auto addend_b = p10 << 32;
+    product_low += addend_a;
+    const bool carry_a = product_low < addend_a;
+    const auto before_b = product_low;
+    product_low += addend_b;
+    const bool carry_b = product_low < before_b;
+    const std::uint64_t product_high = (p01 >> 32) + (p10 >> 32) + p11 +
+        static_cast<std::uint64_t>(carry_a) + static_cast<std::uint64_t>(carry_b);
+    const unsigned product_top = product_high
+        ? 64u + (std::bit_width(product_high) - 1u)
+        : std::bit_width(product_low) - 1u;
+    int result_exponent = lhs_scale + rhs_scale + static_cast<int>(product_top) -
+                          static_cast<int>(2 * fraction_bits);
+    const auto result_significand_shift = [&](unsigned shift) -> std::uint64_t {
+        if (shift == 0) return product_low;
+        if (shift < 64) return (product_low >> shift) | (product_high << (64 - shift));
+        if (shift < 128) return product_high >> (shift - 64);
+        return UINT64_C(0);
+    };
+    const auto bit_at = [&](unsigned bit) {
+        if (bit < 64) return ((product_low >> bit) & 1u) != 0;
+        if (bit < 128) return ((product_high >> (bit - 64)) & 1u) != 0;
+        return false;
+    };
+    const auto any_below = [&](unsigned bit_count) {
+        if (bit_count == 0) return false;
+        if (bit_count < 64) return (product_low & ((UINT64_C(1) << bit_count) - 1)) != 0;
+        if (bit_count == 64) return product_low != 0;
+        if (bit_count < 128) {
+            const unsigned high_bits = bit_count - 64;
+            return product_low != 0 ||
+                (product_high & ((UINT64_C(1) << high_bits) - 1)) != 0;
+        }
+        return product_low != 0 || product_high != 0;
+    };
+    const auto overflow_result = [&]() {
+        const bool to_infinity = rounding_mode == 0 || rounding_mode == 4 ||
+            (rounding_mode == 2 && negative) || (rounding_mode == 3 && !negative);
+        const auto magnitude = to_infinity ? exponent_mask
+            : ((exponent_mask - (UINT64_C(1) << fraction_bits)) | fraction_mask);
+        return RiscvVectorFloatResult{sign | magnitude, 0x05}; // OF | NX
+    };
+    if (result_exponent > maximum_exponent) return overflow_result();
+
+    const int target_exponent = std::max(result_exponent, minimum_exponent);
+    const int signed_shift = static_cast<int>(fraction_bits) + target_exponent - lhs_scale - rhs_scale;
+    if (signed_shift <= 0) return {}; // impossible for normalized IEEE significands
+    const auto shift = static_cast<unsigned>(signed_shift);
+    std::uint64_t rounded = result_significand_shift(shift);
+    const bool guard = shift > 0 && bit_at(shift - 1);
+    const bool sticky = shift > 1 && any_below(shift - 1);
+    const bool inexact = guard || sticky;
+    bool increment = false;
+    switch (rounding_mode) {
+    case 0: increment = guard && (sticky || (rounded & 1u)); break; // RNE
+    case 1: break; // RTZ
+    case 2: increment = negative && inexact; break; // RDN
+    case 3: increment = !negative && inexact; break; // RUP
+    case 4: increment = guard; break; // RMM
+    default: return {};
+    }
+    if (increment) ++rounded;
+
+    const auto hidden = UINT64_C(1) << fraction_bits;
+    if (result_exponent < minimum_exponent) {
+        if (rounded >= hidden) {
+            return {sign | (UINT64_C(1) << fraction_bits), static_cast<std::uint8_t>(inexact ? 0x01 : 0)};
+        }
+        return {sign | rounded, static_cast<std::uint8_t>((inexact ? 0x01 : 0) |
+                                                          (inexact ? 0x02 : 0))};
+    }
+    if (rounded >= (hidden << 1)) {
+        rounded >>= 1;
+        ++result_exponent;
+        if (result_exponent > maximum_exponent) return overflow_result();
+    }
+    const auto encoded_exponent = static_cast<std::uint64_t>(result_exponent + bias);
+    return {sign | (encoded_exponent << fraction_bits) | (rounded & fraction_mask),
+            static_cast<std::uint8_t>(inexact ? 0x01 : 0)};
 }
 
 struct RiscvWidenF32Result {
@@ -1753,7 +1900,7 @@ evaluate_riscv_vector_floating_operation(RiscvOpcode opcode, const RiscvVectorIn
         return {};
 
     enum class Operation { classification, reciprocal_estimate, reciprocal_sqrt_estimate,
-                           add, subtract,
+                           add, subtract, multiply,
                            sign_copy, sign_invert, sign_xor, min, max,
                            reduce_min, reduce_max, reduce_unordered_sum, reduce_ordered_sum,
                            reduce_widen_unordered_sum, reduce_widen_ordered_sum,
@@ -1769,6 +1916,7 @@ evaluate_riscv_vector_floating_operation(RiscvOpcode opcode, const RiscvVectorIn
     case RiscvOpcode::vf: operation = Operation::name; break
     RV_FLOAT_PAIR(vfadd_vv, vfadd_vf, add);
     RV_FLOAT_PAIR(vfsub_vv, vfsub_vf, subtract);
+    RV_FLOAT_PAIR(vfmul_vv, vfmul_vf, multiply);
     RV_FLOAT_PAIR(vfsgnj_vv, vfsgnj_vf, sign_copy);
     RV_FLOAT_PAIR(vfsgnjn_vv, vfsgnjn_vf, sign_invert);
     RV_FLOAT_PAIR(vfsgnjx_vv, vfsgnjx_vf, sign_xor);
@@ -1803,7 +1951,8 @@ evaluate_riscv_vector_floating_operation(RiscvOpcode opcode, const RiscvVectorIn
         (config.masked && std::any_of(operands.predicate_mask.begin(), operands.predicate_mask.end(),
                                       [](std::uint8_t bit) { return bit > 1; })))) return {};
     if (sum_reduction && (!operands.frm || *operands.frm > 4)) return {};
-    const bool rounded_arithmetic = operation == Operation::add || operation == Operation::subtract;
+    const bool rounded_arithmetic = operation == Operation::add || operation == Operation::subtract ||
+                                    operation == Operation::multiply;
     if (rounded_arithmetic && (!operands.frm || *operands.frm > 4)) return {};
     if (vector_rhs && operands.vs1.size() != vlmax) return {};
     mask_result = operation == Operation::equal || operation == Operation::not_equal ||
@@ -1980,6 +2129,12 @@ evaluate_riscv_vector_floating_operation(RiscvOpcode opcode, const RiscvVectorIn
         case Operation::subtract: {
             const auto arithmetic_rhs = operation == Operation::subtract ? (rhs ^ sign_mask) : rhs;
             const auto arithmetic = add_riscv_float_bits(lhs, arithmetic_rhs, sew, *operands.frm);
+            value = arithmetic.bits;
+            result.fflags_set |= arithmetic.fflags;
+            break;
+        }
+        case Operation::multiply: {
+            const auto arithmetic = multiply_riscv_float_bits(lhs, rhs, sew, *operands.frm);
             value = arithmetic.bits;
             result.fflags_set |= arithmetic.fflags;
             break;

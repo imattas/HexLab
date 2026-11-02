@@ -67,6 +67,20 @@ Result<DetectedFormat> detect_format(const ByteStorage &storage) {
         b[3] == std::byte{0x46})
         return DetectedFormat::elf_candidate;
     if (b.size() == 4) {
+        if (b[0] == std::byte{0x01} && b[1] == std::byte{0xdf}) {
+            if (storage.size() < 20)
+                return Error{ErrorCode::malformed, "Truncated XCOFF32 file header"};
+            auto xcoff_header = storage.read_at({0}, 20);
+            if (!xcoff_header) return xcoff_header.error();
+            if (xcoff_header.value().bytes.size() != 20)
+                return Error{ErrorCode::io, "Format detection source returned an incomplete XCOFF32 header"};
+            const auto &h = xcoff_header.value().bytes;
+            const auto file_flags = (std::to_integer<unsigned>(h[18]) << 8) |
+                                    std::to_integer<unsigned>(h[19]);
+            return (file_flags & 0x0002u) != 0
+                ? DetectedFormat::xcoff32_executable_candidate
+                : DetectedFormat::xcoff32_object_candidate;
+        }
         std::uint32_t magic = 0;
         for (const auto byte : b)
             magic = (magic << 8) | std::to_integer<unsigned>(byte);

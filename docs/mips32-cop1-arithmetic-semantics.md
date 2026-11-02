@@ -16,10 +16,15 @@ effects rather than assume host floating-point propagation matches MIPS.
 FPR/FCSR read and write facts before evaluating `ADD.S`, `SUB.S`, or `MUL.S`.
 
 `evaluate_mips32_arithmetic_d` covers finite binary64 `ADD.D`, `SUB.D`, `MUL.D`,
-and `DIV.D`. Addition/subtraction preserve their exact aligned significands;
+`DIV.D`, and finite `SQRT.D`. Square root computes an integer radicand and
+remainder, then rounds without host floating point; negative finite input
+returns the canonical quiet NaN and raises Invalid, while signed zero is
+preserved. Addition/subtraction preserve their exact aligned significands;
 multiplication retains the full 106-bit product; division generates a rounded
 53-bit quotient while carrying the exact remainder through normal and
-subnormal rounding. All four FCSR.RM modes, gradual underflow, overflow results,
+subnormal rounding. Square root uses the same four FCSR.RM modes and marks
+Inexact when its exact root is not representable. All four FCSR.RM modes,
+gradual underflow, overflow results,
 and Inexact/Underflow/Overflow Cause and Flag bits are modeled. Division by
 zero raises Divide-by-Zero for a nonzero numerator; zero divided by zero
 produces the canonical quiet NaN and raises Invalid. Finite zero numerators
@@ -32,12 +37,12 @@ update Cause and suppress the destination write; unenabled exceptions accrue
 sticky Flags.
 
 `evaluate_mips32_arithmetic_d_instruction` also validates the MIPS32 context,
-exact register/FCSR effects, and even-numbered FPR pairs for all three D-format
-registers. The decompiler applies the same even-pair restriction to D-format
+exact register/FCSR effects, and even-numbered FPR pairs for every D-format
+source and destination, including unary `SQRT.D`. The decompiler applies the same even-pair restriction to D-format
 loads/stores, moves, comparisons, arithmetic, and conversions. This bounded
 model assumes the paired 32-bit FPR view; it does not infer runtime Status.FR.
 
-NaN and infinity propagation, `SQRT.D`, signaling-NaN behavior, exact COP1
-exception delivery, and the runtime FR=1 register view remain unsupported.
+NaN and infinity propagation, signaling-NaN behavior, exact COP1 exception
+delivery, and the runtime FR=1 register view remain unsupported.
 Those instructions retain typed but unknown effects in decompilation; the
 numeric evaluator returns no result for unsupported D arithmetic.

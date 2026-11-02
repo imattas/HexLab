@@ -25,6 +25,8 @@ method-relative bytecode offset:
 - A reachable local load or `iinc` that reads an unusable local, a category or
   type mismatch, category-2 half-slot use, or disagreement with a declared
   StackMapTable/legacy StackMap local type.
+- A reachable return opcode whose value category or void/non-void form does not
+  match the method descriptor's declared result category.
 - Use of an uninitialized reference as an ordinary operand, invocation
   receiver, field receiver, return value, monitor or array value; mismatched
   allocation identities at a stack/local merge; or a constructor returning

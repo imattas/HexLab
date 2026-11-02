@@ -8,6 +8,7 @@
 #include "hexlab/loaders/dex.hpp"
 #include "hexlab/loaders/jvm.hpp"
 #include "hexlab/loaders/minidump.hpp"
+#include "hexlab/loaders/xcoff32.hpp"
 #include "macho_internal.hpp"
 #include <stdexcept>
 #include <algorithm>
@@ -277,6 +278,8 @@ bool valid(const LoadRecipe &recipe) {
         return !recipe.raw && !recipe.macho && !recipe.pdb_path;
     if (recipe.format == Format::minidump)
         return !recipe.raw && !recipe.macho && !recipe.pdb_path && !recipe.pe_runtime_architecture;
+    if (recipe.format == Format::xcoff32)
+        return !recipe.raw && !recipe.macho && !recipe.pdb_path && !recipe.pe_runtime_architecture;
     if (recipe.format == Format::macho)
         return !recipe.raw;
     if (recipe.macho)
@@ -390,6 +393,8 @@ Result<std::vector<std::byte>> encode_recipe(const LoadRecipe &recipe) {
             }
             return out;
         }
+        if (recipe.format == Format::xcoff32)
+            return std::vector<std::byte>{std::byte{1}, std::byte{0}, std::byte{19}};
         if (recipe.format == Format::pe && recipe.pe_runtime_architecture) {
             const auto target = static_cast<std::byte>(*recipe.pe_runtime_architecture);
             if (!recipe.pdb_path)
@@ -574,6 +579,9 @@ Result<LoadRecipe> decode_recipe(std::span<const std::byte> bytes) {
     if (bytes.size() == 3 && (bytes[0] == std::byte{1} || bytes[0] == std::byte{4}) &&
         bytes[1] == std::byte{0} && bytes[2] == std::byte{16})
         return LoadRecipe{Format::minidump, {}};
+    if (bytes.size() == 3 && bytes[0] == std::byte{1} && bytes[1] == std::byte{0} &&
+        bytes[2] == std::byte{19})
+        return LoadRecipe{Format::xcoff32, {}};
     if (bytes.size() >= 6 && bytes[0] == std::byte{2} && bytes[1] == std::byte{0} &&
         bytes[2] == std::byte{18}) {
         const auto count = (std::to_integer<unsigned>(bytes[3]) << 8) |
@@ -800,6 +808,11 @@ Result<LoadRecipe> resolve_load_recipe(const ByteStorage &storage, const LoadRec
             return LoadRecipe{Format::minidump, {}};
         if (detected.value() == DetectedFormat::ar_candidate)
             return LoadRecipe{Format::ar, {}};
+        if (detected.value() == DetectedFormat::xcoff32_executable_candidate)
+            return LoadRecipe{Format::xcoff32, {}};
+        if (detected.value() == DetectedFormat::xcoff32_object_candidate)
+            return Error{ErrorCode::unsupported,
+                "XCOFF32 relocatable object is not a linked image; inspect it or open its containing archive"};
         return Error{ErrorCode::unsupported, "Unknown format; choose raw with explicit architecture and base"};
     }
     if (!valid(recipe))
@@ -1058,6 +1071,8 @@ Result<LoadedImage> load_durable_image(std::shared_ptr<const ByteStorage> storag
         }
         return loaded;
     }
+    if (recipe.format == Format::xcoff32)
+        return load_xcoff32_executable(std::move(storage), stop);
     if (recipe.format == Format::ar)
         return Error{ErrorCode::unsupported, "ar archives have no single image; use load_archive and select a member"};
     auto image = load_raw(storage, *recipe.raw, stop);

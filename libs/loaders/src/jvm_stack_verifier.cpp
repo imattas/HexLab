@@ -169,6 +169,16 @@ bool descriptor_locals(const JvmMember &method, std::size_t max_locals, Locals &
     if (!read_type(text, position, result, true) || position != text.size()) return false;
     return true;
 }
+bool descriptor_return_kind(std::string_view text, std::optional<Kind> &result) {
+    if (text.empty() || text.front() != '(') return false;
+    std::size_t position = 1;
+    while (position < text.size() && text[position] != ')') {
+        std::optional<Kind> argument;
+        if (!read_type(text, position, argument, false) || !argument) return false;
+    }
+    if (position >= text.size() || text[position++] != ')') return false;
+    return read_type(text, position, result, true) && position == text.size();
+}
 bool stack_map_locals(const std::vector<JvmVerificationType> &values, std::size_t max_locals,
                       Locals &locals) {
     locals.assign(max_locals, top);
@@ -233,6 +243,8 @@ Result<bool> verify_operand_stack(std::span<const std::byte> bytes, const std::v
     const auto current_class_name = class_name(metadata, metadata.this_class);
     const bool root_object_constructor = constructor_method && !code.stack_map_table &&
         current_class_name && *current_class_name == "java/lang/Object";
+    std::optional<Kind> declared_return;
+    if (!descriptor_return_kind(method.descriptor, declared_return)) return false;
     Locals initial;
     if (code.stack_map_table) {
         if (!stack_map_locals(code.stack_map_table->initial_locals, code.max_locals, initial)) return false;
@@ -409,7 +421,10 @@ Result<bool> verify_operand_stack(std::span<const std::byte> bytes, const std::v
         }
         if (failure) break;
         if (local_handled) {}
-        else if (op == 0x00 || op == 0xa7 || op == 0xc8 || op == 0xb1) {}
+        else if (op == 0x00 || op == 0xa7 || op == 0xc8) {}
+        else if (op == 0xb1) {
+            if (declared_return) fail(offset, "void return does not match the method descriptor");
+        }
         else if (op == 0x01) push(reference);
         else if ((op >= 0x02 && op <= 0x08) || op == 0x10 || op == 0x11) push(integer);
         else if (op <= 0x0a) push(long_value);
@@ -464,7 +479,14 @@ Result<bool> verify_operand_stack(std::span<const std::byte> bytes, const std::v
         else if (op >= 0x9f && op <= 0xa4) { pop(integer); pop(integer); }
         else if (op == 0xa5 || op == 0xa6) { pop(reference); pop(reference); }
         else if (op == 0xaa || op == 0xab) pop(integer);
-        else if (op >= 0xac && op <= 0xb0) pop(local[op - 0xac]);
+        else if (op >= 0xac && op <= 0xb0) {
+            const auto returned_kind = local[op - 0xac];
+            if (!declared_return || *declared_return != returned_kind) {
+                fail(offset, "return opcode does not match the method descriptor");
+            } else {
+                pop(returned_kind);
+            }
+        }
         else if (op >= 0xb2 && op <= 0xba) {
             const auto cp_index = pool_index();
             const auto text = descriptor(metadata, cp_index);

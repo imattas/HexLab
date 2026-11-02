@@ -226,10 +226,13 @@ transfer opcode and known NMOS 6502 frame size; analysis does not follow
 callees, infer caller-specific stack depths at an entry, or model interrupt
 handler control flow. A bounded byte map preserves a proven TSX-derived A/X/Y
 alias through matching PHA/PLA, PHX/PLX, and PHY/PLY pairs; unknown pushes,
-joins with different saved values, calls, and possible ordinary memory writes
-invalidate saved provenance. The map stores only the `[-127,127]` depth window
-with one byte per possible slot. Invalid decoded stack effects fail closed
-instead of changing tracked depth.
+joins with different saved values, calls, and ordinary writes without a proven
+single stack target invalidate saved provenance. A single-byte store through
+exactly `$0100,X` or `$0100,Y` with a live TSX-derived index alias invalidates
+only its proven stack slot. Other bases, offsets, widths, or incomplete memory
+facts retain the conservative full clear. The map stores only the
+`[-127,127]` depth window with one byte per possible slot. Invalid decoded
+stack effects fail closed instead of changing tracked depth.
 
 `TSX` also snapshots the current S depth into X as a frame base. The byte-wide
 snapshot can pass through the explicit `TXA`/`TAX` and `TAY`/`TYA` register

@@ -86,6 +86,36 @@ std::optional<std::size_t> m6502_saved_stack_index(std::int64_t depth) noexcept 
     return static_cast<std::size_t>(depth + 127);
 }
 
+std::optional<std::size_t> m6502_exact_indexed_stack_write(
+    const Instruction &instruction, const FlowState &state) {
+    if (instruction.context.architecture != Architecture::mos6502 ||
+        (instruction.context.mode != ExecutionMode::m6502 &&
+         instruction.context.mode != ExecutionMode::m65c02) ||
+        instruction.flow != FlowKind::fallthrough || !instruction.memory_write ||
+        !state.frame_depth.known || instruction.operands.size() != 1 ||
+        instruction.access.size() != 1 ||
+        (instruction.access.front() != OperandAccess::write &&
+         instruction.access.front() != OperandAccess::read_write))
+        return {};
+    const auto *memory = std::get_if<MemoryOperand>(&instruction.operands.front());
+    if (!memory || !memory->index || memory->index->bank != RegisterBank::mos6502 ||
+        (memory->index->index != 1 && memory->index->index != 2) ||
+        memory->index->width != 8 || memory->address_width != 16 || memory->ip_relative ||
+        memory->base || memory->scale != 1 || memory->displacement != 0x0100 ||
+        memory->data_width != 8)
+        return {};
+    const RegisterOperand index{RegisterBank::mos6502, memory->index->index, 8, false};
+    if (std::count(instruction.register_reads.begin(), instruction.register_reads.end(), index) != 1)
+        return {};
+    const auto alias = state.m6502_stack_alias_deltas[memory->index->index];
+    if (!alias.known) return {};
+    std::int64_t offset = 0;
+    if (!subtract_checked(alias.value, state.frame_depth.value, offset) ||
+        !m6502_slot_offset_unambiguous(offset))
+        return {};
+    return m6502_saved_stack_index(offset);
+}
+
 struct M6502IndexStackOperation {
     bool push = false;
     std::uint8_t index = 0;
@@ -839,8 +869,12 @@ bool transfer(const Instruction &instruction, FlowState &state) {
             instruction.opcode == Opcode::m6502_php ||
             (index_stack && index_stack->push);
         if (instruction.memory_write && !modeled_stack_push &&
-            instruction.opcode != Opcode::m6502_jsr && instruction.opcode != Opcode::m6502_brk)
-            state.m6502_saved_stack_aliases = {};
+            instruction.opcode != Opcode::m6502_jsr && instruction.opcode != Opcode::m6502_brk) {
+            if (const auto overwritten_stack_slot = m6502_exact_indexed_stack_write(instruction, state))
+                state.m6502_saved_stack_aliases[*overwritten_stack_slot] = 0;
+            else
+                state.m6502_saved_stack_aliases = {};
+        }
         switch (instruction.opcode) {
         case Opcode::m6502_jsr:
             // A callee may overwrite any general register. Keep the caller's

@@ -363,7 +363,7 @@ void usage(std::ostream &out) {
            "  --length <bytes>   Number of bytes to print (default: to end of file)\n"
            "  --width <columns>  Bytes per row, 1..32 (default 16)\n\n"
            "Common input options:\n"
-           "  --format auto|pe|elf|raw|macho|wasm|dex|jvm\n"
+           "  --format auto|pe|elf|raw|macho|wasm|dex|jvm|xcoff32\n"
            "  --plugin <module>  Load a native plugin (repeatable)\n"
            "  --dwarf-split-package <file>  Select an exact-ID ELF split-DWARF DWP\n"
            "  --dwarf-supplementary-package <file>  Select a checksum-bound ELF supplementary object\n"
@@ -3190,6 +3190,8 @@ OpenRequest parse(std::span<const std::wstring_view> args, bool disassemble,
                     option(format, Format::dex);
                 else if (value == L"jvm")
                     option(format, Format::jvm);
+                else if (value == L"xcoff32")
+                    option(format, Format::xcoff32);
                 else
                     argument_error("Unknown format value");
             } else if (item == L"--arch") {
@@ -3691,7 +3693,7 @@ int run_cli(std::span<const std::wstring_view> arguments, std::ostream &out, std
             out << "Usage: hexlab_cli inspect <path> [input options]\n"
                    "Inspect the input format and metadata without disassembling it.\n\n"
                    "Input options:\n"
-                   "  --format auto|pe|elf|raw|macho|wasm|dex|jvm\n"
+                   "  --format auto|pe|elf|raw|macho|wasm|dex|jvm|xcoff32\n"
                    "  --pe-runtime arm64|x64-compatible  Select the ARM64X PE view\n"
                    "  --slice <index>  Select a zero-based Mach-O universal slice\n"
                    "  --plugin <module>  Load a native plugin (repeatable)\n"

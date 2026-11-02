@@ -59,8 +59,11 @@ extent checked but uninterpreted, and makes metadata explicitly incomplete
 with a diagnostic. Loader relocations, import binding, AIX TOC initialization,
 other section types, and process runtime behavior remain unsupported. This is
 a mapped linked image for static inspection, not an AIX execution environment.
-The API is a direct loader entry point and is not wired into general format
-auto-detection/open workflow.
+Automatic open detects `F_EXEC` XCOFF32 files and routes them through this
+loader; relocatable objects are separately identified and rejected with an
+object-specific message. AIX archive magic is detected first and continues to
+use the archive member workflow. CLI image commands also accept
+`--format xcoff32` for an explicit selection.
 
 Record layouts and section/name rules follow IBM's [AIX XCOFF object file
 format](https://www.ibm.com/docs/en/aix/7.3.0?topic=formats-xcoff-object-file-format)

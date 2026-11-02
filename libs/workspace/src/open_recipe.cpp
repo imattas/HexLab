@@ -25,7 +25,7 @@ Result<LoadRecipe> resolve_open_recipe(const OpenRequest &request, std::stop_tok
     }
     if (request.format != Format::automatic && request.format != Format::raw && request.format != Format::pe &&
         request.format != Format::elf && request.format != Format::macho &&
-        request.format != Format::intel_hex && request.format != Format::s_record && request.format != Format::wasm && request.format != Format::dex && request.format != Format::jvm && request.format != Format::minidump)
+        request.format != Format::intel_hex && request.format != Format::s_record && request.format != Format::wasm && request.format != Format::dex && request.format != Format::jvm && request.format != Format::minidump && request.format != Format::xcoff32)
         return Error{ErrorCode::invalid_argument, "Unknown requested input format"};
     if (request.macho && request.format != Format::macho && request.format != Format::automatic)
         return Error{ErrorCode::invalid_argument, "Slice options require Mach-O or automatic input format"};

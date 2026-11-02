@@ -483,7 +483,7 @@ Arguments parse(std::span<const std::wstring_view> args) {
         if (options.contains(L"--dwarf-split-package"))
             result.input.dwarf_split_debug_package_path = path_from_wide(options.pop(L"--dwarf-split-package"));
         auto format = options.pop(L"--format", L"auto");
-        require(format == L"auto" || format == L"pe" || format == L"elf" || format == L"raw" || format == L"macho" || format == L"wasm" || format == L"dex" || format == L"jvm" ||
+        require(format == L"auto" || format == L"pe" || format == L"elf" || format == L"raw" || format == L"macho" || format == L"wasm" || format == L"dex" || format == L"jvm" || format == L"xcoff32" ||
                     format == L"ihex" || format == L"srec",
                 "Unknown input format");
         result.input.format = format == L"raw"     ? Format::raw
@@ -493,6 +493,7 @@ Arguments parse(std::span<const std::wstring_view> args) {
                               : format == L"wasm"  ? Format::wasm
                               : format == L"dex"   ? Format::dex
                               : format == L"jvm"   ? Format::jvm
+                              : format == L"xcoff32" ? Format::xcoff32
                               : format == L"ihex"  ? Format::intel_hex
                               : format == L"srec"  ? Format::s_record
                                                    : Format::automatic;

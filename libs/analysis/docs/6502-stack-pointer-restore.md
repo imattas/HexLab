@@ -25,6 +25,13 @@ Page-one indexed stack slots using `$0100,X` or `$0100,Y` can use either
 register's independently tracked copy. The source alias remains available
 after a transfer instruction copies it to another register.
 
+When a single-byte store through exactly `$0100,X` or `$0100,Y` uses a live
+TSX-derived index alias, only the corresponding saved stack-byte alias is
+invalidated. This preserves unrelated PHA/PLA, PHX/PLX, and PHY/PLY byte-value
+provenance. Stores through any other page-one base, an unknown index, or
+incomplete access facts still invalidate the whole saved-byte map because they
+may alias more than one modeled slot.
+
 The accumulator copy can also pass through immediate `ADC` or `SBC` when the
 carry input is known from `CLC` or `SEC`. The analysis applies the exact
 8-bit offset change, including the carry/no-borrow input, and keeps the copy
