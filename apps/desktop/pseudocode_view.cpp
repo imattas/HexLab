@@ -67,19 +67,23 @@ std::string register_token(RegisterOperand reg, std::optional<std::uint32_t> ver
     return result;
 }
 
-std::string phi_identity(const decompiler::LiftedBlock::Phi &phi, Address block_entry) {
-    return "phi_" + std::to_string(block_entry.space.value) + "_" +
+std::string phi_identity(const decompiler::LiftedBlock::Phi &phi, Address function_entry, Address block_entry) {
+    return "phi_" + std::to_string(function_entry.space.value) + "_" +
+           std::to_string(function_entry.offset) + "_" +
+           std::to_string(block_entry.space.value) + "_" +
            std::to_string(block_entry.offset) + "_" +
            std::to_string(static_cast<unsigned>(phi.destination.bank)) + "_" +
            std::to_string(phi.destination.index);
 }
 
-std::string ssa_identity(RegisterOperand reg, Address origin) {
+std::string ssa_identity(RegisterOperand reg, Address function_entry, Address origin) {
     // SSA version numbers depend on the order in which analysis discovers
     // definitions. Use instruction provenance and the destination register
     // instead, so a value keeps the same UI identity across rebuilds that do
     // not move its defining instruction.
-    return "ssa_" + std::to_string(origin.space.value) + "_" +
+    return "ssa_" + std::to_string(function_entry.space.value) + "_" +
+           std::to_string(function_entry.offset) + "_" +
+           std::to_string(origin.space.value) + "_" +
            std::to_string(origin.offset) + "_" +
            std::to_string(static_cast<unsigned>(reg.bank)) + "_" +
            std::to_string(reg.index);
@@ -774,14 +778,14 @@ std::string render_user_variables(const decompiler::LiftedFunction &function, st
             ambiguous.insert(token);
             return;
         }
-        stable_identities.emplace(token, ssa_identity(reg, at));
+        stable_identities.emplace(token, ssa_identity(reg, function.entry, at));
     };
     for (const auto &block : function.blocks) {
         for (const auto &phi : block.phis) {
             if (!phi.version) continue;
             const auto token = register_token(phi.destination, phi.version);
             if (!definitions.emplace(token, block.begin).second) ambiguous.insert(token);
-            stable_identities.emplace(token, phi_identity(phi, block.begin));
+            stable_identities.emplace(token, phi_identity(phi, function.entry, block.begin));
         }
         for (const auto &instruction : block.instructions) {
             std::visit([&](const auto &statement) {
