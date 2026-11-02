@@ -362,3 +362,15 @@ empty or malformed UTF-8 previews and previews without recognized letters.
 This is a bounded Unicode-block display hint, not full Unicode Script-property,
 language, or locale detection, and Kana plus Han may therefore be reported as
 Mixed for Japanese text.
+
+RFC 4648 Base64 candidates are decoded only when the source contains a
+contiguous Base64 alphabet run of at least eight bytes, the padding and unused
+bits are canonical, and the decoded bytes form strict printable UTF-8 with at
+least one letter or non-ASCII scalar. Runs over 4 MiB are discarded. The
+record's file offset, address, and byte length describe the encoded source, so
+navigation and string-reference matching continue to point into the original
+image; `characters` and the UTF-8 preview describe the decoded text. Base64
+recognition is heuristic and can still produce false positives. Persisted
+encoding ID 47 is appended without renumbering existing encodings, and derived
+cache version 104 recomputes prior scans. CLI, desktop, and Python labels expose
+the `Base64 UTF-8` candidate.

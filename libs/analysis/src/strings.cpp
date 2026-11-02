@@ -190,6 +190,7 @@ std::optional<std::uint32_t> decode_windows950_pair(unsigned lead, unsigned trai
     return scalar == 0xffff ? std::nullopt : std::optional<std::uint32_t>{scalar};
 }
 struct Utf8Unit { std::uint32_t scalar=0; unsigned length=0; };
+bool printable(std::uint32_t scalar);
 Utf8Unit decode_utf8(Cursor& input,std::uint64_t at,std::uint64_t end) {
     const unsigned first=input.unit(at,1);
     if(first<0x80)return {first,1};
@@ -206,6 +207,71 @@ Utf8Unit decode_utf8(Cursor& input,std::uint64_t at,std::uint64_t end) {
     }
     if(scalar<minimum || scalar>0x10ffff || (scalar>=0xd800 && scalar<=0xdfff))return {};
     return {scalar,length};
+}
+int base64_value(unsigned char byte) {
+    if (byte >= 'A' && byte <= 'Z') return byte - 'A';
+    if (byte >= 'a' && byte <= 'z') return byte - 'a' + 26;
+    if (byte >= '0' && byte <= '9') return byte - '0' + 52;
+    if (byte == '+') return 62;
+    if (byte == '/') return 63;
+    return -1;
+}
+bool decode_base64(std::string_view encoded, std::string& decoded) {
+    if (encoded.size() < 8 || encoded.size() > 4 * 1024 * 1024) return false;
+    std::size_t data_size = encoded.size();
+    std::size_t padding = 0;
+    while (data_size && encoded[data_size - 1] == '=') { --data_size; ++padding; }
+    if (padding > 2 || (padding && (encoded.size() % 4 || data_size % 4 != 4 - padding)) ||
+        (!padding && data_size % 4 == 1)) return false;
+    decoded.clear();
+    decoded.reserve((data_size * 3) / 4);
+    std::uint32_t bits = 0;
+    unsigned bit_count = 0;
+    for (std::size_t i = 0; i < data_size; ++i) {
+        const int value = base64_value(static_cast<unsigned char>(encoded[i]));
+        if (value < 0) return false;
+        bits = (bits << 6) | static_cast<unsigned>(value);
+        bit_count += 6;
+        if (bit_count >= 8) {
+            bit_count -= 8;
+            decoded.push_back(static_cast<char>((bits >> bit_count) & 0xff));
+        }
+    }
+    // RFC 4648 requires unused low bits in the last sextet to be zero.
+    if ((bit_count && (bits & ((1u << bit_count) - 1u)) != 0) ||
+        (padding == 1 && bit_count != 2) || (padding == 2 && bit_count != 4) ||
+        (!padding && bit_count == 6)) return false;
+    return !decoded.empty();
+}
+bool printable_utf8_preview(std::string_view bytes, std::size_t minimum_characters,
+                            std::string& preview, std::uint64_t& characters) {
+    preview.clear();
+    characters = 0;
+    bool has_text = false;
+    for (std::size_t at = 0; at < bytes.size();) {
+        const auto first = static_cast<unsigned char>(bytes[at]);
+        std::uint32_t scalar = 0;
+        std::size_t length = 0;
+        if (first < 0x80) { scalar = first; length = 1; }
+        else if (first >= 0xc2 && first <= 0xdf) { scalar = first & 0x1f; length = 2; }
+        else if (first >= 0xe0 && first <= 0xef) { scalar = first & 0x0f; length = 3; }
+        else if (first >= 0xf0 && first <= 0xf4) { scalar = first & 0x07; length = 4; }
+        else return false;
+        if (length > bytes.size() - at) return false;
+        for (std::size_t i = 1; i < length; ++i) {
+            const auto next = static_cast<unsigned char>(bytes[at + i]);
+            if ((next & 0xc0) != 0x80) return false;
+            scalar = (scalar << 6) | (next & 0x3f);
+        }
+        const std::uint32_t minimum = length == 1 ? 0 : length == 2 ? 0x80 : length == 3 ? 0x800 : 0x10000;
+        if (scalar < minimum || !printable(scalar)) return false;
+        if ((scalar >= 'A' && scalar <= 'Z') || (scalar >= 'a' && scalar <= 'z') || scalar > 0x7f)
+            has_text = true;
+        if (characters < 256) preview.append(bytes.substr(at, length));
+        ++characters;
+        at += length;
+    }
+    return characters >= minimum_characters && has_text;
 }
 std::optional<std::uint32_t> decode_windows1252(unsigned byte) {
     static constexpr std::uint16_t c1[32]={
@@ -964,13 +1030,43 @@ Result<StringScan> scan_selected(const Image& image,const AnalysisOptions& optio
         for(const auto& range:selected) {
             Cursor input(*image.storage(),range.end,inspected,options.string_scan_work_budget);Run run;
             bool has_high_bit_bytes=false;
+            std::string encoded;
+            std::uint64_t encoded_begin = 0;
+            bool encoded_over_limit = false;
+            const auto emit_base64 = [&](bool terminated) {
+                if (!encoded_over_limit && !encoded.empty()) {
+                    std::string decoded, preview;
+                    std::uint64_t characters = 0;
+                    if (decode_base64(encoded, decoded) &&
+                        printable_utf8_preview(decoded, options.min_string_characters, preview, characters)) {
+                        if (output.records.size() >= options.string_budget) throw BudgetEnd{};
+                        std::optional<Address> address;
+                        if (range.address)
+                            address = Address{range.address->space, range.address->offset + (encoded_begin - range.begin)};
+                        output.records.push_back({StringEncoding::base64_utf8, std::move(preview), characters,
+                                                  encoded.size(), {encoded_begin}, address, terminated});
+                    }
+                }
+                encoded.clear();
+                encoded_over_limit = false;
+            };
             for(auto at=range.begin;at<range.end;++at) {
                 if(((at-range.begin)&4095)==0)check_stop(stop);
                 const auto value=input.byte(at);
                 has_high_bit_bytes=has_high_bit_bytes || (value&0x80)!=0;
+                const auto byte = static_cast<unsigned char>(value);
+                if (base64_value(byte) >= 0 || byte == '=') {
+                    if (encoded.empty() && !encoded_over_limit) encoded_begin = at;
+                    if (encoded.size() < 4 * 1024 * 1024 && !encoded_over_limit)
+                        encoded.push_back(static_cast<char>(byte));
+                    else { encoded.clear(); encoded_over_limit = true; }
+                } else {
+                    emit_base64(byte == 0);
+                }
                 if(value>=0x20 && value<=0x7e)run.add(at,value,1);
                 else emit(run,value==0,StringEncoding::ascii,range,options,output);
             }
+            emit_base64(false);
             emit(run,false,StringEncoding::ascii,range,options,output);
             // UTF-8 is recognized only when it contains a non-ASCII scalar;
             // otherwise the ASCII pass already represents the same bytes.

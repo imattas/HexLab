@@ -591,10 +591,23 @@ std::optional<std::string> lambda_metafactory_summary(const JvmMetadata &metadat
     auto implementation_member = cp_member(metadata, implementation.second, true);
     if (!implementation_member) return {};
     auto implementation_signature = parse_method_descriptor(implementation_member.value().descriptor);
-    if (!implementation_signature) return {};
+    auto invoked_type = parse_method_descriptor(site.descriptor);
+    auto sam_signature = parse_method_descriptor(*sam_type);
+    if (!implementation_signature || !invoked_type || !sam_signature) return {};
     if (reference_kind == 8 &&
         (implementation_member.value().name != "<init>" || implementation_signature.value().result)) return {};
+    // The call-site parameters are captured values and the SAM parameters are
+    // supplied when the functional object is invoked. Their combined arity
+    // must match the implementation handle after accounting for a bound
+    // receiver. Full primitive/reference adaptation is intentionally not
+    // inferred here; this rejects only a shape that cannot possibly link.
+    const auto receiver_count = reference_kind == 5 || reference_kind == 7 || reference_kind == 9 ? 1u : 0u;
+    const auto implementation_arity = implementation_signature.value().parameters.size() + receiver_count;
+    if (implementation_arity != invoked_type.value().parameters.size() + sam_signature.value().parameters.size()) return {};
     return "lambda_metafactory=validated sam_type=" + *sam_type + " instantiated_type=" + *instantiated_type +
+        " capture_arity=" + std::to_string(invoked_type.value().parameters.size()) +
+        " sam_arity=" + std::to_string(sam_signature.value().parameters.size()) +
+        " implementation_arity=" + std::to_string(implementation_arity) +
         " implementation=handle" + std::to_string(reference_kind) + ":" + implementation_member.value().owner + "." +
         implementation_member.value().name + implementation_member.value().descriptor;
 }
@@ -636,8 +649,12 @@ std::optional<std::string> lambda_alt_metafactory_summary(const JvmMetadata &met
         (kind == 8 && target.tag == 10) || (kind == 9 && target.tag == 11);
     if (!target_kind_matches) return {};
     const auto member = cp_member(metadata, implementation.second, true);
-    if (!member || !parse_method_descriptor(member.value().descriptor) ||
-        (kind == 8 && (member.value().name != "<init>" || parse_method_descriptor(member.value().descriptor).value().result))) return {};
+    if (!member) return {};
+    const auto implementation_signature = parse_method_descriptor(member.value().descriptor);
+    const auto invoked_type = parse_method_descriptor(site.descriptor);
+    const auto sam_signature = parse_method_descriptor(*sam);
+    if (!implementation_signature || !invoked_type || !sam_signature ||
+        (kind == 8 && (member.value().name != "<init>" || implementation_signature.value().result))) return {};
     if (args[3] == 0 || args[3] >= metadata.constant_pool.size() || metadata.constant_pool[args[3]].tag != 3) return {};
     const auto &flags_entry = metadata.constant_pool[args[3]];
     constexpr std::uint32_t serializable = 1, markers_flag = 2, bridges_flag = 4;
@@ -667,8 +684,15 @@ std::optional<std::string> lambda_alt_metafactory_summary(const JvmMetadata &met
         }
     }
     if (cursor != args.size()) return {};
+    const auto receiver_count = kind == 5 || kind == 7 || kind == 9 ? 1u : 0u;
+    const auto implementation_arity = implementation_signature.value().parameters.size() + receiver_count;
+    if (implementation_arity != invoked_type.value().parameters.size() + sam_signature.value().parameters.size()) return {};
     std::string summary = "lambda_alt_metafactory=validated sam_type=" + *sam +
-        " instantiated_type=" + *instantiated + " implementation=handle" + std::to_string(kind) + ":" +
+        " instantiated_type=" + *instantiated +
+        " capture_arity=" + std::to_string(invoked_type.value().parameters.size()) +
+        " sam_arity=" + std::to_string(sam_signature.value().parameters.size()) +
+        " implementation_arity=" + std::to_string(implementation_arity) +
+        " implementation=handle" + std::to_string(kind) + ":" +
         member.value().owner + "." + member.value().name + member.value().descriptor;
     if (flags & serializable) summary += " serializable=true";
     if (!markers.empty()) {

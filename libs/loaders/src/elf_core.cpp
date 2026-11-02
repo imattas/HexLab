@@ -165,14 +165,37 @@ void read_thread_status(const ElfHeader &header, const ElfNote &note,
                 names = {"pc", "ra", "sp", "gp", "tp", "t0", "t1", "t2", "s0", "s1", "a0", "a1",
                          "a2", "a3", "a4", "a5", "a6", "a7", "s2", "s3", "s4", "s5", "s6", "s7",
                          "s8", "s9", "s10", "s11", "t3", "t4", "t5", "t6"};
+            } else if (header.machine == 21 && (header.flags & 3u) != 3u) {
+                // Linux PowerPC64 elf_gregset_t is 48 ELF words.  The first
+                // 44 entries are the corresponding pt_regs words; the kernel
+                // zero-fills the final four entries.  Keep those tail slots
+                // present but unnamed so their raw extent/index remains exact.
+                names.resize(48);
+                for (unsigned i = 0; i < 32; ++i)
+                    names[i] = "r" + std::to_string(i);
+                names[32] = "nip"; names[33] = "msr"; names[34] = "orig_r3";
+                names[35] = "ctr"; names[36] = "lr"; names[37] = "xer";
+                names[38] = "ccr"; names[39] = "softe"; names[40] = "trap";
+                names[41] = "dar"; names[42] = "dsisr"; names[43] = "result";
             }
             if (names.empty()) {
-                thread.diagnostic = "NT_PRSTATUS register decoding supports little-endian x86-64, AArch64 "
-                                    "and RISC-V64 only";
+                thread.diagnostic = "NT_PRSTATUS register decoding supports little-endian x86-64, AArch64, "
+                                    "RISC-V64, and PowerPC64 in either byte order only";
             } else {
+                if (header.machine == 21 && bytes.size() != elf64_prstatus_register_offset + 48u * 8u) {
+                    if (bytes.size() < elf64_prstatus_register_offset + 48u * 8u) {
+                        thread.status = ElfCoreThreadStatus::malformed;
+                        thread.diagnostic = "ELF64 PowerPC NT_PRSTATUS gregset is truncated";
+                    } else {
+                        thread.diagnostic = "ELF64 PowerPC NT_PRSTATUS size does not match its 48-word Linux gregset";
+                    }
+                    budget.include(sizeof(ElfCoreThread) + thread.diagnostic.size());
+                    core.threads.push_back(std::move(thread));
+                    return;
+                }
                 decode_registers(std::move(names), elf64_prstatus_register_offset, 8,
                     header.machine == 62 ? "linux-x86_64" : header.machine == 183 ? "linux-aarch64" :
-                    "linux-riscv64");
+                    header.machine == 243 ? "linux-riscv64" : "linux-powerpc64");
             }
         }
     } else {

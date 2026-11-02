@@ -421,7 +421,7 @@ Decoded read_payload(std::span<const std::byte> bytes, const Image &image, const
     require(std::equal(marker.begin(), marker.end(), magic.begin()), "Unknown derived cache magic");
     const auto version = in.number(2);
     require(version == 53 || version == 54 || version == 55 || version == 56 || version == 57 || version == 58 || version == 59 || version == 60 || version == 63 || version == 64 || version == 65 || version == 66 || version == 67 || version == 68 || version == 69 || version == 70 || version == 71 || version == 72 || version == 73 ||
-                version == 87 || version == 88 || version == 89 || version == 90 || version == 91 || version == 96 || version == 102 || version == derived_cache_version,
+                version == 87 || version == 88 || version == 89 || version == 90 || version == 91 || version == 96 || version == 102 || version == 103 || version == derived_cache_version,
             "Unknown derived cache version", ErrorCode::unsupported);
     require(in.key(version >= 54) == key, "Derived cache source key differs from the requested revision");
     auto context = in.context();
@@ -753,7 +753,8 @@ Decoded read_payload(std::span<const std::byte> bytes, const Image &image, const
     auto records = in.count(31);
     for (size_t i = 0; i < records; ++i) {
         auto kind = in.number(1);
-        const auto maximum_string_encoding = version >= 98 ? StringEncoding::windows950 :
+        const auto maximum_string_encoding = version >= 104 ? StringEncoding::base64_utf8 :
+            version >= 98 ? StringEncoding::windows950 :
             version >= 96 ? StringEncoding::windows949 :
             version >= 93 ? StringEncoding::windows936 :
             version >= 89 ? StringEncoding::windows932 :
@@ -917,7 +918,7 @@ Result<AnalysisKey> inspect_derived_key(std::span<const std::byte> bytes, std::s
         require(std::equal(marker.begin(), marker.end(), magic.begin()), "Unknown derived cache envelope magic");
         const auto version = in.number(2);
         require(version == 53 || version == 54 || version == 55 || version == 56 || version == 57 || version == 58 || version == 59 || version == 60 || version == 63 || version == 64 || version == 65 || version == 66 || version == 67 || version == 68 || version == 69 || version == 70 || version == 71 || version == 72 || version == 73 ||
-                    version == 87 || version == 88 || version == 89 || version == 90 || version == 91 || version == 96 || version == 102 || version == derived_cache_version,
+                    version == 87 || version == 88 || version == 89 || version == 90 || version == 91 || version == 96 || version == 102 || version == 103 || version == derived_cache_version,
                 "Unknown derived cache envelope version",
                 ErrorCode::unsupported);
         auto key = in.key(version >= 54);

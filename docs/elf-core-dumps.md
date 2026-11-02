@@ -22,6 +22,18 @@ retains the 27 Linux gregset entries, and AArch64 retains `x0`–`x30`, `sp`, `p
 `s0`-`s11`, and `a0`-`a7`. Register-note file offsets point to the source note
 header; exact register names and values live in the structured thread record.
 
+ELF64 PowerPC (`EM_PPC64`) thread notes decode the Linux 48-word gregset in
+either ELF byte order. The first 32 words are `r0`–`r31`, followed by `nip`,
+`msr`, `orig_r3`, `ctr`, `lr`, `xer`, `ccr`, `softe`, `trap`, `dar`, `dsisr`,
+and `result`. The final four kernel-zeroed gregset slots remain unnamed while
+their slot count, word width, and original byte extent are retained. Only the
+exact 496-byte Linux `elf_prstatus` record is accepted for this layout; a
+truncated gregset is marked malformed and an unexpected larger record remains
+unsupported rather than being interpreted as a different ABI. ELFv1/ELFv2
+specific state and floating/vector/VSX notes are not decoded by this addition.
+The layout follows Linux's [`elf_gregset_t` definition](https://github.com/torvalds/linux/blob/master/arch/powerpc/include/uapi/asm/elf.h)
+and [`pt_regs` field order](https://github.com/torvalds/linux/blob/master/arch/powerpc/include/uapi/asm/ptrace.h).
+
 ## ELF32 Linux register contexts
 
 Linux `CORE`/`LINUX` `NT_PRSTATUS` now also decodes bounded ELF32 gregsets.
