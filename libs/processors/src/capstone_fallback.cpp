@@ -140,11 +140,14 @@ bool mips_classic_direct(unsigned id) {
     switch(id) {
     case MIPS_INS_J: case MIPS_INS_JAL: case MIPS_INS_BAL:
     case MIPS_INS_BEQ: case MIPS_INS_BNE: case MIPS_INS_BGEZ: case MIPS_INS_BLTZ:
-    case MIPS_INS_BGTZ: case MIPS_INS_BLEZ:
+    case MIPS_INS_BGTZ: case MIPS_INS_BLEZ: case MIPS_INS_BEQL: case MIPS_INS_BNEL:
+    case MIPS_INS_BGEZL: case MIPS_INS_BGTZL: case MIPS_INS_BLEZL: case MIPS_INS_BLTZL:
+    case MIPS_INS_BC0FL: case MIPS_INS_BC0TL: case MIPS_INS_BC1FL: case MIPS_INS_BC1TL:
+    case MIPS_INS_BC2FL: case MIPS_INS_BC2TL: case MIPS_INS_BC3FL: case MIPS_INS_BC3TL:
     // Branch-and-link conditionals still use the classic delayed control
     // transfer format. Their flow remains `call` when Capstone marks it so,
     // but the decoded target and one delay slot are equally important facts.
-    case MIPS_INS_BGEZAL: case MIPS_INS_BLTZAL:
+    case MIPS_INS_BGEZAL: case MIPS_INS_BLTZAL: case MIPS_INS_BGEZALL: case MIPS_INS_BLTZALL:
     case MIPS_INS_BC1T: case MIPS_INS_BC1F:
         return true;
     default:return false;
@@ -268,6 +271,7 @@ std::optional<MemoryRole> capstone_memory_role(Architecture architecture, unsign
     }
     if (architecture == Architecture::powerpc) {
         switch (id) {
+        case PPC_INS_LMW: return read(0); // Width depends on RT through r31.
         case PPC_INS_LBZ: case PPC_INS_LBZU: case PPC_INS_LBZUX: case PPC_INS_LBZX:
         case PPC_INS_LBZCIX: return read(8);
         case PPC_INS_LHZ: case PPC_INS_LHZU: case PPC_INS_LHZUX: case PPC_INS_LHZX:
@@ -296,6 +300,7 @@ std::optional<MemoryRole> capstone_memory_role(Architecture architecture, unsign
         case PPC_INS_STDCX: return write(64);
         case PPC_INS_STVX: case PPC_INS_STVXL: case PPC_INS_STXV: case PPC_INS_STXVX:
             return write(128);
+        case PPC_INS_STMW: return write(0); // Width depends on RS through r31.
         default: return {};
         }
     }
@@ -448,7 +453,7 @@ void apply_capstone_detail(csh handle, const cs_insn& insn, Instruction& out, Ar
         for(unsigned i=0;i<p.op_count;i++){const auto& op=p.operands[i];
             if(op.type==PPC_OP_IMM){out.operands.emplace_back(ImmediateOperand{static_cast<std::uint64_t>(op.imm),64,64,true,{}});out.access.push_back(OperandAccess::read);}
             else if(op.type==PPC_OP_REG&&known){auto r=named_register(handle,op.reg,out.context.mode==ExecutionMode::ppc64?64:32,architecture);if(!r)continue;bool rd=false,wr=false;for(unsigned j=0;j<nr;j++)rd|=reads[j]==op.reg;for(unsigned j=0;j<nw;j++)wr|=writes[j]==op.reg;if(rd||wr){out.operands.emplace_back(*r);out.access.push_back(rd&&wr?OperandAccess::read_write:wr?OperandAccess::write:OperandAccess::read);}}
-            else if(op.type==PPC_OP_MEM){MemoryOperand mem;mem.address_width=out.context.mode==ExecutionMode::ppc64?64:32;mem.displacement=op.mem.disp;if(memory_role)mem.data_width=memory_role->data_width;mem.base=named_register(handle,op.mem.base,mem.address_width,architecture);const auto access=memory_role?memory_role->access:OperandAccess::address;out.operands.emplace_back(mem);out.access.push_back(access);out.memory_read|=access==OperandAccess::read||access==OperandAccess::read_write;out.memory_write|=access==OperandAccess::write||access==OperandAccess::read_write;}
+            else if(op.type==PPC_OP_MEM){MemoryOperand mem;mem.address_width=out.context.mode==ExecutionMode::ppc64?64:32;mem.displacement=op.mem.disp;if(memory_role)mem.data_width=memory_role->data_width;if(memory_role&&memory_role->data_width==0&&(insn.id==PPC_INS_LMW||insn.id==PPC_INS_STMW)){for(unsigned j=0;j<p.op_count;j++)if(p.operands[j].type==PPC_OP_REG){const auto first=named_register(handle,p.operands[j].reg,mem.address_width,architecture);if(first&&first->bank==RegisterBank::ppc_gpr&&first->index<32)mem.data_width=static_cast<std::uint16_t>((32-first->index)*32);break;}}mem.base=named_register(handle,op.mem.base,mem.address_width,architecture);const auto access=memory_role?memory_role->access:OperandAccess::address;out.operands.emplace_back(mem);out.access.push_back(access);out.memory_read|=access==OperandAccess::read||access==OperandAccess::read_write;out.memory_write|=access==OperandAccess::write||access==OperandAccess::read_write;}
         }
     } else if (architecture==Architecture::mos6502) {
         const auto &m=d->mos65xx;
