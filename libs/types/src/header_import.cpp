@@ -975,19 +975,25 @@ private:
         pos_=cursor;
         return pattern;
     }
-    TemplateArgument expand_template_pack_argument(const std::vector<Token> &pattern,const std::string &pack_name,
-                                                   const TemplateArgument &element,const TemplateParameter &parameter) {
+    TemplateArgument expand_template_pack_argument(
+        const std::vector<Token> &pattern,
+        const std::map<std::string, TemplateArgument, std::less<>> &elements,
+        const TemplateParameter &parameter) {
         if(template_depth_>=o_.max_nesting)
             fail(ErrorCode::resource_limit,"compound template pack expansion exceeds configured nesting limit");
         Parser expanded(tokens_with_eof(pattern),o_,*this);
-        // A pack occurrence in the pattern becomes one ordinary argument for
-        // this substitution. Keep other packs bound for normal nested lookup.
-        expanded.template_pack_bindings_.erase(pack_name);
-        if(element.type)expanded.template_type_bindings_.insert_or_assign(pack_name,element.type);
-        else if(element.value)expanded.template_value_bindings_.insert_or_assign(pack_name,*element.value);
-        else if(!element.template_name.empty())
-            expanded.template_template_bindings_.insert_or_assign(pack_name,element.template_name);
-        else fail(ErrorCode::malformed,"parameter pack contains an argument without a kind");
+        // Each pack occurrence becomes its element at the current index.
+        // Other packs stay bound for normal nested lookup.
+        for (const auto &[pack_name, element] : elements) {
+            expanded.template_pack_bindings_.erase(pack_name);
+            expanded.template_type_packs_.erase(pack_name);
+            expanded.template_value_packs_.erase(pack_name);
+            if(element.type)expanded.template_type_bindings_.insert_or_assign(pack_name,element.type);
+            else if(element.value)expanded.template_value_bindings_.insert_or_assign(pack_name,*element.value);
+            else if(!element.template_name.empty())
+                expanded.template_template_bindings_.insert_or_assign(pack_name,element.template_name);
+            else fail(ErrorCode::malformed,"parameter pack contains an argument without a kind");
+        }
         if(parameter.template_parameter){
             auto name=expanded.parse_lookup_name();
             if(!expanded.at("<eof>"))
@@ -1038,25 +1044,30 @@ private:
                 continue;
             }
             if(auto pattern=take_compound_pack_pattern()){
-                std::string pack_name;
+                std::vector<std::string> pack_names;
                 for(std::size_t index=0;index<pattern->size();++index){
                     const auto &name=(*pattern)[index].text;
                     // api::Types is a qualified member name, not the local
                     // parameter pack Types. Types::member still expands Types.
                     if((index&&(*pattern)[index-1].text=="::")||!template_pack_bindings_.contains(name))continue;
-                    if(!pack_name.empty()&&pack_name!=name)
-                        fail(ErrorCode::unsupported,"compound template expansion patterns support one distinct bound pack");
-                    pack_name=name;
+                    if(std::find(pack_names.begin(),pack_names.end(),name)==pack_names.end())
+                        pack_names.push_back(name);
                 }
-                if(pack_name.empty())
+                if(pack_names.empty())
                     fail(ErrorCode::unsupported,"compound template expansion requires a bound parameter pack in its pattern");
-                // Nested parser instantiations operate on copies, so the
-                // source pack remains stable through every element expansion.
-                const auto &pack=template_pack_bindings_.at(pack_name);
-                for(const auto &element:pack){
+                // C++ expands multiple packs in lockstep. Reject mismatched
+                // lengths instead of silently truncating or reusing elements.
+                const auto &first_pack=template_pack_bindings_.at(pack_names.front());
+                for(const auto &name:pack_names)
+                    if(template_pack_bindings_.at(name).size()!=first_pack.size())
+                        fail(ErrorCode::malformed,"compound template expansion packs must have equal lengths");
+                for(std::size_t element_index=0;element_index<first_pack.size();++element_index){
                     if(parameter_index>=parameters.size())fail(ErrorCode::malformed,"too many expanded template arguments");
                     if(arguments.size()>=32)fail(ErrorCode::resource_limit,"expanded template argument count exceeds 32");
-                    append(expand_template_pack_argument(*pattern,pack_name,element,parameters[parameter_index]));
+                    std::map<std::string, TemplateArgument, std::less<>> elements;
+                    for(const auto &name:pack_names)
+                        elements.emplace(name,template_pack_bindings_.at(name)[element_index]);
+                    append(expand_template_pack_argument(*pattern,elements,parameters[parameter_index]));
                 }
                 if(take(">"))break;
                 need(",");
@@ -3424,8 +3435,10 @@ private:
                             if(!element.template_name.empty()||
                                (type_pack?(!element.type||element.value):(element.type||!element.value)))
                                 fail(ErrorCode::unsupported,"function parameter-pack element does not match its type or integral pack kind");
-                            auto expanded_type=expand_template_pack_argument(pattern->type,pattern->pack,
-                                                                           pack[pack_index],TemplateParameter{}).type;
+                            const std::map<std::string, TemplateArgument, std::less<>> elements{
+                                {pattern->pack, pack[pack_index]}};
+                            auto expanded_type=expand_template_pack_argument(pattern->type,elements,
+                                                                           TemplateParameter{}).type;
                             if(expanded_type->kind()==Kind::array) {
                                 auto pointer=Type::pointer(expanded_type->element(),o_.pointer_bytes,o_.pointer_bytes);
                                 if(!pointer)fail(pointer.error().code,pointer.error().message);
