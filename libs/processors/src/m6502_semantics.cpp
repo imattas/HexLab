@@ -732,6 +732,35 @@ evaluate_m6502_hardware_interrupt(M6502HardwareInterrupt interrupt,
                                      pushed_status, vector_address};
 }
 
+std::optional<M6502InterruptBusTrace>
+trace_m6502_hardware_interrupt_bus(M6502HardwareInterrupt interrupt,
+                                   std::uint16_t program_counter,
+                                   std::uint8_t stack_pointer, std::uint8_t status,
+                                   std::uint8_t vector_low, std::uint8_t vector_high) noexcept {
+    const auto entry = evaluate_m6502_hardware_interrupt(interrupt, program_counter, stack_pointer,
+                                                          status, vector_low, vector_high);
+    if (!entry) return {};
+
+    M6502InterruptBusTrace trace;
+    const auto append = [&](std::uint16_t address, M6502BusAccessKind kind) {
+        const auto cycle = static_cast<std::uint8_t>(trace.access_count + 1u);
+        trace.accesses[trace.access_count++] = M6502BusAccess{address, kind, cycle};
+    };
+    append(program_counter, M6502BusAccessKind::opcode_fetch);
+    append(program_counter, M6502BusAccessKind::opcode_fetch);
+    auto stack = stack_pointer;
+    append(static_cast<std::uint16_t>(0x0100u | stack), M6502BusAccessKind::stack_write);
+    stack = static_cast<std::uint8_t>(stack - 1u);
+    append(static_cast<std::uint16_t>(0x0100u | stack), M6502BusAccessKind::stack_write);
+    stack = static_cast<std::uint8_t>(stack - 1u);
+    append(static_cast<std::uint16_t>(0x0100u | stack), M6502BusAccessKind::stack_write);
+    append(entry->vector_address, M6502BusAccessKind::vector_read);
+    append(static_cast<std::uint16_t>(entry->vector_address + 1u), M6502BusAccessKind::vector_read);
+    trace.next_program_counter = entry->program_counter;
+    trace.next_stack_pointer = entry->stack_pointer;
+    return trace;
+}
+
 std::optional<M65C02ControlResult>
 evaluate_m65c02_wait_stop(Opcode opcode, std::uint16_t next_program_counter,
                           std::uint8_t stack_pointer, std::uint8_t status) noexcept {

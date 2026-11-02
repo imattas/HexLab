@@ -293,13 +293,29 @@ evaluate_m6502_branch(Opcode opcode, std::uint8_t status) noexcept;
 HEXLAB_PROCESSORS_EXPORT std::optional<bool>
 evaluate_m6502_branch_instruction(const Instruction &instruction, std::uint8_t status) noexcept;
 
-enum class M6502BusAccessKind : std::uint8_t { opcode_fetch, operand_fetch, dummy_read, stack_read, stack_write };
+enum class M6502BusAccessKind : std::uint8_t {
+    opcode_fetch, operand_fetch, dummy_read, stack_read, stack_write, vector_read
+};
 struct M6502BusAccess {
     std::uint16_t address = 0;
     M6502BusAccessKind kind = M6502BusAccessKind::opcode_fetch;
     std::uint8_t cycle = 0;
     bool operator==(const M6502BusAccess &) const = default;
 };
+struct M6502InterruptBusTrace {
+    std::array<M6502BusAccess, 7> accesses{};
+    std::uint8_t access_count = 0;
+    std::uint16_t next_program_counter = 0;
+    std::uint8_t next_stack_pointer = 0;
+    bool operator==(const M6502InterruptBusTrace &) const = default;
+};
+// Trace an already accepted NMOS IRQ/NMI entry. The caller supplies PC/P/S and
+// the two bytes fetched from the selected vector; pin sampling remains external.
+HEXLAB_PROCESSORS_EXPORT std::optional<M6502InterruptBusTrace>
+trace_m6502_hardware_interrupt_bus(M6502HardwareInterrupt interrupt,
+                                   std::uint16_t program_counter,
+                                   std::uint8_t stack_pointer, std::uint8_t status,
+                                   std::uint8_t vector_low, std::uint8_t vector_high) noexcept;
 struct M6502BranchBusTrace {
     std::array<M6502BusAccess, 4> accesses{};
     std::uint8_t access_count = 0;
