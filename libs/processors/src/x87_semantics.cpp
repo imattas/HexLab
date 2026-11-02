@@ -1945,4 +1945,127 @@ evaluate_x87_store_packed_bcd(const X87PackedBcdStoreRequest &request) noexcept 
     return result;
 }
 
+namespace {
+struct X87WideDivision {
+    Product128 quotient{};
+    std::uint64_t remainder = 0;
+};
+
+X87WideDivision divide_wide_by_u64(Product128 dividend, std::uint64_t divisor) noexcept {
+    X87WideDivision result;
+    Product128 remainder{};
+    for (int bit = 127; bit >= 0; --bit) {
+        remainder = {(remainder.hi << 1) | (remainder.lo >> 63),
+                     (remainder.lo << 1) | static_cast<std::uint64_t>(wide_bit(dividend, static_cast<unsigned>(bit)))};
+        if (remainder.hi != 0 || remainder.lo >= divisor) {
+            remainder = subtract_wide(remainder, {0, divisor});
+            if (bit < 64) result.quotient.lo |= std::uint64_t{1} << bit;
+            else result.quotient.hi |= std::uint64_t{1} << (bit - 64);
+        }
+    }
+    result.remainder = remainder.lo;
+    return result;
+}
+
+RegisterOperand x87_st_register(std::uint16_t index) noexcept {
+    return {RegisterBank::x87, index, 80, false};
+}
+RegisterOperand x87_status_register() noexcept {
+    return {RegisterBank::x87_status, 0, 16, false};
+}
+RegisterOperand x87_control_register() noexcept {
+    return {RegisterBank::x87_control, 0, 16, false};
+}
+} // namespace
+
+std::optional<X87RemainderResult> evaluate_x87_remainder(
+    const X87RemainderRequest &request) noexcept {
+    if (request.mode != X87RemainderMode::truncate && request.mode != X87RemainderMode::nearest_even)
+        return {};
+    const auto raw_dividend_exponent = static_cast<std::uint16_t>(request.dividend.sign_exponent & exponent_mask);
+    const auto raw_divisor_exponent = static_cast<std::uint16_t>(request.divisor.sign_exponent & exponent_mask);
+    const auto dividend = decode(request.dividend);
+    const auto divisor = decode(request.divisor);
+    if (dividend.kind != Class::zero && dividend.kind != Class::finite) return {};
+    if (divisor.kind != Class::finite || raw_divisor_exponent == 0 || raw_divisor_exponent == exponent_mask ||
+        (raw_dividend_exponent == 0 && request.dividend.significand != 0) ||
+        (raw_divisor_exponent == 0 && request.divisor.significand != 0))
+        return {};
+
+    auto status = static_cast<std::uint16_t>(request.status_word & ~std::uint16_t{0x4700});
+    std::uint64_t quotient_low = 0;
+    auto remainder = request.dividend.significand;
+    auto remainder_exponent = static_cast<unsigned>(raw_dividend_exponent);
+    bool remainder_negative = dividend.negative;
+
+    if (dividend.kind == Class::finite && raw_dividend_exponent >= raw_divisor_exponent) {
+        const auto exponent_difference = static_cast<unsigned>(raw_dividend_exponent - raw_divisor_exponent);
+        if (exponent_difference >= 64) return {}; // Iterative partial-remainder behavior is intentionally not guessed.
+        const Product128 numerator = exponent_difference == 0
+            ? Product128{0, request.dividend.significand}
+            : Product128{request.dividend.significand >> (64 - exponent_difference),
+                         request.dividend.significand << exponent_difference};
+        const auto divided = divide_wide_by_u64(numerator, request.divisor.significand);
+        quotient_low = divided.quotient.lo & 7;
+        remainder = divided.remainder;
+        remainder_exponent = raw_divisor_exponent;
+
+        if (request.mode == X87RemainderMode::nearest_even && remainder != 0) {
+            const Product128 twice_remainder{remainder >> 63, remainder << 1};
+            const auto comparison = compare_wide(twice_remainder, {0, request.divisor.significand});
+            const bool round_quotient_up = comparison > 0 || (comparison == 0 && (divided.quotient.lo & 1) != 0);
+            if (round_quotient_up) {
+                ++quotient_low;
+                remainder = request.divisor.significand - remainder;
+                remainder_negative = !remainder_negative;
+            }
+        }
+        if ((dividend.negative != divisor.negative)) quotient_low = (std::uint64_t{0} - quotient_low) & 7;
+    }
+
+    X87Binary80 value{};
+    if (remainder == 0) {
+        value.sign_exponent = remainder_negative ? sign_mask : 0;
+    } else {
+        const auto leading_zeros = static_cast<unsigned>(std::countl_zero(remainder));
+        const auto normalized_exponent = static_cast<int>(remainder_exponent) - static_cast<int>(leading_zeros);
+        value.significand = remainder << leading_zeros;
+        if (normalized_exponent > 0) {
+            value.sign_exponent = static_cast<std::uint16_t>(normalized_exponent);
+        } else {
+            // Subnormal binary80 values use the exponent-zero lattice, whose
+            // unit is the exponent-one normal lattice's least significand bit.
+            const auto subnormal_shift = remainder_exponent - 1;
+            value.significand = remainder << subnormal_shift;
+        }
+        if (remainder_negative) value.sign_exponent |= sign_mask;
+    }
+
+    if ((quotient_low & 4) != 0) status |= fsw_c0;
+    if ((quotient_low & 1) != 0) status |= fsw_c1;
+    if ((quotient_low & 2) != 0) status |= fsw_c3;
+    return X87RemainderResult{value, status, static_cast<std::uint8_t>(quotient_low)};
+}
+
+std::optional<X87RemainderResult> evaluate_x87_remainder_instruction(
+    const Instruction &instruction, const X87RemainderRequest &request) noexcept {
+    const bool x86_architecture = instruction.context.architecture == Architecture::x86 ||
+                                  instruction.context.architecture == Architecture::x86_64;
+    const bool x86_mode = instruction.context.mode == ExecutionMode::x86_16 ||
+                          instruction.context.mode == ExecutionMode::x86_32 ||
+                          instruction.context.mode == ExecutionMode::x86_64;
+    const auto expected_mnemonic = request.mode == X87RemainderMode::truncate ? "fprem" : "fprem1";
+    if (!x86_architecture || !x86_mode || instruction.opcode != Opcode::x87 ||
+        instruction.mnemonic_override != expected_mnemonic || instruction.flow != FlowKind::fallthrough ||
+        !instruction.x87_waiting || instruction.x87_stack_delta != 0 || instruction.memory_read ||
+        instruction.memory_write || !instruction.operands.empty() || !instruction.access.empty())
+        return {};
+    const std::vector<RegisterOperand> expected_reads{
+        x87_st_register(0), x87_st_register(1), x87_control_register(), x87_status_register()};
+    const std::vector<RegisterOperand> expected_writes{x87_st_register(0), x87_status_register()};
+    if (instruction.register_reads != expected_reads || instruction.register_writes != expected_writes)
+        return {};
+    return evaluate_x87_remainder(request);
+}
+
 } // namespace hexlab

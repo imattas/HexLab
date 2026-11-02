@@ -4239,11 +4239,38 @@ a64_unhandled:
             };
             if ((op == Opcode::mips_lwc1 || op == Opcode::mips_ldc1) && operands.size() >= 2) {
                 const auto destination = as_register(instruction.operands[0]);
-                if (!destination) return {};
+                const auto *memory = operands[1] ? std::get_if<MemoryValue>(&operands[1]->value) : nullptr;
+                const bool double_precision = op == Opcode::mips_ldc1;
+                if (!destination || !memory || destination->bank != RegisterBank::mips_fpr ||
+                    destination->width != (double_precision ? 64 : 32) ||
+                    (double_precision && (destination->index & 1u) != 0) ||
+                    instruction.operands.size() != 2 || instruction.access !=
+                        std::vector<OperandAccess>{OperandAccess::write, OperandAccess::read} ||
+                    !instruction.memory_read || instruction.memory_write || instruction.delay_slots ||
+                    instruction.flow != FlowKind::fallthrough ||
+                    instruction.register_writes != std::vector<RegisterOperand>{*destination}) {
+                    Intrinsic malformed{"mips_malformed_fp_load", operands, IntrinsicMemoryEffect::unknown};
+                    malformed.register_writes = instruction.register_writes;
+                    return malformed;
+                }
                 return Assign{*destination, fp_memory(operands[1], destination->width)};
             }
             if ((op == Opcode::mips_swc1 || op == Opcode::mips_sdc1) && operands.size() >= 2) {
                 const auto source = as_register(instruction.operands[0]);
+                const auto *memory = operands[1] ? std::get_if<MemoryValue>(&operands[1]->value) : nullptr;
+                const bool double_precision = op == Opcode::mips_sdc1;
+                if (!source || !memory || source->bank != RegisterBank::mips_fpr ||
+                    source->width != (double_precision ? 64 : 32) ||
+                    (double_precision && (source->index & 1u) != 0) ||
+                    instruction.operands.size() != 2 || instruction.access !=
+                        std::vector<OperandAccess>{OperandAccess::read, OperandAccess::write} ||
+                    instruction.memory_read || !instruction.memory_write || instruction.delay_slots ||
+                    instruction.flow != FlowKind::fallthrough ||
+                    instruction.register_reads != std::vector<RegisterOperand>{*source}) {
+                    Intrinsic malformed{"mips_malformed_fp_store", operands, IntrinsicMemoryEffect::unknown};
+                    malformed.register_writes = instruction.register_writes;
+                    return malformed;
+                }
                 return Store{fp_memory(operands[1], source ? source->width : 32), operands[0]};
             }
             if ((op == Opcode::mips_mfc1 || op == Opcode::mips_cfc1 ||
@@ -4322,6 +4349,7 @@ a64_unhandled:
                 };
                 bool valid = valid_fpr(destination) && valid_fpr(source) && condition_register &&
                     condition_register->width == 32 && !condition_register->high_byte &&
+                    (!double_precision || (((destination->index | source->index) & 1u) == 0)) &&
                     (fcc_move ? (condition_register->bank == RegisterBank::mips_fcsr &&
                                  condition_register->index >= 1 && condition_register->index <= 8 &&
                                  instruction.condition == condition_register->index - 1)
@@ -4378,6 +4406,7 @@ a64_unhandled:
                         value->index < 32 && !value->high_byte;
                 };
                 if (!valid_fpr(destination) || !valid_fpr(source) ||
+                    (double_precision && (((destination->index | source->index) & 1u) != 0)) ||
                     operands.size() != 2 || operands[0]->type != floating_type(width) ||
                     operands[1]->type != floating_type(width) || instruction.memory_read || instruction.memory_write ||
                     instruction.flow != FlowKind::fallthrough || instruction.delay_slots ||
@@ -4447,6 +4476,7 @@ a64_unhandled:
                     const bool valid_operands = left_register && right_register &&
                         left_register->bank == RegisterBank::mips_fpr && right_register->bank == RegisterBank::mips_fpr &&
                         left_register->index < 32 && right_register->index < 32 &&
+                        (!double_precision || (((left_register->index | right_register->index) & 1u) == 0)) &&
                         !left_register->high_byte && !right_register->high_byte &&
                         left_register->width == width && right_register->width == width &&
                         operands[0]->type == floating_type(width) && operands[1]->type == floating_type(width);
@@ -4529,13 +4559,15 @@ a64_unhandled:
                             op == Opcode::mips_cvt_w_d || op >= Opcode::mips_round_w_d ? 64 : 32);
                     const auto valid_destination = destination && destination->bank == RegisterBank::mips_fpr &&
                         destination->index < 32 && !destination->high_byte &&
+                        (destination->width != 64 || (destination->index & 1u) == 0) &&
                         destination->width == expected_destination_type.bits &&
                         operands.size() == instruction.operands.size();
                     std::vector<RegisterOperand> expected_reads;
                     for (std::size_t index = 1; index < instruction.operands.size(); ++index) {
                         const auto *source = std::get_if<RegisterOperand>(&instruction.operands[index]);
                         if (!source || source->bank != RegisterBank::mips_fpr || source->index >= 32 ||
-                            source->high_byte || source->width != expected_source_width) {
+                            source->high_byte || source->width != expected_source_width ||
+                            (source->width == 64 && (source->index & 1u) != 0)) {
                             expected_reads.clear();
                             break;
                         }

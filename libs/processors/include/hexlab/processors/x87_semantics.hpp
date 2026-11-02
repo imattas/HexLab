@@ -306,6 +306,31 @@ struct X87DivideRequest {
 HEXLAB_PROCESSORS_EXPORT std::optional<X87ArithmeticResult>
 evaluate_x87_divide(const X87DivideRequest &request) noexcept;
 
+enum class X87RemainderMode : std::uint8_t { truncate, nearest_even };
+struct X87RemainderRequest {
+    X87Binary80 dividend, divisor;
+    std::uint16_t status_word = 0;
+    X87RemainderMode mode = X87RemainderMode::truncate;
+};
+struct X87RemainderResult {
+    X87Binary80 value;
+    std::uint16_t status_word = 0;
+    std::uint8_t quotient_low_bits = 0;
+    bool operator==(const X87RemainderResult &) const = default;
+};
+// Evaluate the exact, final FPREM/FPREM1 result for normal binary80 operands
+// whose exponent difference is less than 64. Large exponent differences,
+// denormals, pseudo-denormals, NaNs, and infinities fail closed; this helper
+// does not approximate the processor's iterative partial-remainder sequence.
+HEXLAB_PROCESSORS_EXPORT std::optional<X87RemainderResult>
+evaluate_x87_remainder(const X87RemainderRequest &request) noexcept;
+// Bind the numeric helper to the decoded register form and reject malformed
+// or mismatched instruction effects before evaluation. Stack-tag checks and
+// pending-exception delivery remain caller-owned.
+HEXLAB_PROCESSORS_EXPORT std::optional<X87RemainderResult>
+evaluate_x87_remainder_instruction(const Instruction &instruction,
+                                   const X87RemainderRequest &request) noexcept;
+
 struct X87SquareRootRequest {
     X87Binary80 value;
     std::uint16_t control_word = 0x037f;

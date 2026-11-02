@@ -100,3 +100,20 @@ Intel specifies x87 NaN source priority. Ghidra's native decompiler
 bits for ties; this evaluator applies the same general guard/sticky decision
 shape over integer limbs while honoring x87 RC/PC state
 ([Ghidra native float.cc](https://github.com/NationalSecurityAgency/ghidra/blob/master/Ghidra/Features/Decompiler/src/decompile/cpp/float.cc)).
+
+`evaluate_x87_remainder` adds the final-result subset for FPREM and FPREM1.
+For normal binary80 operands with an exponent difference below 64, it divides
+the exact 128-bit shifted significand by the divisor significand. FPREM
+truncates the quotient toward zero; FPREM1 selects the nearest integer with
+ties to even. It returns the exact signed remainder and updates C0/C1/C3 with
+the low three signed quotient bits while clearing C2 for completion. Signed
+zero dividends are retained, and exact remainders that fall below the normal
+range are encoded on the binary80 subnormal lattice.
+
+`evaluate_x87_remainder_instruction` accepts only the decoded waiting register
+forms with matching FPREM/FPREM1 mnemonic, ST(0)/ST(1), control/status reads,
+ST(0)/status writes, no memory effects, and no stack delta. The caller still
+owns pending exception delivery and stack-tag validation. This bounded
+evaluator rejects exponent differences of 64 or more instead of fabricating
+the hardware's iterative partial-remainder steps; it also leaves denormal,
+pseudo-denormal, infinite, and NaN operands unsupported.

@@ -5,6 +5,13 @@ normal control flow. Parameter descriptors seed entry registers. Existing
 instruction checks consume register categories for moves, arrays, fields,
 invokes, arithmetic, conversions, comparisons, branches, and returns.
 
+Method-entry local registers start as unassigned; only incoming parameter words
+are initialized. A reachable instruction read of an unassigned register is
+rejected, and a join of an unassigned path with any assigned path becomes an
+unusable conflict. A decoded write whose result category is not modeled instead
+produces an assigned-but-unknown value, preserving the partial verifier's
+conservative type behavior without treating a missing definition as a value.
+
 The category lattice distinguishes a literal zero from an unknown value.
 Zero admits integer, float-bit-pattern, and null-reference interpretations;
 nonzero 32-bit constants admit integer or float-bit-pattern interpretations.
@@ -32,9 +39,9 @@ sources are read from the instruction's incoming state, including overlapping
 `move-wide`. Consumers requiring either kind of wide value check that both
 halves admit the same long/double interpretation.
 
-This remains partial category validation. Unknown facts are permissive and do
-not prove definite assignment. Unsupported writes erase their own category
-facts. Throwing instructions propagate their incoming register state to covered
+This remains partial category validation. Assigned-but-unknown facts are
+permissive and do not prove a value's type. Unsupported writes erase their own
+category facts. Throwing instructions propagate their incoming register state to covered
 handlers, before normal register writes or constructor initialization complete.
 Known reference identities are
 checked for assignability at ordinary invoke receivers and instance field

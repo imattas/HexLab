@@ -107,6 +107,32 @@ evaluate_mips32_arithmetic_s_instruction(const Instruction &instruction,
                                          std::uint32_t lhs_bits, std::uint32_t rhs_bits,
                                          std::uint32_t fcsr) noexcept;
 
+enum class Mips32DArithmeticOperation { add, subtract, multiply };
+
+struct Mips32ArithmeticDResult {
+    std::uint64_t value_bits = 0;
+    std::uint32_t fcsr_after = 0;
+    std::uint8_t exception_bits = 0;
+    bool exception_taken = false;
+    bool writes_destination = true;
+    bool operator==(const Mips32ArithmeticDResult &) const = default;
+};
+
+// Exact binary64 ADD.D/SUB.D/MUL.D for finite inputs. All four FCSR rounding
+// modes, gradual underflow, FS input/output flushing, and the Cause/Flag/Enable
+// fields are modeled. NaNs, infinities, and DIV.D remain outside this slice.
+HEXLAB_PROCESSORS_EXPORT std::optional<Mips32ArithmeticDResult>
+evaluate_mips32_arithmetic_d(Mips32DArithmeticOperation operation,
+                             std::uint64_t lhs_bits, std::uint64_t rhs_bits,
+                             std::uint32_t fcsr) noexcept;
+
+// Validate decoded MIPS32 COP1 D effects (including even FPR pairing) before
+// binding caller-supplied register values to the numeric evaluator.
+HEXLAB_PROCESSORS_EXPORT std::optional<Mips32ArithmeticDResult>
+evaluate_mips32_arithmetic_d_instruction(const Instruction &instruction,
+                                         std::uint64_t lhs_bits, std::uint64_t rhs_bits,
+                                         std::uint32_t fcsr) noexcept;
+
 // Evaluate BC1T/F and likely variants from the selected caller-supplied FCC
 // value. The branch target and delay-slot execution remain caller-owned.
 HEXLAB_PROCESSORS_EXPORT std::optional<bool>

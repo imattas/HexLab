@@ -1763,7 +1763,7 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
                             "Aggregate DEX verifier register-state budget exceeded"};
                     total_type_flow_cells += cells;
                     enum class RegType : std::uint8_t {
-                        unknown, conflict, zero, int32, float32, scalar32, reference, uninitialized_reference, wide_low, wide_high,
+                        unassigned, unknown, conflict, zero, int32, float32, scalar32, reference, uninitialized_reference, wide_low, wide_high,
                         wide_int_low, wide_int_high, wide_float_low, wide_float_high
                     };
                     constexpr std::uint32_t uninitialized_this = UINT32_MAX - 1;
@@ -1782,7 +1782,10 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
                     };
                     std::unordered_map<std::uint32_t, TypeState> incoming_states;
                     std::deque<std::uint32_t> type_work;
-                    TypeState initial(registers, RegType::unknown);
+                    // Dalvik local registers have no implicit entry value.
+                    // Keep that distinct from `unknown`, which means a
+                    // decoded write occurred but its type was not modeled.
+                    TypeState initial(registers, RegType::unassigned);
                     const auto type_id_for = [&](std::string_view descriptor) -> std::uint32_t {
                         const auto found = type_id_lookup.find(descriptor);
                         return found == type_id_lookup.end() ? UINT32_MAX : found->second;
@@ -1790,6 +1793,10 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
                     const auto merge_type = [](RegType a, RegType b) {
                         if (a == b) return a;
                         if (a == RegType::conflict || b == RegType::conflict) return RegType::conflict;
+                        // A register missing on any incoming path stays
+                        // unusable even when another path provides a value.
+                        if (a == RegType::unassigned || b == RegType::unassigned)
+                            return RegType::conflict;
                         // Never turn a possibly uninitialized object into a
                         // permissive unknown at a join.
                         if (a == RegType::uninitialized_reference || b == RegType::uninitialized_reference)
@@ -1973,6 +1980,10 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
                         // and own-class fields of uninitialized-this are the
                         // deliberately narrow exceptions.
                         for (const auto read : decoded_for_flow.instruction->register_reads) {
+                            if (read.index >= before.size())
+                                return initialization_error("DEX instruction reads a register outside the register file");
+                            if (before[read.index] == RegType::unassigned)
+                                return initialization_error("DEX instruction reads a register not assigned on every incoming path");
                             if (before[read.index] == RegType::conflict)
                                 return initialization_error("DEX instruction consumes conflicting register types");
                             if (before[read.index] != RegType::uninitialized_reference) continue;

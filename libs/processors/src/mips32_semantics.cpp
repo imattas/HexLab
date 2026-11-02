@@ -575,6 +575,294 @@ std::optional<Mips32ArithmeticSResult> evaluate_mips32_arithmetic_s_instruction(
     return evaluate_mips32_arithmetic_s(operation, lhs_bits, rhs_bits, fcsr);
 }
 
+namespace {
+struct Mips32Magnitude {
+    std::array<std::uint32_t, 68> words{};
+    bool bit(int index) const noexcept {
+        return index >= 0 && index < 2176 && ((words[static_cast<std::size_t>(index / 32)] >> (index % 32)) & 1u);
+    }
+    int top() const noexcept {
+        for (int n = 67; n >= 0; --n)
+            if (words[static_cast<std::size_t>(n)])
+                return n * 32 + static_cast<int>(std::bit_width(words[static_cast<std::size_t>(n)])) - 1;
+        return -1;
+    }
+};
+
+Mips32Magnitude mips32_magnitude(std::uint64_t value, int shift) noexcept {
+    Mips32Magnitude result;
+    for (int n = 0; n < 64; ++n) {
+        const int bit = n + shift;
+        if (((value >> n) & 1u) && bit >= 0 && bit < 2176)
+            result.words[static_cast<std::size_t>(bit / 32)] |= std::uint32_t{1} << (bit % 32);
+    }
+    return result;
+}
+
+Mips32Magnitude mips32_shift_magnitude(const Mips32Magnitude &value, int shift) noexcept {
+    Mips32Magnitude result;
+    if (shift < 0) return result;
+    for (int bit = 0; bit + shift < 2176; ++bit)
+        if (value.bit(bit))
+            result.words[static_cast<std::size_t>((bit + shift) / 32)] |=
+                std::uint32_t{1} << ((bit + shift) % 32);
+    return result;
+}
+
+int mips32_compare(const Mips32Magnitude &lhs, const Mips32Magnitude &rhs) noexcept {
+    for (int n = 67; n >= 0; --n) {
+        const auto a = lhs.words[static_cast<std::size_t>(n)];
+        const auto b = rhs.words[static_cast<std::size_t>(n)];
+        if (a != b) return a > b ? 1 : -1;
+    }
+    return 0;
+}
+
+Mips32Magnitude mips32_add_magnitude(const Mips32Magnitude &lhs, const Mips32Magnitude &rhs) noexcept {
+    Mips32Magnitude result;
+    std::uint64_t carry = 0;
+    for (std::size_t n = 0; n < result.words.size(); ++n) {
+        const auto sum = std::uint64_t{lhs.words[n]} + rhs.words[n] + carry;
+        result.words[n] = static_cast<std::uint32_t>(sum);
+        carry = sum >> 32;
+    }
+    return result;
+}
+
+Mips32Magnitude mips32_sub_magnitude(const Mips32Magnitude &lhs, const Mips32Magnitude &rhs) noexcept {
+    Mips32Magnitude result;
+    std::uint64_t borrow = 0;
+    for (std::size_t n = 0; n < result.words.size(); ++n) {
+        const auto subtrahend = std::uint64_t{rhs.words[n]} + borrow;
+        const auto minuend = std::uint64_t{lhs.words[n]};
+        result.words[n] = static_cast<std::uint32_t>(minuend - subtrahend);
+        borrow = minuend < subtrahend;
+    }
+    return result;
+}
+
+Mips32Magnitude mips32_multiply_magnitude(std::uint64_t lhs, std::uint64_t rhs) noexcept {
+    Mips32Magnitude result;
+    for (unsigned i = 0; i < 2; ++i) {
+        std::uint64_t carry = 0;
+        for (unsigned j = 0; j < 2; ++j) {
+            const auto index = i + j;
+            const auto value = std::uint64_t{static_cast<std::uint32_t>(lhs >> (i * 32))} *
+                static_cast<std::uint32_t>(rhs >> (j * 32)) + result.words[index] + carry;
+            result.words[index] = static_cast<std::uint32_t>(value);
+            carry = value >> 32;
+        }
+        result.words[i + 2] = static_cast<std::uint32_t>(carry);
+    }
+    return result;
+}
+
+bool mips32_any_below(const Mips32Magnitude &value, int exclusive) noexcept {
+    for (int n = 0; n < exclusive && n < 2176; ++n)
+        if (value.bit(n)) return true;
+    return false;
+}
+
+std::optional<std::uint64_t> mips32_round_magnitude(const Mips32Magnitude &value, int shift,
+    bool sticky, bool negative, unsigned rounding, bool &inexact) noexcept {
+    const int top = value.top();
+    if (top - shift >= 64) return {};
+    std::uint64_t truncated = 0;
+    for (int n = 0; n < 64; ++n)
+        if (value.bit(n + shift)) truncated |= std::uint64_t{1} << n;
+    const bool guard = shift > 0 && value.bit(shift - 1);
+    const bool lower = sticky || (shift > 1 && mips32_any_below(value, shift - 1));
+    inexact = guard || lower;
+    const bool increment = rounding == 0 ? guard && (lower || (truncated & 1u)) :
+        rounding == 2 ? inexact && !negative : rounding == 3 ? inexact && negative : false;
+    if (increment && truncated == UINT64_MAX) return {};
+    return truncated + static_cast<std::uint64_t>(increment);
+}
+
+std::uint64_t mips32_d_overflow(bool negative, unsigned rounding) noexcept {
+    const bool infinity = rounding == 0 || (rounding == 2 && !negative) || (rounding == 3 && negative);
+    return (negative ? UINT64_C(0x8000000000000000) : 0) |
+        (infinity ? UINT64_C(0x7ff0000000000000) : UINT64_C(0x7fefffffffffffff));
+}
+
+void mips32_finalize_d(Mips32ArithmeticDResult &result, std::uint32_t fcsr) noexcept {
+    result.exception_taken = (result.exception_bits & ((fcsr & fcsr_enable_mask) >> 7)) != 0;
+    result.writes_destination = !result.exception_taken;
+    result.fcsr_after = (fcsr & ~fcsr_cause_mask) |
+        (static_cast<std::uint32_t>(result.exception_bits) << 12);
+    if (!result.exception_taken)
+        result.fcsr_after = (result.fcsr_after & ~fcsr_flag_mask) |
+            ((fcsr & fcsr_flag_mask) | (static_cast<std::uint32_t>(result.exception_bits) << 2));
+}
+} // namespace
+
+std::optional<Mips32ArithmeticDResult> evaluate_mips32_arithmetic_d(
+    Mips32DArithmeticOperation operation, std::uint64_t lhs_bits,
+    std::uint64_t rhs_bits, std::uint32_t fcsr) noexcept {
+    if (operation != Mips32DArithmeticOperation::add &&
+        operation != Mips32DArithmeticOperation::subtract &&
+        operation != Mips32DArithmeticOperation::multiply) return {};
+    constexpr std::uint64_t sign_mask = UINT64_C(0x8000000000000000);
+    constexpr std::uint64_t exponent_mask = UINT64_C(0x7ff0000000000000);
+    constexpr std::uint64_t fraction_mask = UINT64_C(0x000fffffffffffff);
+    Mips32ArithmeticDResult result{};
+    const auto rounding = fcsr & 3u;
+    const bool flush_subnormals = (fcsr & fcsr_flush_subnormal) != 0;
+    const auto flush_input = [&](std::uint64_t &bits) {
+        if ((bits & exponent_mask) == 0 && (bits & fraction_mask) != 0 && flush_subnormals) {
+            bits &= sign_mask;
+            result.exception_bits |= fp_inexact;
+        }
+    };
+    flush_input(lhs_bits);
+    flush_input(rhs_bits);
+    if ((lhs_bits & exponent_mask) == exponent_mask || (rhs_bits & exponent_mask) == exponent_mask)
+        return {}; // NaN and infinity propagation is intentionally not guessed.
+
+    struct Operand { std::uint64_t significand; int scale; bool negative; };
+    const auto decode = [=](std::uint64_t bits) {
+        const auto encoded_exponent = static_cast<unsigned>((bits & exponent_mask) >> 52);
+        const auto fraction = bits & fraction_mask;
+        if (encoded_exponent == 0)
+            return Operand{fraction, -1074, (bits & sign_mask) != 0};
+        return Operand{(UINT64_C(1) << 52) | fraction,
+            static_cast<int>(encoded_exponent) - 1023 - 52, (bits & sign_mask) != 0};
+    };
+    const auto lhs = decode(lhs_bits);
+    auto rhs = decode(rhs_bits);
+    if (operation == Mips32DArithmeticOperation::subtract) rhs.negative = !rhs.negative;
+    Mips32Magnitude exact;
+    int scale = 0;
+    bool negative = false;
+    if (operation == Mips32DArithmeticOperation::multiply) {
+        negative = lhs.negative != rhs.negative;
+        scale = lhs.scale + rhs.scale;
+        if (lhs.significand && rhs.significand)
+            exact = mips32_multiply_magnitude(lhs.significand, rhs.significand);
+    } else if (!lhs.significand || !rhs.significand) {
+        const auto &nonzero = lhs.significand ? lhs : rhs;
+        exact = mips32_magnitude(nonzero.significand, 0);
+        scale = nonzero.scale;
+        negative = nonzero.negative;
+        if (!lhs.significand && !rhs.significand) {
+            negative = lhs.negative == rhs.negative ? lhs.negative : rounding == 3;
+        }
+    } else {
+        scale = std::min(lhs.scale, rhs.scale);
+        const auto left = mips32_magnitude(lhs.significand, lhs.scale - scale);
+        const auto right = mips32_magnitude(rhs.significand, rhs.scale - scale);
+        if (lhs.negative == rhs.negative) {
+            exact = mips32_add_magnitude(left, right);
+            negative = lhs.negative;
+        } else {
+            const auto order = mips32_compare(left, right);
+            if (order >= 0) {
+                exact = mips32_sub_magnitude(left, right);
+                negative = lhs.negative;
+            } else {
+                exact = mips32_sub_magnitude(right, left);
+                negative = rhs.negative;
+            }
+            if (order == 0) negative = rounding == 3;
+        }
+    }
+    if (exact.top() < 0) {
+        result.value_bits = negative ? sign_mask : 0;
+        mips32_finalize_d(result, fcsr);
+        return result;
+    }
+
+    int exponent = exact.top() + scale;
+    if (exponent > 1023) {
+        result.value_bits = mips32_d_overflow(negative, rounding);
+        result.exception_bits |= fp_overflow | fp_inexact;
+        mips32_finalize_d(result, fcsr);
+        return result;
+    }
+    if (exponent == 1023) {
+        constexpr std::uint64_t max_finite_significand = (UINT64_C(1) << 53) - 1;
+        constexpr int max_finite_scale = 971;
+        const int common_scale = std::min(scale, max_finite_scale);
+        const auto exact_scaled = mips32_shift_magnitude(exact, scale - common_scale);
+        const auto max_finite_scaled = mips32_magnitude(max_finite_significand,
+            max_finite_scale - common_scale);
+        if (mips32_compare(exact_scaled, max_finite_scaled) > 0) {
+            result.value_bits = mips32_d_overflow(negative, rounding);
+            result.exception_bits |= fp_overflow | fp_inexact;
+            mips32_finalize_d(result, fcsr);
+            return result;
+        }
+    }
+    bool inexact = false;
+    std::optional<std::uint64_t> rounded;
+    if (exponent >= -1022) {
+        rounded = mips32_round_magnitude(exact, exact.top() - 52, false, negative, rounding, inexact);
+        if (!rounded) return {};
+        if (*rounded == (UINT64_C(1) << 53)) {
+            *rounded >>= 1;
+            ++exponent;
+        }
+        if (exponent > 1023) {
+            result.value_bits = mips32_d_overflow(negative, rounding);
+            result.exception_bits |= fp_overflow | fp_inexact;
+            mips32_finalize_d(result, fcsr);
+            return result;
+        }
+        result.value_bits = (negative ? sign_mask : 0) |
+            (static_cast<std::uint64_t>(exponent + 1023) << 52) |
+            (*rounded & fraction_mask);
+    } else {
+        if (flush_subnormals) {
+            // FCSR.FS uses tininess before rounding on the supported MIPS32
+            // profile: even a value that would round to MinNorm is flushed.
+            result.value_bits = negative ? sign_mask : 0;
+            result.exception_bits |= fp_underflow | fp_inexact;
+            mips32_finalize_d(result, fcsr);
+            return result;
+        }
+        rounded = mips32_round_magnitude(exact, -1074 - scale, false, negative, rounding, inexact);
+        if (!rounded) return {};
+        if (inexact && *rounded < (UINT64_C(1) << 52))
+            result.exception_bits |= fp_underflow;
+        if (*rounded >= (UINT64_C(1) << 52)) {
+            result.value_bits = (negative ? sign_mask : 0) | UINT64_C(0x0010000000000000);
+        } else {
+            result.value_bits = (negative ? sign_mask : 0) | *rounded;
+        }
+    }
+    if (inexact) result.exception_bits |= fp_inexact;
+    mips32_finalize_d(result, fcsr);
+    return result;
+}
+
+std::optional<Mips32ArithmeticDResult> evaluate_mips32_arithmetic_d_instruction(
+    const Instruction &instruction, std::uint64_t lhs_bits, std::uint64_t rhs_bits,
+    std::uint32_t fcsr) noexcept {
+    if (instruction.context.architecture != Architecture::mips32 ||
+        instruction.context.mode != ExecutionMode::mips32 || instruction.length != 4 ||
+        instruction.flow != FlowKind::fallthrough || instruction.delay_slots != 0 ||
+        instruction.memory_read || instruction.memory_write || instruction.operands.size() != 3 ||
+        instruction.access != std::vector<OperandAccess>{OperandAccess::write, OperandAccess::read,
+                                                         OperandAccess::read}) return {};
+    const auto *destination = std::get_if<RegisterOperand>(&instruction.operands[0]);
+    const auto *left = std::get_if<RegisterOperand>(&instruction.operands[1]);
+    const auto *right = std::get_if<RegisterOperand>(&instruction.operands[2]);
+    const auto valid_pair = [](const RegisterOperand *reg) {
+        return reg && reg->bank == RegisterBank::mips_fpr && reg->width == 64 &&
+            reg->index < 32 && (reg->index & 1u) == 0 && !reg->high_byte;
+    };
+    if (!valid_pair(destination) || !valid_pair(left) || !valid_pair(right)) return {};
+    const RegisterOperand fcsr_reg{RegisterBank::mips_fcsr, 0, 32, false};
+    if (instruction.register_reads != std::vector<RegisterOperand>{*left, *right, fcsr_reg} ||
+        instruction.register_writes != std::vector<RegisterOperand>{*destination, fcsr_reg} ||
+        (instruction.opcode != Opcode::mips_add_d && instruction.opcode != Opcode::mips_sub_d &&
+         instruction.opcode != Opcode::mips_mul_d)) return {};
+    const auto operation = instruction.opcode == Opcode::mips_add_d ? Mips32DArithmeticOperation::add :
+        instruction.opcode == Opcode::mips_sub_d ? Mips32DArithmeticOperation::subtract :
+        Mips32DArithmeticOperation::multiply;
+    return evaluate_mips32_arithmetic_d(operation, lhs_bits, rhs_bits, fcsr);
+}
+
 std::optional<bool>
 evaluate_mips32_fcc_branch_instruction(const Instruction &instruction,
                                        bool condition_code_value) noexcept {
@@ -1207,7 +1495,8 @@ std::optional<Mips32WordConversionResult> evaluate_mips32_word_conversion_instru
     if (!destination || destination->bank != RegisterBank::mips_fpr || destination->index >= 32 ||
         destination->width != 32 || destination->high_byte || !source ||
         source->bank != RegisterBank::mips_fpr || source->index >= 32 ||
-        source->width != expected_width || source->high_byte)
+        source->width != expected_width || source->high_byte ||
+        (double_precision && (source->index & 1u) != 0))
         return {};
     const RegisterOperand fcsr_reg{RegisterBank::mips_fcsr, 0, 32, false};
     if (instruction.register_reads != std::vector<RegisterOperand>{*source, fcsr_reg} ||
@@ -1253,6 +1542,7 @@ evaluate_mips32_fp_conditional_move_instruction(const Instruction &instruction,
     if (!destination || !source || !condition || destination->bank != RegisterBank::mips_fpr ||
         source->bank != RegisterBank::mips_fpr || destination->index > 31 || source->index > 31 ||
         destination->width != width || source->width != width || destination->high_byte || source->high_byte ||
+        (double_precision && ((destination->index | source->index) & 1u) != 0) ||
         condition->bank != RegisterBank::mips_fcsr || condition->index < 1 || condition->index > 8 ||
         condition->width != 32 || condition->high_byte || instruction.condition != condition->index - 1)
         return {};
