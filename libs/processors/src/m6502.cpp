@@ -624,7 +624,7 @@ static DecodeResult decode_m6502_impl(std::span<const std::byte> bytes, Address 
         i.access = {OperandAccess::address};
         i.direct_target = Address{at.space, target};
         i.flow = op == 0x4c ? FlowKind::jump : FlowKind::call;
-        if (op == 0x20) { i.register_reads = {s}; i.register_writes = {s}; i.memory_write = cmos; }
+        if (op == 0x20) { i.register_reads = {s}; i.register_writes = {s}; i.memory_write = true; }
         return finish(3);
     }
     case 0x6c: {
@@ -641,7 +641,7 @@ static DecodeResult decode_m6502_impl(std::span<const std::byte> bytes, Address 
         implied(op == 0x60 ? Opcode::m6502_rts : Opcode::m6502_rti);
         i.flow = FlowKind::ret;
         i.register_reads = {s}; i.register_writes = {s};
-        i.memory_read = cmos;
+        i.memory_read = true;
         if (op == 0x40) { i.register_writes.push_back(p); if (cmos) i.register_reads.push_back(p); }
         return finish(1);
     }

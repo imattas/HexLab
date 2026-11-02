@@ -329,6 +329,19 @@ struct M6502StackBusTrace {
 HEXLAB_PROCESSORS_EXPORT std::optional<M6502StackBusTrace>
 trace_m6502_stack_bus(const Instruction &instruction, std::uint8_t stack_pointer) noexcept;
 
+struct M6502ControlStackBusTrace {
+    std::array<M6502BusAccess, 6> accesses{};
+    std::uint8_t access_count = 0;
+    std::uint16_t next_program_counter = 0;
+    std::uint8_t next_stack_pointer = 0;
+    bool operator==(const M6502ControlStackBusTrace &) const = default;
+};
+// Trace NMOS JSR/RTS/RTI stack cycles. Return instructions consume stack data
+// in bus-read order (RTS: low/high; RTI: P/low/high) to resolve the next PC.
+HEXLAB_PROCESSORS_EXPORT std::optional<M6502ControlStackBusTrace>
+trace_m6502_control_stack_bus(const Instruction &instruction, std::uint8_t stack_pointer,
+                              std::array<std::uint8_t, 3> pulled_bytes = {}) noexcept;
+
 // Evaluate a W65C02 BBR/BBS branch from its zero-page byte. `bit` is the
 // decoded bit number (0-7); the result is only the branch decision.
 HEXLAB_PROCESSORS_EXPORT std::optional<bool>

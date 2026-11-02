@@ -600,8 +600,8 @@ evaluate_m6502_return_instruction(const Instruction &instruction,
                                   std::uint8_t third) noexcept {
     if (instruction.context.architecture != Architecture::mos6502 ||
         instruction.context.mode != ExecutionMode::m6502 || instruction.flow != FlowKind::ret ||
-        instruction.length != 1 || !instruction.operands.empty() || !instruction.access.empty() ||
-        instruction.memory_read || instruction.memory_write)
+        instruction.length != 1 || instruction.bytes.empty() || !instruction.operands.empty() ||
+        !instruction.access.empty() || !instruction.memory_read || instruction.memory_write)
         return {};
     const RegisterOperand s{RegisterBank::mos6502, 4, 8, false};
     const RegisterOperand p{RegisterBank::mos6502, 3, 8, false};
@@ -610,13 +610,101 @@ evaluate_m6502_return_instruction(const Instruction &instruction,
     };
     if (!contains(instruction.register_reads, s) || !contains(instruction.register_writes, s)) return {};
     if (instruction.opcode == Opcode::m6502_rti) {
-        if (!contains(instruction.register_writes, p)) return {};
+        if (instruction.bytes[0] != std::byte{0x40} || !contains(instruction.register_writes, p)) return {};
     } else if (instruction.opcode == Opcode::m6502_rts) {
-        if (contains(instruction.register_writes, p)) return {};
+        if (instruction.bytes[0] != std::byte{0x60} || contains(instruction.register_writes, p)) return {};
     } else {
         return {};
     }
     return evaluate_m6502_return(instruction.opcode, stack_pointer, first, second, third);
+}
+
+std::optional<M6502ControlStackBusTrace>
+trace_m6502_control_stack_bus(const Instruction &instruction, std::uint8_t stack_pointer,
+                              std::array<std::uint8_t, 3> pulled_bytes) noexcept {
+    if (instruction.context.architecture != Architecture::mos6502 ||
+        instruction.context.mode != ExecutionMode::m6502 || instruction.address.offset > UINT16_MAX ||
+        !instruction.m6502_timing)
+        return {};
+    const RegisterOperand stack{RegisterBank::mos6502, 4, 8, false};
+    const RegisterOperand processor_status{RegisterBank::mos6502, 3, 8, false};
+    const auto &timing = *instruction.m6502_timing;
+    if (timing.base_cycles != 6 || timing.page_cross_penalty || timing.branch_taken_penalty ||
+        timing.branch_page_cross_penalty || timing.decimal_mode_penalty)
+        return {};
+
+    M6502ControlStackBusTrace trace;
+    const auto pc = static_cast<std::uint16_t>(instruction.address.offset);
+    const auto append = [&](std::uint16_t address, M6502BusAccessKind kind) {
+        const auto cycle = static_cast<std::uint8_t>(trace.access_count + 1u);
+        trace.accesses[trace.access_count++] = M6502BusAccess{address, kind, cycle};
+    };
+    if (instruction.opcode == Opcode::m6502_jsr) {
+        if (instruction.length != 3 || instruction.bytes.size() < 3 ||
+            instruction.bytes[0] != std::byte{0x20} || instruction.flow != FlowKind::call ||
+            instruction.operands.size() != 1 || instruction.access.size() != 1 ||
+            instruction.access[0] != OperandAccess::address || !instruction.direct_target ||
+            instruction.memory_read || !instruction.memory_write ||
+            instruction.register_reads.size() != 1 || instruction.register_reads[0] != stack ||
+            instruction.register_writes.size() != 1 || instruction.register_writes[0] != stack)
+            return {};
+        const auto target = static_cast<std::uint16_t>(
+            std::to_integer<std::uint8_t>(instruction.bytes[1]) |
+            (std::to_integer<std::uint8_t>(instruction.bytes[2]) << 8));
+        const auto *operand = std::get_if<RelativeOperand>(&instruction.operands[0]);
+        if (!operand || operand->encoded_width != 16 || operand->effective_width != 16 ||
+            operand->displacement != target || operand->encoding != EncodedField{1, 2} ||
+            *instruction.direct_target != Address{instruction.address.space, target})
+            return {};
+        append(pc, M6502BusAccessKind::opcode_fetch);
+        append(static_cast<std::uint16_t>(pc + 1u), M6502BusAccessKind::operand_fetch);
+        append(static_cast<std::uint16_t>(0x0100u | stack_pointer), M6502BusAccessKind::dummy_read);
+        append(static_cast<std::uint16_t>(0x0100u | stack_pointer), M6502BusAccessKind::stack_write);
+        stack_pointer = static_cast<std::uint8_t>(stack_pointer - 1u);
+        append(static_cast<std::uint16_t>(0x0100u | stack_pointer), M6502BusAccessKind::stack_write);
+        stack_pointer = static_cast<std::uint8_t>(stack_pointer - 1u);
+        append(static_cast<std::uint16_t>(pc + 2u), M6502BusAccessKind::operand_fetch);
+        trace.next_program_counter = target;
+        trace.next_stack_pointer = stack_pointer;
+        return trace;
+    }
+
+    if ((instruction.opcode != Opcode::m6502_rts && instruction.opcode != Opcode::m6502_rti) ||
+        instruction.length != 1 || instruction.bytes.empty() || !instruction.operands.empty() ||
+        !instruction.access.empty() || instruction.flow != FlowKind::ret ||
+        instruction.memory_read != true || instruction.memory_write ||
+        instruction.register_reads.size() != 1 || instruction.register_reads[0] != stack)
+        return {};
+    const bool rts = instruction.opcode == Opcode::m6502_rts;
+    if (instruction.bytes[0] != (rts ? std::byte{0x60} : std::byte{0x40}) ||
+        (rts && (instruction.register_writes.size() != 1 || instruction.register_writes[0] != stack)) ||
+        (!rts && (instruction.register_writes.size() != 2 || instruction.register_writes[0] != stack ||
+                  instruction.register_writes[1] != processor_status)))
+        return {};
+    append(pc, M6502BusAccessKind::opcode_fetch);
+    append(static_cast<std::uint16_t>(pc + 1u), M6502BusAccessKind::dummy_read);
+    append(static_cast<std::uint16_t>(0x0100u | stack_pointer), M6502BusAccessKind::dummy_read);
+    if (rts) {
+        stack_pointer = static_cast<std::uint8_t>(stack_pointer + 1u);
+        append(static_cast<std::uint16_t>(0x0100u | stack_pointer), M6502BusAccessKind::stack_read);
+        stack_pointer = static_cast<std::uint8_t>(stack_pointer + 1u);
+        append(static_cast<std::uint16_t>(0x0100u | stack_pointer), M6502BusAccessKind::stack_read);
+        const auto return_address = static_cast<std::uint16_t>(pulled_bytes[0] |
+            (static_cast<std::uint16_t>(pulled_bytes[1]) << 8));
+        trace.next_program_counter = static_cast<std::uint16_t>(return_address + 1u);
+        append(trace.next_program_counter, M6502BusAccessKind::dummy_read);
+    } else {
+        stack_pointer = static_cast<std::uint8_t>(stack_pointer + 1u);
+        append(static_cast<std::uint16_t>(0x0100u | stack_pointer), M6502BusAccessKind::stack_read);
+        stack_pointer = static_cast<std::uint8_t>(stack_pointer + 1u);
+        append(static_cast<std::uint16_t>(0x0100u | stack_pointer), M6502BusAccessKind::stack_read);
+        stack_pointer = static_cast<std::uint8_t>(stack_pointer + 1u);
+        append(static_cast<std::uint16_t>(0x0100u | stack_pointer), M6502BusAccessKind::stack_read);
+        trace.next_program_counter = static_cast<std::uint16_t>(pulled_bytes[1] |
+            (static_cast<std::uint16_t>(pulled_bytes[2]) << 8));
+    }
+    trace.next_stack_pointer = stack_pointer;
+    return trace;
 }
 
 std::optional<M6502InterruptEntryResult>
