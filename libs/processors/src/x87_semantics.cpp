@@ -1997,18 +1997,21 @@ std::optional<X87RemainderResult> evaluate_x87_remainder(
     auto remainder = request.dividend.significand;
     auto remainder_exponent = static_cast<unsigned>(raw_dividend_exponent);
     bool remainder_negative = dividend.negative;
+    bool completed = true;
 
     if (dividend.kind == Class::finite && raw_dividend_exponent >= raw_divisor_exponent) {
         const auto exponent_difference = static_cast<unsigned>(raw_dividend_exponent - raw_divisor_exponent);
-        if (exponent_difference >= 64) return {}; // Iterative partial-remainder behavior is intentionally not guessed.
-        const Product128 numerator = exponent_difference == 0
+        const auto step_shift = exponent_difference >= 64 ? exponent_difference - 32 : exponent_difference;
+        const auto significand_shift = exponent_difference >= 64 ? 32u : exponent_difference;
+        const Product128 numerator = significand_shift == 0
             ? Product128{0, request.dividend.significand}
-            : Product128{request.dividend.significand >> (64 - exponent_difference),
-                         request.dividend.significand << exponent_difference};
+            : Product128{request.dividend.significand >> (64 - significand_shift),
+                         request.dividend.significand << significand_shift};
         const auto divided = divide_wide_by_u64(numerator, request.divisor.significand);
         quotient_low = divided.quotient.lo & 7;
         remainder = divided.remainder;
-        remainder_exponent = raw_divisor_exponent;
+        remainder_exponent = raw_divisor_exponent + step_shift;
+        completed = exponent_difference < 64;
 
         if (request.mode == X87RemainderMode::nearest_even && remainder != 0) {
             const Product128 twice_remainder{remainder >> 63, remainder << 1};
@@ -2041,10 +2044,11 @@ std::optional<X87RemainderResult> evaluate_x87_remainder(
         if (remainder_negative) value.sign_exponent |= sign_mask;
     }
 
+    if (!completed) status |= fsw_c2;
     if ((quotient_low & 4) != 0) status |= fsw_c0;
     if ((quotient_low & 1) != 0) status |= fsw_c1;
     if ((quotient_low & 2) != 0) status |= fsw_c3;
-    return X87RemainderResult{value, status, static_cast<std::uint8_t>(quotient_low)};
+    return X87RemainderResult{value, status, static_cast<std::uint8_t>(quotient_low), completed};
 }
 
 std::optional<X87RemainderResult> evaluate_x87_remainder_instruction(

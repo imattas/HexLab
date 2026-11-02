@@ -2512,6 +2512,28 @@ Statement lift_instruction(const Instruction &instruction, std::vector<std::stri
             }
             return effect;
         }
+        // Keep FPREM's changing ST(0) value visible in SSA so a surrounding
+        // C2-controlled loop retains the iterative partial-remainder flow.
+        // The processor helper owns exact caller-driven evaluation; this IR
+        // formula is deliberately symbolic and does not claim completion.
+        const std::vector<RegisterOperand> remainder_reads{
+            {RegisterBank::x87, 0, 80, false}, {RegisterBank::x87, 1, 80, false},
+            {RegisterBank::x87_control, 0, 16, false}, {RegisterBank::x87_status, 0, 16, false}};
+        const std::vector<RegisterOperand> remainder_writes{
+            {RegisterBank::x87, 0, 80, false}, {RegisterBank::x87_status, 0, 16, false}};
+        if ((name == "fprem" || name == "fprem1") && instruction.x87_waiting &&
+            instruction.x87_stack_delta == 0 && !instruction.memory_read && !instruction.memory_write &&
+            instruction.operands.empty() && instruction.access.empty() && numeric_operands.size() == 2 &&
+            instruction.register_reads == remainder_reads && instruction.register_writes == remainder_writes) {
+            auto value = std::make_shared<Expression>(Expression{floating_type(80),
+                BinaryValue{"x87_" + name + "_step", numeric_operands[0], numeric_operands[1]}});
+            Intrinsic effect{"x87_" + name, std::move(typed_operands), IntrinsicMemoryEffect::none};
+            effect.register_writes = instruction.register_writes;
+            effect.result_type = floating_type(80);
+            effect.register_output_values = {std::move(value),
+                unknown_expr("x87-status-after-" + name, 16)};
+            return effect;
+        }
         Intrinsic effect{"x87_" + name, std::move(typed_operands),
             instruction.memory_read && instruction.memory_write ? IntrinsicMemoryEffect::unknown :
             instruction.memory_read ? IntrinsicMemoryEffect::read :

@@ -316,12 +316,14 @@ struct X87RemainderResult {
     X87Binary80 value;
     std::uint16_t status_word = 0;
     std::uint8_t quotient_low_bits = 0;
+    // False when this call performed one partial step and C2 requests another.
+    bool completed = true;
     bool operator==(const X87RemainderResult &) const = default;
 };
-// Evaluate the exact, final FPREM/FPREM1 result for normal binary80 operands
-// whose exponent difference is less than 64. Large exponent differences,
-// denormals, pseudo-denormals, NaNs, and infinities fail closed; this helper
-// does not approximate the processor's iterative partial-remainder sequence.
+// Evaluate one FPREM/FPREM1 step for normal binary80 operands. Exponent gaps
+// below 64 complete exactly; larger gaps produce one partial remainder with
+// C2 set so callers can iterate. Denormals, pseudo-denormals, NaNs, and
+// infinities fail closed.
 HEXLAB_PROCESSORS_EXPORT std::optional<X87RemainderResult>
 evaluate_x87_remainder(const X87RemainderRequest &request) noexcept;
 // Bind the numeric helper to the decoded register form and reject malformed

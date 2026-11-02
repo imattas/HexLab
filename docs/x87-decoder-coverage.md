@@ -18,6 +18,14 @@ The decompiler represents the arithmetic forms symbolically; it does not execute
 
 The caller-driven `evaluate_x87_examine` helper classifies binary80 ST(0) values for FXAM and updates C0/C1/C2/C3 while preserving other FSW bits. It accepts the caller's empty-tag fact and does not mutate TOP/tags or fold from decompiler SSA; see [FXAM semantics](x87-examine-semantics.md). The caller-driven `evaluate_x87_test` helper evaluates FTST as an ordered comparison against positive zero, including FSW relation bits and masked/unmasked invalid behavior; it leaves stack-underflow handling to its caller, as described in [x87 comparison semantics](x87-comparison-semantics.md).
 
+FPREM and FPREM1 have caller-driven exact binary80 evaluation through the
+processor API. Large exponent gaps produce one partial remainder and set C2;
+repeated calls with the returned ST(0) value progress to the final step. The
+decompiler carries that recurrence as a typed symbolic ST(0) output alongside
+an unknown FSW output, so C2-controlled loop termination remains visible but
+is not numerically resolved. Special operands and automatic exception
+retirement remain unsupported; see [remainder semantics](x87-rounding-semantics.md).
+
 Caller-driven packed-decimal helpers now evaluate the decoded `FBLD m80bcd`
 and `FBSTP m80bcd` memory forms. FBLD validates all 18 digit nibbles and
 expands valid signed values exactly to binary80; invalid digit encodings return
