@@ -108,7 +108,7 @@ class Itanium {
     std::string parse_encoding(bool require_function = false) {
         const auto name = parse_name(0, false);
         if (at_ == input_.size() || peek() == '.') {
-            if (require_function) malformed();
+            if (require_function || name.inheriting_constructor) malformed();
             return name.type.base;
         }
         std::string result;
@@ -167,7 +167,10 @@ class Itanium {
         bool postfix = false, name_like = false, template_prefix = false;
         bool builtin = false, substituted = false;
     };
-    struct Name { TypeName type; bool template_id = false, special_member = false; };
+    struct Name {
+        TypeName type;
+        bool template_id = false, special_member = false, inheriting_constructor = false;
+    };
     struct Argument { std::string text, key; std::optional<TypeName> type; };
     std::string parse_template_parameter_object() {
         const auto argument = template_argument(0);
@@ -349,6 +352,25 @@ class Itanium {
             }
         } else {
             if (std::isdigit(static_cast<unsigned char>(peek()))) id = identifier();
+            else if (take("CI")) {
+                // CI1/CI2 identify an inheriting constructor and the class
+                // that originally declared it. The base is a class type,
+                // not another parameter in the constructor signature.
+                if (prefix.base.empty() || (peek() != '1' && peek() != '2')) malformed();
+                const bool complete = input_[at_++] == '1';
+                const auto outer_arguments = template_arguments_;
+                const auto base = parse_type_node(d + 1);
+                template_arguments_ = outer_arguments;
+                if (!base.name_like || !base.declarator.empty() || base.template_prefix) malformed();
+                id = combine({short_class_name(prefix.base), " [inheriting ", base.base,
+                              complete ? "; complete object]" : "; base object]"});
+                result.type = named(combine({prefix.base, "::", id}));
+                result.type.key = combine({prefix.key, complete ? "::CI1:" : "::CI2:", base.key});
+                result.special_member = result.inheriting_constructor = true;
+                // Keep the existing constructor restriction on following
+                // template arguments/ABI tags and retain the base's key.
+                return result;
+            }
             else if ((peek() == 'C' || peek() == 'D') && at_ + 1 < input_.size() &&
                      ((peek() == 'C' && input_[at_ + 1] >= '1' && input_[at_ + 1] <= '3') ||
                       (peek() == 'D' && input_[at_ + 1] >= '0' && input_[at_ + 1] <= '2'))) {

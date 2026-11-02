@@ -327,6 +327,36 @@ qualifier. These labels report mangled type/name facts only and do not assert
 that HexLab can execute the function transactionally. The productions follow
 the Itanium ABI's [transaction-safe function entry-point and type rules](https://itanium-cxx-abi.github.io/cxx-abi/abi.html#transaction-safe-function-entry-points).
 
+## Itanium inheriting constructors
+
+Itanium inheriting constructors now accept the ABI productions
+`CI1 <base class type>` (complete object) and `CI2 <base class type>` (base
+object) as the terminal constructor component of a qualified name. The
+declaring base uses the bounded named-type grammar, including supported
+qualified names, template specializations, ABI tags, and class-type
+substitutions. Scalar, pointer, reference, array, and function types cannot
+serve as a base. For example, `_ZN1DCI11BEi` renders as
+`D::D [inheriting B; complete object](int)`; `_ZN1DCI21BEi` labels the base
+object variant instead. The label reports the encoded declaring base and
+constructor variant without reconstructing an inheritance graph.
+
+The base consumes its own type encoding before the constructor parameters.
+Constructor signatures do not consume a template return type, and parsing a
+templated base restores the enclosing template-argument scope before reading
+the signature. Base types participate in the existing substitution dictionary
+and input, nesting, component, dictionary, and output budgets. An absent
+declaring class, unsupported `CI` variant, non-class base, missing parameter
+signature, malformed delimiter, or unsupported parameter preserves the raw
+symbol. `CI3` and compiler-specific inherited constructor variants remain
+unsupported. These productions follow the ABI's
+[constructor and destructor names](https://itanium-cxx-abi.github.io/cxx-abi/abi.html#ctor-dtor-name).
+Source review covered constructor variants, named-base validation, substitution
+ordering, template scope restoration, missing signatures, and parser budgets.
+Windows Debug (MSVC 19.44) and Ubuntu 24.04 WSL Debug (Clang 18.1.3) builds of
+`hexlab_symbols`, `hexlab_image`, and `hexlab_loaders` passed with
+`BUILD_TESTING=OFF`. The WSL build used a byte-matched ext4 source snapshot to
+avoid mounted-filesystem configuration delays. No tests were added or run.
+
 ## Itanium compression and backreferences
 
 The Itanium parser supports all seven standard abbreviations: `St` (`std`),
