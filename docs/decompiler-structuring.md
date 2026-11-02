@@ -601,13 +601,20 @@ across terminating regions. This is a bounded semantic check of those fixtures,
 not a general C interpreter or an equivalence proof for arbitrary functions.
 
 Canonical pre-tested loops also accept a conditional break edge that reaches the
-loop's validated exit through a straight-line chain of at most 64 phi-free,
-side-effect-preserving blocks. A cleanup chain may be shared by multiple
+loop's validated exit through a straight-line chain of at most 64
+side-effect-preserving blocks. Register phis are accepted in cleanup blocks
+with exactly one CFG predecessor when every phi has one input from that edge
+and each destination is unique; parallel copies run before that block's
+statements inside the guarded break path. Whole-memory and partition-memory
+phis are accepted when all inputs exactly match the block's predecessor set.
+A cleanup chain may be shared by multiple
 conditional break edges when every edge enters the same head block. That head's
 predecessors must be exactly those recognized break branches, and every later
-path block must have exactly the preceding path block as its predecessor. All
+path block must have exactly the preceding path block as its predecessor. A
+register-phi cleanup head with multiple incoming break branches remains
+unsupported because each copied path would select a different SSA input. All
 path blocks have one unconditional jump or fallthrough and no return, nested
-branch, switch, or memory phi. The shared exit may contain register phis when
+branch, or switch. The shared exit may contain register phis when
 its predecessor set is exactly the loop-header condition failure edge plus one
 distinct final edge for each cleanup-chain tail. Multiple source break branches
 that share one chain contribute one CFG predecessor at that tail, even though

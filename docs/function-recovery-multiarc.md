@@ -79,6 +79,15 @@ symbol. Their RVAs are translated against the mapped image base and checked
 through the same executable and initialized-code rules. The table identifies
 entry points but does not provide function extents.
 
+Validated PE CHPE redirection pairs also seed both endpoints. Each pair
+associates an AMD64 export thunk with its ARM64EC implementation, so both
+addresses can be analyzed even when neither is reached from the image entry.
+The paired virtual address remains in each seed's provenance, and each
+endpoint is admitted through the normal mapped-context, initialized-code,
+user-decision, and function-budget checks. Redirections do not rewrite call
+edges or model Windows' hybrid dispatch behavior; the CHPE execution profile
+continues to select each endpoint's decoder context.
+
 Validated Mach-O `__eh_frame` FDEs also establish function roots. Their
 address ranges bound recovered ownership, preventing linear fallthrough from
 absorbing adjacent code when the FDE provides an exact nonempty range. FDEs

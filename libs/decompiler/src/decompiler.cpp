@@ -5386,6 +5386,53 @@ a64_unhandled:
         return Intrinsic{"thumb_itstate", operands, IntrinsicMemoryEffect::none};
 
     const bool arm32 = arm32_context;
+    const bool arm_q_add = instruction.opcode == Opcode::arm_qadd ||
+        instruction.opcode == Opcode::arm_qsub || instruction.opcode == Opcode::arm_qdadd ||
+        instruction.opcode == Opcode::arm_qdsub;
+    if (arm32 && arm_q_add) {
+        const auto *destination = instruction.operands.size() == 3
+            ? std::get_if<RegisterOperand>(&instruction.operands[0]) : nullptr;
+        const auto *rm = instruction.operands.size() == 3
+            ? std::get_if<RegisterOperand>(&instruction.operands[1]) : nullptr;
+        const auto *rn = instruction.operands.size() == 3
+            ? std::get_if<RegisterOperand>(&instruction.operands[2]) : nullptr;
+        const unsigned register_limit = instruction.context.mode == ExecutionMode::a32 ? 15u : 13u;
+        const auto valid_gpr = [register_limit](const RegisterOperand *reg) {
+            return reg && reg->bank == RegisterBank::arm32_gpr && reg->width == 32 &&
+                reg->index < register_limit && !reg->high_byte;
+        };
+        const RegisterOperand flags{RegisterBank::arm_flags, 0, 4, false};
+        std::vector<RegisterOperand> expected_reads;
+        if (instruction.arm && instruction.arm->predicate == ArmPredicate::condition)
+            expected_reads.push_back(flags);
+        if (valid_gpr(rm)) expected_reads.push_back(*rm);
+        if (valid_gpr(rn)) expected_reads.push_back(*rn);
+        if (!instruction.arm || !instruction.arm->q_flag_may_set || instruction.arm->flags_written ||
+            !instruction.arm->flags_known || !valid_gpr(destination) || !valid_gpr(rm) || !valid_gpr(rn) ||
+            operands.size() != 3 || instruction.access != std::vector<OperandAccess>{
+                OperandAccess::write, OperandAccess::read, OperandAccess::read} ||
+            instruction.register_writes != std::vector<RegisterOperand>{*destination} ||
+            instruction.register_reads != expected_reads)
+            return Intrinsic{"arm_saturating_malformed", operands, IntrinsicMemoryEffect::none};
+
+        const char *operation = instruction.opcode == Opcode::arm_qadd ? "qadd_s32" :
+            instruction.opcode == Opcode::arm_qsub ? "qsub_s32" :
+            instruction.opcode == Opcode::arm_qdadd ? "qdadd_s32" : "qdsub_s32";
+        ExpressionPtr value = std::make_shared<Expression>(Expression{integer_type(32),
+            BinaryValue{std::string(operation) + "_sticky_q_may_set", operands[1], operands[2]}});
+        if (instruction.arm->predicate == ArmPredicate::condition) {
+            const auto predicate = arm32_condition_expr(instruction.condition, reg_expr(flags));
+            value = arm32_select(predicate, std::move(value), reg_expr(*destination));
+        }
+        Intrinsic effect{"arm_" + std::string(operation) + "_sticky_q_may_set",
+            {operands[1], operands[2]}, IntrinsicMemoryEffect::none};
+        if (instruction.arm->predicate == ArmPredicate::condition)
+            effect.name = "arm_conditional_" + effect.name;
+        effect.register_writes = {*destination};
+        effect.register_output_values = {std::move(value)};
+        effect.result_type = integer_type(32);
+        return effect;
+    }
     const bool packed_extend_signed = instruction.opcode == Opcode::a32_sxtb16 ||
         instruction.opcode == Opcode::a32_sxtab16 || instruction.opcode == Opcode::t32_sxtb16 ||
         instruction.opcode == Opcode::t32_sxtab16;
@@ -11503,6 +11550,7 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
             bool break_on_true = true;
             std::vector<const LiftedBlock *> path;
             std::vector<std::pair<std::string, std::string>> exit_phi_copies;
+            std::map<std::uint64_t, std::vector<std::pair<std::string, std::string>>> path_phi_copies;
         };
         std::vector<LoopBreakPath> loop_breaks;
         std::set<std::uint64_t> loop_break_path_ids;
@@ -12091,7 +12139,26 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
         std::set<std::uint64_t> exit_path_ids;
         bool loop_body_edges_valid = true;
         bool exit_path_valid = true;
-        const auto trace_loop_exit_path = [&](Address target, std::uint64_t predecessor)
+        const auto collect_cleanup_phi_copies = [&](const LiftedBlock &block, std::uint64_t predecessor)
+            -> std::optional<std::vector<std::pair<std::string, std::string>>> {
+            if (block.phis.empty()) return std::vector<std::pair<std::string, std::string>>{};
+            if (block.phis.size() > 4096 ||
+                diamond_predecessors[block.id.value] != std::set<std::uint64_t>{predecessor})
+                return std::nullopt;
+            std::set<std::string> destinations;
+            std::vector<std::pair<std::string, std::string>> copies;
+            for (const auto &phi : block.phis) {
+                if (phi.inputs.size() != 1) return std::nullopt;
+                const auto &input = phi.inputs.front();
+                const auto destination = register_name(phi.destination, phi.version);
+                if (input.predecessor.value != predecessor || !destinations.insert(destination).second)
+                    return std::nullopt;
+                copies.emplace_back(destination, register_name(phi.destination, input.version));
+            }
+            return copies;
+        };
+        const auto trace_loop_exit_path = [&](Address target, std::uint64_t predecessor,
+            std::map<std::uint64_t, std::vector<std::pair<std::string, std::string>>> &path_phi_copies)
             -> std::optional<std::vector<const LiftedBlock *>> {
             std::vector<const LiftedBlock *> path;
             if (!exit_block) return std::nullopt;
@@ -12100,6 +12167,19 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
             if (target_block) {
                 const auto shared = shared_loop_break_paths.find(target_block->id.value);
                 if (shared != shared_loop_break_paths.end()) {
+                    auto path_predecessor = predecessor;
+                    for (std::size_t i = 0; i < shared->second.size(); ++i) {
+                        const auto *path_block = shared->second[i];
+                        const auto &incoming = diamond_predecessors[path_block->id.value];
+                        if (!incoming.contains(path_predecessor) ||
+                            (i != 0 && incoming != std::set<std::uint64_t>{path_predecessor}) ||
+                            !valid_diamond_memory_phi(*path_block))
+                            return std::nullopt;
+                        const auto copies = collect_cleanup_phi_copies(*path_block, path_predecessor);
+                        if (!copies) return std::nullopt;
+                        if (!copies->empty()) path_phi_copies.emplace(path_block->id.value, *copies);
+                        path_predecessor = path_block->id.value;
+                    }
                     shared_loop_break_sources[target_block->id.value].insert(predecessor);
                     return shared->second;
                 }
@@ -12111,8 +12191,8 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                    !loop_body_ids.contains(candidate->id.value) &&
                    !loop_break_path_ids.contains(candidate->id.value) &&
                    seen.insert(candidate->id.value).second && path.size() < 64 &&
-                   candidate->phis.empty() && !candidate->memory_phi &&
-                   candidate->memory_partition_phis.empty() && !contains_return(*candidate) &&
+                   candidate->phis.size() <= 4096 && valid_diamond_memory_phi(*candidate) &&
+                   !contains_return(*candidate) &&
                    !candidate->switch_dispatch && has_only_simple_statements(*candidate) &&
                    candidate->successors.size() == 1 && candidate->successors.front().target &&
                    (candidate->successors.front().kind == BlockEdgeKind::jump ||
@@ -12130,6 +12210,14 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                                  (*source_condition->true_target == candidate->begin ||
                                   *source_condition->false_target == candidate->begin);
                          })))) {
+                const auto &incoming = diamond_predecessors[candidate->id.value];
+                if (!incoming.contains(predecessor)) break;
+                // Register phis in a cleanup block are safe to lower only when
+                // the represented edge is its sole CFG predecessor. Shared
+                // cleanup heads with multiple predecessors remain on fallback.
+                const auto copies = collect_cleanup_phi_copies(*candidate, predecessor);
+                if (!copies) break;
+                if (!copies->empty()) path_phi_copies.emplace(candidate->id.value, *copies);
                 path.push_back(candidate);
                 predecessor = candidate->id.value;
                 candidate = find_block(*candidate->successors.front().target);
@@ -12406,8 +12494,12 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                     loop_body_edges_valid = false;
                     break;
                 }
-                const auto true_exit_path = trace_loop_exit_path(*body_condition->true_target, body->id.value);
-                const auto false_exit_path = trace_loop_exit_path(*body_condition->false_target, body->id.value);
+                std::map<std::uint64_t, std::vector<std::pair<std::string, std::string>>> true_break_phi_copies;
+                std::map<std::uint64_t, std::vector<std::pair<std::string, std::string>>> false_break_phi_copies;
+                const auto true_exit_path = trace_loop_exit_path(*body_condition->true_target, body->id.value,
+                                                                  true_break_phi_copies);
+                const auto false_exit_path = trace_loop_exit_path(*body_condition->false_target, body->id.value,
+                                                                   false_break_phi_copies);
                 const bool true_exits = true_exit_path.has_value();
                 const bool false_exits = false_exit_path.has_value();
                 const bool true_continues = *body_condition->true_target == header->begin;
@@ -12427,7 +12519,13 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                         }
                     if (!loop_body_edges_valid) break;
                     if (shared_path) shared_loop_break_sources[path_head->id.value].insert(body->id.value);
-                    loop_breaks.push_back({body, true_exits, break_path});
+                    LoopBreakPath break_region;
+                    break_region.branch = body;
+                    break_region.break_on_true = true_exits;
+                    break_region.path = break_path;
+                    break_region.path_phi_copies = true_exits ? std::move(true_break_phi_copies) :
+                                                               std::move(false_break_phi_copies);
+                    loop_breaks.push_back(std::move(break_region));
                     next_address = true_exits ? *body_condition->false_target : *body_condition->true_target;
                 } else {
                     const auto trace_return_path = [&](Address target,
@@ -13516,8 +13614,12 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                     if (!body_condition) return fallback("loop break block has no valid conditional branch");
                     out << "        if (" << (conditional_break->break_on_true ? branch_condition_text(*body_condition) :
                         "!(" + branch_condition_text(*body_condition) + ")") << ") {\n";
-                    for (const auto *path_block : conditional_break->path)
+                    for (const auto *path_block : conditional_break->path) {
+                        if (const auto copies = conditional_break->path_phi_copies.find(path_block->id.value);
+                            copies != conditional_break->path_phi_copies.end())
+                            emit_parallel_copies(out, copies->second, 12);
                         emit_block(*path_block, 12, true);
+                    }
                     emit_parallel_copies(out, conditional_break->exit_phi_copies, 12);
                     out << "            break;\n        }\n";
                 }
