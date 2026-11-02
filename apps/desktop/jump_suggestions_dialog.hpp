@@ -19,6 +19,7 @@
 #include <thread>
 #include <cstdint>
 #include <atomic>
+#include <deque>
 
 namespace hexlab::desktop {
 
@@ -28,6 +29,8 @@ class JumpSuggestionsDialog final : public wxDialog {
 public:
     using Search = std::function<NamedLocationSearch(const wxString &, NamedLocationScope, NamedLocationSearchMode,
                                                       const std::atomic_bool &, std::size_t, std::size_t)>;
+    // With background paging enabled, Describe also runs on the worker and
+    // must own its immutable source state rather than reference UI objects.
     using Describe = std::function<wxString(const NamedLocationCandidate &)>;
     using SourceCurrent = std::function<bool()>;
     JumpSuggestionsDialog(wxWindow *parent, const wxString &query, Search search, Describe describe,
@@ -100,6 +103,14 @@ public:
         query_->Bind(wxEVT_TEXT, [this](wxCommandEvent &) {
             // A pending query must never navigate a result from the old text.
             ++generation_;
+            {
+                std::lock_guard lock(async_state_->mutex);
+                if (async_state_->active_cancel)
+                    async_state_->active_cancel->store(true, std::memory_order_relaxed);
+                async_state_->queued.reset();
+            }
+            more_available_ = false;
+            more_->Enable(false);
             candidates_.clear(); list_->Clear(); update_accept();
             status_->SetLabel("Waiting for search refinement...");
             timer_.StartOnce(120);
@@ -176,6 +187,7 @@ private:
         std::uint64_t generation = 0;
         NamedLocationSearch search;
         std::size_t offset = 0;
+        std::optional<wxArrayString> rows;
     };
     struct AsyncState {
         std::mutex mutex;
@@ -186,30 +198,45 @@ private:
         std::shared_ptr<std::atomic_bool> active_cancel;
     };
     static void launch_async(const std::shared_ptr<AsyncState> &state, Search search, AsyncRequest request,
-                             SourceCurrent source_current) {
+                             SourceCurrent source_current, Describe page_describe) {
         try {
             std::thread([state, search = std::move(search), request = std::move(request),
-                         source_current = std::move(source_current)]() mutable {
+                         source_current = std::move(source_current), page_describe = std::move(page_describe)]() mutable {
                 NamedLocationSearch result;
+                std::optional<wxArrayString> rows;
                 try {
                     if (source_current && !source_current()) {
                         result = {{}, true, "current document changed; close and reopen this search"};
                     } else {
                         result = search(request.query, request.scope, request.mode, *request.cancelled,
                                         request.offset, page_size_);
+                        if (page_describe) {
+                            rows.emplace();
+                            rows->Alloc(result.candidates.size());
+                            for (const auto &candidate : result.candidates) {
+                                if (request.cancelled->load(std::memory_order_relaxed)) break;
+                                rows->Add(page_describe(candidate));
+                            }
+                            if (request.cancelled->load(std::memory_order_relaxed)) {
+                                result = {{}, true, "search canceled"};
+                                rows->Clear();
+                            }
+                        }
                         if (source_current && !source_current())
                             result = {{}, true, "current document changed; close and reopen this search"};
                     }
                 } catch (...) {
+                    result.candidates.clear();
                     result.truncated = true;
                     result.limitation = "background name search failed";
+                    rows.reset();
                 }
                 std::optional<AsyncRequest> next;
                 {
                     std::lock_guard lock(state->mutex);
                     state->running = false;
                     if (state->closing) return;
-                    state->completed = AsyncResult{request.generation, std::move(result), request.offset};
+                    state->completed = AsyncResult{request.generation, std::move(result), request.offset, std::move(rows)};
                     if (state->queued) {
                         next = std::move(state->queued);
                         state->queued.reset();
@@ -219,7 +246,7 @@ private:
                         state->active_cancel.reset();
                     }
                 }
-                if (next) launch_async(state, std::move(search), std::move(*next), source_current);
+                if (next) launch_async(state, std::move(search), std::move(*next), source_current, std::move(page_describe));
             }).detach();
         } catch (...) {
             NamedLocationSearch result;
@@ -255,7 +282,9 @@ private:
             async_state_->running = true;
             async_state_->active_cancel = request.cancelled;
         }
-        launch_async(async_state_, search_, std::move(request), source_current_);
+        // Paged current-document descriptions capture immutable source owners.
+        // Other callers may describe through UI-owned references and stay on UI.
+        launch_async(async_state_, search_, std::move(request), source_current_, allow_paging_ ? describe_ : Describe{});
     }
     void request_next_page() {
         if (source_invalidated_ || !background_search_ || !allow_paging_ || searching_ || !more_available_) return;
@@ -267,7 +296,7 @@ private:
         { std::lock_guard lock(async_state_->mutex);
           if (async_state_->closing) return;
           async_state_->running = true; async_state_->active_cancel = request.cancelled; }
-        launch_async(async_state_, search_, std::move(request), source_current_);
+        launch_async(async_state_, search_, std::move(request), source_current_, describe_);
     }
     void poll_background_search() {
         if (!background_search_) return;
@@ -296,7 +325,7 @@ private:
             searching_ = false; more_->Enable(false); update_accept();
             status_->SetLabel("Current document changed; close and reopen this search.");
         } else if (completed && completed->generation == generation_)
-            show_result(std::move(completed->search), completed->offset);
+            show_result(std::move(completed->search), completed->offset, std::move(completed->rows));
     }
     void load_preferences(const wxString &initial_query) {
         auto *config = wxConfigBase::Get(false);
@@ -332,27 +361,37 @@ private:
         show_result(search_(query_->GetValue(), static_cast<NamedLocationScope>(scope_->GetSelection()),
                             static_cast<NamedLocationSearchMode>(mode_->GetSelection()), not_cancelled, 0, page_size_), 0);
     }
-    void show_result(NamedLocationSearch result, std::size_t offset) {
-        const auto selected = selected_candidate();
+    void show_result(NamedLocationSearch result, std::size_t offset, std::optional<wxArrayString> prepared_rows = {}) {
+        // Continuations extend the same immutable, sorted source generation.
+        // Keep the existing native rows and selection; never reformat/reinsert
+        // the entire accumulated result set for a single bounded page.
+        if (offset && (offset != candidates_.size() || offset != list_->GetCount())) {
+            searching_ = false; more_available_ = false; more_->Enable(false);
+            status_->SetLabel("Result page no longer continues the displayed search; refine the query again.");
+            return;
+        }
         const auto page_count = result.candidates.size();
+        const auto selected_index = list_->GetSelection();
+        wxArrayString rows;
+        if (prepared_rows && prepared_rows->size() == page_count)
+            rows = std::move(*prepared_rows);
+        else
+            for (const auto &candidate : result.candidates) rows.Add(describe_(candidate));
         if (offset == 0) candidates_.clear();
-        page_offset_ = offset + page_count;
         candidates_.insert(candidates_.end(), std::make_move_iterator(result.candidates.begin()),
                            std::make_move_iterator(result.candidates.end()));
+        if (offset == 0) {
+            list_->Set(rows);
+        } else {
+            list_->Append(rows);
+            if (selected_index != wxNOT_FOUND) list_->SetSelection(selected_index);
+        }
+        page_offset_ = offset + page_count;
         more_available_ = result.truncated && page_count != 0 &&
             mode_->GetSelection() != static_cast<int>(NamedLocationSearchMode::fuzzy);
         searching_ = false;
         more_->Enable(allow_paging_ && more_available_);
-        wxArrayString rows;
-        int preserved = 0;
-        for (std::size_t i = 0; i < candidates_.size(); ++i) {
-            rows.Add(describe_(candidates_[i]));
-            if (selected && candidates_[i].location == selected->location &&
-                candidates_[i].document == selected->document && candidates_[i].name == selected->name)
-                preserved = static_cast<int>(i);
-        }
-        list_->Set(rows);
-        if (!candidates_.empty()) list_->SetSelection(preserved);
+        if (!candidates_.empty() && list_->GetSelection() == wxNOT_FOUND) list_->SetSelection(0);
         if (result.unique_exact_match && !result.truncated && candidates_.size() == 1) {
             list_->SetSelection(0);
             EndModal(wxID_OK);
@@ -397,7 +436,8 @@ private:
     }
     Search search_;
     Describe describe_;
-    std::vector<NamedLocationCandidate> candidates_;
+    // Appending a page must not relocate every previously accepted candidate.
+    std::deque<NamedLocationCandidate> candidates_;
     wxTextCtrl *query_ = nullptr, *preview_ = nullptr;
     wxChoice *scope_ = nullptr, *mode_ = nullptr;
     wxListBox *list_ = nullptr;

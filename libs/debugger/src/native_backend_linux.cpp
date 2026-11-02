@@ -683,6 +683,7 @@ public:
                 std::string resume_failure;
                 bool failed_trace = false;
                 const bool requested_user_step = step_threads_.erase(tid) != 0;
+                pending_hardware_execute_ = false;
                 siginfo_t stop_info{};
                 const bool trace_complete = WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP &&
                     (static_cast<unsigned>(status) >> 16) == 0 &&
@@ -702,17 +703,28 @@ public:
                 const bool internal_step_only = !hardware_trap && !hardware_status_error;
                 if (displaced_step_ && displaced_step_->thread == tid) {
                     const auto step = *displaced_step_;
-                    const auto owner = std::find_if(ids_.begin(), ids_.end(), [&](const auto& item) {
-                        return item.second == step.address && enabled_ids_.contains(item.first);
-                    });
-                    auto rearmed = owner != ids_.end() && !(tid == pid_ && (WIFEXITED(status) || WIFSIGNALED(status)))
-                        ? rearm_software_breakpoint(step.address) : Status{std::monostate{}};
+                    Status rearmed{std::monostate{}};
+                    if (step.hardware_execute) {
+                        if (!(WIFEXITED(status) || WIFSIGNALED(status)))
+                            rearmed = poke_debug_register(tid, 7, step.saved_dr7);
+                    } else {
+                        const auto owner = std::find_if(ids_.begin(), ids_.end(), [&](const auto& item) {
+                            return item.second == step.address && enabled_ids_.contains(item.first);
+                        });
+                        rearmed = owner != ids_.end() && !(tid == pid_ && (WIFEXITED(status) || WIFSIGNALED(status)))
+                            ? rearm_software_breakpoint(step.address) : Status{std::monostate{}};
+                    }
                     if (!rearmed) {
                         // Publish this stop normally and retain the missing
                         // trap as explicit recovery work before any resume.
-                        breakpoint_rearm_ = step.address;
+                        if (step.hardware_execute)
+                            hardware_step_restore_ = HardwareStepRestore{tid, step.saved_dr7};
+                        else
+                            breakpoint_rearm_ = step.address;
                         resume_blocked_ = true;
-                        resume_failure = "reinsert INT3 after displaced instruction: " + rearmed.error().message;
+                        resume_failure = step.hardware_execute
+                            ? "restore hardware execute breakpoint after step: " + rearmed.error().message
+                            : "reinsert INT3 after displaced instruction: " + rearmed.error().message;
                         failed_trace = trace_complete;
                     }
                     displaced_step_.reset();
@@ -758,7 +770,12 @@ public:
                     } else displaced_user_step = trace_complete && resume_failure.empty() && internal_step_only;
                     if (!trace_complete && WIFSTOPPED(status)) {
                         auto ip = instruction_pointer(tid);
-                        if (ip && ip.value() == step.address) pending_breakpoint_ = step.address;
+                        if (ip && ip.value() == step.address) {
+                            if (step.hardware_execute) {
+                                pending_hardware_execute_ = true;
+                                pending_hardware_execute_address_ = step.address;
+                            } else pending_breakpoint_ = step.address;
+                        }
                     }
                 }
                 DebugEvent event{}; event.sequence = ++seq_; event.process = static_cast<ProcessId>(pid_); event.thread = static_cast<ThreadId>(tid);
@@ -814,6 +831,21 @@ public:
                                     const auto hit = std::find_if(hardware_breakpoints_.begin(), hardware_breakpoints_.end(),
                                         [&](const auto& record) { return record.id == event.breakpoint_ids.front(); });
                                     event.address = hit == hardware_breakpoints_.end() ? regs_address(tid) : hit->address;
+                                    std::optional<std::uint64_t> execute_address;
+                                    bool ambiguous_execute_address = false;
+                                    for (const auto id : event.breakpoint_ids) {
+                                        const auto record = std::find_if(hardware_breakpoints_.begin(), hardware_breakpoints_.end(),
+                                            [&](const auto& item) { return item.id == id && item.enabled; });
+                                        if (record == hardware_breakpoints_.end() || record->kind != BreakpointKind::execute)
+                                            continue;
+                                        if (execute_address && *execute_address != record->address)
+                                            ambiguous_execute_address = true;
+                                        execute_address = record->address;
+                                    }
+                                    if (execute_address && !ambiguous_execute_address) {
+                                        pending_hardware_execute_ = true;
+                                        pending_hardware_execute_address_ = *execute_address;
+                                    }
                                 }
                             } else if (!dr6) event.message += "; " + dr6.error().message;
                         }
@@ -884,11 +916,14 @@ public:
                 return sys_error("PTRACE_CONT interrupted Linux thread");
             stopped_.erase(tid);
             deferred_signals_.erase(tid);
-            pending_breakpoint_.reset(); pending_.reset(); pending_signal_ = 0;
+            pending_breakpoint_.reset(); pending_hardware_execute_ = false; pending_.reset(); pending_signal_ = 0;
             pending_thread_interrupt_ = false;
             return std::monostate{};
         }
         if (disposition == ContinueStatus::handled) {
+            auto hardware_step = needs_hardware_execute_step(tid);
+            if (!hardware_step) return hardware_step.error();
+            if (hardware_step.value()) return begin_hardware_execute_step(tid, true);
             auto displaced = needs_displaced_step(tid);
             if (!displaced) return displaced.error();
             if (displaced.value()) return begin_displaced_step(tid, true);
@@ -896,7 +931,7 @@ public:
         auto resumed = resume_stopped_threads(tid, signal);
         if (!resumed) return resumed;
         deferred_signals_.erase(tid);
-        pending_breakpoint_.reset(); pending_.reset(); pending_signal_ = 0; pending_thread_interrupt_ = false;
+        pending_breakpoint_.reset(); pending_hardware_execute_ = false; pending_.reset(); pending_signal_ = 0; pending_thread_interrupt_ = false;
         return std::monostate{};
     }
     Status continue_thread_event(std::uint64_t sequence, ThreadId thread, ContinueStatus disposition) override {
@@ -912,6 +947,9 @@ public:
             return Error{ErrorCode::busy, "thread-qualified continue requires all peers to remain stopped"};
         const int signal = disposition == ContinueStatus::handled ? 0 : pending_signal_;
         if (disposition == ContinueStatus::handled) {
+            auto hardware_step = needs_hardware_execute_step(tid);
+            if (!hardware_step) return hardware_step.error();
+            if (hardware_step.value()) return begin_hardware_execute_step(tid, false, true);
             auto displaced = needs_displaced_step(tid);
             if (!displaced) return displaced.error();
             if (displaced.value()) return begin_displaced_step(tid, false, true);
@@ -920,7 +958,7 @@ public:
             return sys_error("PTRACE_CONT selected thread");
         stopped_.erase(tid);
         deferred_signals_.erase(tid);
-        pending_breakpoint_.reset(); pending_.reset(); pending_signal_ = 0; pending_thread_interrupt_ = false;
+        pending_breakpoint_.reset(); pending_hardware_execute_ = false; pending_.reset(); pending_signal_ = 0; pending_thread_interrupt_ = false;
         return std::monostate{};
     }
     Status resume_threads_event(std::uint64_t sequence, std::span<const ThreadResumeAction> actions) override {
@@ -978,6 +1016,11 @@ public:
             return Error{ErrorCode::invalid_argument, "resume schedule must include the thread that owns the pending event"};
         if (runnable.empty())
             return Error{ErrorCode::invalid_argument, "resume schedule must continue or step at least one thread"};
+        auto hardware_step = needs_hardware_execute_step(owner);
+        if (!hardware_step) return hardware_step.error();
+        if (hardware_step.value() && runnable.size() > 1)
+            return Error{ErrorCode::unsupported,
+                "Linux x86 hardware execute-breakpoint step-over currently requires an owner-only runnable schedule"};
         if (!step_threads_.empty() && std::any_of(runnable.begin(), runnable.end(), [](const auto* action) {
                 return action->kind == ThreadResumeKind::single_step;
             }))
@@ -1123,7 +1166,7 @@ public:
                 resumed.push_back(tid);
             }
             apply_stopped_signal_dispositions();
-            pending_.reset(); pending_breakpoint_.reset(); pending_signal_ = 0; pending_thread_interrupt_ = false; last_signal_ = 0;
+            pending_.reset(); pending_breakpoint_.reset(); pending_hardware_execute_ = false; pending_signal_ = 0; pending_thread_interrupt_ = false; last_signal_ = 0;
             return std::monostate{};
         }
 
@@ -1131,6 +1174,15 @@ public:
         const auto tid = static_cast<pid_t>(selected_action->thread);
         const int queued_signal = signal_for(*selected_action);
         const int delivered = selected_action->signal_disposition == ContinueStatus::handled ? 0 : queued_signal;
+        if (hardware_step.value()) {
+            if (tid != owner || delivered != 0)
+                return Error{ErrorCode::unsupported,
+                    "Linux x86 hardware execute-breakpoint step-over requires the event owner with its pending signal suppressed"};
+            auto stepped = begin_hardware_execute_step(owner, false,
+                selected_action->kind == ThreadResumeKind::continue_execution);
+            if (stepped) apply_stopped_signal_dispositions();
+            return stepped;
+        }
         if (pending_breakpoint_ && tid != owner)
             return Error{ErrorCode::unsupported, "cannot preserve a pending software-breakpoint event while scheduling another thread"};
         if (selected_action->kind == ThreadResumeKind::single_step) {
@@ -1149,7 +1201,7 @@ public:
             deferred_signals_.erase(tid);
             apply_stopped_signal_dispositions();
             pending_signal_ = 0;
-            pending_.reset(); pending_breakpoint_.reset(); pending_thread_interrupt_ = false; last_signal_ = 0;
+            pending_.reset(); pending_breakpoint_.reset(); pending_hardware_execute_ = false; pending_thread_interrupt_ = false; last_signal_ = 0;
             return std::monostate{};
         }
 
@@ -1176,7 +1228,7 @@ public:
         deferred_signals_.erase(tid);
         apply_stopped_signal_dispositions();
         pending_signal_ = 0;
-        pending_.reset(); pending_breakpoint_.reset(); pending_thread_interrupt_ = false; last_signal_ = 0;
+        pending_.reset(); pending_breakpoint_.reset(); pending_hardware_execute_ = false; pending_thread_interrupt_ = false; last_signal_ = 0;
         return std::monostate{};
     }
     Status single_step_event(std::uint64_t sequence, ContinueStatus disposition) override {
@@ -1186,6 +1238,9 @@ public:
         auto recovered = recover_suspension();
         if (!recovered) return recovered;
         if (disposition == ContinueStatus::handled) {
+            auto hardware_step = needs_hardware_execute_step(tid);
+            if (!hardware_step) return hardware_step.error();
+            if (hardware_step.value()) return begin_hardware_execute_step(tid, false);
             auto displaced = needs_displaced_step(tid);
             if (!displaced) return displaced.error();
             if (displaced.value()) return begin_displaced_step(tid, false);
@@ -1193,7 +1248,7 @@ public:
         const int signal = disposition == ContinueStatus::handled ? 0 : pending_signal_;
         if (ptrace(PTRACE_SINGLESTEP, tid, nullptr, reinterpret_cast<void*>(static_cast<std::intptr_t>(signal))) != 0) return sys_error("PTRACE_SINGLESTEP");
         deferred_signals_.erase(tid);
-        pending_.reset(); pending_breakpoint_.reset(); pending_signal_ = 0; pending_thread_interrupt_ = false;
+        pending_.reset(); pending_breakpoint_.reset(); pending_hardware_execute_ = false; pending_signal_ = 0; pending_thread_interrupt_ = false;
         stopped_.erase(tid); step_threads_.insert(tid); return std::monostate{};
     }
 
@@ -1816,8 +1871,11 @@ private:
         bool continue_thread = false;
         std::vector<std::pair<pid_t, int>> deferred_resumes;
         bool report_step_after_deferred_resumes = false;
+        bool hardware_execute = false;
+        unsigned long saved_dr7 = 0;
     };
     struct BreakpointRollback { pid_t thread; std::uint64_t address, instruction_pointer; };
+    struct HardwareStepRestore { pid_t thread; unsigned long dr7; };
     struct HardwareRecord { BreakpointId id; std::uint64_t address; BreakpointKind kind; std::uint8_t size; bool enabled = true; };
 
     // Consume only debugger-generated interrupt stops internally. Any signal,
@@ -1928,7 +1986,8 @@ private:
         if (startup_cleanup_ || detach_preparing_ || detaching_ || terminating_) return Error{ErrorCode::busy, "cleanup must complete before resuming"};
         if (tracked_.size() > max_inspection_threads) return Error{ErrorCode::resource_limit, "thread limit exceeded; detach or terminate is required"};
         auto children = complete_pending_children(); if (!children) return children;
-        if (!resume_blocked_ && interrupting_.empty() && !breakpoint_rollback_ && !breakpoint_rearm_)
+        if (!resume_blocked_ && interrupting_.empty() && !breakpoint_rollback_ && !breakpoint_rearm_ &&
+            !hardware_step_restore_)
             return std::monostate{};
         auto stopped = stop_all_threads();
         if (!stopped) { resume_blocked_ = true; return stopped; }
@@ -1955,6 +2014,19 @@ private:
             }
             breakpoint_rearm_.reset();
         }
+        if (hardware_step_restore_) {
+            const auto restore = *hardware_step_restore_;
+            if (!stopped_.contains(restore.thread))
+                return Error{ErrorCode::busy, "hardware execute-breakpoint owner must be stopped before debug-register recovery"};
+            auto restored = poke_debug_register(restore.thread, 7, restore.dr7);
+            if (!restored) {
+                resume_blocked_ = true;
+                return Error{restored.error().code,
+                    "hardware execute-breakpoint state is not restored; refusing to resume target: " +
+                    restored.error().message};
+            }
+            hardware_step_restore_.reset();
+        }
         resume_blocked_ = false;
         return std::monostate{};
     }
@@ -1970,6 +2042,72 @@ private:
         if (!ip) return ip.error();
         // A client may explicitly change PC before continuing this stop.
         return ip.value() == bp->first || (bp->first != UINT64_MAX && ip.value() == bp->first + 1);
+    }
+    Result<bool> needs_hardware_execute_step(pid_t tid) const {
+        if (!pending_hardware_execute_) return false;
+        auto ip = instruction_pointer(tid);
+        if (!ip) return ip.error();
+        // A caller may redirect execution after the hardware-breakpoint stop.
+        return ip.value() == pending_hardware_execute_address_;
+    }
+    Status begin_hardware_execute_step(pid_t tid, bool continue_process, bool continue_thread = false) {
+        if (displaced_step_) return Error{ErrorCode::busy, "a breakpoint instruction step is already running"};
+        auto stopped = stop_all_threads();
+        if (!stopped) { resume_blocked_ = true; return stopped; }
+        if (!pending_hardware_execute_ || !tracked_.contains(tid) || !stopped_.contains(tid))
+            return Error{ErrorCode::invalid_argument, "hardware execute-breakpoint step has no stopped event owner"};
+
+        detail::DebugRegisters expected;
+        const auto requests = hardware_requests(hardware_breakpoints_);
+        const auto pointer_size = architecture_ == Architecture::x86 ? std::uint8_t{4} : std::uint8_t{8};
+        if (!detail::encode_hardware_breakpoints(requests, pointer_size, expected))
+            return Error{ErrorCode::conflict, "owned hardware breakpoint state is not encodable for step-over"};
+        std::array<unsigned long, 4> addresses{};
+        for (unsigned slot = 0; slot < addresses.size(); ++slot) {
+            auto value = peek_debug_register(tid, slot);
+            if (!value) return value.error();
+            addresses[slot] = value.value();
+        }
+        auto dr7 = peek_debug_register(tid, 7);
+        if (!dr7) return dr7.error();
+        if (dr7.value() != expected.dr7 ||
+            !std::equal(addresses.begin(), addresses.end(), expected.address.begin()))
+            return Error{ErrorCode::conflict, "hardware breakpoint registers changed outside this debugger; refusing step-over"};
+
+        auto temporarily_disabled = dr7.value();
+        bool found = false;
+        for (std::size_t slot = 0; slot < hardware_slot_ids_.size(); ++slot) {
+            const auto record = std::find_if(hardware_breakpoints_.begin(), hardware_breakpoints_.end(), [&](const auto& item) {
+                return item.id == hardware_slot_ids_[slot] && item.enabled;
+            });
+            if (record == hardware_breakpoints_.end() || record->kind != BreakpointKind::execute ||
+                record->address != pending_hardware_execute_address_) continue;
+            const auto enable_mask = static_cast<unsigned long>(3u) << (slot * 2);
+            temporarily_disabled &= ~enable_mask;
+            found = true;
+        }
+        if (!found)
+            return Error{ErrorCode::invalid_argument, "no enabled owned hardware execute breakpoint matches the stopped PC"};
+
+        auto disabled = poke_debug_register(tid, 7, temporarily_disabled);
+        if (!disabled) return disabled;
+        if (ptrace(PTRACE_SINGLESTEP, tid, nullptr, nullptr) != 0) {
+            const auto error = sys_error("PTRACE_SINGLESTEP over hardware execute breakpoint");
+            auto restored = poke_debug_register(tid, 7, dr7.value());
+            if (!restored) {
+                hardware_step_restore_ = HardwareStepRestore{tid, dr7.value()};
+                resume_blocked_ = true;
+                return Error{error.code, error.message + "; hardware debug-register rollback failed: " +
+                    restored.error().message};
+            }
+            return error;
+        }
+        displaced_step_ = DisplacedStep{tid, pending_hardware_execute_address_, continue_process,
+                                         continue_thread, {}, false, true, dr7.value()};
+        stopped_.erase(tid);
+        pending_hardware_execute_ = false;
+        pending_.reset(); pending_signal_ = 0; pending_thread_interrupt_ = false;
+        return std::monostate{};
     }
     Status begin_displaced_step(pid_t tid, bool continue_process, bool continue_thread = false,
                                 std::vector<std::pair<pid_t, int>> deferred_resumes = {},
@@ -2263,7 +2401,7 @@ private:
             return Error{ErrorCode::conflict, "software breakpoint byte changed outside this debugger; detach retains stopped target ownership"};
         return current.value()[0];
     }
-    void clear() { pending_debugger_trap_ = false; pending_signal_ = 0; pending_thread_interrupt_ = false; requested_thread_interrupt_.reset(); detach_signals_.clear(); detach_restored_breakpoints_.clear(); initial_children_.clear(); hardware_pending_children_.clear(); startup_cleanup_ = false; startup_kill_ = false; detaching_ = false; detach_hardware_cleared_ = false; detach_preparing_ = false; terminating_ = false; pid_ = 0; architecture_ = Architecture::unknown; launched_ = false; exited_ = false; pending_.reset(); initial_event_.reset(); pending_breakpoint_.reset(); stopped_.clear(); tracked_.clear(); seized_.clear(); step_threads_.clear(); displaced_step_.reset(); breakpoint_rollback_.reset(); breakpoint_rearm_.reset(); deferred_stops_.clear(); deferred_signals_.clear(); interrupting_.clear(); resume_blocked_ = false; breakpoints_.clear(); ids_.clear(); enabled_ids_.clear(); hardware_breakpoints_.clear(); hardware_slots_.clear(); hardware_slot_ids_.clear(); }
+    void clear() { pending_debugger_trap_ = false; pending_signal_ = 0; pending_thread_interrupt_ = false; requested_thread_interrupt_.reset(); detach_signals_.clear(); detach_restored_breakpoints_.clear(); initial_children_.clear(); hardware_pending_children_.clear(); startup_cleanup_ = false; startup_kill_ = false; detaching_ = false; detach_hardware_cleared_ = false; detach_preparing_ = false; terminating_ = false; pid_ = 0; architecture_ = Architecture::unknown; launched_ = false; exited_ = false; pending_.reset(); initial_event_.reset(); pending_breakpoint_.reset(); pending_hardware_execute_ = false; pending_hardware_execute_address_ = 0; stopped_.clear(); tracked_.clear(); seized_.clear(); step_threads_.clear(); displaced_step_.reset(); breakpoint_rollback_.reset(); breakpoint_rearm_.reset(); hardware_step_restore_.reset(); deferred_stops_.clear(); deferred_signals_.clear(); interrupting_.clear(); resume_blocked_ = false; breakpoints_.clear(); ids_.clear(); enabled_ids_.clear(); hardware_breakpoints_.clear(); hardware_slots_.clear(); hardware_slot_ids_.clear(); }
     pid_t pid_ = 0; bool launched_ = false; bool exited_ = false; std::uint64_t seq_ = 0; BreakpointId next_bp_ = 1;
     Architecture architecture_ = Architecture::unknown;
     unsigned last_signal_ = 0;
@@ -2271,6 +2409,8 @@ private:
     std::optional<std::pair<std::uint64_t, pid_t>> pending_;
     std::optional<DebugEvent> initial_event_;
     std::optional<std::uint64_t> pending_breakpoint_;
+    bool pending_hardware_execute_ = false;
+    std::uint64_t pending_hardware_execute_address_ = 0;
     std::map<std::uint64_t, std::byte> breakpoints_;
     std::map<BreakpointId, std::uint64_t> ids_;
     std::set<BreakpointId> enabled_ids_;
@@ -2283,6 +2423,7 @@ private:
     std::optional<DisplacedStep> displaced_step_;
     std::optional<BreakpointRollback> breakpoint_rollback_;
     std::optional<std::uint64_t> breakpoint_rearm_;
+    std::optional<HardwareStepRestore> hardware_step_restore_;
     std::map<pid_t, int> deferred_stops_;
     std::map<pid_t, int> deferred_signals_;
     std::set<pid_t> interrupting_;

@@ -151,7 +151,14 @@ source records per request and labels partial results if that bound is reached.
 Literal-match collection checks cancellation during source scans and uses a
 cancellable stable ordering pass before publishing a page. Each accepted result
 batch is capped at 256 rows; selection is retained by name and destination as
-additional pages arrive.
+additional pages arrive. Current-document page labels, including formatted
+destinations, are prepared by the worker against the captured image. The UI
+appends only that page to the existing list, retaining its original row order
+and selected destination; it does not reformat or replace earlier pages.
+Accepted candidates use appendable storage so a continuation does not relocate
+the full accumulated result set. Changing the query immediately cancels active
+work and disables **More results** during the typing delay, before the next
+refinement starts.
 Changing the query, scope, or mode cancels pending work and discards stale
 pages. Source vectors are collected lazily by the chooser's cancellable
 background worker after the dialog opens, so a large document does not block

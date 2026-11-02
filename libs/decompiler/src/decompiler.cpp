@@ -13695,6 +13695,132 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
             }
             if (!body_valid) break;
         }
+        // A complete switch may dispatch directly to several independent
+        // post-tested latch arms. Keep this shape bounded and phi-free: all
+        // destinations must be represented by the switch metadata, each arm
+        // must have one exact predecessor chain, and every latch must share
+        // the same validated loop header and terminal return.
+        if (body_valid && function.blocks.size() >= 4 && function.blocks.size() <= 256 &&
+            entry->switch_dispatch && entry->phis.empty() && !entry->memory_phi &&
+            entry->memory_partition_phis.empty() && has_only_simple_statements(*entry)) {
+            const auto &dispatch = *entry->switch_dispatch;
+            std::map<std::pair<std::uint32_t, std::uint64_t>, std::vector<std::uint64_t>> grouped;
+            std::set<std::uint64_t> values;
+            bool valid = dispatch.complete && dispatch.selector && dispatch.default_target &&
+                         !dispatch.cases.empty() && dispatch.cases.size() <= 64;
+            for (const auto &item : dispatch.cases) {
+                if (!values.insert(item.value).second) valid = false;
+                grouped[{item.target.space.value, item.target.offset}].push_back(item.value);
+            }
+            const auto default_key = std::pair{dispatch.default_target->space.value,
+                                               dispatch.default_target->offset};
+            grouped.try_emplace(default_key);
+            std::set<std::pair<std::uint32_t, std::uint64_t>> actual_targets;
+            for (const auto &edge : entry->successors) {
+                if (!edge.target || !actual_targets.emplace(edge.target->space.value, edge.target->offset).second ||
+                    !grouped.contains({edge.target->space.value, edge.target->offset}) ||
+                    (edge.kind != BlockEdgeKind::jump && edge.kind != BlockEdgeKind::fallthrough) ||
+                    !edge_targets(edge, *edge.target)) valid = false;
+            }
+            valid = valid && grouped.size() >= 2 && grouped.size() <= 8 &&
+                    actual_targets.size() == grouped.size() && actual_targets.size() == entry->successors.size();
+            struct SwitchLatchArm {
+                std::vector<std::uint64_t> values;
+                bool is_default = false;
+                std::vector<const LiftedBlock *> path;
+                const LiftedBlock *latch = nullptr;
+                const Branch *condition = nullptr;
+                bool repeat_on_true = false;
+            };
+            std::vector<SwitchLatchArm> arms;
+            const auto trace_arm = [&](Address start) -> std::optional<std::vector<const LiftedBlock *>> {
+                std::vector<const LiftedBlock *> path;
+                std::set<std::uint64_t> seen;
+                auto *cursor = find_block(start);
+                auto predecessor = entry->id.value;
+                while (cursor && cursor != entry && path.size() < 64 && seen.insert(cursor->id.value).second &&
+                       predecessors[cursor->id.value] == std::set<std::uint64_t>{predecessor} &&
+                       cursor->phis.empty() && !cursor->memory_phi && cursor->memory_partition_phis.empty() &&
+                       !cursor->switch_dispatch && !contains_return(*cursor) && has_only_simple_statements(*cursor)) {
+                    path.push_back(cursor);
+                    if (const auto *condition = terminal_conditional(*cursor)) {
+                        if (!condition->true_target || !condition->false_target ||
+                            *condition->true_target == *condition->false_target || cursor->successors.size() != 2 ||
+                            !conditional_edges_match_targets(*cursor, *condition)) return {};
+                        return path;
+                    }
+                    if (cursor->successors.size() != 1 || !cursor->successors.front().target ||
+                        (cursor->successors.front().kind != BlockEdgeKind::jump &&
+                         cursor->successors.front().kind != BlockEdgeKind::fallthrough) ||
+                        !has_unconditional_edge(*cursor, *cursor->successors.front().target)) return {};
+                    predecessor = cursor->id.value;
+                    cursor = find_block(*cursor->successors.front().target);
+                }
+                return {};
+            };
+            if (valid) {
+                for (const auto &[key, case_values] : grouped) {
+                    SwitchLatchArm arm;
+                    arm.values = case_values;
+                    arm.is_default = key == default_key;
+                    const auto path = trace_arm(Address{{key.first}, key.second});
+                    if (!path || path->empty()) { valid = false; break; }
+                    arm.path = *path;
+                    arm.latch = arm.path.back();
+                    arm.condition = terminal_conditional(*arm.latch);
+                    if (!arm.condition) { valid = false; break; }
+                    const bool repeat_true = *arm.condition->true_target == entry->begin;
+                    const bool repeat_false = *arm.condition->false_target == entry->begin;
+                    if (repeat_true == repeat_false) { valid = false; break; }
+                    arm.repeat_on_true = repeat_true;
+                    arms.push_back(std::move(arm));
+                }
+            }
+            std::set<std::uint64_t> covered{entry->id.value}, latch_ids;
+            const LiftedBlock *shared_exit = nullptr;
+            for (const auto &arm : arms) {
+                for (const auto *block : arm.path)
+                    if (!covered.insert(block->id.value).second) valid = false;
+                if (!latch_ids.insert(arm.latch->id.value).second) valid = false;
+                const auto &condition = *arm.condition;
+                const Address exit_address = arm.repeat_on_true ? *condition.false_target : *condition.true_target;
+                const auto *candidate_exit = find_block(exit_address);
+                if (!candidate_exit || (shared_exit && shared_exit != candidate_exit)) valid = false;
+                shared_exit = candidate_exit;
+            }
+            if (arms.size() != grouped.size() || !shared_exit ||
+                predecessors[entry->id.value] != latch_ids || predecessors[shared_exit->id.value] != latch_ids ||
+                !has_only_terminal_return(*shared_exit) || !shared_exit->phis.empty() || shared_exit->memory_phi ||
+                !shared_exit->memory_partition_phis.empty() || !covered.insert(shared_exit->id.value).second)
+                valid = false;
+            valid = valid && covered.size() == function.blocks.size() &&
+                std::all_of(function.blocks.begin(), function.blocks.end(), [&](const auto &block) {
+                    return covered.contains(block.id.value);
+                });
+            if (valid) {
+                out << "function " << address_label(function.entry) << "() {\n    do {\n";
+                emit_block(*entry, 8, true);
+                out << "        bool __hexlab_latch_exit = false;\n"
+                    << "        switch (" << expression_text(*dispatch.selector) << ") {\n";
+                for (const auto &arm : arms) {
+                    for (const auto value : arm.values)
+                        out << "        case 0x" << std::hex << value << std::dec << ":\n";
+                    if (arm.is_default) out << "        default:\n";
+                    for (std::size_t i = 0; i + 1 < arm.path.size(); ++i)
+                        emit_block(*arm.path[i], 12, true);
+                    emit_block(*arm.latch, 12, true);
+                    const auto condition = branch_condition_text(*arm.condition);
+                    out << "            if (" << (arm.repeat_on_true ? condition : "!(" + condition + ")")
+                        << ") continue;\n"
+                        << "            __hexlab_latch_exit = true;\n"
+                        << "            break;\n";
+                }
+                out << "        }\n        if (__hexlab_latch_exit) break;\n    } while (true);\n";
+                emit_block(*shared_exit, 4);
+                out << "}\n";
+                return {out.str(), false, {}};
+            }
+        }
         // A post-tested loop may route its body through two or three latch
         // blocks. Accept only small, phi-free conditional dispatch trees whose
         // straight-line arms end at distinct latches with the same exact
