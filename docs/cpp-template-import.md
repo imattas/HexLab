@@ -110,6 +110,14 @@ whose parameter and result types use symbolic named references. Function bodies,
 explicit function-template specializations, function-template non-type/template-
 template parameters, and overloaded function-template metadata are unsupported.
 
+These prototypes also accept explicit trailing return types, for example
+`template <typename T> auto identity(T value) -> T;`. Instantiated class-template
+method prototypes can use `auto get() -> T;` or another supported concrete
+type-id; they retain the same method metadata as a leading-return prototype.
+The placeholder must be a plain `auto` on a named direct function. No return
+deduction or `decltype` expression evaluation is performed. See
+[header import](header-import.md) for the syntax and bounds.
+
 Pack expansion supports direct `Pack...` forwarding and compound
 template-argument patterns over one bound pack, including `Types*...`,
 `Box<Types>...`, abstract array/callback types, integral expressions, and

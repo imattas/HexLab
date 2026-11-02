@@ -123,6 +123,7 @@ std::vector<Token> lex(std::string_view text, const HeaderImportOptions &o) {
         if(ident_start(c)){std::size_t b=i++;while(i<text.size()&&ident_continue(text[i]))++i;push(std::string(text.substr(b,i-b)));continue;}
         if(c>='0'&&c<='9'){std::size_t b=i++;while(i<text.size()&&((text[i]>='0'&&text[i]<='9')||(text[i]>='a'&&text[i]<='z')||(text[i]>='A'&&text[i]<='Z')||text[i]=='x'||text[i]=='X'))++i;push(std::string(text.substr(b,i-b)));continue;}
         if(c==':'&&i+1<text.size()&&text[i+1]==':'){push("::");i+=2;continue;}
+        if(c=='-'&&i+1<text.size()&&text[i+1]=='>'){push("->");i+=2;continue;}
         if(c=='.'&&i+2<text.size()&&text.substr(i,3)=="..."){push("...");i+=3;continue;}
         if(std::string_view("{}[]();,*=&+-/%|^~!<>?:.").find(c)!=std::string_view::npos){push(std::string(1,c));++i;continue;}
         fail(ErrorCode::unsupported,"unsupported character in C header at line "+std::to_string(line));
@@ -131,7 +132,7 @@ std::vector<Token> lex(std::string_view text, const HeaderImportOptions &o) {
 }
 
 struct Decl { std::string name; TypePtr type; std::vector<Parameter> params; bool function=false; bool variadic=false; FunctionConvention convention=FunctionConvention::platform_default; };
-struct Base { TypePtr type; bool is_typedef=false; bool is_static=false; bool is_inline=false; };
+struct Base { TypePtr type; bool is_typedef=false; bool is_static=false; bool is_inline=false; bool trailing_return=false; bool is_extern=false; };
 struct TemplateParameter {
     std::string name;
     std::vector<Token> default_type;
@@ -1898,9 +1899,9 @@ private:
                 if (!reference) fail(reference.error().code, reference.error().message);
                 template_type_bindings_.insert_or_assign(parameter.name, reference.value());
             }
-            auto base = parse_base();
+            auto base = parse_base(false, true);
             if (base.is_typedef || base.is_static) syntax("function template has invalid storage specifiers");
-            auto declaration = parse_declarator(base.type, false);
+            auto declaration = parse_declarator(base.type, false, nullptr, base.trailing_return);
             if (!declaration.function)
                 fail(ErrorCode::unsupported, "only function templates and class templates are retained");
             if (at("{")) fail(ErrorCode::unsupported, "function template definitions and bodies are unsupported");
@@ -2422,8 +2423,8 @@ private:
         }
     }
     bool qualifier_or_storage()const{return at("const")||at("volatile")||at("restrict")||at("__restrict")||at("__restrict__")||at("_Atomic")||at("typedef")||at("extern")||at("static")||at("inline");}
-    Base parse_base(bool allow_member_alignment=false){
-        enter(); consume_standard_attributes(); bool is_typedef=false,is_static=false,is_inline=false; std::uint8_t qualifiers=0;
+    Base parse_base(bool allow_member_alignment=false,bool allow_trailing_return=false){
+        enter(); consume_standard_attributes(); bool is_typedef=false,is_static=false,is_inline=false,is_extern=false; std::uint8_t qualifiers=0;
         while(at("__declspec")||at("__attribute__")||alignment_specifier()) { if(alignment_specifier())parse_alignment_specifier();else if(parse_attribute())prefix_packed_=true; }
         while(qualifier_or_storage()||at("__declspec")||at("__attribute__")||alignment_specifier()) {
             if(alignment_specifier()){parse_alignment_specifier();continue;}
@@ -2431,7 +2432,7 @@ private:
             if(take("typedef"))is_typedef=true;
             else if(take("static")){is_static=true;}
             else if(take("inline"))is_inline=true;
-            else if(take("extern")){}
+            else if(take("extern"))is_extern=true;
             else if(take("const"))qualifiers|=static_cast<std::uint8_t>(Qualifier::const_);
             else if(take("volatile"))qualifiers|=static_cast<std::uint8_t>(Qualifier::volatile_);
             else if(take("restrict")||take("__restrict")||take("__restrict__"))qualifiers|=static_cast<std::uint8_t>(Qualifier::restrict_);
@@ -2441,8 +2442,17 @@ private:
         const bool dependent_typename=take("typename");
         if(dependent_typename&&(!identifier(peek().text)&&!at("::")))syntax("typename requires a qualified type name");
         TypePtr base;
+        bool trailing_return=false;
         bool typename_resolved=false;
-        if(take("struct")||take("union")||take("class")) {
+        if(take("auto")) {
+            if(!allow_trailing_return||qualifiers||is_typedef||dependent_typename)
+                fail(ErrorCode::unsupported,"auto is supported only as a plain trailing-return function placeholder");
+            // The placeholder never escapes the declarator: its explicit
+            // trailing type replaces this temporary base before construction.
+            base=Type::void_type();
+            trailing_return=true;
+        }
+        else if(take("struct")||take("union")||take("class")) {
             const auto aggregate_keyword=t_[pos_-1].text;
             base=parse_aggregate(aggregate_keyword=="union",aggregate_keyword=="class");
         }
@@ -2513,7 +2523,7 @@ private:
         }
         if(prefix_packed_&&base->kind()!=Kind::structure&&base->kind()!=Kind::union_type&&!allow_member_alignment){prefix_packed_=false;fail(ErrorCode::unsupported,"packed attributes are supported only on aggregate types or aggregate members");}
         if(qualifiers){auto qualified=Type::qualified(std::move(base),qualifiers);if(!qualified)fail(qualified.error().code,qualified.error().message);base=qualified.value();}
-        leave();return {std::move(base),is_typedef,is_static,is_inline};
+        leave();return {std::move(base),is_typedef,is_static,is_inline,trailing_return,is_extern};
     }
     TypePtr parse_builtin(){
         std::vector<std::string> words;
@@ -2745,7 +2755,7 @@ private:
             }
             consume_standard_attributes();
             const bool virtual_specifier = take("virtual");
-            auto b=parse_base(true);
+            auto b=parse_base(true,true);
             consume_standard_attributes();
             if(virtual_specifier&&b.is_static)fail(ErrorCode::malformed,"static member functions cannot be virtual");
             if(b.is_typedef&&(b.is_static||b.is_inline))syntax("member typedef cannot have static or inline storage");
@@ -2821,7 +2831,7 @@ private:
                 while(at("__attribute__")||at("__declspec"))packed_member=parse_attribute()||packed_member;
                 if(pending_aggregate_alignment_){member_alignment=std::max(member_alignment.value_or(0),*pending_aggregate_alignment_);pending_aggregate_alignment_.reset();}
                 consume_standard_attributes();
-                auto d=parse_declarator(b.type,true);
+                auto d=parse_declarator(b.type,true,nullptr,b.trailing_return);
                 consume_standard_attributes();
                 while(at("__attribute__")||at("__declspec"))packed_member=parse_attribute()||packed_member;
                 if(pending_aggregate_alignment_){member_alignment=std::max(member_alignment.value_or(0),*pending_aggregate_alignment_);pending_aggregate_alignment_.reset();}
@@ -3306,7 +3316,8 @@ private:
         FunctionConvention convention=FunctionConvention::platform_default;
         std::uint8_t qualifiers=0;
     };
-    Decl parse_declarator(TypePtr base,bool allow_abstract,std::vector<Derived>* parsed_ops=nullptr){
+    Decl parse_declarator(TypePtr base,bool allow_abstract,std::vector<Derived>* parsed_ops=nullptr,
+                          bool trailing_return=false){
         enter();
         auto convention=consume_calling_convention();
         std::vector<std::uint8_t> pointer_qualifiers;
@@ -3373,6 +3384,24 @@ private:
             if(expanded_parameters&&params.size()>32)fail(ErrorCode::resource_limit,"expanded function parameter count exceeds 32");
             if(variadic&&params.empty())fail(ErrorCode::malformed,"variadic prototypes require at least one fixed parameter");
             leave();derived.push_back({Derived::Kind::function,0,std::move(params),variadic,convention});
+        }
+        if(trailing_return) {
+            if(name.empty()||!pointer_qualifiers.empty()||derived.size()!=1||
+               derived.front().kind!=Derived::Kind::function)
+                fail(ErrorCode::unsupported,"trailing-return declarations require a named direct function declarator");
+            need("->");
+            const auto result_start=pos_;
+            auto result_base=parse_base();
+            if(result_base.is_typedef||result_base.is_static||result_base.is_inline||result_base.is_extern||
+               prefix_packed_||pending_aggregate_alignment_||pending_vector_size_)
+                fail(ErrorCode::unsupported,"storage and layout attributes are invalid in a trailing return type");
+            auto result=parse_declarator(result_base.type,true);
+            if(std::any_of(t_.begin()+static_cast<std::ptrdiff_t>(result_start),
+                           t_.begin()+static_cast<std::ptrdiff_t>(pos_),
+                           [](const Token &token){return token.text=="{";}))
+                fail(ErrorCode::unsupported,"type definitions are invalid in a trailing return type");
+            if(!result.name.empty())syntax("trailing return type requires an abstract type-id");
+            base=apply_pending_function_convention(std::move(result.type));
         }
         for(auto it=pointer_qualifiers.rbegin();it!=pointer_qualifiers.rend();++it){Derived pointer{Derived::Kind::pointer};pointer.qualifiers=*it;derived.push_back(std::move(pointer));}
         for(auto it=derived.rbegin();it!=derived.rend();++it){
@@ -3619,7 +3648,7 @@ private:
             else fail(ErrorCode::malformed,"invalid internal #pragma pack token");
             return;
         }
-        auto b=parse_base();
+        auto b=parse_base(false,true);
         consume_standard_attributes();
         auto declaration_alignment = pending_aggregate_alignment_;
         pending_aggregate_alignment_.reset();
@@ -3632,8 +3661,11 @@ private:
             if(!b.is_typedef)fail(ErrorCode::unsupported,"vector_size is currently supported only on typedef declarations");
             b.type=make_vector_type(std::move(b.type),bytes);
         }
-        if(take(";"))return;
-        for(;;){consume_standard_attributes();auto d=parse_declarator(b.type,false);consume_standard_attributes();auto effective_alignment=declaration_alignment;if(at("__attribute__")||at("__declspec")){if(parse_attribute())fail(ErrorCode::unsupported,"packed attribute placement on a top-level declaration is unsupported");if(pending_aggregate_alignment_){effective_alignment=std::max(effective_alignment.value_or(0),*pending_aggregate_alignment_);pending_aggregate_alignment_.reset();}}while(alignment_specifier())parse_alignment_specifier();if(pending_aggregate_alignment_){effective_alignment=std::max(effective_alignment.value_or(0),*pending_aggregate_alignment_);pending_aggregate_alignment_.reset();}d.type=apply_pending_vector_size(std::move(d.type),b.is_typedef);d.type=apply_pending_function_convention(std::move(d.type));if(effective_alignment&&!d.function&&!(d.type->kind()==Kind::array&&!b.is_typedef))d.type=apply_alignment(std::move(d.type),effective_alignment);else if(effective_alignment&&d.function)fail(ErrorCode::unsupported,"alignment cannot be applied to function declarations");if(take(":"))fail(ErrorCode::unsupported,"bitfield declarations are unsupported");if(d.function&&at("{"))fail(ErrorCode::unsupported,"function definitions and bodies are unsupported");if(take("="))fail(ErrorCode::unsupported,"initialized declarations are unsupported");
+        if(take(";")){
+            if(b.trailing_return)syntax("auto requires a trailing-return function declarator");
+            return;
+        }
+        for(;;){consume_standard_attributes();auto d=parse_declarator(b.type,false,nullptr,b.trailing_return);consume_standard_attributes();auto effective_alignment=declaration_alignment;if(at("__attribute__")||at("__declspec")){if(parse_attribute())fail(ErrorCode::unsupported,"packed attribute placement on a top-level declaration is unsupported");if(pending_aggregate_alignment_){effective_alignment=std::max(effective_alignment.value_or(0),*pending_aggregate_alignment_);pending_aggregate_alignment_.reset();}}while(alignment_specifier())parse_alignment_specifier();if(pending_aggregate_alignment_){effective_alignment=std::max(effective_alignment.value_or(0),*pending_aggregate_alignment_);pending_aggregate_alignment_.reset();}d.type=apply_pending_vector_size(std::move(d.type),b.is_typedef);d.type=apply_pending_function_convention(std::move(d.type));if(effective_alignment&&!d.function&&!(d.type->kind()==Kind::array&&!b.is_typedef))d.type=apply_alignment(std::move(d.type),effective_alignment);else if(effective_alignment&&d.function)fail(ErrorCode::unsupported,"alignment cannot be applied to function declarations");if(take(":"))fail(ErrorCode::unsupported,"bitfield declarations are unsupported");if(d.function&&at("{"))fail(ErrorCode::unsupported,"function definitions and bodies are unsupported");if(take("="))fail(ErrorCode::unsupported,"initialized declarations are unsupported");
             if(!d.function&&(d.type->kind()==Kind::void_type||d.type->kind()==Kind::function))fail(ErrorCode::malformed,"object declaration has a non-object type");
             if(!d.function&&!b.is_typedef&&!d.type->size())fail(ErrorCode::unsupported,"object declaration requires a complete object type");
             if(d.function){if(d.type->result_type()->kind()!=Kind::void_type&&!d.type->result_type()->size())fail(ErrorCode::unsupported,"function result requires a complete object type");for(const auto &parameter:d.type->parameters())if(!parameter.type->size())fail(ErrorCode::unsupported,"function parameter requires a complete object type");}

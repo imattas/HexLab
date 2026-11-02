@@ -34,6 +34,44 @@ top-level comma ends the default and starts the next parameter. Default
 expressions containing template-ids with commas are not supported by this
 bounded skipping rule. Default values are not evaluated or exported.
 
+Named C++ function and method prototypes may use a plain `auto` placeholder
+with an explicit trailing return type. The importer parses the trailing
+abstract type-id using its ordinary type grammar, then retains the same
+function signature, parameter names, variadic flag and calling convention as
+the equivalent leading-return declaration. Class methods keep their existing
+access, static and `this_type` metadata; their spelling adds no object layout.
+Concrete class-template methods can use bound parameters in the return type,
+and type-only function-template prototypes retain symbolic return types.
+
+```cpp
+auto count(unsigned limit = 0) -> unsigned;
+auto callback() -> int (*)(short);
+
+template <typename T>
+auto identity(T value) -> T;
+
+template <typename T>
+struct Box {
+    auto get() -> T;
+    static auto pointer(T* value) -> T*;
+};
+using ShortBox = Box<short>;
+```
+
+The placeholder must be exactly `auto`, and the declarator must name a direct
+function. Deduced returns, `decltype`, abbreviated `auto` parameters,
+`const auto`, pointer/reference placeholders, placeholder callback variables
+and abstract placeholder aliases remain unsupported. The trailing type must
+be abstract and cannot contain storage specifiers or a type definition;
+existing layout-attribute restrictions also apply. Functions cannot return
+arrays or function types directly; pointer-to-array and callback return types
+use the normal nested declarator rules. Method cv/ref/noexcept qualifiers and
+function bodies remain unsupported. Existing function-template binding limits
+still apply.
+Missing arrows, named return declarators and unsupported forms produce errors
+instead of exposing a placeholder type. This syntax uses the existing token,
+nesting and template expansion bounds.
+
 The importer also consumes the standard attribute specifiers `[[maybe_unused]]`,
 `[[nodiscard]]`, and `[[deprecated]]`, including `[[nodiscard("reason")]]`
 and `[[deprecated("message")]]`. These attributes are accepted before a
