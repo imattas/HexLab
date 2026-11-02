@@ -6,7 +6,7 @@ endif()
 hexlab_add_library(plugins SOURCES src/plugins.cpp src/plugin_authenticode.cpp src/runtime.cpp src/scalar_ir.cpp ${HEXLAB_PLUGIN_NATIVE}
   DEPENDS hexlab::core hexlab::automation hexlab::loaders hexlab::processors hexlab::debugger hexlab::decompiler)
 if(WIN32)
-  target_link_libraries(hexlab_plugins PRIVATE Wintrust)
+  target_link_libraries(hexlab_plugins PRIVATE Wintrust Crypt32)
 endif()
 if(UNIX)
   target_link_libraries(hexlab_plugins PRIVATE ${CMAKE_DL_LIBS})

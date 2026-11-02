@@ -284,6 +284,11 @@ struct HEXLAB_PLUGINS_EXPORT PluginAuthenticodeTrust {
     PluginAuthenticodeTrustStatus status = PluginAuthenticodeTrustStatus::unsupported;
     std::int32_t provider_status = 0;
     std::string provider;
+    // Populated from the signer chain retained by the Authenticode verifier.
+    // These identify the leaf certificate; they are not a publisher allowlist.
+    std::string signer_subject;
+    std::string signer_issuer;
+    std::string signer_certificate_sha256;
 };
 // Uses the host platform's Authenticode trust policy when available. This is
 // informational and does not prevent activation or provide process isolation.

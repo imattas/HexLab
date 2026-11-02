@@ -28,6 +28,12 @@ identity and no capability preflight. The **Check Authenticode Trust** action
 checks the selected file using Windows' generic Authenticode trust policy,
 without opening the module as code. It uses cached trust data only and does not
 check revocation. A positive result reflects the current Windows trust store;
-it is informational and does not gate activation. Other platforms report that
-the provider is unsupported. Neither a sidecar hash nor this check provides
-process isolation: native modules still run in-process.
+it is informational and does not gate activation. When the trust provider
+returns its signer chain, the candidate details show the signer certificate's
+subject, issuer and SHA-256 fingerprint. Those fields identify the certificate
+whose chain was evaluated; HexLab has no publisher allowlist or pinning policy,
+so a trusted chain does not assert that the publisher is approved by the user.
+If signer extraction is unavailable, the trust result remains visible and the
+missing certificate identity is reported explicitly. Other platforms report
+that the provider is unsupported. Neither a sidecar hash nor this check
+provides process isolation: native modules still run in-process.

@@ -763,6 +763,10 @@ void PluginsView::verify_candidate_signature() {
             result.message = "No Authenticode trust provider is available on this platform.";
             break;
         }
+        if (!checked.value().signer_subject.empty())
+            result.message += " Signer certificate subject: " + checked.value().signer_subject + ".";
+        if (!checked.value().signer_certificate_sha256.empty())
+            result.message += " Leaf certificate SHA-256: " + checked.value().signer_certificate_sha256 + ".";
         return result;
     }, false, "Checking platform Authenticode trust without loading the module...");
 }
@@ -1353,6 +1357,15 @@ void PluginsView::show_candidate_details() {
         case plugins::PluginAuthenticodeTrustStatus::unsupported: details << "unsupported"; break;
         }
         details << "\nProvider: " << trust.provider << "\n";
+        if (!trust.signer_subject.empty())
+            details << "Signer certificate subject: " << trust.signer_subject << "\n";
+        if (!trust.signer_issuer.empty())
+            details << "Signer certificate issuer: " << trust.signer_issuer << "\n";
+        if (!trust.signer_certificate_sha256.empty())
+            details << "Signer certificate SHA-256: " << trust.signer_certificate_sha256 << "\n";
+        if (trust.status == plugins::PluginAuthenticodeTrustStatus::trusted &&
+            trust.signer_certificate_sha256.empty())
+            details << "Signer certificate identity: unavailable from the platform trust state\n";
     } else {
         details << "Platform signature check: not checked\n";
     }
