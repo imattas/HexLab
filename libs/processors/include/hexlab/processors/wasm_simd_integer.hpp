@@ -42,4 +42,68 @@ inline std::optional<WasmSimdIntegerBinaryOp> wasm_simd_integer_binary_op(
     return std::nullopt;
 }
 
+enum class WasmSimdIntegerExtendedKind : std::uint8_t {
+    narrow,
+    extend,
+    pairwise_add,
+    extended_multiply
+};
+
+// Explicit metadata for core integer SIMD transforms. `source_lane_bits` and
+// `result_lane_bits` describe the widened/narrowed lane widths. Narrowing reads
+// signed source lanes for both result kinds; `signed_result` selects whether
+// the narrowed result saturates to signed or unsigned bounds. For the other
+// operations `signed_input` controls sign extension/multiplication.
+struct WasmSimdIntegerExtendedOp {
+    std::uint32_t subopcode;
+    std::string_view name;
+    WasmSimdIntegerExtendedKind kind;
+    unsigned source_lane_bits;
+    unsigned result_lane_bits;
+    bool signed_input;
+    bool signed_result;
+    bool high_half;
+};
+
+inline std::optional<WasmSimdIntegerExtendedOp> wasm_simd_integer_extended_op(
+    std::uint32_t subopcode) noexcept {
+    using Kind = WasmSimdIntegerExtendedKind;
+    static constexpr WasmSimdIntegerExtendedOp operations[]{
+        {0x65, "i8x16.narrow_i16x8_s", Kind::narrow, 16, 8, true, true, false},
+        {0x66, "i8x16.narrow_i16x8_u", Kind::narrow, 16, 8, true, false, false},
+        {0x85, "i16x8.narrow_i32x4_s", Kind::narrow, 32, 16, true, true, false},
+        {0x86, "i16x8.narrow_i32x4_u", Kind::narrow, 32, 16, true, false, false},
+        {0x7c, "i16x8.extadd_pairwise_i8x16_s", Kind::pairwise_add, 8, 16, true, true, false},
+        {0x7d, "i16x8.extadd_pairwise_i8x16_u", Kind::pairwise_add, 8, 16, false, false, false},
+        {0x7e, "i32x4.extadd_pairwise_i16x8_s", Kind::pairwise_add, 16, 32, true, true, false},
+        {0x7f, "i32x4.extadd_pairwise_i16x8_u", Kind::pairwise_add, 16, 32, false, false, false},
+        {0x87, "i16x8.extend_low_i8x16_s", Kind::extend, 8, 16, true, true, false},
+        {0x88, "i16x8.extend_high_i8x16_s", Kind::extend, 8, 16, true, true, true},
+        {0x89, "i16x8.extend_low_i8x16_u", Kind::extend, 8, 16, false, false, false},
+        {0x8a, "i16x8.extend_high_i8x16_u", Kind::extend, 8, 16, false, false, true},
+        {0xa7, "i32x4.extend_low_i16x8_s", Kind::extend, 16, 32, true, true, false},
+        {0xa8, "i32x4.extend_high_i16x8_s", Kind::extend, 16, 32, true, true, true},
+        {0xa9, "i32x4.extend_low_i16x8_u", Kind::extend, 16, 32, false, false, false},
+        {0xaa, "i32x4.extend_high_i16x8_u", Kind::extend, 16, 32, false, false, true},
+        {0xc7, "i64x2.extend_low_i32x4_s", Kind::extend, 32, 64, true, true, false},
+        {0xc8, "i64x2.extend_high_i32x4_s", Kind::extend, 32, 64, true, true, true},
+        {0xc9, "i64x2.extend_low_i32x4_u", Kind::extend, 32, 64, false, false, false},
+        {0xca, "i64x2.extend_high_i32x4_u", Kind::extend, 32, 64, false, false, true},
+        {0x9c, "i16x8.extmul_low_i8x16_s", Kind::extended_multiply, 8, 16, true, true, false},
+        {0x9d, "i16x8.extmul_high_i8x16_s", Kind::extended_multiply, 8, 16, true, true, true},
+        {0x9e, "i16x8.extmul_low_i8x16_u", Kind::extended_multiply, 8, 16, false, false, false},
+        {0x9f, "i16x8.extmul_high_i8x16_u", Kind::extended_multiply, 8, 16, false, false, true},
+        {0xbc, "i32x4.extmul_low_i16x8_s", Kind::extended_multiply, 16, 32, true, true, false},
+        {0xbd, "i32x4.extmul_high_i16x8_s", Kind::extended_multiply, 16, 32, true, true, true},
+        {0xbe, "i32x4.extmul_low_i16x8_u", Kind::extended_multiply, 16, 32, false, false, false},
+        {0xbf, "i32x4.extmul_high_i16x8_u", Kind::extended_multiply, 16, 32, false, false, true},
+        {0xdc, "i64x2.extmul_low_i32x4_s", Kind::extended_multiply, 32, 64, true, true, false},
+        {0xdd, "i64x2.extmul_high_i32x4_s", Kind::extended_multiply, 32, 64, true, true, true},
+        {0xde, "i64x2.extmul_low_i32x4_u", Kind::extended_multiply, 32, 64, false, false, false},
+        {0xdf, "i64x2.extmul_high_i32x4_u", Kind::extended_multiply, 32, 64, false, false, true}};
+    for (const auto &operation : operations)
+        if (operation.subopcode == subopcode) return operation;
+    return std::nullopt;
+}
+
 } // namespace hexlab

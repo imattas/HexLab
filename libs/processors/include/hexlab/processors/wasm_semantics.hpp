@@ -52,9 +52,10 @@ inline std::optional<WasmV128> evaluate_wasm_simd_integer_binary_instruction(
             value |= static_cast<std::uint64_t>(vector[offset + index]) << (index * 8);
         return value;
     };
-    // Signed operations below have lanes at most 32 bits. Conversion uses
-    // explicit two's-complement magnitude instead of out-of-range casts.
+    // Conversion uses explicit two's-complement magnitude for narrow lanes
+    // and preserves all bits with bit_cast for signed 64-bit comparisons.
     const auto signed_lane = [bits, mask](std::uint64_t value) -> std::int64_t {
+        if (bits == 64) return std::bit_cast<std::int64_t>(value);
         return value & (UINT64_C(1) << (bits - 1)) ?
             -static_cast<std::int64_t>((mask - value) + 1) : static_cast<std::int64_t>(value);
     };
@@ -106,6 +107,124 @@ inline std::optional<WasmV128> evaluate_wasm_simd_integer_binary_instruction(
             result[offset + index] = static_cast<std::uint8_t>(value >> (index * 8));
     }
     return result;
+}
+
+// Evaluate the core SIMD integer widening/narrowing transform family.
+// Narrowing reads signed source lanes from lhs then rhs and saturates into the
+// result range; widening, pairwise addition, and extended multiplication read
+// one or both vectors according to the exact decoded opcode.
+inline std::optional<WasmV128> evaluate_wasm_simd_integer_extended_instruction(
+    const Instruction &instruction, const WasmV128 &lhs, const WasmV128 *rhs = nullptr) noexcept {
+    if (instruction.context.architecture != Architecture::wasm ||
+        instruction.context.mode != ExecutionMode::wasm32 || instruction.opcode != Opcode::wasm ||
+        instruction.flow != FlowKind::fallthrough || instruction.length < 2 || instruction.length > 6 ||
+        instruction.bytes[0] != std::byte{0xfd} || !instruction.operands.empty() ||
+        !instruction.access.empty() || instruction.memory_read || instruction.memory_write)
+        return std::nullopt;
+
+    std::uint32_t subopcode = 0;
+    bool terminated = false;
+    for (unsigned index = 1; index < instruction.length; ++index) {
+        const auto byte = std::to_integer<std::uint8_t>(instruction.bytes[index]);
+        const auto payload = static_cast<std::uint32_t>(byte & 0x7f);
+        if (index == 5 && payload > 15) return std::nullopt;
+        subopcode |= payload << ((index - 1) * 7);
+        if (!(byte & 0x80)) {
+            if (index + 1 != instruction.length) return std::nullopt;
+            terminated = true;
+            break;
+        }
+    }
+    const auto info = wasm_simd_integer_extended_op(subopcode);
+    if (!terminated || !info || instruction.mnemonic_override != info->name)
+        return std::nullopt;
+
+    const bool binary = info->kind == WasmSimdIntegerExtendedKind::narrow ||
+                        info->kind == WasmSimdIntegerExtendedKind::extended_multiply;
+    if (binary != (rhs != nullptr)) return std::nullopt;
+
+    const auto lane_bytes = [](unsigned bits) { return bits / 8; };
+    const auto read_lane = [](const WasmV128 &vector, unsigned offset, unsigned bits) {
+        std::uint64_t value = 0;
+        for (unsigned index = 0; index < bits / 8; ++index)
+            value |= static_cast<std::uint64_t>(vector[offset + index]) << (index * 8);
+        return value;
+    };
+    const auto write_lane = [](WasmV128 &vector, unsigned lane, unsigned bits, std::uint64_t value) {
+        const auto bytes = bits / 8;
+        for (unsigned index = 0; index < bytes; ++index)
+            vector[lane * bytes + index] = static_cast<std::uint8_t>(value >> (index * 8));
+    };
+    const auto signed_lane = [](std::uint64_t value, unsigned bits) -> std::int64_t {
+        const auto mask = bits == 64 ? UINT64_MAX : (UINT64_C(1) << bits) - 1;
+        if (bits == 64) return std::bit_cast<std::int64_t>(value);
+        if (value & (UINT64_C(1) << (bits - 1)))
+            return -static_cast<std::int64_t>((mask - value) + 1);
+        return static_cast<std::int64_t>(value);
+    };
+    const auto extend = [&](std::uint64_t value) -> std::uint64_t {
+        if (info->signed_input)
+            return static_cast<std::uint64_t>(signed_lane(value, info->source_lane_bits));
+        return value;
+    };
+
+    WasmV128 result{};
+    const auto source_bytes = lane_bytes(info->source_lane_bits);
+    const auto result_bytes = lane_bytes(info->result_lane_bits);
+    const auto source_lane_count = 16 / source_bytes;
+    const auto result_lane_count = 16 / result_bytes;
+    const auto result_mask = info->result_lane_bits == 64 ? UINT64_MAX :
+        (UINT64_C(1) << info->result_lane_bits) - 1;
+    switch (info->kind) {
+    case WasmSimdIntegerExtendedKind::narrow: {
+        const auto result_min_signed = -(INT64_C(1) << (info->result_lane_bits - 1));
+        const auto result_max_signed = (INT64_C(1) << (info->result_lane_bits - 1)) - 1;
+        const auto result_max_unsigned = static_cast<std::int64_t>(result_mask);
+        for (unsigned lane = 0; lane < result_lane_count; ++lane) {
+            const auto &input = lane < result_lane_count / 2 ? lhs : *rhs;
+            const auto source_lane = lane < result_lane_count / 2 ? lane : lane - result_lane_count / 2;
+            const auto value = signed_lane(read_lane(input, source_lane * source_bytes,
+                                                     info->source_lane_bits), info->source_lane_bits);
+            const auto saturated = info->signed_result
+                ? std::clamp(value, result_min_signed, result_max_signed)
+                : std::clamp(value, INT64_C(0), result_max_unsigned);
+            write_lane(result, lane, info->result_lane_bits, static_cast<std::uint64_t>(saturated) & result_mask);
+        }
+        return result;
+    }
+    case WasmSimdIntegerExtendedKind::extend: {
+        const auto start = info->high_half ? source_lane_count / 2 : 0;
+        for (unsigned lane = 0; lane < result_lane_count; ++lane) {
+            const auto value = read_lane(lhs, (start + lane) * source_bytes, info->source_lane_bits);
+            write_lane(result, lane, info->result_lane_bits, extend(value) & result_mask);
+        }
+        return result;
+    }
+    case WasmSimdIntegerExtendedKind::pairwise_add: {
+        for (unsigned lane = 0; lane < result_lane_count; ++lane) {
+            const auto first = read_lane(lhs, (lane * 2) * source_bytes, info->source_lane_bits);
+            const auto second = read_lane(lhs, (lane * 2 + 1) * source_bytes, info->source_lane_bits);
+            const auto value = extend(first) + extend(second);
+            write_lane(result, lane, info->result_lane_bits, value & result_mask);
+        }
+        return result;
+    }
+    case WasmSimdIntegerExtendedKind::extended_multiply: {
+        const auto start = info->high_half ? result_lane_count : 0;
+        for (unsigned lane = 0; lane < result_lane_count; ++lane) {
+            const auto offset = (start + lane) * source_bytes;
+            const auto left = read_lane(lhs, offset, info->source_lane_bits);
+            const auto right = read_lane(*rhs, offset, info->source_lane_bits);
+            const auto product = info->signed_input
+                ? static_cast<std::uint64_t>(signed_lane(left, info->source_lane_bits) *
+                                             signed_lane(right, info->source_lane_bits))
+                : left * right;
+            write_lane(result, lane, info->result_lane_bits, product & result_mask);
+        }
+        return result;
+    }
+    }
+    return std::nullopt;
 }
 
 // Evaluate one of the twelve integer SIMD lane shifts. WebAssembly masks the

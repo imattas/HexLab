@@ -75,4 +75,6 @@ binary arithmetic and vector comparisons have concrete semantics helpers; see
 still require their own typed lifting.
 
 The concrete integer SIMD unary helper and its exact lane semantics are
-documented in [integer unary operations](wasm-simd-integer-unary.md).
+documented in [integer unary operations](wasm-simd-integer-unary.md). Core
+integer narrowing, widening, pairwise addition, and extended multiplication
+have concrete semantics in [extended integer transforms](wasm-simd-integer-extended.md).

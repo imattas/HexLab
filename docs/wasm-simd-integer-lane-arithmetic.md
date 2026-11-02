@@ -1,7 +1,7 @@
 # WebAssembly SIMD integer lane arithmetic
 
 The decoder, module validator, and typed function lifter share an explicit
-34-opcode table for integer SIMD binary arithmetic:
+35-opcode table for integer SIMD binary arithmetic:
 
 - Wrapping add and subtract for i8x16, i16x8, i32x4, and i64x2.
 - Signed and unsigned saturating add and subtract for i8x16 and i16x8.
@@ -31,9 +31,12 @@ bounded u32 subopcode LEB encoding, exact mnemonic, absence of extra bytes or
 operands, and absence of memory effects. Valid padded LEB encodings are accepted.
 
 The helper is an explicit processor semantics API. The symbolic evaluator does
-not automatically execute or fold these named vector expressions. Narrowing,
-widening, dot products, pairwise operations, and relaxed SIMD remain outside this
-arithmetic slice.
+not automatically execute or fold these named vector expressions. Integer
+comparisons have a separate exact mask evaluator. Core narrowing, widening,
+pairwise-add, and extended-multiply transforms are covered by the
+[extended integer evaluator](wasm-simd-integer-extended.md). Relaxed SIMD
+remains outside these deterministic helpers because its permitted results may
+vary by implementation.
 
 Opcode assignments and arithmetic behavior follow the official
 [SIMD binary encoding](https://github.com/WebAssembly/simd/blob/main/proposals/simd/BinarySIMD.md)
