@@ -364,6 +364,8 @@ Result<bool> bind_local_pe_pdb(LoadedImage &image, const std::filesystem::path &
             row.has_frame_data = symbol.has_frame_data;
             row.type_index = symbol.type_index;
             row.type_index_is_id = symbol.type_index_is_id;
+            row.module_index = symbol.module_index;
+            row.record_offset = symbol.record_offset;
             if (symbol.section != 0 && symbol.section <= image.metadata.sections.size()) {
                 const auto &section = image.metadata.sections[symbol.section - 1];
                 const auto extent = std::max<std::uint64_t>(section.virtual_size, section.raw_size);
@@ -375,6 +377,37 @@ Result<bool> bind_local_pe_pdb(LoadedImage &image, const std::filesystem::path &
                     row.address = Address{image.image->layout().space.id, base + rva};
             }
             pe.pdb_symbols.push_back(std::move(row));
+        }
+        for (const auto &separated : symbols.value().separated_code) {
+            PePdbSeparatedCode row;
+            row.module_index = separated.module_index;
+            row.procedure_record_offset = separated.procedure_record_offset;
+            row.record_offset = separated.record_offset;
+            row.scope_end_offset = separated.scope_end_offset;
+            row.section = separated.section;
+            row.parent_section = separated.parent_section;
+            row.section_offset = separated.section_offset;
+            row.parent_section_offset = separated.parent_section_offset;
+            row.size = separated.size;
+            row.flags = separated.flags;
+            const auto mapped_address = [&](std::uint16_t section_index, std::uint32_t section_offset,
+                                            std::uint64_t extent_size) -> std::optional<Address> {
+                if (section_index == 0 || section_index > image.metadata.sections.size()) return {};
+                const auto &section = image.metadata.sections[section_index - 1];
+                const auto extent = std::max<std::uint64_t>(section.virtual_size, section.raw_size);
+                const auto offset = std::uint64_t{section_offset};
+                const auto rva = std::uint64_t{section.rva.value} + offset;
+                if (offset >= extent || extent_size > extent - offset || rva >= image.metadata.image_size ||
+                    extent_size > image.metadata.image_size - rva ||
+                    rva > std::numeric_limits<std::uint64_t>::max() - base)
+                    return {};
+                return Address{image.image->layout().space.id, base + rva};
+            };
+            row.address = mapped_address(separated.section, separated.section_offset, separated.size);
+            row.parent_address = mapped_address(separated.parent_section, separated.parent_section_offset, 1);
+            pe.pdb_separated_code.push_back(std::move(row));
+            if (pe.pdb_separated_code.size() > 2'000'000)
+                return Error{ErrorCode::resource_limit, "PDB separated-code rows exceed inspection limit"};
         }
     } else {
         if (!partial_warning("DBI symbol", symbols.error())) return symbols.error();

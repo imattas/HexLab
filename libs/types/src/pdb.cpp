@@ -1129,6 +1129,7 @@ Result<PdbSymbolTable> parse_pdb_symbols(const PdbDatabase &database, std::stop_
         constexpr std::uint16_t S_END = 0x0006, S_PROC_ID_END = 0x114f;
         constexpr std::uint16_t S_BLOCK32 = 0x1103, S_FRAMEPROC = 0x1012;
         constexpr std::uint16_t S_INLINESITE = 0x114d, S_INLINESITE_END = 0x114e;
+        constexpr std::uint16_t S_SEPCODE = 0x1132;
         for (const auto &module : modules) {
             check_cancel(stop);
             if (module.stream == 0xffff || module.symbols == 0) continue;
@@ -1142,6 +1143,8 @@ Result<PdbSymbolTable> parse_pdb_symbols(const PdbDatabase &database, std::stop_
             std::optional<std::size_t> active_procedure;
             std::uint32_t procedure_scope_depth = 0;
             bool procedure_has_frame = false;
+            std::vector<std::pair<std::uint32_t, std::uint32_t>> scope_end_offsets;
+            std::vector<std::pair<std::size_t, std::uint32_t>> module_separated_rows;
             while (at < symbols.size()) {
                 check_cancel(stop);
                 require(symbols.size() - at >= 4, "Truncated CodeView module symbol record");
@@ -1219,10 +1222,48 @@ Result<PdbSymbolTable> parse_pdb_symbols(const PdbDatabase &database, std::stop_
                         leaf_padding = leaf_padding && actual == 0xf0u + padding - i;
                     }
                     require(zero_padding || leaf_padding, "Invalid CodeView S_FRAMEPROC padding");
+                } else if (record_kind == S_SEPCODE) {
+                    require(end - payload == 28, "Invalid CodeView S_SEPCODE size");
+                    const auto parent = r32(symbols, payload); payload += 4;
+                    const auto scope_end = r32(symbols, payload); payload += 4;
+                    const auto size = r32(symbols, payload); payload += 4;
+                    const auto flags = r32(symbols, payload); payload += 4;
+                    const auto offset = r32(symbols, payload); payload += 4;
+                    const auto parent_offset = r32(symbols, payload); payload += 4;
+                    const auto section = r16(symbols, payload); payload += 2;
+                    const auto parent_section = r16(symbols, payload); payload += 2;
+                    require((flags & ~std::uint32_t{3}) == 0, "Invalid CodeView S_SEPCODE flags");
+                    require(size > 0 && section != 0 && parent_section != 0,
+                            "Invalid CodeView S_SEPCODE address extent");
+                    require(parent != 0 && scope_end > at + 4 && scope_end < module.symbols,
+                            "CodeView S_SEPCODE scope pointers are outside the module stream");
+                    if (active_procedure) {
+                        bool retained_row = false;
+                        const auto parent_row = module_symbol_offsets.find(module_symbol_key(module.index, parent));
+                        if (parent_row != module_symbol_offsets.end() &&
+                            result.symbols[parent_row->second].kind == PdbSymbolKind::procedure &&
+                            result.symbols[parent_row->second].record_offset ==
+                                result.symbols[*active_procedure].record_offset) {
+                            require(at <= std::numeric_limits<std::uint32_t>::max(),
+                                    "PDB separated-code record offset exceeds inspection limit",
+                                    ErrorCode::resource_limit);
+                            result.separated_code.push_back({module.index, static_cast<std::uint32_t>(at),
+                                result.symbols[*active_procedure].record_offset,
+                                static_cast<std::uint32_t>(scope_end - 4), section, parent_section,
+                                offset, parent_offset, size, flags});
+                            retained_row = true;
+                        }
+                        ++procedure_scope_depth;
+                        if (retained_row)
+                            module_separated_rows.emplace_back(result.separated_code.size() - 1,
+                                                               procedure_scope_depth);
+                    }
                 } else if (active_procedure && (record_kind == S_BLOCK32 || record_kind == S_INLINESITE)) {
                     ++procedure_scope_depth;
                 } else if (active_procedure && (record_kind == S_END || record_kind == S_PROC_ID_END ||
                                                 record_kind == S_INLINESITE_END)) {
+                    if (record_kind == S_END || record_kind == S_PROC_ID_END)
+                        scope_end_offsets.emplace_back(static_cast<std::uint32_t>(at), procedure_scope_depth);
                     if (procedure_scope_depth)
                         --procedure_scope_depth;
                     if (!procedure_scope_depth) {
@@ -1237,6 +1278,12 @@ Result<PdbSymbolTable> parse_pdb_symbols(const PdbDatabase &database, std::stop_
                 }
                 at = end;
             }
+            for (auto row = module_separated_rows.rbegin(); row != module_separated_rows.rend(); ++row)
+                if (std::find(scope_end_offsets.begin(), scope_end_offsets.end(),
+                              std::pair{result.separated_code[row->first].scope_end_offset, row->second}) ==
+                    scope_end_offsets.end())
+                    result.separated_code.erase(result.separated_code.begin() +
+                                                static_cast<std::ptrdiff_t>(row->first));
         }
         if (symbol_record_stream != 0xffff) {
             require(symbol_record_stream < database.streams.size() &&

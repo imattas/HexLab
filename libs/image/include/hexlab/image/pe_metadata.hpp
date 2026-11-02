@@ -815,7 +815,19 @@ struct PePdbSymbol {
     bool has_frame_data = false;
     std::uint32_t type_index = 0;
     bool type_index_is_id = false;
+    // Exact module-stream record identity used to attach separated hot/cold
+    // code ranges without resolving by a potentially ambiguous symbol name.
+    std::uint16_t module_index = 0;
+    std::uint32_t record_offset = 0;
     bool operator==(const PePdbSymbol &) const = default;
+};
+struct PePdbSeparatedCode {
+    std::uint16_t module_index = 0;
+    std::uint32_t procedure_record_offset = 0, record_offset = 0, scope_end_offset = 0;
+    std::uint16_t section = 0, parent_section = 0;
+    std::uint32_t section_offset = 0, parent_section_offset = 0, size = 0, flags = 0;
+    std::optional<Address> address, parent_address;
+    bool operator==(const PePdbSeparatedCode &) const = default;
 };
 struct PePdbTypeField {
     std::uint16_t leaf = 0;
@@ -917,6 +929,7 @@ struct PeMetadata {
     PePdbStatus pdb_status = PePdbStatus::unavailable;
     std::string pdb_path;
     std::vector<PePdbSymbol> pdb_symbols;
+    std::vector<PePdbSeparatedCode> pdb_separated_code;
     std::vector<PePdbType> pdb_types;
     std::vector<PePdbLocal> pdb_locals;
     std::vector<PePdbInlineSite> pdb_inline_sites;

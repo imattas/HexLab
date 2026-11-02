@@ -1467,15 +1467,99 @@ void Recovery::seed_roots() {
             metadata_chunks[*function.address].push_back({*function.address, function.size, {}});
         }
     }
-    // PDB procedures are compiler-declared function boundaries. Consume them
-    // only when the PDB identity was verified against this PE image; stale or
-    // partially matched debug data must not split trusted code ownership.
-    if (metadata.pe && metadata.pe->pdb_status == PePdbStatus::matched)
+    // Matched PDB procedure extents and CodeView separated-code rows provide
+    // compiler-authored hot/cold function chunks. Accept them only when every
+    // range is backed by executable initialized bytes and ownership is unique.
+    if (metadata.pe && metadata.pe->pdb_status == PePdbStatus::matched) {
+        const auto valid_pdb_extent = [&](Address begin, std::uint64_t size) {
+            if (!size || !AddressRange::create(begin, size)) return false;
+            const auto *segment = image.segment_at(begin);
+            if (!segment || !segment->executable || begin.offset < segment->begin.offset) return false;
+            const auto relative = begin.offset - segment->begin.offset;
+            return relative < segment->file_size && size <= segment->file_size - relative &&
+                   relative < segment->size && size <= segment->size - relative &&
+                   image.code_window(begin, size) == size;
+        };
+        const auto overlaps = [](Address a, std::uint64_t as, Address b, std::uint64_t bs) {
+            return a.space == b.space && a.offset < b.offset + bs && b.offset < a.offset + as;
+        };
         for (const auto &symbol : metadata.pe->pdb_symbols) {
             canceled();
             if (symbol.procedure && symbol.address)
                 root({FunctionSeedKind::symbol, *symbol.address, {}, {}}, false);
         }
+        for (const auto &symbol : metadata.pe->pdb_symbols) {
+            canceled();
+            if (!symbol.procedure || !symbol.address || !symbol.size || metadata_chunks.contains(*symbol.address))
+                continue;
+            const auto begin = *symbol.address;
+            if (!valid_pdb_extent(begin, symbol.size)) { output->complete = false; continue; }
+            const auto end = begin.offset + symbol.size;
+            const auto next_root = root_entries.upper_bound(begin);
+            if (next_root != root_entries.end() && next_root->space == begin.space && next_root->offset < end) {
+                output->complete = false;
+                continue;
+            }
+            bool collision = false;
+            for (const auto &[owner, chunks] : metadata_chunks)
+                for (const auto &chunk : chunks)
+                    if (owner != begin && overlaps(begin, symbol.size, chunk.begin, chunk.size)) collision = true;
+            if (collision) { output->complete = false; continue; }
+            FunctionChunk extent{begin, symbol.size, {}};
+            extent.pdb_evidence = FunctionChunkPdbEvidence{symbol.module_index, symbol.section,
+                symbol.record_offset, symbol.record_offset, symbol.section_offset, symbol.size, false};
+            metadata_chunks[begin].push_back(std::move(extent));
+        }
+        // Each separated-code owner is identified by exact module and procedure
+        // record offsets. Reject an owner's entire fragment set on any ambiguity.
+        for (const auto &symbol : metadata.pe->pdb_symbols) {
+            canceled();
+            if (!symbol.procedure || !symbol.address) continue;
+            std::vector<const PePdbSeparatedCode *> rows;
+            for (const auto &row : metadata.pe->pdb_separated_code)
+                if (row.module_index == symbol.module_index &&
+                    row.procedure_record_offset == symbol.record_offset)
+                    rows.push_back(&row);
+            if (rows.empty()) continue;
+            auto bounds = metadata_chunks.find(*symbol.address);
+            if (bounds == metadata_chunks.end() || bounds->second.empty() ||
+                !bounds->second.front().pdb_evidence || bounds->second.front().pdb_evidence->separated) {
+                output->complete = false;
+                continue;
+            }
+            const auto &primary = bounds->second.front();
+            std::vector<FunctionChunk> accepted;
+            std::vector<std::pair<Address, std::uint64_t>> local_ranges;
+            bool valid = true;
+            for (const auto *row : rows) {
+                if (!row->address || !row->parent_address || !row->size ||
+                    !valid_pdb_extent(*row->address, row->size) ||
+                    row->parent_address->space != primary.begin.space ||
+                    row->parent_address->offset < primary.begin.offset ||
+                    row->parent_address->offset - primary.begin.offset >= primary.size ||
+                    overlaps(*row->address, row->size, primary.begin, primary.size)) { valid = false; break; }
+                for (const auto &[other, other_size] : local_ranges)
+                    if (overlaps(*row->address, row->size, other, other_size)) valid = false;
+                const auto end = row->address->offset + row->size;
+                auto interior_root = root_entries.lower_bound(*row->address);
+                if (interior_root != root_entries.end() && interior_root->space == row->address->space &&
+                    interior_root->offset < end) valid = false;
+                for (const auto &[owner, chunks] : metadata_chunks)
+                    for (const auto &chunk : chunks)
+                        if (owner != *symbol.address && overlaps(*row->address, row->size, chunk.begin, chunk.size))
+                            valid = false;
+                if (!valid) break;
+                local_ranges.emplace_back(*row->address, row->size);
+                FunctionChunk fragment{*row->address, row->size, {}};
+                fragment.pdb_evidence = FunctionChunkPdbEvidence{row->module_index, row->section,
+                    row->procedure_record_offset, row->record_offset, row->section_offset, row->size, true};
+                accepted.push_back(std::move(fragment));
+            }
+            if (!valid) { output->complete = false; continue; }
+            auto &owner_chunks = metadata_chunks[*symbol.address];
+            owner_chunks.insert(owner_chunks.end(), accepted.begin(), accepted.end());
+        }
+    }
     // PE TLS callbacks are invoked by the loader independently of the image
     // entry point, so they are execution roots even when no symbol names them.
     if (metadata.pe && metadata.pe->tls) {
@@ -3366,6 +3450,8 @@ bool semantic_decoder_image_reads_intersect(const AnalysisOptions &options,
 }
 Sha256Digest function_engine_fingerprint(const AnalysisOptions &options) {
     Sha256 hash;
+    constexpr std::string_view pdb_separated_code_version = "pe-pdb-procedure-extents-separated-code-v1";
+    (void)hash.update(std::as_bytes(std::span(pdb_separated_code_version)));
     constexpr std::string_view mips32_shifted_switch_version = "mips32-fixed-shift-switch-bases-v1";
     (void)hash.update(std::as_bytes(std::span(mips32_shifted_switch_version)));
     constexpr std::string_view version =

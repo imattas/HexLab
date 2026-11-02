@@ -182,7 +182,17 @@ struct PdbSymbol {
     std::uint32_t frame_flags = 0;
     bool has_frame_data = false;
 };
-struct PdbSymbolTable { std::vector<PdbSymbol> symbols; };
+struct PdbSeparatedCode {
+    std::uint16_t module_index = 0;
+    // Offsets are relative to the module symbol records, excluding the
+    // four-byte CodeView signature, matching PdbSymbol::record_offset.
+    std::uint32_t record_offset = 0, procedure_record_offset = 0, scope_end_offset = 0;
+    std::uint16_t section = 0, parent_section = 0;
+    std::uint32_t section_offset = 0, parent_section_offset = 0, size = 0;
+    std::uint32_t flags = 0;
+    bool operator==(const PdbSeparatedCode &) const = default;
+};
+struct PdbSymbolTable { std::vector<PdbSymbol> symbols; std::vector<PdbSeparatedCode> separated_code; };
 
 enum class PdbLocalLocationKind : std::uint8_t { unknown, frame_relative, register_relative, register_value };
 struct PdbLocalRangeGap { std::uint16_t offset = 0, size = 0; };

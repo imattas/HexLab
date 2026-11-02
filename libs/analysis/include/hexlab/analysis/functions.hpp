@@ -5,6 +5,12 @@
 namespace hexlab {
 struct FunctionId {std::uint64_t value;auto operator<=>(const FunctionId&)const=default;};
 struct BlockId {std::uint64_t value;auto operator<=>(const BlockId&)const=default;};
+struct FunctionChunkPdbEvidence {
+    std::uint16_t module_index = 0, section = 0;
+    std::uint32_t procedure_record_offset = 0, record_offset = 0, section_offset = 0, record_size = 0;
+    bool separated = false;
+    bool operator==(const FunctionChunkPdbEvidence &) const = default;
+};
 enum class FunctionSeedKind {entry,export_symbol,direct_call,user_function,user_code,symbol,unwind,arm_context_root,tls_callback,initializer,guard_cf,dex_method,safe_seh,pogo,wasm_export,wasm_start,wasm_element,wasm_defined,dwarf_subprogram,m6502_nmi_vector,m6502_reset_vector,m6502_irq_vector,dwarf_entry_point,jvm_method};
 struct FunctionSeedUnwindEvidence {std::uint32_t section=0;std::uint64_t file_offset=0,record_size=0;bool operator==(const FunctionSeedUnwindEvidence&)const=default;};
 struct FunctionSeedDwarfEvidence {std::uint64_t unit_offset=0,die_offset=0,record_size=0;bool operator==(const FunctionSeedDwarfEvidence&)const=default;};
@@ -34,7 +40,7 @@ struct BasicBlock {
     std::vector<BlockSuccessor> successors;std::optional<FunctionStop> stop;std::vector<FunctionId> owners;
     bool operator==(const BasicBlock&)const=default;
 };
-struct FunctionChunk {Address begin;std::uint64_t size;std::vector<BlockId> blocks;bool operator==(const FunctionChunk&)const=default;};
+struct FunctionChunk {Address begin;std::uint64_t size;std::vector<BlockId> blocks;std::optional<FunctionChunkPdbEvidence> pdb_evidence;bool operator==(const FunctionChunk&)const=default;};
 struct FunctionRecord {
     FunctionId id;Address entry;std::vector<FunctionChunk> chunks;std::vector<BlockId> blocks;
     std::vector<FunctionSeed> seeds;std::vector<FunctionStop> stops;bool complete=true;bool thunk=false;

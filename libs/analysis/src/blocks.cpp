@@ -64,7 +64,15 @@ void finish_functions(Recovery& recovery){
             if(seen.insert(found->second).second)function->blocks.push_back(found->second);
             const auto& node=recovery.nodes.at(at);if(!node.fact || recovery.ambiguous.contains(at))continue;
             const auto length=node.fact->instruction.length;
-            if(function->chunks.empty() || function->chunks.back().begin.space!=at.space || function->chunks.back().begin.offset+function->chunks.back().size!=at.offset)function->chunks.push_back({at,length,{found->second}});
+            std::optional<FunctionChunkPdbEvidence> pdb_evidence;
+            if (auto bounds = recovery.metadata_chunks.find(entry); bounds != recovery.metadata_chunks.end())
+                for (const auto &bound : bounds->second)
+                    if (bound.pdb_evidence && bound.begin.space == at.space && at.offset >= bound.begin.offset &&
+                        at.offset - bound.begin.offset < bound.size) {
+                        pdb_evidence = bound.pdb_evidence;
+                        break;
+                    }
+            if(function->chunks.empty() || function->chunks.back().begin.space!=at.space || function->chunks.back().begin.offset+function->chunks.back().size!=at.offset || function->chunks.back().pdb_evidence!=pdb_evidence)function->chunks.push_back({at,length,{found->second},pdb_evidence});
             else {auto& chunk=function->chunks.back();chunk.size+=length;if(chunk.blocks.empty() || chunk.blocks.back()!=found->second)chunk.blocks.push_back(found->second);}
         }
         std::sort(function->stops.begin(),function->stops.end(),[](const auto& a,const auto& b){return std::tie(a.address.space.value,a.address.offset,a.reason,a.detail)<std::tie(b.address.space.value,b.address.offset,b.reason,b.detail);});

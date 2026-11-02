@@ -148,6 +148,17 @@ std::vector<std::byte> payload(const DerivedProposal &proposal, std::stop_token 
             out.address(chunk.begin);
             out.number(chunk.size);
             ids(out, chunk.blocks);
+            out.flag(chunk.pdb_evidence.has_value());
+            if (chunk.pdb_evidence) {
+                const auto &evidence = *chunk.pdb_evidence;
+                out.number(evidence.module_index, 2);
+                out.number(evidence.section, 2);
+                out.number(evidence.procedure_record_offset, 4);
+                out.number(evidence.record_offset, 4);
+                out.number(evidence.section_offset, 4);
+                out.number(evidence.record_size, 4);
+                out.flag(evidence.separated);
+            }
         }
         ids(out, function->blocks);
         out.count(function->seeds.size());
@@ -410,7 +421,7 @@ Decoded read_payload(std::span<const std::byte> bytes, const Image &image, const
     require(std::equal(marker.begin(), marker.end(), magic.begin()), "Unknown derived cache magic");
     const auto version = in.number(2);
     require(version == 53 || version == 54 || version == 55 || version == 56 || version == 57 || version == 58 || version == 59 || version == 60 || version == 63 || version == 64 || version == 65 || version == 66 || version == 67 || version == 68 || version == 69 || version == 70 || version == 71 || version == 72 || version == 73 ||
-                version == 87 || version == 88 || version == 89 || version == 90 || version == 91 || version == 96 || version == derived_cache_version,
+                version == 87 || version == 88 || version == 89 || version == 90 || version == 91 || version == 96 || version == 102 || version == derived_cache_version,
             "Unknown derived cache version", ErrorCode::unsupported);
     require(in.key(version >= 54) == key, "Derived cache source key differs from the requested revision");
     auto context = in.context();
@@ -531,6 +542,12 @@ Decoded read_payload(std::span<const std::byte> bytes, const Image &image, const
             chunk.size = in.number();
             require(chunk.size && bool(advance(chunk.begin, chunk.size)), "Invalid cached function chunk extent");
             chunk.blocks = read_ids<BlockId>(in);
+            if (version >= 103 && in.flag()) {
+                chunk.pdb_evidence = FunctionChunkPdbEvidence{
+                    static_cast<std::uint16_t>(in.number(2)), static_cast<std::uint16_t>(in.number(2)),
+                    static_cast<std::uint32_t>(in.number(4)), static_cast<std::uint32_t>(in.number(4)),
+                    static_cast<std::uint32_t>(in.number(4)), static_cast<std::uint32_t>(in.number(4)), in.flag()};
+            }
             function->chunks.push_back(std::move(chunk));
         }
         function->blocks = read_ids<BlockId>(in);
@@ -900,7 +917,7 @@ Result<AnalysisKey> inspect_derived_key(std::span<const std::byte> bytes, std::s
         require(std::equal(marker.begin(), marker.end(), magic.begin()), "Unknown derived cache envelope magic");
         const auto version = in.number(2);
         require(version == 53 || version == 54 || version == 55 || version == 56 || version == 57 || version == 58 || version == 59 || version == 60 || version == 63 || version == 64 || version == 65 || version == 66 || version == 67 || version == 68 || version == 69 || version == 70 || version == 71 || version == 72 || version == 73 ||
-                    version == 87 || version == 88 || version == 89 || version == 90 || version == 91 || version == 96 || version == derived_cache_version,
+                    version == 87 || version == 88 || version == 89 || version == 90 || version == 91 || version == 96 || version == 102 || version == derived_cache_version,
                 "Unknown derived cache envelope version",
                 ErrorCode::unsupported);
         auto key = in.key(version >= 54);
