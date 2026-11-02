@@ -1,18 +1,30 @@
 # A32 and Thumb-2 saturating arithmetic
 
 The decoders recognize `QADD`, `QSUB`, `QDADD`, and `QDSUB` in A32 and
-Thumb-2. All forms retain destination and source register access facts and are
-marked as potentially setting the sticky APSR.Q bit. They do not write NZCV.
-PC operands are rejected. Thumb-2 SP operands are rejected; A32 accepts
-encodings with SP where permitted by the instruction form.
+Thumb-2, plus scalar `SSAT` and `USAT` in A32. All forms retain destination and
+source register access facts and are marked as potentially setting sticky
+APSR.Q. They do not write NZCV. PC operands are rejected. Thumb-2 SP operands
+are rejected; A32 accepts encodings with SP where permitted by the form.
 
 `evaluate_arm32_saturating_instruction` takes the Rm and Rn values as 32-bit
-bit patterns plus the incoming Q state. `QADD` and `QSUB` saturate signed
-32-bit addition/subtraction. `QDADD` and `QDSUB` first double and saturate Rn,
-then add/subtract that result from Rm with a second signed saturation. The
-returned Q bit is sticky: it is the incoming bit OR any saturation in either
-stage. The helper evaluates arithmetic only; callers resolve A32 conditions
-or Thumb IT predicates and commit results.
+bit patterns plus incoming Q. QADD/QSUB saturate signed 32-bit addition or
+subtraction. QDADD/QDSUB first double and saturate Rn, then add/subtract that
+result from Rm with a second signed saturation. The returned Q bit is sticky:
+incoming Q OR any saturation in either stage. Callers resolve predicates and
+commit results.
+
+For A32 SSAT/USAT, the helper takes Rn's bit pattern as its `rm` argument;
+`rn` is ignored. It applies the decoded LSL/ASR before clamping. `SSAT #n`
+admits 1 through 32 signed result bits (encoded field n−1); `USAT #n` admits 0
+through 31 unsigned result bits. LSL #0 leaves the input unchanged, and ASR
+with encoded imm5 zero is ASR #32. Bounds are exact, including the USAT #0
+range [0,0]. Incoming Q remains set, and a clamp sets it. Callers resolve the
+A32 condition and commit the result and Q state.
+
+The A32 decoder admits only the SSAT/USAT fixed patterns with LSL or ASR
+selectors, ordinary GPRs R0–R14, and valid saturation immediates. PC operands
+and reserved LSR/ROR selectors are rejected. Thumb-2 SSAT/USAT encodings are
+not decoded by this slice.
 
 The supported operation and saturation behavior follow Arm's
 [A32/T32 instruction reference](https://documentation-service.arm.com/static/6245c734b059dc5ff9a8bdab)
@@ -20,4 +32,13 @@ and [Cortex-M4 instruction guide](https://documentation-service.arm.com/static/5
 
 ## Decompiler lifting
 
-A32 and Thumb QADD/QSUB/QDADD/QDSUB lift to 32-bit signed saturation operations, retaining each architecture's signed overflow behavior. Predicated A32 forms and known Thumb IT predicates select the prior destination when false; unknown Thumb IT state remains an opaque effect. The lifted destination expression is named `qadd_s32_sticky_q_may_set`, `qsub_s32_sticky_q_may_set`, `qdadd_s32_sticky_q_may_set`, or `qdsub_s32_sticky_q_may_set` to preserve the distinction from wrapping arithmetic and make the possible sticky Q update visible. The IR does not yet model Q as an independently versioned flag, and this lowering does not reconstruct a concrete overflow condition for Q.
+A32 and Thumb QADD/QSUB/QDADD/QDSUB lift to 32-bit signed saturation
+operations. Predicated A32 forms and known Thumb IT predicates select the
+prior destination when false; unknown Thumb IT state remains opaque. The IR
+does not yet model Q as an independently versioned flag, so Q is represented
+as a sticky-Q effect marker rather than a concrete flag output.
+
+A32 SSAT/USAT lift with their decoded shift, exact signed/unsigned saturation
+width, and sticky-Q marker. Conditional forms select the prior destination if
+the condition fails. Q remains an effect marker rather than a separately
+versioned flag value in the IR.

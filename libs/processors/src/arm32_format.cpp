@@ -54,7 +54,8 @@ std::string mnemonic(Opcode opcode, std::uint8_t condition) {
     }
     const char *saturating_name = opcode == Opcode::arm_qadd ? "qadd" :
         opcode == Opcode::arm_qsub ? "qsub" : opcode == Opcode::arm_qdadd ? "qdadd" :
-        opcode == Opcode::arm_qdsub ? "qdsub" : nullptr;
+        opcode == Opcode::arm_qdsub ? "qdsub" : opcode == Opcode::arm_ssat ? "ssat" :
+        opcode == Opcode::arm_usat ? "usat" : nullptr;
     if (saturating_name) {
         static constexpr const char *conditions[]{"eq", "ne", "hs", "lo", "mi", "pl", "vs", "vc",
                                                    "hi", "ls", "ge", "lt", "gt", "le", "", "?"};

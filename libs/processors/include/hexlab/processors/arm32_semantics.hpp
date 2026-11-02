@@ -99,8 +99,9 @@ struct Arm32SaturatingResult {
     bool operator==(const Arm32SaturatingResult &) const = default;
 };
 
-// Evaluate A32/T32 QADD, QSUB, QDADD, or QDSUB from Rm and Rn bit patterns.
-// `incoming_q` models the sticky APSR.Q bit and is never cleared by these ops.
+// Evaluate A32/T32 QADD-family operations, or A32 SSAT/USAT. For SSAT/USAT,
+// `rm` supplies Rn and the decoded shift is applied; `rn` is ignored. The
+// `incoming_q` argument models sticky APSR.Q and is never cleared.
 HEXLAB_PROCESSORS_EXPORT std::optional<Arm32SaturatingResult> evaluate_arm32_saturating_instruction(
     const Instruction &instruction, std::uint32_t rm, std::uint32_t rn, bool incoming_q = false) noexcept;
 

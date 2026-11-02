@@ -5433,6 +5433,52 @@ a64_unhandled:
         effect.result_type = integer_type(32);
         return effect;
     }
+    if (arm32 && (instruction.opcode == Opcode::arm_ssat || instruction.opcode == Opcode::arm_usat)) {
+        const auto *destination = instruction.operands.size() == 3
+            ? std::get_if<RegisterOperand>(&instruction.operands[0]) : nullptr;
+        const auto *width = instruction.operands.size() == 3
+            ? std::get_if<ImmediateOperand>(&instruction.operands[1]) : nullptr;
+        const auto *shifted = instruction.operands.size() == 3
+            ? std::get_if<ArmShiftedRegisterOperand>(&instruction.operands[2]) : nullptr;
+        const auto valid_gpr = [](const RegisterOperand *reg) {
+            return reg && reg->bank == RegisterBank::arm32_gpr && reg->width == 32 &&
+                reg->index < 15 && !reg->high_byte;
+        };
+        const RegisterOperand flags{RegisterBank::arm_flags, 0, 4, false};
+        std::vector<RegisterOperand> expected_reads;
+        if (instruction.arm && instruction.arm->predicate == ArmPredicate::condition)
+            expected_reads.push_back(flags);
+        if (shifted && valid_gpr(&shifted->source)) expected_reads.push_back(shifted->source);
+        const bool signed_saturation = instruction.opcode == Opcode::arm_ssat;
+        const unsigned result_bits = width ? static_cast<unsigned>(width->value) + (signed_saturation ? 1u : 0u) : 0u;
+        if (!instruction.arm || !instruction.arm->q_flag_may_set || instruction.arm->flags_written ||
+            !instruction.arm->flags_known || !valid_gpr(destination) || !width || width->value > 31 ||
+            width->encoded_width != 5 || width->is_signed || !shifted || !valid_gpr(&shifted->source) ||
+            shifted->amount_register || shifted->amount > 32 ||
+            (shifted->shift != ArmShift::lsl && shifted->shift != ArmShift::asr) ||
+            (shifted->shift == ArmShift::lsl && shifted->amount > 31) ||
+            operands.size() != 3 || instruction.access != std::vector<OperandAccess>{
+                OperandAccess::write, OperandAccess::read, OperandAccess::read} ||
+            instruction.register_writes != std::vector<RegisterOperand>{*destination} ||
+            instruction.register_reads != expected_reads)
+            return Intrinsic{"arm_scalar_saturation_malformed", operands, IntrinsicMemoryEffect::none};
+        const std::string operation = signed_saturation ? "ssat_s32" : "usat_u32";
+        ExpressionPtr value = std::make_shared<Expression>(Expression{integer_type(32),
+            BinaryValue{std::string("arm_") + operation + "_" + std::to_string(result_bits) + "_sticky_q_may_set", operands[2],
+                        constant_expr(result_bits, 32)}});
+        if (instruction.arm->predicate == ArmPredicate::condition) {
+            const auto predicate = arm32_condition_expr(instruction.condition, reg_expr(flags));
+            value = arm32_select(predicate, std::move(value), reg_expr(*destination));
+        }
+        Intrinsic effect{"arm_" + operation + "_" + std::to_string(result_bits) + "_sticky_q_may_set",
+            {operands[2]}, IntrinsicMemoryEffect::none};
+        if (instruction.arm->predicate == ArmPredicate::condition)
+            effect.name = "arm_conditional_" + effect.name;
+        effect.register_writes = {*destination};
+        effect.register_output_values = {std::move(value)};
+        effect.result_type = integer_type(32);
+        return effect;
+    }
     const bool packed_extend_signed = instruction.opcode == Opcode::a32_sxtb16 ||
         instruction.opcode == Opcode::a32_sxtab16 || instruction.opcode == Opcode::t32_sxtb16 ||
         instruction.opcode == Opcode::t32_sxtab16;

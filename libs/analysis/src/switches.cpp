@@ -3667,6 +3667,116 @@ std::optional<std::uint32_t> mips32_path_complete_constant(
     return incoming(node->second, wanted.index);
 }
 
+struct Mips32ScaledSelector {
+    RegisterOperand selector;
+    Address instruction{};
+    friend bool operator==(const Mips32ScaledSelector &, const Mips32ScaledSelector &) = default;
+};
+
+std::optional<Mips32ScaledSelector> mips32_path_complete_word_scale(
+    const FunctionRecord &function, const FunctionSnapshot &snapshot, const SwitchGuardGraph &graph,
+    Address before, RegisterOperand wanted, Address dispatch, bool control_flow_closed,
+    std::stop_token stop) {
+    constexpr std::size_t max_blocks = 128;
+    constexpr std::size_t max_snapshot_blocks = 1024;
+    constexpr std::size_t max_nodes = 4096;
+    constexpr std::size_t max_edges = 8192;
+    constexpr std::size_t max_work = 32768;
+    if (!function.complete || !snapshot.complete || function.blocks.size() > max_blocks ||
+        snapshot.blocks.size() > max_snapshot_blocks || graph.nodes.size() > max_nodes ||
+        snapshot.candidates.size() > 8192 || wanted.bank != RegisterBank::mips_gpr ||
+        wanted.width != 32 || wanted.index == 0 || !control_flow_closed || stop.stop_requested())
+        return {};
+
+    const auto node = graph.addresses.find(guard_address(before));
+    if (node == graph.addresses.end() || !graph.nodes[node->second].fact ||
+        graph.nodes[node->second].fact->instruction.address != before)
+        return {};
+    using Key = std::pair<std::size_t, bool>;
+    std::map<Key, std::optional<Mips32ScaledSelector>> memo;
+    std::set<Key> active;
+    std::size_t remaining_work = max_work;
+    std::function<std::optional<Mips32ScaledSelector>(std::size_t)> incoming;
+    std::function<std::optional<Mips32ScaledSelector>(std::size_t)> after;
+    incoming = [&](std::size_t current) -> std::optional<Mips32ScaledSelector> {
+        const Key key{current, false};
+        if (const auto found = memo.find(key); found != memo.end()) return found->second;
+        if (stop.stop_requested() || remaining_work == 0 || !active.insert(key).second) return {};
+        --remaining_work;
+        const auto &node_value = graph.nodes[current];
+        if (!node_value.fact || node_value.alternate_entry || node_value.ambiguous ||
+            node_value.predecessors.empty()) {
+            active.erase(key);
+            memo.emplace(key, std::nullopt);
+            return {};
+        }
+        std::optional<Mips32ScaledSelector> unanimous;
+        std::size_t visited_edges = 0;
+        for (const auto predecessor : node_value.predecessors) {
+            if (stop.stop_requested() || remaining_work == 0 || ++visited_edges > max_edges) {
+                active.erase(key);
+                return {};
+            }
+            --remaining_work;
+            const auto value = after(predecessor);
+            if (!value || (unanimous && *unanimous != *value)) {
+                active.erase(key);
+                memo.emplace(key, std::nullopt);
+                return {};
+            }
+            unanimous = value;
+        }
+        active.erase(key);
+        memo.emplace(key, unanimous);
+        return unanimous;
+    };
+    after = [&](std::size_t current) -> std::optional<Mips32ScaledSelector> {
+        const Key key{current, true};
+        if (const auto found = memo.find(key); found != memo.end()) return found->second;
+        if (stop.stop_requested() || remaining_work == 0 || !active.insert(key).second) return {};
+        --remaining_work;
+        const auto &node_value = graph.nodes[current];
+        if (!node_value.fact || node_value.ambiguous) {
+            active.erase(key);
+            memo.emplace(key, std::nullopt);
+            return {};
+        }
+        const auto &instruction = node_value.fact->instruction;
+        if (instruction.context.architecture != Architecture::mips32 ||
+            instruction.context.mode != ExecutionMode::mips32 || instruction.delay_slots ||
+            (instruction.flow != FlowKind::fallthrough && instruction.flow != FlowKind::conditional_branch &&
+             instruction.flow != FlowKind::jump) || instruction.opcode == Opcode::opaque ||
+            instruction.opcode == Opcode::x86_opaque) {
+            active.erase(key);
+            memo.emplace(key, std::nullopt);
+            return {};
+        }
+        if (!writes_register(instruction, wanted)) {
+            const auto value = incoming(current);
+            active.erase(key);
+            memo.emplace(key, value);
+            return value;
+        }
+        const auto *destination = instruction.operands.size() == 3 ? register_operand(instruction, 0) : nullptr;
+        const auto *selector = instruction.operands.size() == 3 ? register_operand(instruction, 1) : nullptr;
+        const auto *amount = instruction.operands.size() == 3
+            ? std::get_if<ImmediateOperand>(&instruction.operands[2]) : nullptr;
+        std::optional<Mips32ScaledSelector> result;
+        if (instruction.opcode == Opcode::mips_sll && destination && selector && amount &&
+            instruction.flow == FlowKind::fallthrough &&
+            destination->bank == RegisterBank::mips_gpr && destination->width == 32 &&
+            destination->index == wanted.index && selector->bank == RegisterBank::mips_gpr &&
+            selector->width == 32 && selector->index != 0 && selector->index != wanted.index &&
+            amount->encoded_width == 5 && amount->effective_width == 32 && !amount->is_signed &&
+            amount->value == 2)
+            result = Mips32ScaledSelector{*selector, instruction.address};
+        active.erase(key);
+        memo.emplace(key, result);
+        return result;
+    };
+    return incoming(node->second);
+}
+
 std::optional<SwitchSite> mips32_register_absolute_switch(
     const Image &image, const FunctionRecord &function, const FunctionSnapshot &snapshot,
     const std::vector<std::shared_ptr<const InstructionFact>> &facts,
@@ -3783,10 +3893,10 @@ std::optional<SwitchSite> mips32_register_absolute_switch(
     };
     std::map<std::uint32_t, Value> registers;
     const auto remember = [&](std::uint32_t index, Value value) { registers[index] = std::move(value); };
-    // Seed constants that reach the beginning of this basic block only when
-    // every CFG predecessor path agrees. Dynamic selector values remain
-    // unknown; the existing same-block transfer then proves the table scale
-    // and address calculation from the seeded bases.
+    // Seed constants and a word-scale value at block entry only when every
+    // CFG predecessor path agrees. The scale proof retains the exact SLL and
+    // selector registers, allowing the existing guarded-bound proof to verify
+    // the defining instruction even when it precedes this block.
     if (!facts.empty() && facts.front()) {
         bool bounded_graph_candidate = function.complete && snapshot.complete &&
             function.blocks.size() <= 128 && snapshot.blocks.size() <= 1024;
@@ -3845,6 +3955,14 @@ std::optional<SwitchSite> mips32_register_absolute_switch(
                 if (const auto value = mips32_path_complete_constant(function, snapshot, *guards.graph,
                         block_entry, operand, relocations, dispatch.address, control_flow_closed, stop))
                     remember(reg, Value{Address{dispatch.address.space, *value}});
+            }
+            for (const auto reg : entry_reads) {
+                if (stop.stop_requested()) return {};
+                if (registers.contains(reg)) continue;
+                const RegisterOperand operand{RegisterBank::mips_gpr, reg, 32, false};
+                if (const auto scale = mips32_path_complete_word_scale(function, snapshot, *guards.graph,
+                        block_entry, operand, dispatch.address, control_flow_closed, stop))
+                    remember(reg, Value{{}, {}, scale->selector, 4, scale->instruction, true});
             }
         }
     }

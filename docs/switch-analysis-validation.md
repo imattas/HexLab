@@ -385,15 +385,22 @@ unsupported.
 The same constrained register-value analysis now recognizes the corresponding
 MIPS32 O32 absolute-pointer form with a four-byte table entry:
 `LUI`/`ORI` (and checked `ADDIU` adjustments), `SLL` by two, `ADDU`, `LW`,
-and `JR`. It accepts only one straight-line block, exact 32-bit GPR operands,
-a distinct nonzero selector/base/target, and file-backed table storage. Each
+and `JR`. Base/address/load setup remains within one straight-line block;
+bounded predecessor setup additionally supports the selector scale. This
+extension carries only an exact `SLL scaled, selector, 2` definition when
+every CFG predecessor path reaches the dispatch block with the same
+definition and source register, and the scaled register is not overwritten
+before block entry. It rejects alternate entries, ambiguous or incomplete
+CFG nodes, cycles, unresolved control flow, delay slots, and paths exceeding
+the graph work limits. Exact 32-bit GPR operands, a distinct nonzero
+selector/base/target, and file-backed table storage are still required. Each
 entry must resolve from its exact four-byte slot and decode as executable
 MIPS32 code; ELF/Mach-O relocation rows are retained through the existing
 slot resolver. The 4096-entry cap applies. Without the validated guard,
 counts and defaults remain unknown and scanning is limited to a verified
-prefix. Unsupported base construction, cross-block values, and delay-slot
-control flow remain outside this recognizer. No test or build was run for this
-extension; runtime recognition remains unverified.
+prefix. Unsupported base construction and delay-slot control flow remain
+outside this recognizer. No test or build was run for this extension; runtime
+recognition remains unverified.
 
 MIPS64 N64 also recognizes a bounded same-block signed-offset table when a
 32-bit `LW` is followed by `DADDU target, codeBase, target` (either source

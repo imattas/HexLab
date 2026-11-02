@@ -662,6 +662,8 @@ enum class Opcode {
     arm_sbfx, arm_ubfx, arm_bfi, arm_bfc,
     // A32/T32 saturating add/subtract forms; append for stable IDs.
     arm_qadd, arm_qsub, arm_qdadd, arm_qdsub,
+    // A32 scalar signed/unsigned saturation; appended for stable IDs.
+    arm_ssat, arm_usat,
     // A32/T32 word, byte, and halfword exclusive load/store operations.
     arm_ldrex, arm_ldrexb, arm_ldrexh, arm_strex, arm_strexb, arm_strexh,
     // VEX.128/.256 packed-vector test; appended to preserve serialized IDs.

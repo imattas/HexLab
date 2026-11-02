@@ -60,6 +60,27 @@ bool data(Instruction &i, std::uint32_t word) {
         i.arm->q_flag_may_set = true;
         return true;
     }
+    // A32 scalar saturation. The shift selector admits only LSL and ASR;
+    // imm5==0 means no shift for LSL and ASR #32 for ASR.
+    const auto saturation_key = word & 0x0fe00030u;
+    if (saturation_key == 0x06a00010u || saturation_key == 0x06e00010u) {
+        const auto rd = (word >> 12) & 15;
+        const auto rn = word & 15;
+        const auto shift_kind = (word >> 5) & 3;
+        const auto shift_amount = (word >> 7) & 31;
+        if (rd == 15 || rn == 15 || (shift_kind != 0 && shift_kind != 2))
+            return false;
+        const auto source = gpr(rn);
+        i.opcode = saturation_key == 0x06a00010u ? Opcode::arm_ssat : Opcode::arm_usat;
+        i.operands = {gpr(rd), ImmediateOperand{(word >> 16) & 31, 5, 32, false, {}},
+                      ArmShiftedRegisterOperand{source, static_cast<ArmShift>(shift_kind),
+                          static_cast<std::uint8_t>(shift_kind == 2 && shift_amount == 0 ? 32 : shift_amount), {}}};
+        i.access = {OperandAccess::write, OperandAccess::read, OperandAccess::read};
+        read(i, source);
+        i.register_writes.push_back(gpr(rd));
+        i.arm->q_flag_may_set = true;
+        return true;
+    }
     const auto bitfield_key = word & 0x0fe00070u;
     const auto bitfield_rd = (word >> 12) & 15;
     const auto bitfield_rn = word & 15;

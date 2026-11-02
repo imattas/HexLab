@@ -506,6 +506,42 @@ std::optional<std::uint32_t> evaluate_arm32_bitfield_instruction(
 
 std::optional<Arm32SaturatingResult> evaluate_arm32_saturating_instruction(
     const Instruction &instruction, std::uint32_t rm, std::uint32_t rn, bool incoming_q) noexcept {
+    if (instruction.context.architecture == Architecture::arm && instruction.context.mode == ExecutionMode::a32 &&
+        (instruction.opcode == Opcode::arm_ssat || instruction.opcode == Opcode::arm_usat)) {
+        if (instruction.flow != FlowKind::fallthrough || instruction.memory_read || instruction.memory_write ||
+            instruction.operands.size() != 3 || instruction.access.size() != 3 || !instruction.arm ||
+            !instruction.arm->q_flag_may_set || instruction.arm->flags_written != 0 || !instruction.arm->flags_known)
+            return {};
+        const auto *destination = std::get_if<RegisterOperand>(&instruction.operands[0]);
+        const auto *width_operand = std::get_if<ImmediateOperand>(&instruction.operands[1]);
+        const auto *shifted = std::get_if<ArmShiftedRegisterOperand>(&instruction.operands[2]);
+        if (!destination || destination->bank != RegisterBank::arm32_gpr || destination->index >= 15 ||
+            destination->width != 32 || destination->high_byte || !width_operand ||
+            width_operand->value > 31 || !shifted || shifted->source.bank != RegisterBank::arm32_gpr ||
+            shifted->source.index >= 15 || shifted->source.width != 32 || shifted->source.high_byte ||
+            shifted->amount_register || (shifted->shift != ArmShift::lsl && shifted->shift != ArmShift::asr) ||
+            shifted->amount > 32 || (shifted->shift == ArmShift::lsl && shifted->amount > 31) ||
+            instruction.access != std::vector<OperandAccess>{OperandAccess::write, OperandAccess::read, OperandAccess::read})
+            return {};
+        const auto contains = [](const auto &registers, RegisterOperand reg) {
+            return std::find(registers.begin(), registers.end(), reg) != registers.end();
+        };
+        if (!contains(instruction.register_writes, *destination) || !contains(instruction.register_reads, shifted->source))
+            return {};
+        std::int64_t value = static_cast<std::int64_t>(std::bit_cast<std::int32_t>(rm));
+        if (shifted->shift == ArmShift::lsl)
+            value *= INT64_C(1) << shifted->amount;
+        else
+            value >>= shifted->amount;
+        const bool is_signed = instruction.opcode == Opcode::arm_ssat;
+        const unsigned bits = static_cast<unsigned>(width_operand->value) + (is_signed ? 1u : 0u);
+        const std::int64_t minimum = is_signed ? -(INT64_C(1) << (bits - 1)) : 0;
+        const std::int64_t maximum = is_signed ? (INT64_C(1) << (bits - 1)) - 1 :
+            (bits == 32 ? INT64_C(0xffffffff) : (INT64_C(1) << bits) - 1);
+        const bool saturated = value < minimum || value > maximum;
+        value = std::clamp(value, minimum, maximum);
+        return Arm32SaturatingResult{static_cast<std::uint32_t>(value), incoming_q || saturated};
+    }
     if (instruction.context.architecture != Architecture::arm ||
         (instruction.context.mode != ExecutionMode::a32 && instruction.context.mode != ExecutionMode::thumb) ||
         (instruction.opcode != Opcode::arm_qadd && instruction.opcode != Opcode::arm_qsub &&
