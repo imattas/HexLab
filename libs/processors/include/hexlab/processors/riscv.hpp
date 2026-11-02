@@ -131,7 +131,9 @@ enum class RiscvOpcode {
     // RVV FP-to-integer conversions, appended for stable opcode IDs.
     vfcvt_xu_f_v, vfcvt_x_f_v,
     // Zfa half-precision immediate load; append to preserve serialized IDs.
-    fli_h
+    fli_h,
+    // RVV signed and unsigned integer-to-floating vector conversions.
+    vfcvt_f_xu_v, vfcvt_f_x_v
 };
 
 struct RiscvRegister {

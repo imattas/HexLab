@@ -246,7 +246,18 @@ evaluator rejects nonzero `vstart` rather than returning a partial result. The
 unordered and ordered floating sum reductions and their rounding behavior
 remain unsupported.
 
-Conversions, reciprocal and reciprocal-square-root estimates,
+The conversions `vfcvt.f.xu.v` and `vfcvt.f.x.v` are decoded and lifted as
+named intrinsics. The lane evaluator converts an unsigned or two's-complement
+signed integer in each SEW-wide source lane to an IEEE binary32 or binary64
+result of the same width. It rounds using the supplied `frm` (RNE, RTZ, RDN,
+RUP, or RMM), sets NX exactly when source bits are discarded, and preserves
+masked, prestart, and tail destination lanes. The conversion uses integer
+significand arithmetic, so the host floating-point mode cannot affect results.
+SEW 8/16 and vector floating-point widths wider than 64 bits remain unsupported.
+The operand classes and rounding dependency follow the
+[RISC-V V specification, vector conversion instructions](https://docs.riscv.org/reference/isa/unpriv/v-st-ext.html#vector-conversion-instructions).
+
+Other conversions, reciprocal and reciprocal-square-root estimates,
 widening floating-point arithmetic, half-precision
 vector operations, and all other vector floating-point encodings remain
 unsupported. A recognized FP funct6 with a reserved operand class is invalid;

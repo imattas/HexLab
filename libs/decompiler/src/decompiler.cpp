@@ -342,6 +342,8 @@ std::optional<RiscvVectorEffect> riscv_vector_effect(Opcode opcode) {
     case Opcode::rv_vfclass_v: return RiscvVectorEffect{"vfclass.v", false};
     case Opcode::rv_vfcvt_xu_f_v: return RiscvVectorEffect{"vfcvt.xu.f.v", false};
     case Opcode::rv_vfcvt_x_f_v: return RiscvVectorEffect{"vfcvt.x.f.v", false};
+    case Opcode::rv_vfcvt_f_xu_v: return RiscvVectorEffect{"vfcvt.f.xu.v", true};
+    case Opcode::rv_vfcvt_f_x_v: return RiscvVectorEffect{"vfcvt.f.x.v", true};
     case Opcode::rv_vmfeq_vv: return RiscvVectorEffect{"vmfeq.vv", true, true};
     case Opcode::rv_vmfeq_vf: return RiscvVectorEffect{"vmfeq.vf", true, true};
     case Opcode::rv_vmfne_vv: return RiscvVectorEffect{"vmfne.vv", true, true};

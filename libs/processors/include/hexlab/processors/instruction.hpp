@@ -741,7 +741,9 @@ enum class Opcode {
     // RVV FP-to-integer vector conversions; append to preserve cached IDs.
     rv_vfcvt_xu_f_v, rv_vfcvt_x_f_v,
     // Zfa half-precision immediate load; append to preserve serialized IDs.
-    rv_fli_h
+    rv_fli_h,
+    // RVV vector integer-to-floating conversions; appended for stable IDs.
+    rv_vfcvt_f_xu_v, rv_vfcvt_f_x_v
 };
 enum class OperandAccess { read, write, read_write, address };
 // The encoded x86 group-one repeat prefix is retained separately from the

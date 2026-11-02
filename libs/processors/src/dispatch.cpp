@@ -171,6 +171,10 @@ DecodeResult decode_riscv_context(DecodeContext context, std::span<const std::by
         opcode = Opcode::rv_vfcvt_xu_f_v;
     else if (source.opcode == RiscvOpcode::vfcvt_x_f_v)
         opcode = Opcode::rv_vfcvt_x_f_v;
+    else if (source.opcode == RiscvOpcode::vfcvt_f_xu_v)
+        opcode = Opcode::rv_vfcvt_f_xu_v;
+    else if (source.opcode == RiscvOpcode::vfcvt_f_x_v)
+        opcode = Opcode::rv_vfcvt_f_x_v;
     else if (source.opcode == RiscvOpcode::fli_h)
         opcode = Opcode::rv_fli_h;
     else if (source.opcode >= RiscvOpcode::andn && source.opcode <= RiscvOpcode::roriw)

@@ -318,10 +318,11 @@ bool decode_vector_floating(std::uint32_t w, RiscvInstruction &i) {
         i.vector_masked = !vm;
         return true;
     }
-    // VFUNARY1 uses OPFVV and encodes its sub-op in vs1.
-    // VFUNARY0 integer conversions (round-to-current-mode variants).
-    if (funct3 == 1 && funct6 == 0x12 && (vs1 == 0 || vs1 == 1)) {
-        i.opcode = vs1 == 0 ? RiscvOpcode::vfcvt_xu_f_v : RiscvOpcode::vfcvt_x_f_v;
+    // VFUNARY0 integer/floating conversions (round-to-current-mode variants).
+    if (funct3 == 1 && funct6 == 0x12 && vs1 <= 3) {
+        i.opcode = vs1 == 0 ? RiscvOpcode::vfcvt_xu_f_v :
+                   vs1 == 1 ? RiscvOpcode::vfcvt_x_f_v :
+                   vs1 == 2 ? RiscvOpcode::vfcvt_f_xu_v : RiscvOpcode::vfcvt_f_x_v;
         i.reads_frm = true;
         i.reads_fflags = true;
         i.writes_fflags = true;
