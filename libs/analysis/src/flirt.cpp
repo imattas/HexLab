@@ -128,26 +128,16 @@ Result<FlirtCatalog> parse_flirt_pat(std::string_view text, Architecture archite
 
         FlirtCatalog catalog{1, 0, architecture, mode, std::move(provenance), {}};
         std::size_t line_number = 0;
-        while (!text.empty()) {
-            check_stop(stop);
-            ++line_number;
-            const auto line_end = text.find('\n');
-            auto line = text.substr(0, line_end == text.npos ? text.size() : line_end);
-            text = line_end == text.npos ? std::string_view{} : text.substr(line_end + 1);
-            if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
-            auto nonspace = line.find_first_not_of(" \t");
-            if (nonspace == line.npos) continue;
-            line.remove_prefix(nonspace);
-            if (line.starts_with("---")) break;
-            if (line.starts_with('#') || line.starts_with(';')) continue;
-            require(nonspace == 0, "FLIRT continuation lines are unsupported at line " + std::to_string(line_number),
-                    ErrorCode::unsupported);
-            require(line.size() <= 4096, "FLIRT pattern line exceeds 4096 bytes", ErrorCode::resource_limit);
-
-            std::istringstream tokens{std::string(line)};
+        std::size_t logical_line_number = 0;
+        std::string logical_record;
+        auto parse_record = [&](std::string_view record, std::size_t record_line) {
+            require(record.size() <= 65536,
+                    "FLIRT logical pattern record exceeds 65536 bytes at line " + std::to_string(record_line),
+                    ErrorCode::resource_limit);
+            std::istringstream tokens{std::string(record)};
             std::string head, crc_length, crc, module_length;
             require(bool(tokens >> head >> crc_length >> crc >> module_length),
-                    "Malformed FLIRT pattern line " + std::to_string(line_number));
+                    "Malformed FLIRT pattern line " + std::to_string(record_line));
             auto head_pattern = parse_pattern(head, 32);
             require(head_pattern.size() == 32, "FLIRT head must contain exactly 32 bytes");
             require(std::any_of(head_pattern.begin(), head_pattern.end(), [](const auto &b) { return b.mask != std::byte{}; }),
@@ -205,7 +195,40 @@ Result<FlirtCatalog> parse_flirt_pat(std::string_view text, Architecture archite
             catalog.patterns.push_back(std::move(definition));
             require(catalog.patterns.size() <= limits.max_patterns,
                     "FLIRT pattern count exceeds its configured bound", ErrorCode::resource_limit);
+        };
+        auto flush_record = [&] {
+            if (!logical_record.empty()) {
+                parse_record(logical_record, logical_line_number);
+                logical_record.clear();
+            }
+        };
+        while (!text.empty()) {
+            check_stop(stop);
+            ++line_number;
+            const auto line_end = text.find('\n');
+            auto line = text.substr(0, line_end == text.npos ? text.size() : line_end);
+            text = line_end == text.npos ? std::string_view{} : text.substr(line_end + 1);
+            if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
+            require(line.size() <= 4096, "FLIRT physical pattern line exceeds 4096 bytes", ErrorCode::resource_limit);
+            auto nonspace = line.find_first_not_of(" \t");
+            if (nonspace == line.npos) continue;
+            line.remove_prefix(nonspace);
+            if (line.starts_with("---")) { flush_record(); break; }
+            if (line.starts_with('#') || line.starts_with(';')) continue;
+            if (nonspace != 0) {
+                require(!logical_record.empty(), "FLIRT continuation line has no preceding pattern at line " +
+                        std::to_string(line_number), ErrorCode::unsupported);
+                require(logical_record.size() + line.size() + 1 <= 65536,
+                        "FLIRT logical pattern record exceeds 65536 bytes", ErrorCode::resource_limit);
+                logical_record.push_back(' ');
+                logical_record.append(line);
+            } else {
+                flush_record();
+                logical_line_number = line_number;
+                logical_record.assign(line);
+            }
         }
+        flush_record();
         require(!catalog.patterns.empty(), "FLIRT catalog contains no patterns");
         return catalog;
     });

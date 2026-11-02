@@ -233,19 +233,27 @@ pattern's 32-byte masked head, CRC-16/X-25 window, module length, symbol
 records, and optional post-CRC tail are retained. The bounded recognizer checks
 only recovered function entries in executable, file-backed function chunks.
 
-The text parser accepts one record per line: a 64-character head (32 pairs of
+The text parser accepts one logical record per pattern: a 64-character head (32 pairs of
 hex digits or `..` wildcard bytes), two-hex-digit CRC length, four-hex-digit
 CRC-16, four-hex-digit nonzero module length, one or more `:OFFSET[@] NAME`
 public/local records or `^OFFSET NAME` reference records, and an optional
-final tail token encoded as hex byte pairs or `..`. Offsets are hexadecimal
+final tail token encoded as hex byte pairs or `..`. A physical line beginning
+with one or more spaces or tabs continues the preceding pattern record; its
+whitespace-delimited fields are appended to that record. This permits long
+symbol/reference lists to wrap across lines without creating another pattern.
+An indented row without a preceding pattern is rejected. Blank and comment
+lines do not end a pending record; `---` flushes the pending record and ends
+parsing. Offsets are hexadecimal
 byte offsets and must be strictly less than the module length. The CRC window
 starts immediately after the 32-byte head; a tail starts immediately after
 that window. The tail and CRC window must fit within the declared module
 length. Blank lines, leading-whitespace comment lines beginning `#` or `;`,
 and a `---` terminator are supported. Inline comments may begin at any
 whitespace-delimited token boundary with `#` or `;`; the remainder of that
-record line is ignored. Continuation lines remain unsupported. Other malformed
-or unsupported syntax is rejected rather than partially imported.
+record line is ignored. Physical pattern rows are capped at 4,096 bytes and a
+continued logical record at 65,536 bytes; the existing pattern, symbol and name
+caps apply across the whole record. Other malformed or unsupported syntax is
+rejected rather than partially imported.
 
 Reference records (`^offset name`) are checked against a direct call at the
 recorded function-relative offset. A reference is accepted only when the call
