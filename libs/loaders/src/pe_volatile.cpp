@@ -26,7 +26,18 @@ PeVolatileMetadata read_volatile_metadata(const Image &image, const ImageMetadat
         result.range_table_rva = u32(16);
         result.range_table_size = u32(20);
         result.source = PeRecordSource{0, reader.sources(rva, result.declared_size)};
-        require(result.version == 1, "PE volatile metadata version is unsupported", ErrorCode::unsupported);
+        if (result.version == 1) {
+            result.version_encoding = PeVolatileVersionEncoding::legacy_version;
+            result.min_version = 1;
+            result.max_version = 0;
+        } else {
+            // Newer toolchains encode the version interval as two WORDs in
+            // the same 32-bit slot. Preserve those raw values without
+            // assigning undocumented flag or compatibility semantics.
+            result.version_encoding = PeVolatileVersionEncoding::min_max_version;
+            result.min_version = static_cast<std::uint16_t>(result.version & 0xffffu);
+            result.max_version = static_cast<std::uint16_t>(result.version >> 16);
+        }
 
         require(result.access_table_size % 4 == 0,
                 "PE volatile access table ends inside a 4-byte RVA row");

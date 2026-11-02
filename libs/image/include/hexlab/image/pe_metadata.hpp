@@ -255,6 +255,7 @@ struct PeEnclaveConfiguration {
     bool operator==(const PeEnclaveConfiguration &) const = default;
 };
 enum class PeVolatileMetadataStatus : std::uint8_t { decoded, unsupported, malformed, resource_limit };
+enum class PeVolatileVersionEncoding : std::uint8_t { legacy_version, min_max_version };
 struct PeVolatileAccess {
     std::uint32_t rva = 0;
     PeRecordSource source;
@@ -266,9 +267,11 @@ struct PeVolatileRange {
     bool operator==(const PeVolatileRange &) const = default;
 };
 // Compiler volatile-access inventory only; this does not enforce runtime
-// memory ordering. Unknown raw version encodings remain unsupported.
+// memory ordering. The raw DWORD is retained alongside its recognized layout.
 struct PeVolatileMetadata {
     std::uint32_t rva = 0, declared_size = 0, version = 0;
+    PeVolatileVersionEncoding version_encoding = PeVolatileVersionEncoding::legacy_version;
+    std::uint16_t min_version = 0, max_version = 0;
     std::uint32_t access_table_rva = 0, access_table_size = 0;
     std::uint32_t range_table_rva = 0, range_table_size = 0;
     PeVolatileMetadataStatus status = PeVolatileMetadataStatus::malformed;

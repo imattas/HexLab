@@ -805,6 +805,45 @@ inline void pe_description(std::ostream &out, const ImageMetadata &metadata, con
             }
         }
         pointer("Volatile metadata", config.volatile_metadata_rva);
+        if (config.volatile_metadata) {
+            const auto &volatile_data = *config.volatile_metadata;
+            const auto volatile_status = volatile_data.status == PeVolatileMetadataStatus::decoded ? "decoded" :
+                volatile_data.status == PeVolatileMetadataStatus::unsupported ? "unsupported" :
+                volatile_data.status == PeVolatileMetadataStatus::resource_limit ? "resource-limit" : "malformed";
+            out << "  Volatile metadata detail: " << volatile_status << " RVA=0x" << std::hex
+                << volatile_data.rva << " size=0x" << volatile_data.declared_size << " version=0x"
+                << volatile_data.version;
+            if (volatile_data.version_encoding == PeVolatileVersionEncoding::min_max_version)
+                out << " min-version=" << std::dec << volatile_data.min_version
+                    << " max-version=" << volatile_data.max_version << std::hex;
+            else out << " legacy-version=" << std::dec << volatile_data.version << std::hex;
+            out << std::dec << " access-rows=" << volatile_data.accesses.size()
+                << " range-rows=" << volatile_data.ranges.size();
+            if (!volatile_data.source || volatile_data.source->spans.empty()) out << " file=<unavailable>";
+            else out << " file=0x" << std::hex << volatile_data.source->spans.front().offset.value << std::dec;
+            out << '\n';
+            if (!volatile_data.diagnostic.empty()) out << "    diagnostic: " << volatile_data.diagnostic << '\n';
+            constexpr std::size_t volatile_output_limit = 256;
+            const auto access_count = std::min(volatile_data.accesses.size(), volatile_output_limit);
+            for (std::size_t i = 0; i < access_count; ++i) {
+                const auto &access = volatile_data.accesses[i];
+                out << "    volatile-access[" << i << "] RVA=0x" << std::hex << access.rva;
+                if (!access.source.spans.empty()) out << " file=0x" << access.source.spans.front().offset.value;
+                out << std::dec << '\n';
+            }
+            if (access_count != volatile_data.accesses.size())
+                out << "    ... volatile access output limited to " << volatile_output_limit << " rows\n";
+            const auto range_count = std::min(volatile_data.ranges.size(), volatile_output_limit);
+            for (std::size_t i = 0; i < range_count; ++i) {
+                const auto &range = volatile_data.ranges[i];
+                out << "    volatile-range[" << i << "] RVA=0x" << std::hex << range.rva
+                    << " size=0x" << range.size;
+                if (!range.source.spans.empty()) out << " file=0x" << range.source.spans.front().offset.value;
+                out << std::dec << '\n';
+            }
+            if (range_count != volatile_data.ranges.size())
+                out << "    ... volatile range output limited to " << volatile_output_limit << " rows\n";
+        }
         if (config.hot_patch_table_offset)
             out << "  Hot-patch table offset=0x" << std::hex << *config.hot_patch_table_offset << std::dec << '\n';
         auto table = [&](const char *name, const auto &targets) {

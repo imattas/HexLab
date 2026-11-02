@@ -7,11 +7,14 @@ normalized pointer and its load-config field provenance. The pointer is a
 preferred-base VA at PE32 offset 160 or PE32+ offset 256; the nested table
 locations and row targets are image RVAs. Rebasing does not change those RVAs.
 
-The parser is `libs/loaders/src/pe_volatile.cpp`. It reads the legacy 24-byte
-header and supports exactly raw `Version == 1`. It retains declared size,
-raw version, both table RVAs and both byte sizes. Other versions, including
-newer min/max-version encodings, remain `unsupported`; their rows are not
-interpreted. A declared extension is source-backed but remains opaque.
+The parser is `libs/loaders/src/pe_volatile.cpp`. It reads the 24-byte fixed
+header and retains declared size, raw version DWORD, both table RVAs and both
+byte sizes. Raw `Version == 1` is exposed as the legacy encoding. Other values
+are interpreted as the newer packed pair of 16-bit minimum and maximum version
+fields, following the layout used by LIEF's current parser. The API preserves
+both words exactly and does not assign undocumented flag or compatibility
+semantics to them. Both encodings use the same table validation below. A
+declared extension is source-backed but remains opaque.
 
 The access table consists of 4-byte instruction RVAs. The range table consists
 of 8-byte RVA/size pairs, with a half-open target extent `[rva, rva + size)`.
@@ -49,11 +52,15 @@ the raw preferred-base VA. Pointer normalization and payload parsing have a
 local diagnostic boundary, preserving unrelated load-config fields.
 Allocation failures still follow the loader's outer resource-limit handling.
 
+The CLI prints status, raw and interpreted version fields, table counts,
+diagnostics and up to 256 rows from each table. Each row includes its target RVA
+and source file offset when available; omitted rows are reported. Desktop PE
+metadata pages do not yet render these records.
+
 This is an inspection capability. It does not select runtime memory ordering,
 emulate acquire/release semantics, prove a compiler's inventory complete, or
 execute target instructions. Hot-patch metadata and language-specific unwind
-handler execution remain separate residual work. CLI and desktop rendering of
-the newly decoded rows are outside this change.
+handler execution remain separate residual work.
 
 ## Format references
 
@@ -64,8 +71,9 @@ RVA rows and range rows follow the
 and their image-relative use in
 [FEX's image tracker](https://github.com/FEX-Emu/FEX/blob/main/Source/Windows/Common/ImageTracker.cpp).
 [LIEF's parser](https://github.com/lief-project/LIEF/blob/main/src/PE/LoadConfigurations/VolatileMetadata.cpp)
-also frames these two tables by byte size and documents newer min/max-version
-fields. HexLab deliberately does not interpret those newer version semantics.
+documents the newer min/max-version field layout. HexLab follows only that
+field layout; it preserves raw words and makes no claim about their runtime
+semantics.
 
 ## Verification record
 
@@ -109,3 +117,9 @@ unknown versions/extended headers, widened extents and unmapped/uninitialized
 targets, atomic publication after second-table failure, and cancellation.
 This is build and source-review evidence; it provides no runtime parser-test
 or emulator-behavior claim.
+
+Follow-up source change adds the packed min/max version-word presentation and
+CLI row summaries. Its isolated Windows and Ubuntu-24.04 configurations
+succeeded with `BUILD_TESTING=OFF`; duplicate cold dependency builds were
+stopped at integration request before reaching the loader/CLI targets. No tests
+were added or run for this follow-up.
