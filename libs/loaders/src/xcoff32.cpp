@@ -64,7 +64,7 @@ std::vector<std::byte> read(const ByteStorage &storage, std::uint64_t offset,
 
 Result<Xcoff32Object> inspect_xcoff32_object(const ByteStorage &storage,
     std::stop_token stop, Xcoff32ObjectLimits limits) try {
-    require(limits.max_sections && limits.max_symbols && limits.max_relocations && limits.max_metadata_bytes && limits.max_name_bytes,
+    require(limits.max_sections && limits.max_symbols && limits.max_relocations && limits.max_metadata_bytes && limits.max_name_bytes && limits.max_line_numbers,
             "XCOFF32 object limits must be positive", ErrorCode::invalid_argument);
     std::uint64_t budget = 0;
     const auto header = read(storage, 0, 20, budget, limits, stop);
@@ -88,11 +88,15 @@ Result<Xcoff32Object> inspect_xcoff32_object(const ByteStorage &storage,
     const auto sections = read(storage, 20, section_bytes, budget, limits, stop);
     charge(std::uint64_t{section_count} * sizeof(Xcoff32Section), budget, limits);
     result.sections.reserve(section_count);
-    std::uint64_t relocation_total = 0;
-    struct RelocationOverflow {
-        std::uint32_t section = 0, target = 0, count = 0;
+    struct TableOverflow {
+        std::uint32_t section = 0, target = 0;
     };
-    std::vector<RelocationOverflow> relocation_overflows;
+    charge(std::uint64_t{section_count} * (sizeof(TableOverflow) + sizeof(std::uint8_t)), budget, limits);
+    std::vector<TableOverflow> table_overflows;
+    table_overflows.reserve(section_count);
+    // Track encoded markers separately: an expanded count of exactly 65535 is
+    // valid and must not be mistaken for an unresolved marker or a duplicate.
+    std::vector<std::uint8_t> overflow_state(section_count, 0); // 0: ordinary, 1: pending, 2: resolved.
     for (std::uint32_t index = 0; index < section_count; ++index) {
         canceled(stop);
         const auto row = std::span<const std::byte>(sections).subspan(std::size_t{index} * 40, 40);
@@ -112,7 +116,7 @@ Result<Xcoff32Object> inspect_xcoff32_object(const ByteStorage &storage,
         section.line_number_file_offset = be(row, 28, 4);
         const auto encoded_relocation_count = be(row, 32, 2);
         section.relocation_count = encoded_relocation_count;
-        section.line_number_count = static_cast<std::uint16_t>(be(row, 34, 2));
+        section.line_number_count = be(row, 34, 2);
         section.flags = be(row, 36, 4);
         const auto type = section.flags & 0xffffu;
         require(section.flags != 0xffffffffu,
@@ -129,13 +133,9 @@ Result<Xcoff32Object> inspect_xcoff32_object(const ByteStorage &storage,
             require(target_section != 0 && target_section == target_line_section &&
                         target_section <= section_count,
                     "XCOFF32 overflow section has inconsistent target section numbers");
-            require(relocation_count > 0xfffeu && relocation_count <= limits.max_relocations,
-                    "XCOFF32 overflow relocation count is invalid", ErrorCode::resource_limit);
-            require(line_count == 0,
-                    "XCOFF32 line-number overflow is unsupported", ErrorCode::unsupported);
-            require(section.relocation_file_offset != 0,
-                    "XCOFF32 overflow section has no relocation-table pointer");
-            relocation_overflows.push_back({index + 1, target_section, relocation_count});
+            require(relocation_count > 0xfffeu || line_count > 0xfffeu,
+                    "XCOFF32 overflow section has no overflowing table count");
+            table_overflows.push_back({index + 1, target_section});
             section.relocation_count = 0;
             section.line_number_count = 0;
             result.sections.push_back(std::move(section));
@@ -143,60 +143,61 @@ Result<Xcoff32Object> inspect_xcoff32_object(const ByteStorage &storage,
         }
         require((section.relocation_count == 0xffffu) == (section.line_number_count == 0xffffu),
                 "XCOFF32 relocation and line-number overflow markers are not paired");
+        if (section.relocation_count == 0xffffu) overflow_state[index] = 1;
         // BSS/TBSS have no file-backed data; names do not determine section type.
         if (type != 0x80 && type != 0x800 && section.data_file_offset && section.size)
             require(section.data_file_offset >= header_end &&
                         contains(storage.size(), section.data_file_offset, section.size),
                     "XCOFF32 section data exceeds file extent or overlaps headers");
-        if (section.relocation_count && section.relocation_count != 0xffffu) {
-            require(type != 0x1000, "XCOFF32 loader relocation rows are unsupported", ErrorCode::unsupported);
-            require(section.relocation_file_offset != 0, "XCOFF32 relocation count has no file offset");
-            require(section.relocation_count <= limits.max_relocations - relocation_total,
-                    "XCOFF32 relocation count exceeds configured limit", ErrorCode::resource_limit);
-            relocation_total += section.relocation_count;
-            require(section.relocation_file_offset >= header_end &&
-                        contains(storage.size(), section.relocation_file_offset,
-                                 std::uint64_t{section.relocation_count} * 10),
-                    "XCOFF32 relocation table exceeds file extent or overlaps headers");
-        }
-        if (section.line_number_count && section.line_number_count != 0xffffu)
-            require(section.line_number_file_offset >= header_end &&
-                        contains(storage.size(), section.line_number_file_offset,
-                                 std::uint64_t{section.line_number_count} * 6),
-                    "XCOFF32 line-number table exceeds file extent or overlaps headers");
         result.sections.push_back(std::move(section));
     }
 
     // XCOFF32 overflow headers identify the primary section by its one-based
     // section number; the primary header contains no backlink. Search all
-    // headers before reading relocation arrays so ordering is irrelevant.
-    for (const auto &overflow : relocation_overflows) {
+    // headers before validating either table so ordering is irrelevant. Keep
+    // overflow headers in the section vector to preserve symbol section indexes.
+    for (const auto &overflow : table_overflows) {
         canceled(stop);
         auto &target = result.sections[overflow.target - 1];
-        require((target.flags & 0xffffu) != 0x8000u && target.relocation_count == 0xffffu &&
-                    target.line_number_count == 0xffffu,
+        require(overflow_state[overflow.target - 1] != 2,
+                "Duplicate XCOFF32 table overflow header");
+        require(overflow_state[overflow.target - 1] == 1,
                 "XCOFF32 overflow header does not match a primary overflow marker");
         const auto &overflow_section = result.sections[overflow.section - 1];
         require(target.relocation_file_offset == overflow_section.relocation_file_offset,
                 "XCOFF32 overflow and primary relocation offsets disagree");
         require(target.line_number_file_offset == overflow_section.line_number_file_offset,
                 "XCOFF32 overflow and primary line-number offsets disagree");
-        require(target.relocation_count == 0xffffu,
-                "Duplicate XCOFF32 relocation overflow header");
-        target.relocation_count = overflow.count;
-        require(overflow.count <= limits.max_relocations - relocation_total,
-                "XCOFF32 aggregate relocation count exceeds configured limit", ErrorCode::resource_limit);
-        relocation_total += overflow.count;
-        require(target.relocation_file_offset >= header_end &&
-                    contains(storage.size(), target.relocation_file_offset,
-                             std::uint64_t{overflow.count} * 10),
-                "XCOFF32 overflow relocation table exceeds file extent or overlaps headers");
-        target.line_number_count = 0;
+        target.relocation_count = overflow_section.physical_address;
+        target.line_number_count = overflow_section.virtual_address;
+        overflow_state[overflow.target - 1] = 2;
     }
+    std::uint64_t relocation_total = 0, line_total = 0;
     for (const auto &section : result.sections) {
+        canceled(stop);
         if ((section.flags & 0xffffu) == 0x8000u) continue;
-        require(section.relocation_count != 0xffffu && section.line_number_count != 0xffffu,
+        require(overflow_state[section.index - 1] != 1,
                 "XCOFF32 overflow marker has no matching overflow section", ErrorCode::unsupported);
+        if (section.relocation_count) {
+            require((section.flags & 0xffffu) != 0x1000u,
+                    "XCOFF32 loader relocation rows are unsupported", ErrorCode::unsupported);
+            require(section.relocation_count <= limits.max_relocations - relocation_total,
+                    "XCOFF32 aggregate relocation count exceeds configured limit", ErrorCode::resource_limit);
+            relocation_total += section.relocation_count;
+            require(section.relocation_file_offset >= header_end &&
+                        contains(storage.size(), section.relocation_file_offset,
+                                 std::uint64_t{section.relocation_count} * 10),
+                    "XCOFF32 relocation table exceeds file extent or overlaps headers");
+        }
+        if (section.line_number_count) {
+            require(section.line_number_count <= limits.max_line_numbers - line_total,
+                    "XCOFF32 aggregate line-number count exceeds configured limit", ErrorCode::resource_limit);
+            line_total += section.line_number_count;
+            require(section.line_number_file_offset >= header_end &&
+                        contains(storage.size(), section.line_number_file_offset,
+                                 std::uint64_t{section.line_number_count} * 6),
+                    "XCOFF32 line-number table exceeds file extent or overlaps headers");
+        }
     }
 
     if (result.symbol_count) {

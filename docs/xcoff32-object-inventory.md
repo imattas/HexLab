@@ -18,7 +18,8 @@ Auxiliary slots are skipped after checking their declared extent.
 
 Reads, retained record storage and decoded names share a configurable metadata
 budget (256 MiB by default). Limits also bound section count (4096), symbol slots
-(one million) and each decoded name (4096 bytes). Name scans stop at that limit.
+(one million), aggregate line-number rows (one million, `max_line_numbers`), and
+each decoded name (4096 bytes). Name scans stop at that limit.
 The reader checks cancellation before and after storage reads and during section
 and symbol traversal, checks complete reads and table extents, and maps allocation
 failures to resource-limit errors. The string table may be absent when names are
@@ -26,12 +27,15 @@ inline; when present, empty tables (size at most four bytes) are accepted. It
 checks ordinary 10-byte relocation and 6-byte line-number table extents.
 XCOFF32 `STYP_OVRFLO` headers are resolved by their one-based target section
 number independent of header order. For paired `0xffff` primary counts, the
-true relocation count in the overflow header's `s_paddr` is accepted, bounded,
-and used to validate and decode the primary section's relocation rows. The
-overflow record must match the primary relocation and line-table offsets and
-must report zero line-number rows; line-number overflow remains unsupported.
-Orphaned, duplicate, mismatched, or over-budget overflow headers are rejected.
-The expanded relocation count is exposed as a 32-bit value in the result.
+true counts in `s_paddr` and `s_vaddr` replace both primary counts. This accepts
+line-only overflow, relocation-only overflow, and overflow in both tables,
+including a true count of exactly 65,535. At least one table must exceed 65,534.
+Both overflow target fields must identify the same primary section, with matching
+table offsets and zero overflow-header size/data pointer. Missing, duplicate,
+orphaned, mismatched, truncated and over-limit records are rejected before table
+decoding. Both expanded counts are exposed as 32-bit values; line-number rows
+remain extent-checked only. Overflow headers retain their original section slots
+and do not become image mappings, so symbol section numbers keep their meaning.
 Ordinary 10-byte relocation rows are decoded into virtual address, zero-based symbol
 slot, raw `r_rsize`/`r_rtype` bytes and record file offset. A one-million-row
 aggregate limit bounds retained relocations, in addition to the shared 256 MiB
@@ -45,8 +49,8 @@ applied. Line-number rows remain extent-checked only. Section
 type flags determine whether raw data is BSS/TBSS; names are only metadata.
 A zero raw-data pointer denotes absent raw data, including in a nonempty section.
 
-The subset rejects executable (`F_EXEC`) objects, optional headers, deleted
-section headers and line-number overflow. Loader-section payloads
+The subset rejects executable (`F_EXEC`) objects, optional headers and deleted
+section headers. Loader-section payloads
 and their embedded loader relocation tables remain uninterpreted. Line-number
 rows are extent-checked only. It does not validate overlap between payload
 tables or decode line records. Csect auxiliary records are decoded by the
@@ -118,3 +122,20 @@ Record layouts and section/name rules follow IBM's [AIX XCOFF object file
 format](https://www.ibm.com/docs/en/aix/7.3.0?topic=formats-xcoff-object-file-format),
 including its `.loader` table definitions. The fixed record layouts are also
 cross-checked against LLVM's [XCOFF object structures](https://llvm.org/doxygen/XCOFFObjectFile_8h_source.html).
+
+## 2026-11-02 overflow validation scope
+
+The overflow resolver uses separate pending/resolved state instead of treating
+65,535 as a marker after expansion. Ordinary and expanded table counts share
+aggregate limits and checked 64-bit extent calculations. Relocation rows still
+validate primary symbol-slot membership, section-relative addresses and order.
+The primary/overflow pointer equality checks follow IBM's [AIX 7.1 overflow
+header definition](https://www.ibm.com/docs/en/aix/7.1.0?topic=formats-xcoff-object-file-format),
+which requires both `s_relptr` and `s_lnnoptr` to match the primary header.
+The new line-row limit also applies to ordinary counts across all sections.
+Windows Debug (MSVC 19.44) and Ubuntu 24.04 WSL Debug (Clang 18.1.3)
+`hexlab_loaders` builds passed with `BUILD_TESTING=OFF`; no tests or GitHub CI
+ran. WSL built an ext4 snapshot of the isolated checkout after Windows-mounted
+source reads stalled; SHA-256 hashes of both changed C++ files matched.
+Linked-executable overflow sections, source-line decoding, overlapping-table
+validation, archive/library binding and full AIX linking remain unsupported.

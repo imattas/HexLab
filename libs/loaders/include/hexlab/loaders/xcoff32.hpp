@@ -24,9 +24,8 @@ struct Xcoff32Section {
     std::string name;
     std::uint32_t physical_address = 0, virtual_address = 0, size = 0;
     std::uint32_t data_file_offset = 0, relocation_file_offset = 0, line_number_file_offset = 0;
-    // Expanded XCOFF32 relocation count, including STYP_OVRFLO counts.
-    std::uint32_t relocation_count = 0;
-    std::uint16_t line_number_count = 0;
+    // Expanded XCOFF32 table counts, including STYP_OVRFLO counts.
+    std::uint32_t relocation_count = 0, line_number_count = 0;
     std::vector<Xcoff32Relocation> relocations;
 };
 
@@ -57,11 +56,13 @@ struct Xcoff32ObjectLimits {
     std::uint64_t max_relocations = 1'000'000;
     std::uint64_t max_metadata_bytes = 256ULL * 1024 * 1024;
     std::size_t max_name_bytes = 4096;
+    std::uint64_t max_line_numbers = 1'000'000;
 };
 
 // Structural inventory of big-endian relocatable XCOFF32 without an optional
 // header. Decodes ordinary relocation rows as metadata; it does not modify the
-// source storage. Overflow sections and loader relocation rows are unsupported.
+// source storage. Resolves paired overflow headers for both table counts;
+// line-number rows remain extent-checked only. Loader relocations are unsupported.
 HEXLAB_LOADERS_EXPORT std::string_view xcoff32_relocation_type_name(std::uint8_t);
 HEXLAB_LOADERS_EXPORT Result<Xcoff32Object> inspect_xcoff32_object(
     const ByteStorage &, std::stop_token = {}, Xcoff32ObjectLimits = {});
