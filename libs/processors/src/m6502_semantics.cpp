@@ -23,8 +23,6 @@ trace_m6502_memory_bus(const Instruction &instruction,
                        instruction.opcode == Opcode::m6502_sty || (cmos && instruction.opcode == Opcode::m65c02_stz);
     const bool shift = instruction.opcode == Opcode::m6502_asl || instruction.opcode == Opcode::m6502_lsr ||
         instruction.opcode == Opcode::m6502_rol || instruction.opcode == Opcode::m6502_ror;
-    // W65C02 shifts wait for a separate CMOS bus-cycle contract.
-    if (shift && cmos) return {};
     const bool rmw = instruction.opcode == Opcode::m6502_inc || instruction.opcode == Opcode::m6502_dec || shift;
     const bool read = instruction.opcode == Opcode::m6502_lda || instruction.opcode == Opcode::m6502_ldx ||
         instruction.opcode == Opcode::m6502_ldy || instruction.opcode == Opcode::m6502_adc ||
@@ -568,7 +566,7 @@ std::optional<M6502ShiftResult>
 evaluate_m6502_shift_instruction(const Instruction &instruction,
                                  std::uint8_t value, std::uint8_t status) noexcept {
     if (instruction.context.architecture != Architecture::mos6502 ||
-        instruction.context.mode != ExecutionMode::m6502 ||
+        (instruction.context.mode != ExecutionMode::m6502 && instruction.context.mode != ExecutionMode::m65c02) ||
         instruction.flow != FlowKind::fallthrough || instruction.direct_target ||
         instruction.address.offset > UINT16_MAX ||
         instruction.length < 1 || instruction.length > 3 || instruction.length > instruction.bytes.size() ||

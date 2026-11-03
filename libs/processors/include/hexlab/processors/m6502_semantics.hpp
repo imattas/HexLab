@@ -110,16 +110,17 @@ struct M6502ShiftResult {
     std::uint8_t status = 0;
     bool operator==(const M6502ShiftResult &) const = default;
 };
-// Evaluate the NMOS 6502 ASL/LSR/ROL/ROR byte operation after the caller has
-// fetched its operand. Rotates consume P.C; all four operations update C/Z/N
-// and preserve the remaining modeled status bits. Memory access and register
-// selection remain caller-owned.
+// Evaluate the shared NMOS 6502/W65C02 ASL/LSR/ROL/ROR byte operation after
+// the caller has fetched its operand. Rotates consume P.C; all four operations
+// update C/Z/N and preserve the remaining modeled status bits. Memory access
+// and register selection remain caller-owned.
 HEXLAB_PROCESSORS_EXPORT std::optional<M6502ShiftResult>
 evaluate_m6502_shift(Opcode opcode, std::uint8_t value, std::uint8_t status) noexcept;
-// Bind an already-fetched value to one of the documented NMOS ASL/LSR/ROL/ROR
-// encodings. The adapter validates the instruction mode, bytes, operand form,
-// register effects, and memory effects before returning the byte/flag result.
-// The caller still performs the fetch and (for memory forms) the write.
+// Bind an already-fetched value to one of the documented NMOS/W65C02
+// ASL/LSR/ROL/ROR encodings. The adapter validates the instruction mode,
+// bytes, operand form, register effects, and memory effects before returning
+// the byte/flag result. The caller still performs the fetch and (for memory
+// forms) the write.
 HEXLAB_PROCESSORS_EXPORT std::optional<M6502ShiftResult>
 evaluate_m6502_shift_instruction(const Instruction &instruction,
                                  std::uint8_t value, std::uint8_t status) noexcept;
@@ -330,11 +331,11 @@ struct M6502MemoryBusTrace {
     bool operator==(const M6502MemoryBusTrace &) const = default;
 };
 // Trace validated documented NMOS/65C02 byte loads, stores, ALU/compare, and
-// memory INC/DEC. NMOS ASL/LSR/ROL/ROR memory forms also report their original
-// value read, NMOS dummy write, and shifted final write. The caller supplies
-// the value read from the final effective address (and pointer bytes where
-// needed); no memory or pin model is implied. W65C02 shift traces remain
-// unsupported until their distinct bus behavior is modeled.
+// memory INC/DEC/ASL/LSR/ROL/ROR. NMOS read/modify/write forms report the
+// original-value dummy write; W65C02 forms report the second effective-address
+// read before the final write. The caller supplies the value read from the
+// final effective address (and pointer bytes where needed); no memory or pin
+// model is implied.
 HEXLAB_PROCESSORS_EXPORT std::optional<M6502MemoryBusTrace>
 trace_m6502_memory_bus(const Instruction &instruction,
                        const M6502MemoryBusInputs &inputs) noexcept;
