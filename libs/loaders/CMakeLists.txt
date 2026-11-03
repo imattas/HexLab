@@ -19,3 +19,4 @@ endif()
 
 # StackMapTable offsets are validated by the shared JVM instruction decoder.
 target_link_libraries(hexlab_loaders PRIVATE hexlab::processors)
+target_sources(hexlab_loaders PRIVATE src/pe_messages.cpp)
