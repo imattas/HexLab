@@ -415,6 +415,22 @@ struct M6502BranchBusTrace {
 HEXLAB_PROCESSORS_EXPORT std::optional<M6502BranchBusTrace>
 trace_m6502_branch_bus(const Instruction &instruction, std::uint8_t status) noexcept;
 
+struct M65C02BitBranchBusTrace {
+    std::array<M6502BusAccess, 7> accesses{};
+    std::uint8_t access_count = 0;
+    std::uint16_t zero_page_address = 0;
+    std::uint16_t next_program_counter = 0;
+    bool branch_taken = false;
+    bool page_crossed = false;
+    bool operator==(const M65C02BitBranchBusTrace &) const = default;
+};
+// Trace a validated W65C02 BBR/BBS bus sequence. The caller supplies the
+// fetched zero-page byte; pin sampling and memory data outside that read remain
+// external to this bounded address trace.
+HEXLAB_PROCESSORS_EXPORT std::optional<M65C02BitBranchBusTrace>
+trace_m65c02_bit_branch_bus(const Instruction &instruction,
+                            std::uint8_t zero_page_value) noexcept;
+
 struct M6502StackBusTrace {
     std::array<M6502BusAccess, 4> accesses{};
     std::uint8_t access_count = 0;
@@ -448,5 +464,18 @@ evaluate_m65c02_bit_branch(Opcode opcode, std::uint8_t bit, std::uint8_t value) 
 HEXLAB_PROCESSORS_EXPORT std::optional<bool>
 evaluate_m65c02_bit_branch_instruction(const Instruction &instruction,
                                        std::uint8_t zero_page_value) noexcept;
+
+struct M65C02BitBranchResult {
+    std::uint16_t next_program_counter = 0;
+    std::uint8_t cycles = 0;
+    bool branch_taken = false;
+    bool page_crossed = false;
+    bool operator==(const M65C02BitBranchResult &) const = default;
+};
+// Resolve a decoded W65C02 BBR/BBS using its fetched zero-page byte. Cycles
+// include the base operation, taken-branch penalty, and taken page-cross cost.
+HEXLAB_PROCESSORS_EXPORT std::optional<M65C02BitBranchResult>
+evaluate_m65c02_bit_branch_execution(const Instruction &instruction,
+                                     std::uint8_t zero_page_value) noexcept;
 
 } // namespace hexlab

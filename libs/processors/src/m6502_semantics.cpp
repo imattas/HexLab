@@ -1472,7 +1472,7 @@ evaluate_m65c02_bit_branch_instruction(const Instruction &instruction,
         instruction.context.mode != ExecutionMode::m65c02 ||
         (instruction.opcode != Opcode::m65c02_bbr && instruction.opcode != Opcode::m65c02_bbs) ||
         instruction.condition > 7 || instruction.flow != FlowKind::conditional_branch ||
-        instruction.length != 3 || instruction.operands.size() != 2 ||
+        instruction.length != 3 || instruction.bytes.size() < 3 || instruction.operands.size() != 2 ||
         instruction.access.size() != 2 || instruction.access[0] != OperandAccess::read ||
         instruction.access[1] != OperandAccess::address || !instruction.memory_read ||
         instruction.memory_write || !instruction.direct_target || instruction.address.offset > UINT16_MAX)
@@ -1497,6 +1497,71 @@ evaluate_m65c02_bit_branch_instruction(const Instruction &instruction,
         memory->resolved_address->offset != std::to_integer<std::uint8_t>(instruction.bytes[1]))
         return {};
     return evaluate_m65c02_bit_branch(instruction.opcode, instruction.condition, zero_page_value);
+}
+
+std::optional<M65C02BitBranchResult>
+evaluate_m65c02_bit_branch_execution(const Instruction &instruction,
+                                     std::uint8_t zero_page_value) noexcept {
+    if (!instruction.m6502_timing) return {};
+    const auto &timing = *instruction.m6502_timing;
+    if (timing.base_cycles != 5 || !timing.branch_taken_penalty ||
+        !timing.branch_page_cross_penalty || timing.page_cross_penalty ||
+        timing.decimal_mode_penalty)
+        return {};
+    const auto taken = evaluate_m65c02_bit_branch_instruction(instruction, zero_page_value);
+    if (!taken) return {};
+    const auto sequential = static_cast<std::uint16_t>(instruction.address.offset + 3u);
+    const auto target = *instruction.direct_target;
+    const auto page_crossed = *taken &&
+        (sequential & 0xff00u) != (target.offset & 0xff00u);
+    const auto cycles = static_cast<std::uint8_t>(timing.base_cycles + (*taken ? 1u : 0u) +
+                                                   (page_crossed ? 1u : 0u));
+    return M65C02BitBranchResult{*taken ? static_cast<std::uint16_t>(target.offset) : sequential,
+                                 cycles, *taken, page_crossed};
+}
+
+std::optional<M65C02BitBranchBusTrace>
+trace_m65c02_bit_branch_bus(const Instruction &instruction,
+                            std::uint8_t zero_page_value) noexcept {
+    const auto execution = evaluate_m65c02_bit_branch_execution(instruction, zero_page_value);
+    if (!execution) return {};
+    const auto *memory = std::get_if<MemoryOperand>(&instruction.operands[0]);
+    const auto *relative = std::get_if<RelativeOperand>(&instruction.operands[1]);
+    if (!memory || !relative) return {};
+
+    M65C02BitBranchBusTrace trace;
+    trace.zero_page_address = static_cast<std::uint16_t>(memory->resolved_address->offset);
+    trace.next_program_counter = execution->next_program_counter;
+    trace.branch_taken = execution->branch_taken;
+    trace.page_crossed = execution->page_crossed;
+    const auto pc = static_cast<std::uint16_t>(instruction.address.offset);
+    const auto sequential = static_cast<std::uint16_t>(pc + 3u);
+    const auto target = static_cast<std::uint16_t>(instruction.direct_target->offset);
+    const auto append = [&](std::uint16_t address, M6502BusAccessKind kind,
+                            std::optional<std::uint8_t> value = {}) {
+        if (trace.access_count >= trace.accesses.size()) return false;
+        const auto cycle = static_cast<std::uint8_t>(trace.access_count + 1u);
+        trace.accesses[trace.access_count++] = M6502BusAccess{address, kind, cycle, value};
+        return true;
+    };
+    append(pc, M6502BusAccessKind::opcode_fetch,
+           std::to_integer<std::uint8_t>(instruction.bytes[0]));
+    append(static_cast<std::uint16_t>(pc + 1u), M6502BusAccessKind::operand_fetch,
+           std::to_integer<std::uint8_t>(instruction.bytes[1]));
+    append(trace.zero_page_address, M6502BusAccessKind::data_read, zero_page_value);
+    append(static_cast<std::uint16_t>(pc + 2u), M6502BusAccessKind::operand_fetch,
+           std::to_integer<std::uint8_t>(instruction.bytes[2]));
+    append(sequential, M6502BusAccessKind::dummy_read);
+    if (execution->branch_taken) {
+        if (execution->page_crossed) {
+            const auto intermediate = static_cast<std::uint16_t>(
+                (sequential & 0xff00u) | (target & 0x00ffu));
+            if (!append(intermediate, M6502BusAccessKind::dummy_read)) return {};
+        }
+        if (!append(target, M6502BusAccessKind::opcode_fetch)) return {};
+    }
+    if (trace.access_count != execution->cycles) return {};
+    return trace;
 }
 
 } // namespace hexlab
