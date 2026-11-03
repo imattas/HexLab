@@ -16181,6 +16181,81 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                     const auto join = nearest_common_postdominator({*true_target, *false_target});
                     if (!join || *join == current || (stop && !postdominators[*join].contains(*stop))) return false;
                     const std::string spaces(indent, ' ');
+
+                    // If both branch targets are empty transfer blocks that
+                    // feed the same phi join, preserve the predecessor choice
+                    // directly as a C conditional expression. The earlier CFG
+                    // pass has already proved complete predecessor coverage;
+                    // this local check additionally binds each input to the
+                    // branch's true/false target, rather than relying on block
+                    // storage order or phi input order.
+                    const auto is_empty_transfer = [&](std::size_t arm) {
+                        if (arm >= count || successors[arm].size() != 1 || successors[arm].front() != *join)
+                            return false;
+                        const auto &arm_block = function.blocks[arm];
+                        if (predecessors[arm].size() != 1 || predecessors[arm].front() != current)
+                            return false;
+                        if (arm_block.instructions.empty()) return true;
+                        if (arm_block.instructions.size() != 1) return false;
+                        const auto *transfer = std::get_if<Branch>(&arm_block.instructions.front().statement);
+                        return transfer && transfer->condition == "true" && transfer->true_target &&
+                            *transfer->true_target == function.blocks[*join].begin &&
+                            !transfer->false_target && !transfer->indirect_target;
+                    };
+                    bool lowered_phi_join = false;
+                    if (*true_target != *false_target && !function.blocks[*join].phis.empty() &&
+                        is_empty_transfer(*true_target) && is_empty_transfer(*false_target) &&
+                        predecessors[*join].size() == 2 &&
+                        std::find(predecessors[*join].begin(), predecessors[*join].end(), *true_target) != predecessors[*join].end() &&
+                        std::find(predecessors[*join].begin(), predecessors[*join].end(), *false_target) != predecessors[*join].end()) {
+                        std::vector<std::pair<std::string, std::pair<std::string, std::string>>> edge_values;
+                        edge_values.reserve(function.blocks[*join].phis.size());
+                        bool exact_inputs = true;
+                        for (const auto &phi : function.blocks[*join].phis) {
+                            const auto input_for = [&](std::size_t predecessor) {
+                                return std::find_if(phi.inputs.begin(), phi.inputs.end(), [&](const auto &input) {
+                                    return input.predecessor == function.blocks[predecessor].id;
+                                });
+                            };
+                            const auto true_input = input_for(*true_target);
+                            const auto false_input = input_for(*false_target);
+                            if (true_input == phi.inputs.end() || false_input == phi.inputs.end()) {
+                                exact_inputs = false;
+                                break;
+                            }
+                            edge_values.emplace_back(register_name(phi.destination, phi.version),
+                                std::pair{register_name(phi.destination, true_input->version),
+                                          register_name(phi.destination, false_input->version)});
+                        }
+                        if (exact_inputs) {
+                            const auto condition_temporary = "__hexlab_phi_" + std::to_string(phi_temporary++);
+                            out << spaces << "auto " << condition_temporary << " = ("
+                                << branch_condition_text(*conditional) << ");\n";
+                            std::vector<std::string> temporaries;
+                            temporaries.reserve(edge_values.size());
+                            for (const auto &[destination, incoming] : edge_values) {
+                                (void)destination;
+                                auto temporary = "__hexlab_phi_" + std::to_string(phi_temporary++);
+                                out << spaces << "auto " << temporary << " = " << condition_temporary
+                                    << " ? " << incoming.first << " : " << incoming.second << ";\n";
+                                temporaries.push_back(std::move(temporary));
+                            }
+                            for (std::size_t n = 0; n < edge_values.size(); ++n)
+                                out << spaces << edge_values[n].first << " = " << temporaries[n] << ";\n";
+                            for (const auto arm : {*true_target, *false_target}) {
+                                if (++occurrences[arm] > max_copies_per_block ||
+                                    ++occurrence_count > max_acyclic_occurrences) return false;
+                                emitted.insert(arm);
+                            }
+                            lowered_phi_join = true;
+                        }
+                    }
+                    if (lowered_phi_join) {
+                        if (stop && *join == *stop) return true;
+                        current = *join;
+                        incoming_predecessor.reset();
+                        continue;
+                    }
                     out << spaces << "if (" << branch_condition_text(*conditional) << ") {\n";
                     if (!emit_region(*true_target, join, indent + 4, block.id, depth + 1)) return false;
                     out << spaces << "} else {\n";

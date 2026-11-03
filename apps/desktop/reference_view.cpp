@@ -890,7 +890,32 @@ void ReferenceView::explore_call_paths() {
         navigation_revision_ != revision || !project_->derived_key || !project_->references ||
         project_->references->key() != project_->derived_key || !navigate)
         return;
-    navigate(document, snapshot, Location{paths[static_cast<std::size_t>(selection)].functions.back()});
+    const auto &selected_path = paths[static_cast<std::size_t>(selection)];
+    wxArrayString steps;
+    steps.Alloc(selected_path.functions.size());
+    for (std::size_t i = 0; i < selected_path.functions.size(); ++i) {
+        wxString label = wxString::Format("%zu. ", i);
+        label += preview_text(presentation_name(*snapshot, Location{selected_path.functions[i]}), 96);
+        label += wxString::Format(" (%s)", location_text(Location{selected_path.functions[i]}, image));
+        if (i > 0) {
+            const auto &edge = selected_path.edges[i - 1];
+            label += wxString::Format(" — call site %s [ref #%llu, %s]",
+                location_text(Location{edge.call_site}, image),
+                static_cast<unsigned long long>(edge.reference_id.value), provenance_name(edge.provenance));
+        }
+        steps.Add(label);
+    }
+    wxSingleChoiceDialog step_dialog(this,
+        "Choose a function on this route to navigate to it. The first row is the selected function; later rows follow the route.",
+        "Call path destination", steps);
+    if (step_dialog.ShowModal() != wxID_OK) return;
+    const auto step = step_dialog.GetSelection();
+    if (step == wxNOT_FOUND || static_cast<std::size_t>(step) >= selected_path.functions.size() ||
+        !document_ || document_->value != document.value || project_ != snapshot ||
+        navigation_revision_ != revision || !project_->derived_key || !project_->references ||
+        project_->references->key() != project_->derived_key || !navigate)
+        return;
+    navigate(document, snapshot, Location{selected_path.functions[static_cast<std::size_t>(step)]});
 }
 void ReferenceView::retain_documents(std::span<const DocumentInfo> docs) {
     for (auto it = preferences_.begin(); it != preferences_.end();)

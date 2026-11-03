@@ -45,6 +45,8 @@ std::vector<WasmLinkResolution> link_wasm_inventory(std::span<const WasmLinkModu
         for (const auto &imp : consumer.metadata->imports) {
             if (stop.stop_requested()) return out;
             WasmLinkResolution row{consumer.identity, imp.module, imp.name, imp.kind};
+            row.import_entry_index = imp.entry_index;
+            row.import_entry_file_offset = imp.entry_file_offset;
             if (!known_kind(imp.kind)) {
                 row.status = WasmLinkStatus::unsupported; row.detail = "import kind is not represented by this metadata version";
                 out.push_back(std::move(row)); continue;
@@ -66,7 +68,10 @@ std::vector<WasmLinkResolution> link_wasm_inventory(std::span<const WasmLinkModu
             if (!hits) { row.status = WasmLinkStatus::missing; row.detail = "no supplied module exports the requested module/name/kind"; out.push_back(std::move(row)); continue; }
             if (hits != 1) { row.status = WasmLinkStatus::ambiguous; row.detail = "multiple supplied exports match the requested module/name/kind"; out.push_back(std::move(row)); continue; }
             row.provider = provider->identity; row.provider_export_index = exp->index;
+            row.provider_export_entry_index = exp->entry_index;
+            row.provider_export_entry_file_offset = exp->entry_file_offset;
             bool compatible = false;
+            std::string incompatibility_detail;
             switch (imp.kind) {
             case WasmExternalKind::function:
                 if (!imp.function_type_index || *imp.function_type_index >= consumer.metadata->function_types.size() ||
@@ -75,19 +80,27 @@ std::vector<WasmLinkResolution> link_wasm_inventory(std::span<const WasmLinkModu
                     out.push_back(std::move(row)); continue;
                 }
                 compatible = consumer.metadata->function_types[*imp.function_type_index] == provider->metadata->function_types[*exp->function_type_index];
+                if (!compatible)
+                    incompatibility_detail = "provider function parameter/result types do not match the import signature";
                 break;
             case WasmExternalKind::table:
             case WasmExternalKind::memory:
                 if (!imp.limits || !exp->limits) { row.status = WasmLinkStatus::unsupported; row.detail = "limits metadata is incomplete"; out.push_back(std::move(row)); continue; }
                 compatible = limits_match(*imp.limits, *exp->limits);
+                if (!compatible)
+                    incompatibility_detail = "provider limits do not satisfy the import's minimum, maximum, and sharedness requirements";
                 break;
             case WasmExternalKind::global:
                 if (!imp.global_value_type || !exp->global_value_type) { row.status = WasmLinkStatus::unsupported; row.detail = "global type metadata is incomplete"; out.push_back(std::move(row)); continue; }
                 compatible = imp.global_value_type == exp->global_value_type && imp.global_mutable == exp->global_mutable;
+                if (!compatible)
+                    incompatibility_detail = imp.global_value_type != exp->global_value_type
+                        ? "provider global value type differs from the import type"
+                        : "provider global mutability differs from the import requirement";
                 break;
             }
             row.status = compatible ? WasmLinkStatus::linked : WasmLinkStatus::incompatible;
-            row.detail = compatible ? "metadata types are compatible; no runtime binding was created" : "provider export type does not satisfy import type";
+            row.detail = compatible ? "metadata types are compatible; no runtime binding was created" : std::move(incompatibility_detail);
             out.push_back(std::move(row));
         }
     }

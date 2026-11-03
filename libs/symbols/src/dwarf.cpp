@@ -925,6 +925,20 @@ hexlab::Result<ImportResult> import_dwarf(const DwarfSections&sections){
             return static_cast<const Value*>(nullptr);
         };
         auto function_attribute=[&](std::size_t index,std::uint64_t attribute)->hexlab::Result<const Value*>{std::set<std::size_t> visited;return inherited_attribute(index,attribute,visited);};
+        auto prior_cross_unit_signature=[&](const Die&die)->const PriorFunctionSignature*{
+            for(const auto reference_attribute:{attr_abstract_origin,attr_specification}){
+                const auto*reference=ref(die,reference_attribute);if(!reference)continue;
+                if(!reference->section_absolute)continue;
+                const std::uint64_t absolute_offset=reference->offset;
+                if(absolute_offset<sections.info_section_offset)continue;
+                const auto local_offset=absolute_offset-sections.info_section_offset;
+                const auto target=die_unit_index.find(local_offset);
+                if(target==die_unit_index.end()||target->second==context_index)continue;
+                const auto found=prior_function_signatures.find(absolute_offset);
+                if(found!=prior_function_signatures.end())return &found->second;
+            }
+            return nullptr;
+        };
         auto validate_calling_convention=[&](const Value*value)->hexlab::Result<bool>{
             if(!value)return true;
             const auto*code=std::get_if<std::uint64_t>(value);
@@ -1156,26 +1170,23 @@ hexlab::Result<ImportResult> import_dwarf(const DwarfSections&sections){
         for(std::size_t i=0;i<dies.size();++i){
             const auto&die=dies[i];
             if(die.tag!=tag_subprogram)continue;
-            auto convention_value=function_attribute(i,attr_calling_convention);
-            if(!convention_value)return convention_value.error();
-            auto convention_valid=validate_calling_convention(convention_value.value());
-            if(!convention_valid)return convention_valid.error();
-            const PriorFunctionSignature*prior=nullptr;
-            for(const auto reference_attribute:{attr_abstract_origin,attr_specification}){
-                const auto*reference=ref(die,reference_attribute);
-                if(!reference)continue;
-                std::uint64_t target_offset=reference->offset;
-                if(!reference->section_absolute){
-                    if(reference->offset>UINT64_MAX-unit_offset)continue;
-                    const auto relative_target=unit_offset+reference->offset;
-                    if(relative_target>UINT64_MAX-sections.info_section_offset)continue;
-                    target_offset=sections.info_section_offset+relative_target;
-                }
-                const auto found=prior_function_signatures.find(target_offset);
-                if(found!=prior_function_signatures.end()){prior=&found->second;break;}
+            const auto*prior=prior_cross_unit_signature(die);
+            if(attr(die,attr_calling_convention)){
+                auto convention_value=function_attribute(i,attr_calling_convention);
+                if(!convention_value)return convention_value.error();
+                auto convention_valid=validate_calling_convention(convention_value.value());
+                if(!convention_valid)return convention_valid.error();
+            }else if(!prior){
+                auto convention_value=function_attribute(i,attr_calling_convention);
+                if(!convention_value)return convention_value.error();
+                auto convention_valid=validate_calling_convention(convention_value.value());
+                if(!convention_valid)return convention_valid.error();
             }
             std::optional<std::string> name;
-            auto name_value=function_attribute(i,attr_name);
+            auto name_value=attr(die,attr_name)
+                ? function_attribute(i,attr_name)
+                : (prior ? hexlab::Result<const Value*>(static_cast<const Value*>(nullptr))
+                         : function_attribute(i,attr_name));
             if(name_value&&name_value.value()){
                 if(const auto*value=std::get_if<std::string>(name_value.value()))name=*value;
                 else return malformed("inherited DW_AT_name is not a string");
@@ -1328,10 +1339,6 @@ hexlab::Result<ImportResult> import_dwarf(const DwarfSections&sections){
                     output.symbols.push_back(std::move(entry_point));
                 }
             } else if(d.tag==tag_subprogram){
-                auto convention_value=function_attribute(i,attr_calling_convention);
-                if(!convention_value)return convention_value.error();
-                auto convention_valid=validate_calling_convention(convention_value.value());
-                if(!convention_valid)return convention_valid.error();
                 const auto*low=num(d,attr_low_pc);const auto*high=num(d,attr_high_pc);
                 auto function_ranges=std::vector<ImportedSymbol::Range>{};
                 if(const auto*ranges_value=attr(d,attr_ranges)){
@@ -1386,6 +1393,12 @@ hexlab::Result<ImportResult> import_dwarf(const DwarfSections&sections){
                     }
                     auto found=prior_function_signatures.find(reference->offset);
                     if(found!=prior_function_signatures.end()){prior=&found->second;break;}
+                }
+                if(attr(d,attr_calling_convention)||!prior){
+                    auto convention_value=function_attribute(i,attr_calling_convention);
+                    if(!convention_value)return convention_value.error();
+                    auto convention_valid=validate_calling_convention(convention_value.value());
+                    if(!convention_valid)return convention_valid.error();
                 }
                 auto name_value=function_attribute(i,attr_name);
                 if(!name_value&&!prior)return name_value.error();

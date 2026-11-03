@@ -52,6 +52,16 @@ remain conservative.
 Before flow begins, a bounded class-data index records in-image class, field,
 and method access flags independent of class-definition order. Standard field
 opcodes are checked against the resolved static/instance field declaration.
+Optimized volatile field opcodes (`0xe3`–`0xeb`) also receive descriptor-
+driven transfers: ordinary forms require a single-word primitive, the object
+form requires a reference, and wide forms require `J` or `D`. When an in-image
+field declaration resolves, the verifier also requires `ACC_VOLATILE`, the
+encoded static/instance form, and applicable access checks. Instance receivers
+are checked against the symbolic field owner when their type is known. A
+throwing volatile access sends its incoming state to covered handlers before
+the normal destination write. Unresolved external declarations remain
+conservative; quick field offsets (`0xf2`–`0xf7`) still have no descriptor or
+owner proof.
 Field and method declaration lookup follows in-image superclasses and
 interfaces using exact name/type or name/prototype signatures. Resolved members
 are checked against public/private/protected/package visibility; both the

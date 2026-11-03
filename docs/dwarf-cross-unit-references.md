@@ -48,3 +48,13 @@ cache, cancellation, and cycle limits; they do not treat package offsets as
 identities in another file. TU-to-CU dependencies through this particular
 composition, external-package signatures in the target CU, and supplementary
 package composition remain unsupported.
+
+Within one supplied `.debug_info` section, the importer also follows bounded
+`DW_FORM_ref_addr` `DW_AT_specification` and `DW_AT_abstract_origin` edges from
+concrete subprogram DIEs to already-resolved subprogram summaries in other
+units. It carries the target's name, return type, parameter types and variadic
+flag forward when the concrete DIE omits those attributes. The target unit is
+scheduled first by the existing reference dependency order; cycles continue to
+fail closed. The imported symbol retains the concrete DIE's own source
+provenance and code ranges. This does not retain arbitrary cross-unit DIE
+graphs or infer missing parameter names from the declaration.

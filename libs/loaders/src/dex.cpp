@@ -85,10 +85,10 @@ bool extent(std::uint64_t off, std::uint64_t count, std::uint64_t stride, std::u
     return off <= size && (!count || (stride && count <= (size - off) / stride));
 }
 
-// Standard Dalvik operations below can transfer control to an in-method
-// handler without completing their normal register write. Keep this list
-// conservative: extra handler predecessors lose type precision at joins but
-// cannot manufacture a value that was written only on the normal path.
+// Standard Dalvik operations and retained optimized volatile-field forms can
+// transfer control to an in-method handler without completing their normal
+// register write. Keep this list conservative: extra handler predecessors
+// lose type precision at joins but cannot manufacture normal-path values.
 bool dex_opcode_may_throw(std::uint8_t opcode) {
     if (opcode == 0x1a || opcode == 0x1b || opcode == 0x1c || opcode == 0x1d ||
         opcode == 0x1e || opcode == 0x1f || opcode == 0x20 || opcode == 0x21 ||
@@ -99,7 +99,7 @@ bool dex_opcode_may_throw(std::uint8_t opcode) {
         opcode == 0xb3 || opcode == 0xb4 || opcode == 0xbe || opcode == 0xbf ||
         opcode == 0xd3 || opcode == 0xd4 || opcode == 0xde || opcode == 0xdf ||
         opcode == 0xf0 || opcode == 0xfa || opcode == 0xfb || opcode == 0xfc || opcode == 0xfd ||
-        opcode == 0xfe || opcode == 0xff)
+        (opcode >= 0xe3 && opcode <= 0xeb) || opcode == 0xfe || opcode == 0xff)
         return true;
     return false;
 }
@@ -2361,9 +2361,15 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
                                 // the runtime ArrayStoreException check.
                                 return array_error("DEX aput-object value is not a reference");
                             }
-                        } else if (opcode >= 0x52 && opcode <= 0x6d) {
-                            const auto instance = opcode < 0x60;
-                            const auto get = opcode <= 0x58 || (opcode >= 0x60 && opcode <= 0x66);
+                        } else if ((opcode >= 0x52 && opcode <= 0x6d) ||
+                                   (opcode >= 0xe3 && opcode <= 0xeb)) {
+                            const bool volatile_field = opcode >= 0xe3 && opcode <= 0xeb;
+                            const auto instance = volatile_field
+                                ? opcode == 0xe3 || opcode == 0xe4 || opcode == 0xe7 || opcode == 0xe8 || opcode == 0xe9
+                                : opcode < 0x60;
+                            const auto get = volatile_field
+                                ? opcode == 0xe3 || opcode == 0xe5 || opcode == 0xe7 || opcode == 0xe8 || opcode == 0xea
+                                : opcode <= 0x58 || (opcode >= 0x60 && opcode <= 0x66);
                             const auto value = instance ? reg4a : reg8;
                             const auto receiver = reg4b;
                             const auto field_index = word(1);
@@ -2382,6 +2388,9 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
                                         "field", field_index);
                                 if (declaration) {
                                     const bool declared_static = (declaration->second & 0x0008u) != 0;
+                                    if (volatile_field && (declaration->second & 0x0040u) == 0)
+                                        return member_error("DEX volatile field opcode references a non-volatile in-image field",
+                                            "field", field_index);
                                     if (declared_static == instance) {
                                         std::ostringstream provenance;
                                         provenance << "DEX field opcode disagrees with the declared static/instance field kind"
@@ -2419,6 +2428,18 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
                                         state.references[receiver] = UINT32_MAX;
                                 }
                                 const auto &field_type = types[fields[field_index].type];
+                                if (volatile_field) {
+                                    const auto field_category = descriptor_type(field_type);
+                                    const bool category_matches =
+                                        ((opcode == 0xe3 || opcode == 0xe4 || opcode == 0xe5 || opcode == 0xe6) &&
+                                            (field_category == RegType::int32 || field_category == RegType::float32)) ||
+                                        (opcode == 0xe7 && field_category == RegType::reference) ||
+                                        ((opcode == 0xe8 || opcode == 0xe9 || opcode == 0xea || opcode == 0xeb) &&
+                                            (field_category == RegType::wide_int_low || field_category == RegType::wide_float_low));
+                                    if (!category_matches)
+                                        return member_error("DEX volatile field opcode disagrees with the field descriptor category",
+                                            "field", field_index);
+                                }
                                 if (get) set_descriptor(value, field_type);
                                 else if (!expect_descriptor(value, field_type) ||
                                          !expect_assignable_reference(value, field_type))

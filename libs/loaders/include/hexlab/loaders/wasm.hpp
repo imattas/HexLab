@@ -48,8 +48,16 @@ struct WasmLinkResolution {
     WasmExternalKind kind = WasmExternalKind::function;
     WasmLinkStatus status = WasmLinkStatus::missing;
     std::optional<std::string> provider;
+    // Kind-specific function/table/memory/global index in the provider.
     std::optional<std::uint32_t> provider_export_index;
     std::string detail;
+    // Import-entry provenance is present for every row produced from an import.
+    std::uint32_t import_entry_index = 0;
+    FileOffset import_entry_file_offset{};
+    // Export-entry provenance is present only when one unique matching export
+    // was found, including when its type is incompatible or incomplete.
+    std::optional<std::uint32_t> provider_export_entry_index;
+    std::optional<FileOffset> provider_export_entry_file_offset;
 };
 struct WasmLinkOptions {
     std::size_t maximum_modules = 4096;

@@ -8,6 +8,15 @@ as each region's join. It lowers SSA phi values into edge-specific assignments
 and follows multi-block straight-line arms. A simple conditional early return
 is also structured, including the case where the return is on the branch's
 false edge.
+When both conditional arms are empty transfer blocks that lead directly to a
+two-predecessor join, register phis at that join can be emitted as conditional
+expressions. The formatter binds the true and false incoming versions to the
+corresponding branch targets, evaluates the predicate once, and captures all
+selected values before writing phi destinations, preserving parallel-copy
+semantics. Whole-memory and partition-memory phis at the same join must still
+match the exact CFG predecessor set; they remain ordering metadata and do not
+become source-level assignments. Nonempty arms and joins with extra
+predecessors keep the ordinary edge-copy form or existing fallback.
 Single-exit functions try this local-join structuring before return-tree
 expansion. Direct entry early-return guards also prefer it when a bounded
 acyclic path analysis proves a shared nonterminal join in the continuation.
