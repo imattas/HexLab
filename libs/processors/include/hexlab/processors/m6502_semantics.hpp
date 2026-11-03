@@ -108,6 +108,18 @@ evaluate_m65c02_tsb_trb_instruction(const Instruction &instruction,
                                     std::uint8_t memory_value,
                                     std::uint8_t status) noexcept;
 
+struct M65C02RmbSmbResult {
+    std::uint8_t memory_value = 0;
+    bool operator==(const M65C02RmbSmbResult &) const = default;
+};
+// Evaluate W65C02 RMB/SMB for bit 0..7. These operations do not change P.
+HEXLAB_PROCESSORS_EXPORT std::optional<M65C02RmbSmbResult>
+evaluate_m65c02_rmb_smb(Opcode opcode, std::uint8_t bit,
+                        std::uint8_t memory_value) noexcept;
+HEXLAB_PROCESSORS_EXPORT std::optional<M65C02RmbSmbResult>
+evaluate_m65c02_rmb_smb_instruction(const Instruction &instruction,
+                                    std::uint8_t memory_value) noexcept;
+
 struct M6502AlrResult {
     std::uint8_t accumulator = 0;
     std::uint8_t status = 0;
@@ -347,11 +359,11 @@ struct M6502MemoryBusTrace {
     bool operator==(const M6502MemoryBusTrace &) const = default;
 };
 // Trace validated documented NMOS/65C02 byte loads, stores, ALU/compare, and
-// memory INC/DEC/ASL/LSR/ROL/ROR plus W65C02 TSB/TRB. NMOS read/modify/write
-// forms report the original-value dummy write; W65C02 forms report the second
-// effective-address read before the final write. The caller supplies A/P and
-// the value read from the final effective address (and pointer bytes where
-// needed); no memory or pin model is implied.
+// memory INC/DEC/ASL/LSR/ROL/ROR plus W65C02 TSB/TRB/RMB/SMB. NMOS
+// read/modify/write forms report the original-value dummy write; W65C02 forms
+// report the second effective-address read before the final write. The caller
+// supplies A/P and the value read from the final effective address (and pointer
+// bytes where needed); no memory or pin model is implied.
 HEXLAB_PROCESSORS_EXPORT std::optional<M6502MemoryBusTrace>
 trace_m6502_memory_bus(const Instruction &instruction,
                        const M6502MemoryBusInputs &inputs) noexcept;

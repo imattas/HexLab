@@ -23,8 +23,11 @@ trace_m6502_memory_bus(const Instruction &instruction,
                        instruction.opcode == Opcode::m6502_sty || (cmos && instruction.opcode == Opcode::m65c02_stz);
     const bool shift = instruction.opcode == Opcode::m6502_asl || instruction.opcode == Opcode::m6502_lsr ||
         instruction.opcode == Opcode::m6502_rol || instruction.opcode == Opcode::m6502_ror;
-    const bool bit_modify = cmos && (instruction.opcode == Opcode::m65c02_tsb ||
-                                    instruction.opcode == Opcode::m65c02_trb);
+    const bool tsb_trb = cmos && (instruction.opcode == Opcode::m65c02_tsb ||
+                                 instruction.opcode == Opcode::m65c02_trb);
+    const bool rmb_smb = cmos && (instruction.opcode == Opcode::m65c02_rmb ||
+                                 instruction.opcode == Opcode::m65c02_smb);
+    const bool bit_modify = tsb_trb || rmb_smb;
     const bool rmw = instruction.opcode == Opcode::m6502_inc || instruction.opcode == Opcode::m6502_dec ||
                      shift || bit_modify;
     const bool read = instruction.opcode == Opcode::m6502_lda || instruction.opcode == Opcode::m6502_ldx ||
@@ -66,6 +69,8 @@ trace_m6502_memory_bus(const Instruction &instruction,
         case Opcode::m6502_ror: return opcode_byte==0x66||opcode_byte==0x76||opcode_byte==0x6e||opcode_byte==0x7e;
         case Opcode::m65c02_tsb: return cmos&&(opcode_byte==0x04||opcode_byte==0x0c);
         case Opcode::m65c02_trb: return cmos&&(opcode_byte==0x14||opcode_byte==0x1c);
+        case Opcode::m65c02_rmb: return cmos&&(opcode_byte&0x8fu)==0x07u;
+        case Opcode::m65c02_smb: return cmos&&(opcode_byte&0x8fu)==0x87u;
         default: return false;
         }
     };
@@ -109,11 +114,15 @@ trace_m6502_memory_bus(const Instruction &instruction,
     if (shift && ((mode != Mode::zp && mode != Mode::zpx && mode != Mode::abs && mode != Mode::absx) ||
                   !evaluate_m6502_shift_instruction(instruction, inputs.memory_value, inputs.status)))
         return {};
-    const auto bit_modify_result = bit_modify
+    const auto tsb_trb_result = tsb_trb
         ? evaluate_m65c02_tsb_trb_instruction(instruction, inputs.accumulator,
                                               inputs.memory_value, inputs.status)
         : std::optional<M65C02TsbTrbResult>{};
-    if (bit_modify && ((mode != Mode::zp && mode != Mode::abs) || !bit_modify_result)) return {};
+    if (tsb_trb && ((mode != Mode::zp && mode != Mode::abs) || !tsb_trb_result)) return {};
+    const auto rmb_smb_result = rmb_smb
+        ? evaluate_m65c02_rmb_smb_instruction(instruction, inputs.memory_value)
+        : std::optional<M65C02RmbSmbResult>{};
+    if (rmb_smb && (mode != Mode::zp || !rmb_smb_result)) return {};
 
     M6502MemoryBusTrace trace;
     const auto pc = static_cast<std::uint16_t>(instruction.address.offset);
@@ -176,8 +185,10 @@ trace_m6502_memory_bus(const Instruction &instruction,
         const auto shifted = evaluate_m6502_shift_instruction(instruction, inputs.memory_value, inputs.status);
         if (!shifted) return {};
         write_value = shifted->value;
-    } else if (bit_modify) {
-        write_value = bit_modify_result->memory_value;
+    } else if (tsb_trb) {
+        write_value = tsb_trb_result->memory_value;
+    } else if (rmb_smb) {
+        write_value = rmb_smb_result->memory_value;
     } else if (rmw) write_value = instruction.opcode == Opcode::m6502_inc ?
         static_cast<std::uint8_t>(inputs.memory_value + 1u) : static_cast<std::uint8_t>(inputs.memory_value - 1u);
     if (rmw) {
@@ -575,6 +586,49 @@ evaluate_m65c02_tsb_trb_instruction(const Instruction &instruction,
             instruction.register_reads.end() || instruction.register_writes[0] != p)
         return {};
     return evaluate_m65c02_tsb_trb(instruction.opcode, accumulator, memory_value, status);
+}
+
+std::optional<M65C02RmbSmbResult>
+evaluate_m65c02_rmb_smb(Opcode opcode, std::uint8_t bit,
+                        std::uint8_t memory_value) noexcept {
+    if ((opcode != Opcode::m65c02_rmb && opcode != Opcode::m65c02_smb) || bit > 7) return {};
+    const auto mask = static_cast<std::uint8_t>(1u << bit);
+    const auto result = opcode == Opcode::m65c02_smb
+        ? static_cast<std::uint8_t>(memory_value | mask)
+        : static_cast<std::uint8_t>(memory_value & static_cast<std::uint8_t>(~mask));
+    return M65C02RmbSmbResult{result};
+}
+
+std::optional<M65C02RmbSmbResult>
+evaluate_m65c02_rmb_smb_instruction(const Instruction &instruction,
+                                    std::uint8_t memory_value) noexcept {
+    if (instruction.context.architecture != Architecture::mos6502 ||
+        instruction.context.mode != ExecutionMode::m65c02 ||
+        instruction.flow != FlowKind::fallthrough || instruction.direct_target ||
+        instruction.address.offset > UINT16_MAX || instruction.length != 2 ||
+        instruction.bytes.size() < 2 ||
+        (instruction.opcode != Opcode::m65c02_rmb && instruction.opcode != Opcode::m65c02_smb) ||
+        instruction.condition > 7 || instruction.operands.size() != 1 ||
+        instruction.access.size() != 1 || instruction.access[0] != OperandAccess::read_write ||
+        !instruction.memory_read || !instruction.memory_write || !instruction.m6502_timing ||
+        instruction.m6502_timing->base_cycles != 5 || instruction.m6502_timing->page_cross_penalty ||
+        !instruction.register_reads.empty() || !instruction.register_writes.empty())
+        return {};
+    const auto encoded = std::to_integer<std::uint8_t>(instruction.bytes[0]);
+    const auto expected_opcode = static_cast<std::uint8_t>(instruction.opcode == Opcode::m65c02_smb ? 0x87 : 0x07);
+    if ((encoded & 0x8fu) != expected_opcode || ((encoded >> 4) & 7u) != instruction.condition)
+        return {};
+    const auto address = std::to_integer<std::uint8_t>(instruction.bytes[1]);
+    const auto *memory = std::get_if<MemoryOperand>(&instruction.operands[0]);
+    if (!memory || memory->data_width != 8 || memory->address_width != 16 || memory->index ||
+        memory->base || memory->segment || memory->scale != 1 || memory->ip_relative ||
+        memory->writeback || memory->post_index || memory->writeback_displacement != 0 ||
+        !memory->index_extend.empty() || memory->index_shift_amount != 0 ||
+        memory->displacement != address ||
+        memory->displacement_encoding != EncodedField{1, 1} ||
+        memory->resolved_address != Address{instruction.address.space, address})
+        return {};
+    return evaluate_m65c02_rmb_smb(instruction.opcode, instruction.condition, memory_value);
 }
 
 std::optional<M6502AlrResult>
