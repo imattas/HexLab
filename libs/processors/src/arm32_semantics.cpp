@@ -506,7 +506,8 @@ std::optional<std::uint32_t> evaluate_arm32_bitfield_instruction(
 
 std::optional<Arm32SaturatingResult> evaluate_arm32_saturating_instruction(
     const Instruction &instruction, std::uint32_t rm, std::uint32_t rn, bool incoming_q) noexcept {
-    if (instruction.context.architecture == Architecture::arm && instruction.context.mode == ExecutionMode::a32 &&
+    if (instruction.context.architecture == Architecture::arm &&
+        (instruction.context.mode == ExecutionMode::a32 || instruction.context.mode == ExecutionMode::thumb) &&
         (instruction.opcode == Opcode::arm_ssat || instruction.opcode == Opcode::arm_usat)) {
         if (instruction.flow != FlowKind::fallthrough || instruction.memory_read || instruction.memory_write ||
             instruction.operands.size() != 3 || instruction.access.size() != 3 || !instruction.arm ||
@@ -515,12 +516,14 @@ std::optional<Arm32SaturatingResult> evaluate_arm32_saturating_instruction(
         const auto *destination = std::get_if<RegisterOperand>(&instruction.operands[0]);
         const auto *width_operand = std::get_if<ImmediateOperand>(&instruction.operands[1]);
         const auto *shifted = std::get_if<ArmShiftedRegisterOperand>(&instruction.operands[2]);
-        if (!destination || destination->bank != RegisterBank::arm32_gpr || destination->index >= 15 ||
+        const auto register_limit = instruction.context.mode == ExecutionMode::a32 ? 15u : 13u;
+        if (!destination || destination->bank != RegisterBank::arm32_gpr || destination->index >= register_limit ||
             destination->width != 32 || destination->high_byte || !width_operand ||
             width_operand->value > 31 || !shifted || shifted->source.bank != RegisterBank::arm32_gpr ||
-            shifted->source.index >= 15 || shifted->source.width != 32 || shifted->source.high_byte ||
+            shifted->source.index >= register_limit || shifted->source.width != 32 || shifted->source.high_byte ||
             shifted->amount_register || (shifted->shift != ArmShift::lsl && shifted->shift != ArmShift::asr) ||
-            shifted->amount > 32 || (shifted->shift == ArmShift::lsl && shifted->amount > 31) ||
+            shifted->amount > (instruction.context.mode == ExecutionMode::a32 ? 32 : 31) ||
+            (shifted->shift == ArmShift::lsl && shifted->amount > 31) ||
             instruction.access != std::vector<OperandAccess>{OperandAccess::write, OperandAccess::read, OperandAccess::read})
             return {};
         const auto contains = [](const auto &registers, RegisterOperand reg) {

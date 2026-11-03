@@ -1,8 +1,8 @@
 # A32 and Thumb-2 saturating arithmetic
 
 The decoders recognize `QADD`, `QSUB`, `QDADD`, and `QDSUB` in A32 and
-Thumb-2, plus scalar `SSAT` and `USAT` in A32. All forms retain destination and
-source register access facts and are marked as potentially setting sticky
+Thumb-2, plus scalar `SSAT` and `USAT` in A32 and Thumb-2. All forms retain
+destination and source register access facts and are marked as potentially setting sticky
 APSR.Q. They do not write NZCV. PC operands are rejected. Thumb-2 SP operands
 are rejected; A32 accepts encodings with SP where permitted by the form.
 
@@ -13,18 +13,20 @@ result from Rm with a second signed saturation. The returned Q bit is sticky:
 incoming Q OR any saturation in either stage. Callers resolve predicates and
 commit results.
 
-For A32 SSAT/USAT, the helper takes Rn's bit pattern as its `rm` argument;
+For SSAT/USAT, the helper takes Rn's bit pattern as its `rm` argument;
 `rn` is ignored. It applies the decoded LSL/ASR before clamping. `SSAT #n`
 admits 1 through 32 signed result bits (encoded field n−1); `USAT #n` admits 0
-through 31 unsigned result bits. LSL #0 leaves the input unchanged, and ASR
-with encoded imm5 zero is ASR #32. Bounds are exact, including the USAT #0
-range [0,0]. Incoming Q remains set, and a clamp sets it. Callers resolve the
-A32 condition and commit the result and Q state.
+through 31 unsigned result bits. LSL #0 leaves the input unchanged. In A32,
+ASR with encoded imm5 zero is ASR #32. Thumb-2 uses split imm3:imm2 shift
+encoding and reserves ASR with zero shift for SSAT16/USAT16, which this scalar
+decoder rejects. Bounds are exact, including the USAT #0 range [0,0]. Incoming
+Q remains set, and a clamp sets it. Callers resolve the A32 condition or Thumb
+IT predicate and commit the result and Q state.
 
 The A32 decoder admits only the SSAT/USAT fixed patterns with LSL or ASR
-selectors, ordinary GPRs R0–R14, and valid saturation immediates. PC operands
-and reserved LSR/ROR selectors are rejected. Thumb-2 SSAT/USAT encodings are
-not decoded by this slice.
+selectors and GPRs R0–R14. The Thumb-2 T1 decoder admits the corresponding
+split immediate shift forms with GPRs R0–R12. Both reject PC operands; the
+Thumb-2 scalar decoder also rejects SP and the SSAT16/USAT16 selector pattern.
 
 The supported operation and saturation behavior follow Arm's
 [A32/T32 instruction reference](https://documentation-service.arm.com/static/6245c734b059dc5ff9a8bdab)
@@ -38,7 +40,7 @@ prior destination when false; unknown Thumb IT state remains opaque. The IR
 does not yet model Q as an independently versioned flag, so Q is represented
 as a sticky-Q effect marker rather than a concrete flag output.
 
-A32 SSAT/USAT lift with their decoded shift, exact signed/unsigned saturation
-width, and sticky-Q marker. Conditional forms select the prior destination if
+A32 and Thumb-2 SSAT/USAT lift with their decoded shift, exact signed/unsigned
+saturation width, and sticky-Q marker. Conditional forms select the prior destination if
 the condition fails. Q remains an effect marker rather than a separately
 versioned flag value in the IR.

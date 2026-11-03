@@ -1,12 +1,14 @@
 #include "graph_view.hpp"
 #include "data_views.hpp"
 #include <wx/button.h>
+#include <wx/choicdlg.h>
 #include <wx/clipbrd.h>
 #include <wx/dataobj.h>
 #include <wx/sizer.h>
 #include "hexlab/loaders/loaded_image.hpp"
 #include <algorithm>
 #include <array>
+#include <queue>
 namespace hexlab::desktop {
 namespace {
 constexpr std::array<std::size_t, 7> call_depth_values{1, 2, 3, 4, 8, 16, 32};
@@ -62,6 +64,11 @@ GraphView::GraphView(wxWindow *parent) : wxPanel(parent) {
     next_node->SetToolTip("Focus the next graph node and navigate linked views when it has an address.");
     bar->Add(previous_node, 0, wxALL, pad);
     bar->Add(next_node, 0, wxALL, pad);
+    trace_path_ = new wxButton(this, wxID_ANY, "Trace path");
+    trace_path_->SetName("graph-trace-path");
+    trace_path_->SetToolTip("Find a shortest resolved call route between exactly two selected functions.");
+    trace_path_->Enable(false);
+    bar->Add(trace_path_, 0, wxALL, pad);
     search_status_ = new wxStaticText(this, wxID_ANY, "");
     search_status_->SetName("graph-node-search-status");
     bar->Add(search_status_, 0, wxALIGN_CENTER_VERTICAL | wxLEFT | wxRIGHT, pad);
@@ -90,7 +97,7 @@ GraphView::GraphView(wxWindow *parent) : wxPanel(parent) {
     copy_graph_json_->Disable();
     bar->Add(copy_graph_json_, 0, wxALL, pad);
     canvas = new GraphCanvas(this);
-    canvas->SetToolTip("Find searches graph node names, comments, and addresses. Click an instruction to select it. Up/Down: previous/next instruction; "
+    canvas->SetToolTip("Find searches graph node names, comments, and addresses. Ctrl-click two functions to select a call-path source and destination. Click an instruction to select it. Up/Down: previous/next instruction; "
                        "Ctrl+Left/Right: select or follow predecessor/successor; Ctrl+Up/Down: cycle branch edges. "
                        "Ctrl-click toggles graph nodes; Shift-click selects a range (up to 256 nodes). "
                        "Enter or double click: follow target. Shift+Up/Down or Left/Right: pan. Home: fit. F6: graph items list.");
@@ -166,6 +173,7 @@ GraphView::GraphView(wxWindow *parent) : wxPanel(parent) {
     find_next->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { find_node(1, false); });
     previous_node->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { (void)canvas->move_node(false); });
     next_node->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { (void)canvas->move_node(true); });
+    trace_path_->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { trace_selected_path(); });
     search_->Bind(wxEVT_TEXT_ENTER, [this](wxCommandEvent &) { find_node(1, true); });
     fit->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { canvas->fit(); });
     reset_layout->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { canvas->reset_layout(); });
@@ -297,6 +305,114 @@ void GraphView::find_node(int direction, bool restart) {
     search_status_->SetLabel(wxString::Format("%zu/%zu", search_index_ + 1, search_matches_.size()));
     canvas->focus_node(search_matches_[search_index_]);
 }
+void GraphView::trace_selected_path() {
+    constexpr std::size_t node_limit = 4096, edge_limit = 20000, expansion_limit = 4096, hop_limit = 64;
+    const auto graph = canvas->graph();
+    if (!graph || !graph->model || graph->model->kind == GraphKind::function_cfg) {
+        status_->SetLabel("Trace path is available in the image and function call graphs.");
+        return;
+    }
+    const auto &model = *graph->model;
+    if (model.nodes.size() > node_limit || model.edges.size() > edge_limit) {
+        status_->SetLabel("This graph exceeds the 4,096-node or 20,000-edge path-search limit; narrow the graph first.");
+        return;
+    }
+    const auto &selected = canvas->selected_node_ids();
+    if (selected.size() != 2) {
+        status_->SetLabel("Select exactly two call-graph functions to trace a path.");
+        return;
+    }
+    GraphNodeId destination = *selected.rbegin();
+    if (const auto focus = canvas->focused_item()) {
+        if (const auto *node = std::get_if<GraphNodeId>(&*focus); node && selected.contains(*node))
+            destination = *node;
+    }
+    const GraphNodeId source = *std::find_if(selected.begin(), selected.end(),
+        [&](GraphNodeId node) { return node != destination; });
+
+    std::map<GraphNodeId, const GraphNode *> nodes;
+    for (const auto &node : model.nodes) nodes.emplace(node.id, &node);
+    if (!nodes.contains(source) || !nodes.contains(destination) ||
+        nodes.at(source)->kind != GraphNodeKind::function || nodes.at(destination)->kind != GraphNodeKind::function) {
+        status_->SetLabel("Select two recovered function nodes that are present in this graph.");
+        return;
+    }
+    std::map<GraphNodeId, std::vector<const GraphEdge *>> outgoing;
+    for (const auto &edge : model.edges) {
+        if (edge.boundary || (edge.kind != GraphEdgeKind::call && edge.kind != GraphEdgeKind::conditional_call &&
+                              edge.kind != GraphEdgeKind::tail_candidate))
+            continue;
+        if (nodes.contains(edge.source) && nodes.contains(edge.target) &&
+            nodes.at(edge.source)->kind == GraphNodeKind::function &&
+            nodes.at(edge.target)->kind == GraphNodeKind::function)
+            outgoing[edge.source].push_back(&edge);
+    }
+    std::queue<GraphNodeId> pending;
+    std::map<GraphNodeId, std::size_t> depth;
+    std::map<GraphNodeId, std::pair<GraphNodeId, const GraphEdge *>> previous;
+    pending.push(source);
+    depth.emplace(source, 0);
+    std::size_t expanded = 0;
+    bool depth_limited = false, expansion_limited = false;
+    while (!pending.empty()) {
+        if (expanded >= expansion_limit) { expansion_limited = true; break; }
+        const auto current = pending.front(); pending.pop(); ++expanded;
+        const auto current_depth = depth.at(current);
+        if (current == destination) break;
+        if (current_depth >= hop_limit) {
+            if (const auto found = outgoing.find(current); found != outgoing.end() && !found->second.empty())
+                depth_limited = true;
+            continue;
+        }
+        if (const auto found = outgoing.find(current); found != outgoing.end()) {
+            for (const auto *edge : found->second) {
+                if (depth.contains(edge->target)) continue;
+                depth.emplace(edge->target, current_depth + 1);
+                previous.emplace(edge->target, std::pair{current, edge});
+                pending.push(edge->target);
+            }
+        }
+    }
+    if (!depth.contains(destination)) {
+        const auto graph_note = model.complete ? wxString{} : wxString(" The displayed graph is partial.");
+        status_->SetLabel((depth_limited
+            ? "No route was found within the 64-hop limit."
+            : expansion_limited ? "Path search reached its 4,096-node expansion limit."
+                                : "No resolved call route connects the selected functions.") + graph_note);
+        return;
+    }
+    std::vector<GraphNodeId> route;
+    for (auto current = destination;; current = previous.at(current).first) {
+        route.push_back(current);
+        if (current == source) break;
+    }
+    std::reverse(route.begin(), route.end());
+    wxArrayString choices;
+    choices.Alloc(route.size());
+    for (std::size_t i = 0; i < route.size(); ++i) {
+        const auto *node = nodes.at(route[i]);
+        auto label = wxString::Format("%zu. ", i) + wxString::FromUTF8(node->label);
+        if (label.length() > 512) label = label.Left(509) + "...";
+        if (node->selection) label += " — " + location_text(*node->selection);
+        if (i > 0) {
+            const auto *edge = previous.at(route[i]).second;
+            label += edge->kind == GraphEdgeKind::tail_candidate ? " — tail transfer"
+                : edge->kind == GraphEdgeKind::conditional_call ? " — conditional call" : " — call";
+        }
+        choices.Add(label);
+    }
+    wxString prompt = "Shortest resolved route from " + wxString::FromUTF8(nodes.at(source)->label) +
+        " to " + wxString::FromUTF8(nodes.at(destination)->label) + wxString::Format(
+            ": %zu call hop(s). Choose a function to navigate to.", route.size() - 1);
+    if (!model.complete) prompt += " The graph is partial, so a shorter route may be absent.";
+    wxSingleChoiceDialog dialog(this, prompt, "Resolved call path", choices);
+    if (dialog.ShowModal() != wxID_OK) return;
+    const auto choice = dialog.GetSelection();
+    if (choice == wxNOT_FOUND || static_cast<std::size_t>(choice) >= route.size() ||
+        canvas->graph() != graph || !canvas->graph()->model || canvas->graph()->model->key != model.key)
+        return;
+    (void)canvas->focus_node(route[static_cast<std::size_t>(choice)]);
+}
 void GraphView::refresh_status() {
     auto label = status_base_;
     const auto focus = canvas->focus_description();
@@ -307,6 +423,20 @@ void GraphView::refresh_status() {
     if (canvas->selected_node_count() > 1)
         label += wxString::Format("; %zu graph nodes selected", canvas->selected_node_count());
     const auto location = canvas->source_location();
+    const auto graph = canvas->graph();
+    const bool call_graph = graph && graph->model && graph->model->kind != GraphKind::function_cfg;
+    bool selected_functions = call_graph && canvas->selected_node_count() == 2;
+    if (selected_functions) {
+        for (const auto id : canvas->selected_node_ids()) {
+            const auto found = std::find_if(graph->model->nodes.begin(), graph->model->nodes.end(),
+                [&](const GraphNode &node) { return node.id == id; });
+            if (found == graph->model->nodes.end() || found->kind != GraphNodeKind::function) {
+                selected_functions = false;
+                break;
+            }
+        }
+    }
+    trace_path_->Enable(selected_functions);
     show_listing_->Enable(location.has_value());
     show_pseudocode_->Enable(location && std::holds_alternative<Address>(*location));
     if (location) label += "; source " + location_text(*location);

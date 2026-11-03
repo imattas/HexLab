@@ -5536,10 +5536,11 @@ a64_unhandled:
         if (shifted && valid_gpr(&shifted->source)) expected_reads.push_back(shifted->source);
         const bool signed_saturation = instruction.opcode == Opcode::arm_ssat;
         const unsigned result_bits = width ? static_cast<unsigned>(width->value) + (signed_saturation ? 1u : 0u) : 0u;
+        const auto shift_limit = instruction.context.mode == ExecutionMode::a32 ? 32u : 31u;
         if (!instruction.arm || !instruction.arm->q_flag_may_set || instruction.arm->flags_written ||
             !instruction.arm->flags_known || !valid_gpr(destination) || !width || width->value > 31 ||
             width->encoded_width != 5 || width->is_signed || !shifted || !valid_gpr(&shifted->source) ||
-            shifted->amount_register || shifted->amount > 32 ||
+            shifted->amount_register || shifted->amount > shift_limit ||
             (shifted->shift != ArmShift::lsl && shifted->shift != ArmShift::asr) ||
             (shifted->shift == ArmShift::lsl && shifted->amount > 31) ||
             operands.size() != 3 || instruction.access != std::vector<OperandAccess>{

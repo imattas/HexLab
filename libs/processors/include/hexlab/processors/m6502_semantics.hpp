@@ -330,8 +330,11 @@ struct M6502MemoryBusTrace {
     bool operator==(const M6502MemoryBusTrace &) const = default;
 };
 // Trace validated documented NMOS/65C02 byte loads, stores, ALU/compare, and
-// memory INC/DEC. The caller supplies the value read from the final effective
-// address (and pointer bytes where needed); no memory or pin model is implied.
+// memory INC/DEC. NMOS ASL/LSR/ROL/ROR memory forms also report their original
+// value read, NMOS dummy write, and shifted final write. The caller supplies
+// the value read from the final effective address (and pointer bytes where
+// needed); no memory or pin model is implied. W65C02 shift traces remain
+// unsupported until their distinct bus behavior is modeled.
 HEXLAB_PROCESSORS_EXPORT std::optional<M6502MemoryBusTrace>
 trace_m6502_memory_bus(const Instruction &instruction,
                        const M6502MemoryBusInputs &inputs) noexcept;

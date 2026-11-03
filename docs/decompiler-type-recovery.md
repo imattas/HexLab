@@ -704,6 +704,14 @@ The call result type is retained as prototype metadata; the pass does not infer
 stores through the buffer as a materialized aggregate value. Incomplete or
 ambiguous layouts, missing register snapshots, and other ABIs remain unresolved.
 
+For AAPCS64 integer-class chunks, type recovery also preserves a nested
+structure or fixed-array type when the chunk exactly spans that complete
+subobject within a structure parameter/result. Traversal is bounded to depth 8
+and 256 aggregate nodes. Union alternatives remain opaque unless the chunk
+covers the declared union as a whole; recovery does not guess which field is
+active. Chunks that combine unrelated fields or padding retain their
+width-matched integer type.
+
 PowerPC64 scalar recovery selects the ELFv2 profile only for an ELF64
 `EM_PPC64` little-endian image whose `e_flags & EF_PPC64_ABI` value is 2. Raw
 PPC64, big-endian ELF, ELFv1, and files with another ABI flag do not receive a

@@ -1280,6 +1280,88 @@ std::optional<types::TypePtr> abi_component_type(const types::TypePtr &input,
 
 std::optional<types::TypePtr> aapcs64_component_type(const types::TypePtr &input,
     std::uint8_t component_offset, std::uint8_t component_size, AbiValueClass value_class) {
+    // Preserve a declared nested aggregate when one ABI integer chunk covers
+    // that complete subobject. Flattening first loses this identity whenever
+    // the chunk contains several scalar leaves (for example, a nested pair of
+    // 32-bit fields). Only structures and arrays are traversed: selecting a
+    // member from a union would require knowing the active alternative.
+    if (value_class == AbiValueClass::integer) {
+        const auto root = unqualified_type(input);
+        if (root && root->size() && *root->size() == component_size && component_offset == 0 &&
+            (root->kind() == types::Kind::structure || root->kind() == types::Kind::union_type ||
+             root->kind() == types::Kind::array))
+            return root;
+
+        struct AggregateRange { std::uint64_t begin; std::uint64_t end; types::TypePtr type; unsigned depth; };
+        std::vector<AggregateRange> candidates;
+        std::size_t work = 0;
+        bool valid = true;
+        const auto requested_begin = static_cast<std::uint64_t>(component_offset);
+        const auto requested_end = requested_begin + component_size;
+        const auto visit = [&](const types::TypePtr &candidate, std::uint64_t base, unsigned depth,
+                               auto &&self) -> void {
+            if (!valid || !candidate || depth > 8 || work++ >= 256) { valid = false; return; }
+            const auto type = unqualified_type(candidate);
+            if (!type || !type->size() || !*type->size() || base > UINT64_MAX - *type->size()) {
+                valid = false;
+                return;
+            }
+            const auto end = base + *type->size();
+            if (base == requested_begin && end == requested_end &&
+                (type->kind() == types::Kind::structure || type->kind() == types::Kind::union_type ||
+                 type->kind() == types::Kind::array))
+                candidates.push_back({base, end, type, depth});
+
+            if (type->kind() == types::Kind::structure) {
+                const auto layout = types::layout(*type, types::Abi::aarch64);
+                if (!layout || layout.value().members.size() != type->members().size()) {
+                    valid = false;
+                    return;
+                }
+                for (std::size_t index = 0; index < type->members().size(); ++index) {
+                    const auto &member = type->members()[index];
+                    if (!member.has_fixed_offset() || member.bit_width || member.bit_offset || !member.type ||
+                        layout.value().members[index].offset > UINT64_MAX - base) {
+                        valid = false;
+                        return;
+                    }
+                    self(member.type, base + layout.value().members[index].offset, depth + 1, self);
+                }
+            } else if (type->kind() == types::Kind::array) {
+                const auto element = unqualified_type(type->element());
+                if (!element || !element->size() || !*element->size() || !type->count() ||
+                    type->count() > *type->size() / *element->size() ||
+                    type->count() * *element->size() != *type->size()) {
+                    valid = false;
+                    return;
+                }
+                for (std::uint64_t index = 0; index < type->count(); ++index) {
+                    if (index > (UINT64_MAX - base) / *element->size()) { valid = false; return; }
+                    self(type->element(), base + index * *element->size(), depth + 1, self);
+                }
+            }
+            // A union is an opaque leaf here. Its full range can match the
+            // requested ABI chunk, but its alternatives cannot identify a
+            // narrower active field.
+        };
+        if (root && root->kind() == types::Kind::structure && root->size() &&
+            component_size != 0 && requested_end <= *root->size())
+            visit(root, 0, 0, visit);
+        if (valid && !candidates.empty()) {
+            const auto deepest = std::max_element(candidates.begin(), candidates.end(),
+                [](const auto &left, const auto &right) { return left.depth < right.depth; })->depth;
+            types::TypePtr selected;
+            for (const auto &candidate : candidates) {
+                if (candidate.depth != deepest) continue;
+                if (selected && selected->id() != candidate.type->id()) {
+                    selected.reset();
+                    break;
+                }
+                selected = candidate.type;
+            }
+            if (selected) return selected;
+        }
+    }
     auto projected = abi_component_type(input, component_offset, component_size, value_class,
                                         types::Abi::aarch64);
     if (projected || value_class != AbiValueClass::integer) return projected;

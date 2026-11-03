@@ -46,6 +46,28 @@ std::optional<std::uint32_t> expand_modified_immediate(std::uint16_t first, std:
 }
 } // namespace
 bool data_wide(Instruction &i, std::uint16_t first, std::uint16_t second) {
+    // Thumb-2 scalar SSAT/USAT T1. The immediate shift is split across
+    // imm3:imm2; sh selects LSL/ASR. sh=1, shift=0 is the SSAT16/USAT16
+    // encoding and must not be treated as scalar ASR #32 in Thumb.
+    const auto saturation_key = first & 0xffc0u;
+    if (saturation_key == 0xf300u || saturation_key == 0xf380u) {
+        const auto rn = first & 15u;
+        const auto rd = (second >> 8) & 15u;
+        const auto shift_kind = (first >> 5) & 1u;
+        const auto shift_amount = (((second >> 12) & 7u) << 2) | ((second >> 6) & 3u);
+        if ((second & 0x8020u) || rn >= 13 || rd >= 13 || (shift_kind && !shift_amount))
+            return false;
+        const auto source = reg(rn);
+        i.opcode = saturation_key == 0xf300u ? Opcode::arm_ssat : Opcode::arm_usat;
+        i.operands = {reg(rd), ImmediateOperand{second & 31u, 5, 32, false, {}},
+                      ArmShiftedRegisterOperand{source, shift_kind ? ArmShift::asr : ArmShift::lsl,
+                                                static_cast<std::uint8_t>(shift_amount), {}}};
+        i.access = {OperandAccess::write, OperandAccess::read, OperandAccess::read};
+        read(i, source);
+        i.register_writes.push_back(reg(rd));
+        i.arm->q_flag_may_set = true;
+        return true;
+    }
     // Thumb-2 long multiply family, T1. Its fields match the A32 long
     // multiply operands but have a different register-pair ordering. In the
     // second halfword bit 15 is fixed zero and RdLo occupies bits 14:12;

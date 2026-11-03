@@ -21,7 +21,11 @@ trace_m6502_memory_bus(const Instruction &instruction,
     const bool cmos = instruction.context.mode == ExecutionMode::m65c02;
     const bool store = instruction.opcode == Opcode::m6502_sta || instruction.opcode == Opcode::m6502_stx ||
                        instruction.opcode == Opcode::m6502_sty || (cmos && instruction.opcode == Opcode::m65c02_stz);
-    const bool rmw = instruction.opcode == Opcode::m6502_inc || instruction.opcode == Opcode::m6502_dec;
+    const bool shift = instruction.opcode == Opcode::m6502_asl || instruction.opcode == Opcode::m6502_lsr ||
+        instruction.opcode == Opcode::m6502_rol || instruction.opcode == Opcode::m6502_ror;
+    // W65C02 shifts wait for a separate CMOS bus-cycle contract.
+    if (shift && cmos) return {};
+    const bool rmw = instruction.opcode == Opcode::m6502_inc || instruction.opcode == Opcode::m6502_dec || shift;
     const bool read = instruction.opcode == Opcode::m6502_lda || instruction.opcode == Opcode::m6502_ldx ||
         instruction.opcode == Opcode::m6502_ldy || instruction.opcode == Opcode::m6502_adc ||
         instruction.opcode == Opcode::m6502_sbc || instruction.opcode == Opcode::m6502_and ||
@@ -55,6 +59,10 @@ trace_m6502_memory_bus(const Instruction &instruction,
         case Opcode::m6502_bit: return (cmos&&opcode_byte==0x89)||opcode_byte==0x24||opcode_byte==0x2c||(cmos&&(opcode_byte==0x34||opcode_byte==0x3c));
         case Opcode::m6502_inc: return opcode_byte==0xe6||opcode_byte==0xf6||opcode_byte==0xee||opcode_byte==0xfe;
         case Opcode::m6502_dec: return opcode_byte==0xc6||opcode_byte==0xd6||opcode_byte==0xce||opcode_byte==0xde;
+        case Opcode::m6502_asl: return opcode_byte==0x06||opcode_byte==0x16||opcode_byte==0x0e||opcode_byte==0x1e;
+        case Opcode::m6502_lsr: return opcode_byte==0x46||opcode_byte==0x56||opcode_byte==0x4e||opcode_byte==0x5e;
+        case Opcode::m6502_rol: return opcode_byte==0x26||opcode_byte==0x36||opcode_byte==0x2e||opcode_byte==0x3e;
+        case Opcode::m6502_ror: return opcode_byte==0x66||opcode_byte==0x76||opcode_byte==0x6e||opcode_byte==0x7e;
         default: return false;
         }
     };
@@ -95,6 +103,9 @@ trace_m6502_memory_bus(const Instruction &instruction,
 
     const bool pointer_mode = mode == Mode::indx || mode == Mode::indy || mode == Mode::zpind;
     if (store && instruction.memory_read != pointer_mode) return {};
+    if (shift && ((mode != Mode::zp && mode != Mode::zpx && mode != Mode::abs && mode != Mode::absx) ||
+                  !evaluate_m6502_shift_instruction(instruction, inputs.memory_value, inputs.status)))
+        return {};
 
     M6502MemoryBusTrace trace;
     const auto pc = static_cast<std::uint16_t>(instruction.address.offset);
@@ -153,7 +164,11 @@ trace_m6502_memory_bus(const Instruction &instruction,
     else if (instruction.opcode == Opcode::m6502_stx) write_value = inputs.x;
     else if (instruction.opcode == Opcode::m6502_sty) write_value = inputs.y;
     else if (cmos && instruction.opcode == Opcode::m65c02_stz) write_value = 0;
-    else if (rmw) write_value = instruction.opcode == Opcode::m6502_inc ?
+    else if (shift) {
+        const auto shifted = evaluate_m6502_shift_instruction(instruction, inputs.memory_value, inputs.status);
+        if (!shifted) return {};
+        write_value = shifted->value;
+    } else if (rmw) write_value = instruction.opcode == Opcode::m6502_inc ?
         static_cast<std::uint8_t>(inputs.memory_value + 1u) : static_cast<std::uint8_t>(inputs.memory_value - 1u);
     if (rmw) {
         append(effective, M6502BusAccessKind::data_read, inputs.memory_value);

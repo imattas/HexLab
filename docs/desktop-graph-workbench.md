@@ -83,3 +83,12 @@ followed. Stale facts, ambiguous targets, and missing targets do not fall back
 to another instruction. When the current instruction has no resolved target,
 its source remains selected in the linked views and the Output pane explains
 why no target was followed. These operations do not alter graph facts.
+
+In either call-graph mode, Ctrl-click two recovered function nodes and choose
+**Trace path** to find the shortest directed route of resolved call,
+conditional-call, or tail-transfer edges from the other selected node to the focused node. The chooser
+lists each function and its location; selecting a step focuses that graph node
+and navigates the linked views. The action is bounded to graphs with at most
+4,096 nodes and 20,000 edges, 4,096 node expansions, and 64 call hops. A partial
+graph is identified in the chooser, so absence of a route is not presented as
+proof that no route exists in the full analysis.
