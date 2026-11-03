@@ -1,8 +1,8 @@
 ﻿add_library(hexlab_desktop_components STATIC main_frame.cpp document_controller.cpp session_controller.cpp session_search.cpp session_listing.cpp session_graph.cpp graph_canvas.cpp graph_view.cpp reference_view.cpp document_tabs.cpp project_actions.cpp reference_dialog.cpp close_coordinator.cpp project_view.cpp edit_dialogs.cpp search_view.cpp data_views.cpp open_dialogs.cpp type_symbols_view.cpp type_editor.cpp debugger_view.cpp debugger_locals.cpp plugins_view.cpp)
 if(MSVC)
-  # main_frame.cpp aggregates most desktop actions and can exceed COFF's
-  # default section-count limit as the UI grows.
-  set_source_files_properties(main_frame.cpp PROPERTIES COMPILE_OPTIONS /bigobj)
+  # Desktop action aggregation and async listing payload instantiations can
+  # exceed COFF's default section-count limit in MSVC Debug builds.
+  set_source_files_properties(main_frame.cpp session_listing.cpp PROPERTIES COMPILE_OPTIONS /bigobj)
 endif()
 target_include_directories(hexlab_desktop_components PRIVATE "${PROJECT_SOURCE_DIR}/libs/workspace/src")
 target_sources(hexlab_desktop_components PRIVATE string_view.cpp analysis_issues_view.cpp project_name_search.cpp)
