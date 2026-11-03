@@ -23,7 +23,10 @@ trace_m6502_memory_bus(const Instruction &instruction,
                        instruction.opcode == Opcode::m6502_sty || (cmos && instruction.opcode == Opcode::m65c02_stz);
     const bool shift = instruction.opcode == Opcode::m6502_asl || instruction.opcode == Opcode::m6502_lsr ||
         instruction.opcode == Opcode::m6502_rol || instruction.opcode == Opcode::m6502_ror;
-    const bool rmw = instruction.opcode == Opcode::m6502_inc || instruction.opcode == Opcode::m6502_dec || shift;
+    const bool bit_modify = cmos && (instruction.opcode == Opcode::m65c02_tsb ||
+                                    instruction.opcode == Opcode::m65c02_trb);
+    const bool rmw = instruction.opcode == Opcode::m6502_inc || instruction.opcode == Opcode::m6502_dec ||
+                     shift || bit_modify;
     const bool read = instruction.opcode == Opcode::m6502_lda || instruction.opcode == Opcode::m6502_ldx ||
         instruction.opcode == Opcode::m6502_ldy || instruction.opcode == Opcode::m6502_adc ||
         instruction.opcode == Opcode::m6502_sbc || instruction.opcode == Opcode::m6502_and ||
@@ -61,6 +64,8 @@ trace_m6502_memory_bus(const Instruction &instruction,
         case Opcode::m6502_lsr: return opcode_byte==0x46||opcode_byte==0x56||opcode_byte==0x4e||opcode_byte==0x5e;
         case Opcode::m6502_rol: return opcode_byte==0x26||opcode_byte==0x36||opcode_byte==0x2e||opcode_byte==0x3e;
         case Opcode::m6502_ror: return opcode_byte==0x66||opcode_byte==0x76||opcode_byte==0x6e||opcode_byte==0x7e;
+        case Opcode::m65c02_tsb: return cmos&&(opcode_byte==0x04||opcode_byte==0x0c);
+        case Opcode::m65c02_trb: return cmos&&(opcode_byte==0x14||opcode_byte==0x1c);
         default: return false;
         }
     };
@@ -104,6 +109,11 @@ trace_m6502_memory_bus(const Instruction &instruction,
     if (shift && ((mode != Mode::zp && mode != Mode::zpx && mode != Mode::abs && mode != Mode::absx) ||
                   !evaluate_m6502_shift_instruction(instruction, inputs.memory_value, inputs.status)))
         return {};
+    const auto bit_modify_result = bit_modify
+        ? evaluate_m65c02_tsb_trb_instruction(instruction, inputs.accumulator,
+                                              inputs.memory_value, inputs.status)
+        : std::optional<M65C02TsbTrbResult>{};
+    if (bit_modify && ((mode != Mode::zp && mode != Mode::abs) || !bit_modify_result)) return {};
 
     M6502MemoryBusTrace trace;
     const auto pc = static_cast<std::uint16_t>(instruction.address.offset);
@@ -166,6 +176,8 @@ trace_m6502_memory_bus(const Instruction &instruction,
         const auto shifted = evaluate_m6502_shift_instruction(instruction, inputs.memory_value, inputs.status);
         if (!shifted) return {};
         write_value = shifted->value;
+    } else if (bit_modify) {
+        write_value = bit_modify_result->memory_value;
     } else if (rmw) write_value = instruction.opcode == Opcode::m6502_inc ?
         static_cast<std::uint8_t>(inputs.memory_value + 1u) : static_cast<std::uint8_t>(inputs.memory_value - 1u);
     if (rmw) {
@@ -497,6 +509,72 @@ evaluate_m65c02_compare_instruction(const Instruction &instruction,
         return {};
     }
     return evaluate_m65c02_compare(instruction.opcode, left, operand, status, immediate_bit);
+}
+
+std::optional<M65C02TsbTrbResult>
+evaluate_m65c02_tsb_trb(Opcode opcode, std::uint8_t accumulator,
+                        std::uint8_t memory_value, std::uint8_t status) noexcept {
+    if (opcode != Opcode::m65c02_tsb && opcode != Opcode::m65c02_trb) return {};
+    const auto zero = (accumulator & memory_value) == 0;
+    const auto result = opcode == Opcode::m65c02_tsb
+        ? static_cast<std::uint8_t>(memory_value | accumulator)
+        : static_cast<std::uint8_t>(memory_value & static_cast<std::uint8_t>(~accumulator));
+    const auto updated_status = static_cast<std::uint8_t>((status & 0xfdu) | (zero ? 0x02u : 0u));
+    return M65C02TsbTrbResult{result, updated_status};
+}
+
+std::optional<M65C02TsbTrbResult>
+evaluate_m65c02_tsb_trb_instruction(const Instruction &instruction,
+                                    std::uint8_t accumulator,
+                                    std::uint8_t memory_value,
+                                    std::uint8_t status) noexcept {
+    if (instruction.context.architecture != Architecture::mos6502 ||
+        instruction.context.mode != ExecutionMode::m65c02 ||
+        instruction.flow != FlowKind::fallthrough || instruction.direct_target ||
+        instruction.address.offset > UINT16_MAX || instruction.length < 2 || instruction.length > 3 ||
+        (instruction.opcode != Opcode::m65c02_tsb && instruction.opcode != Opcode::m65c02_trb) ||
+        instruction.operands.size() != 1 || instruction.access.size() != 1 ||
+        instruction.access[0] != OperandAccess::read_write || !instruction.memory_read ||
+        !instruction.memory_write || !instruction.m6502_timing)
+        return {};
+    const auto *memory = std::get_if<MemoryOperand>(&instruction.operands[0]);
+    if (!memory || memory->data_width != 8 || memory->address_width != 16 || memory->index ||
+        memory->base || memory->segment || memory->scale != 1 || memory->ip_relative ||
+        memory->writeback || memory->post_index || memory->writeback_displacement != 0 ||
+        !memory->index_extend.empty() || memory->index_shift_amount != 0)
+        return {};
+
+    const auto encoded = std::to_integer<std::uint8_t>(instruction.bytes[0]);
+    const bool zero_page = (encoded == 0x04 || encoded == 0x14);
+    const bool absolute = (encoded == 0x0c || encoded == 0x1c);
+    if ((!zero_page && !absolute) ||
+        (instruction.opcode == Opcode::m65c02_tsb && encoded != 0x04 && encoded != 0x0c) ||
+        (instruction.opcode == Opcode::m65c02_trb && encoded != 0x14 && encoded != 0x1c))
+        return {};
+    const auto expected_length = static_cast<std::uint8_t>(zero_page ? 2 : 3);
+    const auto expected_cycles = static_cast<std::uint8_t>(zero_page ? 5 : 6);
+    if (instruction.length != expected_length || instruction.bytes.size() < expected_length ||
+        instruction.m6502_timing->base_cycles != expected_cycles ||
+        instruction.m6502_timing->page_cross_penalty)
+        return {};
+    const auto address = zero_page
+        ? std::uint16_t(std::to_integer<std::uint8_t>(instruction.bytes[1]))
+        : std::uint16_t(std::to_integer<std::uint8_t>(instruction.bytes[1]) |
+            (std::uint16_t(std::to_integer<std::uint8_t>(instruction.bytes[2])) << 8));
+    if (memory->displacement != address ||
+        memory->displacement_encoding != EncodedField{1, static_cast<std::uint8_t>(expected_length - 1)} ||
+        memory->resolved_address != Address{instruction.address.space, address})
+        return {};
+
+    const RegisterOperand a{RegisterBank::mos6502, 0, 8, false};
+    const RegisterOperand p{RegisterBank::mos6502, 3, 8, false};
+    if (instruction.register_reads.size() != 2 || instruction.register_writes.size() != 1 ||
+        std::find(instruction.register_reads.begin(), instruction.register_reads.end(), a) ==
+            instruction.register_reads.end() ||
+        std::find(instruction.register_reads.begin(), instruction.register_reads.end(), p) ==
+            instruction.register_reads.end() || instruction.register_writes[0] != p)
+        return {};
+    return evaluate_m65c02_tsb_trb(instruction.opcode, accumulator, memory_value, status);
 }
 
 std::optional<M6502AlrResult>

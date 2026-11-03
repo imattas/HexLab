@@ -92,6 +92,22 @@ evaluate_m65c02_compare_instruction(const Instruction &instruction,
                                     std::uint8_t left, std::uint8_t operand,
                                     std::uint8_t status) noexcept;
 
+struct M65C02TsbTrbResult {
+    std::uint8_t memory_value = 0;
+    std::uint8_t status = 0;
+    bool operator==(const M65C02TsbTrbResult &) const = default;
+};
+// Evaluate W65C02 TSB/TRB. Z reflects A & the original memory byte; memory
+// receives memory | A for TSB or memory & ~A for TRB. Other P bits are kept.
+HEXLAB_PROCESSORS_EXPORT std::optional<M65C02TsbTrbResult>
+evaluate_m65c02_tsb_trb(Opcode opcode, std::uint8_t accumulator,
+                        std::uint8_t memory_value, std::uint8_t status) noexcept;
+HEXLAB_PROCESSORS_EXPORT std::optional<M65C02TsbTrbResult>
+evaluate_m65c02_tsb_trb_instruction(const Instruction &instruction,
+                                    std::uint8_t accumulator,
+                                    std::uint8_t memory_value,
+                                    std::uint8_t status) noexcept;
+
 struct M6502AlrResult {
     std::uint8_t accumulator = 0;
     std::uint8_t status = 0;
@@ -331,11 +347,11 @@ struct M6502MemoryBusTrace {
     bool operator==(const M6502MemoryBusTrace &) const = default;
 };
 // Trace validated documented NMOS/65C02 byte loads, stores, ALU/compare, and
-// memory INC/DEC/ASL/LSR/ROL/ROR. NMOS read/modify/write forms report the
-// original-value dummy write; W65C02 forms report the second effective-address
-// read before the final write. The caller supplies the value read from the
-// final effective address (and pointer bytes where needed); no memory or pin
-// model is implied.
+// memory INC/DEC/ASL/LSR/ROL/ROR plus W65C02 TSB/TRB. NMOS read/modify/write
+// forms report the original-value dummy write; W65C02 forms report the second
+// effective-address read before the final write. The caller supplies A/P and
+// the value read from the final effective address (and pointer bytes where
+// needed); no memory or pin model is implied.
 HEXLAB_PROCESSORS_EXPORT std::optional<M6502MemoryBusTrace>
 trace_m6502_memory_bus(const Instruction &instruction,
                        const M6502MemoryBusInputs &inputs) noexcept;
