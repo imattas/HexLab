@@ -11,6 +11,7 @@
 #include "graph_view.hpp"
 #include "reference_view.hpp"
 #include "call_site_browser.hpp"
+#include "function_browser.hpp"
 #include "close_coordinator.hpp"
 #include "project_view.hpp"
 #include "data_views.hpp"
@@ -4497,6 +4498,48 @@ struct MainFrame::Impl {
         }
         frame.docking_.Update();
     }
+    void function_workbench() {
+        const auto document = shown;
+        if (!document || !document->project || !document->image || closer->closing_window()) return;
+        std::optional<Address> selection;
+        if (const auto location = state().selection()) {
+            if (const auto *address = std::get_if<Address>(&*location)) selection = *address;
+            else if (const auto mapped = document->image->to_address(std::get<FileOffset>(*location)); mapped)
+                selection = mapped.value();
+        }
+        const auto destination = browse_functions(&frame, document->project, selection);
+        if (!destination) return;
+        const auto current = state().current();
+        if (closer->closing_window() || !current || current->id != document->id ||
+            current->revision != document->revision || current->image != document->image ||
+            controller->documents().active_document() != document->id ||
+            controller->documents().project(document->id) != document->project) {
+            log("Function navigation canceled because its source document or analysis changed. Reopen Function Workbench.");
+            return;
+        }
+        if (destination->destination == FunctionDestination::calls) {
+            inspect_calls(destination->entry, destination->entry);
+            return;
+        }
+        if (!navigate_from_document(document, Location{destination->address})) return;
+        switch (destination->destination) {
+        case FunctionDestination::listing:
+            pages->SetSelection(pages->FindPage(listing)); listing->SetFocus(); break;
+        case FunctionDestination::graph: {
+            auto queued = controller->request_graph(document->id, Location{destination->entry}, GraphKind::function_cfg);
+            if (!queued) log(text(queued.error().message));
+            sync(); pages->SetSelection(pages->FindPage(graph)); graph->SetFocus(); break;
+        }
+        case FunctionDestination::pseudocode:
+            frame.docking_.GetPane("pseudocode").Show();
+            document_page_views.insert_or_assign(document->id.value, 3);
+            pseudocode->SetFocus(); break;
+        case FunctionDestination::references:
+            browse_references(document->id, Location{destination->entry}, true); break;
+        case FunctionDestination::calls: break;
+        }
+        frame.docking_.Update();
+    }
     void browse_selected_metadata_references(bool imports_table) {
         const auto document = shown;
         if (!document || controller->documents().active_document() != document->id ||
@@ -4823,6 +4866,7 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
     nav->Append(follow_id, "&Follow Target\tEnter");
     nav->Append(incoming_references_id, "Incoming References\tCtrl+Shift+X");
     nav->Append(outgoing_references_id, "Outgoing References\tCtrl+Alt+X");
+    nav->Append(function_workbench_id, "Function Workbench...\tCtrl+Alt+F");
     nav->Append(browse_call_sites_id, "Inspect Calls in Function...\tCtrl+Alt+C");
     nav->Append(back_id, "&Back\tAlt+Left");
     nav->Append(forward_id, "&Forward\tAlt+Right");
@@ -5170,6 +5214,9 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
     symbol_layout->Add(ui.symbol_filter_status, 0, wxLEFT | wxRIGHT | wxBOTTOM, FromDIP(4));
     symbol_layout->Add(ui.symbols, 1, wxEXPAND);
     symbol_panel->SetSizer(symbol_layout);
+    auto *function_workbench_button = new wxButton(function_panel, function_workbench_id, "Function Workbench...");
+    function_workbench_button->SetToolTip("Triage partial functions and unresolved calls; inspect chunks and navigate to analysis views.");
+    function_layout->Add(function_workbench_button, 0, wxEXPAND | wxALL, FromDIP(4));
     function_layout->Add(ui.function_filter, 0, wxEXPAND | wxALL, FromDIP(4));
     function_layout->Add(ui.candidates, 1, wxEXPAND);
     function_panel->SetSizer(function_layout);
@@ -6228,6 +6275,7 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
         menu.Append(function_id, "Define function here");
         menu.Append(chunks_id, "Function chunks...");
         menu.Append(browse_call_sites_id, "Inspect calls in function...");
+        menu.Append(function_workbench_id, "Function Workbench...");
         menu.Append(suppress_id, "Toggle function suppression");
         if (position.x == -1 && position.y == -1)
             table->PopupMenu(&menu);
@@ -6481,6 +6529,15 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
         Bind(wxEVT_UPDATE_UI, [this](wxUpdateUIEvent &event) { impl_->update_navigation(event); }, id);
     Bind(wxEVT_MENU, [this](wxCommandEvent &) { impl_->jump(); }, jump_id);
     Bind(wxEVT_MENU, [this](wxCommandEvent &) { impl_->inspect_calls(); }, browse_call_sites_id);
+    Bind(wxEVT_MENU, [this](wxCommandEvent &) { impl_->function_workbench(); }, function_workbench_id);
+    function_workbench_button->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { impl_->function_workbench(); });
+    Bind(wxEVT_UPDATE_UI, [this](wxUpdateUIEvent &event) {
+        const auto document = impl_->shown;
+        const auto project = document ? document->project : nullptr;
+        event.Enable(!impl_->closer->closing_window() && project && project->functions && project->derived_key &&
+            project->functions->key == project->derived_key &&
+            (project->status == DerivedStatus::fresh || project->status == DerivedStatus::incomplete));
+    }, function_workbench_id);
     Bind(wxEVT_UPDATE_UI, [this](wxUpdateUIEvent &event) {
         const auto document = impl_->shown;
         const auto project = document ? document->project : nullptr;

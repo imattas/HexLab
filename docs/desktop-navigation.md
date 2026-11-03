@@ -386,3 +386,9 @@ multiple inputs. Search cannot include documents that are not open until
 HexLab has an authoritative project document catalog and a persisted index
 keyed by those document identities. The desktop must not infer project
 membership by scanning arbitrary filesystem paths.
+
+Function triage is available through **Navigate > Function Workbench**
+(`Ctrl+Alt+F`) and the Functions dock button. Filter recovered functions by
+completion, thunk state, or unresolved calls, inspect chunk/stop evidence, and
+continue directly in listing, CFG, pseudocode, references, or call inspection.
+See [Function Workbench](desktop-function-workbench.md) for semantics and bounds.

@@ -51,6 +51,7 @@ enum Command {
     browse_image_entries_id,
     export_navigation_history_id,
     browse_call_sites_id,
+    function_workbench_id,
     main_frame_command_end
 };
 class MainFrame final : public wxFrame {
