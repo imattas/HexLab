@@ -244,15 +244,32 @@ evaluate_m6502_hardware_interrupt(M6502HardwareInterrupt interrupt,
                                   std::uint8_t status,
                                   std::uint8_t vector_low,
                                   std::uint8_t vector_high) noexcept;
+// W65C02 IRQ/NMI entry has the same pushed frame but clears D after saving P.
+HEXLAB_PROCESSORS_EXPORT std::optional<M6502InterruptEntryResult>
+evaluate_m65c02_hardware_interrupt(M6502HardwareInterrupt interrupt,
+                                   std::uint16_t program_counter,
+                                   std::uint8_t stack_pointer,
+                                   std::uint8_t status,
+                                   std::uint8_t vector_low,
+                                   std::uint8_t vector_high) noexcept;
 HEXLAB_PROCESSORS_EXPORT std::optional<M6502InterruptEntryResult>
 evaluate_m6502_brk(std::uint16_t program_counter, std::uint8_t stack_pointer,
                    std::uint8_t status, std::uint8_t vector_low,
                    std::uint8_t vector_high) noexcept;
 HEXLAB_PROCESSORS_EXPORT std::optional<M6502InterruptEntryResult>
+evaluate_m65c02_brk(std::uint16_t program_counter, std::uint8_t stack_pointer,
+                    std::uint8_t status, std::uint8_t vector_low,
+                    std::uint8_t vector_high) noexcept;
+HEXLAB_PROCESSORS_EXPORT std::optional<M6502InterruptEntryResult>
 evaluate_m6502_brk_instruction(const Instruction &instruction,
                                std::uint16_t program_counter, std::uint8_t stack_pointer,
                                std::uint8_t status, std::uint8_t vector_low,
                                std::uint8_t vector_high) noexcept;
+HEXLAB_PROCESSORS_EXPORT std::optional<M6502InterruptEntryResult>
+evaluate_m65c02_brk_instruction(const Instruction &instruction,
+                                std::uint16_t program_counter, std::uint8_t stack_pointer,
+                                std::uint8_t status, std::uint8_t vector_low,
+                                std::uint8_t vector_high) noexcept;
 
 // Coarse W65C02 execution-control state for event evaluators. This is not a
 // cycle-accurate CPU state machine; the caller owns pin sampling and memory.
@@ -396,9 +413,18 @@ trace_m6502_hardware_interrupt_bus(M6502HardwareInterrupt interrupt,
                                    std::uint8_t stack_pointer, std::uint8_t status,
                                    std::uint8_t vector_low, std::uint8_t vector_high) noexcept;
 HEXLAB_PROCESSORS_EXPORT std::optional<M6502InterruptBusTrace>
+trace_m65c02_hardware_interrupt_bus(M6502HardwareInterrupt interrupt,
+                                    std::uint16_t program_counter,
+                                    std::uint8_t stack_pointer, std::uint8_t status,
+                                    std::uint8_t vector_low, std::uint8_t vector_high) noexcept;
+HEXLAB_PROCESSORS_EXPORT std::optional<M6502InterruptBusTrace>
 trace_m6502_brk_bus(const Instruction &instruction, std::uint16_t program_counter,
                     std::uint8_t stack_pointer, std::uint8_t status,
                     std::uint8_t vector_low, std::uint8_t vector_high) noexcept;
+HEXLAB_PROCESSORS_EXPORT std::optional<M6502InterruptBusTrace>
+trace_m65c02_brk_bus(const Instruction &instruction, std::uint16_t program_counter,
+                     std::uint8_t stack_pointer, std::uint8_t status,
+                     std::uint8_t vector_low, std::uint8_t vector_high) noexcept;
 struct M6502BranchBusTrace {
     std::array<M6502BusAccess, 4> accesses{};
     std::uint8_t access_count = 0;
