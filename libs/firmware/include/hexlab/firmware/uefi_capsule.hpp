@@ -26,6 +26,10 @@ struct UefiCapsuleEmbeddedVolume {
 };
 struct UefiCapsuleItem {
     UefiCapsuleItemKind kind = UefiCapsuleItemKind::embedded_driver;
+    // Offsets on this item are relative to the byte span passed to the parser
+    // invocation that produced it. Add source_offset_base to resolve them in
+    // the original top-level input, including recursively nested capsules.
+    std::uint64_t source_offset_base = 0;
     std::uint64_t file_offset = 0;
     std::uint64_t size = 0;
     std::uint32_t image_header_version = 0;
@@ -125,6 +129,9 @@ HEXLAB_FIRMWARE_EXPORT Result<UefiFmpDependencyResult> evaluate_uefi_fmp_depende
     bool version_inventory_complete, std::stop_token stop = {});
 struct UefiNestedCapsule {
     UefiNestedCapsuleKind kind = UefiNestedCapsuleKind::fmp;
+    // Absolute offset of this nested capsule's first byte in the original
+    // top-level input. Child item offsets remain local to this capsule.
+    std::uint64_t source_offset_base = 0;
     // size is the declared ImageSize; candidate_size is the available span in
     // the parent item, which can be larger when the nested input has trailing bytes.
     std::uint64_t item_relative_offset = 0, size = 0, candidate_size = 0, trailing_size = 0;

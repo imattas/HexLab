@@ -336,18 +336,37 @@ struct NestedBudget {
     std::size_t capsules = 0;
     std::uint64_t bytes = 0;
 };
+bool rebase_item_source_offsets(UefiCapsuleItem &item, std::uint64_t delta) {
+    if (item.source_offset_base > (std::numeric_limits<std::uint64_t>::max)() - delta)
+        return false;
+    item.source_offset_base += delta;
+    for (auto &nested : item.nested_capsules) {
+        if (nested.source_offset_base > (std::numeric_limits<std::uint64_t>::max)() - delta)
+            return false;
+        nested.source_offset_base += delta;
+        for (auto &child : nested.items)
+            if (!rebase_item_source_offsets(child, delta))
+                return false;
+    }
+    return true;
+}
 Result<UefiCapsule> parse_fmp_impl(std::span<const std::byte>, UefiCapsuleParseOptions,
-                                   std::stop_token, bool, std::size_t, NestedBudget &);
+                                   std::stop_token, bool, std::size_t, NestedBudget &,
+                                   std::uint64_t source_offset_base);
 Result<bool> inspect_nested_capsules(UefiCapsuleItem &, std::span<const std::byte>, std::uint64_t, std::uint64_t,
-                                    UefiCapsuleParseOptions, std::stop_token, std::size_t, NestedBudget &);
+                                    std::uint64_t source_offset_base, UefiCapsuleParseOptions,
+                                    std::stop_token, std::size_t, NestedBudget &);
 }
 
 namespace {
 Result<UefiCapsule> parse_fmp_impl(std::span<const std::byte> bytes, UefiCapsuleParseOptions options,
                                    std::stop_token stop, bool scan_embedded_volumes,
-                                   std::size_t nested_depth, NestedBudget &nested_budget) {
+                                   std::size_t nested_depth, NestedBudget &nested_budget,
+                                   std::uint64_t source_offset_base) {
     if (stop.stop_requested()) return Error{ErrorCode::canceled, "UEFI capsule parsing canceled"};
     if (bytes.size() > options.max_input_bytes) return Error{ErrorCode::resource_limit, "UEFI capsule exceeds input-size limit"};
+    if (bytes.size() > (std::numeric_limits<std::uint64_t>::max)() - source_offset_base)
+        return Error{ErrorCode::resource_limit, "UEFI capsule source offset overflows"};
     if (bytes.size() < 28) return malformed("EFI capsule header is truncated");
     UefiCapsule result;
     for (std::size_t i = 0; i < 16; ++i) result.capsule_guid[i] = u8(bytes, i);
@@ -470,6 +489,7 @@ Result<UefiCapsule> parse_fmp_impl(std::span<const std::byte> bytes, UefiCapsule
         const std::uint64_t item_start = offsets[i];
         const std::uint64_t item_end = i + 1 < count ? offsets[i + 1] : result.image_size - base;
         UefiCapsuleItem item;
+        item.source_offset_base = source_offset_base;
         item.file_offset = base + item_start;
         item.size = item_end - item_start;
         if (i < result.embedded_driver_count) {
@@ -589,7 +609,8 @@ Result<UefiCapsule> parse_fmp_impl(std::span<const std::byte> bytes, UefiCapsule
                 item.dependency_expression_size - item.fmp_payload_header_size
             : item.size;
         const auto nested = inspect_nested_capsules(item, bytes, item.file_offset + nested_offset,
-                                                    nested_size, options, stop, nested_depth, nested_budget);
+                                                    nested_size, source_offset_base, options, stop,
+                                                    nested_depth, nested_budget);
         if (!nested) return nested.error();
         result.items.push_back(std::move(item));
     }
@@ -600,7 +621,7 @@ Result<UefiCapsule> parse_fmp_impl(std::span<const std::byte> bytes, UefiCapsule
 namespace {
 Result<bool> inspect_nested_capsules(UefiCapsuleItem &item, std::span<const std::byte> parent_bytes,
                                      std::uint64_t candidate_offset, std::uint64_t candidate_size,
-                                     UefiCapsuleParseOptions options, std::stop_token stop,
+                                     std::uint64_t source_offset_base, UefiCapsuleParseOptions options, std::stop_token stop,
                                      std::size_t depth, NestedBudget &budget) {
     if (candidate_size < 16 || candidate_offset > parent_bytes.size() ||
         candidate_size > parent_bytes.size() - candidate_offset)
@@ -627,15 +648,20 @@ Result<bool> inspect_nested_capsules(UefiCapsuleItem &item, std::span<const std:
         return incomplete("nested EFI capsule byte limit reached");
     if (candidate_size > options.max_input_bytes)
         return incomplete("nested EFI capsule exceeds the input-size limit");
+    if (candidate_offset > (std::numeric_limits<std::uint64_t>::max)() - source_offset_base)
+        return incomplete("nested EFI capsule source offset overflows");
+    const auto nested_source_offset_base = source_offset_base + candidate_offset;
     ++budget.capsules;
     budget.bytes += candidate_size;
 
     UefiNestedCapsule nested;
     nested.kind = is_fmp ? UefiNestedCapsuleKind::fmp : UefiNestedCapsuleKind::json;
+    nested.source_offset_base = nested_source_offset_base;
     nested.item_relative_offset = candidate_offset - item.file_offset;
     nested.candidate_size = candidate_size;
     if (is_fmp) {
-        auto parsed = parse_fmp_impl(candidate, options, stop, false, depth + 1, budget);
+        auto parsed = parse_fmp_impl(candidate, options, stop, false, depth + 1, budget,
+                                     nested_source_offset_base);
         if (!parsed) {
             if (parsed.error().code == ErrorCode::canceled) return parsed.error();
             return incomplete("nested FMP capsule is malformed or unsupported: " + parsed.error().message);
@@ -797,7 +823,7 @@ Result<UefiFmpAntiRollbackResult> evaluate_uefi_fmp_anti_rollback(
 Result<UefiCapsule> parse_uefi_fmp_capsule(std::span<const std::byte> bytes,
                                            UefiCapsuleParseOptions options, std::stop_token stop) {
     NestedBudget budget;
-    return parse_fmp_impl(bytes, options, stop, true, 0, budget);
+    return parse_fmp_impl(bytes, options, stop, true, 0, budget, 0);
 }
 
 namespace {
@@ -989,6 +1015,13 @@ Result<UefiScatterGatherCapsuleList> parse_uefi_fmp_scatter_gather_regions(
         }
         auto parsed = parse_uefi_fmp_capsule_list(capsules, options.capsule, stop);
         if (!parsed) return parsed.error();
+        for (std::size_t i = 0; i < parsed.value().capsules.size(); ++i) {
+            if (i >= result.capsule_logical_offsets.size())
+                return malformed("UEFI gathered capsule provenance count is inconsistent");
+            for (auto &item : parsed.value().capsules[i].items)
+                if (!rebase_item_source_offsets(item, result.capsule_logical_offsets[i]))
+                    return Error{ErrorCode::resource_limit, "UEFI gathered capsule source offset overflows"};
+        }
         result.inventory = std::move(parsed.value()); result.blocks = std::move(gathered.value().blocks);
         return result;
     } catch (const std::bad_alloc &) {
@@ -1028,7 +1061,7 @@ Result<UefiCapsuleList> parse_uefi_fmp_capsule_list(
         capsule_options.max_embedded_sections = options.max_embedded_sections - embedded_sections_used;
         capsule_options.max_embedded_payload_scans = options.max_embedded_payload_scans - embedded_scans_used;
         capsule_options.max_embedded_decompressed_bytes = options.max_embedded_decompressed_bytes - embedded_decompressed_used;
-        auto parsed = parse_fmp_impl(capsule_bytes, capsule_options, stop, true, 0, nested_budget);
+        auto parsed = parse_fmp_impl(capsule_bytes, capsule_options, stop, true, 0, nested_budget, 0);
         if (!parsed) return parsed.error();
         if (result.capsules.empty()) {
             result.capsule_guid = parsed.value().capsule_guid;

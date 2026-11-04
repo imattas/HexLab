@@ -178,6 +178,7 @@ void write_nested_capsule(std::ostream &out, const firmware::UefiNestedCapsule &
         << (capsule.kind == firmware::UefiNestedCapsuleKind::fmp ? "FMP" : "JSON")
         << " guid=" << firmware::uefi_guid_string(capsule.capsule_guid)
         << " item-relative-offset=" << hex_value(capsule.item_relative_offset)
+        << " source-input-offset=" << hex_value(capsule.source_offset_base)
         << " image-size=" << hex_value(capsule.size)
         << " candidate-span=" << hex_value(capsule.candidate_size)
         << " header-size=" << hex_value(capsule.header_size)
@@ -205,16 +206,22 @@ void write_capsule_item(std::ostream &out, const firmware::UefiCapsuleItem &item
     out << indent << label << " kind="
         << (item.kind == firmware::UefiCapsuleItemKind::embedded_driver ? "embedded-driver" : "fmp-payload")
         << (logical ? " logical-capsule-offset=" : nested ? " capsule-relative-file-offset=" : " file-offset=")
-        << hex_value(item.file_offset) << " size=" << hex_value(item.size);
+        << hex_value(item.file_offset) << " source-input-offset="
+        << hex_value(item.source_offset_base + item.file_offset) << " size=" << hex_value(item.size);
     if (item.kind == firmware::UefiCapsuleItemKind::fmp_payload) {
         out << " image-header-version=" << item.image_header_version
             << " image-type-guid=" << firmware::uefi_guid_string(item.image_type_guid)
             << " image-index=" << static_cast<unsigned>(item.image_index)
             << " image-size=" << hex_value(item.update_image_size)
             << " payload-offset=" << hex_value(item.payload_offset)
+            << " source-payload-offset=" << hex_value(item.source_offset_base + item.payload_offset)
             << " firmware-image-offset=" << hex_value(item.firmware_image_offset)
+            << " source-firmware-image-offset="
+            << hex_value(item.source_offset_base + item.firmware_image_offset)
             << " vendor-code-size=" << hex_value(item.vendor_code_size)
-            << " vendor-code-offset=" << hex_value(item.vendor_code_offset);
+            << " vendor-code-offset=" << hex_value(item.vendor_code_offset)
+            << " source-vendor-code-offset="
+            << hex_value(item.source_offset_base + item.vendor_code_offset);
         if (item.image_header_version >= 2) out << " hardware-instance=" << hex_value(item.hardware_instance);
         if (item.image_header_version >= 3) {
             out << " image-capsule-support=" << hex_value(item.image_capsule_support)
@@ -229,15 +236,25 @@ void write_capsule_item(std::ostream &out, const firmware::UefiCapsuleItem &item
                 << " certificate-offset=" << hex_value(item.authentication_certificate_offset)
                 << " certificate-size=" << hex_value(item.authentication_certificate_size)
                 << " certificate-data-offset=" << hex_value(item.authentication_certificate_data_offset)
+                << " source-certificate-offset="
+                << hex_value(item.source_offset_base + item.authentication_certificate_offset)
+                << " source-certificate-data-offset="
+                << hex_value(item.source_offset_base + item.authentication_certificate_data_offset)
                 << " certificate-data-size=" << hex_value(item.authentication_certificate_data_size)
                 << " signed-image-offset=" << hex_value(item.authentication_signed_image_offset)
+                << " source-signed-image-offset="
+                << hex_value(item.source_offset_base + item.authentication_signed_image_offset)
                 << " signed-image-size=" << hex_value(item.authentication_signed_image_size);
         if (item.dependency_expression_present)
             out << " dependency-expression-offset=" << hex_value(item.dependency_expression_offset)
+                << " source-dependency-expression-offset="
+                << hex_value(item.source_offset_base + item.dependency_expression_offset)
                 << " dependency-expression-size=" << hex_value(item.dependency_expression_size);
         if (item.fmp_payload_header_present)
             out << " fmp-payload-header=mss1"
                 << " fmp-payload-header-offset=" << hex_value(item.fmp_payload_header_offset)
+                << " source-fmp-payload-header-offset="
+                << hex_value(item.source_offset_base + item.fmp_payload_header_offset)
                 << " fmp-payload-header-size=" << hex_value(item.fmp_payload_header_size)
                 << " firmware-version=" << hex_value(item.firmware_version)
                 << " lowest-supported-firmware-version=" << hex_value(item.lowest_supported_firmware_version);

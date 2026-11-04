@@ -68,9 +68,22 @@ represented by a single invented capture offset. The list result retains each
 capsule's start in `capsule_logical_offsets` and its inventory in
 `inventory.capsules`. Item and top-level embedded-volume offsets remain local
 to that capsule: add the capsule's logical-stream offset before translating
-through the data descriptors. Nested offsets retain their existing
-parent-relative conventions. CLI labels distinguish capsule-local,
-logical-stream and descriptor/data capture offsets, showing the first
+through the data descriptors. Nested offsets retain their local coordinate
+systems, and now every `UefiCapsuleItem` exposes `source_offset_base` while
+every `UefiNestedCapsule` exposes its `source_offset_base`. To resolve any
+item field offset (including payload, dependency-expression, authentication
+certificate, signed-image or vendor-code offsets) in the original parser input,
+add it to the item's `source_offset_base`. For gathered capsule lists this is
+the logical-stream offset, not a physical capture address; translate it through
+the retained data descriptors to recover one or more capture ranges. Direct
+contiguous parsing uses base zero, and separate capsule-list inputs each retain
+their own base-zero coordinate system. CLI labels report source-input offsets
+alongside local offsets. The FMP item-offset list is validated for bounds and
+strict ordering, but not alignment: UEFI 2.11 specifies packed FMP structures
+and permits driver and payload items to begin on any byte boundary. Scatter/
+gather descriptor alignment and extent checks remain separate. CLI labels
+distinguish capsule-local, logical-stream and descriptor/data capture offsets,
+showing the first
 256 descriptor records with an explicit omission count; the API retains all
 records up to the descriptor cap. Existing item/nested output caps still apply.
 
@@ -140,6 +153,14 @@ copies bytes only; it does not verify signatures, assess applicability, or
 apply the firmware update.
 
 The FMP parser accepts the standard 28-byte EFI capsule header or an extended header identified by `HeaderSize`, the FMP capsule GUID, FMP header version 1, and FMP image header versions 1 through 3. It checks declared bounds, ascending item offsets, descriptor sizes, cancellation, a 512 MiB input cap, and a 4096-item cap. The JSON parser validates the same generic capsule extent and the version-1 `EFI_JSON_CAPSULE_HEADER` (exact nonzero payload extent), then validates payload UTF-8 and JSON syntax. It accepts any JSON value because UEFI leaves the payload schema to the receiving firmware driver; platform-specific schema binding is not attempted. Validation is bounded to 16 MiB and 128 nested arrays/objects by default, with configurable limits and cancellation. For an extended EFI capsule header, the API and CLI report the exact opaque byte range between the fixed 28-byte header and `HeaderSize`; no assumptions are made about those extension bytes. The API also reports the number of input bytes after `ImageSize`, separately from the declared capsule extent. Malformed and unsupported structures return a diagnostic. Payload bytes, embedded drivers, and vendor data are never extracted or executed.
+
+The UEFI 2.11 FMP section states that its capsule structures are packed and
+payload items may begin on byte boundaries without padding. Accordingly, the
+parser validates each item offset's ordering and extent but does not invent an
+alignment restriction that would reject valid capsules. The scatter/gather
+descriptor format has its own fixed 16-byte descriptor extent and validation.
+See [UEFI Specification 2.11, §23.3.1](https://uefi.org/sites/default/files/resources/UEFI_Spec_Final_2.11.pdf)
+for the packed-structure and item-boundary requirements.
 
 The FMP library also recognizes a nested FMP or JSON capsule when its known
 capsule GUID starts exactly at an embedded-driver item or update-image payload
