@@ -2,6 +2,7 @@
 #include "hexlab/processors/instruction.hpp"
 #include "hexlab/processors/processors_export.hpp"
 #include <span>
+#include <string>
 #include <string_view>
 namespace hexlab {
 struct ProcessorVariantCoverage {
@@ -45,6 +46,20 @@ HEXLAB_PROCESSORS_EXPORT DecodeResult decode_m6502(std::span<const std::byte>, A
 HEXLAB_PROCESSORS_EXPORT DecodeResult decode_m65c02(std::span<const std::byte>, Address);
 HEXLAB_PROCESSORS_EXPORT DecodeResult decode_wasm(std::span<const std::byte>, Address);
 HEXLAB_PROCESSORS_EXPORT DecodeResult decode_dex(std::span<const std::byte>, Address);
+// Layout inspection is independent of typed operand/display limits. A decoded
+// status proves only a complete encoding extent, not valid operands or flow.
+// Version 0 preserves raw/optimized decoding without a DEX version assertion.
+struct DexInstructionEncoding {
+    DecodeStatus status = DecodeStatus::invalid;
+    std::uint32_t byte_size = 0;
+    bool payload = false;
+    std::string reason;
+};
+HEXLAB_PROCESSORS_EXPORT DexInstructionEncoding inspect_dex_instruction_encoding(
+    std::span<const std::byte>, Address, unsigned dex_version = 0);
+// Explicit version-aware decoding for callers with a containing DEX header.
+// Legacy optimized e3-f9 opcodes remain accepted without runtime-version proof.
+HEXLAB_PROCESSORS_EXPORT DecodeResult decode_dex(std::span<const std::byte>, Address, unsigned dex_version);
 HEXLAB_PROCESSORS_EXPORT DecodeResult decode_jvm(std::span<const std::byte>, Address);
 // Unknown IT state is distinct from a caller-established boundary {true,0}.
 HEXLAB_PROCESSORS_EXPORT DecodeResult decode_thumb(std::span<const std::byte>, Address, ThumbITState = {});

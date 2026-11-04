@@ -274,8 +274,13 @@ metadata; parameter-to-register bindings are not inferred.
 The decoder covers the defined standard DEX opcode encodings through the
 DEX 039 `const-method-handle`/`const-method-type` additions, as well as the
 legacy optimized opcodes documented below. Reserved opcode values and
-unrecognized payload identifiers fail closed. The format version is not
-currently used to reject instructions introduced by later DEX versions.
+unrecognized payload identifiers fail closed. The DEX loader now checks the
+entire encoded method against its header version before operand decoding:
+`0xfa`–`0xfd` require DEX 038 and `0xfe`–`0xff` require DEX 039. A layout-only
+walk continues past instructions and payloads exceeding the operand decoder's
+limits. The processor's explicit version-aware decode overload applies the
+same admission checks; raw decoding still has no containing version. See
+`dex-opcode-versions.md` for encoding coverage and optimized-runtime limits.
 Decoded instructions retain method call flow and direct intra-method branch
 targets. Reference operands are shown as table indices because string/type/
 field/method names are not attached to the decoded instruction. Bounded

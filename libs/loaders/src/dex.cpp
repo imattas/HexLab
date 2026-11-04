@@ -1478,10 +1478,33 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
                     for(const auto &item:try_items){const auto found=handler_lists.find(item.handler);if(found==handler_lists.end())return Error{ErrorCode::malformed,"DEX try_item references a missing catch handler"};total_catch_handlers+=found->second.size();if(total_catch_handlers>4'000'000)return Error{ErrorCode::resource_limit,"Expanded DEX try/catch associations exceed four million"};exception_regions.push_back({item.start*2,(item.start+item.count)*2,found->second});}
                 }
                 if(insns==0||cr.pos>data_end)return Error{ErrorCode::malformed,"DEX code_item is empty or extends outside data section"};
+                // Check the whole encoded stream before typed operand decoding.
+                // High vregs and large payloads exceed that decoder's bounded
+                // representation; they must not hide later version violations.
+                std::uint32_t encoding_offset = 0;
+                while (encoding_offset < insns * 2) {
+                    if (stop.stop_requested())
+                        return Error{ErrorCode::canceled, "DEX encoding validation canceled"};
+                    const auto remaining = std::span<const std::byte>(bytes).subspan(
+                        static_cast<std::size_t>(insns_off + encoding_offset),
+                        static_cast<std::size_t>(insns * 2 - encoding_offset));
+                    auto encoding = inspect_dex_instruction_encoding(remaining, {{0}, encoding_offset}, version);
+                    if (encoding.status != DecodeStatus::decoded) {
+                        std::ostringstream message;
+                        message << encoding.reason << " (method_index=" << method_idx
+                            << ", code_item_offset=" << code_off
+                            << ", instruction_code_unit=" << encoding_offset / 2
+                            << ", instruction_file_offset=" << insns_off + encoding_offset
+                            << ", dex_version=" << version << ", opcode=0x" << std::hex
+                            << static_cast<unsigned>(std::to_integer<std::uint8_t>(remaining[0])) << ')';
+                        return Error{ErrorCode::malformed, message.str()};
+                    }
+                    encoding_offset += encoding.byte_size;
+                }
                 // The shared decoder already exposes every register slot used
                 // by its supported instructions. Reject references outside
-                // this method's register file while leaving unknown opcodes to
-                // the decoder's conservative unsupported path.
+                // this method's register file while leaving unrepresentable
+                // operand forms to the decoder's conservative unsupported path.
                 std::uint32_t instruction_offset = 0;
                 std::unordered_set<std::uint32_t> instruction_starts;
                 std::unordered_set<std::uint32_t> payload_starts;
@@ -1508,7 +1531,7 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
                     const auto remaining = std::span<const std::byte>(bytes).subspan(
                         static_cast<std::size_t>(insns_off + instruction_offset),
                         static_cast<std::size_t>(insns * 2 - instruction_offset));
-                    auto decoded = decode_dex(remaining, {{0}, instruction_offset});
+                    auto decoded = decode_dex(remaining, {{0}, instruction_offset}, version);
                     if (decoded.status != DecodeStatus::decoded || !decoded.instruction) {
                         instruction_stream_complete = false;
                         break;
@@ -1538,7 +1561,8 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
                         return static_cast<std::uint16_t>(std::to_integer<std::uint8_t>(instruction_source[offset]) |
                             (std::uint16_t(std::to_integer<std::uint8_t>(instruction_source[offset + 1])) << 8));
                     };
-                    const auto index16 = operand_word(1);
+                    // Single-code-unit instructions have no index operand.
+                    const auto index16 = instruction.length >= 4 ? operand_word(1) : std::uint16_t{0};
                     bool reference_valid = true;
                     const auto within = [&](std::uint64_t index, std::size_t count) { return index < count; };
                     const auto opcode = std::to_integer<std::uint8_t>(instruction_source[0]);
@@ -2117,7 +2141,7 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage, std::span<
                         };
                         // Unsupported writes invalidate only their register
                         // facts, preventing stale values from crossing them.
-                        auto decoded_for_flow = decode_dex(instruction_bytes, {{0}, offset});
+                        auto decoded_for_flow = decode_dex(instruction_bytes, {{0}, offset}, version);
                         if (!decoded_for_flow.instruction)
                             return Error{ErrorCode::malformed, "DEX verifier could not decode an instruction boundary"};
                         const bool ordinary_invoke = (opcode >= 0x6e && opcode <= 0x72) ||

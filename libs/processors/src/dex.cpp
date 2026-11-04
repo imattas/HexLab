@@ -21,6 +21,105 @@ std::string vr(unsigned n) { return "v" + std::to_string(n); }
 std::uint32_t le32(std::uint16_t a, std::uint16_t b) { return std::uint32_t(a) | (std::uint32_t(b) << 16); }
 }
 
+DexInstructionEncoding inspect_dex_instruction_encoding(
+    std::span<const std::byte> bytes, Address at, unsigned dex_version) {
+    const auto rejected = [](DecodeStatus status, std::string reason) {
+        return DexInstructionEncoding{status, 0, false, std::move(reason)};
+    };
+    if (at.offset & 1)
+        return rejected(DecodeStatus::invalid, "DEX instruction address is not code-unit aligned");
+    if (dex_version && (dex_version < 35 || dex_version > 41))
+        return rejected(DecodeStatus::unsupported, "DEX encoding version is outside 035 through 041");
+    std::uint16_t first = 0;
+    if (!code_unit(bytes, 0, first))
+        return rejected(DecodeStatus::truncated, "truncated DEX code unit");
+    const auto op = std::uint8_t(first & 0xff);
+    if (dex_version && op >= 0xfa) {
+        const auto minimum = op <= 0xfd ? 38u : 39u;
+        if (dex_version < minimum)
+            return rejected(DecodeStatus::invalid,
+                "DEX opcode requires version 0" + std::to_string(minimum) + " or later");
+    }
+
+    // Standard instruction formats plus the legacy optimized forms accepted
+    // by decode_dex. Zero entries are reserved; never guess their lengths.
+    static constexpr auto widths = [] {
+        std::array<std::uint8_t, 256> result{};
+        const auto set = [&](unsigned first_op, unsigned last_op, std::uint8_t words) {
+            for (auto value = first_op; value <= last_op; ++value) result[value] = words;
+        };
+        set(0x00, 0x12, 1);
+        for (unsigned base : {0x01u, 0x04u, 0x07u}) {
+            result[base + 1] = 2;
+            result[base + 2] = 3;
+        }
+        set(0x13, 0x1c, 2);
+        result[0x14] = result[0x17] = result[0x1b] = 3;
+        result[0x18] = 5;
+        set(0x1d, 0x27, 1);
+        result[0x1f] = result[0x20] = result[0x22] = result[0x23] = 2;
+        result[0x24] = result[0x25] = result[0x26] = 3;
+        result[0x28] = 1;
+        result[0x29] = 2;
+        set(0x2a, 0x2c, 3);
+        set(0x2d, 0x3d, 2);
+        set(0x44, 0x6d, 2);
+        set(0x6e, 0x72, 3);
+        set(0x74, 0x78, 3);
+        set(0x7b, 0x8f, 1);
+        set(0x90, 0xaf, 2);
+        set(0xb0, 0xcf, 1);
+        set(0xd0, 0xeb, 2);
+        result[0xec] = result[0xf1] = 1;
+        result[0xed] = 2;
+        set(0xee, 0xf0, 3);
+        set(0xf2, 0xf7, 2);
+        set(0xf8, 0xf9, 3);
+        set(0xfa, 0xfb, 4);
+        set(0xfc, 0xfd, 3);
+        set(0xfe, 0xff, 2);
+        return result;
+    }();
+    std::uint64_t length = std::uint64_t(widths[op]) * 2;
+    const bool payload = op == 0 && first != 0;
+    if (payload) {
+        if (at.offset & 3)
+            return rejected(DecodeStatus::invalid, "DEX payload is not four-byte aligned");
+        std::uint16_t count_or_width = 0;
+        if (first != 0x0100 && first != 0x0200 && first != 0x0300)
+            return rejected(DecodeStatus::invalid, "unknown DEX payload identifier");
+        if (!code_unit(bytes, 1, count_or_width))
+            return rejected(DecodeStatus::truncated, "truncated DEX payload header");
+        if (first == 0x0100)
+            length = 8 + std::uint64_t(count_or_width) * 4;
+        else if (first == 0x0200)
+            length = 4 + std::uint64_t(count_or_width) * 8;
+        else {
+            if (count_or_width != 1 && count_or_width != 2 && count_or_width != 4 && count_or_width != 8)
+                return rejected(DecodeStatus::invalid, "DEX fill-array-data payload has invalid element width");
+            std::uint16_t low = 0, high = 0;
+            if (!code_unit(bytes, 2, low) || !code_unit(bytes, 3, high))
+                return rejected(DecodeStatus::truncated, "truncated DEX fill-array-data payload header");
+            const auto data_bytes = std::uint64_t(le32(low, high)) * count_or_width;
+            length = 8 + data_bytes + (data_bytes & 1);
+        }
+    } else if (!length) {
+        return rejected(DecodeStatus::invalid, "reserved DEX opcode has no instruction encoding");
+    }
+    if (length > UINT32_MAX || at.offset > UINT32_MAX - length)
+        return rejected(DecodeStatus::invalid, "DEX encoding extent exceeds the method address space");
+    if (length > bytes.size())
+        return rejected(DecodeStatus::truncated, "truncated DEX instruction or payload encoding");
+    return {DecodeStatus::decoded, static_cast<std::uint32_t>(length), payload, {}};
+}
+
+DecodeResult decode_dex(std::span<const std::byte> bytes, Address at, unsigned dex_version) {
+    auto encoding = inspect_dex_instruction_encoding(bytes, at, dex_version);
+    if (encoding.status != DecodeStatus::decoded)
+        return fail(encoding.status, std::move(encoding.reason));
+    return decode_dex(bytes, at);
+}
+
 DecodeResult decode_dex(std::span<const std::byte> bytes, Address at) {
     if (at.offset & 1)
         return fail(DecodeStatus::invalid, "DEX instruction address is not code-unit aligned");

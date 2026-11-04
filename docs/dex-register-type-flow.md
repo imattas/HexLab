@@ -4,6 +4,10 @@ The DEX loader runs a bounded worklist over each completely decoded method's
 normal control flow. Parameter descriptors seed entry registers. Existing
 instruction checks consume register categories for moves, arrays, fields,
 invokes, arithmetic, conversions, comparisons, branches, and returns.
+Before operand decoding, a separate complete encoding walk checks instruction
+extents, payload extents/alignment, reserved opcodes, and the DEX 038/039 opcode
+introduction versions. Operand-model limits cannot bypass that walk. See
+`dex-opcode-versions.md`; encoding admission does not establish register types.
 
 Method-entry local registers start as unassigned; only incoming parameter words
 are initialized. A reachable instruction read of an unassigned register is
