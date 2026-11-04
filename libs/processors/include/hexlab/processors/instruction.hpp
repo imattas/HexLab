@@ -754,7 +754,16 @@ enum class Opcode {
     ppc_vcmpgtsb, ppc_vcmpgtsh, ppc_vcmpgtsw,
     ppc_vcmpequb_dot, ppc_vcmpequh_dot, ppc_vcmpequw_dot,
     ppc_vcmpgtub_dot, ppc_vcmpgtuh_dot, ppc_vcmpgtuw_dot,
-    ppc_vcmpgtsb_dot, ppc_vcmpgtsh_dot, ppc_vcmpgtsw_dot
+    ppc_vcmpgtsb_dot, ppc_vcmpgtsh_dot, ppc_vcmpgtsw_dot,
+    // RISC-V Zfh scalar half-precision forms; append to preserve cache IDs.
+    rv_flh, rv_fsh, rv_fadd_h, rv_fsub_h, rv_fmul_h, rv_fdiv_h, rv_fsqrt_h,
+    rv_fsgnj_h, rv_fsgnjn_h, rv_fsgnjx_h, rv_fmin_h, rv_fmax_h,
+    rv_fmadd_h, rv_fmsub_h, rv_fnmsub_h, rv_fnmadd_h,
+    rv_feq_h, rv_flt_h, rv_fle_h, rv_fclass_h,
+    rv_fcvt_w_h, rv_fcvt_wu_h, rv_fcvt_l_h, rv_fcvt_lu_h,
+    rv_fcvt_h_w, rv_fcvt_h_wu, rv_fcvt_h_l, rv_fcvt_h_lu,
+    rv_fcvt_s_h, rv_fcvt_d_h, rv_fcvt_h_s, rv_fcvt_h_d,
+    rv_fmv_x_h, rv_fmv_h_x, rv_fminm_h, rv_fmaxm_h, rv_fleq_h, rv_fltq_h
 };
 enum class OperandAccess { read, write, read_write, address };
 // The encoded x86 group-one repeat prefix is retained separately from the

@@ -894,6 +894,18 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
             "fadd.d","fsub.d","fmul.d","fdiv.d","fsqrt.d","fsgnj.d","fsgnjn.d","fsgnjx.d","fmin.d","fmax.d","fmadd.d","fmsub.d","fnmsub.d","fnmadd.d","feq.d","flt.d","fle.d","fclass.d","fcvt.w.d","fcvt.wu.d","fcvt.l.d","fcvt.lu.d","fcvt.d.w","fcvt.d.wu","fcvt.d.l","fcvt.d.lu","fcvt.s.d","fcvt.d.s","fmv.x.d","fmv.d.x"};
         return fp_names[static_cast<std::size_t>(op) - static_cast<std::size_t>(Opcode::rv_flw)];
     }
+    if (op >= Opcode::rv_flh && op <= Opcode::rv_fltq_h) {
+        static constexpr const char *half_names[]{
+            "flh","fsh","fadd.h","fsub.h","fmul.h","fdiv.h","fsqrt.h",
+            "fsgnj.h","fsgnjn.h","fsgnjx.h","fmin.h","fmax.h",
+            "fmadd.h","fmsub.h","fnmsub.h","fnmadd.h",
+            "feq.h","flt.h","fle.h","fclass.h",
+            "fcvt.w.h","fcvt.wu.h","fcvt.l.h","fcvt.lu.h",
+            "fcvt.h.w","fcvt.h.wu","fcvt.h.l","fcvt.h.lu",
+            "fcvt.s.h","fcvt.d.h","fcvt.h.s","fcvt.h.d",
+            "fmv.x.h","fmv.h.x","fminm.h","fmaxm.h","fleq.h","fltq.h"};
+        return half_names[static_cast<std::size_t>(op) - static_cast<std::size_t>(Opcode::rv_flh)];
+    }
     if (op >= Opcode::rv_vsetvli && op <= Opcode::rv_vsetvl) {
         static constexpr const char *names[]{"vsetvli", "vsetivli", "vsetvl"};
         return names[static_cast<std::size_t>(op) - static_cast<std::size_t>(Opcode::rv_vsetvli)];

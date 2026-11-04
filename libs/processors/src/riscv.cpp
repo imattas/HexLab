@@ -935,10 +935,10 @@ bool decode_store(std::uint32_t w, RiscvInstruction &i, unsigned xlen) {
 
 bool decode_fp_load(std::uint32_t w, RiscvInstruction &i) {
     const unsigned f3 = (w >> 12) & 7, rd = (w >> 7) & 31, rs1 = (w >> 15) & 31;
-    const unsigned width = f3 == 2 ? 32 : f3 == 3 ? 64 : 0;
+    const unsigned width = f3 == 1 ? 16 : f3 == 2 ? 32 : f3 == 3 ? 64 : 0;
     if (!width)
         return false;
-    i.opcode = width == 32 ? RiscvOpcode::flw : RiscvOpcode::fld;
+    i.opcode = width == 16 ? RiscvOpcode::flh : width == 32 ? RiscvOpcode::flw : RiscvOpcode::fld;
     operand(i, RiscvRegister{static_cast<std::uint8_t>(rd), true}, RiscvOperandAccess::write);
     operand(i, RiscvMemory{RiscvRegister{static_cast<std::uint8_t>(rs1)}, sign_extend(w >> 20, 12),
                            static_cast<std::uint8_t>(width), false}, RiscvOperandAccess::read);
@@ -949,11 +949,11 @@ bool decode_fp_load(std::uint32_t w, RiscvInstruction &i) {
 
 bool decode_fp_store(std::uint32_t w, RiscvInstruction &i) {
     const unsigned f3 = (w >> 12) & 7, rs1 = (w >> 15) & 31, rs2 = (w >> 20) & 31;
-    const unsigned width = f3 == 2 ? 32 : f3 == 3 ? 64 : 0;
+    const unsigned width = f3 == 1 ? 16 : f3 == 2 ? 32 : f3 == 3 ? 64 : 0;
     if (!width)
         return false;
     const auto immediate = ((w >> 25) << 5) | ((w >> 7) & 31);
-    i.opcode = width == 32 ? RiscvOpcode::fsw : RiscvOpcode::fsd;
+    i.opcode = width == 16 ? RiscvOpcode::fsh : width == 32 ? RiscvOpcode::fsw : RiscvOpcode::fsd;
     operand(i, RiscvRegister{static_cast<std::uint8_t>(rs2), true}, RiscvOperandAccess::read);
     operand(i, RiscvMemory{RiscvRegister{static_cast<std::uint8_t>(rs1)}, sign_extend(immediate, 12),
                            static_cast<std::uint8_t>(width), false}, RiscvOperandAccess::write);
@@ -969,6 +969,7 @@ bool decode_fp_op(std::uint32_t w, RiscvInstruction &i, unsigned xlen) {
     if (major != 0x53 && major != 0x43 && major != 0x47 && major != 0x4b && major != 0x4f) return false;
     if (fmt == 3) return false; // Q is outside the supported scalar formats.
     const bool d = fmt == 1;
+    const bool h = fmt == 2;
     auto set = [&](RiscvOpcode op, bool flags, bool rm, bool uses_rounding = true) {
         if (rm && (f3 == 5 || f3 == 6)) return false;
         i.opcode = op;
@@ -993,44 +994,52 @@ bool decode_fp_op(std::uint32_t w, RiscvInstruction &i, unsigned xlen) {
         operand(i, RiscvImmediate{static_cast<std::int64_t>(rs1), 5, false}, RiscvOperandAccess::read);
         return true;
     }
-    if (fmt == 2) {
-        // Zfa FROUND.H/FROUNDNX.H require Zfh. Remaining half-precision
-        // instructions remain outside the selected scalar decoder slice.
-        if (major != 0x53 || f7 != 0x22 || (rs2 != 4 && rs2 != 5) ||
-            !set(rs2 == 4 ? RiscvOpcode::fround_h : RiscvOpcode::froundnx_h, true, true))
+    if (fmt == 2 && major == 0x53 && f7 == 0x22 && (rs2 == 4 || rs2 == 5)) {
+        if (!set(rs2 == 4 ? RiscvOpcode::fround_h : RiscvOpcode::froundnx_h, true, true))
             return false;
         fp_rd(); fp_rs1(); return true;
     }
     if (major != 0x53) {
-        if (fmt > 1) return false;
         static constexpr RiscvOpcode s_ops[]{RiscvOpcode::fmadd_s,RiscvOpcode::fmsub_s,RiscvOpcode::fnmsub_s,RiscvOpcode::fnmadd_s};
         static constexpr RiscvOpcode d_ops[]{RiscvOpcode::fmadd_d,RiscvOpcode::fmsub_d,RiscvOpcode::fnmsub_d,RiscvOpcode::fnmadd_d};
-        if (!set(d ? d_ops[(major >> 2) & 3] : s_ops[(major >> 2) & 3], true, true)) return false;
+        static constexpr RiscvOpcode h_ops[]{RiscvOpcode::fmadd_h,RiscvOpcode::fmsub_h,RiscvOpcode::fnmsub_h,RiscvOpcode::fnmadd_h};
+        if (!set(h ? h_ops[(major >> 2) & 3] : d ? d_ops[(major >> 2) & 3] : s_ops[(major >> 2) & 3],
+                 true, true)) return false;
         fp_rd(); fp_rs1(); fp_rs2(); operand(i,RiscvRegister{static_cast<std::uint8_t>(rs3),true},RiscvOperandAccess::read); return true;
     }
     const unsigned operation = f7 & ~1u;
     const auto s = [&](RiscvOpcode op) { return set(op, true, true); };
     const auto plain = [&](RiscvOpcode op, bool flags=false) { return set(op, flags, false); };
     bool ok = false, dst_fp = true, src1_fp = true, src2_fp = true, unary = false;
-    if (operation == 0x00) { ok=s(d?RiscvOpcode::fadd_d:RiscvOpcode::fadd_s); }
-    else if (operation == 0x04) { ok=s(d?RiscvOpcode::fsub_d:RiscvOpcode::fsub_s); }
-    else if (operation == 0x08) { ok=s(d?RiscvOpcode::fmul_d:RiscvOpcode::fmul_s); }
-    else if (operation == 0x0c) { ok=s(d?RiscvOpcode::fdiv_d:RiscvOpcode::fdiv_s); }
-    else if (operation == 0x2c && rs2==0) { ok=s(d?RiscvOpcode::fsqrt_d:RiscvOpcode::fsqrt_s); unary=true; }
-    else if (operation == 0x10) { static constexpr RiscvOpcode ops[2][3]{{RiscvOpcode::fsgnj_s,RiscvOpcode::fsgnjn_s,RiscvOpcode::fsgnjx_s},{RiscvOpcode::fsgnj_d,RiscvOpcode::fsgnjn_d,RiscvOpcode::fsgnjx_d}}; if(f3<3) ok=plain(ops[d][f3]); }
+    if (operation == 0x00) { ok=s(h?RiscvOpcode::fadd_h:d?RiscvOpcode::fadd_d:RiscvOpcode::fadd_s); }
+    else if (operation == 0x04) { ok=s(h?RiscvOpcode::fsub_h:d?RiscvOpcode::fsub_d:RiscvOpcode::fsub_s); }
+    else if (operation == 0x08) { ok=s(h?RiscvOpcode::fmul_h:d?RiscvOpcode::fmul_d:RiscvOpcode::fmul_s); }
+    else if (operation == 0x0c) { ok=s(h?RiscvOpcode::fdiv_h:d?RiscvOpcode::fdiv_d:RiscvOpcode::fdiv_s); }
+    else if (operation == 0x2c && rs2==0) { ok=s(h?RiscvOpcode::fsqrt_h:d?RiscvOpcode::fsqrt_d:RiscvOpcode::fsqrt_s); unary=true; }
+    else if (operation == 0x10) {
+        static constexpr RiscvOpcode ops[3][3]{
+            {RiscvOpcode::fsgnj_s,RiscvOpcode::fsgnjn_s,RiscvOpcode::fsgnjx_s},
+            {RiscvOpcode::fsgnj_d,RiscvOpcode::fsgnjn_d,RiscvOpcode::fsgnjx_d},
+            {RiscvOpcode::fsgnj_h,RiscvOpcode::fsgnjn_h,RiscvOpcode::fsgnjx_h}};
+        if(f3<3) ok=plain(ops[h?2:d?1:0][f3]);
+    }
     else if (operation == 0x14) {
-        if(f3<2) ok=plain(d?(f3?RiscvOpcode::fmax_d:RiscvOpcode::fmin_d):(f3?RiscvOpcode::fmax_s:RiscvOpcode::fmin_s),true);
-        else if(f3<4) ok=plain(d?(f3==3?RiscvOpcode::fmaxm_d:RiscvOpcode::fminm_d):(f3==3?RiscvOpcode::fmaxm_s:RiscvOpcode::fminm_s),true);
+        if(f3<2) ok=plain(h?(f3?RiscvOpcode::fmax_h:RiscvOpcode::fmin_h):
+            d?(f3?RiscvOpcode::fmax_d:RiscvOpcode::fmin_d):(f3?RiscvOpcode::fmax_s:RiscvOpcode::fmin_s),true);
+        else if(f3<4) ok=plain(h?(f3==3?RiscvOpcode::fmaxm_h:RiscvOpcode::fminm_h):
+            d?(f3==3?RiscvOpcode::fmaxm_d:RiscvOpcode::fminm_d):(f3==3?RiscvOpcode::fmaxm_s:RiscvOpcode::fminm_s),true);
     }
     else if (operation == 0x50) {
         if (f3 >= 1 && f3 <= 2) {
-            ok=plain(d?(f3==2?RiscvOpcode::feq_d:RiscvOpcode::flt_d):(f3==2?RiscvOpcode::feq_s:RiscvOpcode::flt_s),true);
+            ok=plain(h?(f3==2?RiscvOpcode::feq_h:RiscvOpcode::flt_h):
+                d?(f3==2?RiscvOpcode::feq_d:RiscvOpcode::flt_d):(f3==2?RiscvOpcode::feq_s:RiscvOpcode::flt_s),true);
             dst_fp=false; src1_fp=src2_fp=true;
-        } else if (f3 == 0) { ok=plain(d?RiscvOpcode::fle_d:RiscvOpcode::fle_s,true); dst_fp=false; }
+        } else if (f3 == 0) { ok=plain(h?RiscvOpcode::fle_h:d?RiscvOpcode::fle_d:RiscvOpcode::fle_s,true); dst_fp=false; }
         else if (f3 == 4 || f3 == 5) {
             // Zfa FLEQ/FLTQ are bit-14 variants of FLE/FLT. Quiet NaNs do
             // not raise NV, but signaling NaNs still can.
-            ok=plain(d?(f3==4?RiscvOpcode::fleq_d:RiscvOpcode::fltq_d)
+            ok=plain(h?(f3==4?RiscvOpcode::fleq_h:RiscvOpcode::fltq_h):
+                       d?(f3==4?RiscvOpcode::fleq_d:RiscvOpcode::fltq_d)
                        :(f3==4?RiscvOpcode::fleq_s:RiscvOpcode::fltq_s),true);
             dst_fp=false;
         }
@@ -1039,19 +1048,49 @@ bool decode_fp_op(std::uint32_t w, RiscvInstruction &i, unsigned xlen) {
         ok = set(RiscvOpcode::fcvtmod_w_d, true, true, false);
         dst_fp = false; unary = true;
     }
-    else if (operation == 0x70 && rs2==0 && (f3==0 || f3==1) && (!d || f3==1 || xlen==64)) { ok=plain(d?(f3?RiscvOpcode::fclass_d:RiscvOpcode::fmv_x_d):(f3?RiscvOpcode::fclass_s:RiscvOpcode::fmv_x_w)); dst_fp=false; unary=true; }
-    else if (operation == 0x78 && rs2==0 && f3==0 && (!d || xlen==64)) { ok=plain(d?RiscvOpcode::fmv_d_x:RiscvOpcode::fmv_w_x); src1_fp=false; unary=true; }
-    else if ((operation==0x60 || operation==0x68) && rs2<=3 && (rs2<2 || xlen==64)) {
-        const bool to_int=operation==0x60; static constexpr RiscvOpcode tos[2][4]{{RiscvOpcode::fcvt_w_s,RiscvOpcode::fcvt_wu_s,RiscvOpcode::fcvt_l_s,RiscvOpcode::fcvt_lu_s},{RiscvOpcode::fcvt_w_d,RiscvOpcode::fcvt_wu_d,RiscvOpcode::fcvt_l_d,RiscvOpcode::fcvt_lu_d}};
-        static constexpr RiscvOpcode froms[2][4]{{RiscvOpcode::fcvt_s_w,RiscvOpcode::fcvt_s_wu,RiscvOpcode::fcvt_s_l,RiscvOpcode::fcvt_s_lu},{RiscvOpcode::fcvt_d_w,RiscvOpcode::fcvt_d_wu,RiscvOpcode::fcvt_d_l,RiscvOpcode::fcvt_d_lu}};
-        // Every 32-bit integer is represented exactly by binary64. These two
-        // forms cannot raise exceptions, although rm is decoded as usual.
-        const bool exact = !to_int && d && rs2 < 2;
-        ok=set(to_int?tos[d][rs2]:froms[d][rs2],!exact,true,!exact); dst_fp=!to_int; src1_fp=to_int; unary=true;
+    else if (operation == 0x70 && rs2==0 && (f3==0 || f3==1) &&
+             (!d || f3==1 || xlen==64)) {
+        ok=plain(h?(f3?RiscvOpcode::fclass_h:RiscvOpcode::fmv_x_h):
+            d?(f3?RiscvOpcode::fclass_d:RiscvOpcode::fmv_x_d):
+              (f3?RiscvOpcode::fclass_s:RiscvOpcode::fmv_x_w));
+        dst_fp=false; unary=true;
     }
-    else if (operation==0x20 && rs2==((f7 & 1) ? 0u : 1u)) {
-        const bool to_double = (f7 & 1) != 0;
-        ok=set(to_double ? RiscvOpcode::fcvt_d_s : RiscvOpcode::fcvt_s_d, true, true, !to_double);
+    else if (operation == 0x78 && rs2==0 && f3==0 && (!d || h || xlen==64)) {
+        ok=plain(h?RiscvOpcode::fmv_h_x:d?RiscvOpcode::fmv_d_x:RiscvOpcode::fmv_w_x);
+        src1_fp=false; unary=true;
+    }
+    else if ((operation==0x60 || operation==0x68) && rs2<=3 && (rs2<2 || xlen==64)) {
+        const bool to_int=operation==0x60;
+        static constexpr RiscvOpcode tos[3][4]{
+            {RiscvOpcode::fcvt_w_s,RiscvOpcode::fcvt_wu_s,RiscvOpcode::fcvt_l_s,RiscvOpcode::fcvt_lu_s},
+            {RiscvOpcode::fcvt_w_d,RiscvOpcode::fcvt_wu_d,RiscvOpcode::fcvt_l_d,RiscvOpcode::fcvt_lu_d},
+            {RiscvOpcode::fcvt_w_h,RiscvOpcode::fcvt_wu_h,RiscvOpcode::fcvt_l_h,RiscvOpcode::fcvt_lu_h}};
+        static constexpr RiscvOpcode froms[3][4]{
+            {RiscvOpcode::fcvt_s_w,RiscvOpcode::fcvt_s_wu,RiscvOpcode::fcvt_s_l,RiscvOpcode::fcvt_s_lu},
+            {RiscvOpcode::fcvt_d_w,RiscvOpcode::fcvt_d_wu,RiscvOpcode::fcvt_d_l,RiscvOpcode::fcvt_d_lu},
+            {RiscvOpcode::fcvt_h_w,RiscvOpcode::fcvt_h_wu,RiscvOpcode::fcvt_h_l,RiscvOpcode::fcvt_h_lu}};
+        // FCVT.D.W[U] is exact; all H conversions can round or saturate.
+        const bool exact = !to_int && d && rs2 < 2;
+        ok=set(to_int?tos[h?2:d?1:0][rs2]:froms[h?2:d?1:0][rs2],!exact,true,!exact);
+        dst_fp=!to_int; src1_fp=to_int; unary=true;
+    }
+    else if (operation==0x20 &&
+             ((fmt==0 && (rs2==1 || rs2==2)) ||
+              (fmt==1 && (rs2==0 || rs2==2)) ||
+              (fmt==2 && (rs2==0 || rs2==1)))) {
+        if (fmt==0 && rs2==1)
+            ok=set(RiscvOpcode::fcvt_s_d,true,true);
+        else if (fmt==1 && rs2==0)
+            ok=set(RiscvOpcode::fcvt_d_s,true,true,false);
+        else if (fmt==0 && rs2==2)
+            ok=set(RiscvOpcode::fcvt_s_h,false,true,false);
+        else if (fmt==1 && rs2==2)
+            ok=set(RiscvOpcode::fcvt_d_h,false,true,false);
+        else if (fmt==2 && rs2==0)
+            ok=set(RiscvOpcode::fcvt_h_s,true,true);
+        else if (fmt==2 && rs2==1)
+            ok=set(RiscvOpcode::fcvt_h_d,true,true);
+        src1_fp=true; unary=true;
     }
     else if (operation == 0x20 && (rs2 == 4 || rs2 == 5)) {
         const bool exact = rs2 == 5;

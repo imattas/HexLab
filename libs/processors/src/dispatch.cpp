@@ -219,6 +219,21 @@ DecodeResult decode_riscv_context(DecodeContext context, std::span<const std::by
         opcode = std::array{Opcode::rv_vslide1up_vx, Opcode::rv_vslide1down_vx,
                             Opcode::rv_vfslide1up_vf, Opcode::rv_vfslide1down_vf}
             [opcode_index - static_cast<std::size_t>(RiscvOpcode::vslide1up_vx)];
+    else if (opcode_index >= static_cast<std::size_t>(RiscvOpcode::flh) &&
+             opcode_index <= static_cast<std::size_t>(RiscvOpcode::fltq_h))
+        opcode = std::array{
+            Opcode::rv_flh, Opcode::rv_fsh, Opcode::rv_fadd_h, Opcode::rv_fsub_h,
+            Opcode::rv_fmul_h, Opcode::rv_fdiv_h, Opcode::rv_fsqrt_h,
+            Opcode::rv_fsgnj_h, Opcode::rv_fsgnjn_h, Opcode::rv_fsgnjx_h,
+            Opcode::rv_fmin_h, Opcode::rv_fmax_h,
+            Opcode::rv_fmadd_h, Opcode::rv_fmsub_h, Opcode::rv_fnmsub_h, Opcode::rv_fnmadd_h,
+            Opcode::rv_feq_h, Opcode::rv_flt_h, Opcode::rv_fle_h, Opcode::rv_fclass_h,
+            Opcode::rv_fcvt_w_h, Opcode::rv_fcvt_wu_h, Opcode::rv_fcvt_l_h, Opcode::rv_fcvt_lu_h,
+            Opcode::rv_fcvt_h_w, Opcode::rv_fcvt_h_wu, Opcode::rv_fcvt_h_l, Opcode::rv_fcvt_h_lu,
+            Opcode::rv_fcvt_s_h, Opcode::rv_fcvt_d_h, Opcode::rv_fcvt_h_s, Opcode::rv_fcvt_h_d,
+            Opcode::rv_fmv_x_h, Opcode::rv_fmv_h_x, Opcode::rv_fminm_h, Opcode::rv_fmaxm_h,
+            Opcode::rv_fleq_h, Opcode::rv_fltq_h}
+            [opcode_index - static_cast<std::size_t>(RiscvOpcode::flh)];
     else
         return {DecodeStatus::invalid, {}, "RV64 opcode has no generic representation"};
 

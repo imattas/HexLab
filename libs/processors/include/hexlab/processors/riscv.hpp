@@ -135,7 +135,16 @@ enum class RiscvOpcode {
     // RVV signed and unsigned integer-to-floating vector conversions.
     vfcvt_f_xu_v, vfcvt_f_x_v,
     // RVV scalar-insert single-element slides; appended for opcode stability.
-    vslide1up_vx, vslide1down_vx, vfslide1up_vf, vfslide1down_vf
+    vslide1up_vx, vslide1down_vx, vfslide1up_vf, vfslide1down_vf,
+    // Zfh scalar half-precision arithmetic and transfer forms.
+    flh, fsh, fadd_h, fsub_h, fmul_h, fdiv_h, fsqrt_h,
+    fsgnj_h, fsgnjn_h, fsgnjx_h, fmin_h, fmax_h,
+    fmadd_h, fmsub_h, fnmsub_h, fnmadd_h,
+    feq_h, flt_h, fle_h, fclass_h,
+    fcvt_w_h, fcvt_wu_h, fcvt_l_h, fcvt_lu_h,
+    fcvt_h_w, fcvt_h_wu, fcvt_h_l, fcvt_h_lu,
+    fcvt_s_h, fcvt_d_h, fcvt_h_s, fcvt_h_d,
+    fmv_x_h, fmv_h_x, fminm_h, fmaxm_h, fleq_h, fltq_h
 };
 
 struct RiscvRegister {

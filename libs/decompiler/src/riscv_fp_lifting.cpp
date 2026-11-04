@@ -65,6 +65,21 @@ std::optional<Conversion> conversion(Opcode op) {
     case Opcode::rv_fcvt_d_s: return Conversion{"fcvt.d.s", floating(32), floating(64), false, 16, false};
     case Opcode::rv_fclass_s: return Conversion{"fclass.s", floating(32), integer(10), true};
     case Opcode::rv_fclass_d: return Conversion{"fclass.d", floating(64), integer(10), true};
+    case Opcode::rv_fclass_h: return Conversion{"fclass.h", floating(16), integer(10), true};
+    case Opcode::rv_fcvt_w_h: return Conversion{"fcvt.w.h", floating(16), integer(32, true), false, 17};
+    case Opcode::rv_fcvt_wu_h: return Conversion{"fcvt.wu.h", floating(16), integer(32, false), false, 17};
+    case Opcode::rv_fcvt_l_h: return Conversion{"fcvt.l.h", floating(16), integer(64, true), false, 17};
+    case Opcode::rv_fcvt_lu_h: return Conversion{"fcvt.lu.h", floating(16), integer(64, false), false, 17};
+    case Opcode::rv_fcvt_h_w: return Conversion{"fcvt.h.w", integer(32, true), floating(16), false, 1};
+    case Opcode::rv_fcvt_h_wu: return Conversion{"fcvt.h.wu", integer(32, false), floating(16), false, 1};
+    case Opcode::rv_fcvt_h_l: return Conversion{"fcvt.h.l", integer(64, true), floating(16), false, 1};
+    case Opcode::rv_fcvt_h_lu: return Conversion{"fcvt.h.lu", integer(64, false), floating(16), false, 1};
+    case Opcode::rv_fcvt_s_h: return Conversion{"fcvt.s.h", floating(16), floating(32), false, 0, false};
+    case Opcode::rv_fcvt_d_h: return Conversion{"fcvt.d.h", floating(16), floating(64), false, 0, false};
+    case Opcode::rv_fcvt_h_s: return Conversion{"fcvt.h.s", floating(32), floating(16), false, 23};
+    case Opcode::rv_fcvt_h_d: return Conversion{"fcvt.h.d", floating(64), floating(16), false, 23};
+    case Opcode::rv_fmv_x_h: return Conversion{"fmv.x.h", floating(16), integer(16), false, 0, false};
+    case Opcode::rv_fmv_h_x: return Conversion{"fmv.h.x", integer(16), floating(16), false, 0, false};
     default: return {};
     }
 }
@@ -75,11 +90,11 @@ std::optional<Statement> lift_riscv_fp_conversion(const Instruction &instruction
     const auto shape = conversion(instruction.opcode);
     if (!shape || operands.size() != 2 || instruction.operands.size() != 2) return {};
     const auto *destination = std::get_if<RegisterOperand>(&instruction.operands[0]);
-    if (!destination || (!shape->classify && !instruction.rounding_mode)) return {};
+    if (!destination || (shape->uses_rounding && !instruction.rounding_mode)) return {};
 
     auto source = operands[1];
     if (shape->source.kind == TypeKind::integer && source->type.bits > shape->source.bits)
-        source = unary("trunc32", source, shape->source);
+        source = unary("trunc" + std::to_string(shape->source.bits), source, shape->source);
     else source = typed(source, shape->source);
 
     Intrinsic effect{shape->name, {source}, IntrinsicMemoryEffect::none};

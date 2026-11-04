@@ -200,6 +200,18 @@ ValueType vector_type(std::uint16_t bits, TypeKind element_kind = TypeKind::unkn
     return {TypeKind::vector, bits, element_signed, element_kind, element_bits, lanes};
 }
 std::string riscv_fp_name(Opcode op) {
+    if (op >= Opcode::rv_flh && op <= Opcode::rv_fltq_h) {
+        static constexpr const char *half_names[]{
+            "flh","fsh","fadd.h","fsub.h","fmul.h","fdiv.h","fsqrt.h",
+            "fsgnj.h","fsgnjn.h","fsgnjx.h","fmin.h","fmax.h",
+            "fmadd.h","fmsub.h","fnmsub.h","fnmadd.h",
+            "feq.h","flt.h","fle.h","fclass.h",
+            "fcvt.w.h","fcvt.wu.h","fcvt.l.h","fcvt.lu.h",
+            "fcvt.h.w","fcvt.h.wu","fcvt.h.l","fcvt.h.lu",
+            "fcvt.s.h","fcvt.d.h","fcvt.h.s","fcvt.h.d",
+            "fmv.x.h","fmv.h.x","fminm.h","fmaxm.h","fleq.h","fltq.h"};
+        return half_names[static_cast<std::size_t>(op) - static_cast<std::size_t>(Opcode::rv_flh)];
+    }
     if (op == Opcode::rv_fround_h) return "fround.h";
     if (op == Opcode::rv_froundnx_h) return "froundnx.h";
     if (op == Opcode::rv_fleq_s) return "fleq.s";
@@ -5057,50 +5069,57 @@ a64_unhandled:
             effect.register_writes = instruction.register_writes;
             return effect;
         }
-        if (op >= Opcode::rv_fminm_s && op <= Opcode::rv_fmaxm_d) {
+        if ((op >= Opcode::rv_fminm_s && op <= Opcode::rv_fmaxm_d) ||
+            op == Opcode::rv_fminm_h || op == Opcode::rv_fmaxm_h) {
             std::vector<ExpressionPtr> inputs(operands.begin() + 1, operands.end());
             for (const auto &reg : instruction.register_reads)
                 if (reg.bank == RegisterBank::riscv_fstatus) inputs.push_back(reg_expr(reg));
             const auto name = op == Opcode::rv_fminm_s ? "fminm.s" : op == Opcode::rv_fmaxm_s ? "fmaxm.s" :
-                              op == Opcode::rv_fminm_d ? "fminm.d" : "fmaxm.d";
+                              op == Opcode::rv_fminm_d ? "fminm.d" : op == Opcode::rv_fmaxm_d ? "fmaxm.d" :
+                              op == Opcode::rv_fminm_h ? "fminm.h" : "fmaxm.h";
             Intrinsic effect{name, std::move(inputs), IntrinsicMemoryEffect::none};
             effect.register_writes = instruction.register_writes;
-            effect.result_type = floating_type((op == Opcode::rv_fminm_s || op == Opcode::rv_fmaxm_s) ? 32 : 64);
+            effect.result_type = floating_type((op == Opcode::rv_fminm_s || op == Opcode::rv_fmaxm_s) ? 32 :
+                (op == Opcode::rv_fminm_h || op == Opcode::rv_fmaxm_h) ? 16 : 64);
             return effect;
         }
-        if ((op >= Opcode::rv_flw && op <= Opcode::rv_fmv_d_x) || op == Opcode::rv_fcvtmod_w_d ||
+        if ((op >= Opcode::rv_flw && op <= Opcode::rv_fmv_d_x) ||
+            (op >= Opcode::rv_flh && op <= Opcode::rv_fltq_h) || op == Opcode::rv_fcvtmod_w_d ||
             (op >= Opcode::rv_fleq_s && op <= Opcode::rv_fltq_d) ||
             op == Opcode::rv_fli_h || op == Opcode::rv_fli_s || op == Opcode::rv_fli_d ||
             (op >= Opcode::rv_fround_s && op <= Opcode::rv_froundnx_d) ||
             op == Opcode::rv_fround_h || op == Opcode::rv_froundnx_h) {
             if (auto converted = lift_riscv_fp_conversion(instruction, operands)) return *converted;
-            if ((op == Opcode::rv_flw || op == Opcode::rv_fld) && dst && operands.size() >= 2) {
+            if ((op == Opcode::rv_flw || op == Opcode::rv_fld || op == Opcode::rv_flh) &&
+                dst && operands.size() >= 2) {
                 auto loaded = *operands[1];
                 if (auto *memory = std::get_if<MemoryValue>(&loaded.value)) {
-                    const auto type = floating_type(op == Opcode::rv_flw ? 32 : 64);
+                    const auto type = floating_type(op == Opcode::rv_flh ? 16 : op == Opcode::rv_flw ? 32 : 64);
                     loaded.type = type; memory->type = type;
                 }
                 return Assign{*dst, std::make_shared<Expression>(std::move(loaded))};
             }
-            if ((op == Opcode::rv_fsw || op == Opcode::rv_fsd) && operands.size() >= 2) {
+            if ((op == Opcode::rv_fsw || op == Opcode::rv_fsd || op == Opcode::rv_fsh) && operands.size() >= 2) {
                 auto address = *operands[1];
                 if (auto *memory = std::get_if<MemoryValue>(&address.value)) {
-                    const auto type = floating_type(op == Opcode::rv_fsw ? 32 : 64);
+                    const auto type = floating_type(op == Opcode::rv_fsh ? 16 : op == Opcode::rv_fsw ? 32 : 64);
                     address.type = type; memory->type = type;
                 }
-                const std::uint16_t width = op == Opcode::rv_fsw ? 32 : 64;
+                const std::uint16_t width = op == Opcode::rv_fsh ? 16 : op == Opcode::rv_fsw ? 32 : 64;
                 const auto stored = retag_expr(operands[0], floating_type(width));
                 return Store{std::make_shared<Expression>(std::move(address)), stored};
             }
             std::vector<ExpressionPtr> inputs;
+            const bool half = op >= Opcode::rv_flh && op <= Opcode::rv_fltq_h;
             const bool single = op <= Opcode::rv_fmv_w_x || op == Opcode::rv_fcvt_d_s || op == Opcode::rv_fmv_x_w ||
                                 op == Opcode::rv_fleq_s || op == Opcode::rv_fltq_s;
             const bool raw_move = op == Opcode::rv_fmv_x_w || op == Opcode::rv_fmv_x_d ||
-                                  op == Opcode::rv_fmv_w_x || op == Opcode::rv_fmv_d_x;
+                                  op == Opcode::rv_fmv_w_x || op == Opcode::rv_fmv_d_x ||
+                                  op == Opcode::rv_fmv_x_h || op == Opcode::rv_fmv_h_x;
             for (std::size_t n = 1; n < operands.size(); ++n) {
                 auto input = operands[n];
                 if (input->type.kind == TypeKind::floating) {
-                    const std::uint16_t width = op == Opcode::rv_fcvt_s_d || op == Opcode::rv_fmv_x_d
+                    const std::uint16_t width = half ? 16 : op == Opcode::rv_fcvt_s_d || op == Opcode::rv_fmv_x_d
                                                     ? 64 : op == Opcode::rv_fcvt_d_s || op == Opcode::rv_fmv_x_w
                                                     ? 32 : single ? 32 : 64;
                     input = retag_expr(input, raw_move ? integer_type(width) : floating_type(width));
@@ -5113,6 +5132,7 @@ a64_unhandled:
                     case Opcode::rv_fcvt_s_l: case Opcode::rv_fcvt_s_lu:
                     case Opcode::rv_fcvt_d_l: case Opcode::rv_fcvt_d_lu:
                     case Opcode::rv_fmv_d_x: integer_width = 64; break;
+                    case Opcode::rv_fmv_h_x: integer_width = 16; break;
                     default: break;
                     }
                     if (integer_width != 0)
@@ -5127,6 +5147,12 @@ a64_unhandled:
             Intrinsic effect{riscv_fp_name(op), std::move(inputs), IntrinsicMemoryEffect::none};
             effect.register_writes = instruction.register_writes;
             if (dst && dst->bank == RegisterBank::riscv_fpr) {
+                const bool half_result = (op >= Opcode::rv_fadd_h && op <= Opcode::rv_fmax_h) ||
+                    (op >= Opcode::rv_fmadd_h && op <= Opcode::rv_fnmadd_h) ||
+                    op == Opcode::rv_fcvt_h_w || op == Opcode::rv_fcvt_h_wu ||
+                    op == Opcode::rv_fcvt_h_l || op == Opcode::rv_fcvt_h_lu ||
+                    op == Opcode::rv_fcvt_h_s || op == Opcode::rv_fcvt_h_d ||
+                    op == Opcode::rv_fmv_h_x;
                 const bool single_result = op == Opcode::rv_flw ||
                     (op >= Opcode::rv_fadd_s && op <= Opcode::rv_fmax_s) ||
                     (op >= Opcode::rv_fmadd_s && op <= Opcode::rv_fnmadd_s) ||
@@ -5139,9 +5165,14 @@ a64_unhandled:
                     op == Opcode::rv_fcvt_d_w || op == Opcode::rv_fcvt_d_wu ||
                     op == Opcode::rv_fcvt_d_l || op == Opcode::rv_fcvt_d_lu ||
                     op == Opcode::rv_fcvt_d_s || op == Opcode::rv_fmv_d_x;
-                if (single_result) effect.result_type = floating_type(32);
+                if (half_result) effect.result_type = floating_type(16);
+                else if (single_result) effect.result_type = floating_type(32);
                 else if (double_result) effect.result_type = floating_type(64);
             }
+            else if (dst && dst->bank == RegisterBank::riscv_gpr &&
+                     (op == Opcode::rv_feq_h || op == Opcode::rv_flt_h || op == Opcode::rv_fle_h ||
+                      op == Opcode::rv_fleq_h || op == Opcode::rv_fltq_h))
+                effect.result_type = integer_type(dst->width);
             return effect;
         }
         if (dst && dst->bank == RegisterBank::riscv_gpr && dst->index == 0 && instruction.flow == FlowKind::fallthrough) return Intrinsic{"nop", {}, IntrinsicMemoryEffect::none};
