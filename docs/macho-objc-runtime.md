@@ -78,14 +78,18 @@ metadata byte and entry-count budgets:
   required instance and class methods through its exact adopted-protocol links.
   Each requirement retains the `__objc_protolist` definition index that
   declared it, so inherited requirements remain attributable. Method evidence
-  combines the class's validated methods with methods from its linked scanned
-  categories; it does not infer superclass methods or category registrations
-  outside the image. Cycles, unresolved adoption links, incomplete protocol
-  declarations, inheritance deeper than 32, or exhausted requirement-work
-  budgets downgrade the result to partial evidence. Protocol declarations need
-  validated selector names; their implementation pointers are not required to
-  be non-null. The flattened requirement and emitted-result work are each
-  bounded by `max_protocol_requirement_work` (200,000 by default).
+  starts with the class's validated methods and linked categories, then walks
+  the resolved in-image superclass chain and its linked categories. The nearest
+  implementation wins when a subclass overrides a selector; duplicate methods
+  at one hierarchy level remain ambiguous. External or unscanned superclasses,
+  cycles, unresolved adoption links, incomplete method/protocol lists, hierarchy
+  depth above 32, or exhausted requirement/method work budgets produce partial
+  evidence rather than a false missing-method result. The superclass-depth
+  bound is `max_class_hierarchy_depth` (32 by default), and method candidates
+  share the `max_protocol_requirement_work` budget (200,000 by default).
+  Protocol declarations need validated selector names; their implementation
+  pointers are not required to be non-null. The desktop browser includes the
+  matched implementation address in the protocol requirement detail.
 - Metaclass `class_ro_t` records retain their raw compiler-emitted flags and
   report the recognized ObjC2 flag names through the same decoder used for
   ordinary classes. Runtime realization/future bits remain unsupported and

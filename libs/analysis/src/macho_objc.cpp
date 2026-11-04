@@ -866,7 +866,7 @@ Result<MachOObjCScan> scan_macho_objc_classes(const Image &image, const ImageMet
         return Error{ErrorCode::conflict, "Objective-C selected slice and mapped-image pointer width or byte order disagree"};
     if (!limits.max_classes || !limits.max_categories || !limits.max_protocols || !limits.max_metadata_bytes ||
         !limits.max_name_bytes || !limits.max_ivar_layout_bytes || !limits.max_list_entries || !limits.max_protocol_inheritance_depth ||
-        !limits.max_protocol_requirement_work)
+        !limits.max_protocol_requirement_work || !limits.max_class_hierarchy_depth)
         return Error{ErrorCode::invalid_argument, "Objective-C scan limits must be nonzero"};
     auto resolver = RelocationResolver::create(image, metadata, stop);
     if (!resolver) return resolver.error();
@@ -1365,9 +1365,8 @@ Result<MachOObjCScan> scan_macho_objc_classes(const Image &image, const ImageMet
     for (auto &row : scan.categories) link_protocols(row.protocols);
     for (auto &row : scan.protocols) link_protocols(row.adopted_protocols);
     // Check required methods for protocols directly adopted by each class,
-    // including those protocols' bounded adopted-protocol contracts. Only
-    // selectors in validated method lists count; superclass methods and
-    // categories outside the scanned image are not guessed.
+    // including their bounded adopted-protocol contracts and validated
+    // implementations inherited from the scanned superclass chain.
     const auto complete_method_list = [](const MachOObjCList &list) {
         return (list.status == "null" || list.status.ends_with("/extent-validated")) &&
             std::all_of(list.methods.begin(), list.methods.end(),
@@ -1448,6 +1447,43 @@ Result<MachOObjCScan> scan_macho_objc_classes(const Image &image, const ImageMet
                 index[*method.selector].push_back(method.implementation);
         }
     };
+    std::size_t class_hierarchy_method_work = 0;
+    const auto append_class_methods = [&](SelectorIndex &instance, SelectorIndex &class_methods,
+                                          const MachOObjCClass &candidate, bool &complete) {
+        if (!complete_method_list(candidate.methods) || !complete_method_list(candidate.class_methods))
+            complete = false;
+        const auto append = [&](SelectorIndex &index, const MachOObjCList &list) {
+            for (const auto &method : list.methods) {
+                if (class_hierarchy_method_work >= limits.max_protocol_requirement_work) {
+                    complete = false;
+                    scan.complete = false;
+                    if (scan.reason.empty())
+                        scan.reason = "Objective-C inherited method evidence exhausted its work budget";
+                    return false;
+                }
+                ++class_hierarchy_method_work;
+                if (method.selector)
+                    index[*method.selector].push_back(method.implementation);
+            }
+            return true;
+        };
+        if (!append(instance, candidate.methods) || !append(class_methods, candidate.class_methods))
+            return false;
+        for (const auto category_index : candidate.category_indices) {
+            if (category_index >= scan.categories.size()) {
+                complete = false;
+                continue;
+            }
+            const auto &category = scan.categories[category_index];
+            if (!complete_method_list(category.instance_methods) ||
+                !complete_method_list(category.class_methods))
+                complete = false;
+            if (!append(instance, category.instance_methods) ||
+                !append(class_methods, category.class_methods))
+                return false;
+        }
+        return true;
+    };
     std::size_t emitted_protocol_requirement_work = 0;
     const auto check_protocol_requirements = [&](MachOObjCProtocolReference &reference,
         const ProtocolContract &contract,
@@ -1469,7 +1505,7 @@ Result<MachOObjCScan> scan_macho_objc_classes(const Image &image, const ImageMet
                     result.implementation = *found->second.front();
                     result.status = "implemented";
                 } else result.status = "implementation-unresolved";
-            } else result.status = fully_checked ? "missing-in-scanned-image" : "unverified-incomplete-method-lists";
+            } else result.status = fully_checked ? "missing-in-scanned-hierarchy" : "unverified-incomplete-method-lists";
             reference.requirements.push_back(std::move(result));
             ++emitted_protocol_requirement_work;
         }
@@ -1477,25 +1513,61 @@ Result<MachOObjCScan> scan_macho_objc_classes(const Image &image, const ImageMet
         else if (!fully_checked) reference.conformance_status = "partial-method-evidence";
         else if (std::all_of(reference.requirements.begin(), reference.requirements.end(),
                      [](const auto &requirement) { return requirement.status == "implemented"; }))
-            reference.conformance_status = "required-methods-present-in-scanned-image";
+            reference.conformance_status = "required-methods-present-in-scanned-hierarchy";
         else if (std::any_of(reference.requirements.begin(), reference.requirements.end(),
                      [](const auto &requirement) { return requirement.status == "ambiguous-implementation"; }))
             reference.conformance_status = "ambiguous-method-evidence";
-        else reference.conformance_status = "required-methods-missing-from-scanned-image";
+        else reference.conformance_status = "required-methods-missing-from-scanned-hierarchy";
     };
     for (auto &owner : scan.classes) {
+        if (owner.protocols.protocol_references.empty())
+            continue;
         SelectorIndex instance_methods, class_methods;
         bool fully_checked = scan.complete && complete_method_list(owner.methods) &&
             complete_method_list(owner.class_methods);
-        add_method_candidates(instance_methods, owner.methods);
-        add_method_candidates(class_methods, owner.class_methods);
-        for (const auto index : owner.category_indices) {
-            if (index >= scan.categories.size()) { fully_checked = false; continue; }
-            const auto &category = scan.categories[index];
-            fully_checked = fully_checked && complete_method_list(category.instance_methods) &&
-                complete_method_list(category.class_methods);
-            add_method_candidates(instance_methods, category.instance_methods);
-            add_method_candidates(class_methods, category.class_methods);
+        if (!append_class_methods(instance_methods, class_methods, owner, fully_checked))
+            fully_checked = false;
+
+        std::vector<MetadataAddressKey> visited_superclasses;
+        if (owner.class_address)
+            visited_superclasses.push_back(address_key(*owner.class_address));
+        auto next_superclass = owner.superclass_address;
+        for (std::size_t depth = 0; next_superclass; ++depth) {
+            if (depth >= limits.max_class_hierarchy_depth) {
+                fully_checked = false;
+                break;
+            }
+            const auto key = address_key(*next_superclass);
+            if (std::find(visited_superclasses.begin(), visited_superclasses.end(), key) !=
+                visited_superclasses.end()) {
+                fully_checked = false;
+                break;
+            }
+            visited_superclasses.push_back(key);
+            const auto parent = class_indices_by_address.find(key);
+            if (parent == class_indices_by_address.end()) {
+                // A superclass outside the scanned image can satisfy a
+                // requirement, but its implementation cannot be proven here.
+                fully_checked = false;
+                break;
+            }
+            const auto &ancestor = scan.classes[parent->second];
+            SelectorIndex nearest_instance, nearest_class;
+            if (!ancestor.complete ||
+                !append_class_methods(nearest_instance, nearest_class, ancestor, fully_checked)) {
+                fully_checked = false;
+            }
+            // Use the nearest in-image implementation. Multiple definitions
+            // within a single hierarchy level remain explicitly ambiguous.
+            for (auto &[selector, methods] : nearest_instance)
+                instance_methods.try_emplace(selector, std::move(methods));
+            for (auto &[selector, methods] : nearest_class)
+                class_methods.try_emplace(selector, std::move(methods));
+            next_superclass = ancestor.superclass_address;
+            if (ancestor.superclass_pointer_status != "null" && !next_superclass) {
+                fully_checked = false;
+                break;
+            }
         }
         for (auto &reference : owner.protocols.protocol_references) {
             reference.requirements.clear();

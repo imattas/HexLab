@@ -187,6 +187,7 @@ struct MachOObjCLimits {
     std::uint32_t max_list_entries = 1000000;
     std::size_t max_protocol_inheritance_depth = 32;
     std::size_t max_protocol_requirement_work = 200000;
+    std::size_t max_class_hierarchy_depth = 32;
 };
 
 struct MachOObjCScan {

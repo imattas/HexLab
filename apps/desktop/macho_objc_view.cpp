@@ -134,6 +134,8 @@ void add_protocol_reference(std::vector<MachOObjCViewRow> &rows, const MachOObjC
         requirements += "; ";
         requirements += requirement.class_method ? "+" : "-";
         requirements += requirement.selector + "=" + requirement.status;
+        if (requirement.implementation)
+            requirements += "@" + number(requirement.implementation->offset);
     }
     if (reference.requirements.size() > shown_limit)
         requirements += "; omitted-requirements=" +
