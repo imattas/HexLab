@@ -852,7 +852,7 @@ int modules_command(std::span<const std::wstring_view> arguments, std::ostream &
             remaining.dependency_rows -= report.rows.size();
             remaining.dependency_name_bytes -= report.dependency_name_bytes;
             for (const auto &row : report.rows) {
-                auto &resolution = discovered_dependencies[source][row.name];
+                auto &resolution = discovered_dependencies[source][leaf(row.name)];
                 resolution.dependency_kind = row.delay_load && !row.eager_load ? "delay-load" : "eager-load";
                 resolution.filesystem_errors = row.filesystem_errors;
                 resolution.escaped_paths = row.escaped_paths;
@@ -1360,6 +1360,12 @@ int modules_command(std::span<const std::wstring_view> arguments, std::ostream &
             raw_dependency_rows += deps.size();
             for (const auto &dep : deps) dependency_name_bytes += dep.size();
             sort_dependencies(deps);
+            if (is_pe_module(modules[source].document->metadata)) {
+                std::set<std::string> seen_pe_names;
+                deps.erase(std::remove_if(deps.begin(), deps.end(), [&](const auto &name) {
+                    return !seen_pe_names.insert(leaf(name)).second;
+                }), deps.end());
+            }
             if (deps.size() > max_graph_edges - edge_count) {
                 err << "Dependency graph exceeds " << max_graph_edges << " unique dependency rows.\n";
                 return 2;
@@ -1374,7 +1380,9 @@ int modules_command(std::span<const std::wstring_view> arguments, std::ostream &
                     path_resolution_authoritative = true;
                     const auto importer = discovered_dependencies.find(source);
                     if (importer != discovered_dependencies.end()) {
-                        const auto found = importer->second.find(edge.name);
+                        const auto &lookup_name = is_pe_module(modules[source].document->metadata)
+                            ? leaf(edge.name) : edge.name;
+                        const auto found = importer->second.find(lookup_name);
                         if (found != importer->second.end()) {
                             edge.discovery = &found->second;
                             edge.providers = &found->second.providers;
