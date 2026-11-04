@@ -75,6 +75,7 @@ namespace {
 struct ArgumentError {
     std::string message;
 };
+std::string_view string_encoding_label(StringEncoding encoding);
 [[noreturn]] void argument_error(std::string message) { throw ArgumentError{std::move(message)}; }
 std::string hex(std::uint64_t value) {
     std::ostringstream out;
