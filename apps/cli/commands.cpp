@@ -639,6 +639,7 @@ int modules_command(std::span<const std::wstring_view> arguments, std::ostream &
     std::string lib_token, platform_token;
     std::vector<std::filesystem::path> discovery_directories, ld_library_path_directories;
     bool graph_mode = false, discover = false, glibc_system_search = false;
+    bool pe_windows_default_search = false;
     std::size_t option_count = 0;
     while (option_count < arguments.size()) {
         const auto option = arguments[option_count];
@@ -646,6 +647,7 @@ int modules_command(std::span<const std::wstring_view> arguments, std::ostream &
         if (option == L"--graph") graph_mode = true;
         else if (option == L"--discover") discover = true;
         else if (option == L"--glibc-system-search") glibc_system_search = true;
+        else if (option == L"--windows-default-search") pe_windows_default_search = true;
         else if (option == L"--sysroot" || option == L"--search-dir" || option == L"--ld-library-path-dir" || option == L"--target-cwd" ||
                  option == L"--lib-token" || option == L"--platform-token") {
             if (++option_count == arguments.size()) {
@@ -675,14 +677,14 @@ int modules_command(std::span<const std::wstring_view> arguments, std::ostream &
     }
     const auto inputs = arguments.subspan(option_count);
     if ((graph_mode && inputs.empty()) || (!graph_mode && inputs.size() < 2)) {
-        err << "Usage: hexlab_cli modules [--sysroot <directory>] [--discover] [--glibc-system-search] [--search-dir <directory>] [--ld-library-path-dir <directory>] [--target-cwd <directory>] [--lib-token <value>] [--platform-token <value>] [--graph] <binary>...\n"
+        err << "Usage: hexlab_cli modules [--sysroot <directory>] [--discover] [--glibc-system-search] [--windows-default-search] [--search-dir <directory>] [--ld-library-path-dir <directory>] [--target-cwd <directory>] [--lib-token <value>] [--platform-token <value>] [--graph] <binary>...\n"
                "       Graph mode starts at the first binary. Discovery requires --graph and --sysroot.\n";
         return 2;
     }
     if ((sysroot && !graph_mode) || (discover && (!graph_mode || !sysroot)) ||
         (!discovery_directories.empty() && !discover) || (!ld_library_path_directories.empty() && !discover) ||
-        ((target_working_directory || !lib_token.empty() || !platform_token.empty() || glibc_system_search) && !discover)) {
-        err << "--discover requires --graph and --sysroot; --search-dir, --ld-library-path-dir, target path substitutions and --glibc-system-search require --discover.\n";
+        ((target_working_directory || !lib_token.empty() || !platform_token.empty() || glibc_system_search || pe_windows_default_search) && !discover)) {
+        err << "--discover requires --graph and --sysroot; --search-dir, --ld-library-path-dir, target path substitutions, --glibc-system-search and --windows-default-search require --discover.\n";
         return 2;
     }
     constexpr std::size_t max_graph_modules = 4096;
@@ -794,13 +796,132 @@ int modules_command(std::span<const std::wstring_view> arguments, std::ostream &
     };
     std::map<std::size_t, std::map<std::string, DiscoveredDependency>> discovered_dependencies;
     const auto supplied_count = modules.size();
-    if (discover && !modules.front().document->metadata.elf && !modules.front().document->metadata.macho) {
-        err << "Filesystem dependency discovery currently requires an ELF or Mach-O root.\n";
+    if (discover && !modules.front().document->metadata.elf && !modules.front().document->metadata.macho &&
+        modules.front().document->metadata.format != "PE32" && modules.front().document->metadata.format != "PE32+") {
+        err << "Filesystem dependency discovery requires a PE, ELF, or Mach-O root.\n";
+        return 2;
+    }
+    if (discover && pe_windows_default_search && modules.front().document->metadata.format != "PE32" &&
+        modules.front().document->metadata.format != "PE32+") {
+        err << "--windows-default-search requires a PE graph root.\n";
         return 2;
     }
     if (discover && !ld_library_path_directories.empty() && !modules.front().document->metadata.elf) {
         err << "--ld-library-path-dir is supported only for ELF dependency discovery.\n";
         return 2;
+    }
+    if (discover && (modules.front().document->metadata.format == "PE32" ||
+                     modules.front().document->metadata.format == "PE32+")) {
+        std::map<std::string, std::size_t> module_ids;
+        std::map<std::string, std::shared_ptr<const DocumentSnapshot>> loaded_files;
+        for (std::size_t index = 0; index < modules.size(); ++index) {
+            std::error_code ec;
+            const auto canonical = std::filesystem::canonical(modules[index].path, ec);
+            if (!ec) {
+                const auto key = path_key(canonical);
+                module_ids.try_emplace(key, index);
+                loaded_files.try_emplace(key, modules[index].document);
+            }
+        }
+        struct PendingPe { std::size_t index = 0, depth = 0; };
+        std::vector<PendingPe> pending{{0, 0}};
+        std::set<std::size_t> queued{0};
+        PeDependencyDiscoveryLimits remaining;
+        out << "PE sysroot file discovery (effective search-rank candidates retained):\n";
+        for (std::size_t cursor = 0; cursor < pending.size(); ++cursor) {
+            const auto current = pending[cursor];
+            const auto source = current.index;
+            const auto &source_image = *modules[source].document;
+            const auto target_bitness = source_image.metadata.format == "PE32"
+                ? PeDependencyTargetBitness::pe32 : PeDependencyTargetBitness::pe32_plus;
+            auto found = discover_pe_dependency_files(source_image.metadata.imports, modules[source].path,
+                *canonical_sysroot, discovery_directories, remaining, {}, pe_windows_default_search, target_bitness);
+            if (!found) {
+                err << path_text(modules[source].path) << ": " << found.error().message << '\n';
+                return 1;
+            }
+            const auto &report = found.value();
+            if (report.directory_entries > remaining.directory_entries || report.candidates > remaining.candidates ||
+                report.rows.size() > remaining.dependency_rows ||
+                report.dependency_name_bytes > remaining.dependency_name_bytes) {
+                err << "PE dependency discovery exceeded its remaining graph budget.\n";
+                return 2;
+            }
+            remaining.directory_entries -= report.directory_entries;
+            remaining.candidates -= report.candidates;
+            remaining.dependency_rows -= report.rows.size();
+            remaining.dependency_name_bytes -= report.dependency_name_bytes;
+            for (const auto &row : report.rows) {
+                auto &resolution = discovered_dependencies[source][row.name];
+                resolution.dependency_kind = row.delay_load && !row.eager_load ? "delay-load" : "eager-load";
+                resolution.filesystem_errors = row.filesystem_errors;
+                resolution.escaped_paths = row.escaped_paths;
+                out << "  [" << source << "] " << row.name << " " << resolution.dependency_kind << '\n';
+                if (!row.effective_precedence) {
+                    out << "    unresolved (no sysroot candidate)\n";
+                    continue;
+                }
+                for (const auto &candidate : row.candidates) {
+                    if (candidate.precedence != *row.effective_precedence) continue;
+                    const auto key = path_key(candidate.path);
+                    auto loaded = loaded_files.find(key);
+                    if (loaded == loaded_files.end()) {
+                        if (current.depth + 1 >= max_graph_depth) {
+                            resolution.depth_limited = true;
+                            continue;
+                        }
+                        if (loaded_files.size() >= max_graph_modules) {
+                            err << "Dependency discovery exceeds 4096 distinct inspected files.\n";
+                            return 2;
+                        }
+                        OpenRequest request;
+                        request.path = candidate.path;
+                        request.run_analysis = false;
+                        auto document = load_document(request, {{loaded_files.size()}, 1}, {});
+                        if (!document) {
+                            ++resolution.filesystem_errors;
+                            out << "    rejected " << path_text(candidate.path) << ": "
+                                << document.error().message << '\n';
+                            continue;
+                        }
+                        loaded = loaded_files.emplace(key, document.value()).first;
+                    }
+                    const auto compatibility = classify_pe_module_compatibility(
+                        source_image.metadata, loaded->second->metadata);
+                    if (compatibility != PeModuleCompatibility::compatible) {
+                        ++resolution.incompatible_files;
+                        const char *reason = compatibility == PeModuleCompatibility::machine_mismatch
+                            ? "COFF machine mismatch"
+                            : compatibility == PeModuleCompatibility::optional_header_mismatch
+                                ? "PE32/PE32+ mismatch" : "not a PE image";
+                        out << "    rejected " << path_text(candidate.path) << ": " << reason << '\n';
+                        continue;
+                    }
+                    auto id = module_ids.find(key);
+                    if (id == module_ids.end()) {
+                        if (modules.size() >= max_graph_modules) {
+                            err << "Dependency discovery exceeds 4096 graph modules.\n";
+                            return 2;
+                        }
+                        id = module_ids.emplace(key, modules.size()).first;
+                        modules.push_back({candidate.path, loaded->second});
+                    }
+                    resolution.providers.push_back(id->second);
+                    out << "    [" << id->second << "] " << path_text(candidate.path)
+                        << " via search rank " << candidate.precedence << '\n';
+                }
+                std::sort(resolution.providers.begin(), resolution.providers.end());
+                resolution.providers.erase(std::unique(resolution.providers.begin(), resolution.providers.end()),
+                                           resolution.providers.end());
+                if (resolution.providers.size() == 1 && current.depth + 1 < max_graph_depth) {
+                    const auto child = resolution.providers.front();
+                    if (queued.insert(child).second) pending.push_back({child, current.depth + 1});
+                }
+            }
+        }
+        out << "PE discovery summary: " << modules.size() << " graph modules, "
+            << remaining.directory_entries << " directory-entry probes remaining, "
+            << remaining.candidates << " candidates remaining.\n";
     }
     if (discover && modules.front().document->metadata.elf) {
         std::map<std::string, std::size_t> module_ids;
@@ -1248,7 +1369,8 @@ int modules_command(std::span<const std::wstring_view> arguments, std::ostream &
             for (auto &dep : deps) {
                 Edge edge{std::move(dep), {}};
                 bool path_resolution_authoritative = false;
-                if (discover && (modules[source].document->metadata.elf || modules[source].document->metadata.macho)) {
+                if (discover && (modules[source].document->metadata.elf || modules[source].document->metadata.macho ||
+                                 is_pe_module(modules[source].document->metadata))) {
                     path_resolution_authoritative = true;
                     const auto importer = discovered_dependencies.find(source);
                     if (importer != discovered_dependencies.end()) {

@@ -57,6 +57,25 @@ inherited RPATH lookup, and filesystem discovery are not implemented by this
 supplied-file path mode. This is a partial path-resolution aid, not full loader
 precedence.
 
+PE graphs also support recursive discovery under the explicit sysroot:
+
+```text
+hexlab_cli modules --sysroot ./sdk --discover --graph ./sdk/bin/app.exe
+hexlab_cli modules --sysroot ./sdk --discover --windows-default-search --graph ./sdk/bin/app.exe
+```
+
+PE traversal searches the importing image's directory, then caller-provided
+`--search-dir` entries. `--windows-default-search` additionally checks the
+target-bitness-aware `Windows/System32` or `Windows/SysWOW64` directory and
+then `Windows`, all beneath the sysroot. Only candidates at the earliest rank
+are considered for an edge; multiple same-rank providers remain ambiguous,
+and later ranks are shadowed. Each candidate is loaded as metadata and checked
+for a compatible COFF machine and PE32/PE32+ class before it becomes a graph
+node. Traversal uses the existing 4,096-module, 100,000 dependency/candidate,
+1,000,000 directory-entry, and 64-level bounds. It never loads or executes a
+discovered image and does not model API-set redirection, KnownDLLs, activation
+contexts, WOW64 filesystem redirection, or the full Windows loader policy.
+
 Add `--glibc-system-search` to explicitly include the target sysroot's glibc
 cache and standard default directories in filesystem discovery:
 
