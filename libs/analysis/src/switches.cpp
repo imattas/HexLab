@@ -1036,23 +1036,26 @@ std::optional<SwitchBound> guarded_case_bound(const Image &image, const Function
                 // [0, bound) for the table. The classic delay slot executes
                 // on both paths and must be a known, side-effect-free op.
                 mips_strict_upper_bound = true;
-            } else if (context.architecture == Architecture::powerpc && context.mode == ExecutionMode::ppc32 &&
+            } else if (context.architecture == Architecture::powerpc &&
+                       (context.mode == ExecutionMode::ppc32 || context.mode == ExecutionMode::ppc64) &&
                        compare.opcode == Opcode::ppc_cmpli && compare.operands.size() == 3 &&
                        branch.opcode == Opcode::ppc_bc && branch.operands.size() == 4) {
-                // CMPLWI CRf, rSelector, bound; BGE CRf, default. BO=4
-                // branches when the selected CR bit is clear; BI=4*f selects
-                // the LT bit set by CMPLI in CR field f, so fallthrough proves
-                // the unsigned interval [0, bound).
+                // CMPLWI/CMPLDI CRf, rSelector, bound; BGE CRf, default.
+                // BO=4 branches when the selected CR bit is clear; BI=4*f
+                // selects the LT bit set by CMPLI in CR field f, so fallthrough
+                // proves the unsigned interval [0, bound).
                 const auto *field = register_operand(compare, 0);
                 compared_register = register_operand(compare, 1);
                 immediate = std::get_if<ImmediateOperand>(&compare.operands[2]);
                 const auto *bo = std::get_if<ImmediateOperand>(&branch.operands[0]);
                 const auto *bi = std::get_if<ImmediateOperand>(&branch.operands[1]);
                 const auto *branch_field = register_operand(branch, 2);
+                const auto compare_width = context.mode == ExecutionMode::ppc64 ? 64u : 32u;
                 if (!field || field->bank != RegisterBank::ppc_cr || field->width != 4 ||
                     !compared_register || compared_register->bank != RegisterBank::ppc_gpr ||
-                    compared_register->width != 32 || !immediate || immediate->encoded_width != 16 ||
-                    immediate->effective_width != 32 || immediate->is_signed || immediate->value == 0 ||
+                    compared_register->width != compare_width || !immediate || immediate->encoded_width != 16 ||
+                    (immediate->effective_width != 32 && immediate->effective_width != compare_width) ||
+                    immediate->is_signed || immediate->value == 0 ||
                     immediate->value > max_entries || !bo || bo->value != 4 || !bi ||
                     bi->value != static_cast<std::uint64_t>(field->index) * 4 ||
                     !branch_field || branch_field->bank != RegisterBank::ppc_cr ||
@@ -4338,7 +4341,7 @@ std::optional<SwitchSite> mips32_register_absolute_switch(
         ? std::optional<SwitchSite>(std::move(site)) : std::nullopt;
 }
 
-std::optional<SwitchSite> ppc32_register_absolute_switch(
+std::optional<SwitchSite> ppc_register_switch(
     const Image &image, const FunctionRecord &function, const FunctionSnapshot &snapshot,
     const std::vector<std::shared_ptr<const InstructionFact>> &facts,
     std::size_t dispatch_index, SwitchGuardContext &guards, const RelocationResolver *relocations,
@@ -4348,18 +4351,23 @@ std::optional<SwitchSite> ppc32_register_absolute_switch(
     //   LWZX target, tableBase, index; [ADD target, tableBase, target];
     //   or for relative halfwords, LHAX target, tableBase, index; ADD target, codeBase, target;
     //   MTCTR target; BCTR.
+    // PPC64 absolute tables use the same base materialization with either
+    // MULLI index, selector, 8 or SLDI index, selector, 3; LDX then loads an
+    // XLEN-sized pointer before MTCTR/BCTR.
     // This deliberately handles linked images with literal instruction
     // immediates. Relocation-paired HA/LO table bases need a separate proof.
     if (dispatch_index < 4 || dispatch_index >= facts.size() || stop.stop_requested() ||
         !facts[dispatch_index])
         return {};
     const auto &dispatch = facts[dispatch_index]->instruction;
-    if (dispatch.context.architecture != Architecture::powerpc ||
-        dispatch.context.mode != ExecutionMode::ppc32 || dispatch.opcode != Opcode::ppc_bcctr ||
+    const unsigned xlen = dispatch.context.mode == ExecutionMode::ppc64 ? 64u
+        : dispatch.context.mode == ExecutionMode::ppc32 ? 32u : 0u;
+    if (dispatch.context.architecture != Architecture::powerpc || xlen == 0 ||
+        dispatch.opcode != Opcode::ppc_bcctr ||
         dispatch.flow != FlowKind::jump || dispatch.operands.size() < 2)
         return {};
     const auto ctr_read = std::any_of(dispatch.register_reads.begin(), dispatch.register_reads.end(),
-        [](const RegisterOperand &reg) { return reg.bank == RegisterBank::ppc_ctr && reg.width == 32; });
+        [xlen](const RegisterOperand &reg) { return reg.bank == RegisterBank::ppc_ctr && reg.width == xlen; });
     if (!ctr_read || !facts[dispatch_index - 1] || !facts[dispatch_index - 2])
         return {};
     const auto &move_to_ctr = facts[dispatch_index - 1]->instruction;
@@ -4368,12 +4376,12 @@ std::optional<SwitchSite> ppc32_register_absolute_switch(
         ? register_operand(move_to_ctr, 1) : nullptr;
     if (move_to_ctr.context != dispatch.context || move_to_ctr.opcode != Opcode::ppc_mtctr ||
         move_to_ctr.flow != FlowKind::fallthrough || !mtctr_end || mtctr_end.value() != dispatch.address ||
-        !dispatch_target || dispatch_target->bank != RegisterBank::ppc_gpr || dispatch_target->width != 32 ||
+        !dispatch_target || dispatch_target->bank != RegisterBank::ppc_gpr || dispatch_target->width != xlen ||
         dispatch_target->index == 0 || !facts[dispatch_index - 2])
         return {};
     const Instruction *relative_target_add = nullptr;
     std::size_t load_index = dispatch_index - 2;
-    if (dispatch_index >= 4 && facts[dispatch_index - 2] &&
+    if (xlen == 32 && dispatch_index >= 4 && facts[dispatch_index - 2] &&
         facts[dispatch_index - 2]->instruction.opcode == Opcode::ppc_add) {
         relative_target_add = &facts[dispatch_index - 2]->instruction;
         load_index = dispatch_index - 3;
@@ -4382,9 +4390,12 @@ std::optional<SwitchSite> ppc32_register_absolute_switch(
     const auto &terminal_load = facts[load_index]->instruction;
     const auto load_end = analysis_detail::continuation_address(terminal_load);
     const auto *loaded_register = terminal_load.operands.empty() ? nullptr : register_operand(terminal_load, 0);
-    const bool halfword_relative = relative_target_add && terminal_load.opcode == Opcode::ppc_lhax;
+    const bool halfword_relative = xlen == 32 && relative_target_add &&
+                                   terminal_load.opcode == Opcode::ppc_lhax;
+    const bool absolute_load = xlen == 32 ? terminal_load.opcode == Opcode::ppc_lwzx
+                                          : terminal_load.opcode == Opcode::ppc_ldx;
     if (terminal_load.context != dispatch.context ||
-        (terminal_load.opcode != Opcode::ppc_lwzx && !halfword_relative) ||
+        (!absolute_load && !halfword_relative) ||
         terminal_load.flow != FlowKind::fallthrough || !load_end ||
         load_end.value() != (relative_target_add ? relative_target_add->address : move_to_ctr.address) ||
         !loaded_register || !same_register(loaded_register, dispatch_target) || terminal_load.operands.size() != 2)
@@ -4412,7 +4423,7 @@ std::optional<SwitchSite> ppc32_register_absolute_switch(
     std::map<std::uint32_t, Value> registers;
     const auto erase_written = [&](const Instruction &instruction) {
         for (const auto &written : instruction.register_writes)
-            if (written.bank == RegisterBank::ppc_gpr && written.width == 32)
+            if (written.bank == RegisterBank::ppc_gpr && written.width == xlen)
                 registers.erase(written.index);
     };
     const auto decoded_immediate_is_unrelocated = [&](const Instruction &instruction, std::uint32_t operand) {
@@ -4421,8 +4432,9 @@ std::optional<SwitchSite> ppc32_register_absolute_switch(
         auto resolution = relocations->operand(instruction, operand, stop);
         return resolution && !resolution.value().relocated();
     };
-    const auto add32 = [&](Address base, std::int64_t delta) {
-        return Address{base.space, static_cast<std::uint32_t>(base.offset + static_cast<std::uint64_t>(delta))};
+    const auto add_xlen = [xlen](Address base, std::int64_t delta) {
+        const auto sum = base.offset + static_cast<std::uint64_t>(delta);
+        return Address{base.space, xlen == 32 ? static_cast<std::uint32_t>(sum) : sum};
     };
 
     const auto setup_end = relative_target_add ? dispatch_index - 2 : dispatch_index - 1;
@@ -4442,7 +4454,7 @@ std::optional<SwitchSite> ppc32_register_absolute_switch(
         }
         const auto *destination = instruction.operands.empty() ? nullptr : register_operand(instruction, 0);
         const auto valid_destination = [&](const RegisterOperand *reg) {
-            return reg && reg->bank == RegisterBank::ppc_gpr && reg->width == 32 && reg->index != 0;
+            return reg && reg->bank == RegisterBank::ppc_gpr && reg->width == xlen && reg->index != 0;
         };
 
         if (instruction.opcode == Opcode::ppc_addis && instruction.operands.size() == 3 &&
@@ -4454,15 +4466,16 @@ std::optional<SwitchSite> ppc32_register_absolute_switch(
             std::optional<Address> base;
             if (zero_base)
                 base = Address{dispatch.address.space, 0};
-            else if (source && source->bank == RegisterBank::ppc_gpr && source->width == 32 && source->index) {
+            else if (source && source->bank == RegisterBank::ppc_gpr && source->width == xlen && source->index) {
                 if (const auto found = registers.find(source->index); found != registers.end())
                     base = found->second.constant;
             }
-            if (immediate && immediate->effective_width == 32 && immediate->is_signed && base &&
+            if (immediate && (immediate->effective_width == 32 || immediate->effective_width == xlen) &&
+                immediate->is_signed && base &&
                 base->space == dispatch.address.space && decoded_immediate_is_unrelocated(instruction, 2)) {
                 const auto signed_value = std::bit_cast<std::int64_t>(immediate->value);
                 erase_written(instruction);
-                registers[destination->index] = Value{add32(*base, signed_value)};
+                registers[destination->index] = Value{add_xlen(*base, signed_value)};
             } else {
                 erase_written(instruction);
             }
@@ -4477,15 +4490,16 @@ std::optional<SwitchSite> ppc32_register_absolute_switch(
             std::optional<Address> base;
             if (zero_base)
                 base = Address{dispatch.address.space, 0};
-            else if (source && source->bank == RegisterBank::ppc_gpr && source->width == 32 && source->index) {
+            else if (source && source->bank == RegisterBank::ppc_gpr && source->width == xlen && source->index) {
                 if (const auto found = registers.find(source->index); found != registers.end())
                     base = found->second.constant;
             }
-            if (immediate && immediate->effective_width == 32 && immediate->is_signed && base &&
+            if (immediate && (immediate->effective_width == 32 || immediate->effective_width == xlen) &&
+                immediate->is_signed && base &&
                 base->space == dispatch.address.space && decoded_immediate_is_unrelocated(instruction, 2)) {
                 const auto signed_value = std::bit_cast<std::int64_t>(immediate->value);
                 erase_written(instruction);
-                registers[destination->index] = Value{add32(*base, signed_value)};
+                registers[destination->index] = Value{add_xlen(*base, signed_value)};
             } else {
                 erase_written(instruction);
             }
@@ -4496,13 +4510,14 @@ std::optional<SwitchSite> ppc32_register_absolute_switch(
             const auto *source = register_operand(instruction, 1);
             const auto *immediate = std::get_if<ImmediateOperand>(&instruction.operands[2]);
             std::optional<Address> base;
-            if (source && source->bank == RegisterBank::ppc_gpr && source->width == 32) {
+            if (source && source->bank == RegisterBank::ppc_gpr && source->width == xlen) {
                 if (!source->index)
                     base = Address{dispatch.address.space, 0};
                 else if (const auto found = registers.find(source->index); found != registers.end())
                     base = found->second.constant;
             }
-            if (immediate && immediate->encoded_width == 16 && immediate->effective_width == 32 &&
+            if (immediate && immediate->encoded_width == 16 &&
+                (immediate->effective_width == 32 || immediate->effective_width == xlen) &&
                 !immediate->is_signed && immediate->value <= 0xffff && base &&
                 base->space == dispatch.address.space && decoded_immediate_is_unrelocated(instruction, 2)) {
                 const auto target = Address{base->space, base->offset | immediate->value};
@@ -4513,10 +4528,12 @@ std::optional<SwitchSite> ppc32_register_absolute_switch(
             }
             continue;
         }
-        const auto entry_scale = halfword_relative ? 2u : 4u;
+        const auto entry_scale = halfword_relative ? 2u : xlen / 8;
         const bool multiply_scale = instruction.opcode == Opcode::ppc_mulli &&
                                     instruction.operands.size() == 3;
-        const bool shift_scale = instruction.opcode == Opcode::ppc_rlwinm &&
+        const bool word_shift_scale = xlen == 32 && instruction.opcode == Opcode::ppc_rlwinm;
+        const bool doubleword_shift_scale = xlen == 64 && instruction.opcode == Opcode::ppc_rldicr;
+        const bool shift_scale = (word_shift_scale || doubleword_shift_scale) &&
                                  instruction.operands.size() == 5;
         if ((multiply_scale || shift_scale) && valid_destination(destination)) {
             const auto *source = register_operand(instruction, 1);
@@ -4524,18 +4541,20 @@ std::optional<SwitchSite> ppc32_register_absolute_switch(
             bool exact_scale = false;
             if (multiply_scale) {
                 const auto *immediate = std::get_if<ImmediateOperand>(&instruction.operands[2]);
-                exact_scale = immediate && immediate->effective_width == 32 && immediate->is_signed &&
+                exact_scale = immediate && (immediate->effective_width == 32 ||
+                    immediate->effective_width == xlen) && immediate->is_signed &&
                     std::bit_cast<std::int64_t>(immediate->value) == entry_scale &&
                     decoded_immediate_is_unrelocated(instruction, 2);
             } else {
                 const auto *shift = std::get_if<ImmediateOperand>(&instruction.operands[2]);
                 const auto *mask_begin = std::get_if<ImmediateOperand>(&instruction.operands[3]);
                 const auto *mask_end = std::get_if<ImmediateOperand>(&instruction.operands[4]);
-                exact_scale = shift && mask_begin && mask_end && shift->value == (halfword_relative ? 1u : 2u) &&
-                    mask_begin->value == 0 && mask_end->value == (halfword_relative ? 30u : 29u);
+                exact_scale = shift && mask_begin && mask_end && shift->value == (halfword_relative ? 1u : xlen == 64 ? 3u : 2u) &&
+                    mask_begin->value == 0 && mask_end->value ==
+                        (halfword_relative ? 30u : xlen == 64 ? 60u : 29u);
             }
             if (exact_scale && source && source->bank == RegisterBank::ppc_gpr &&
-                source->width == 32 && source->index) {
+                source->width == xlen && source->index) {
                 Value scaled;
                 scaled.selector = *source;
                 scaled.scale = entry_scale;
@@ -4548,25 +4567,25 @@ std::optional<SwitchSite> ppc32_register_absolute_switch(
                 registers[destination->index] = std::move(*value);
             continue;
         }
-        if ((instruction.opcode == Opcode::ppc_lwzx ||
+        if ((instruction.opcode == (xlen == 64 ? Opcode::ppc_ldx : Opcode::ppc_lwzx) ||
              (halfword_relative && instruction.opcode == Opcode::ppc_lhax)) && instruction.operands.size() == 2 &&
             valid_destination(destination)) {
             const auto *memory = std::get_if<MemoryOperand>(&instruction.operands[1]);
             std::optional<Value> loaded;
-            if (memory && memory->data_width == (halfword_relative ? 16u : 32u) &&
-                memory->address_width == 32 && memory->base &&
+            if (memory && memory->data_width == (halfword_relative ? 16u : xlen) &&
+                memory->address_width == xlen && memory->base &&
                 memory->index && memory->scale == 1) {
                 const auto base = registers.find(memory->base->index);
                 const auto index_value = registers.find(memory->index->index);
-                if (memory->base->bank == RegisterBank::ppc_gpr && memory->base->width == 32 &&
-                    memory->index->bank == RegisterBank::ppc_gpr && memory->index->width == 32 &&
+                if (memory->base->bank == RegisterBank::ppc_gpr && memory->base->width == xlen &&
+                    memory->index->bank == RegisterBank::ppc_gpr && memory->index->width == xlen &&
                     base != registers.end() && base->second.constant &&
                     base->second.constant->space == dispatch.address.space && index_value != registers.end() &&
                     index_value->second.selector && index_value->second.has_scale_instruction &&
                     index_value->second.scale == entry_scale) {
                     Value table_value;
                     table_value.constant = *base->second.constant;
-                    table_value.table_base = add32(*base->second.constant, memory->displacement);
+                    table_value.table_base = add_xlen(*base->second.constant, memory->displacement);
                     table_value.selector = index_value->second.selector;
                     table_value.scale = index_value->second.scale;
                     table_value.scale_instruction = index_value->second.scale_instruction;
@@ -4584,9 +4603,10 @@ std::optional<SwitchSite> ppc32_register_absolute_switch(
 
     const auto loaded = registers.find(dispatch_target->index);
     if (loaded == registers.end() || !loaded->second.table_base || !loaded->second.selector ||
-        !loaded->second.has_scale_instruction || loaded->second.scale != (halfword_relative ? 2u : 4u) ||
+        !loaded->second.has_scale_instruction ||
+        loaded->second.scale != (halfword_relative ? 2u : xlen / 8) ||
         same_register(&*loaded->second.selector, dispatch_target) ||
-        !file_backed_range(image, *loaded->second.table_base, halfword_relative ? 2u : 4u, false))
+        !file_backed_range(image, *loaded->second.table_base, halfword_relative ? 2u : xlen / 8, false))
         return {};
     if (relative_target_add) {
         const auto *left = register_operand(*relative_target_add, 1);
@@ -4624,16 +4644,16 @@ std::optional<SwitchSite> ppc32_register_absolute_switch(
     for (std::size_t index = 0; index < scan_limit; ++index) {
         if (stop.stop_requested())
             return {};
-        const auto entry_bytes = halfword_relative ? 2u : 4u;
+        const auto entry_bytes = halfword_relative ? 2u : xlen / 8;
         const auto target = table_target(image, site.table, index, entry_bytes, relative_target_add != nullptr,
                                          relocations, stop,
                                          relative_target_add ? site.target_base : std::nullopt,
-                                         32);
+                                         xlen);
         if (!target || !decodes_at(image, dispatch.context, target->address, stop)) {
             site.complete = false;
             site.incomplete_reason = bound
-                ? "table entry is unreadable, unresolved, or not executable PPC32 code"
-                : "unguarded table prefix ended at an unreadable, unresolved, or non-executable PPC32 entry";
+                ? "table entry is unreadable, unresolved, or not executable PowerPC code"
+                : "unguarded table prefix ended at an unreadable, unresolved, or non-executable PowerPC entry";
             break;
         }
         site.cases.push_back({static_cast<std::uint32_t>(index), target->address, target->source,
@@ -4641,7 +4661,7 @@ std::optional<SwitchSite> ppc32_register_absolute_switch(
     }
     if (!bound && site.cases.size() == max_entries) {
         site.complete = false;
-        site.incomplete_reason = "unguarded PPC32 table prefix reached the 4096-entry scan cap";
+        site.incomplete_reason = "unguarded PowerPC table prefix reached the 4096-entry scan cap";
     }
     return site.cases.size() >= 2 || (site.case_count && site.cases.size() == 1)
         ? std::optional<SwitchSite>(std::move(site)) : std::nullopt;
@@ -5076,9 +5096,9 @@ static Result<SwitchAnalysis> analyze_switch_tables_impl(const Image &image, con
                 continue;
             }
             if (instruction.context.architecture == Architecture::powerpc &&
-                instruction.context.mode == ExecutionMode::ppc32 && instruction.opcode == Opcode::ppc_bcctr &&
-                instruction.flow == FlowKind::jump) {
-                auto ppc_switch = ppc32_register_absolute_switch(image, function, snapshot,
+                (instruction.context.mode == ExecutionMode::ppc32 || instruction.context.mode == ExecutionMode::ppc64) &&
+                instruction.opcode == Opcode::ppc_bcctr && instruction.flow == FlowKind::jump) {
+                auto ppc_switch = ppc_register_switch(image, function, snapshot,
                     found->second->instructions, fact_index, guards, relocations, stop);
                 if (stop.stop_requested())
                     return Error{ErrorCode::canceled, "Switch analysis canceled"};

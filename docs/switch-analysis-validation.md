@@ -629,9 +629,22 @@ and dispatch without alternate entries or selector writes. Bounds must be in
 immediates covered by relocations are left unresolved, and entry relocations
 are resolved through the existing relocation-aware table reader. The scan
 reads exactly the proven number of entries for guarded results and preserves a
-partial prefix if an entry is unreadable, unresolved, or invalid. PPC64, HA/LO
+partial prefix if an entry is unreadable, unresolved, or invalid. HA/LO
 relocation-paired bases, other index scaling instructions, and cross-block
 register propagation are not recognized by this variant.
+
+PPC64 recognizes an eight-byte absolute-pointer table ending in
+`LDX target, tableBase, scaledIndex; MTCTR target; BCTR`. The index scale must
+be proven by `MULLI scaledIndex, selector, 8` or the `SLDI` idiom
+`RLDICR scaledIndex, selector, 3, 0, 60`, and the table
+base must resolve through same-block `ADDIS`/`ADDI`/`ORI` facts. A
+`CMPLDI CRf, selector, bound; BGE CRf, default` pair proves the unsigned
+range `[0,bound)` only when the bounded CFG proof connects the fallthrough
+path to the table setup and dispatch without selector writes or alternate
+entries. With no exact guard, only a contiguous prefix of executable targets
+is retained and the site remains partial. Entry reads are checked at eight-byte
+width; unresolved table bases, alternate scaling sequences, and cross-block
+register propagation remain unsupported.
 
 The same bounded setup recognizer also accepts the signed-relative form
 `LWZX target, tableBase, scaledIndex; ADD target, relativeBase, target; MTCTR

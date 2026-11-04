@@ -72,9 +72,11 @@ struct SwitchAnalysis {
     bool complete = true;
 };
 
-// Recovers bounded x86, AArch64, Thumb, A32, MIPS32/MIPS64, and PPC32 jump tables from recognized
-// indexed indirect dispatch forms. A32 LDR-PC tables require aligned ARM-mode
-// targets; mixed ARM/Thumb interworking slots are not represented. x86 supports
+// Recovers bounded x86, AArch64, Thumb, A32, MIPS32/MIPS64, and PPC32/PPC64
+// jump tables from recognized indexed indirect dispatch forms. PPC64 absolute
+// pointer tables use an XLEN-width LDX/MTCTR/BCTR sequence with eight-byte
+// entries. A32 LDR-PC tables require aligned ARM-mode targets; mixed ARM/Thumb
+// interworking slots are not represented. x86 supports
 // statically based indexed indirect JMPs and the contiguous x86-64 LEA
 // (RIP-relative table base), MOVSXD
 // ([base + index*4]), ADD (loaded value + table base), JMP (loaded register)
