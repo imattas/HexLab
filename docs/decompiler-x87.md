@@ -92,3 +92,18 @@ retirement remain incomplete.
 ## FLD ST(i) value copies
 
 `FLD ST(i)` retains the source payload as an explicit x87 register-output value while separately preserving the push depth and unknown FSW/FTW outputs. When TOP is proven, the decompiler's existing stack remapper reads the source against pre-instruction TOP and writes the copy to the newly exposed physical slot. Unknown TOP remains represented by the logical stack boundary and does not fabricate a physical placement. This models the copy itself; stack overflow and pending exception delivery remain outside the lifter.
+
+## Constant integer stores
+
+The optimizer can replace the memory value of `FIST`, `FISTP`, or
+`FISTTP` with an integer constant when its ST(0) input is an exact,
+same-block binary80 SSA constant. It evaluates the conversion across every
+FCW invalid/precision mask and rounding-control setting and folds only when all
+settings complete and produce identical destination bits. This lets proven
+exact conversions reach the stored value without assuming the reset control
+word or exception masks.
+
+Only the memory-output value is folded. The memory address, FSW updates, and
+FISTP/FISTTP stack retirement remain explicit opaque effects. Fractional,
+out-of-range, exceptional, nonconstant, or otherwise mask-dependent inputs
+stay symbolic.

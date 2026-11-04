@@ -34,3 +34,9 @@ underflow or unsupported-encoding exceptions.
 
 The rounding, destination, exception, and C1 rules follow Intel's [FIST/FISTP
 and FISTTP instruction reference](https://cdrdv2-public.intel.com/812383/253666-sdm-vol-2a.pdf).
+
+The decompiler uses this evaluator for conservative constant folding of the
+stored integer when an exact same-block binary80 input is known. It checks all
+FCW rounding and invalid/precision mask combinations, and replaces the memory
+value only when every case completes with the same destination bits. Status
+and pop effects remain symbolic; see [x87 decompilation](decompiler-x87.md).

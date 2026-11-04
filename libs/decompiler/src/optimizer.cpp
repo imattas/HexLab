@@ -82,6 +82,64 @@ std::optional<X87Binary80Value> fold_x87_unary(const UnaryValue &unary, ValueTyp
     return X87Binary80Value{evaluate_x87_unary(operand->value, 0, operation).value};
 }
 
+std::optional<ConstantValue> fold_x87_integer_store(
+    const Intrinsic &intrinsic, const std::map<Key, X87Binary80> &constants) {
+    if ((intrinsic.name != "x87_fist" && intrinsic.name != "x87_fistp" &&
+         intrinsic.name != "x87_fisttp") ||
+        intrinsic.memory_effect != IntrinsicMemoryEffect::write || !intrinsic.memory_output)
+        return {};
+    const auto value_index = intrinsic.memory_output->value_operand;
+    if (value_index >= intrinsic.operands.size() || !intrinsic.operands[value_index])
+        return {};
+    const auto &expression = intrinsic.operands[value_index];
+    if (expression->type.kind != TypeKind::integer ||
+        (expression->type.bits != 16 && expression->type.bits != 32 && expression->type.bits != 64))
+        return {};
+
+    ExpressionPtr source_expression;
+    if (intrinsic.name == "x87_fisttp") {
+        const auto *unary = std::get_if<UnaryValue>(&expression->value);
+        if (!unary || unary->operation != "x87_fisttp_i" + std::to_string(expression->type.bits))
+            return {};
+        source_expression = unary->operand;
+    } else {
+        const auto *binary = std::get_if<BinaryValue>(&expression->value);
+        if (!binary || binary->operation != "x87_fist_rc_i" + std::to_string(expression->type.bits))
+            return {};
+        source_expression = binary->left;
+    }
+    if (!source_expression || source_expression->type != ValueType{TypeKind::floating, 80, false})
+        return {};
+    const auto *source = std::get_if<RegisterValue>(&source_expression->value);
+    if (!source || source->reg.bank != RegisterBank::x87 || source->reg.width != 80 || !source->version)
+        return {};
+    const auto known = constants.find(key(source->reg, *source->version));
+    if (known == constants.end())
+        return {};
+
+    // Keep FSW status outputs symbolic. Fold the concrete memory value only
+    // when every FCW mask/rounding combination completes with identical bits.
+    std::optional<std::uint64_t> common;
+    const bool truncate = intrinsic.name == "x87_fisttp";
+    for (std::uint16_t invalid_mask = 0; invalid_mask < 2; ++invalid_mask) {
+        for (std::uint16_t precision_mask = 0; precision_mask < 2; ++precision_mask) {
+            for (std::uint16_t rounding = 0; rounding < 4; ++rounding) {
+                const auto control = static_cast<std::uint16_t>(
+                    invalid_mask | (precision_mask << 5) | (rounding << 10));
+                const X87IntegerConvertRequest request{
+                    known->second, control, 0, static_cast<std::uint8_t>(expression->type.bits), truncate};
+                const auto converted = evaluate_x87_to_integer(request);
+                if (!converted || !converted->completed || !converted->destination_bits)
+                    return {};
+                if (common && *common != *converted->destination_bits)
+                    return {};
+                common = *converted->destination_bits;
+            }
+        }
+    }
+    return common ? std::optional<ConstantValue>{ConstantValue{*common, expression->type}} : std::nullopt;
+}
+
 std::optional<ConstantValue> fold_unary(const UnaryValue &unary, ValueType result_type) {
     const auto *operand = unary.operand ? std::get_if<ConstantValue>(&unary.operand->value) : nullptr;
     if (!operand || !operand->type.bits || operand->type.bits > 64 ||
@@ -1320,6 +1378,13 @@ void propagate_x87_binary80_constants(LiftedFunction &function) {
                 continue;
             }
             if (auto *intrinsic = std::get_if<Intrinsic>(&instruction.statement)) {
+                if (intrinsic->memory_output &&
+                    intrinsic->memory_output->value_operand < intrinsic->operands.size()) {
+                    const auto folded = fold_x87_integer_store(*intrinsic, constants);
+                    if (folded)
+                        intrinsic->operands[intrinsic->memory_output->value_operand] =
+                            constant_expression(*folded);
+                }
                 if (intrinsic->name == "x87_fcomi" || intrinsic->name == "x87_fucomi") {
                     // Substitute only immutable, same-block SSA payload facts.
                     // Unknown outputs have distinct versions and never inherit
