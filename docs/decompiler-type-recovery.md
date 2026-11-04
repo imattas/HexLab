@@ -252,12 +252,16 @@ through an interior pointer therefore contributes its enclosing-object offset
 to the original pointer's recovered structure while retaining its local offset
 in the interior view when that offset is valid. A valid
 non-overlapping layout becomes a recovered structure. A run of at least three
-contiguous same-width fields is represented as an array member; shorter runs,
-sparse accesses, and different-width fields remain separate members. This is
-a shape heuristic based only on observed accesses and can mistake adjacent
-record fields for an array. Unsupported widths, oversized offsets, or
-overlapping members keep the conservative `byte*` pointee. Member names are
-synthetic. A member is rendered as signed only when every observed integer
+contiguous same-width scalar fields is represented as an array member. A run
+of at least three contiguous pointer-width fields also becomes an array when
+each field is independently classified as pointer-valued and the observed
+nested pointee layouts agree; mismatched or ambiguous pointees remain separate
+pointer fields. Shorter runs, sparse accesses, and different-width fields
+remain separate members. This is a shape heuristic based only on observed
+accesses and can mistake adjacent record fields for an array. Unsupported
+widths, oversized offsets, or overlapping members keep the conservative
+`byte*` pointee. Member names are synthetic. A member is rendered as signed
+only when every observed integer
 load at that byte offset and width carries an explicit signed integer marker;
 unsigned-only, mixed, or missing signedness evidence keeps the unsigned
 integer fallback. The marker follows the same proven constant-offset pointer
@@ -463,8 +467,14 @@ does not become an ordered signature or a call-site argument slot.
 stack shifts: x64 uses 8 bytes for the return address and AArch64 uses 0 for
 its link-register call. Custom ABIs default to 0 and must set this value when
 their call mechanics shift the stack. Call clobbers for other conventions and
-general aliasing between ordinary register assignments remain unsupported. Constant-offset aggregate inference recovers one nested pointer-to-structure level when both the pointer slot and the loaded pointee have direct evidence. It does not recover deeper nesting or unions. A pointer base use
-is evidence of pointer semantics, not proof of a particular pointee type.
+general aliasing between ordinary register assignments remain unsupported.
+Constant-offset aggregate inference can follow pointer-valued member loads
+through nested pointee accesses to a maximum of eight levels. Each level needs
+direct pointer-width and child-layout evidence; cycles, conflicting aliases,
+ambiguous nested shapes, and incomplete children are omitted or suppress the
+affected pointee layout. It does not infer unions or resolve a particular
+active union alternative. A pointer base use is evidence of pointer semantics,
+not proof of a particular pointee type.
 Unconstrained integer values are represented as signed or unsigned integer
 types according to available IR evidence; this is not equivalent to full C
 integer-promotion or ABI classification.

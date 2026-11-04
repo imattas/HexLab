@@ -460,9 +460,24 @@ types::TypePtr recovered_object_type(
         auto end = std::next(field);
         std::uint64_t count = 1;
         auto expected_offset = offset + bytes;
-        while (!pointer_fields.contains(offset) && end != fields.end() &&
-               end->second == bits && end->first == expected_offset && !pointer_fields.contains(end->first) &&
-               signed_fields.contains(end->first) == signed_fields.contains(offset)) {
+        const auto compatible_pointer_elements = [&](std::uint64_t left_offset,
+                                                      std::uint64_t right_offset) {
+            if (!pointer_field || !pointer_fields.contains(right_offset) ||
+                nested_fields_ambiguous.contains(left_offset) ||
+                nested_fields_ambiguous.contains(right_offset))
+                return false;
+            const auto left = nested_fields.find(left_offset);
+            const auto right = nested_fields.find(right_offset);
+            if (left == nested_fields.end() || !left->second)
+                return right == nested_fields.end() || !right->second;
+            if (right == nested_fields.end() || !right->second) return false;
+            bool complete = true;
+            return equal_layout(*left->second, *right->second, work, complete) && complete;
+        };
+        while (end != fields.end() && end->second == bits && end->first == expected_offset &&
+               pointer_fields.contains(end->first) == pointer_field &&
+               (pointer_field ? compatible_pointer_elements(offset, end->first)
+                              : signed_fields.contains(end->first) == signed_fields.contains(offset))) {
             if (work >= aggregate_layout_work_limit) return {};
             ++work;
             ++count;
@@ -471,8 +486,10 @@ types::TypePtr recovered_object_type(
         }
         types::TypePtr recovered_member = member_type.value();
         // Three adjacent accesses of one width are enough evidence for an
-        // array shape. Shorter runs stay as independent fields to avoid
-        // turning an ordinary two-field record into an array by default.
+        // array shape. Pointer elements must also agree on their observed
+        // nested layouts; ambiguous or mismatched pointees stay separate.
+        // Shorter runs remain independent fields to avoid turning an ordinary
+        // two-field record into an array by default.
         if (count >= 3) {
             auto array_type = types::Type::array(member_type.value(), count);
             if (!array_type) return {};
