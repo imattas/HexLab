@@ -751,3 +751,18 @@ exceeded budgets retain fallback. The November 2 extension was checked by
 static review and Windows/WSL library builds with `BUILD_TESTING=OFF`; no tests
 were added or run. See `libs/decompiler/docs/multi-latch-loops.md` for the full
 shape and SSA limits.
+
+
+Pre-tested loops with an explicit preheader can start after a straight-line
+chain of up to 64 blocks, rather than only immediately after function entry.
+The chain must contain only simple statements and unconditional jump or
+fallthrough edges, with no register or memory phis, switches, returns, or
+side entries. The complete bounded CFG predecessor map must show that function
+entry has no incoming edge and each later chain block has exactly its previous
+chain block as predecessor. Together with the existing loop ownership and
+header predecessor checks, this proves the supported loop is entered through
+its header. Chain statements are emitted in order, and header register-phi
+copies use the final chain block as their original incoming predecessor.
+Cycles, malformed edges, exceptional flow, side-entered chains and all other
+unsupported loop layouts retain the existing fallback. This does not provide
+general dominator analysis or arbitrary reducible-loop structuring.

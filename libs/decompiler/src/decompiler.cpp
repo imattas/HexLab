@@ -11936,9 +11936,35 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
     };
     if (auto structured = try_explicit_preheader_multi_latch_loop()) return *structured;
 
-    if (function.blocks.size() >= 4 && has_only_simple_statements(*entry) && entry->phis.empty() &&
-        entry->successors.size() == 1 && entry->successors.front().target) {
-        const auto *header = find_block(*entry->successors.front().target);
+    // A single-entry straight-line chain proves that its final block is the
+    // unique external predecessor of a pre-tested loop header.  The full CFG
+    // predecessor proof below rejects side entries and cycles before emission.
+    std::vector<const LiftedBlock *> pretested_preheader_path;
+    std::set<std::uint64_t> pretested_preheader_ids;
+    const auto *pretested_cursor = entry;
+    while (pretested_cursor && !terminal_conditional(*pretested_cursor) &&
+           pretested_preheader_path.size() < 64 &&
+           pretested_preheader_ids.insert(pretested_cursor->id.value).second) {
+        if (!has_only_simple_statements(*pretested_cursor) || contains_return(*pretested_cursor) ||
+            pretested_cursor->switch_dispatch || !pretested_cursor->phis.empty() ||
+            pretested_cursor->memory_phi || !pretested_cursor->memory_partition_phis.empty() ||
+            pretested_cursor->successors.size() != 1 || !pretested_cursor->successors.front().target ||
+            (pretested_cursor->successors.front().kind != BlockEdgeKind::jump &&
+             pretested_cursor->successors.front().kind != BlockEdgeKind::fallthrough) ||
+            !has_unconditional_edge(*pretested_cursor, *pretested_cursor->successors.front().target)) {
+            pretested_cursor = nullptr;
+            break;
+        }
+        pretested_preheader_path.push_back(pretested_cursor);
+        pretested_cursor = find_block(*pretested_cursor->successors.front().target);
+    }
+    if (function.blocks.size() >= 4 && !pretested_preheader_path.empty() &&
+        pretested_cursor && terminal_conditional(*pretested_cursor) &&
+        !pretested_preheader_ids.contains(pretested_cursor->id.value)) {
+        // Existing region recognition refers to the immediate header predecessor
+        // as entry; the original function entry remains in the path above.
+        const auto *entry = pretested_preheader_path.back();
+        const auto *header = pretested_cursor;
         const auto *condition = header ? terminal_conditional(*header) : nullptr;
         const auto *body_start = condition ? find_block(*condition->true_target) : nullptr;
         const auto *exit_block = condition ? find_block(*condition->false_target) : nullptr;
@@ -12077,6 +12103,15 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                 }
                 if (!diamond_cfg_valid) break;
             }
+        }
+        // Every block in the chain must be reached only from its preceding
+        // chain block (and function entry must have no incoming CFG edge).
+        // This makes the header dominate every subsequently proven loop node.
+        for (std::size_t i = 0; diamond_cfg_valid && i < pretested_preheader_path.size(); ++i) {
+            const std::set<std::uint64_t> expected = i == 0 ? std::set<std::uint64_t>{} :
+                std::set<std::uint64_t>{pretested_preheader_path[i - 1]->id.value};
+            if (diamond_predecessors[pretested_preheader_path[i]->id.value] != expected)
+                diamond_cfg_valid = false;
         }
         const auto valid_diamond_memory_phi = [&](const LiftedBlock &block) {
             const auto &incoming = diamond_predecessors[block.id.value];
@@ -13736,7 +13771,7 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
         if (exit_block && (exit_block->memory_phi || !exit_block->memory_partition_phis.empty()))
             exit_path_valid = false;
         if (header && condition && body_start && exit_block && latch && closes_to_header && loop_body_edges_valid &&
-            header != entry && body_start != entry && exit_block != entry && body_start != header &&
+            diamond_cfg_valid && header != entry && body_start != entry && exit_block != entry && body_start != header &&
             exit_block != header && exit_block != body_start &&
             header->instructions.size() == 1 && has_only_simple_statements(*header) &&
             valid_diamond_memory_phi(*header) &&
@@ -13744,11 +13779,18 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                 return valid_diamond_memory_phi(*block);
             }) &&
             has_unconditional_edge(*entry, header->begin) &&
+            std::none_of(pretested_preheader_path.begin(), pretested_preheader_path.end(), [&](const auto *block) {
+                return loop_body_ids.contains(block->id.value) || loop_break_path_ids.contains(block->id.value) ||
+                    std::any_of(loop_returns.begin(), loop_returns.end(), [&](const auto &side_exit) {
+                        return std::find(side_exit.path.begin(), side_exit.path.end(), block) != side_exit.path.end();
+                    });
+            }) &&
             exit_path_valid && std::none_of(exit_path.begin(), exit_path.end(), [&](const auto *block) {
-                return loop_body_ids.contains(block->id.value) || block == header || block == entry;
+                return loop_body_ids.contains(block->id.value) || block == header ||
+                    pretested_preheader_ids.contains(block->id.value);
             }) &&
             std::all_of(function.blocks.begin(), function.blocks.end(), [&](const LiftedBlock &candidate) {
-                return &candidate == entry || &candidate == header || loop_body_ids.contains(candidate.id.value) ||
+                return pretested_preheader_ids.contains(candidate.id.value) || &candidate == header || loop_body_ids.contains(candidate.id.value) ||
                     exit_path_ids.contains(candidate.id.value) ||
                     loop_break_path_ids.contains(candidate.id.value) ||
                     std::any_of(loop_returns.begin(), loop_returns.end(), [&](const auto &side_exit) {
@@ -13829,7 +13871,7 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                 [&](const auto &item) { return !conditional_tree_valid(conditional_tree_valid, item.second); }))
                 return fallback("loop conditional region has no valid branch");
             out << "function " << address_label(function.entry) << "() {\n";
-            emit_block(*entry, 4, true);
+            for (const auto *block : pretested_preheader_path) emit_block(*block, 4, true);
             emit_parallel_copies(out, initial_loop_phi_copies, 4);
             out << "    while (" << branch_condition_text(*condition) << ") {\n";
             emit_block(*header, 8, true);
