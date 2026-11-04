@@ -34,6 +34,7 @@ enum Command {
     type_symbols_id,
     pseudocode_id,
     debugger_panel_id,
+    strings_panel_id,
     debugger_toggle_selection_bp_id,
     plugins_panel_id,
     compare_id,

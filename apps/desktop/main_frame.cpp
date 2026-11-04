@@ -185,15 +185,15 @@ std::optional<std::vector<std::byte>> decode_recipe_hex(std::string_view encoded
     return bytes;
 }
 #ifdef HEXLAB_DESKTOP_PYTHON_CONSOLE
-constexpr std::array<const char *, 8> movable_pane_names{
-    "workspace", "functions", "symbols", "metadata", "pseudocode", "debugger", "output", "python-console"};
-constexpr std::array<const char *, 8> movable_pane_labels{
-    "Listing / Bytes / Graph / Source", "Functions", "Symbols", "Binary Metadata", "Decompiler", "Debugger", "Output", "Python Console"};
+constexpr std::array<const char *, 9> movable_pane_names{
+    "workspace", "functions", "symbols", "metadata", "pseudocode", "debugger", "output", "python-console", "strings"};
+constexpr std::array<const char *, 9> movable_pane_labels{
+    "Listing / Bytes / Graph / Source", "Functions", "Symbols", "Binary Metadata", "Decompiler", "Debugger", "Output", "Python Console", "Strings / References"};
 #else
-constexpr std::array<const char *, 7> movable_pane_names{
-    "workspace", "functions", "symbols", "metadata", "pseudocode", "debugger", "output"};
-constexpr std::array<const char *, 7> movable_pane_labels{
-    "Listing / Bytes / Graph / Source", "Functions", "Symbols", "Binary Metadata", "Decompiler", "Debugger", "Output"};
+constexpr std::array<const char *, 8> movable_pane_names{
+    "workspace", "functions", "symbols", "metadata", "pseudocode", "debugger", "output", "strings"};
+constexpr std::array<const char *, 8> movable_pane_labels{
+    "Listing / Bytes / Graph / Source", "Functions", "Symbols", "Binary Metadata", "Decompiler", "Debugger", "Output", "Strings / References"};
 #endif
 constexpr int dock_floating_panes_id = move_pane_id_base + static_cast<int>(movable_pane_names.size());
 constexpr int focus_pane_id_base = dock_floating_panes_id + 1;
@@ -4919,6 +4919,7 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
     view->Append(reanalyze_id, "Reanalyze Project\tCtrl+F5");
     view->Append(type_symbols_id, "Types & Symbols");
     view->Append(pseudocode_id, "Show Decompiler at Selection\tCtrl+D");
+    view->AppendCheckItem(strings_panel_id, "Strings / References");
     view->Append(plugins_panel_id, "Plugins");
 #ifdef HEXLAB_DESKTOP_PYTHON_CONSOLE
     view->Append(python_console_id, "Python Console");
@@ -5291,7 +5292,7 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
     segments_layout->Add(ui.segment_filter_status, 0, wxLEFT | wxRIGHT | wxBOTTOM, FromDIP(4));
     segments_layout->Add(ui.segments, 1, wxEXPAND);
     segments_panel->SetSizer(segments_layout);
-    ui.strings = new StringBrowserView(metadata);
+    ui.strings = new StringBrowserView(this);
     ui.strings->navigate = [this](Location location) { Navigate(location); };
     ui.strings->comment = [this, strings = ui.strings](Location location) {
         const auto id = projects().active_document();
@@ -5651,7 +5652,6 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
         impl_->select_context_rows(impl_->state().selection());
     });
     metadata->AddPage(segments_panel, "Segments");
-    metadata->AddPage(ui.strings, "Strings");
     metadata->AddPage(imports_panel, "Imports");
     metadata->AddPage(exports_panel, "Exports");
     metadata->AddPage(ui.pe_view, "PE");
@@ -5997,6 +5997,14 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
                                    .Position(0)
                                    .BestSize(FromDIP(wxSize(340, 400)))
                                    .MinSize(FromDIP(wxSize(220, 160))));
+    docking_.AddPane(ui.strings, wxAuiPaneInfo()
+                                     .Name("strings")
+                                     .Caption("Strings / References")
+                                     .Right()
+                                     .Row(1)
+                                     .BestSize(FromDIP(wxSize(550, 460)))
+                                     .MinSize(FromDIP(wxSize(300, 220)))
+                                     .Hide());
     docking_.AddPane(ui.pseudocode, wxAuiPaneInfo()
                                         .Name("pseudocode")
                                         .Caption("Decompiler")
@@ -6405,6 +6413,20 @@ MainFrame::MainFrame(std::shared_ptr<plugins::ModuleProvider> plugin_provider)
         docking_.Update();
         impl_->debugger->SetFocus();
     }, debugger_panel_id);
+    Bind(wxEVT_MENU, [this](wxCommandEvent &) {
+        auto &pane = docking_.GetPane("strings");
+        if (!pane.IsOk()) return;
+        pane.Show(!pane.IsShown());
+        docking_.Update();
+        if (pane.IsShown()) {
+            if (auto *filter = wxWindow::FindWindowByName("strings-filter", impl_->strings))
+                filter->SetFocus();
+        }
+    }, strings_panel_id);
+    Bind(wxEVT_UPDATE_UI, [this](wxUpdateUIEvent &event) {
+        const auto &pane = docking_.GetPane("strings");
+        event.Check(pane.IsOk() && pane.IsShown());
+    }, strings_panel_id);
 #ifdef HEXLAB_DESKTOP_PYTHON_CONSOLE
     Bind(wxEVT_MENU, [this](wxCommandEvent &) {
         auto &pane = docking_.GetPane("python-console");

@@ -1,6 +1,8 @@
 # Desktop string browser
 
-The Metadata notebook's Strings page filters discovered strings by preview text, mapped address or file offset, encoding, and its project or standalone comment. Matching is case-insensitive substring search. The split view shows the selected string's incoming references and supports bounded paging; activating a string navigates to its data, while activating a reference navigates to its source.
+The **Strings / References** tool is a separate dockable pane, not a page inside Binary Metadata. Toggle it from **View → Strings / References**, or focus/move it from **View → Focus Workspace Pane** and **Move Pane to Next Display**. Its visibility, docking, and floating position participate in the normal saved workspace layout. It opens hidden by default so the initial workspace remains focused on the listing and its core side panes.
+
+The pane filters discovered strings by preview text, mapped address or file offset, encoding, and its project or standalone comment. Matching is case-insensitive substring search. The split view shows the selected string's incoming references and supports bounded paging; activating a string navigates to its data, while activating a reference navigates to its source.
 
 The selected string's original bytes are shown as hexadecimal in a separate
 read-only preview, limited to the first 64 bytes. The table's encoding and byte
