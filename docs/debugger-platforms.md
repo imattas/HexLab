@@ -25,6 +25,15 @@ calling `CreateProcessW`; the quoted command line is bounded to 32,766 UTF-16
 characters so its terminator fits the Win32 32,767-character limit. This avoids
 silently replacing malformed input or passing a truncated command line.
 
+Process and module discovery use bounded Toolhelp snapshots. Snapshot creation
+retries transient `ERROR_BAD_LENGTH` failures at most six times, then reports
+the Win32 error instead of waiting indefinitely. Enumeration distinguishes an
+empty snapshot from a failed first/next-entry call; a module walk never returns
+a truncated list as if it were complete. Windows can still omit modules loaded
+as data files, and cross-bitness module snapshots can fail with
+`ERROR_PARTIAL_COPY` ([CreateToolhelp32Snapshot documentation](https://learn.microsoft.com/en-us/windows/win32/api/tlhelp32/nf-tlhelp32-createtoolhelp32snapshot),
+[Module32First documentation](https://learn.microsoft.com/en-us/windows/win32/api/tlhelp32/nf-tlhelp32-module32first)).
+
 HexLab host support is limited to Windows and Linux. Linux backend selection is
 explicit. Known x86-64 and AArch64 CMake processor names select their matching
 ptrace implementation. Other Linux processor names select the unsupported

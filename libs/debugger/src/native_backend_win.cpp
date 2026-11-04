@@ -30,6 +30,22 @@ namespace {
 Error win_error(const char* action) {
     return {ErrorCode::io, std::string(action) + " failed (Win32 error " + std::to_string(GetLastError()) + ")"};
 }
+Result<HANDLE> create_toolhelp_snapshot(DWORD flags, DWORD process_id, const char* action) {
+    // Toolhelp documents ERROR_BAD_LENGTH as transient while the loader list
+    // changes. Bound retries so a busy process cannot stall the debugger UI.
+    constexpr unsigned max_attempts = 6;
+    for (unsigned attempt = 0; attempt < max_attempts; ++attempt) {
+        HANDLE snapshot = CreateToolhelp32Snapshot(flags, process_id);
+        if (snapshot != INVALID_HANDLE_VALUE) return snapshot;
+        const DWORD error = GetLastError();
+        if (error != ERROR_BAD_LENGTH || attempt + 1 == max_attempts) {
+            SetLastError(error);
+            return win_error(action);
+        }
+        Sleep(2u * (attempt + 1));
+    }
+    return Error{ErrorCode::io, std::string(action) + " failed after bounded retries"};
+}
 BOOL wait_for_debug_event_compatible(LPDEBUG_EVENT event, DWORD timeout) {
     using WaitForDebugEventExFunction = BOOL (WINAPI *)(LPDEBUG_EVENT, DWORD);
     static const auto wait_ex = [] {
@@ -1074,13 +1090,22 @@ public:
     bool output_events_require_acknowledgement() const noexcept override { return true; }
 
     Result<std::vector<ProcessInfo>> processes() override {
-        HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if (snapshot == INVALID_HANDLE_VALUE) return win_error("CreateToolhelp32Snapshot");
+        auto snapshot_result = create_toolhelp_snapshot(TH32CS_SNAPPROCESS, 0, "CreateToolhelp32Snapshot processes");
+        if (!snapshot_result) return snapshot_result.error();
+        HANDLE snapshot = snapshot_result.value();
         std::vector<ProcessInfo> result;
         result.reserve(max_inspection_processes);
         PROCESSENTRY32W entry{};
         entry.dwSize = sizeof(entry);
+        SetLastError(ERROR_SUCCESS);
         BOOL available = Process32FirstW(snapshot, &entry);
+        if (!available) {
+            const DWORD error = GetLastError();
+            CloseHandle(snapshot);
+            if (error == ERROR_NO_MORE_FILES) return result;
+            SetLastError(error);
+            return win_error("Process32FirstW");
+        }
         while (available) {
             if (result.size() == max_inspection_processes) {
                 CloseHandle(snapshot);
@@ -1093,9 +1118,15 @@ public:
                 CloseHandle(target);
             }
             result.push_back(ProcessInfo{entry.th32ProcessID, narrow(entry.szExeFile), architecture});
+            SetLastError(ERROR_SUCCESS);
             available = Process32NextW(snapshot, &entry);
         }
+        const DWORD enumeration_error = GetLastError();
         CloseHandle(snapshot);
+        if (enumeration_error != ERROR_NO_MORE_FILES) {
+            SetLastError(enumeration_error);
+            return win_error("Process32NextW");
+        }
         return result;
     }
 
@@ -1972,21 +2003,39 @@ public:
     }
     Result<std::vector<ModuleInfo>> modules() override {
         if (!process_) return Error{ErrorCode::invalid_argument, "no debug target is attached"};
-        HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, process_id_);
-        if (snapshot == INVALID_HANDLE_VALUE) return win_error("CreateToolhelp32Snapshot modules");
+        auto snapshot_result = create_toolhelp_snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32,
+                                                        process_id_, "CreateToolhelp32Snapshot modules");
+        if (!snapshot_result) return snapshot_result.error();
+        HANDLE snapshot = snapshot_result.value();
         std::vector<ModuleInfo> result;
         MODULEENTRY32W entry{}; entry.dwSize = sizeof(entry);
-        if (Module32FirstW(snapshot, &entry)) do {
+        SetLastError(ERROR_SUCCESS);
+        BOOL available = Module32FirstW(snapshot, &entry);
+        if (!available) {
+            const DWORD error = GetLastError();
+            CloseHandle(snapshot);
+            if (error == ERROR_NO_MORE_FILES) return result;
+            SetLastError(error);
+            return win_error("Module32FirstW");
+        }
+        while (available) {
             if (result.size() == max_inspection_modules) {
                 CloseHandle(snapshot);
-                return Error{ErrorCode::invalid_argument, "target exposes more than 4096 modules"};
+                return Error{ErrorCode::resource_limit, "target exposes more than 4096 modules"};
             }
             result.push_back({narrow(entry.szModule), narrow(entry.szExePath),
                 static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(entry.modBaseAddr)),
                 static_cast<std::uint64_t>(entry.modBaseSize)});
             entry.dwSize = sizeof(entry);
-        } while (Module32NextW(snapshot, &entry));
+            SetLastError(ERROR_SUCCESS);
+            available = Module32NextW(snapshot, &entry);
+        }
+        const DWORD enumeration_error = GetLastError();
         CloseHandle(snapshot);
+        if (enumeration_error != ERROR_NO_MORE_FILES) {
+            SetLastError(enumeration_error);
+            return win_error("Module32NextW");
+        }
         return result;
     }
     Result<std::vector<MemoryRegion>> memory_regions() override {
