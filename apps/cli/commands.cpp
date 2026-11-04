@@ -349,6 +349,7 @@ void usage(std::ostream &out) {
            "  inspect <path> [options]                 Inspect a binary image\n"
            "  hexdump <path> [options]                 Print bytes as hex and ASCII\n"
            "  disassemble <path> [options] [--json]    Disassemble an image\n"
+           "  strings <path> [options] [--limit N]     List discovered strings\n"
            "  functions <path> [options] [--limit N]   List discovered functions\n"
            "  decompile <path> [options]               Decompile an image\n"
            "  compare <old> <new> [options]            Compare two images\n"
@@ -563,6 +564,72 @@ int functions_report(const DocumentSnapshot &document, const std::filesystem::pa
         out << "  " << snapshot.functions.size() - count << " function(s) omitted by --limit\n";
     }
     return snapshot.complete && count == snapshot.functions.size() && !snapshot.functions.empty() ? 0 : 3;
+}
+
+int strings_report(const DocumentSnapshot &document, const std::filesystem::path &input,
+                   const AnalysisOptions &options, std::size_t limit, bool json,
+                   std::ostream &out, std::ostream &err) {
+    if (!document.image) {
+        err << "String scanning requires a loaded image\n";
+        return 1;
+    }
+    auto scanned = find_strings(*document.image, options, {});
+    if (!scanned) {
+        err << "String scan: " << scanned.error().message << '\n';
+        return 1;
+    }
+    const auto &strings = scanned.value();
+    const auto count = (std::min)(limit, strings.records.size());
+    const bool truncated = count < strings.records.size();
+    const bool complete = strings.complete && !truncated;
+    if (json) {
+        out << "{\"schema\":\"hexlab.strings.v1\",\"path\":"
+            << processor_inventory_json_string(path_text(input))
+            << ",\"complete\":" << (complete ? "true" : "false")
+            << ",\"scan_complete\":" << (strings.complete ? "true" : "false")
+            << ",\"truncated\":" << (truncated ? "true" : "false")
+            << ",\"total_count\":" << strings.records.size()
+            << ",\"returned_count\":" << count << ",\"strings\":[";
+        for (std::size_t i = 0; i < count; ++i) {
+            if (i) out << ',';
+            const auto &row = strings.records[i];
+            out << "{\"file_offset\":" << processor_inventory_json_string(hex(row.file_offset.value))
+                << ",\"address\":";
+            if (row.address)
+                out << processor_inventory_json_string(format_location(*row.address, document.image.get()));
+            else
+                out << "null";
+            out << ",\"encoding\":" << processor_inventory_json_string(string_encoding_label(row.encoding))
+                << ",\"script_hint\":"
+                << processor_inventory_json_string(string_script_name(classify_string_script(row.preview)))
+                << ",\"byte_length\":" << row.byte_length << ",\"characters\":" << row.characters
+                << ",\"terminated\":" << (row.terminated ? "true" : "false")
+                << ",\"preview\":" << processor_inventory_json_string(row.preview) << '}';
+        }
+        out << "]}\n";
+    } else {
+        out << "Strings in " << path_text(input) << " (" << count << '/' << strings.records.size()
+            << (complete ? ", complete)\n" : ", partial)\n");
+        out << "Address                  File offset            Encoding          Script       Bytes  Chars  Flags       Preview\n";
+        for (std::size_t i = 0; i < count; ++i) {
+            const auto &row = strings.records[i];
+            const auto address = row.address
+                ? format_location(*row.address, document.image.get()) : std::string("-");
+            out << std::left << std::setw(24) << address << ' '
+                << std::setw(22) << hex(row.file_offset.value) << ' '
+                << std::setw(17) << string_encoding_label(row.encoding) << ' '
+                << std::setw(12) << string_script_name(classify_string_script(row.preview)) << ' '
+                << std::right << std::setw(5) << row.byte_length << ' '
+                << std::setw(6) << row.characters << ' '
+                << std::setw(11) << (row.terminated ? "terminated" : "unterminated") << ' '
+                << safe_text(row.preview) << '\n';
+        }
+        if (truncated)
+            out << "Showing " << count << " of " << strings.records.size() << " strings.\n";
+        for (const auto &diagnostic : strings.diagnostics)
+            err << "String scan: " << diagnostic.message << '\n';
+    }
+    return complete ? 0 : 3;
 }
 
 int modules_command(std::span<const std::wstring_view> arguments, std::ostream &out, std::ostream &err) {
@@ -3891,8 +3958,9 @@ int run_cli(std::span<const std::wstring_view> arguments, std::ostream &out, std
     if (arguments[0] == L"pe-deps")
         return pe_dependency_files_command(arguments.subspan(1), out, err);
     const bool functions_only = arguments[0] == L"functions";
+    const bool strings_only = arguments[0] == L"strings";
     if (arguments[0] != L"inspect" && arguments[0] != L"disassemble" && arguments[0] != L"decompile" &&
-        !functions_only) {
+        !functions_only && !strings_only) {
         err << "Invalid arguments. Use --help for usage.\n";
         return 2;
     }
@@ -3901,6 +3969,11 @@ int run_cli(std::span<const std::wstring_view> arguments, std::ostream &out, std
             out << "Usage: hexlab_cli functions <path> [input/analysis options] [--limit <count>] [--json]\n"
                    "       Input options match `disassemble`; --show-strings is not supported here.\n"
                    "       --limit caps returned rows (default 10000, maximum 100000).\n";
+        else if (strings_only)
+            out << "Usage: hexlab_cli strings <path> [input/analysis options] [--limit <count>] [--json]\n"
+                   "Scan and list bounded printable strings without disassembling instructions.\n"
+                   "Input options match `inspect`; analysis options accept --string-budget and --min-string-length.\n"
+                   "--limit caps returned rows (default 10000, maximum 100000); --json emits hexlab.strings.v1.\n";
         else if (arguments[0] == L"inspect")
             out << "Usage: hexlab_cli inspect <path> [input options]\n"
                    "Inspect the input format and metadata without disassembling it.\n\n"
@@ -3940,18 +4013,18 @@ int run_cli(std::span<const std::wstring_view> arguments, std::ostream &out, std
     }
     try {
         const bool decompile = arguments[0] == L"decompile";
-        const bool disassemble = arguments[0] == L"disassemble" || decompile || functions_only;
+        const bool disassemble = arguments[0] == L"disassemble" || decompile || functions_only || strings_only;
         std::vector<std::filesystem::path> plugin_paths;
-        bool show_strings = false;
+        bool show_strings = strings_only;
         bool json_output = false;
         std::size_t function_limit = 10000;
         std::vector<std::wstring_view> parse_arguments;
         bool end_options = false, limit_seen = false;
         for (std::size_t index = 1; index < arguments.size(); ++index) {
             const auto argument = arguments[index];
-            if (!functions_only || end_options || argument != L"--limit") {
+            if ((!functions_only && !strings_only) || end_options || argument != L"--limit") {
                 parse_arguments.push_back(argument);
-                if (functions_only && argument == L"--") end_options = true;
+                if ((functions_only || strings_only) && argument == L"--") end_options = true;
                 continue;
             }
             if (limit_seen || index + 1 >= arguments.size() || arguments[index + 1].starts_with(L"--"))
@@ -3967,8 +4040,10 @@ int run_cli(std::span<const std::wstring_view> arguments, std::ostream &out, std
             argument_error("--show-strings is not supported by the functions command");
         if (functions_only)
             request.run_analysis = false;
+        if (strings_only)
+            request.run_analysis = false;
         if (json_output && (!disassemble || decompile))
-            argument_error("--json is currently supported only by disassemble or functions");
+            argument_error("--json is currently supported only by disassemble, functions, or strings");
         plugins::PluginManager plugin_manager(plugins::make_native_module_provider(),
                                                plugins::default_plugin_state_path());
         for (const auto& plugin_path : plugin_paths) {
@@ -3978,7 +4053,7 @@ int run_cli(std::span<const std::wstring_view> arguments, std::ostream &out, std
                 return 1;
             }
         }
-        if (disassemble && !plugin_paths.empty())
+        if (disassemble && !strings_only && !plugin_paths.empty())
             request.analysis_options = plugin_manager.analysis_options(request.analysis_options);
         if (request.format == Format::automatic && !plugin_paths.empty()) {
             auto source = FileStorage::open(request.path);
@@ -4033,15 +4108,18 @@ int run_cli(std::span<const std::wstring_view> arguments, std::ostream &out, std
         for (const auto& failure : plugin_manager.extension_failures())
             err << "Plugin extension disabled: " << failure.plugin_id << "/" << failure.extension_id
                 << " (" << failure.kind << "): " << failure.reason << '\n';
-        if (disassemble && !functions_only && !analysis) {
+        if (disassemble && !functions_only && !strings_only && !analysis) {
             err << "Unsupported analysis: this CPU/mode has no enabled decoder\n";
             return 1;
         }
-        if (!json_output) metadata(out, document);
+        if (!json_output && !strings_only) metadata(out, document);
         diagnostics(err, document.diagnostics, document.image.get());
         if (functions_only)
             return functions_report(document, request.path, request.analysis_options,
                                     function_limit, json_output, out, err);
+        if (strings_only)
+            return strings_report(document, request.path, request.analysis_options,
+                                  function_limit, json_output, out, err);
         if (!disassemble)
             return 0;
         if (show_strings) {

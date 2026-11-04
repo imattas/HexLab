@@ -245,3 +245,11 @@ A bounded search page can finish before the input ends. Pass the printed `Contin
 Exit status is 0 for success, 1 for IO/unsupported/read-only/conflict errors, 2 for invalid arguments, and 3 for partial analysis or another result page. `--instruction-budget` and `--string-budget` select analysis bounds. Broader instruction sets and formats remain under development; see [instruction coverage](x64-coverage.csv) and [capabilities](capabilities.csv).
 
 For machine-readable live image disassembly, use `hexlab_cli disassemble <path> --json`. The `hexlab.disassembly.v1` object contains the input path, complete/partial analysis status, and ordered instruction rows with formatted address, encoded bytes, rendered instruction, and control-flow kind. Add `--show-strings` to include bounded discovered string rows. A partial analysis returns exit status 3; complete analysis returns 0. JSON mode emits one object to stdout, while diagnostics remain on stderr. The current JSON option applies only to `disassemble` (not `inspect` or `decompile`).
+
+Use `hexlab_cli strings <path> [options]` to scan strings without decoding
+instructions. It accepts the normal loader options plus `--string-budget`,
+`--min-string-length`, `--limit`, and `--json`. Text output is a compact
+table with image address (when mapped), file offset, encoding, script hint,
+byte and character lengths, termination state, and preview. The bounded JSON
+form uses schema `hexlab.strings.v1` and reports scan completeness separately
+from row truncation. A partial scan or limited result returns exit status 3.
