@@ -2,9 +2,6 @@
 
 ## Unreleased
 
-- HexLab host support is limited to Windows and Linux. Mach-O files and
-  Apple-target binaries remain supported analysis inputs on those hosts.
-
 ## 0.1.1 — 2026-10-31
 
 ### Improved
@@ -22,6 +19,8 @@
 - Fixed desktop startup initialization order so the String browser callback is
   installed only after the view exists, and corrected Objective-C metadata
   control parenting.
+- HexLab now runs on Windows and Linux only. Mach-O files and Apple-target
+  binaries remain supported as analysis inputs on those hosts.
 
 ## 0.1.0 — 2026-10-31
 
@@ -57,6 +56,6 @@ unsupported semantics explicit or incomplete.
 
 The Windows ZIP includes HexLab and non-system runtime DLLs but requires the
 matching Microsoft Visual C++ 2022 Redistributable. Python automation uses a
-host Python runtime. Linux packages are built and smoke-checked by their native
-CI runner, but CI does not launch the GUI. The packages are
+host Python runtime. The Windows and Linux packages are built manually; Linux
+GUI launch still needs validation on a native Linux desktop. The packages are
 multi-file installations; they are not standalone executables.
