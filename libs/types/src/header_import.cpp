@@ -1915,6 +1915,7 @@ private:
         for (auto &[key, symbol] : nested.result_.symbols) result_.symbols.insert_or_assign(key, std::move(symbol));
         for (auto &[key, value] : nested.result_.enum_constants) result_.enum_constants.insert_or_assign(key, value);
         for (auto &[key, line] : nested.result_.enum_constant_source_lines) result_.enum_constant_source_lines.insert_or_assign(key, line);
+        for (auto &[key, line] : nested.result_.tag_source_lines) result_.tag_source_lines.insert_or_assign(key, line);
         for (const auto &[key, value] : nested.enum_value_bindings_) enum_value_bindings_.insert_or_assign(key, value);
         for (const auto &[name, values] : nested.enum_unqualified_bindings_) {
             auto &merged = enum_unqualified_bindings_[name];
@@ -2141,9 +2142,10 @@ private:
             fail(ErrorCode::conflict, "duplicate template specialization for '" + base_name + "'");
         primary->second.specializations.push_back(std::move(specialization));
     }
-    void register_tag_type(std::string_view tag_kind,const std::string &qualified,TypePtr type,bool inject_ordinary=false) {
+    void register_tag_type(std::string_view tag_kind,const std::string &qualified,TypePtr type,bool inject_ordinary=false,
+                           std::uint32_t source_line=0) {
         const auto tag_key=std::string(tag_kind)+" "+qualified;
-        const bool inject=inject_ordinary||!current_namespace().empty();
+        const bool inject=inject_ordinary||!current_namespace().empty()||!aggregate_scopes_.empty();
         if(inject)if(auto ordinary=names_.find(qualified);ordinary!=names_.end()){
             const auto previous=names_.find(tag_key);
             if(ordinary->second->id()!=type->id()&&(previous==names_.end()||previous->second->id()!=ordinary->second->id()))
@@ -2151,6 +2153,7 @@ private:
         }
         names_[tag_key]=type;
         result_.symbols[tag_key]=HeaderSymbol{HeaderSymbolKind::tag,type};
+        if(source_line)result_.tag_source_lines.insert_or_assign(tag_key,source_line);
         if(inject){names_[qualified]=type;result_.symbols[qualified]=HeaderSymbol{HeaderSymbolKind::tag,std::move(type)};}
     }
     void register_member_alias(const std::string &owner,const std::string &name,TypePtr type,
@@ -2621,7 +2624,9 @@ private:
             if(parse_attribute())packed=true;
             if(pending_aggregate_alignment_){requested_alignment=std::max(requested_alignment,*pending_aggregate_alignment_);pending_aggregate_alignment_.reset();}
         }
+        const std::uint32_t tag_source_line = peek().line;
         const bool anonymous_tag = !identifier(peek().text) && !at("::");
+        const bool explicitly_qualified = at("::") || peek(1).text == "::";
         std::string tag;
         if (anonymous_tag) {
             if (!at("{"))
@@ -2632,6 +2637,13 @@ private:
             if (!aggregate_scopes_.empty()) tag = aggregate_scopes_.back() + "::" + tag;
             else if (!current_namespace().empty()) tag = current_namespace() + "::" + tag;
         } else tag=parse_qualified_name();
+        if (!aggregate_scopes_.empty() && !anonymous_tag && !explicitly_qualified) {
+            const auto owner = aggregate_scopes_.back();
+            const auto namespace_prefix = current_namespace().empty() ? std::string{} : current_namespace() + "::";
+            if (!namespace_prefix.empty() && tag.starts_with(namespace_prefix))
+                tag.erase(0, namespace_prefix.size());
+            tag = owner + "::" + tag;
+        }
         if (at("<")) {
             if (template_instance_name_.empty()) {
                 const auto template_name = resolve_template_name(tag);
@@ -2668,25 +2680,23 @@ private:
             if(existing==names_.end()) {
                 auto incomplete=Type::incomplete_aggregate(is_union?Kind::union_type:Kind::structure,tag);
                 if(!incomplete)fail(incomplete.error().code,incomplete.error().message);
-                register_tag_type(is_union?"union":"struct",tag,incomplete.value(),is_class);
+                register_tag_type(is_union?"union":"struct",tag,incomplete.value(),is_class,tag_source_line);
             }
             auto reference=Type::named_reference(key);if(!reference)fail(reference.error().code,reference.error().message);
             return reference.value();
         }
-        if(!aggregate_scopes_.empty()&&!anonymous_tag)
-            fail(ErrorCode::unsupported,"nested named aggregate definitions are unsupported");
         if(auto existing=names_.find(key);existing!=names_.end()&&existing->second->size())
             fail(ErrorCode::conflict,"duplicate aggregate tag '"+key+"'");
         if(!names_.contains(key)){
             auto incomplete=Type::incomplete_aggregate(is_union?Kind::union_type:Kind::structure,tag);
             if(!incomplete)fail(incomplete.error().code,incomplete.error().message);
-            register_tag_type(is_union?"union":"struct",tag,incomplete.value(),is_class);
+            register_tag_type(is_union?"union":"struct",tag,incomplete.value(),is_class,tag_source_line);
         }
         aggregate_scopes_.push_back(tag);
         bool cpp_declarations=is_class;
         std::uint32_t declaration_ordinal=0;
         std::vector<StaticDataMember> static_members;
-        std::vector<Member> members;std::vector<Method> methods;std::set<std::string> member_names;std::uint64_t offset=0,max_size=0,max_align=1;
+        std::vector<Member> members;std::vector<Method> methods;std::set<std::string> member_names,nested_type_names;std::uint64_t offset=0,max_size=0,max_align=1;
         auto access=is_class?MemberAccess::private_:MemberAccess::public_;
         std::set<std::string> method_names;
         struct BitfieldUnit { std::uint64_t type_id=0,size=0,alignment=1,offset=0,used=0; };
@@ -2858,6 +2868,31 @@ private:
             if(virtual_specifier&&b.is_static)fail(ErrorCode::malformed,"static member functions cannot be virtual");
             if(b.is_typedef&&(b.is_static||b.is_inline))syntax("member typedef cannot have static or inline storage");
             if(take(";")) {
+                const Type *declared_type=unqualified(b.type.get());
+                if(declared_type&&declared_type->kind()==Kind::named_reference){
+                    const auto reference=names_.find(declared_type->name());
+                    if(reference!=names_.end())declared_type=unqualified(reference->second.get());
+                }
+                std::string nested_type_name;
+                if(declared_type&&(declared_type->kind()==Kind::structure||declared_type->kind()==Kind::union_type)){
+                    const auto owner_prefix=tag+"::";
+                    if(declared_type->name().starts_with(owner_prefix))
+                        nested_type_name=declared_type->name().substr(owner_prefix.size());
+                }
+                if(!nested_type_name.empty()){
+                    if(b.is_typedef||b.is_static||b.is_inline)
+                        syntax("nested aggregate type declarations cannot have typedef or storage specifiers");
+                    if(nested_type_name.find("::")!=std::string::npos||!identifier(nested_type_name))
+                        fail(ErrorCode::unsupported,"nested aggregate declarations must name one direct class-scope tag");
+                    if((member_names.contains(nested_type_name)&&!nested_type_names.contains(nested_type_name))||
+                       method_names.contains(nested_type_name))
+                        fail(ErrorCode::conflict,"duplicate aggregate type or member '"+nested_type_name+"'");
+                    member_names.insert(nested_type_name);
+                    nested_type_names.insert(nested_type_name);
+                    cpp_declarations=true;
+                    ++declaration_ordinal;
+                    continue;
+                }
                 if(b.is_typedef||b.is_static||b.is_inline)
                     syntax("anonymous aggregate member cannot have typedef or storage specifiers");
                 if(is_class)
@@ -3103,7 +3138,7 @@ private:
         auto completed=p.value();
         if(!methods.empty()){auto with_methods=Type::with_methods(completed,std::move(methods));if(!with_methods)fail(with_methods.error().code,with_methods.error().message);completed=with_methods.value();}
         if(!static_members.empty()){auto with_static=Type::with_static_data_members(completed,std::move(static_members));if(!with_static)fail(with_static.error().code,with_static.error().message);completed=with_static.value();}
-        register_tag_type(is_union?"union":"struct",tag,completed,cpp_declarations);return completed;
+        register_tag_type(is_union?"union":"struct",tag,completed,cpp_declarations,tag_source_line);return completed;
     }
     std::vector<Token> take_integer_expression_until(std::string_view delimiter, bool template_delimiters) {
         std::vector<Token> expression;
@@ -3249,6 +3284,7 @@ private:
     }
     std::int64_t integer_literal(std::string s){return static_cast<std::int64_t>(integer_magnitude(std::move(s),std::uint64_t(INT64_MAX)));}
     TypePtr parse_enum(){
+        const std::uint32_t tag_source_line = peek().line;
         const bool scoped=take("class")||take("struct");
         if(!identifier(peek().text)&&!at("::"))syntax("named enum tags are required");
         const bool explicitly_qualified = at("::") || peek(1).text == "::";
@@ -3354,7 +3390,7 @@ private:
         if (fixed_underlying) {
             auto p = Type::enumeration_with_values(tag, std::move(fixed_underlying), std::move(values));
             if (!p) fail(p.error().code, p.error().message);
-            register_tag_type("enum",tag,p.value(),!aggregate_scopes_.empty());return p.value();
+            register_tag_type("enum",tag,p.value(),!aggregate_scopes_.empty(),tag_source_line);return p.value();
         }
         std::uint8_t enum_bytes=0;std::string enum_base;
         for(const auto [name,bytes] : {std::pair<std::string_view,std::uint8_t>{"int",o_.int_bytes},{"long",o_.long_bytes},{"long long",o_.long_long_bytes}}){
@@ -3364,7 +3400,7 @@ private:
         if(!enum_bytes)fail(ErrorCode::unsupported,"enum values exceed supported signed integer types");
         auto base=Type::integer(enum_base,enum_bytes,enum_bytes,true);if(!base)fail(base.error().code,base.error().message);
         auto p=Type::enumeration_with_values(tag,base.value(),std::move(values));if(!p)fail(p.error().code,p.error().message);
-        register_tag_type("enum",tag,p.value(),!aggregate_scopes_.empty());return p.value();
+        register_tag_type("enum",tag,p.value(),!aggregate_scopes_.empty(),tag_source_line);return p.value();
     }
     struct ParameterPackPattern {
         std::vector<Token> type;

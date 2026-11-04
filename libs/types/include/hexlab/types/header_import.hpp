@@ -91,6 +91,10 @@ struct HeaderImportResult {
     std::map<std::string, std::int64_t, std::less<>> enum_constants;
     // Line number in the preprocessed token stream for each enumerator name.
     std::map<std::string, std::uint32_t, std::less<>> enum_constant_source_lines;
+    // Declaration line in the preprocessed token stream for each aggregate or
+    // enum tag (including nested C++ tags). Keys use the same spelling as the
+    // tag symbol, for example `struct api::Outer::Inner`.
+    std::map<std::string, std::uint32_t, std::less<>> tag_source_lines;
     // Template declarations retain their parameter kinds and pack shape even
     // when no concrete specialization is instantiated in the imported header.
     std::map<std::string, HeaderTemplateDeclaration, std::less<>> templates;
@@ -114,10 +118,13 @@ struct HeaderImportResult {
 // class-scoped typedef/using type aliases, static data declarations, and access
 // labels. Aliases resolve from their declaration onward and export Owner::Alias;
 // concrete templates and bound aggregate types can qualify those aliases.
+// Direct nested class/struct/union tags support forward declarations, later
+// completion, and type-only definitions without adding storage to the owner;
+// tag_source_lines records their line in the preprocessed token stream.
 // Static data preserves type/access/source order separately from object layout;
 // incomplete static object/array declarations are retained without inventing
 // storage. Initializers, inline static definitions, static alignment attributes,
-// nested class/struct/union definitions, method bodies and constructors fail explicitly.
+// nested aggregate templates, method bodies and constructors fail explicitly.
 // Bounded alias
 // and class/struct/union templates support type, integral non-type, and template-
 // template parameters, defaults, and a trailing parameter pack. Integral arguments

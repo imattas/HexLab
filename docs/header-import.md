@@ -299,9 +299,15 @@ each other and against directly declared fields and methods. A collision is an
 ambiguity error rather than an arbitrary lookup choice. Anonymous member
 nesting is bounded to 64 levels. Anonymous tags are scoped under their owning
 aggregate, and an anonymous tag cannot be forward-declared without a body.
-Layout attributes on no-declarator anonymous members, anonymous aggregate
-members inside C++ classes, and nested named aggregate definitions remain
-unsupported.
+Layout attributes on no-declarator anonymous members and anonymous aggregate
+members inside C++ classes remain unsupported. Direct nested named
+class/struct/union tags are retained as qualified types. A type-only definition
+such as `struct Header { struct Node { int value; }; Node first; };` adds no
+storage for the nested declaration itself, while a later field of that type is
+laid out normally. Nested forward declarations can be completed later in the
+owning class. The result includes `tag_source_lines`, keyed by the tag symbol
+(for example `struct Header::Node`), with line numbers from the preprocessed
+token stream. Nested aggregate templates inside template-specialization bodies remain unsupported.
 
 The supported subset includes common C integer and floating scalar spellings,
 standard fixed-width and pointer-width aliases, typedef aliases, qualified
