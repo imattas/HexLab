@@ -46,6 +46,17 @@ HEXLAB_LOADERS_EXPORT Result<std::vector<std::byte>> link_elf64_aarch64_executab
     std::span<const std::shared_ptr<const ByteStorage>>, std::string_view entry_symbol = "_start",
     std::uint64_t base_address = 0x400000, std::stop_token = {}, ElfLinkLimits = {});
 
+// RISC-V ELF64 little-endian subset. Merges the same allocated section layout
+// as the x86-64/AArch64 paths and applies RELA R_RISCV_32/64, BRANCH, JAL,
+// CALL/CALL_PLT, HI20, LO12_I, and LO12_S. R_RISCV_RELAX records are accepted
+// as markers without performing relaxation. PCREL_HI20/LO12, GOT/TLS, ALIGN,
+// compressed-instruction relocations, veneers, and relaxation are unsupported.
+HEXLAB_LOADERS_EXPORT Result<std::vector<std::byte>> link_elf64_riscv_text(
+    std::span<const std::shared_ptr<const ByteStorage>>, std::stop_token = {}, ElfLinkLimits = {});
+HEXLAB_LOADERS_EXPORT Result<std::vector<std::byte>> link_elf64_riscv_executable(
+    std::span<const std::shared_ptr<const ByteStorage>>, std::string_view entry_symbol = "_start",
+    std::uint64_t base_address = 0x400000, std::stop_token = {}, ElfLinkLimits = {});
+
 // Produces a bounded ELF32 little-endian i386 ET_REL from compatible ET_REL
 // inputs. Merges allocated .text/.rodata/.data/.bss and applies SHT_REL
 // R_386_NONE, R_386_32, R_386_PC32, R_386_PLT32, R_386_16, R_386_PC16,

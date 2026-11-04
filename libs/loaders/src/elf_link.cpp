@@ -161,6 +161,114 @@ std::uint64_t aarch64_relocation(std::uint32_t type, std::uint64_t target, std::
     return (instruction & ~UINT32_C(0x003ffc00)) | ((low >> 3) << 10);
 }
 
+std::size_t riscv64_width(std::uint32_t type) {
+    switch (type) {
+    case 0: // R_RISCV_NONE
+    case 51: // R_RISCV_RELAX is a marker; this linker does not relax instructions.
+        return 0;
+    case 2: // R_RISCV_64
+        return 8;
+    case 18: // R_RISCV_CALL
+    case 19: // R_RISCV_CALL_PLT
+        return 8;
+    case 1: // R_RISCV_32
+    case 16: // R_RISCV_BRANCH
+    case 17: // R_RISCV_JAL
+    case 26: // R_RISCV_HI20
+    case 27: // R_RISCV_LO12_I
+    case 28: // R_RISCV_LO12_S
+        return 4;
+    default:
+        require(false, "Unsupported RISC-V ELF relocation type " + std::to_string(type), ErrorCode::unsupported);
+        return 0;
+    }
+}
+
+std::uint64_t riscv64_relocation(std::uint32_t type, std::uint64_t target, std::int64_t addend,
+                                std::uint64_t place, std::span<const std::byte> field) {
+    require(field.size() >= 4, "RISC-V instruction relocation field is truncated", ErrorCode::malformed);
+    const auto instruction = static_cast<std::uint32_t>(read_le(field.first(4)));
+    const auto signed32 = [](std::int64_t value, std::string_view name) {
+        require(value >= INT32_MIN && value <= INT32_MAX,
+                std::string(name) + " exceeds signed 32-bit range", ErrorCode::unsupported);
+        return value;
+    };
+    if (type == 1) {
+        const auto value = add_signed(target, addend);
+        require(value <= UINT32_MAX, "R_RISCV_32 relocation overflows", ErrorCode::unsupported);
+        return static_cast<std::uint32_t>(value);
+    }
+    if (type == 2) {
+        return add_signed(target, addend);
+    }
+    if (type == 16 || type == 17) {
+        require((instruction & 0x7fU) == (type == 16 ? 0x63U : 0x6fU),
+                type == 16 ? "R_RISCV_BRANCH requires a conditional branch instruction"
+                           : "R_RISCV_JAL requires a JAL instruction", ErrorCode::malformed);
+        const auto delta = pc_value(target, addend, place);
+        const auto minimum = type == 16 ? -(INT64_C(1) << 12) : -(INT64_C(1) << 20);
+        const auto maximum = type == 16 ? (INT64_C(1) << 12) - 2 : (INT64_C(1) << 20) - 2;
+        require((delta & 1) == 0 && delta >= minimum && delta <= maximum,
+                type == 16 ? "R_RISCV_BRANCH displacement is unaligned or out of range"
+                           : "R_RISCV_JAL displacement is unaligned or out of range", ErrorCode::unsupported);
+        const auto value = static_cast<std::uint32_t>(delta);
+        if (type == 16) {
+            return (instruction & 0x01fff07fU) |
+                   ((value & 0x1000U) << 19) | ((value & 0x07e0U) << 20) |
+                   ((value & 0x001eU) << 7) | ((value & 0x0800U) >> 4);
+        }
+        return (instruction & 0x00000fffU) |
+               ((value & 0x100000U) << 11) | ((value & 0x0007feU) << 20) |
+               ((value & 0x000800U) << 9) | (value & 0x0ff000U);
+    }
+    if (type == 18 || type == 19) {
+        require(field.size() >= 8, "R_RISCV_CALL relocation is truncated", ErrorCode::malformed);
+        const auto second = static_cast<std::uint32_t>(read_le(field.subspan(4, 4)));
+        require((instruction & 0x7fU) == 0x17U && (second & 0x707fU) == 0x67U &&
+                    ((instruction >> 7) & 0x1fU) == ((second >> 15) & 0x1fU),
+                "R_RISCV_CALL requires an AUIPC/JALR pair using the same base register", ErrorCode::malformed);
+        const auto delta = signed32(pc_value(target, addend, place), "R_RISCV_CALL displacement");
+        const auto high = (delta + 0x800) >> 12;
+        const auto low = delta - high * 4096;
+        const auto patched_high = (instruction & 0x00000fffU) |
+                                  ((static_cast<std::uint32_t>(high) & 0x000fffffU) << 12);
+        const auto patched_low = (second & 0x000fffffU) |
+                                 ((static_cast<std::uint32_t>(low) & 0x00000fffU) << 20);
+        return static_cast<std::uint64_t>(patched_high) |
+               (static_cast<std::uint64_t>(patched_low) << 32);
+    }
+    if (type == 26) {
+        require((instruction & 0x7fU) == 0x37U,
+                "R_RISCV_HI20 requires LUI", ErrorCode::malformed);
+        const auto absolute = add_signed(target, addend);
+        require(absolute <= INT32_MAX, "R_RISCV_HI20 value exceeds signed 32-bit range", ErrorCode::unsupported);
+        const auto value = static_cast<std::int64_t>(absolute);
+        const auto high = (value + 0x800) >> 12;
+        require(high >= -(INT64_C(1) << 19) && high < (INT64_C(1) << 19),
+                "R_RISCV high-20 relocation overflows", ErrorCode::unsupported);
+        return (instruction & 0x00000fffU) |
+               ((static_cast<std::uint32_t>(high) & 0x000fffffU) << 12);
+    }
+    if (type == 27 || type == 28) {
+        const bool i_form = type == 27;
+        const auto opcode = instruction & 0x7fU;
+        const bool valid_i = opcode == 0x03U || opcode == 0x07U || opcode == 0x13U ||
+                             opcode == 0x1bU || opcode == 0x67U;
+        require(i_form ? valid_i : (opcode == 0x23U || opcode == 0x27U),
+                i_form ? "R_RISCV_LO12_I requires an I-immediate instruction"
+                       : "R_RISCV_LO12_S requires an S-immediate instruction", ErrorCode::malformed);
+        const auto value = add_signed(target, addend);
+        if (i_form)
+            return (instruction & 0x000fffffU) |
+                   ((static_cast<std::uint32_t>(value) & 0x00000fffU) << 20);
+        return (instruction & 0x01fff07fU) |
+               ((static_cast<std::uint32_t>(value) & 0x00000fe0U) << 20) |
+               ((static_cast<std::uint32_t>(value) & 0x0000001fU) << 7);
+    }
+    require(false, "Unsupported RISC-V ELF relocation type " + std::to_string(type), ErrorCode::unsupported);
+    return 0;
+}
+
 std::vector<std::byte> build_output(const std::vector<Object> &objects, const std::vector<OutputSymbol> &symbols,
                                     std::uint64_t text_alignment, std::uint64_t rodata_alignment,
                                     std::uint64_t data_alignment,
@@ -247,7 +355,8 @@ std::vector<std::byte> build_output(const std::vector<Object> &objects, const st
             "ELF linked text and alignment padding exceed output limit", ErrorCode::resource_limit);
     out.resize(static_cast<std::size_t>(text_offset));
     out.insert(out.end(), text.begin(), text.end());
-    const auto segment_alignment = executable && machine == 183 ? UINT64_C(65536) : UINT64_C(1);
+    const auto segment_alignment = executable && machine == 183 ? UINT64_C(65536) :
+                                  executable && machine == 243 ? UINT64_C(4096) : UINT64_C(1);
     const auto rodata_offset = align_up(out.size(), std::max(rodata_alignment, segment_alignment));
     require(rodata_offset <= max_output && rodata.size() <= max_output - rodata_offset,
             "ELF linked .rodata and alignment padding exceed output limit", ErrorCode::resource_limit);
@@ -340,7 +449,8 @@ static Result<std::vector<std::byte>> link_elf64_impl(
             auto &elf = *loaded.value().metadata.elf;
             require(elf.header.object_type == 1 && elf.header.is_64 && elf.header.order == ByteOrder::little && elf.header.machine == machine,
                     machine == 183 ? "ELF link subset requires ELF64 little-endian AArch64 ET_REL objects"
-                                   : "ELF link subset requires ELF64 little-endian x86-64 ET_REL objects", ErrorCode::unsupported);
+                    : machine == 243 ? "ELF link subset requires ELF64 little-endian RISC-V ET_REL objects"
+                                     : "ELF link subset requires ELF64 little-endian x86-64 ET_REL objects", ErrorCode::unsupported);
             require(elf.symbols.size() <= limits.max_symbols - symbol_count, "ELF link symbol limit exceeded", ErrorCode::resource_limit);
             symbol_count += elf.symbols.size();
             std::optional<std::uint32_t> text_index;
@@ -481,10 +591,12 @@ static Result<std::vector<std::byte>> link_elf64_impl(
             bss_end += common.common_size;
         }
         const auto file_text_offset = align_up(64 + (executable ? (rodata_end ? 3 : 2) * 56 : 0), text_alignment);
-        const auto segment_alignment = executable && machine == 183 ? UINT64_C(65536) : UINT64_C(1);
-        if (executable && machine == 183)
+        const auto segment_alignment = executable && machine == 183 ? UINT64_C(65536) :
+                                      executable && machine == 243 ? UINT64_C(4096) : UINT64_C(1);
+        if (executable && (machine == 183 || machine == 243))
             require(base_address % std::max({segment_alignment, text_alignment, rodata_alignment, data_alignment, bss_alignment}) == 0,
-                    "AArch64 executable base must satisfy 64KiB and input section alignment", ErrorCode::invalid_argument);
+                    machine == 183 ? "AArch64 executable base must satisfy 64KiB and input section alignment"
+                                   : "RISC-V executable base must satisfy 4KiB and input section alignment", ErrorCode::invalid_argument);
         const auto file_rodata_offset = align_up(file_text_offset + text_end, std::max(rodata_alignment, segment_alignment));
         require(file_rodata_offset <= UINT64_MAX - rodata_end, "ELF executable .rodata extent overflows", ErrorCode::resource_limit);
         const auto file_data_offset = align_up(file_rodata_offset + rodata_end, std::max(data_alignment, segment_alignment));
@@ -630,13 +742,14 @@ static Result<std::vector<std::byte>> link_elf64_impl(
                         "ELF link subset supports RELA relocations only", ErrorCode::unsupported);
                 const auto type = relocation.type;
                 const std::size_t width = machine == 183 ? aarch64_width(type) :
+                    machine == 243 ? riscv64_width(type) :
                     type == 0 ? 0 : (type == 1 || type == 24 ? 8 :
                     (type == 12 || type == 13 ? 2 : (type == 14 || type == 15 ? 1 : 4)));
-                require(machine == 183 || type == 0 || type == 1 || type == 2 || type == 4 || type == 10 || type == 11 || type == 12 || type == 13 || type == 14 || type == 15 || type == 24,
+                require(machine == 183 || machine == 243 || type == 0 || type == 1 || type == 2 || type == 4 || type == 10 || type == 11 || type == 12 || type == 13 || type == 14 || type == 15 || type == 24,
                         "Unsupported x86-64 ELF relocation type " + std::to_string(type), ErrorCode::unsupported);
                 require(relocation.offset <= target_bytes.size() && width <= target_bytes.size() - relocation.offset,
                         std::string("ELF relocation field exceeds ") + target_name, ErrorCode::malformed);
-                if (type == 0) continue;
+                if (type == 0 || (machine == 243 && type == 51)) continue;
                 require(relocation.symbol_table && relocation.symbol_index_validated,
                         "ELF relocation symbol table/index is unavailable", ErrorCode::unsupported);
                 const auto table = std::find_if(elf.symbol_tables.begin(), elf.symbol_tables.end(), [&](const auto &candidate) {
@@ -702,6 +815,9 @@ static Result<std::vector<std::byte>> link_elf64_impl(
                     const auto instruction = width == 4 ? static_cast<std::uint32_t>(read_le(
                         std::span<const std::byte>(target_bytes).subspan(static_cast<std::size_t>(relocation.offset), 4))) : 0;
                     result = aarch64_relocation(type, target, *relocation.addend, place, instruction);
+                } else if (machine == 243) {
+                    result = riscv64_relocation(type, target, *relocation.addend, place,
+                        std::span<const std::byte>(target_bytes).subspan(static_cast<std::size_t>(relocation.offset), width));
                 } else if (type == 1 || type == 12 || type == 14) {
                     result = add_signed(target, *relocation.addend);
                     if (type == 12)
@@ -767,5 +883,18 @@ Result<std::vector<std::byte>> link_elf64_aarch64_executable(
     if (entry_symbol.empty())
         return Error{ErrorCode::invalid_argument, "ELF executable entry symbol cannot be empty"};
     return link_elf64_impl(inputs, 183, true, entry_symbol, base_address, stop, limits);
+}
+
+Result<std::vector<std::byte>> link_elf64_riscv_text(
+    std::span<const std::shared_ptr<const ByteStorage>> inputs, std::stop_token stop, ElfLinkLimits limits) {
+    return link_elf64_impl(inputs, 243, false, {}, 0, stop, limits);
+}
+
+Result<std::vector<std::byte>> link_elf64_riscv_executable(
+    std::span<const std::shared_ptr<const ByteStorage>> inputs, std::string_view entry_symbol,
+    std::uint64_t base_address, std::stop_token stop, ElfLinkLimits limits) {
+    if (entry_symbol.empty())
+        return Error{ErrorCode::invalid_argument, "ELF executable entry symbol cannot be empty"};
+    return link_elf64_impl(inputs, 243, true, entry_symbol, base_address, stop, limits);
 }
 } // namespace hexlab
