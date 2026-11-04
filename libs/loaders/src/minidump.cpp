@@ -4,6 +4,7 @@
 #include <array>
 #include <charconv>
 #include <limits>
+#include <map>
 #include <string_view>
 #include <unordered_set>
 
@@ -1545,6 +1546,74 @@ Result<LoadedImage> load_minidump(std::shared_ptr<const ByteStorage> storage, st
             std::sort(thread_ids.begin(), thread_ids.end());
             if (std::adjacent_find(thread_ids.begin(), thread_ids.end()) != thread_ids.end())
                 return Error{ErrorCode::malformed, "Minidump ThreadList has duplicate thread IDs"};
+        }
+
+        // Thread stack descriptors are themselves captured-memory descriptors.
+        // Many producers also repeat them in MemoryList/Memory64List; add only
+        // their uncovered virtual-address slices so either representation can
+        // back ordinary image reads without duplicating overlapping segments.
+        if (!metadata.threads.empty()) {
+            std::map<std::uint64_t, std::uint64_t> covered;
+            auto cover = [&](std::uint64_t begin, std::uint64_t end) {
+                auto it = covered.lower_bound(begin);
+                if (it != covered.begin()) {
+                    auto previous = std::prev(it);
+                    if (previous->second >= begin) it = previous;
+                }
+                while (it != covered.end() && it->first <= end) {
+                    begin = std::min(begin, it->first);
+                    end = std::max(end, it->second);
+                    it = covered.erase(it);
+                }
+                covered.emplace(begin, end);
+            };
+            auto sorted_regions = regions;
+            std::sort(sorted_regions.begin(), sorted_regions.end(), [](const auto &left, const auto &right) {
+                return left.begin < right.begin || (left.begin == right.begin && left.size < right.size);
+            });
+            for (const auto &region : sorted_regions) cover(region.begin, region.begin + region.size);
+
+            auto add_descriptor = [&](std::uint64_t begin, std::uint64_t size, std::uint64_t file,
+                                      Error &error) -> bool {
+                if (!size) return true;
+                const auto end = begin + size; // Address overflow was checked while decoding the thread.
+                std::uint64_t cursor = begin;
+                auto it = covered.lower_bound(begin);
+                if (it != covered.begin()) {
+                    auto previous = std::prev(it);
+                    if (previous->second > begin) it = previous;
+                }
+                for (; it != covered.end() && it->first < end; ++it) {
+                    if (it->first > cursor) {
+                        if (regions.size() >= max_memory_regions)
+                            { error = {ErrorCode::resource_limit, "Minidump thread stack ranges exceed the memory-region limit"}; return false; }
+                        const auto piece_end = std::min(end, it->first);
+                        regions.push_back({cursor, piece_end - cursor, file + (cursor - begin)});
+                    }
+                    cursor = std::max(cursor, std::min(end, it->second));
+                    if (cursor >= end) break;
+                }
+                if (cursor < end) {
+                    if (regions.size() >= max_memory_regions)
+                        { error = {ErrorCode::resource_limit, "Minidump thread stack ranges exceed the memory-region limit"}; return false; }
+                    regions.push_back({cursor, end - cursor, file + (cursor - begin)});
+                }
+                cover(begin, end);
+                return true;
+            };
+            for (const auto &thread : metadata.threads) {
+                if (stop.stop_requested()) return Error{ErrorCode::canceled, "Minidump thread memory mapping canceled"};
+                Error mapping_error{};
+                if (!add_descriptor(thread.stack_address, thread.stack_size, thread.stack_rva, mapping_error))
+                    return mapping_error;
+                if (thread.extended_record) {
+                    if (!add_descriptor(thread.backing_store_address, thread.backing_store_size,
+                                        thread.backing_store_rva, mapping_error)) return mapping_error;
+                }
+            }
+            budget += (regions.size() - sorted_regions.size()) * sizeof(Region);
+            if (budget > max_metadata_bytes)
+                return Error{ErrorCode::resource_limit, "Minidump thread memory metadata exceeds its byte budget"};
         }
 
         if (auto exception = stream(stream_exception)) {

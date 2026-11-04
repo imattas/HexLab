@@ -9,6 +9,14 @@ The loader reads the bounded stream directory and supports standard
 `SystemInfo`, `MemoryList`, `Memory64List`, `MemoryInfoList`, `ModuleList`,
 `ThreadList` and `ThreadExList`, `ThreadNames`, `HandleData`, `UnloadedModuleList`, and `Exception`
 streams.
+Captured thread stacks and ThreadEx backing stores also contribute bytes to the
+image memory map. If their address ranges are already covered by MemoryList or
+Memory64List, the existing mapping is retained; otherwise only uncovered slices
+are added from the thread descriptor's validated file RVA. Thus stack bytes are
+still inspectable when a producer omits them from the top-level memory list.
+Added stack-only slices have provisional permissions when no MemoryInfoList
+entry covers them, and the loader marks metadata incomplete as it does for any
+other captured range without protection metadata.
 The optional `TokenStream` (type 19) validates its extensible list and per-token
 record sizes, retaining token IDs, handle values, record/payload file offsets,
 and payload lengths. Token payload bytes remain opaque because they carry
