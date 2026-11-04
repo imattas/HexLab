@@ -222,6 +222,28 @@ method to interrupt the native scan; cancellation raises `AnalysisCancelled` and
 does not return a partial page. `source_complete` distinguishes a completed scan
 from a complete decoded instruction source.
 
+`Project.switch_analysis(function_entry)` exposes the native bounded jump-table
+analyzer for one exact recovered function entry. It returns detached sites with
+dispatch/table addresses, selector bank/index/width, entry encoding, target
+base, case/default targets, relocation/fixup row provenance, and per-site
+completeness. The top-level result includes the pinned edit and byte revisions.
+Pass `expected_revision` to reject a stale plan and `cancel=` to stop the scan;
+concurrent project changes raise `ProjectChangedDuringQuery`. Recognized tables
+inspect at most 4096 entries each. Unsupported dispatch patterns are omitted
+rather than guessed, and incomplete tables retain only validated entries.
+
+```python
+snapshot = project.snapshot()
+switches = project.switch_analysis(
+    Address(0, 0x401000),
+    expected_revision=snapshot["edit_revision"],
+)
+for site in switches["sites"]:
+    print(site["dispatch"], site["table"], site["entry_encoding"])
+    for case in site["cases"]:
+        print(case["index"], case["target"], case["source"])
+```
+
 Each Python string record includes a `script_hint` alongside its encoding name.
 The hint classifies the retained UTF-8 preview (at most 256 Unicode scalars) into
 a coarse script family such as Latin, Cyrillic, Greek, Hebrew, Arabic, Thai, Han,

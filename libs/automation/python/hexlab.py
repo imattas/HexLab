@@ -945,6 +945,27 @@ class Project:
         """Return stable ``id`` and ``entry`` candidates owning an address."""
         return self._call("function_owners", _location(address))
 
+    def switch_analysis(self, function_entry, *, expected_revision=None, cancel=None):
+        """Recover bounded jump-table sites for one exact recovered function.
+
+        The result is detached and revision-pinned. Each site reports its
+        selector, entry encoding, table/default/case targets, completeness,
+        and ELF/Mach-O relocation provenance. Unsupported patterns are omitted;
+        incomplete analyses retain validated switch sites. Pass an edit
+        revision to reject stale plans; cancellation raises AnalysisCancelled.
+        """
+        if not isinstance(function_entry, Address):
+            raise TypeError("function_entry must be an Address")
+        if expected_revision is not None:
+            _unsigned(expected_revision, "expected_revision")
+        try:
+            return self._workspace_read_call(
+                "switch_analysis", _location(function_entry), expected_revision, cancel=cancel)
+        except Error as error:
+            if error.code == _hexlab.CONFLICT_ERROR_CODE:
+                raise ProjectChangedDuringQuery("project changed during switch analysis") from None
+            raise
+
     def stack_frame(self, address):
         """Return recovered frame size/completeness for the unique function at address.
 

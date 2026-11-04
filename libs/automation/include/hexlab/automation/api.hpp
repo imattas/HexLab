@@ -7,6 +7,7 @@
 #include "hexlab/workspace/search.hpp"
 #include "hexlab/analysis/graph.hpp"
 #include "hexlab/analysis/references.hpp"
+#include "hexlab/analysis/switches.hpp"
 #include "hexlab/analysis/flirt.hpp"
 #include "hexlab/analysis/signatures.hpp"
 #include "hexlab/loaders/ar.hpp"
@@ -63,6 +64,13 @@ struct Decompilation {
     bool used_fallback = false;
     std::string fallback_reason;
     std::vector<std::string> diagnostics;
+};
+// Bounded per-function jump-table recovery tied to the exact project snapshot
+// used to derive function and relocation facts.
+struct SwitchAnalysisInfo {
+    Address function_entry;
+    database::ProjectRevisions revisions;
+    SwitchAnalysis analysis;
 };
 // Stable identity and entry for every recovered function that owns an address.
 // Shared tails can have more than one candidate.
@@ -279,6 +287,9 @@ public:
     // node/edge budgets; cancellation is checked throughout graph collection.
     HEXLAB_AUTOMATION_EXPORT Result<std::shared_ptr<const GraphModel>> call_graph(
         Address, GraphOptions = {}, std::stop_token = {}) const;
+    HEXLAB_AUTOMATION_EXPORT Result<SwitchAnalysisInfo> switch_analysis(
+        Address function_entry, std::optional<std::uint64_t> expected_edit_revision={},
+        std::stop_token={}) const;
     HEXLAB_AUTOMATION_EXPORT Result<std::optional<StackFrameInfo>> stack_frame(Address) const;
     HEXLAB_AUTOMATION_EXPORT Result<std::vector<StackSlotInfo>> stack_slots(
         Address, std::size_t start=0, std::size_t count=256) const;

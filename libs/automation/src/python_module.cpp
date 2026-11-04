@@ -377,6 +377,92 @@ std::string_view reference_kind_name(ReferenceKind kind){
     }
     invalid("Unknown reference kind");return {};
 }
+std::string_view switch_encoding_name(SwitchEntryEncoding encoding){
+    switch(encoding){
+    case SwitchEntryEncoding::absolute_pointer:return "absolute_pointer";
+    case SwitchEntryEncoding::signed_offset_from_table:return "signed_offset_from_table";
+    case SwitchEntryEncoding::signed_halfword_offset_from_table:return "signed_halfword_offset_from_table";
+    case SwitchEntryEncoding::thumb_scaled_pc_relative:return "thumb_scaled_pc_relative";
+    case SwitchEntryEncoding::signed_offset_from_target_base:return "signed_offset_from_target_base";
+    case SwitchEntryEncoding::unsigned_byte_offset_scaled_from_target_base:return "unsigned_byte_offset_scaled_from_target_base";
+    case SwitchEntryEncoding::a32_branch_instruction:return "a32_branch_instruction";
+    case SwitchEntryEncoding::unsigned_dword_offset_from_target_base:return "unsigned_dword_offset_from_target_base";
+    case SwitchEntryEncoding::signed_halfword_offset_from_target_base:return "signed_halfword_offset_from_target_base";
+    case SwitchEntryEncoding::decoded_metadata:return "decoded_metadata";
+    case SwitchEntryEncoding::signed_byte_offset_from_target_base:return "signed_byte_offset_from_target_base";
+    }
+    invalid("Unknown switch entry encoding");return {};
+}
+std::string_view switch_case_source_name(SwitchCase::TargetSource source){
+    switch(source){
+    case SwitchCase::TargetSource::encoded_bytes:return "encoded_bytes";
+    case SwitchCase::TargetSource::elf_relocation:return "elf_relocation";
+    case SwitchCase::TargetSource::macho_relocation:return "macho_relocation";
+    case SwitchCase::TargetSource::macho_dyld_rebase:return "macho_dyld_rebase";
+    }
+    invalid("Unknown switch target source");return {};
+}
+std::string_view switch_base_source_name(SwitchSite::TableBaseSource source){
+    switch(source){
+    case SwitchSite::TableBaseSource::encoded_bytes:return "encoded_bytes";
+    case SwitchSite::TableBaseSource::elf_relocation_pair:return "elf_relocation_pair";
+    case SwitchSite::TableBaseSource::operand_relocation:return "operand_relocation";
+    }
+    invalid("Unknown switch table base source");return {};
+}
+std::string_view switch_register_bank_name(RegisterBank bank){
+    switch(bank){
+    case RegisterBank::gpr:return "gpr";
+    case RegisterBank::arm32_gpr:return "arm32_gpr";
+    case RegisterBank::arm64_gpr:return "arm64_gpr";
+    case RegisterBank::riscv_gpr:return "riscv_gpr";
+    case RegisterBank::mips_gpr:return "mips_gpr";
+    case RegisterBank::ppc_gpr:return "ppc_gpr";
+    case RegisterBank::dex_vreg:return "dex_vreg";
+    default:return "other";
+    }
+}
+PyObject* encode_u64_vector(const std::vector<std::uint64_t>& rows){
+    Object output(PyList_New(0));
+    for(const auto value:rows)append(output,integer(value));
+    return output.release();
+}
+PyObject* encode_switch_analysis(const automation::SwitchAnalysisInfo& report){
+    Object output(PyDict_New()),sites(PyList_New(0));
+    set(output,"function_entry",encode(report.function_entry));
+    set(output,"edit_revision",integer(report.revisions.edit));
+    set(output,"byte_revision",integer(report.revisions.bytes));
+    set(output,"complete",PyBool_FromLong(report.analysis.complete));
+    for(const auto& site:report.analysis.sites){
+        Object item(PyDict_New()),selector(PyDict_New()),cases(PyList_New(0));
+        set(item,"dispatch",encode(site.dispatch));set(item,"table",encode(site.table));
+        set(selector,"bank",integer(static_cast<unsigned>(site.selector.bank)));
+        set(selector,"bank_name",string(switch_register_bank_name(site.selector.bank)));
+        set(selector,"index",integer(site.selector.index));set(selector,"width",integer(site.selector.width));
+        set(selector,"high_byte",PyBool_FromLong(site.selector.high_byte));set(item,"selector",selector.release());
+        set(item,"scale",integer(site.scale));set(item,"entry_encoding",string(switch_encoding_name(site.entry_encoding)));
+        set(item,"target_base",site.target_base?encode(*site.target_base):none());
+        set(item,"case_count",site.case_count?integer(*site.case_count):none());
+        set(item,"default_target",site.default_target?encode(*site.default_target):none());
+        set(item,"complete",PyBool_FromLong(site.complete));
+        set(item,"incomplete_reason",site.incomplete_reason?string(*site.incomplete_reason):none());
+        set(item,"table_base_source",string(switch_base_source_name(site.table_base_source)));
+        set(item,"table_base_relocation_rows",encode_u64_vector(site.table_base_relocation_rows));
+        set(item,"base_definition",site.base_definition?encode(*site.base_definition):none());
+        set(item,"selector_use",site.selector_use?encode(*site.selector_use):none());
+        for(const auto& row:site.cases){
+            Object value(PyDict_New());
+            set(value,"index",integer(row.index));set(value,"target",encode(row.target));
+            set(value,"source",string(switch_case_source_name(row.source)));
+            set(value,"relocation_rows",encode_u64_vector(row.relocation_rows));
+            set(value,"dyld_classic_rows",encode_u64_vector(row.dyld_classic_rows));
+            set(value,"dyld_chained_rows",encode_u64_vector(row.dyld_chained_rows));
+            append(cases,value.release());
+        }
+        set(item,"cases",cases.release());append(sites,item.release());
+    }
+    set(output,"sites",sites.release());return output.release();
+}
 PyObject* encode_presentation(const LocationPresentation& row){
     Object item(PyDict_New());set(item,"name",string(row.name));set(item,"comment",string(row.comment));
     set(item,"user_name",PyBool_FromLong(row.user_name));set(item,"orphaned",PyBool_FromLong(row.orphaned));return item.release();
@@ -1245,6 +1331,14 @@ PyObject* call_project(PyObject*,PyObject* args){return guarded([&]()->PyObject*
         count(values,1);auto rows=take(p.function_owners(address(argument(values,0))));Object list(PyList_New(0));
         for(const auto& row:rows){Object item(PyDict_New());set(item,"id",integer(row.id.value));set(item,"entry",encode(row.entry));append(list,item.release());}
         return list.release();
+    }
+    if(method=="switch_analysis"){
+        count(values,3);const auto entry=address(argument(values,0));
+        const auto expected=argument(values,1)==Py_None?std::optional<std::uint64_t>{}:
+            std::optional<std::uint64_t>{strict_unsigned(argument(values,1),"expected_revision must be an unsigned integer, not bool")};
+        const auto stop=argument(values,2)==Py_None?std::stop_token{}:stop_source(argument(values,2)).get_token();
+        auto report=take(without_gil([&]{return p.switch_analysis(entry,expected,stop);}));
+        return encode_switch_analysis(report);
     }
     if(method=="call_graph_model"){
         count(values,5);const auto target=address(argument(values,0));

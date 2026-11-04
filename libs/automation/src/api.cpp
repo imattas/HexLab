@@ -372,6 +372,42 @@ Result<std::shared_ptr<const GraphModel>> Project::call_graph(
     return build_graph(*current.value()->functions, *current.value()->references,
                        GraphKind::function_calls, function->id, options, labels, stop);
 }
+Result<SwitchAnalysisInfo> Project::switch_analysis(
+    Address function_entry, std::optional<std::uint64_t> expected_edit_revision,
+    std::stop_token stop) const {
+    if (stop.stop_requested())
+        return Error{ErrorCode::canceled, "Switch analysis canceled"};
+    auto initial = snapshot();
+    if (!initial) return initial.error();
+    const auto pinned = initial.value();
+    auto valid = derived_ok(*pinned);
+    if (!valid) return valid.error();
+    if (expected_edit_revision && *expected_edit_revision != pinned->state->revisions.edit)
+        return Error{ErrorCode::conflict, "Switch analysis expected a different project edit revision"};
+    if (!pinned->loaded || !pinned->loaded->image || !pinned->functions || !pinned->effective)
+        return Error{ErrorCode::unsupported, "Switch analysis requires a mapped image and recovered function facts"};
+    auto source = project_analysis_key(*pinned, pinned->analysis_options);
+    if (!source) return source.error();
+    if (pinned->derived_key != source.value() || pinned->functions->key != source.value())
+        return Error{ErrorCode::conflict, "Switch-analysis function facts belong to another project revision"};
+
+    const auto found = std::find_if(pinned->functions->functions.begin(), pinned->functions->functions.end(),
+        [&](const auto& function) { return function && function->entry == function_entry; });
+    if (found == pinned->functions->functions.end())
+        return Error{ErrorCode::invalid_argument, "No recovered function starts at the selected address"};
+
+    auto analysis = analyze_switch_tables(*pinned->loaded->image, pinned->loaded->metadata,
+                                          **found, *pinned->functions, stop);
+    if (!analysis) return analysis.error();
+    if (stop.stop_requested())
+        return Error{ErrorCode::canceled, "Switch analysis canceled"};
+    auto current = snapshot();
+    if (!current) return current.error();
+    if (current.value()->state->revisions != pinned->state->revisions ||
+        current.value()->derived_key != pinned->derived_key)
+        return Error{ErrorCode::conflict, "Project changed while switch analysis was running"};
+    return SwitchAnalysisInfo{function_entry, pinned->state->revisions, std::move(analysis.value())};
+}
 Result<std::optional<StackFrameInfo>> Project::stack_frame(Address address) const {
     auto s=snapshot();if(!s)return s.error();
     auto valid=derived_ok(*s.value());if(!valid)return valid.error();
