@@ -53,11 +53,12 @@ with truncation disclosed in its summary. Names/search text are bounded at
 indexes are transient; filters, sorting, and workbench selection are not saved.
 There is no new session/project schema or release/CI workflow.
 
-Validation for this change started an isolated Windows/MSVC 19.44 Debug
-`hexlab` build with `BUILD_TESTING=OFF`. Core, types, symbols, processors, image,
-analysis, loaders, database and decompiler targets completed; workspace compilation
-was still active at handoff. The desktop target has not yet been verified.
-No tests are added or run. The Ubuntu 24.04 WSL/Clang 18
+Validation: the isolated Windows/MSVC 19.44 Debug `hexlab` target built and
+linked successfully with `BUILD_TESTING=OFF`. The first attempt exposed MSVC
+C1128 in the existing async `session_listing.cpp` translation unit; extending
+the existing MSVC-only per-source `/bigobj` setting to that file fixed the
+COFF section limit, and the resumed full desktop build exited 0. No tests are
+added or run. The Ubuntu 24.04 WSL/Clang 18
 configuration found GTK3, but the fresh wxWidgets configuration was stopped
 before completion because of its duration; Linux compilation is unverified.
 Interactive GUI behavior remains subject to manual host verification.
