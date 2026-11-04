@@ -14,6 +14,8 @@ namespace hexlab::debugger::rsp {
 namespace {
 constexpr std::size_t max_pending_notifications = 4096;
 constexpr std::size_t max_pending_console_output = 1024 * 1024;
+constexpr std::size_t max_memory_transfer = 16 * 1024 * 1024;
+constexpr unsigned max_packet_attempts = 3;
 Error io_error(std::string message) { return {ErrorCode::io, std::move(message)}; }
 int hex_digit(char c) {
     if (c >= '0' && c <= '9') return c - '0';
@@ -73,6 +75,26 @@ std::string hex_u64(std::uint64_t value) {
     std::array<char, 16> buffer{};
     auto [end, ec] = std::to_chars(buffer.data(), buffer.data() + buffer.size(), value, 16);
     return ec == std::errc{} ? std::string(buffer.data(), end) : std::string{};
+}
+std::size_t memory_write_chunk(std::uint64_t address, std::size_t remaining,
+    std::size_t packet_limit) {
+    // Both hex M data and worst-case escaped X data cost two wire characters
+    // per byte. The length field grows at hexadecimal boundaries, so find the
+    // largest count whose actual header and data fit rather than reserving an
+    // unnecessary 16-character length field.
+    const auto fixed_header = std::size_t{3} + hex_u64(address).size(); // XADDR,LEN:
+    if (fixed_header >= packet_limit) return 0;
+    std::size_t low = 0;
+    std::size_t high = std::min({remaining, packet_limit / 2, std::size_t{64 * 1024}});
+    while (low < high) {
+        const auto candidate = low + (high - low + 1) / 2;
+        const auto header = fixed_header + hex_u64(candidate).size();
+        if (header <= packet_limit && candidate <= (packet_limit - header) / 2)
+            low = candidate;
+        else
+            high = candidate - 1;
+    }
+    return low;
 }
 Result<std::vector<std::byte>> decode_hex(std::string_view data) {
     if ((data.size() & 1U) != 0) return Error{ErrorCode::malformed, "RSP hex payload has odd length"};
@@ -358,21 +380,27 @@ Result<unsigned char> Client::read_byte(Deadline deadline, std::stop_token stop)
     }
 }
 Result<std::pair<bool, std::string>> Client::read_packet_after_start(
-    unsigned char marker, Deadline deadline, std::stop_token stop) {
+    unsigned char marker, Deadline deadline, std::stop_token stop, bool allow_expired_deadline) {
     std::lock_guard operation_lock(operation_mutex_);
     if (marker != '$' && marker != '%')
         return Error{ErrorCode::invalid_argument, "RSP packet start marker is invalid"};
     const bool notification = marker == '%';
     std::string frame(1, static_cast<char>(marker));
     bool escaped = false;
+    const auto read_packet_byte = [&]() -> Result<unsigned char> {
+        if (stop.stop_requested()) return Error{ErrorCode::canceled, "RSP operation canceled"};
+        if (!allow_expired_deadline && std::chrono::steady_clock::now() >= deadline)
+            return io_error("RSP packet read timed out");
+        return read_byte(deadline, stop);
+    };
     for (;;) {
-        auto byte = read_byte(deadline, stop); if (!byte) return byte.error();
+        auto byte = read_packet_byte(); if (!byte) return byte.error();
         const char c = static_cast<char>(byte.value()); frame += c;
         if (frame.size() > max_packet_ + 4)
             return Error{ErrorCode::resource_limit, "RSP packet exceeds configured limit"};
         if (!escaped && c == '#') {
             for (int i = 0; i < 2; ++i) {
-                auto digit = read_byte(deadline, stop); if (!digit) return digit.error();
+                auto digit = read_packet_byte(); if (!digit) return digit.error();
                 frame += static_cast<char>(digit.value());
             }
             if (notification) frame.front() = '$';
@@ -418,7 +446,10 @@ std::vector<std::byte> Client::take_console_output(std::size_t limit) {
 }
 Result<bool> Client::read_ack(Deadline deadline, std::stop_token stop) {
     std::lock_guard operation_lock(operation_mutex_);
+    unsigned invalid_packets = 0;
     for (;;) {
+        if (stop.stop_requested()) return Error{ErrorCode::canceled, "RSP operation canceled"};
+        if (std::chrono::steady_clock::now() >= deadline) return io_error("RSP acknowledgement timed out");
         auto byte = read_byte(deadline, stop); if (!byte) return byte.error();
         if (byte.value() == '+') return true;
         if (byte.value() == '-') return false;
@@ -426,10 +457,16 @@ Result<bool> Client::read_ack(Deadline deadline, std::stop_token stop) {
         const auto start = byte.value();
         auto packet = read_packet_after_start(start, deadline, stop);
         if (!packet) {
-            if (start == '%' && packet.error().code != ErrorCode::resource_limit &&
-                packet.error().code != ErrorCode::canceled && packet.error().code != ErrorCode::io)
+            if (packet.error().code != ErrorCode::integrity && packet.error().code != ErrorCode::malformed)
+                return packet.error();
+            if (++invalid_packets >= max_packet_attempts) return packet.error();
+            // Notifications are never acknowledged. A damaged ordinary packet
+            // (for example console output) can be retransmitted before the ACK.
+            if (start == '%')
                 continue;
-            return packet.error();
+            auto sent = write_all("-", deadline, stop);
+            if (!sent) return sent.error();
+            continue;
         }
         if (!packet.value().first) {
             auto payload = std::move(packet.value().second);
@@ -454,10 +491,17 @@ Result<std::string> Client::receive_packet(Deadline deadline, std::stop_token st
                                            bool *was_notification) {
     std::lock_guard operation_lock(operation_mutex_);
     if (was_notification) *was_notification = false;
+    unsigned invalid_packets = 0;
     for (;;) {
+        if (stop.stop_requested()) return Error{ErrorCode::canceled, "RSP operation canceled"};
+        // A zero-timeout stop poll may still drain an already-buffered packet.
+        // Ordinary transactions must not outlive their deadline just because
+        // the peer keeps the socket readable with notifications or junk.
+        if (!accept_notifications && std::chrono::steady_clock::now() >= deadline)
+            return io_error("RSP response timed out");
         auto start = read_byte(deadline, stop); if (!start) return start.error();
         if (start.value() != '$' && start.value() != '%') continue;
-        auto packet = read_packet_after_start(start.value(), deadline, stop);
+        auto packet = read_packet_after_start(start.value(), deadline, stop, accept_notifications);
         const bool notification = start.value() == '%';
         if (!packet) {
             if (packet.error().code == ErrorCode::resource_limit ||
@@ -465,10 +509,12 @@ Result<std::string> Client::receive_packet(Deadline deadline, std::stop_token st
                 packet.error().code == ErrorCode::io ||
                 packet.error().code == ErrorCode::busy)
                 return packet.error();
+            if (++invalid_packets >= max_packet_attempts) return packet.error();
             if (notification) continue;
             if (no_ack_mode_) return packet.error();
             const char response = '-';
-            const auto ack_deadline = std::max(deadline, std::chrono::steady_clock::now() + timeout_);
+            const auto ack_deadline = accept_notifications
+                ? std::max(deadline, std::chrono::steady_clock::now() + timeout_) : deadline;
             auto sent = write_all(std::string_view(&response, 1), ack_deadline, stop); if (!sent) return sent.error();
             continue;
         }
@@ -489,7 +535,8 @@ Result<std::string> Client::receive_packet(Deadline deadline, std::stop_token st
             if (!queued) return queued.error();
             if (!no_ack_mode_) {
                 const char response = '+';
-                const auto ack_deadline = std::max(deadline, std::chrono::steady_clock::now() + timeout_);
+                const auto ack_deadline = accept_notifications
+                    ? std::max(deadline, std::chrono::steady_clock::now() + timeout_) : deadline;
                 auto sent = write_all(std::string_view(&response, 1), ack_deadline, stop);
                 if (!sent) return sent.error();
             }
@@ -497,7 +544,8 @@ Result<std::string> Client::receive_packet(Deadline deadline, std::stop_token st
         }
         if (no_ack_mode_) return payload;
         const char response = '+';
-        const auto ack_deadline = std::max(deadline, std::chrono::steady_clock::now() + timeout_);
+        const auto ack_deadline = accept_notifications
+            ? std::max(deadline, std::chrono::steady_clock::now() + timeout_) : deadline;
         auto sent = write_all(std::string_view(&response, 1), ack_deadline, stop); if (!sent) return sent.error();
         return payload;
     }
@@ -516,7 +564,7 @@ Result<std::string> Client::transact_until(std::string_view command, Deadline de
     const auto encoded_payload_size = packet.size() - 4; // '$' + payload + '#' + checksum
     if (encoded_payload_size > max_packet_ || encoded_payload_size > peer_packet_size_)
         return Error{ErrorCode::resource_limit, "encoded RSP command exceeds the negotiated packet limit"};
-    for (unsigned attempt = 0; attempt < 3; ++attempt) {
+    for (unsigned attempt = 0; attempt < max_packet_attempts; ++attempt) {
         auto sent = write_all(packet, deadline, stop); if (!sent) return sent.error();
         if (!no_ack_mode_) {
             auto ack = read_ack(deadline, stop); if (!ack) return ack.error();
@@ -1696,12 +1744,11 @@ Status Client::write_register(std::uint64_t number, std::span<const std::byte> b
 }
 Result<std::vector<std::byte>> Client::read_memory(std::uint64_t address, std::size_t size, std::stop_token stop) {
     std::lock_guard operation_lock(operation_mutex_);
-    constexpr std::size_t max_transfer = 16 * 1024 * 1024;
     if (size == 0) return std::vector<std::byte>{};
-    if (size > max_transfer || size > std::numeric_limits<std::uint64_t>::max() ||
-        address > UINT64_MAX - size)
+    if (size > max_memory_transfer || address > UINT64_MAX - (size - 1))
         return Error{ErrorCode::invalid_argument, "RSP memory range is invalid or exceeds the 16 MiB limit"};
     const auto packet_limit = std::min(max_packet_, peer_packet_size_);
+    const auto deadline = std::chrono::steady_clock::now() + timeout_;
 
     std::vector<std::byte> result;
     result.reserve(size);
@@ -1713,15 +1760,20 @@ Result<std::vector<std::byte>> Client::read_memory(std::uint64_t address, std::s
         // The request size itself contributes at most 16 hexadecimal digits.
         // Bound the reply by the negotiated packet size and leave room for the
         // actual request header before choosing each chunk.
-        if (prefix.size() + 1 >= packet_limit)
+        if (prefix.size() + 1 > packet_limit)
             return Error{ErrorCode::resource_limit, "RSP peer packet limit cannot fit a memory-read header"};
         const auto reply_capacity = packet_limit / 2;
         auto count = std::min({size - offset, reply_capacity, std::size_t{64 * 1024}});
         while (count != 0 && prefix.size() + hex_u64(count).size() > packet_limit) --count;
         if (count == 0)
             return Error{ErrorCode::resource_limit, "RSP peer packet limit cannot fit memory-read data"};
-        auto response = transact(prefix + hex_u64(count), stop);
+        auto response = transact_until(prefix + hex_u64(count), deadline, stop);
         if (!response) return response.error();
+        if (response.value().empty())
+            return Error{ErrorCode::unsupported, "remote does not support memory reads"};
+        if (response.value().size() == 3 && response.value().front() == 'E' &&
+            hex_digit(response.value()[1]) >= 0 && hex_digit(response.value()[2]) >= 0)
+            return io_error("remote rejected memory read: " + response.value());
         auto bytes = decode_hex(response.value());
         if (!bytes) return bytes.error();
         if (bytes.value().size() != count)
@@ -2108,66 +2160,58 @@ Status Client::set_breakpoint(std::uint64_t address, BreakpointType type, std::u
 }
 Status Client::write_memory(std::uint64_t address, std::span<const std::byte> bytes, std::stop_token stop) {
     std::lock_guard operation_lock(operation_mutex_);
-    if (bytes.empty() || address > UINT64_MAX - bytes.size())
-        return Error{ErrorCode::invalid_argument, "RSP memory write range is empty or overflows the address space"};
+    if (bytes.empty() || bytes.size() > max_memory_transfer || address > UINT64_MAX - (bytes.size() - 1))
+        return Error{ErrorCode::invalid_argument, "RSP memory write range is empty, overflows, or exceeds the 16 MiB limit"};
+    if (stop.stop_requested()) return Error{ErrorCode::canceled, "RSP memory write canceled before transmission"};
     const auto packet_limit = std::min(max_packet_, peer_packet_size_);
-    if (packet_limit < 48)
-        return Error{ErrorCode::resource_limit, "RSP peer packet limit is too small for a memory write"};
-
-    // Try the binary X packet first. It avoids hex expansion for the normal
-    // case. Bound each chunk for the worst case, where every byte needs RSP
-    // escaping; the packet-size feature counts encoded data characters.
+    // Preflight the largest address header, including the X-to-M fallback,
+    // before any bytes change. Every subsequent chunk can fit at least a byte.
+    if (memory_write_chunk(address + (bytes.size() - 1), 1, packet_limit) == 0)
+        return Error{ErrorCode::resource_limit, "RSP peer packet limit cannot fit a memory-write header and data"};
+    const auto deadline = std::chrono::steady_clock::now() + timeout_;
     std::size_t offset = 0;
+    bool binary = true;
+    const auto fail = [&](Error error, bool uncertain_chunk) -> Status {
+        error.message = "RSP memory write acknowledged " + std::to_string(offset) + " of " +
+            std::to_string(bytes.size()) + " bytes: " + error.message;
+        if (uncertain_chunk)
+            error.message += "; the current chunk may already have changed; reconnect before retrying";
+        else if (offset != 0)
+            error.message += "; the acknowledged prefix remains changed";
+        return error;
+    };
     while (offset < bytes.size()) {
+        if (stop.stop_requested()) return fail({ErrorCode::canceled, "canceled before the next chunk"}, false);
+        if (std::chrono::steady_clock::now() >= deadline)
+            return fail(io_error("transfer timed out before the next chunk"), false);
         const auto current = address + offset;
-        const auto x_prefix = "X" + hex_u64(current) + ",";
-        const auto remaining = bytes.size() - offset;
-        // Reserve the full 64-bit length field so the chosen data count is
-        // safe before its hexadecimal width is known.
-        const auto x_header_size = x_prefix.size() + 16 + 1;
-        if (x_header_size >= packet_limit)
-            return Error{ErrorCode::resource_limit, "RSP peer packet limit cannot fit a binary memory-write header"};
-        const auto x_capacity = (packet_limit - x_header_size) / 2;
-        const auto x_count = std::min(remaining, x_capacity);
-        if (x_count == 0)
-            return Error{ErrorCode::resource_limit, "RSP peer packet limit cannot fit binary memory-write data"};
-        const auto prefix = x_prefix + hex_u64(x_count) + ":";
-        std::string command = prefix;
-        command.append(reinterpret_cast<const char*>(bytes.data() + offset), x_count);
-        auto response = transact(command, stop);
-        if (!response) return response.error();
+        const auto count = memory_write_chunk(current, bytes.size() - offset, packet_limit);
+        if (count == 0)
+            return fail({ErrorCode::resource_limit, "packet limit cannot fit memory-write data"}, false);
+        std::string command = std::string(binary ? "X" : "M") + hex_u64(current) + "," + hex_u64(count) + ":";
+        if (binary)
+            command.append(reinterpret_cast<const char*>(bytes.data() + offset), count);
+        else
+            command += encode_hex(bytes.subspan(offset, count));
+        auto response = transact_until(command, deadline, stop);
+        // A failed transaction may have sent some or all of the request before
+        // cancellation, timeout, or checksum exhaustion. Do not resend the
+        // command at this layer: RSP has no write transaction or rollback ID.
+        if (!response) return fail(response.error(), true);
         if (response.value() == "OK") {
-            offset += x_count;
+            offset += count;
             continue;
         }
-        if (response.value().empty()) {
-            // Empty is the protocol's unsupported-packet reply. Falling back
-            // to M keeps older stubs usable; no bytes from this X packet were
-            // accepted.
-            break;
+        if (response.value().empty() && binary) {
+            // Only the explicit unsupported reply permits X-to-M fallback.
+            // Preserve the acknowledged prefix and retry the same offset.
+            binary = false;
+            continue;
         }
-        return Error{ErrorCode::io, "remote rejected binary memory write: " + response.value()};
-    }
-    if (offset == bytes.size()) return std::monostate{};
-
-    // Hex M data expands by exactly two characters per byte, so it can use
-    // the remaining advertised packet capacity without the binary worst-case
-    // escape allowance.
-    while (offset < bytes.size()) {
-        const auto current = address + offset;
-        const auto remaining = bytes.size() - offset;
-        const auto m_prefix = "M" + hex_u64(current) + ",";
-        if (m_prefix.size() + 16 + 1 >= packet_limit)
-            return Error{ErrorCode::resource_limit, "RSP peer packet limit cannot fit a hex memory-write header"};
-        const auto count = std::min(remaining, (packet_limit - (m_prefix.size() + 16 + 1)) / 2);
-        if (count == 0)
-            return Error{ErrorCode::resource_limit, "RSP peer packet limit cannot fit hex memory-write data"};
-        const auto prefix = m_prefix + hex_u64(count) + ":";
-        auto response = transact(prefix + encode_hex(bytes.subspan(offset, count)), stop);
-        if (!response) return response.error();
-        if (response.value() != "OK")
-            return Error{ErrorCode::io, "remote rejected memory write: " + response.value()};
-        offset += count;
+        if (response.value().empty())
+            return fail({ErrorCode::unsupported, "remote does not support memory writes"}, false);
+        // Even an error reply need not imply that a target made no changes.
+        return fail(io_error("remote rejected memory write: " + response.value()), true);
     }
     return std::monostate{};
 }

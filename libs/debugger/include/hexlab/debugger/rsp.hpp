@@ -175,6 +175,8 @@ public:
     Result<std::vector<std::byte>> read_register(std::uint64_t number, std::stop_token = {});
     Result<std::string> read_register_raw(std::uint64_t number, std::stop_token = {});
     Status write_register(std::uint64_t number, std::span<const std::byte>, std::stop_token = {});
+    // Transfers at most 16 MiB using one timeout across all chunks and retries.
+    // Zero-byte reads do not perform I/O; no partial read result is returned.
     Result<std::vector<std::byte>> read_memory(std::uint64_t address, std::size_t size, std::stop_token = {});
     // Searches a bounded target memory range. Empty optional means no match;
     // an unsupported remote reports ErrorCode::unsupported.
@@ -224,6 +226,9 @@ public:
     std::vector<std::byte> take_console_output(std::size_t limit = 4096);
     Status set_breakpoint(std::uint64_t address, BreakpointType, std::uint8_t size, bool insert,
                           std::stop_token = {});
+    // Writes 1..16 MiB using one timeout across X/M chunks and retries. Errors
+    // report acknowledged progress; an in-flight chunk may already have changed.
+    // Reconnect after an interrupted in-flight transaction before retrying.
     Status write_memory(std::uint64_t address, std::span<const std::byte>, std::stop_token = {});
     // Erases and programs a bounded flash range with vFlashErase/vFlashWrite/
     // vFlashDone. A failure after erase may leave the remote flash partially
@@ -253,7 +258,8 @@ private:
         std::uint64_t offset, std::size_t maximum_size, bool probe_limit, std::stop_token);
     Status write_all(std::string_view, Deadline, std::stop_token);
     Result<unsigned char> read_byte(Deadline, std::stop_token);
-    Result<std::pair<bool, std::string>> read_packet_after_start(unsigned char, Deadline, std::stop_token);
+    Result<std::pair<bool, std::string>> read_packet_after_start(unsigned char, Deadline, std::stop_token,
+                                                              bool allow_expired_deadline = false);
     Status queue_stop_notification(std::string);
     Status queue_console_output(std::string_view);
     Result<bool> read_ack(Deadline, std::stop_token);

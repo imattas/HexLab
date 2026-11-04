@@ -122,7 +122,31 @@ standard object is reported as malformed rather than hidden by a fallback.
 into ordered `m` requests sized for both the local and peer `PacketSize`. It
 checks every decoded chunk against the requested length, supports cancellation
 between chunks, and caps one call at 16 MiB. A zero-byte request returns an
-empty result without I/O; overflowing and over-limit ranges are rejected.
+empty result without I/O; overflowing and over-limit ranges are rejected. A
+range whose last byte is `UINT64_MAX` is valid. Empty replies report unsupported,
+standard `Ehh` replies report a remote error, and malformed or short data never
+produces a partial successful result.
+
+Memory reads and writes share one client timeout across all chunks, command
+retransmissions, response decoding, and response acknowledgements once the
+serialized operation begins. A slow peer cannot renew that deadline by sending
+notifications or a continuous stream of ready bytes. Each request is sent at
+most three times after negative acknowledgements. In ACK mode, the third
+corrupt or malformed packet in an acknowledgement wait or response wait fails
+the exchange; earlier damaged ordinary packets request retransmission. In
+no-ACK mode a damaged ordinary reply fails immediately. Notifications never
+receive `+`/`-` acknowledgements. Asynchronous stop polling retains its ability
+to drain an already-buffered packet at zero timeout and to acknowledge that
+packet with a separate bounded write deadline.
+
+Cancellation stops the transfer before its next chunk and is checked during
+transport reads and writes. Interleaved `%Stop:` notifications are retained
+for the normal stop-event path; they neither replace the memory reply nor
+cancel a transfer by themselves. An interrupted in-flight transaction may leave
+a partial frame or an unread reply in the stream: reconnect with a fresh client
+before issuing further commands. This API does not automatically resynchronize
+the connection or roll back target memory. Framing and acknowledgements follow
+the [GDB RSP overview](https://sourceware.org/gdb/current/onlinedocs/gdb.html/Overview.html).
 
 `rsp::Client::memory_crc32(address, length)` requests a remote CRC-32 through
 `qCRC:ADDR,LENGTH`, allowing callers to compare a memory range without reading
@@ -693,7 +717,18 @@ Memory writes use the binary `X` packet first and fall back to hexadecimal `M`
 when a peer replies with the protocol's empty unsupported-packet response. Both
 forms are split into bounded chunks using the peer's advertised `PacketSize`;
 binary chunk sizing reserves worst-case RSP escaping expansion, so arbitrary
-bytes cannot exceed the negotiated wire payload limit.
+bytes cannot exceed the negotiated wire payload limit. Each chunk uses its
+actual address and length header, is capped at 64 KiB of source data, and fits
+both local and peer ceilings. The largest address header is checked before any
+write, including the possible `M` fallback, so an address-width transition
+cannot discover an unrepresentable header after changing an earlier chunk.
+Writes accept 1 byte through 16 MiB, including a range ending at `UINT64_MAX`.
+Only exact `OK` advances the acknowledged offset. Failures retain their error
+code and report the number of acknowledged bytes; the prefix remains changed,
+and an in-flight or rejected chunk may also have changed even without `OK`.
+Only an explicit empty `X` reply permits `M` fallback at the same offset; other
+errors never trigger automatic replay. See the
+[GDB memory packet reference](https://sourceware.org/gdb/current/onlinedocs/gdb.html/Packets.html).
 
 When `qSupported` advertises `QNonStop+`, the remote backend requests `QNonStop:1`; peers that do not support the request remain in all-stop mode. In non-stop mode, `%Stop:` notifications use the normal RSP checksum and escaping rules and carry no `+`/`-` acknowledgement byte. HexLab acknowledges each stop through the `vStopped` sequence, including additional synchronous stop replies and the terminating `OK`. Stop notifications that arrive while another command response is being read are retained for the next `wait_stop_reply` call, and the backend maps them through the regular `DebugSession` event path. The pending queue is bounded to 4,096 stop replies and to the configured aggregate packet-byte budget; exceeding either bound returns `resource_limit` from the in-flight operation. The session exposes one stop event at a time, while the remote target may continue other threads; unqualified continue resumes the exact stopped thread in non-stop mode. `DebugSession::thread_run_states()` provides a token-keyed snapshot with `unknown`, `running`, `stopped`, and `exited` states for every RSP thread known to the session. Thread-list XML seeds or refreshes the snapshot when it includes state; stop notifications update the owning thread; thread-created/thread-exited reasons update lifecycle state; and successful resume schedules update only the threads named by their actions. An all-stop notification marks all known threads stopped, while non-stop notifications change only their identified thread. `request_interrupt()` does not predict a stop: state changes only as stop notifications arrive. The snapshot retains known exited threads and may omit threads not yet observed or enumerated. When a legacy all-stop step has no identified thread, the backend marks active-thread states `unknown` rather than guessing which one ran. `SessionState` remains a coarse session summary, and the common API still acknowledges one stop event at a time, so simultaneous pending-event ownership is not modeled. A multiprocess target that reports no initial stop and therefore provides no process identity is rejected rather than assigned to an arbitrary process.
 
