@@ -167,6 +167,16 @@ bool instruction_bytes_match(const InstructionFact &fact, const Image &image, st
     return bytes && bytes.value().size() == instruction.length &&
            std::equal(bytes.value().begin(), bytes.value().end(), encoded.begin());
 }
+bool semantic_reads_within_image(const SemanticDecoderReadSetSnapshot &snapshot,
+                                 std::uint64_t image_size, std::stop_token stop) {
+    for (const auto &range : snapshot.image_reads) {
+        canceled(stop);
+        if (!range.size || range.begin.value > image_size ||
+            range.size > image_size - range.begin.value)
+            return false;
+    }
+    return true;
+}
 bool effective_images_match(const Image &left, const Image &right, std::stop_token stop) {
     const auto &left_storage = *left.storage();
     const auto &right_storage = *right.storage();
@@ -369,6 +379,7 @@ Result<InvalidationPlan> plan_invalidation(const AnalysisBasis &old, std::span<c
         canceled(stop);
         validate_basis(old);
         require(changes.size() <= 1000000, "Too many invalidation ranges");
+        const auto semantic_reads = take(capture_semantic_decoder_read_set(old.options, stop));
         InvalidationPlan plan;
         plan.before_key = old.key;
         plan.source_key = key;
@@ -419,11 +430,11 @@ Result<InvalidationPlan> plan_invalidation(const AnalysisBasis &old, std::span<c
             plan.full_reason = "External analysis-input identity changed";
         else if (key.engine_fingerprint != old.key.engine_fingerprint)
             plan.full_reason = "Analysis engine or options changed";
-        else if (!semantic_decoder_read_set_complete(old.options))
+        else if (!semantic_reads.complete)
             plan.full_reason = "Semantic decoder external reads are not completely declared; full rebuild required";
-        else if (semantic_decoder_image_reads_intersect(old.options, {}, old.image->storage()->size()))
+        else if (!semantic_reads_within_image(semantic_reads, old.image->storage()->size(), stop))
             plan.full_reason = "Semantic decoder image-read ranges are invalid; full rebuild required";
-        else if (!semantic_decoder_image_read_ranges(old.options).empty() &&
+        else if (!semantic_reads.image_reads.empty() &&
                  key.byte_revision != old.key.byte_revision && !byte_ranges_verified)
             plan.full_reason = "Semantic decoder image reads require a certified complete byte diff";
         else if (plan.metadata_invalid)
@@ -547,16 +558,16 @@ Result<DerivedProposal> reanalyze(const AnalysisBasis &old, std::shared_ptr<cons
             return Error{ErrorCode::conflict, "Loader metadata changed without advancing the analysis source key"};
         if (key == old.key && !effective_images_match(*old.image, *image, stop))
             return Error{ErrorCode::conflict, "Effective input bytes changed without advancing the analysis source key"};
-        const bool callback_reads_complete = semantic_decoder_read_set_complete(old.options);
+        const auto semantic_reads = take(capture_semantic_decoder_read_set(old.options, stop));
         // The invalidation plan may have been prepared before a host callback
         // refreshed its manifest. Recheck its current primary-image reads at
         // the reuse boundary so newly declared dependencies cannot leave stale
         // callback-derived instructions in the retained snapshot.
         const bool callback_external_reads_unverified =
-            !semantic_decoder_image_read_ranges(old.options).empty() &&
+            !semantic_reads.image_reads.empty() &&
             key.byte_revision != old.key.byte_revision && !plan.byte_ranges_verified;
-        const bool callback_read_conflict = !callback_reads_complete || callback_external_reads_unverified ||
-            semantic_decoder_image_reads_intersect(old.options, {}, old.image->storage()->size());
+        const bool callback_read_conflict = !semantic_reads.complete || callback_external_reads_unverified ||
+            !semantic_reads_within_image(semantic_reads, old.image->storage()->size(), stop);
         // A loader's dependency ranges are the fast invalidation path, but the
         // freshly parsed result remains authoritative. A changed mapping or
         // metadata snapshot disables all derived-fact reuse even when the

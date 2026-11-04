@@ -49,6 +49,16 @@ struct AnalysisOptions {
     DecoderIdentity semantic_decoder_identity;
     SemanticDecoderReadSet semantic_decoder_read_set;
 };
+struct SemanticDecoderReadSetSnapshot {
+    bool configured = false;
+    bool complete = true;
+    std::vector<FileRange> image_reads;
+};
+// Captures and validates the callback manifest once, checking cancellation
+// while walking the bounded input and range lists. An invalid/throwing
+// manifest is returned with complete=false so incremental callers can rebuild.
+HEXLAB_ANALYSIS_EXPORT Result<SemanticDecoderReadSetSnapshot> capture_semantic_decoder_read_set(
+    const AnalysisOptions &, std::stop_token);
 HEXLAB_ANALYSIS_EXPORT bool semantic_decoder_read_set_complete(const AnalysisOptions&) noexcept;
 HEXLAB_ANALYSIS_EXPORT std::vector<FileRange> semantic_decoder_image_read_ranges(const AnalysisOptions&) noexcept;
 HEXLAB_ANALYSIS_EXPORT bool semantic_decoder_image_reads_intersect(

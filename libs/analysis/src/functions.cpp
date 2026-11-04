@@ -3359,11 +3359,14 @@ struct SemanticDecoderManifest {
     std::vector<AnalysisOptions::SemanticDecoderInput> inputs;
 };
 
-std::optional<SemanticDecoderManifest> capture_semantic_decoder_manifest(const AnalysisOptions &options) noexcept {
+std::optional<SemanticDecoderManifest> capture_semantic_decoder_manifest(
+    const AnalysisOptions &options, std::stop_token stop = {}) noexcept {
     if (!options.semantic_decoder || !options.semantic_decoder_identity || !options.semantic_decoder_read_set)
         return {};
     try {
+        if (stop.stop_requested()) return {};
         SemanticDecoderManifest manifest{options.semantic_decoder_identity(), options.semantic_decoder_read_set()};
+        if (stop.stop_requested()) return {};
         if (manifest.identity.size() > 1024 * 1024 || manifest.inputs.size() > 4096)
             return {};
         std::sort(manifest.inputs.begin(), manifest.inputs.end(), [](const auto &a, const auto &b) {
@@ -3372,6 +3375,7 @@ std::optional<SemanticDecoderManifest> capture_semantic_decoder_manifest(const A
         std::size_t total = 0;
         std::size_t total_ranges = 0;
         for (std::size_t i = 0; i < manifest.inputs.size(); ++i) {
+            if (stop.stop_requested()) return {};
             auto &input = manifest.inputs[i];
             const bool digest_missing = std::all_of(input.sha256.begin(), input.sha256.end(),
                                                     [](std::byte value) { return value == std::byte{}; });
@@ -3387,9 +3391,11 @@ std::optional<SemanticDecoderManifest> capture_semantic_decoder_manifest(const A
             total_ranges += input.image_reads.size();
             ReadSet normalized;
             for (const auto &range : input.image_reads) {
+                if (stop.stop_requested()) return {};
                 if (!range.size || !normalized.include(range.begin, range.size))
                     return {};
             }
+            if (stop.stop_requested()) return {};
             input.image_reads.assign(normalized.ranges().begin(), normalized.ranges().end());
         }
         return manifest;
@@ -3398,6 +3404,51 @@ std::optional<SemanticDecoderManifest> capture_semantic_decoder_manifest(const A
     }
 }
 } // namespace
+
+Result<SemanticDecoderReadSetSnapshot> capture_semantic_decoder_read_set(
+    const AnalysisOptions &options, std::stop_token stop) {
+    if (stop.stop_requested())
+        return Error{ErrorCode::canceled, "Semantic decoder read-set capture canceled"};
+    SemanticDecoderReadSetSnapshot result;
+    result.configured = static_cast<bool>(options.semantic_decoder);
+    if (!result.configured)
+        return result;
+    const auto manifest = capture_semantic_decoder_manifest(options, stop);
+    if (stop.stop_requested())
+        return Error{ErrorCode::canceled, "Semantic decoder read-set capture canceled"};
+    if (!manifest) {
+        result.complete = false;
+        return result;
+    }
+    try {
+        ReadSet reads;
+        for (const auto &input : manifest->inputs) {
+            if (stop.stop_requested())
+                return Error{ErrorCode::canceled, "Semantic decoder read-set capture canceled"};
+            for (const auto &range : input.image_reads) {
+                if (stop.stop_requested())
+                    return Error{ErrorCode::canceled, "Semantic decoder read-set capture canceled"};
+                if (!reads.include(range.begin, range.size)) {
+                    result.complete = false;
+                    return result;
+                }
+            }
+        }
+        result.image_reads.reserve(reads.ranges().size());
+        for (const auto &range : reads.ranges()) {
+            if (stop.stop_requested())
+                return Error{ErrorCode::canceled, "Semantic decoder read-set capture canceled"};
+            result.image_reads.push_back(range);
+        }
+        if (stop.stop_requested())
+            return Error{ErrorCode::canceled, "Semantic decoder read-set capture canceled"};
+        return result;
+    } catch (const std::bad_alloc &) {
+        return Error{ErrorCode::resource_limit, "Cannot allocate semantic decoder read-set snapshot"};
+    } catch (const std::length_error &) {
+        return Error{ErrorCode::resource_limit, "Semantic decoder read-set snapshot exceeds container limits"};
+    }
+}
 
 bool semantic_decoder_read_set_complete(const AnalysisOptions &options) noexcept {
     if (!options.semantic_decoder)

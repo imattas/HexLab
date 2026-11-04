@@ -80,3 +80,13 @@ facts are fully rebuilt instead of reusing callback-derived instructions. The
 manifest remains a caller certification, and stable external-input identity is
 still required in the analysis key when callback behavior depends on external
 content.
+
+Each invalidation-planning and reanalysis stage now captures one normalized
+semantic-decoder read-set snapshot and uses that evidence throughout its reuse
+decision. Capture checks cancellation before and during manifest input/range
+validation and unioning. A requested stop returns `ErrorCode::canceled` before
+an invalidation plan or derived proposal can be published. Missing, malformed,
+or out-of-image dependencies remain uncertified and force full derived-fact
+rebuild; they are never treated as an empty read set. Planning and reanalysis
+capture separately because a host may legitimately refresh its manifest between
+those stages.
