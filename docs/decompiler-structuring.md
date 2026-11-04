@@ -672,15 +672,19 @@ same region-first structuring principle visible in Ghidra's native
 [`blockaction.cc`](https://github.com/NationalSecurityAgency/ghidra/blob/master/Ghidra/Features/Decompiler/src/decompile/cpp/blockaction.cc); no Ghidra source is copied.
 
 Nested pre-tested child loops also accept conditional continue edges that pass
-through up to 1,024 phi-free cleanup blocks before returning to the child header,
-matching the enclosing CFG block budget.
-The cleanup chain must be single-entry, unconditional, and free of side entries,
-returns, switches, and memory phis. Its final block must be an actual CFG
-predecessor of the header. The child header's register phis are validated
-against the cleanup tail and ordinary latch edges, and their parallel copies
-are emitted after the guarded cleanup statements immediately before `continue`.
-Direct conditional continues remain the zero-block case; ambiguous or
-side-entered cleanup paths retain the existing fallback.
+through up to 1,024 single-entry cleanup blocks before returning to the child
+header, matching the enclosing CFG block budget. Cleanup blocks must have one
+unconditional successor, no side entries, returns, or switches. Register phis
+are accepted when each has exactly one input from the block's actual
+predecessor and a unique destination; their parallel copies execute on that
+incoming edge before the cleanup block's statements. Whole-memory and
+partition-memory phis remain analysis-only and require exact predecessor
+coverage, with nonempty unique partition names. The cleanup tail must be an
+actual CFG predecessor of the header. The child header's register phis are
+validated against the cleanup tail and ordinary latch edges, and their
+parallel copies execute after the guarded cleanup statements immediately
+before `continue`. Direct conditional continues remain the zero-block case;
+ambiguous or side-entered cleanup paths retain the existing fallback.
 
 A nested pre-tested child loop may contain a guarded return-only side path while
 its other conditional edge continues along the child body. The return side may

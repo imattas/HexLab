@@ -11970,6 +11970,12 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
             std::vector<LoopConditionalReturn> conditional_returns;
             std::vector<std::pair<const LiftedBlock *, bool>> conditional_continues;
             std::map<std::uint64_t, std::vector<const LiftedBlock *>> conditional_continue_paths;
+            // Register phis in a single-entry conditional-continue cleanup
+            // chain are copied on their original incoming edge before the
+            // block's effects execute.
+            std::map<std::uint64_t, std::vector<std::pair<std::string, std::string>>>
+                conditional_continue_path_phi_copies;
+            std::size_t conditional_continue_path_phi_input_count = 0;
             // A final child-body decision tree may end at several distinct
             // unconditional backedges instead of one linear-spine latch.
             std::vector<NestedLatchTreeNode> latch_tree;
@@ -13025,9 +13031,19 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                                                !inner_ids.contains(cursor->id.value) &&
                                                path.size() < max_nested_child_cleanup_blocks &&
                                                seen.insert(cursor->id.value).second) {
-                                            if (!cursor->phis.empty() || cursor->switch_dispatch ||
+                                            bool register_phis_valid = cursor->phis.size() <= 4096;
+                                            std::set<std::string> destinations;
+                                            for (const auto &phi : cursor->phis) {
+                                                const auto destination = register_name(phi.destination, phi.version);
+                                                if (!destinations.insert(destination).second || phi.inputs.size() != 1 ||
+                                                    phi.inputs.front().predecessor.value != predecessor) {
+                                                    register_phis_valid = false;
+                                                    break;
+                                                }
+                                            }
+                                            if (!register_phis_valid || cursor->switch_dispatch ||
                                                 contains_return(*cursor) || !has_only_simple_statements(*cursor) ||
-                                                cursor->memory_phi || !cursor->memory_partition_phis.empty() ||
+                                                !valid_diamond_memory_phi(*cursor) ||
                                                 cursor->successors.size() != 1 ||
                                                 !cursor->successors.front().target ||
                                                 (cursor->successors.front().kind != BlockEdgeKind::jump &&
@@ -13067,8 +13083,29 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                                                 *false_continue_path;
                                             candidate.conditional_continue_paths.emplace(inner_current->id.value,
                                                 continue_path);
-                                            for (const auto *path_block : continue_path)
+                                            auto path_predecessor = inner_current->id.value;
+                                            for (const auto *path_block : continue_path) {
+                                                auto &copies = candidate.conditional_continue_path_phi_copies[
+                                                    path_block->id.value];
+                                                for (const auto &phi : path_block->phis) {
+                                                    if (phi.inputs.size() != 1 ||
+                                                        phi.inputs.front().predecessor.value != path_predecessor ||
+                                                        phi.inputs.size() > 65536 -
+                                                            candidate.conditional_continue_path_phi_input_count) {
+                                                        candidate_valid = false;
+                                                        break;
+                                                    }
+                                                    candidate.conditional_continue_path_phi_input_count +=
+                                                        phi.inputs.size();
+                                                    copies.emplace_back(
+                                                        register_name(phi.destination, phi.version),
+                                                        register_name(phi.destination, phi.inputs.front().version));
+                                                }
+                                                if (!candidate_valid) break;
                                                 inner_ids.insert(path_block->id.value);
+                                                path_predecessor = path_block->id.value;
+                                            }
+                                            if (!candidate_valid) break;
                                             inner_current = continuation;
                                             continue;
                                         }
@@ -13936,7 +13973,13 @@ StructuredPseudocode format_structured_pseudocode(const LiftedFunction &function
                             const auto path = region.conditional_continue_paths.find(inner_block->id.value);
                             const auto path_blocks = path == region.conditional_continue_paths.end()
                                 ? std::vector<const LiftedBlock *>{} : path->second;
-                            for (const auto *path_block : path_blocks) emit_block(*path_block, 16, true);
+                            for (const auto *path_block : path_blocks) {
+                                if (const auto copies = region.conditional_continue_path_phi_copies.find(
+                                        path_block->id.value);
+                                    copies != region.conditional_continue_path_phi_copies.end())
+                                    emit_parallel_copies(out, copies->second, 16);
+                                emit_block(*path_block, 16, true);
+                            }
                             const auto *backedge = path_blocks.empty() ? inner_block : path_blocks.back();
                             if (const auto copies = region.backedge_phi_copies.find(backedge->id.value);
                                 copies != region.backedge_phi_copies.end())
