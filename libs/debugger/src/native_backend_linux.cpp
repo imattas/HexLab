@@ -4,6 +4,7 @@
 #include "linux_x86_fp_registers.hpp"
 #include "linux_x86_registers.hpp"
 #include "linux_proc_task_state.hpp"
+#include "linux_launch_environment.hpp"
 
 #include <algorithm>
 #include <array>
@@ -295,12 +296,16 @@ public:
     }
 
     Result<ProcessInfo> launch(const Target& target) override {
-        if (!target.remote_environment.empty())
-            return Error{ErrorCode::unsupported, "remote environment changes are not supported by native launch"};
         WaitScope scope(*this);
         if (startup_cleanup_) { auto cleanup = cleanup_startup(); if (!cleanup) return cleanup.error(); }
         if (pid_) return Error{ErrorCode::busy, "backend already owns a debug target"};
         if (target.executable.empty()) return Error{ErrorCode::invalid_argument, "executable path is empty"};
+        std::optional<detail::LinuxLaunchEnvironment> launch_environment;
+        if (!target.remote_environment.empty()) {
+            auto prepared = detail::prepare_linux_launch_environment(target.remote_environment, environ);
+            if (!prepared) return prepared.error();
+            launch_environment = std::move(prepared.value());
+        }
         int gate[2]{};
         if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, gate) != 0) return sys_error("socketpair for ptrace launch");
         std::vector<char*> argv; argv.reserve(target.arguments.size() + 2);
@@ -319,7 +324,11 @@ public:
             close(gate[0]);
             if (count != 1 || release != 'G') _exit(126);
             if (working_directory && chdir(working_directory) != 0) _exit(126);
-            execv(executable, argv_data); _exit(127);
+            if (launch_environment)
+                execve(executable, argv_data, launch_environment->entries.data());
+            else
+                execv(executable, argv_data);
+            _exit(127);
         }
         close(gate[0]);
         pid_ = child; tracked_.insert(child); startup_cleanup_ = true; startup_kill_ = true;

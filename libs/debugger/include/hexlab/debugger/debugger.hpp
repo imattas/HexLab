@@ -67,7 +67,9 @@ struct Target {
     std::string executable;
     std::vector<std::string> arguments;
     std::string working_directory;
-    // Extended-remote launch only. Native launch rejects nonempty changes.
+    // Launch environment patch. Extended-remote targets apply it to their
+    // default environment; Linux native launch applies it to the inherited
+    // local environment. Other native backends may reject nonempty changes.
     // At most 256 unique names / 64 KiB total name+value bytes; each name is
     // 1..4096 bytes (no '=' or NUL), each value is <=16 KiB (no NUL).
     std::vector<RemoteEnvironmentChange> remote_environment;

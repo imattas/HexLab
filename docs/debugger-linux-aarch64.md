@@ -6,6 +6,17 @@ Attach seizes and interrupts every visible task, repeats the `/proc/<pid>/task`
 census until it stabilizes, enables clone tracing, and rolls back acquired
 threads if ownership cannot be established. The bounded thread limit is 4096.
 
+Native launch accepts the bounded Target.remote_environment patch. It starts
+from the debugger's inherited environment, replaces each named variable,
+removes variables whose values are absent, and preserves empty values as
+NAME=. The inherited environment is copied into a bounded owned snapshot and
+envp is prepared before fork; the gated child uses execve without calling
+allocation-heavy environment mutators after the fork. Changes are limited to
+256 unique names, 64 KiB total
+name/value bytes, 4,096-byte names and 16 KiB values; names cannot contain
+equals or NUL and values cannot contain NUL. The inherited snapshot is limited
+to 65,536 entries and 16 MiB.
+
 After launch or attach, thread creation is tracked through
 `PTRACE_O_TRACECLONE`. Stop events suspend the remaining owned threads before
 they are published. Global continue resumes stopped owned threads; a

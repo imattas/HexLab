@@ -38,6 +38,16 @@ If cleanup times out, the backend retains its exact remaining ownership and
 reports that cleanup needs retry. The next backend launch/attach attempt,
 explicit backend detach or destruction retries the retained cleanup.
 
+Native launch accepts the bounded Target.remote_environment patch. It starts
+from the debugger's inherited environment, replaces each named variable,
+removes variables whose values are absent, and preserves empty values as
+NAME=. The inherited environment is copied into a bounded owned snapshot and
+envp is prepared before fork; the gated child uses execve without calling
+allocation-heavy environment mutators after the fork. Changes are limited to
+256 unique names, 64 KiB total name/value bytes, 4,096-byte names and 16 KiB
+values; names cannot contain equals or NUL and values cannot contain NUL. The
+inherited snapshot is limited to 65,536 entries and 16 MiB.
+
 Clone event TIDs are range-checked and recorded before waiting for initial
 stops. A timeout retains both the child and the consumed parent clone status.
 Pending initial stops and per-child hardware-debug setup must complete before
