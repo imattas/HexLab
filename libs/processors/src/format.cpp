@@ -416,6 +416,18 @@ std::string opcode_name(Opcode op, std::uint8_t condition) {
     case Opcode::mips64_trunc_l_d: return "trunc.l.d";
     case Opcode::mips64_ceil_l_d: return "ceil.l.d";
     case Opcode::mips64_floor_l_d: return "floor.l.d";
+    case Opcode::mips64_lwxc1: return "lwxc1";
+    case Opcode::mips64_ldxc1: return "ldxc1";
+    case Opcode::mips64_swxc1: return "swxc1";
+    case Opcode::mips64_sdxc1: return "sdxc1";
+    case Opcode::mips64_madd_s: return "madd.s";
+    case Opcode::mips64_madd_d: return "madd.d";
+    case Opcode::mips64_msub_s: return "msub.s";
+    case Opcode::mips64_msub_d: return "msub.d";
+    case Opcode::mips64_nmadd_s: return "nmadd.s";
+    case Opcode::mips64_nmadd_d: return "nmadd.d";
+    case Opcode::mips64_nmsub_s: return "nmsub.s";
+    case Opcode::mips64_nmsub_d: return "nmsub.d";
     case Opcode::mips64_lwl: return "lwl";
     case Opcode::mips64_lwr: return "lwr";
     case Opcode::mips64_swl: return "swl";

@@ -260,6 +260,47 @@ DecodeResult decode_mips64(std::span<const std::byte> bytes, Address at, ByteOrd
             i.access = {OperandAccess::write, OperandAccess::read, OperandAccess::read};
             i.register_reads = {left, right, fcsr}; i.register_writes = {destination, fcsr};
         }
+    } else if (op == 0x13) { // COP1X: indexed FP memory and fused S/D arithmetic.
+        const auto fpr = [](unsigned index, std::uint16_t width) {
+            return RegisterOperand{RegisterBank::mips_fpr, static_cast<std::uint8_t>(index), width, false};
+        };
+        const RegisterOperand fcsr{RegisterBank::mips_fcsr, 0, 32, false};
+        if (funct == 0x00 || funct == 0x01 || funct == 0x08 || funct == 0x09) {
+            const bool load = funct == 0x00 || funct == 0x01;
+            const bool is_double = funct == 0x01 || funct == 0x09;
+            const auto width = static_cast<std::uint16_t>(is_double ? 64 : 32);
+            if ((load && rd != 0) || (!load && shamt != 0))
+                return invalid("Reserved MIPS64 COP1X indexed FP memory field");
+            const auto fp_index = load ? shamt : rd;
+            const auto fp = fpr(fp_index, width);
+            MemoryOperand memory{width, 64, {}, reg(rs), reg(rt), 1, 0, false, {}, {}};
+            i.opcode = funct == 0x00 ? Opcode::mips64_lwxc1 : funct == 0x01 ? Opcode::mips64_ldxc1 :
+                       funct == 0x08 ? Opcode::mips64_swxc1 : Opcode::mips64_sdxc1;
+            i.operands = {fp, memory};
+            i.access = load ? std::vector<OperandAccess>{OperandAccess::write, OperandAccess::read}
+                            : std::vector<OperandAccess>{OperandAccess::read, OperandAccess::write};
+            i.memory_read = load; i.memory_write = !load;
+            if (rs) i.register_reads.push_back(reg(rs));
+            if (rt) i.register_reads.push_back(reg(rt));
+            if (load) i.register_writes.push_back(fp);
+            else i.register_reads.push_back(fp);
+        } else if ((funct & 0x07) == 0x00 && (funct & 0x38) >= 0x20 && (funct & 0x38) <= 0x38) {
+            const auto group = funct & 0x38;
+            const auto fmt = funct & 0x07;
+            if (fmt > 1) return {DecodeStatus::unsupported, {}, "MIPS64 COP1X fused arithmetic supports S and D formats"};
+            const bool is_double = fmt == 1;
+            const auto width = static_cast<std::uint16_t>(is_double ? 64 : 32);
+            const RegisterOperand fr = fpr(rs, width), ft = fpr(rt, width), fs = fpr(rd, width), fd = fpr(shamt, width);
+            if (group == 0x20) i.opcode = is_double ? Opcode::mips64_madd_d : Opcode::mips64_madd_s;
+            else if (group == 0x28) i.opcode = is_double ? Opcode::mips64_msub_d : Opcode::mips64_msub_s;
+            else if (group == 0x30) i.opcode = is_double ? Opcode::mips64_nmadd_d : Opcode::mips64_nmadd_s;
+            else i.opcode = is_double ? Opcode::mips64_nmsub_d : Opcode::mips64_nmsub_s;
+            i.operands = {fd, fr, ft, fs};
+            i.access = {OperandAccess::write, OperandAccess::read, OperandAccess::read, OperandAccess::read};
+            i.register_reads = {fr, ft, fs, fcsr}; i.register_writes = {fd, fcsr};
+        } else {
+            return {DecodeStatus::unsupported, {}, "MIPS64 COP1X operation is outside indexed memory and fused arithmetic subset"};
+        }
     } else if (op == 0x31 || op == 0x35 || op == 0x39 || op == 0x3d) { // LWC1/LDC1/SWC1/SDC1.
         const bool load = op == 0x31 || op == 0x35;
         const bool double_width = op == 0x35 || op == 0x3d;

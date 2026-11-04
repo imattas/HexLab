@@ -357,3 +357,19 @@ fingerprint's `functions.cpp`, with `BUILD_TESTING=OFF`. No tests, numeric
 execution probes, or independent floating-point oracle were added or run;
 this expansion does not claim runtime or whole-IEEE validation. Capability
 status remains partial.
+## COP1X indexed memory and fused arithmetic
+
+The decoder now recognizes COP1X indexed single/double floating-point memory
+operations (`lwxc1`, `ldxc1`, `swxc1`, `sdxc1`) and the single/double `madd`,
+`msub`, `nmadd`, and `nmsub` families. Indexed effective addresses retain both
+64-bit GPR base and index registers. Loads/stores record FPR and memory
+effects, validate the format-specific reserved field, and compute the address
+as GPR[base] + GPR[index], independent of byte order.
+
+Fused operations carry the three source FPRs and FCSR into a typed floating
+intrinsic and declare the destination FPR plus FCSR effects. The represented
+forms are `fd = fr * ft + fs`, `fd = fr * ft - fs`, `fd = -(fr * ft + fs)`,
+and `fd = -(fr * ft - fs)`, respectively. They are not
+numerically evaluated yet; unsupported COP1X functions and non-S/D fused
+formats remain unsupported. This is a bounded COP1X subset, not complete
+COP1X or full MIPS64 coverage.

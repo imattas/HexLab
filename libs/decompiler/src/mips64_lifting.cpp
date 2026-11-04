@@ -89,6 +89,31 @@ std::optional<Statement> lift_mips64_instruction(const Instruction &instruction)
         return effect;
     }
 
+    if (op >= Opcode::mips64_madd_s && op <= Opcode::mips64_nmsub_d) {
+        const bool is_double = op == Opcode::mips64_madd_d || op == Opcode::mips64_msub_d ||
+            op == Opcode::mips64_nmadd_d || op == Opcode::mips64_nmsub_d;
+        const auto width = static_cast<std::uint16_t>(is_double ? 64 : 32);
+        if (items.size() != 4 || !destination || destination->bank != RegisterBank::mips_fpr ||
+            destination->width != width || instruction.access != std::vector<OperandAccess>{
+                OperandAccess::write, OperandAccess::read, OperandAccess::read, OperandAccess::read} ||
+            instruction.memory_read || instruction.memory_write)
+            return intrinsic(instruction, "mips64_malformed_cop1x_fused", IntrinsicMemoryEffect::unknown);
+        Intrinsic effect{op == Opcode::mips64_madd_s || op == Opcode::mips64_madd_d ? "mips64.madd" :
+            op == Opcode::mips64_msub_s || op == Opcode::mips64_msub_d ? "mips64.msub" :
+            op == Opcode::mips64_nmadd_s || op == Opcode::mips64_nmadd_d ? "mips64.nmadd" : "mips64.nmsub",
+            {}, IntrinsicMemoryEffect::none};
+        for (std::size_t index = 1; index < items.size(); ++index) {
+            const auto *source = std::get_if<RegisterOperand>(&items[index]);
+            if (!source || source->bank != RegisterBank::mips_fpr || source->width != width)
+                return intrinsic(instruction, "mips64_malformed_cop1x_fused", IntrinsicMemoryEffect::unknown);
+            effect.operands.push_back(operand(items[index]));
+        }
+        effect.operands.push_back(reg({RegisterBank::mips_fcsr, 0, 32, false}));
+        effect.result_type = floating(width);
+        effect.register_writes = instruction.register_writes;
+        return effect;
+    }
+
     if (op == Opcode::mips_syscall || op == Opcode::mips_break) {
         const auto *code = items.size() == 1 ? std::get_if<ImmediateOperand>(&items[0]) : nullptr;
         if (!code || code->is_signed || code->encoded_width != 20 || code->effective_width != 32 ||
@@ -225,10 +250,12 @@ std::optional<Statement> lift_mips64_instruction(const Instruction &instruction)
         memory.type = floating(bits);
         return std::make_shared<Expression>(Expression{floating(bits), std::move(memory)});
     };
-    if ((op == Opcode::mips_lwc1 || op == Opcode::mips_ldc1) && items.size() >= 2 && destination &&
+    if ((op == Opcode::mips_lwc1 || op == Opcode::mips_ldc1 || op == Opcode::mips64_lwxc1 ||
+         op == Opcode::mips64_ldxc1) && items.size() >= 2 && destination &&
         destination->bank == RegisterBank::mips_fpr)
         return Assign{*destination, fp_memory(operand(items[1]), destination->width)};
-    if ((op == Opcode::mips_swc1 || op == Opcode::mips_sdc1) && items.size() >= 2 && destination &&
+    if ((op == Opcode::mips_swc1 || op == Opcode::mips_sdc1 || op == Opcode::mips64_swxc1 ||
+         op == Opcode::mips64_sdxc1) && items.size() >= 2 && destination &&
         destination->bank == RegisterBank::mips_fpr)
         return Store{fp_memory(operand(items[1]), destination->width), operand(items[0])};
 

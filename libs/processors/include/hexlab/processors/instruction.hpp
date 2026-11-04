@@ -763,7 +763,11 @@ enum class Opcode {
     rv_fcvt_w_h, rv_fcvt_wu_h, rv_fcvt_l_h, rv_fcvt_lu_h,
     rv_fcvt_h_w, rv_fcvt_h_wu, rv_fcvt_h_l, rv_fcvt_h_lu,
     rv_fcvt_s_h, rv_fcvt_d_h, rv_fcvt_h_s, rv_fcvt_h_d,
-    rv_fmv_x_h, rv_fmv_h_x, rv_fminm_h, rv_fmaxm_h, rv_fleq_h, rv_fltq_h
+    rv_fmv_x_h, rv_fmv_h_x, rv_fminm_h, rv_fmaxm_h, rv_fleq_h, rv_fltq_h,
+    // MIPS64 COP1X indexed memory and fused arithmetic; append for cache stability.
+    mips64_lwxc1, mips64_ldxc1, mips64_swxc1, mips64_sdxc1,
+    mips64_madd_s, mips64_madd_d, mips64_msub_s, mips64_msub_d,
+    mips64_nmadd_s, mips64_nmadd_d, mips64_nmsub_s, mips64_nmsub_d
 };
 enum class OperandAccess { read, write, read_write, address };
 // The encoded x86 group-one repeat prefix is retained separately from the
