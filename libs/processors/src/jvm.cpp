@@ -149,10 +149,10 @@ DecodeResult decode_jvm(std::span<const std::byte> b, Address at) {
             return fail(DecodeStatus::invalid, "wide local index cannot fit in the JVM Code.max_locals limit");
         mnemonic=std::string("wide ")+std::string(names[nested]); imm(nested,8); imm(index,16); n+=2;
         if(nested==0x84){imm(static_cast<std::uint16_t>(s16(b,n)),16,true);n+=2;}
-        if(nested==0xa9)flow=FlowKind::jump;
+        if(nested==0xa9)flow=FlowKind::ret;
     }
     if(op>=0xb6&&op<=0xba)flow=FlowKind::call;
-    if(op==0xa9)flow=FlowKind::jump;
+    if(op==0xa9)flow=FlowKind::ret;
     if(op>=0xac&&op<=0xb1) flow=FlowKind::ret;
     if(op==0xbf) flow=FlowKind::trap;
     if(n>65535) return fail(DecodeStatus::unsupported,"JVM instruction exceeds the classfile Code extent limit");

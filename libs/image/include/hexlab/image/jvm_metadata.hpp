@@ -138,12 +138,15 @@ struct JvmMethodParameter {
     std::optional<std::string> name;
     bool operator==(const JvmMethodParameter &) const = default;
 };
-// Values retain the class-file verification_type_info tag. Long/double are
-// one logical entry occupying two JVM local/operand locations.
+// Values retain class-file verification_type_info tags, with return_address
+// reserved for internal legacy jsr/ret dataflow. Long/double are one logical
+// entry occupying two JVM local/operand locations.
 enum class JvmVerificationKind : std::uint8_t {
     top = 0, integer = 1, float_value = 2, double_value = 3,
     long_value = 4, null_value = 5, uninitialized_this = 6,
-    object = 7, uninitialized = 8
+    object = 7, uninitialized = 8,
+    // Internal legacy subroutine proof value; never encoded in StackMapTable.
+    return_address = 9
 };
 struct JvmVerificationType {
     JvmVerificationKind kind = JvmVerificationKind::top;

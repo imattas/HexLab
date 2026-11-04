@@ -289,6 +289,7 @@ LocalCategory local_category(JvmVerificationKind kind) {
     case JvmVerificationKind::double_value: return LocalCategory::double_value;
     case JvmVerificationKind::null_value: case JvmVerificationKind::uninitialized_this:
     case JvmVerificationKind::object: case JvmVerificationKind::uninitialized:
+    case JvmVerificationKind::return_address:
         return LocalCategory::reference;
     case JvmVerificationKind::top: return LocalCategory::top;
     }
@@ -707,8 +708,253 @@ std::optional<std::string> lambda_alt_metafactory_summary(const JvmMetadata &met
     }
     return summary;
 }
+struct LegacyJvmExpansion {
+    FunctionRecord function;
+    FunctionSnapshot snapshot;
+    bool changed = false;
+};
+struct LegacyCallSite {
+    BlockId entry{};
+    BlockId continuation{};
+    Address return_address{};
+};
+struct LegacyBlockContext {
+    BlockId source{};
+    std::vector<std::uint64_t> calls;
+    auto operator<=>(const LegacyBlockContext &) const = default;
+};
+Result<LegacyJvmExpansion> expand_legacy_jvm_subroutines(const FunctionRecord &function,
+                                                          const FunctionSnapshot &snapshot,
+                                                          const JvmMetadata *metadata) {
+    std::map<std::uint64_t, std::shared_ptr<const BasicBlock>> original;
+    std::map<std::pair<std::uint32_t, std::uint64_t>, BlockId> address_blocks;
+    for (const auto &block : snapshot.blocks) {
+        if (!block) return Error{ErrorCode::invalid_argument, "JVM snapshot has a null basic block"};
+        original.emplace(block->id.value, block);
+    }
+    std::vector<std::shared_ptr<const BasicBlock>> owned;
+    owned.reserve(function.blocks.size());
+    bool has_subroutine = false;
+    for (const auto id : function.blocks) {
+        const auto found = original.find(id.value);
+        if (found == original.end()) return Error{ErrorCode::invalid_argument, "JVM function references a missing basic block"};
+        const auto &block = found->second;
+        owned.push_back(block);
+        address_blocks.emplace(std::pair{block->begin.space.value, block->begin.offset}, block->id);
+        for (const auto &fact : block->instructions) {
+            if (!fact || fact->instruction.context.architecture != Architecture::jvm || fact->instruction.bytes.empty()) continue;
+            const auto op = std::to_integer<std::uint8_t>(fact->instruction.bytes[0]);
+            has_subroutine = has_subroutine || op == 0xa8 || op == 0xc9 || op == 0xa9 ||
+                (op == 0xc4 && fact->instruction.bytes.size() > 1 && fact->instruction.bytes[1] == std::byte{0xa9});
+        }
+    }
+    if (!has_subroutine) return LegacyJvmExpansion{function, snapshot, false};
+    if (!metadata || metadata->major_version >= 51)
+        return no("legacy jsr/ret requires classfile metadata for a version 50-or-earlier method");
+    const JvmCode *method_code = nullptr;
+    for (const auto &method : metadata->methods)
+        if (method.code && method.code->begin == function.entry) {
+            if (method_code) return no("legacy subroutine Code metadata is ambiguous");
+            method_code = &*method.code;
+        }
+    if (!method_code) return no("legacy subroutine has no matching method Code metadata");
+    if (method_code->stack_map_table)
+        return no("legacy subroutine expansion with StackMapTable frames is not supported");
+    for (const auto &block : owned)
+        if (std::any_of(block->successors.begin(), block->successors.end(),
+                [](const auto &edge) { return edge.kind == BlockEdgeKind::exception; }))
+            return no("legacy subroutine expansion with exceptional control-flow edges is not supported");
+
+    const auto block_at = [&](Address address) -> std::optional<BlockId> {
+        const auto found = address_blocks.find({address.space.value, address.offset});
+        return found == address_blocks.end() ? std::optional<BlockId>{} : found->second;
+    };
+    std::map<std::uint64_t, LegacyCallSite> call_sites;
+    for (const auto &block : owned) {
+        for (std::size_t index = 0; index < block->instructions.size(); ++index) {
+            const auto &fact = block->instructions[index];
+            if (!fact || fact->instruction.context.architecture != Architecture::jvm || fact->instruction.bytes.empty()) continue;
+            const auto &instruction = fact->instruction;
+            const auto op = std::to_integer<std::uint8_t>(instruction.bytes[0]);
+            if (op != 0xa8 && op != 0xc9) continue;
+            if (index + 1 != block->instructions.size()) return no("jsr is not the final instruction in its basic block");
+            if (!instruction.direct_target) return no("jsr has no decoded subroutine entry target");
+            const auto entry = block_at(*instruction.direct_target);
+            if (!entry) return no("jsr target is not a recovered basic-block entry");
+            if (*entry == block_at(function.entry).value_or(BlockId{UINT64_MAX}))
+                return no("jsr subroutine recursively targets the containing method entry");
+            const auto continuation = std::find_if(block->successors.begin(), block->successors.end(),
+                [](const auto &edge) { return edge.kind == BlockEdgeKind::call_continuation && edge.target; });
+            if (continuation == block->successors.end()) return no("jsr continuation address was not recovered");
+            const auto return_block = block_at(*continuation->target);
+            if (!return_block) return no("jsr continuation is not a recovered basic-block entry");
+            if (instruction.length > UINT64_MAX - instruction.address.offset) return no("jsr return address overflows the address space");
+            call_sites.emplace(fact->id, LegacyCallSite{*entry, *return_block,
+                {instruction.address.space, instruction.address.offset + instruction.length}});
+        }
+    }
+    if (call_sites.empty()) return no("ret appears without a jsr call site");
+    const auto last_jvm_subroutine = [](const BasicBlock &block) -> const InstructionFact * {
+        if (block.instructions.empty()) return nullptr;
+        const auto *fact = block.instructions.back().get();
+        if (!fact || fact->instruction.context.architecture != Architecture::jvm || fact->instruction.bytes.empty()) return nullptr;
+        const auto op = std::to_integer<std::uint8_t>(fact->instruction.bytes[0]);
+        if (op == 0xa9 || (op == 0xc4 && fact->instruction.bytes.size() > 1 && fact->instruction.bytes[1] == std::byte{0xa9})) return fact;
+        return nullptr;
+    };
+    const auto ret_local = [](const Instruction &instruction) -> std::optional<std::uint16_t> {
+        const bool wide = std::to_integer<std::uint8_t>(instruction.bytes[0]) == 0xc4;
+        const auto operand = wide ? 1u : 0u;
+        if (operand >= instruction.operands.size()) return {};
+        const auto *index = std::get_if<ImmediateOperand>(&instruction.operands[operand]);
+        if (!index || index->value > UINT16_MAX) return {};
+        return static_cast<std::uint16_t>(index->value);
+    };
+    std::uint64_t next_id = 1;
+    for (const auto &block : snapshot.blocks) if (block) {
+        if (block->id.value == UINT64_MAX) return Error{ErrorCode::resource_limit, "JVM block IDs are exhausted"};
+        next_id = std::max(next_id, block->id.value + 1);
+    }
+    constexpr std::size_t max_expanded_blocks = 65'536;
+    constexpr std::size_t max_nesting = 64;
+    std::map<LegacyBlockContext, BlockId> ids;
+    std::deque<LegacyBlockContext> pending;
+    std::map<std::uint64_t, std::shared_ptr<BasicBlock>> expanded;
+    const auto intern = [&](LegacyBlockContext context) -> Result<BlockId> {
+        if (const auto found = ids.find(context); found != ids.end()) return found->second;
+        if (ids.size() >= max_expanded_blocks || next_id == UINT64_MAX)
+            return Error{ErrorCode::resource_limit, "legacy JVM subroutine expansion exceeds its block bound"};
+        const BlockId id{next_id++};
+        ids.emplace(context, id);
+        pending.push_back(std::move(context));
+        return id;
+    };
+    const auto entry = block_at(function.entry);
+    if (!entry) return no("JVM function entry is not a recovered basic-block start");
+    auto root_id = intern(LegacyBlockContext{*entry, {}});
+    if (!root_id) return root_id.error();
+    while (!pending.empty()) {
+        auto context = std::move(pending.front());
+        pending.pop_front();
+        const auto id = ids.at(context);
+        const auto source_it = original.find(context.source.value);
+        if (source_it == original.end()) return no("subroutine context references a missing source block");
+        const auto &source = *source_it->second;
+        auto clone = std::make_shared<BasicBlock>(source);
+        clone->id = id;
+        clone->successors.clear();
+        const auto *ret = last_jvm_subroutine(source);
+        const InstructionFact *jsr = nullptr;
+        for (std::size_t index = 0; index < source.instructions.size(); ++index) {
+            const auto &fact = source.instructions[index];
+            if (!fact || fact->instruction.context.architecture != Architecture::jvm || fact->instruction.bytes.empty()) continue;
+            const auto op = std::to_integer<std::uint8_t>(fact->instruction.bytes[0]);
+            if (op == 0xa8 || op == 0xc9) {
+                if (index + 1 != source.instructions.size()) return no("jsr is not the final instruction in its basic block");
+                jsr = fact.get();
+            }
+            if ((op == 0xa9 || (op == 0xc4 && fact->instruction.bytes.size() > 1 && fact->instruction.bytes[1] == std::byte{0xa9})) &&
+                index + 1 != source.instructions.size()) return no("ret is not the final instruction in its basic block");
+        }
+        if (jsr) {
+            const auto info = call_sites.find(jsr->id);
+            if (info == call_sites.end()) return no("jsr call-site provenance is missing");
+            for (const auto ancestor : context.calls) {
+                const auto frame = call_sites.find(ancestor);
+                if (frame == call_sites.end()) return no("nested jsr context provenance is missing");
+                if (frame->second.entry == info->second.entry)
+                    return no("recursive legacy JVM jsr subroutine is not supported");
+            }
+            if (info->second.entry == block_at(function.entry).value_or(BlockId{UINT64_MAX}))
+                return no("jsr subroutine recursively targets the containing method entry");
+            if (context.calls.size() >= max_nesting) return Error{ErrorCode::resource_limit, "legacy JVM jsr nesting exceeds its bound"};
+            auto child_context = context;
+            child_context.source = info->second.entry;
+            child_context.calls.push_back(jsr->id);
+            auto child = intern(std::move(child_context));
+            if (!child) return child.error();
+            clone->stop.reset();
+            auto fact = std::make_shared<InstructionFact>(*jsr);
+            fact->instruction.jvm_subroutine_control = JvmSubroutineControl{
+                JvmSubroutineControl::Kind::call, info->second.return_address, 0};
+            clone->instructions.back() = std::move(fact);
+            const auto target_block = original.at(info->second.entry.value);
+            clone->successors.push_back({jsr->instruction.address, target_block->begin, child.value(), BlockEdgeKind::jump});
+        } else if (ret) {
+            if (context.calls.empty()) return no("ret occurs outside a jsr subroutine context");
+            const auto site = call_sites.find(context.calls.back());
+            if (site == call_sites.end()) return no("ret has no matching jsr call context");
+            const auto local = ret_local(ret->instruction);
+            if (!local) return no("ret local index is malformed");
+            auto parent = context;
+            parent.calls.pop_back();
+            parent.source = site->second.continuation;
+            auto continuation = intern(std::move(parent));
+            if (!continuation) return continuation.error();
+            clone->stop.reset();
+            auto fact = std::make_shared<InstructionFact>(*ret);
+            fact->instruction.jvm_subroutine_control = JvmSubroutineControl{
+                JvmSubroutineControl::Kind::return_to, site->second.return_address, *local};
+            clone->instructions.back() = std::move(fact);
+            const auto target_block = original.at(site->second.continuation.value);
+            clone->successors.push_back({ret->instruction.address, target_block->begin, continuation.value(), BlockEdgeKind::jump});
+        } else {
+            if (!context.calls.empty() && source.stop && source.stop->reason != FunctionStopReason::trap &&
+                source.stop->reason != FunctionStopReason::ret)
+                return no("legacy subroutine has an unsupported control-flow exit");
+            if (!context.calls.empty() && source.stop && source.stop->reason == FunctionStopReason::ret &&
+                !source.instructions.empty()) {
+                const auto op = std::to_integer<std::uint8_t>(source.instructions.back()->instruction.bytes.front());
+                if (op >= 0xac && op <= 0xb1) return no("legacy subroutine returns from the method without ret");
+            }
+            for (const auto &edge : source.successors) {
+                if (edge.kind == BlockEdgeKind::exception) return no("legacy subroutine exceptional edge is not context-expandable");
+                if (!edge.block && !edge.target) return no("legacy subroutine has an unresolved CFG edge");
+                const auto target_id = edge.block ? edge.block : block_at(*edge.target);
+                if (!target_id) return no("legacy subroutine CFG target is not a recovered block");
+                if (!context.calls.empty()) {
+                    const auto call = call_sites.find(context.calls.back());
+                    if (call != call_sites.end() && *target_id == call->second.continuation)
+                        return no("legacy subroutine reaches its continuation without ret");
+                }
+                auto target_context = context;
+                target_context.source = *target_id;
+                auto successor = intern(std::move(target_context));
+                if (!successor) return successor.error();
+                auto remapped = edge;
+                remapped.block = successor.value();
+                clone->successors.push_back(std::move(remapped));
+            }
+        }
+        expanded.emplace(id.value, std::move(clone));
+    }
+    LegacyJvmExpansion result;
+    result.function = function;
+    result.function.blocks.clear();
+    for (const auto &[context, id] : ids) {
+        (void)context;
+        result.function.blocks.push_back(id);
+    }
+    for (auto &chunk : result.function.chunks) chunk.blocks.clear();
+    for (const auto &[id, block] : expanded) {
+        (void)id;
+        for (auto &chunk : result.function.chunks)
+            if (chunk.begin.space == block->begin.space && block->begin.offset >= chunk.begin.offset &&
+                block->begin.offset - chunk.begin.offset < chunk.size)
+                chunk.blocks.push_back(block->id);
+    }
+    result.snapshot = snapshot;
+    for (const auto &[id, block] : expanded) {
+        (void)id;
+        result.snapshot.blocks.push_back(block);
+    }
+    for (auto &record : result.snapshot.functions)
+        if (record && record->id == function.id) record = std::make_shared<const FunctionRecord>(result.function);
+    result.changed = true;
+    return result;
 }
-Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const FunctionSnapshot &snapshot,const JvmMetadata *metadata){
+}
+static Result<LiftedFunction> lift_jvm_function_regular(const FunctionRecord &function,const FunctionSnapshot &snapshot,const JvmMetadata *metadata){
     std::map<std::uint64_t,std::shared_ptr<const BasicBlock>> blocks;
     for(const auto &b:snapshot.blocks){if(!b)return Error{ErrorCode::invalid_argument,"JVM snapshot has a null basic block"};if(!blocks.emplace(b->id.value,b).second)return Error{ErrorCode::invalid_argument,"JVM snapshot has duplicate basic-block IDs"};}
     const auto count = function.blocks.size();
@@ -722,15 +968,28 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
     std::map<std::pair<std::uint32_t, std::uint64_t>, std::size_t> address_positions;
     std::vector<const BasicBlock *> sources(count);
     std::optional<std::size_t> entry;
+    bool has_expanded_subroutines = false;
+    for (const auto id : function.blocks) {
+        const auto found = blocks.find(id.value);
+        if (found != blocks.end() && found->second &&
+            std::any_of(found->second->instructions.begin(), found->second->instructions.end(),
+                [](const auto &fact) { return fact && fact->instruction.jvm_subroutine_control.has_value(); })) {
+            has_expanded_subroutines = true;
+            break;
+        }
+    }
     for (std::size_t i = 0; i < count; ++i) {
         const auto found = blocks.find(function.blocks[i].value);
         if (found == blocks.end()) return Error{ErrorCode::invalid_argument, "JVM function block is absent from snapshot"};
         sources[i] = found->second.get();
         for (const auto &fact : sources[i]->instructions)
             if (!fact) return Error{ErrorCode::invalid_argument, "JVM basic block contains a null instruction"};
-        if (!block_positions.emplace(function.blocks[i].value, i).second ||
-            !address_positions.emplace(std::pair{sources[i]->begin.space.value, sources[i]->begin.offset}, i).second)
-            return no("duplicate basic-block identity or address");
+        if (!block_positions.emplace(function.blocks[i].value, i).second)
+            return no("duplicate basic-block identity");
+        const auto inserted = address_positions.emplace(
+            std::pair{sources[i]->begin.space.value, sources[i]->begin.offset}, i).second;
+        if (!inserted && !has_expanded_subroutines)
+            return no("duplicate basic-block address");
         if (sources[i]->begin == function.entry) entry = i;
     }
     if (!entry) return no("function entry has no basic block");
@@ -749,13 +1008,13 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
                 const auto found = block_positions.find(edge.block->value);
                 if (found == block_positions.end()) return no("CFG successor block is outside the function");
                 target_position = found->second;
-            }
-            if (edge.target) {
+                if (edge.target && *edge.target != sources[*target_position]->begin)
+                    return no("CFG edge target address disagrees with its block identity");
+            } else if (edge.target) {
                 const auto found = address_positions.find({edge.target->space.value, edge.target->offset});
                 if (found != address_positions.end()) {
-                    if (target_position && *target_position != found->second) return no("CFG edge identity disagrees with target address");
                     target_position = found->second;
-                } else if (target_position) return no("CFG edge target address is outside its target block");
+                }
             }
             if (edge.kind == BlockEdgeKind::exception) {
                 if (!target_position) return no("exception handler target is unresolved");
@@ -988,6 +1247,49 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
                     return edge.kind == BlockEdgeKind::conditional_false && edge.target.has_value();
                 })) return no("conditional CFG has no fallthrough successor");
             if(op==0x00)continue;
+            if (i.jvm_subroutine_control) {
+                const auto &control = *i.jvm_subroutine_control;
+                const bool call = control.kind == JvmSubroutineControl::Kind::call;
+                if ((call && op != 0xa8 && op != 0xc9) || (!call && op != 0xa9 && op != 0xc4))
+                    return no("expanded jsr/ret control provenance disagrees with the source opcode");
+                if (!code || control.target.space != code->begin.space || control.target.offset < code->begin.offset ||
+                    control.target.offset - code->begin.offset >= code->code_size ||
+                    control.target.offset - code->begin.offset > UINT32_MAX)
+                    return no("expanded jsr/ret target lies outside the method Code range");
+                if (call) {
+                    const auto target_text = "jvm_return_address@" + std::to_string(control.target.offset);
+                    const auto value = unknown(target_text, ref32());
+                    if (references) {
+                        ReferenceIdentity return_address{JvmVerificationKind::return_address, {},
+                            static_cast<std::uint32_t>(control.target.offset - code->begin.offset)};
+                        stack.push_back(evidence(value, std::move(return_address)));
+                    } else stack.push_back(value);
+                    if (!shapes_only) {
+                        Intrinsic marker; marker.name = target_text; marker.result_type = ref32();
+                        emit(*fact, std::move(marker));
+                    }
+                    continue;
+                }
+                if (control.local_index >= local_count || control.local_index >= 256 ||
+                    (code && control.local_index >= code->max_locals))
+                    return no("ret local index exceeds bounded Code.max_locals");
+                if (references) {
+                    if (references->local_categories[control.local_index] != LocalCategory::reference)
+                        return no("ret reads a local that is not a verified return address");
+                    const auto found = references->locals.find(control.local_index);
+                    const auto expected_offset = static_cast<std::uint32_t>(control.target.offset - code->begin.offset);
+                    if (found == references->locals.end() || !found->second ||
+                        found->second->kind != JvmVerificationKind::return_address ||
+                        found->second->allocation_offset != expected_offset)
+                        return no("ret local does not contain this jsr call's exact return address");
+                }
+                if (!shapes_only) {
+                    Intrinsic marker; marker.name = "jvm_subroutine_return local=" +
+                        std::to_string(control.local_index) + " target=" + std::to_string(control.target.offset);
+                    emit(*fact, std::move(marker));
+                }
+                continue;
+            }
             if(op==0x01){stack.push_back(evidence(con(0,ref32()),ReferenceIdentity{JvmVerificationKind::null_value,{},0}));continue;}
             if(op>=0x02&&op<=0x08){const auto v=static_cast<std::int32_t>(op)-3;stack.push_back(con(static_cast<std::uint32_t>(v),int32()));continue;}
             if(op==0x09||op==0x0a){stack.push_back(con(op-0x09,int64()));continue;}
@@ -1611,7 +1913,7 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
                         return no("switch CFG is missing a decoded case/default edge");
                 dst.switch_dispatch=std::move(dispatch);continue;
             }
-            if(op==0xa8||op==0xa9||op==0xc9)return no("legacy jsr/ret subroutine flow");
+            if(op==0xa8||op==0xa9||op==0xc9)return no("legacy jsr/ret subroutine lacks context expansion provenance");
             return no("opcode/effect not modeled: "+i.mnemonic_override);
         }
         if (!valid_stack(stack)) return no("operand stack exceeds max_stack or the 256 logical-slot IR limit");
@@ -1663,7 +1965,8 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
     if (code) for (const auto *source : sources) for (const auto &fact : source->instructions) {
         const auto offset = static_cast<std::uint32_t>(fact->instruction.address.offset - code->begin.offset);
         const auto [found, inserted] = bytecode_instructions.emplace(offset, &fact->instruction);
-        if (!inserted) found->second = nullptr;
+        if (!inserted && found->second && found->second->bytes != fact->instruction.bytes)
+            found->second = nullptr;
     }
     const auto verifier_reference = [&](const JvmVerificationType &type) -> Reference {
         if (!metadata || !method || !code) return {};
@@ -1766,7 +2069,8 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
         case JvmVerificationKind::double_value: return fp64();
         case JvmVerificationKind::long_value: return int64();
         case JvmVerificationKind::null_value: case JvmVerificationKind::uninitialized_this:
-        case JvmVerificationKind::object: case JvmVerificationKind::uninitialized: return ref32();
+        case JvmVerificationKind::object: case JvmVerificationKind::uninitialized:
+        case JvmVerificationKind::return_address: return ref32();
         default: return {};
         }
     };
@@ -2098,5 +2402,13 @@ Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function,const Fu
         out.blocks.push_back(std::move(block));
     }
     return out;
+}
+Result<LiftedFunction> lift_jvm_function(const FunctionRecord &function, const FunctionSnapshot &snapshot,
+                                         const JvmMetadata *metadata) {
+    auto expanded = expand_legacy_jvm_subroutines(function, snapshot, metadata);
+    if (!expanded) return expanded.error();
+    if (!expanded.value().changed)
+        return lift_jvm_function_regular(function, snapshot, metadata);
+    return lift_jvm_function_regular(expanded.value().function, expanded.value().snapshot, metadata);
 }
 } // namespace hexlab::decompiler

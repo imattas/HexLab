@@ -915,6 +915,16 @@ struct JvmSwitchTable {
     std::vector<JvmSwitchCase> cases;
     bool operator==(const JvmSwitchTable &) const = default;
 };
+// Set only by the legacy jsr/ret normalizer. It records the context-specific
+// branch selected by return-address dataflow while leaving original Code
+// bytes, address, and instruction id untouched.
+struct JvmSubroutineControl {
+    enum class Kind : std::uint8_t { call, return_to };
+    Kind kind = Kind::call;
+    Address target{{0}, 0};
+    std::uint16_t local_index = 0;
+    bool operator==(const JvmSubroutineControl &) const = default;
+};
 // Published NMOS 6502 and W65C02S instruction timing. Additional cycles are
 // conditional: indexed reads may incur one cycle on a page crossing; a taken
 // branch incurs one cycle and a taken page-crossing branch can incur one
@@ -1001,6 +1011,7 @@ struct Instruction {
     // narrower than the architectural FLAGS register. Appended to preserve
     // positional aggregate initializers; unset means only whole-register facts.
     std::optional<std::uint64_t> x86_flags_read_mask, x86_flags_write_mask;
+    std::optional<JvmSubroutineControl> jvm_subroutine_control;
     std::size_t byte_length() const noexcept { return length; }
     std::span<const std::byte> encoded_bytes() const noexcept {
         if (!extended_bytes.empty()) return extended_bytes;

@@ -1949,7 +1949,7 @@ Result<LoadedImage> parse(std::shared_ptr<const ByteStorage> storage,std::stop_t
     LoadedImage loaded;loaded.image=std::move(image.value());loaded.metadata.format="Java classfile";loaded.metadata.header_size=10;loaded.metadata.image_size=size;loaded.metadata.jvm=std::move(md);loaded.metadata_complete=metadata_complete;
     loaded.diagnostics.push_back({DiagnosticSeverity::info,"JVM method Code arrays use independent big-endian bytecode address spaces",{}});
     if(operand_stack_partial)loaded.diagnostics.push_back({DiagnosticSeverity::info,
-        "JVM operand-stack analysis is partial for legacy subroutines, unsupported evidence or exhausted analysis budgets",{}});
+        "JVM operand-stack analysis is partial for recursive/unsupported subroutines, unsupported evidence or exhausted analysis budgets",{}});
     auto tracked=loaded.metadata_reads.include({0},size);if(!tracked)return tracked.error();loaded.metadata_reads_complete=true;
     return loaded;
 }

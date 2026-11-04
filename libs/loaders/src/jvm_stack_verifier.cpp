@@ -3,6 +3,7 @@
 #include "hexlab/processors/jvm_semantics.hpp"
 #include <algorithm>
 #include <array>
+#include <deque>
 #include <limits>
 #include <map>
 #include <optional>
@@ -12,7 +13,7 @@
 namespace hexlab::jvm_detail {
 namespace {
 enum class Kind : std::uint8_t {
-    top, integer, long_value, long_tail, float_value, double_value, double_tail, reference
+    top, integer, long_value, long_tail, float_value, double_value, double_tail, reference, return_address
 };
 struct Value {
     Kind kind = Kind::top;
@@ -23,6 +24,10 @@ struct Value {
     // identity evidence for this reference. Null is kept separately.
     std::string reference_type;
     bool null_reference = false;
+    // Legacy jsr/ret subroutines can merge return addresses from multiple
+    // callers. Keep the finite, exact set rather than widening it to a normal
+    // reference or an integer.
+    std::vector<std::uint32_t> return_sites;
     constexpr Value() = default;
     Value(Kind value_kind, std::uint32_t identity = 0, std::string type = {}, bool is_null = false)
         : kind(value_kind), uninitialized(identity), reference_type(std::move(type)), null_reference(is_null) {}
@@ -35,7 +40,7 @@ struct FrameState { Stack stack; Locals locals; bool constructor_initialized = t
 constexpr auto top = Kind::top, integer = Kind::integer, long_value = Kind::long_value,
     long_tail = Kind::long_tail, float_value = Kind::float_value,
     double_value = Kind::double_value, double_tail = Kind::double_tail,
-    reference = Kind::reference;
+    reference = Kind::reference, return_address = Kind::return_address;
 constexpr std::array scalar{integer, long_value, float_value, double_value};
 constexpr std::array local{integer, long_value, float_value, double_value, reference};
 constexpr std::array array_element{integer, long_value, float_value, double_value, reference, integer, integer, integer};
@@ -356,6 +361,12 @@ bool intersect_locals(Locals &current, const Locals &incoming, ReferenceResolver
     for (std::size_t i = 0; i < current.size(); ++i) {
         if (current[i].kind == top || incoming[i].kind == top) {
             if (current[i].kind != top) { current[i] = top; changed = true; }
+        } else if (current[i].kind == return_address && incoming[i].kind == return_address) {
+            auto joined = current[i].return_sites;
+            joined.insert(joined.end(), incoming[i].return_sites.begin(), incoming[i].return_sites.end());
+            std::sort(joined.begin(), joined.end());
+            joined.erase(std::unique(joined.begin(), joined.end()), joined.end());
+            if (joined != current[i].return_sites) { current[i].return_sites = std::move(joined); changed = true; }
         } else if (current[i] != incoming[i] && (is_uninitialized(current[i]) || is_uninitialized(incoming[i]))) {
             current[i] = top;
             changed = true;
@@ -383,16 +394,90 @@ Result<bool> verify_operand_stack(std::span<const std::byte> bytes, const std::v
         if (amount > max_class_work - class_work) { partial = true; return false; }
         class_work += amount; return true;
     };
-    // Subroutine return addresses need context-sensitive jsr/ret analysis. Do
-    // not infer normal successors, or report violations from a partial model.
+    // jsr/ret was removed from classfile version 51. Newer methods containing
+    // it are malformed; older methods are analyzed with explicit return-address
+    // values and a bounded set of return sites below.
+    std::set<std::uint32_t> subroutine_entries;
+    std::size_t jsr_count = 0;
     for (std::size_t offset = 0; offset < bytes.size(); ++offset) {
         if ((offset & 255u) == 0 && stop.stop_requested())
             return Error{ErrorCode::canceled, "JVM operand-stack verification canceled"};
         if (!tick(1)) return false;
         if (!starts[offset]) continue;
         const auto op = std::to_integer<std::uint8_t>(bytes[offset]);
-        if (op == 0xa8 || op == 0xa9 || op == 0xc9 ||
-            (op == 0xc4 && offset + 1 < bytes.size() && bytes[offset + 1] == std::byte{0xa9})) return false;
+        if ((op == 0xa8 || op == 0xa9 || op == 0xc9 ||
+             (op == 0xc4 && offset + 1 < bytes.size() && bytes[offset + 1] == std::byte{0xa9})) &&
+            metadata.major_version >= 51) return false;
+        if (starts[offset] && (op == 0xa8 || op == 0xc9)) {
+            auto decoded = decode_jvm(bytes.subspan(offset), {code.begin.space, offset});
+            if (!decoded.instruction || !decoded.instruction->direct_target ||
+                decoded.instruction->direct_target->offset > UINT32_MAX) return false;
+            subroutine_entries.insert(static_cast<std::uint32_t>(decoded.instruction->direct_target->offset));
+            if (++jsr_count > 4096) return false;
+        }
+    }
+    if (!subroutine_entries.empty()) {
+        std::map<std::uint32_t, std::set<std::uint32_t>> subroutine_calls;
+        const auto enqueue = [&](std::deque<std::uint32_t> &work, std::uint32_t target) {
+            if (target < starts.size() && starts[target]) work.push_back(target);
+        };
+        for (const auto root : subroutine_entries) {
+            std::deque<std::uint32_t> scan{root};
+            std::set<std::uint32_t> seen;
+            while (!scan.empty()) {
+                if (!tick(1)) return false;
+                const auto offset = scan.front(); scan.pop_front();
+                if (offset >= bytes.size() || !starts[offset] || !seen.insert(offset).second) continue;
+                auto decoded = decode_jvm(bytes.subspan(offset), {code.begin.space, offset});
+                if (!decoded.instruction) return false;
+                const auto &instruction = *decoded.instruction;
+                const auto raw = std::to_integer<std::uint8_t>(bytes[offset]);
+                const bool wide = raw == 0xc4;
+                const auto op = wide ? std::to_integer<std::uint8_t>(bytes[offset + 1]) : raw;
+                const auto next = static_cast<std::uint32_t>(offset + instruction.length);
+                if (op == 0xa8 || op == 0xc9) {
+                    if (!instruction.direct_target || instruction.direct_target->offset > UINT32_MAX) return false;
+                    const auto target = static_cast<std::uint32_t>(instruction.direct_target->offset);
+                    subroutine_calls[root].insert(target);
+                    if (subroutine_calls[root].size() > 4096) return false;
+                    enqueue(scan, target);
+                    enqueue(scan, next); // execution resumes here after nested ret.
+                } else if (op == 0xaa || op == 0xab) {
+                    if (!instruction.jvm_switch) return false;
+                    enqueue(scan, static_cast<std::uint32_t>(instruction.jvm_switch->default_target.offset));
+                    for (const auto &entry : instruction.jvm_switch->cases)
+                        enqueue(scan, static_cast<std::uint32_t>(entry.target.offset));
+                } else if (op == 0xa7 || op == 0xc8) {
+                    if (!instruction.direct_target || instruction.direct_target->offset > UINT32_MAX) return false;
+                    enqueue(scan, static_cast<std::uint32_t>(instruction.direct_target->offset));
+                } else if ((op >= 0x99 && op <= 0xa6) || op == 0xc6 || op == 0xc7) {
+                    if (!instruction.direct_target || instruction.direct_target->offset > UINT32_MAX) return false;
+                    enqueue(scan, static_cast<std::uint32_t>(instruction.direct_target->offset));
+                    enqueue(scan, next);
+                } else if (!(op == 0xa9 || (wide && op == 0xa9) || (op >= 0xac && op <= 0xb1) || op == 0xbf)) {
+                    enqueue(scan, next);
+                }
+            }
+        }
+        std::map<std::uint32_t, std::uint8_t> visit;
+        for (const auto entry : subroutine_entries) {
+            std::vector<std::pair<std::uint32_t, bool>> walk{{entry, false}};
+            while (!walk.empty()) {
+                const auto [node, exiting] = walk.back();
+                walk.pop_back();
+                auto &state = visit[node];
+                if (exiting) { state = 2; continue; }
+                if (state == 1) return false;
+                if (state == 2) continue;
+                state = 1;
+                walk.emplace_back(node, true);
+                if (const auto edges = subroutine_calls.find(node); edges != subroutine_calls.end())
+                    for (const auto target : edges->second) {
+                        if (visit[target] == 1) return false;
+                        if (visit[target] == 0) walk.emplace_back(target, false);
+                    }
+            }
+        }
     }
     std::vector<std::optional<FrameState>> states(bytes.size());
     std::vector<const JvmStackMapFrame *> frames(bytes.size(), nullptr);
@@ -516,6 +601,17 @@ Result<bool> verify_operand_stack(std::span<const std::byte> bytes, const std::v
             bool stack_changed = false;
             for (std::size_t n = 0; n < effective_stack.size(); ++n) {
                 if (state->stack[n] == effective_stack[n]) continue;
+                if (state->stack[n].kind == return_address && effective_stack[n].kind == return_address) {
+                    auto joined = state->stack[n].return_sites;
+                    joined.insert(joined.end(), effective_stack[n].return_sites.begin(), effective_stack[n].return_sites.end());
+                    std::sort(joined.begin(), joined.end());
+                    joined.erase(std::unique(joined.begin(), joined.end()), joined.end());
+                    if (state->stack[n].return_sites != joined) {
+                        state->stack[n].return_sites = std::move(joined);
+                        stack_changed = true;
+                    }
+                    continue;
+                }
                 if (state->stack[n].kind == reference && effective_stack[n].kind == reference &&
                     !is_uninitialized(state->stack[n]) && !is_uninitialized(effective_stack[n])) {
                     const auto joined = references.common_type(state->stack[n], effective_stack[n]);
@@ -585,7 +681,7 @@ Result<bool> verify_operand_stack(std::span<const std::byte> bytes, const std::v
         };
         const std::uint8_t local_op = op;
         const auto local_index_for = [&]() -> std::optional<std::size_t> {
-            if ((local_op >= 0x15 && local_op <= 0x19) || (local_op >= 0x36 && local_op <= 0x3a) || local_op == 0x84) {
+            if ((local_op >= 0x15 && local_op <= 0x19) || (local_op >= 0x36 && local_op <= 0x3a) || local_op == 0x84 || local_op == 0xa9) {
                 const auto operand_index = wide ? 1u : 0u;
                 if (operand_index >= instruction.operands.size()) return {};
                 const auto *value = std::get_if<ImmediateOperand>(&instruction.operands[operand_index]);
@@ -632,7 +728,8 @@ Result<bool> verify_operand_stack(std::span<const std::byte> bytes, const std::v
             if (!index || group >= local.size()) return false;
             const auto kind = local[group];
             const auto count = width(kind);
-            const auto stored = pop(kind, kind == reference);
+            const auto stored = kind == reference && !stack.empty() && stack.back().kind == return_address
+                ? pop(return_address) : pop(kind, kind == reference);
             if (!failure) {
                 if (*index + count > locals.size()) fail(offset, "local store exceeds Code.max_locals");
                 else {
@@ -652,7 +749,15 @@ Result<bool> verify_operand_stack(std::span<const std::byte> bytes, const std::v
         }
         if (failure) break;
         if (local_handled) {}
-        else if (op == 0x00 || op == 0xa7 || op == 0xc8) {}
+        else if (op == 0xa8 || op == 0xc9) {
+            Value address{return_address};
+            address.return_sites.push_back(static_cast<std::uint32_t>(offset + instruction.length));
+            push(std::move(address));
+        } else if (op == 0xa9) {
+            const auto index = local_index_for();
+            if (!index || *index >= locals.size() || locals[*index].kind != return_address || locals[*index].return_sites.empty())
+                fail(offset, "ret local does not contain a proven jsr return address");
+        } else if (op == 0x00 || op == 0xa7 || op == 0xc8) {}
         else if (op == 0xb1) {
             if (declared_return) fail(offset, "void return does not match the method descriptor");
         }
@@ -929,6 +1034,17 @@ Result<bool> verify_operand_stack(std::span<const std::byte> bytes, const std::v
             merge(instruction.jvm_switch->default_target.offset, stack, locals, constructor_initialized);
             for (const auto &entry : instruction.jvm_switch->cases) {
                 merge(entry.target.offset, stack, locals, constructor_initialized);
+                if (partial || failure) break;
+            }
+        } else if (op == 0xa8 || op == 0xc9) {
+            if (!instruction.direct_target) return false;
+            merge(instruction.direct_target->offset, stack, locals, constructor_initialized);
+        } else if (op == 0xa9) {
+            const auto index = local_index_for();
+            if (!index || *index >= locals.size() || locals[*index].kind != return_address || locals[*index].return_sites.empty())
+                return false;
+            for (const auto site : locals[*index].return_sites) {
+                merge(site, stack, locals, constructor_initialized);
                 if (partial || failure) break;
             }
         } else if (op == 0xa7 || op == 0xc8) {

@@ -2604,6 +2604,21 @@ Node &Recovery::node(Address address, ThumbITState incoming_it) {
     }
     case FlowKind::jump:
     {
+        // A legacy JVM jsr enters an in-method subroutine and eventually
+        // resumes at the byte immediately following the call via ret. Keep
+        // that continuation reachable for the decompiler's context expansion
+        // without claiming that execution falls through immediately.
+        if (instruction.context.architecture == Architecture::jvm &&
+            (instruction.mnemonic_override == "jsr" || instruction.mnemonic_override == "jsr_w")) {
+            value.edges.push_back({flow_target, flow_target ? BlockEdgeKind::jump : BlockEdgeKind::unresolved,
+                                   target_it(), executes_with, writes_nzcv});
+            if (flow_target) continuation(BlockEdgeKind::call_continuation, executes_with);
+            else {
+                value.stop = FunctionStop{address, unresolved(), "JVM jsr subroutine target remains unresolved"};
+                value.stop_guard = executes_with;
+            }
+            break;
+        }
         const bool wasm_tail_call = wasm_terminal_call(instruction);
         const bool predicated_arm_transfer = instruction.context.architecture == Architecture::arm && instruction.arm &&
                                              instruction.arm->predicate != ArmPredicate::always;
