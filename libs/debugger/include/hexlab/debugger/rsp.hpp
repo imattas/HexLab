@@ -11,6 +11,7 @@
 #include <deque>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <stop_token>
@@ -243,7 +244,10 @@ public:
     // the protocol selectors 0, -1, pPID.0, and pPID.-1.
     Status select_thread(std::uint64_t thread, std::stop_token = {});
     Status select_thread(std::string_view thread_id, std::stop_token = {});
-    bool no_ack_mode() const noexcept { return no_ack_mode_; }
+    bool no_ack_mode() const {
+        std::lock_guard lock(operation_mutex_);
+        return no_ack_mode_;
+    }
 private:
     Result<std::vector<std::byte>> read_remote_file_impl(std::string_view path,
         std::uint64_t offset, std::size_t maximum_size, bool probe_limit, std::stop_token);
@@ -259,6 +263,10 @@ private:
     Result<std::string> transact_until(std::string_view, Deadline, std::stop_token);
     Status apply_environment_batch(std::span<const RemoteEnvironmentChange>, std::stop_token);
     ByteTransport& transport_;
+    // An RSP connection has one request/reply stream. Keep each public client
+    // operation (including multi-packet transactions) indivisible when the UI
+    // or automation invokes the client concurrently.
+    mutable std::recursive_mutex operation_mutex_;
     std::chrono::milliseconds timeout_;
     std::size_t max_packet_;
     std::size_t peer_packet_size_ = 4096;

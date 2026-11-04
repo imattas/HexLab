@@ -19,6 +19,17 @@ lookups. A timed-out or canceled lookup may continue in the background and
 occupy one slot until the OS resolver returns; further connects wait within
 their own deadline rather than starting unbounded resolver threads.
 
+`rsp::Client` serializes calls made concurrently against one connection. A
+client has one ordered request/reply stream and mutable negotiated/session
+state; interleaving independent callers could otherwise associate a reply with
+the wrong command or split a multi-packet operation. Serialization covers
+packet framing, notification/console queues, negotiated features, thread
+selection, bounded memory and annex transfers, remote-file lifecycles, and
+multi-command launch/flash operations. Waiting operations retain the same
+cancellation token and deadline behavior, but another client call waits for
+the active operation to finish or cancel. Use separate clients for separate
+connections; this lock does not make a `ByteTransport` shareable across clients.
+
 `rsp::Client::read_feature_annex()` reads `qXfer:features:read` annexes in
 multiple packets. Its `chunk` argument is a maximum and is reduced to fit both
 the local and peer `PacketSize` ceilings, leaving room for worst-case escaping

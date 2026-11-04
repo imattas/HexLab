@@ -334,6 +334,7 @@ Client::Client(ByteTransport& transport, std::chrono::milliseconds timeout, std:
     : transport_(transport), timeout_(timeout), max_packet_(max_packet),
       peer_packet_size_(std::min<std::size_t>(max_packet, 4096)) {}
 Status Client::write_all(std::string_view bytes, Deadline deadline, std::stop_token stop) {
+    std::lock_guard operation_lock(operation_mutex_);
     std::size_t offset = 0;
     while (offset < bytes.size()) {
         if (stop.stop_requested()) return Error{ErrorCode::canceled, "RSP operation canceled"};
@@ -346,6 +347,7 @@ Status Client::write_all(std::string_view bytes, Deadline deadline, std::stop_to
     return std::monostate{};
 }
 Result<unsigned char> Client::read_byte(Deadline deadline, std::stop_token stop) {
+    std::lock_guard operation_lock(operation_mutex_);
     std::byte b{};
     while (true) {
         if (stop.stop_requested()) return Error{ErrorCode::canceled, "RSP operation canceled"};
@@ -357,6 +359,7 @@ Result<unsigned char> Client::read_byte(Deadline deadline, std::stop_token stop)
 }
 Result<std::pair<bool, std::string>> Client::read_packet_after_start(
     unsigned char marker, Deadline deadline, std::stop_token stop) {
+    std::lock_guard operation_lock(operation_mutex_);
     if (marker != '$' && marker != '%')
         return Error{ErrorCode::invalid_argument, "RSP packet start marker is invalid"};
     const bool notification = marker == '%';
@@ -381,6 +384,7 @@ Result<std::pair<bool, std::string>> Client::read_packet_after_start(
     }
 }
 Status Client::queue_stop_notification(std::string payload) {
+    std::lock_guard operation_lock(operation_mutex_);
     if (pending_notifications_.size() >= max_pending_notifications ||
         pending_notification_bytes_ > max_packet_ ||
         payload.size() > max_packet_ - pending_notification_bytes_)
@@ -390,6 +394,7 @@ Status Client::queue_stop_notification(std::string payload) {
     return std::monostate{};
 }
 Status Client::queue_console_output(std::string_view payload) {
+    std::lock_guard operation_lock(operation_mutex_);
     if (payload.empty() || payload.front() != 'O')
         return Error{ErrorCode::malformed, "invalid RSP console-output packet"};
     auto decoded = decode_hex(payload.substr(1));
@@ -401,6 +406,7 @@ Status Client::queue_console_output(std::string_view payload) {
     return std::monostate{};
 }
 std::vector<std::byte> Client::take_console_output(std::size_t limit) {
+    std::lock_guard operation_lock(operation_mutex_);
     const auto count = std::min(limit, pending_console_output_.size());
     std::vector<std::byte> result;
     result.reserve(count);
@@ -411,6 +417,7 @@ std::vector<std::byte> Client::take_console_output(std::size_t limit) {
     return result;
 }
 Result<bool> Client::read_ack(Deadline deadline, std::stop_token stop) {
+    std::lock_guard operation_lock(operation_mutex_);
     for (;;) {
         auto byte = read_byte(deadline, stop); if (!byte) return byte.error();
         if (byte.value() == '+') return true;
@@ -445,6 +452,7 @@ Result<bool> Client::read_ack(Deadline deadline, std::stop_token stop) {
 }
 Result<std::string> Client::receive_packet(Deadline deadline, std::stop_token stop, bool accept_notifications,
                                            bool *was_notification) {
+    std::lock_guard operation_lock(operation_mutex_);
     if (was_notification) *was_notification = false;
     for (;;) {
         auto start = read_byte(deadline, stop); if (!start) return start.error();
@@ -495,9 +503,11 @@ Result<std::string> Client::receive_packet(Deadline deadline, std::stop_token st
     }
 }
 Result<std::string> Client::transact(std::string_view command, std::stop_token stop) {
+    std::lock_guard operation_lock(operation_mutex_);
     return transact_until(command, std::chrono::steady_clock::now() + timeout_, stop);
 }
 Result<std::string> Client::transact_until(std::string_view command, Deadline deadline, std::stop_token stop) {
+    std::lock_guard operation_lock(operation_mutex_);
     if (command.size() > max_packet_) return Error{ErrorCode::resource_limit, "RSP command exceeds configured limit"};
     const auto packet = encode_packet(command);
     // PacketSize limits the transmitted payload, after RSP escaping. Escaping
@@ -516,12 +526,17 @@ Result<std::string> Client::transact_until(std::string_view command, Deadline de
     }
     return io_error("RSP peer rejected packet after three attempts");
 }
-Result<std::string> Client::request(std::string_view command, std::stop_token stop) { return transact(command, stop); }
+Result<std::string> Client::request(std::string_view command, std::stop_token stop) {
+    std::lock_guard operation_lock(operation_mutex_);
+    return transact(command, stop);
+}
 
 Result<Capabilities> Client::negotiate(std::stop_token stop) {
+    std::lock_guard operation_lock(operation_mutex_);
     return negotiate(stop, true);
 }
 Result<Capabilities> Client::negotiate(std::stop_token stop, bool request_no_ack) {
+    std::lock_guard operation_lock(operation_mutex_);
     memory_tagging_supported_ = false;
     auto supported = transact("qSupported:multiprocess+;swbreak+;hwbreak+;vContSupported+;QThreadEvents+;QPassSignals+;memory-tagging+;QHexLabLaunchSettingsTransaction+;qXfer:launch-settings:read+", stop);
     if (!supported) return supported.error();
@@ -602,6 +617,7 @@ Result<Capabilities> Client::negotiate(std::stop_token stop, bool request_no_ack
     return result;
 }
 Status Client::set_non_stop_mode(bool enabled, std::stop_token stop) {
+    std::lock_guard operation_lock(operation_mutex_);
     if (enabled && !non_stop_supported_)
         return Error{ErrorCode::unsupported, "remote did not advertise QNonStop support"};
     if (enabled == non_stop_mode_) return std::monostate{};
@@ -616,6 +632,7 @@ Status Client::set_non_stop_mode(bool enabled, std::stop_token stop) {
     return std::monostate{};
 }
 Status Client::set_thread_events(bool enabled, std::stop_token stop) {
+    std::lock_guard operation_lock(operation_mutex_);
     if (enabled && !thread_events_supported_)
         return Error{ErrorCode::unsupported, "remote did not advertise QThreadEvents support"};
     if (enabled == thread_events_enabled_) return std::monostate{};
@@ -629,6 +646,7 @@ Status Client::set_thread_events(bool enabled, std::stop_token stop) {
     return std::monostate{};
 }
 Status Client::set_pass_signals(std::span<const unsigned> signals, std::stop_token stop) {
+    std::lock_guard operation_lock(operation_mutex_);
     if (!pass_signals_supported_)
         return Error{ErrorCode::unsupported, "remote did not advertise QPassSignals support"};
     if (signals.empty() || signals.size() > 256)
@@ -656,12 +674,14 @@ Status Client::set_pass_signals(std::span<const unsigned> signals, std::stop_tok
     return std::monostate{};
 }
 Result<StopReply> Client::read_stop_reply(std::stop_token stop) {
+    std::lock_guard operation_lock(operation_mutex_);
     auto response = read_stop_reply_optional(stop);
     if (!response) return response.error();
     if (!response.value()) return Error{ErrorCode::unsupported, "remote reports no stopped thread"};
     return std::move(*response.value());
 }
 Result<std::optional<StopReply>> Client::read_stop_reply_optional(std::stop_token stop) {
+    std::lock_guard operation_lock(operation_mutex_);
     auto response = transact("?", stop); if (!response) return response.error();
     if (response.value() == "OK") return std::optional<StopReply>{};
     auto parsed = parse_stop(response.value());
@@ -670,6 +690,7 @@ Result<std::optional<StopReply>> Client::read_stop_reply_optional(std::stop_toke
     return std::optional<StopReply>{std::move(parsed.value())};
 }
 Result<StopReply> Client::wait_stop_reply(std::chrono::milliseconds timeout, std::stop_token stop) {
+    std::lock_guard operation_lock(operation_mutex_);
     if (timeout.count() < 0) return Error{ErrorCode::invalid_argument, "RSP stop wait timeout cannot be negative"};
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     for (;;) {
@@ -700,6 +721,7 @@ Result<StopReply> Client::wait_stop_reply(std::chrono::milliseconds timeout, std
     }
 }
 Status Client::send_resume(std::string_view command, std::stop_token stop) {
+    std::lock_guard operation_lock(operation_mutex_);
     const auto hex_digits = [](std::string_view value) {
         return !value.empty() && value.find_first_not_of("0123456789abcdefABCDEF") == std::string_view::npos;
     };
@@ -790,6 +812,7 @@ Status Client::send_resume(std::string_view command, std::stop_token stop) {
     return io_error("RSP peer rejected resume after three attempts");
 }
 Status Client::send_vcont(std::string_view action, std::stop_token stop) {
+    std::lock_guard operation_lock(operation_mutex_);
     if (action.empty() || action.find(';') != std::string_view::npos ||
         (action.front() != 'c' && action.front() != 's' && action.front() != 'C' && action.front() != 'S'))
         return Error{ErrorCode::invalid_argument, "vCont resume requires one continue or step action"};
@@ -820,6 +843,7 @@ Status Client::send_vcont(std::string_view action, std::stop_token stop) {
     return send_resume("vCont;" + std::string(action), stop);
 }
 Status Client::send_vcont_actions(std::span<const std::string> actions, std::stop_token stop) {
+    std::lock_guard operation_lock(operation_mutex_);
     if (actions.empty() || actions.size() > 4096)
         return Error{ErrorCode::invalid_argument, "vCont schedule must contain 1 to 4096 actions"};
     std::string command = "vCont;";
@@ -873,6 +897,7 @@ Status Client::send_vcont_actions(std::span<const std::string> actions, std::sto
     return send_resume(command, stop);
 }
 Status Client::kill(std::stop_token stop) {
+    std::lock_guard operation_lock(operation_mutex_);
     if (stop.stop_requested()) return Error{ErrorCode::canceled, "RSP operation canceled"};
     // The `k` packet has no protocol reply. In particular, the peer may close
     // the transport as soon as it has accepted the request, so waiting for an
@@ -881,6 +906,7 @@ Status Client::kill(std::stop_token stop) {
     return write_all(packet, std::chrono::steady_clock::now() + timeout_, stop);
 }
 Status Client::kill_process(std::uint64_t process, std::stop_token stop) {
+    std::lock_guard operation_lock(operation_mutex_);
     if (process == 0) return Error{ErrorCode::invalid_argument, "RSP process ID must be nonzero"};
     auto response = transact("vKill;" + hex_u64(process), stop);
     if (!response) return response.error();
@@ -889,6 +915,7 @@ Status Client::kill_process(std::uint64_t process, std::stop_token stop) {
     return Error{ErrorCode::io, "remote rejected vKill: " + response.value()};
 }
 Result<std::optional<StopReply>> Client::attach_process(std::uint64_t process, std::stop_token stop) {
+    std::lock_guard operation_lock(operation_mutex_);
     if (process == 0) return Error{ErrorCode::invalid_argument, "RSP process ID must be nonzero"};
     auto response = transact("vAttach;" + hex_u64(process), stop);
     if (!response) return response.error();
@@ -906,6 +933,7 @@ Result<std::optional<StopReply>> Client::attach_process(std::uint64_t process, s
 }
 Result<StopReply> Client::run_program(std::string_view executable,
     std::span<const std::string> arguments, std::stop_token stop) {
+    std::lock_guard operation_lock(operation_mutex_);
     if (executable.empty() || executable.find('\0') != std::string_view::npos)
         return Error{ErrorCode::invalid_argument, "RSP vRun executable path must be nonempty and contain no NUL"};
     if (arguments.size() > 4096)
@@ -944,6 +972,7 @@ Result<StopReply> Client::run_program(std::string_view executable,
     return stopped;
 }
 Status Client::set_working_directory(std::string_view directory, std::stop_token stop) {
+    std::lock_guard operation_lock(operation_mutex_);
     if (directory.find('\0') != std::string_view::npos)
         return Error{ErrorCode::invalid_argument, "RSP working directory cannot contain NUL"};
     if (!working_directory_supported_)
@@ -974,6 +1003,7 @@ Status Client::set_working_directory(std::string_view directory, std::stop_token
     return Error{ErrorCode::io, "remote rejected working directory: " + response.value()};
 }
 Status Client::apply_environment_batch(std::span<const RemoteEnvironmentChange> changes, std::stop_token stop) {
+    std::lock_guard operation_lock(operation_mutex_);
     constexpr std::string_view reset = "QEnvironmentReset";
     if (changes.size() > 256)
         return Error{ErrorCode::resource_limit, "RSP launch environment exceeds the 256-change limit"};
@@ -1070,6 +1100,7 @@ Status Client::apply_environment_batch(std::span<const RemoteEnvironmentChange> 
     return std::monostate{};
 }
 Status Client::set_environment(std::span<const RemoteEnvironmentChange> changes, std::stop_token stop) {
+    std::lock_guard operation_lock(operation_mutex_);
     const auto previous = known_environment_changes_;
     if (previous && std::equal(previous->begin(), previous->end(), changes.begin(), changes.end()))
         return std::monostate{};
@@ -1101,6 +1132,7 @@ Status Client::set_environment(std::span<const RemoteEnvironmentChange> changes,
 }
 Status Client::configure_launch_settings(std::span<const RemoteEnvironmentChange> changes,
     std::string_view working_directory, std::stop_token stop) {
+    std::lock_guard operation_lock(operation_mutex_);
     if (launch_settings_transaction_supported_) {
         auto payload = encode_launch_settings(changes, working_directory);
         if (!payload) return payload.error();
@@ -1198,6 +1230,7 @@ Status Client::configure_launch_settings(std::span<const RemoteEnvironmentChange
     return Error{directory.error().code, std::move(detail)};
 }
 Status Client::detach_process(std::uint64_t process, std::stop_token stop) {
+    std::lock_guard operation_lock(operation_mutex_);
     if (process == 0) return Error{ErrorCode::invalid_argument, "RSP process ID must be nonzero"};
     auto response = transact("D;" + hex_u64(process), stop);
     if (!response) return response.error();
@@ -1226,6 +1259,7 @@ Status Client::detach_process(std::uint64_t process, std::stop_token stop) {
     return Error{ErrorCode::io, "remote rejected process-specific detach: " + response.value()};
 }
 Status Client::interrupt(std::stop_token stop) {
+    std::lock_guard operation_lock(operation_mutex_);
     if (non_stop_mode_) {
         auto response = transact("vCtrlC", stop);
         if (!response) return response.error();
@@ -1238,6 +1272,7 @@ Status Client::interrupt(std::stop_token stop) {
     return write_all(std::string_view(&interrupt_byte, 1), std::chrono::steady_clock::now() + timeout_, stop);
 }
 Result<std::vector<std::uint64_t>> Client::enumerate_threads(std::stop_token stop) {
+    std::lock_guard operation_lock(operation_mutex_);
     auto ids = enumerate_thread_ids(stop);
     if (!ids) return ids.error();
     std::vector<std::uint64_t> result; result.reserve(ids.value().size());
@@ -1249,6 +1284,7 @@ Result<std::vector<std::uint64_t>> Client::enumerate_threads(std::stop_token sto
     return result;
 }
 Result<std::vector<std::string>> Client::enumerate_thread_ids(std::stop_token stop) {
+    std::lock_guard operation_lock(operation_mutex_);
     std::vector<std::string> result; std::set<std::string, std::less<>> seen; std::string command = "qfThreadInfo";
     for (std::size_t pages = 0; pages < 65536; ++pages) {
         auto response = transact(command, stop); if (!response) return response.error();
@@ -1273,6 +1309,7 @@ Result<std::vector<std::string>> Client::enumerate_thread_ids(std::stop_token st
 }
 Result<std::optional<std::string>> Client::read_thread_extra_info(std::string_view thread_id,
     std::size_t limit, std::chrono::milliseconds timeout, std::stop_token stop) {
+    std::lock_guard operation_lock(operation_mutex_);
     if (limit == 0 || limit > 64 * 1024 || timeout <= std::chrono::milliseconds::zero() ||
         timeout > std::chrono::minutes(1) || thread_id.empty() || thread_id.size() > 34)
         return Error{ErrorCode::invalid_argument, "invalid RSP thread-info bounds or ID"};
@@ -1308,10 +1345,15 @@ Result<std::optional<std::string>> Client::read_thread_extra_info(std::string_vi
     return std::optional<std::string>(std::move(description));
 }
 Result<std::vector<std::byte>> Client::read_registers(std::stop_token stop) {
+    std::lock_guard operation_lock(operation_mutex_);
     auto response = read_registers_raw(stop); if (!response) return response.error(); return decode_hex(response.value());
 }
-Result<std::string> Client::read_registers_raw(std::stop_token stop) { return transact("g", stop); }
+Result<std::string> Client::read_registers_raw(std::stop_token stop) {
+    std::lock_guard operation_lock(operation_mutex_);
+    return transact("g", stop);
+}
 Status Client::write_registers_raw(std::string_view hex_registers, std::stop_token stop) {
+    std::lock_guard operation_lock(operation_mutex_);
     if (hex_registers.empty() || hex_registers.size() % 2 != 0 ||
         hex_registers.size() >= max_packet_ ||
         !std::all_of(hex_registers.begin(), hex_registers.end(), [](unsigned char c) {
@@ -1326,6 +1368,7 @@ Status Client::write_registers_raw(std::string_view hex_registers, std::stop_tok
 }
 Result<std::optional<std::string>> Client::read_feature_annex(std::string_view annex, std::size_t limit,
     std::size_t chunk, std::stop_token stop) {
+    std::lock_guard operation_lock(operation_mutex_);
     if (annex.empty() || annex.size() > 256 || annex.find_first_of(":,;#$\r\n") != std::string_view::npos ||
         limit == 0 || limit > 1024 * 1024 || chunk == 0 || chunk > 64 * 1024)
         return Error{ErrorCode::invalid_argument, "invalid RSP feature annex bounds or name"};
@@ -1365,6 +1408,7 @@ Result<std::optional<std::string>> Client::read_feature_annex(std::string_view a
     return Error{ErrorCode::resource_limit, "RSP feature annex exceeds configured limit"};
 }
 Result<std::optional<std::string>> Client::read_libraries_annex(std::size_t limit, std::size_t chunk, std::stop_token stop) {
+    std::lock_guard operation_lock(operation_mutex_);
     if (limit == 0 || limit > 1024 * 1024 || chunk == 0 || chunk > 64 * 1024)
         return Error{ErrorCode::invalid_argument, "invalid RSP libraries annex bounds"};
     const auto packet_limit = std::min(max_packet_, peer_packet_size_);
@@ -1404,6 +1448,7 @@ Result<std::optional<std::string>> Client::read_libraries_annex(std::size_t limi
     return read_object("libraries-svr4");
 }
 Result<std::optional<std::string>> Client::read_memory_map_annex(std::size_t limit, std::size_t chunk, std::stop_token stop) {
+    std::lock_guard operation_lock(operation_mutex_);
     if (limit == 0 || limit > 1024 * 1024 || chunk == 0 || chunk > 64 * 1024)
         return Error{ErrorCode::invalid_argument, "invalid RSP memory-map annex bounds"};
     const auto packet_limit = std::min(max_packet_, peer_packet_size_);
@@ -1437,6 +1482,7 @@ Result<std::optional<std::string>> Client::read_memory_map_annex(std::size_t lim
     return Error{ErrorCode::resource_limit, "RSP memory-map annex exceeds configured limit"};
 }
 Result<std::optional<std::string>> Client::read_threads_annex(std::size_t limit, std::size_t chunk, std::stop_token stop) {
+    std::lock_guard operation_lock(operation_mutex_);
     if (limit == 0 || limit > 1024 * 1024 || chunk == 0 || chunk > 64 * 1024)
         return Error{ErrorCode::invalid_argument, "invalid RSP thread annex bounds"};
     const auto packet_limit = std::min(max_packet_, peer_packet_size_);
@@ -1472,10 +1518,12 @@ Result<std::optional<std::string>> Client::read_threads_annex(std::size_t limit,
 }
 Result<std::optional<std::string>> Client::read_processes_annex(std::size_t limit, std::size_t chunk,
     std::stop_token stop) {
+    std::lock_guard operation_lock(operation_mutex_);
     return read_osdata_annex("processes", limit, chunk, stop);
 }
 Result<std::optional<std::string>> Client::read_osdata_annex(std::string_view type,
     std::size_t limit, std::size_t chunk, std::stop_token stop) {
+    std::lock_guard operation_lock(operation_mutex_);
     const bool valid_type = !type.empty() && type.size() <= 64 &&
         std::all_of(type.begin(), type.end(), [](unsigned char c) {
             return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
@@ -1516,6 +1564,7 @@ Result<std::optional<std::string>> Client::read_osdata_annex(std::string_view ty
 }
 Result<std::optional<std::string>> Client::read_exec_file_annex(std::optional<std::uint64_t> process,
     std::size_t limit, std::size_t chunk, std::stop_token stop) {
+    std::lock_guard operation_lock(operation_mutex_);
     const auto packet_limit = std::min(max_packet_, peer_packet_size_);
     if ((process && *process == 0) || limit == 0 || limit > 1024 * 1024 || chunk == 0 ||
         chunk > 64 * 1024 || packet_limit < 64)
@@ -1555,6 +1604,7 @@ Result<std::optional<std::string>> Client::read_exec_file_annex(std::optional<st
 }
 Result<std::optional<std::vector<std::byte>>> Client::read_auxv_annex(
     std::size_t limit, std::size_t chunk, std::stop_token stop) {
+    std::lock_guard operation_lock(operation_mutex_);
     const auto packet_limit = std::min(max_packet_, peer_packet_size_);
     if (limit == 0 || limit > 1024 * 1024 || chunk == 0 || chunk > 64 * 1024 || packet_limit < 32)
         return Error{ErrorCode::invalid_argument, "invalid RSP auxiliary-vector annex bounds"};
@@ -1591,6 +1641,7 @@ Result<std::optional<std::vector<std::byte>>> Client::read_auxv_annex(
 }
 Result<std::optional<std::vector<std::byte>>> Client::read_siginfo_annex(
     std::size_t limit, std::size_t chunk, std::stop_token stop) {
+    std::lock_guard operation_lock(operation_mutex_);
     const auto packet_limit = std::min(max_packet_, peer_packet_size_);
     if (limit == 0 || limit > 64 * 1024 || chunk == 0 || chunk > 64 * 1024 || packet_limit < 32)
         return Error{ErrorCode::invalid_argument, "invalid RSP siginfo annex bounds"};
@@ -1626,12 +1677,15 @@ Result<std::optional<std::vector<std::byte>>> Client::read_siginfo_annex(
     return Error{ErrorCode::resource_limit, "RSP siginfo annex exceeds configured limit"};
 }
 Result<std::vector<std::byte>> Client::read_register(std::uint64_t number, std::stop_token stop) {
+    std::lock_guard operation_lock(operation_mutex_);
     auto response = read_register_raw(number, stop); if (!response) return response.error(); return decode_hex(response.value());
 }
 Result<std::string> Client::read_register_raw(std::uint64_t number, std::stop_token stop) {
+    std::lock_guard operation_lock(operation_mutex_);
     return transact("p" + hex_u64(number), stop);
 }
 Status Client::write_register(std::uint64_t number, std::span<const std::byte> bytes, std::stop_token stop) {
+    std::lock_guard operation_lock(operation_mutex_);
     if (bytes.empty() || bytes.size() > max_packet_ / 2)
         return Error{ErrorCode::invalid_argument, "RSP register write is empty or exceeds packet limit"};
     auto response = transact("P" + hex_u64(number) + "=" + encode_hex(bytes), stop);
@@ -1641,6 +1695,7 @@ Status Client::write_register(std::uint64_t number, std::span<const std::byte> b
     return Error{ErrorCode::io, "remote rejected register write: " + response.value()};
 }
 Result<std::vector<std::byte>> Client::read_memory(std::uint64_t address, std::size_t size, std::stop_token stop) {
+    std::lock_guard operation_lock(operation_mutex_);
     constexpr std::size_t max_transfer = 16 * 1024 * 1024;
     if (size == 0) return std::vector<std::byte>{};
     if (size > max_transfer || size > std::numeric_limits<std::uint64_t>::max() ||
@@ -1678,6 +1733,7 @@ Result<std::vector<std::byte>> Client::read_memory(std::uint64_t address, std::s
 }
 Result<std::optional<std::uint64_t>> Client::search_memory(std::uint64_t address,
     std::uint64_t length, std::span<const std::byte> pattern, std::stop_token stop) {
+    std::lock_guard operation_lock(operation_mutex_);
     if (length == 0 || address > UINT64_MAX - length || pattern.empty())
         return Error{ErrorCode::invalid_argument, "RSP memory search range or pattern is empty or overflows"};
     std::string command = "qSearch:memory:" + hex_u64(address) + ";" + hex_u64(length) + ";";
@@ -1711,6 +1767,7 @@ Result<std::optional<std::uint64_t>> Client::search_memory(std::uint64_t address
     return std::optional<std::uint64_t>(match);
 }
 Result<std::uint32_t> Client::memory_crc32(std::uint64_t address, std::uint64_t length, std::stop_token stop) {
+    std::lock_guard operation_lock(operation_mutex_);
     if (length == 0 || address > UINT64_MAX - (length - 1))
         return Error{ErrorCode::invalid_argument, "RSP CRC range is empty or overflows the address space"};
     auto response = transact("qCRC:" + hex_u64(address) + "," + hex_u64(length), stop);
@@ -1726,6 +1783,7 @@ Result<std::uint32_t> Client::memory_crc32(std::uint64_t address, std::uint64_t 
 }
 Result<std::vector<std::byte>> Client::read_memory_tags(std::uint64_t address,
     std::uint64_t length, std::int32_t type, std::size_t max_tag_bytes, std::stop_token stop) {
+    std::lock_guard operation_lock(operation_mutex_);
     if (length == 0 || address > UINT64_MAX - (length - 1))
         return Error{ErrorCode::invalid_argument, "RSP memory-tag range is empty or overflows the address space"};
     if (!memory_tagging_supported_)
@@ -1757,6 +1815,7 @@ Result<std::vector<std::byte>> Client::read_memory_tags(std::uint64_t address,
     return tags;
 }
 Result<bool> Client::is_address_tagged(std::uint64_t address, std::stop_token stop) {
+    std::lock_guard operation_lock(operation_mutex_);
     const auto command = "qIsAddressTagged:" + hex_u64(address);
     if (command.size() > std::min(max_packet_, peer_packet_size_))
         return Error{ErrorCode::resource_limit, "RSP qIsAddressTagged request exceeds the negotiated packet limit"};
@@ -1770,16 +1829,19 @@ Result<bool> Client::is_address_tagged(std::uint64_t address, std::stop_token st
 }
 Result<std::vector<std::byte>> Client::read_remote_file(std::string_view path,
     std::size_t maximum_size, std::stop_token stop) {
+    std::lock_guard operation_lock(operation_mutex_);
     return read_remote_file_impl(path, 0, maximum_size, true, stop);
 }
 Result<std::vector<std::byte>> Client::read_remote_file_range(std::string_view path,
     std::uint64_t offset, std::size_t size, std::stop_token stop) {
+    std::lock_guard operation_lock(operation_mutex_);
     if (size == 0 || size > 256 * 1024 * 1024 || offset > UINT64_MAX - size)
         return Error{ErrorCode::invalid_argument,
             "RSP remote file range must be non-empty, at most 256 MiB, and not overflow"};
     return read_remote_file_impl(path, offset, size, false, stop);
 }
 Result<std::vector<std::byte>> Client::run_monitor_command(std::string_view command, std::stop_token stop) {
+    std::lock_guard operation_lock(operation_mutex_);
     if (command.empty() || command.size() > 4096 || command.find('\0') != std::string_view::npos)
         return Error{ErrorCode::invalid_argument, "RSP monitor command must contain 1 to 4096 non-NUL bytes"};
     for (const unsigned char byte : command) {
@@ -1813,6 +1875,7 @@ Result<std::vector<std::byte>> Client::run_monitor_command(std::string_view comm
     return output;
 }
 Result<RemoteFileStat> Client::stat_remote_file(std::uint64_t descriptor, std::stop_token stop) {
+    std::lock_guard operation_lock(operation_mutex_);
     if (descriptor > static_cast<std::uint64_t>(INT64_MAX))
         return Error{ErrorCode::invalid_argument, "RSP vFile descriptor exceeds the signed protocol range"};
     const auto command = "vFile:fstat:" + hex_u64(descriptor);
@@ -1826,6 +1889,7 @@ Result<RemoteFileStat> Client::stat_remote_file(std::uint64_t descriptor, std::s
 }
 Result<RemoteFileStat> Client::stat_remote_file_path(std::string_view path,
     bool follow_symlinks, std::stop_token stop) {
+    std::lock_guard operation_lock(operation_mutex_);
     if (path.empty() || path.size() > 16 * 1024 || path.find('\0') != std::string_view::npos)
         return Error{ErrorCode::invalid_argument, "RSP vFile stat path must contain 1..16384 non-NUL bytes"};
     const auto operation = follow_symlinks ? std::string_view("stat") : std::string_view("lstat");
@@ -1841,6 +1905,7 @@ Result<RemoteFileStat> Client::stat_remote_file_path(std::string_view path,
 }
 Result<std::vector<std::byte>> Client::read_remote_symlink(std::string_view path,
     std::size_t maximum_size, std::stop_token stop) {
+    std::lock_guard operation_lock(operation_mutex_);
     if (path.empty() || path.size() > 16 * 1024 || path.find('\0') != std::string_view::npos)
         return Error{ErrorCode::invalid_argument, "RSP symlink path must contain 1..16384 non-NUL bytes"};
     if (maximum_size == 0 || maximum_size > 1024 * 1024)
@@ -1866,6 +1931,7 @@ Result<std::vector<std::byte>> Client::read_remote_symlink(std::string_view path
 }
 Status Client::write_remote_file_range(std::string_view path, std::uint64_t offset,
     std::span<const std::byte> bytes, std::uint64_t flags, std::uint64_t mode, std::stop_token stop) {
+    std::lock_guard operation_lock(operation_mutex_);
     if (path.empty() || path.size() > 16 * 1024 || path.find('\0') != std::string_view::npos ||
         bytes.empty() || bytes.size() > 256 * 1024 * 1024 || offset > UINT64_MAX - bytes.size())
         return Error{ErrorCode::invalid_argument, "RSP remote file write requires a valid path and 1..256 MiB non-overflowing range"};
@@ -1935,6 +2001,7 @@ Status Client::write_remote_file_range(std::string_view path, std::uint64_t offs
 }
 Result<std::vector<std::byte>> Client::read_remote_file_impl(std::string_view path,
     std::uint64_t file_offset, std::size_t maximum_size, bool probe_limit, std::stop_token stop) {
+    std::lock_guard operation_lock(operation_mutex_);
     if (path.empty() || path.size() > 16 * 1024 || path.find('\0') != std::string_view::npos)
         return Error{ErrorCode::invalid_argument, "RSP remote file path is empty, contains NUL, or exceeds 16 KiB"};
     if (maximum_size == 0 || maximum_size > 256 * 1024 * 1024)
@@ -2021,6 +2088,7 @@ Result<std::vector<std::byte>> Client::read_remote_file_impl(std::string_view pa
     return bytes;
 }
 Status Client::set_breakpoint(std::uint64_t address, BreakpointType type, std::uint8_t size, bool insert, std::stop_token stop) {
+    std::lock_guard operation_lock(operation_mutex_);
     if (size == 0 || address > UINT64_MAX - (static_cast<std::uint64_t>(size) - 1))
         return Error{ErrorCode::invalid_argument, "RSP breakpoint range is empty or overflows the address space"};
     const char* kind = nullptr;
@@ -2039,6 +2107,7 @@ Status Client::set_breakpoint(std::uint64_t address, BreakpointType type, std::u
     return Error{ErrorCode::io, "remote rejected breakpoint command: " + response.value()};
 }
 Status Client::write_memory(std::uint64_t address, std::span<const std::byte> bytes, std::stop_token stop) {
+    std::lock_guard operation_lock(operation_mutex_);
     if (bytes.empty() || address > UINT64_MAX - bytes.size())
         return Error{ErrorCode::invalid_argument, "RSP memory write range is empty or overflows the address space"};
     const auto packet_limit = std::min(max_packet_, peer_packet_size_);
@@ -2103,6 +2172,7 @@ Status Client::write_memory(std::uint64_t address, std::span<const std::byte> by
     return std::monostate{};
 }
 Result<std::optional<RemoteLaunchSettings>> Client::read_launch_settings(std::stop_token stop) {
+    std::lock_guard operation_lock(operation_mutex_);
     if (!launch_settings_readback_supported_) return std::optional<RemoteLaunchSettings>{};
     std::string data;
     constexpr std::size_t maximum = 256 * (4096 + 16 * 1024 + 8) + 16 * 1024 + 12;
@@ -2130,6 +2200,7 @@ Result<std::optional<RemoteLaunchSettings>> Client::read_launch_settings(std::st
     return std::optional<RemoteLaunchSettings>{std::move(parsed.value())};
 }
 Status Client::program_flash(std::uint64_t address, std::span<const std::byte> bytes, std::stop_token stop) {
+    std::lock_guard operation_lock(operation_mutex_);
     constexpr std::size_t maximum_flash_bytes = 256 * 1024 * 1024;
     if (bytes.empty() || address > UINT64_MAX - (static_cast<std::uint64_t>(bytes.size()) - 1))
         return Error{ErrorCode::invalid_argument, "RSP flash range is empty or overflows the address space"};
@@ -2195,6 +2266,7 @@ Status Client::program_flash(std::uint64_t address, std::span<const std::byte> b
 }
 Status Client::program_flash_in_regions(std::uint64_t address, std::span<const std::byte> bytes,
                                         std::span<const MemoryRegion> regions, std::stop_token stop) {
+    std::lock_guard operation_lock(operation_mutex_);
     if (bytes.empty() || address > UINT64_MAX - (static_cast<std::uint64_t>(bytes.size()) - 1))
         return Error{ErrorCode::invalid_argument, "RSP flash range is empty or overflows the address space"};
     const auto last = address + static_cast<std::uint64_t>(bytes.size()) - 1;
@@ -2230,6 +2302,7 @@ Status Client::program_flash_in_regions(std::uint64_t address, std::span<const s
 }
 Status Client::program_flash_verified_in_regions(std::uint64_t address,
     std::span<const std::byte> bytes, std::span<const MemoryRegion> regions, std::stop_token stop) {
+    std::lock_guard operation_lock(operation_mutex_);
     if (bytes.empty() || bytes.size() > 256 * 1024 * 1024 ||
         address > UINT64_MAX - (static_cast<std::uint64_t>(bytes.size()) - 1))
         return Error{ErrorCode::invalid_argument,
@@ -2288,9 +2361,11 @@ Status Client::program_flash_verified_in_regions(std::uint64_t address,
     return std::monostate{};
 }
 Status Client::select_thread(std::uint64_t thread, std::stop_token stop) {
+    std::lock_guard operation_lock(operation_mutex_);
     return select_thread(hex_u64(thread), stop);
 }
 Status Client::select_thread(std::string_view thread_id, std::stop_token stop) {
+    std::lock_guard operation_lock(operation_mutex_);
     if (!valid_thread_selection_id(thread_id))
         return Error{ErrorCode::invalid_argument, "invalid RSP thread selector"};
     auto response = transact("Hg" + std::string(thread_id), stop);
